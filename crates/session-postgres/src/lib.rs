@@ -44,12 +44,14 @@ mod query;
 mod terminal;
 
 const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
-    id: "session.0001.durable-session-owner",
+    id: "session.current-baseline",
     domain: SESSION_DOMAIN,
     version: 1,
-    description: "create session, message, event, snapshot and fenced outbox owners",
+    description:
+        "initialize current clean Session, input, presence, terminal binding and ACK schema",
     statements: &[
-        "CREATE TABLE IF NOT EXISTS session_records (
+        r#"DO $clean$ BEGIN IF EXISTS(SELECT 1 FROM cowd_schema_migrations WHERE domain='session' AND id<>'session.current-baseline') OR to_regclass('session_records') IS NOT NULL THEN RAISE EXCEPTION 'unsupported session catalog; initialize an explicitly selected clean namespace'; END IF; END $clean$"#,
+        r#"CREATE TABLE session_records (
             session_id TEXT PRIMARY KEY,
             platform TEXT NOT NULL,
             chat_id TEXT NOT NULL,
@@ -62,21 +64,20 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             metadata_json TEXT,
             input_tokens BIGINT NOT NULL DEFAULT 0,
             output_tokens BIGINT NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'active'
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_records_activity
-            ON session_records(last_activity DESC, session_id ASC)",
-        "CREATE INDEX IF NOT EXISTS idx_session_records_platform
-            ON session_records(platform, last_activity DESC, session_id ASC)",
-        "CREATE INDEX IF NOT EXISTS idx_session_records_status_model
-            ON session_records(status, model, last_activity DESC, session_id ASC)",
-        "CREATE TABLE IF NOT EXISTS session_memory_associations (
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at_ms BIGINT NOT NULL DEFAULT 0,
+            updated_at_ms BIGINT NOT NULL DEFAULT 0,
+            input_generation BIGINT NOT NULL DEFAULT 1,
+            input_admission_open BOOLEAN NOT NULL DEFAULT TRUE,
+            discovery_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id()
+        )"#,
+        r#"CREATE TABLE session_memory_associations (
             session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
             memory_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY(session_id, memory_id)
-        )",
-        "CREATE TABLE IF NOT EXISTS session_messages (
+        )"#,
+        r#"CREATE TABLE session_messages (
             stable_message_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
             sequence BIGINT NOT NULL,
@@ -87,44 +88,39 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             tool_name TEXT,
             token_usage_json TEXT,
             created_at_ms BIGINT NOT NULL,
-            UNIQUE(session_id, sequence)
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_messages_session_sequence
-            ON session_messages(session_id, sequence ASC)",
-        "CREATE INDEX IF NOT EXISTS idx_session_messages_search
-            ON session_messages USING GIN(to_tsvector('simple', coalesce(role, '') || ' ' || coalesce(content_json, '') || ' ' || coalesce(tool_name, '')))",
-        "CREATE TABLE IF NOT EXISTS session_events (
+            UNIQUE(session_id, sequence),
+            discovery_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id(),
+            terminal_runtime_commit_cursor BIGINT,
+            terminal_content_digest TEXT,
+            CONSTRAINT session_terminal_binding_pair CHECK (
+    (terminal_runtime_commit_cursor IS NULL AND terminal_content_digest IS NULL)
+    OR (terminal_runtime_commit_cursor > 0
+        AND terminal_runtime_commit_cursor IS NOT NULL
+        AND terminal_content_digest IS NOT NULL
+        AND terminal_content_digest ~ '^session-public-v1:sha256:[0-9a-f]{64}$')),
+            CONSTRAINT session_terminal_message_identity UNIQUE (session_id, stable_message_id)
+        )"#,
+        r#"CREATE TABLE session_events (
             session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
             sequence BIGINT NOT NULL,
             event_type TEXT NOT NULL,
             event_json TEXT NOT NULL,
             created_at_ms BIGINT NOT NULL,
             PRIMARY KEY(session_id, sequence)
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_events_type_sequence
-            ON session_events(session_id, event_type, sequence ASC)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_domain_event_id
-            ON session_events(session_id, (event_json::jsonb ->> 'event_id'))
-            WHERE event_type = 'SessionDomainEvent'
-              AND (event_json::jsonb ->> 'event_id') IS NOT NULL",
-        "CREATE INDEX IF NOT EXISTS idx_session_domain_kind_sequence
-            ON session_events(session_id, (event_json::jsonb ->> 'kind'), sequence ASC)
-            WHERE event_type = 'SessionDomainEvent'",
-        "CREATE TABLE IF NOT EXISTS session_event_checkpoints (
+        )"#,
+        r#"CREATE TABLE session_event_checkpoints (
             session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
             checkpoint_id TEXT NOT NULL,
             PRIMARY KEY(session_id, checkpoint_id)
-        )",
-        "CREATE TABLE IF NOT EXISTS session_snapshots (
+        )"#,
+        r#"CREATE TABLE session_snapshots (
             session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
             event_idx BIGINT NOT NULL,
             messages_json TEXT NOT NULL,
             created_at_ms BIGINT NOT NULL,
             PRIMARY KEY(session_id, event_idx)
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_snapshots_latest
-            ON session_snapshots(session_id, event_idx DESC)",
-        "CREATE TABLE IF NOT EXISTS session_runtime_outbox (
+        )"#,
+        r#"CREATE TABLE session_runtime_outbox (
             request_id TEXT PRIMARY KEY,
             turn_id TEXT NOT NULL UNIQUE,
             message_id TEXT NOT NULL UNIQUE REFERENCES session_messages(stable_message_id) ON DELETE CASCADE,
@@ -141,13 +137,20 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             revision BIGINT NOT NULL DEFAULT 0,
             created_at_ms BIGINT NOT NULL,
             updated_at_ms BIGINT NOT NULL,
-            runtime_options_json TEXT
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_claim
-            ON session_runtime_outbox(status, next_attempt_at_ms, claim_expires_at_ms, sequence)",
-        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_session
-            ON session_runtime_outbox(session_id, created_at_ms DESC)",
-        "CREATE TABLE IF NOT EXISTS session_runtime_outbox_history (
+            runtime_options_json TEXT,
+            input_id TEXT NOT NULL,
+            session_generation BIGINT NOT NULL DEFAULT 1,
+            decision TEXT NOT NULL DEFAULT 'start_new_turn',
+            target_turn_id TEXT,
+            classification_json TEXT,
+            claim_token TEXT,
+            terminal_at_ms BIGINT,
+            claim_fence_epoch BIGINT,
+            CONSTRAINT session_runtime_claim_fence_epoch_positive CHECK (claim_fence_epoch IS NULL OR claim_fence_epoch > 0),
+            task_route_hint_json TEXT,
+            application_receipt_json TEXT
+        )"#,
+        r#"CREATE TABLE session_runtime_outbox_history (
             history_id BIGSERIAL PRIMARY KEY,
             request_id TEXT NOT NULL REFERENCES session_runtime_outbox(request_id) ON DELETE CASCADE,
             action TEXT NOT NULL,
@@ -161,92 +164,106 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             to_status TEXT,
             attempts BIGINT,
             created_at_ms BIGINT NOT NULL
-        )",
-        "CREATE TABLE IF NOT EXISTS session_mission_outbox (
-            request_id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            workspace_key TEXT NOT NULL,
-            operation TEXT NOT NULL,
-            status TEXT NOT NULL,
-            attempts BIGINT NOT NULL DEFAULT 0,
-            next_attempt_at_ms BIGINT NOT NULL,
-            claim_owner TEXT,
-            claim_expires_at_ms BIGINT,
-            failure_class TEXT,
+        )"#,
+        r#"CREATE TABLE session_recovery_manifest (
+            session_id TEXT PRIMARY KEY REFERENCES session_records(session_id) ON DELETE CASCADE,
+            durable_cursor BIGINT NOT NULL DEFAULT 0,
+            history_revision BIGINT NOT NULL DEFAULT 0,
+            transcript_messages BIGINT NOT NULL DEFAULT 0,
+            transcript_bytes BIGINT NOT NULL DEFAULT 0,
+            in_flight_turn BOOLEAN NOT NULL DEFAULT FALSE,
+            pending_approval BOOLEAN NOT NULL DEFAULT FALSE,
+            active_writer_or_attachment BOOLEAN NOT NULL DEFAULT FALSE,
+            mission_agent_team_continuation BOOLEAN NOT NULL DEFAULT FALSE,
+            last_activity_ms BIGINT NOT NULL DEFAULT 0,
+            manifest_revision BIGINT NOT NULL DEFAULT 0,
+            event_cursor BIGINT NOT NULL DEFAULT 0,
+            latest_checkpoint_sequence BIGINT,
+            latest_checkpoint_event_id TEXT,
+            index_generation BIGINT NOT NULL DEFAULT 0,
+            indexed_through_sequence BIGINT,
+            index_card_count BIGINT NOT NULL DEFAULT 0,
+            index_pending BOOLEAN NOT NULL DEFAULT FALSE
+        )"#,
+        r#"CREATE TABLE session_lifecycle_intents (
+            operation_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
+            disposition TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            last_stable_phase TEXT NOT NULL,
+            expected_generation BIGINT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
             last_error TEXT,
-            revision BIGINT NOT NULL DEFAULT 0,
+            revision BIGINT NOT NULL DEFAULT 0
+        )"#,
+        r#"CREATE TABLE session_branch_activations (
+            operation_id TEXT PRIMARY KEY,
+            source_session_id TEXT NOT NULL
+                REFERENCES session_records(session_id) ON DELETE CASCADE,
+            target_session_id TEXT NOT NULL UNIQUE
+                REFERENCES session_records(session_id) ON DELETE CASCADE,
+            source_message_count BIGINT NOT NULL,
+            phase TEXT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
+            last_error TEXT,
+            revision BIGINT NOT NULL DEFAULT 0
+        )"#,
+        r#"CREATE TABLE session_context_index_outbox (
+            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
+            source_sequence BIGINT NOT NULL,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts BIGINT NOT NULL DEFAULT 0,
+            created_at_ms BIGINT NOT NULL DEFAULT 0,
+            updated_at_ms BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY(session_id, source_sequence, operation)
+        )"#,
+        r#"CREATE TABLE session_context_index_cards (
+            card_id TEXT PRIMARY KEY,
+            parent_card_id TEXT,
+            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
+            source_start_sequence BIGINT NOT NULL,
+            source_end_sequence BIGINT NOT NULL,
+            source_message_count BIGINT NOT NULL,
+            source_digest TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            generation BIGINT NOT NULL,
             created_at_ms BIGINT NOT NULL,
             updated_at_ms BIGINT NOT NULL
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_mission_outbox_claim
-            ON session_mission_outbox(workspace_key, status, next_attempt_at_ms, claim_expires_at_ms, created_at_ms)",
-        "CREATE INDEX IF NOT EXISTS idx_session_mission_outbox_session
-            ON session_mission_outbox(session_id, created_at_ms DESC)",
-        "CREATE TABLE IF NOT EXISTS session_mission_outbox_history (
-            history_id BIGSERIAL PRIMARY KEY,
-            request_id TEXT NOT NULL REFERENCES session_mission_outbox(request_id) ON DELETE CASCADE,
-            action TEXT NOT NULL,
-            actor TEXT,
-            expected_revision BIGINT,
-            previous_status TEXT NOT NULL,
-            next_status TEXT NOT NULL,
-            detail TEXT,
-            reason TEXT,
-            from_status TEXT,
-            to_status TEXT,
-            attempts BIGINT,
-            created_at_ms BIGINT NOT NULL
-        )",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0002.history-copy-fields",
-    domain: SESSION_DOMAIN,
-    version: 2,
-    description: "preserve portable outbox history fields during SQLite cutover",
-    statements: &[
-        "ALTER TABLE session_runtime_outbox_history ADD COLUMN IF NOT EXISTS reason TEXT",
-        "ALTER TABLE session_runtime_outbox_history ADD COLUMN IF NOT EXISTS from_status TEXT",
-        "ALTER TABLE session_runtime_outbox_history ADD COLUMN IF NOT EXISTS to_status TEXT",
-        "ALTER TABLE session_runtime_outbox_history ADD COLUMN IF NOT EXISTS attempts BIGINT",
-        "ALTER TABLE session_mission_outbox_history ADD COLUMN IF NOT EXISTS reason TEXT",
-        "ALTER TABLE session_mission_outbox_history ADD COLUMN IF NOT EXISTS from_status TEXT",
-        "ALTER TABLE session_mission_outbox_history ADD COLUMN IF NOT EXISTS to_status TEXT",
-        "ALTER TABLE session_mission_outbox_history ADD COLUMN IF NOT EXISTS attempts BIGINT",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0003.reconcile-message-summaries",
-    domain: SESSION_DOMAIN,
-    version: 3,
-    description: "reconcile legacy session counters with durable messages",
-    statements: &[
-        "UPDATE session_records
-            SET message_count = (
-                    SELECT COUNT(*) FROM session_messages
-                     WHERE session_id=session_records.session_id
-                ),
-                input_tokens = COALESCE((
-                    SELECT SUM(COALESCE(
-                        (token_usage_json::jsonb->>'input_tokens')::bigint, 0
-                    ))
-                      FROM session_messages
-                     WHERE session_id=session_records.session_id
-                ), 0),
-                output_tokens = COALESCE((
-                    SELECT SUM(COALESCE(
-                        (token_usage_json::jsonb->>'output_tokens')::bigint, 0
-                    ))
-                      FROM session_messages
-                     WHERE session_id=session_records.session_id
-        ), 0)",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0004.safe-message-usage-reconciliation",
-    domain: SESSION_DOMAIN,
-    version: 4,
-    description: "make durable message usage reconciliation tolerant of malformed legacy payloads",
-    statements: &[
-        "CREATE OR REPLACE FUNCTION cowd_safe_session_usage_token(raw TEXT, token_key TEXT)
+        )"#,
+        r#"CREATE TABLE session_presence_projection (
+            session_id TEXT PRIMARY KEY REFERENCES session_records(session_id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            attachments_json JSONB NOT NULL,
+            next_sequence BIGINT NOT NULL,
+            revision BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
+            CHECK (jsonb_typeof(attachments_json) = 'array')
+        )"#,
+        r#"CREATE TABLE session_discovery_invalidations (
+            key TEXT PRIMARY KEY,
+            revision BIGINT NOT NULL
+        )"#,
+        r#"CREATE TABLE session_terminal_message_acks (
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            runtime_commit_cursor BIGINT NOT NULL CHECK (runtime_commit_cursor > 0),
+            client_id TEXT NOT NULL CHECK (length(client_id) > 0),
+            principal_id TEXT NOT NULL CHECK (length(principal_id) > 0),
+            content_digest TEXT NOT NULL
+    CHECK (content_digest ~ '^session-public-v1:sha256:[0-9a-f]{64}$'),
+            received_at_ms BIGINT NOT NULL CHECK (received_at_ms >= 0),
+            PRIMARY KEY (session_id, message_id, runtime_commit_cursor, client_id),
+            CONSTRAINT session_terminal_ack_message_identity
+    FOREIGN KEY (session_id, message_id)
+    REFERENCES session_messages(session_id, stable_message_id)
+    ON UPDATE RESTRICT ON DELETE CASCADE
+        )"#,
+        r#"CREATE FUNCTION cowd_safe_session_usage_token(raw TEXT, token_key TEXT)
          RETURNS BIGINT
          LANGUAGE plpgsql
          IMMUTABLE
@@ -270,34 +287,8 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
          EXCEPTION WHEN OTHERS THEN
              RETURN 0;
          END
-         $$",
-        "UPDATE session_records
-            SET message_count = (
-                    SELECT COUNT(*) FROM session_messages
-                     WHERE session_id=session_records.session_id
-                ),
-                input_tokens = COALESCE((
-                    SELECT SUM(cowd_safe_session_usage_token(
-                        token_usage_json, 'input_tokens'
-                    ))
-                      FROM session_messages
-                     WHERE session_id=session_records.session_id
-                ), 0),
-                output_tokens = COALESCE((
-                    SELECT SUM(cowd_safe_session_usage_token(
-                        token_usage_json, 'output_tokens'
-                    ))
-                      FROM session_messages
-                     WHERE session_id=session_records.session_id
-        ), 0)",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0005.monotonic-session-activity-ms",
-    domain: SESSION_DOMAIN,
-    version: 5,
-    description: "align PostgreSQL session activity clocks with SQLite monotonic millisecond semantics",
-    statements: &[
-        "CREATE OR REPLACE FUNCTION cowd_safe_session_epoch_ms(raw TEXT)
+         $$"#,
+        r#"CREATE FUNCTION cowd_safe_session_epoch_ms(raw TEXT)
          RETURNS BIGINT
          LANGUAGE plpgsql
          IMMUTABLE
@@ -311,894 +302,8 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
          EXCEPTION WHEN OTHERS THEN
              RETURN 0;
          END
-         $$",
-        "ALTER TABLE session_records ADD COLUMN IF NOT EXISTS created_at_ms BIGINT NOT NULL DEFAULT 0",
-        "ALTER TABLE session_records ADD COLUMN IF NOT EXISTS updated_at_ms BIGINT NOT NULL DEFAULT 0",
-        "UPDATE session_records
-            SET created_at_ms = GREATEST(created_at_ms, cowd_safe_session_epoch_ms(created_at)),
-                updated_at_ms = GREATEST(
-                    updated_at_ms,
-                    cowd_safe_session_epoch_ms(last_activity),
-                    cowd_safe_session_epoch_ms(created_at)
-                )",
-        "CREATE INDEX IF NOT EXISTS idx_session_records_updated_ms
-            ON session_records(updated_at_ms DESC, session_id ASC)",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0006.recovery-manifest",
-    domain: SESSION_DOMAIN,
-    version: 6,
-    description: "add body-free durable session recovery manifests",
-    statements: &[
-        "CREATE TABLE IF NOT EXISTS session_recovery_manifest (
-            session_id TEXT PRIMARY KEY REFERENCES session_records(session_id) ON DELETE CASCADE,
-            durable_cursor BIGINT NOT NULL DEFAULT 0,
-            history_revision BIGINT NOT NULL DEFAULT 0,
-            transcript_messages BIGINT NOT NULL DEFAULT 0,
-            transcript_bytes BIGINT NOT NULL DEFAULT 0,
-            in_flight_turn BOOLEAN NOT NULL DEFAULT FALSE,
-            pending_approval BOOLEAN NOT NULL DEFAULT FALSE,
-            active_writer_or_attachment BOOLEAN NOT NULL DEFAULT FALSE,
-            mission_agent_team_continuation BOOLEAN NOT NULL DEFAULT FALSE,
-            last_activity_ms BIGINT NOT NULL DEFAULT 0,
-            manifest_revision BIGINT NOT NULL DEFAULT 0
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_recovery_required
-            ON session_recovery_manifest(
-                in_flight_turn,
-                pending_approval,
-                active_writer_or_attachment,
-                mission_agent_team_continuation,
-                last_activity_ms DESC
-            )",
-        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
-             target_session_id TEXT,
-             bump_history BOOLEAN
-         )
-         RETURNS VOID
-         LANGUAGE plpgsql
-         AS $$
-         BEGIN
-             INSERT INTO session_recovery_manifest(
-                 session_id, durable_cursor, history_revision,
-                 transcript_messages, transcript_bytes, in_flight_turn,
-                 active_writer_or_attachment,
-                 mission_agent_team_continuation, last_activity_ms,
-                 manifest_revision
-             )
-             SELECT
-                 record.session_id,
-                 COALESCE((
-                     SELECT MAX(sequence) + 1 FROM session_messages
-                      WHERE session_id=record.session_id
-                 ), 0),
-                 CASE WHEN bump_history THEN 1 ELSE 0 END,
-                 COALESCE((
-                     SELECT COUNT(*) FROM session_messages
-                      WHERE session_id=record.session_id
-                 ), 0),
-                 COALESCE((
-                     SELECT SUM(
-                         octet_length(stable_message_id)
-                         + octet_length(session_id)
-                         + octet_length(role)
-                         + octet_length(content_json)
-                         + octet_length(COALESCE(token_usage_json, ''))
-                         + octet_length(COALESCE(tool_use_id, ''))
-                         + octet_length(COALESCE(tool_name, ''))
-                     )
-                     FROM session_messages WHERE session_id=record.session_id
-                 ), 0),
-                 EXISTS(
-                     SELECT 1 FROM session_runtime_outbox
-                      WHERE session_id=record.session_id
-                        AND status IN ('pending', 'claimed', 'retry_scheduled')
-                 ),
-                 COALESCE((
-                     SELECT jsonb_array_length(
-                         (event_json::jsonb)->'snapshot'->'attachments'
-                     ) > 0
-                       FROM session_events
-                      WHERE session_id=record.session_id
-                        AND event_type='session.lifecycle.v1'
-                      ORDER BY sequence DESC
-                      LIMIT 1
-                 ), FALSE),
-                 EXISTS(
-                     SELECT 1 FROM session_mission_outbox
-                      WHERE session_id=record.session_id
-                        AND operation = 'start'
-                        AND status IN ('pending', 'claimed', 'retry_scheduled')
-                 ),
-                 GREATEST(record.created_at_ms, record.updated_at_ms),
-                 1
-             FROM session_records AS record
-             WHERE record.session_id=target_session_id
-             ON CONFLICT(session_id) DO UPDATE SET
-                 durable_cursor=EXCLUDED.durable_cursor,
-                 history_revision=session_recovery_manifest.history_revision
-                     + CASE WHEN bump_history THEN 1 ELSE 0 END,
-                 transcript_messages=EXCLUDED.transcript_messages,
-                 transcript_bytes=EXCLUDED.transcript_bytes,
-                 in_flight_turn=EXCLUDED.in_flight_turn,
-                 active_writer_or_attachment=
-                     EXCLUDED.active_writer_or_attachment,
-                 mission_agent_team_continuation=
-                     EXCLUDED.mission_agent_team_continuation,
-                 last_activity_ms=GREATEST(
-                     session_recovery_manifest.last_activity_ms,
-                     EXCLUDED.last_activity_ms
-                 ),
-                 manifest_revision=
-                     session_recovery_manifest.manifest_revision + 1;
-         END
-         $$",
-        "CREATE OR REPLACE FUNCTION cowd_session_recovery_manifest_trigger()
-         RETURNS TRIGGER
-         LANGUAGE plpgsql
-         AS $$
-         DECLARE
-             target_session_id TEXT;
-         BEGIN
-             IF TG_OP = 'DELETE' THEN
-                 target_session_id := OLD.session_id;
-                 PERFORM cowd_refresh_session_recovery_manifest(
-                     target_session_id,
-                     TG_TABLE_NAME = 'session_messages'
-                 );
-                 RETURN OLD;
-             ELSE
-                 target_session_id := NEW.session_id;
-                 PERFORM cowd_refresh_session_recovery_manifest(
-                     target_session_id,
-                     TG_TABLE_NAME = 'session_messages'
-                 );
-                 RETURN NEW;
-             END IF;
-         END
-         $$",
-        "DROP TRIGGER IF EXISTS session_recovery_record_change ON session_records",
-        "CREATE TRIGGER session_recovery_record_change
-             AFTER INSERT OR UPDATE OF status, last_activity, updated_at_ms
-                ON session_records
-              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
-        "DROP TRIGGER IF EXISTS session_recovery_message_change ON session_messages",
-        "CREATE TRIGGER session_recovery_message_change
-             AFTER INSERT OR UPDATE OR DELETE ON session_messages
-              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
-        "DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_change ON session_events",
-        "CREATE TRIGGER session_recovery_lifecycle_event_change
-             AFTER INSERT ON session_events
-              FOR EACH ROW
-              WHEN (NEW.event_type = 'session.lifecycle.v1')
-              EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
-        "DROP TRIGGER IF EXISTS session_recovery_runtime_outbox_change ON session_runtime_outbox",
-        "CREATE TRIGGER session_recovery_runtime_outbox_change
-             AFTER INSERT OR UPDATE OF status ON session_runtime_outbox
-              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
-        "DROP TRIGGER IF EXISTS session_recovery_mission_outbox_change ON session_mission_outbox",
-        "CREATE TRIGGER session_recovery_mission_outbox_change
-             AFTER INSERT OR UPDATE OF status ON session_mission_outbox
-              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
-        "SELECT cowd_refresh_session_recovery_manifest(session_id, FALSE)
-           FROM session_records",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0007.lifecycle-recovery-signal",
-    domain: SESSION_DOMAIN,
-    version: 7,
-    description: "derive durable recovery attachment state from lifecycle events",
-    statements: &[
-        "CREATE OR REPLACE FUNCTION cowd_session_recovery_lifecycle_trigger()
-         RETURNS TRIGGER
-         LANGUAGE plpgsql
-         AS $$
-         BEGIN
-             UPDATE session_recovery_manifest
-                SET active_writer_or_attachment =
-                        COALESCE(
-                            jsonb_array_length(
-                                (NEW.event_json::jsonb)->'snapshot'->'attachments'
-                            ) > 0,
-                            FALSE
-                        ),
-                    last_activity_ms=GREATEST(last_activity_ms, NEW.created_at_ms),
-                    manifest_revision=manifest_revision + 1
-              WHERE session_id=NEW.session_id;
-             RETURN NEW;
-         END
-         $$",
-        "DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_change ON session_events",
-        "CREATE TRIGGER session_recovery_lifecycle_event_change
-             AFTER INSERT ON session_events
-              FOR EACH ROW
-              WHEN (NEW.event_type = 'session.lifecycle.v1')
-              EXECUTE FUNCTION cowd_session_recovery_lifecycle_trigger()",
-        "UPDATE session_recovery_manifest AS manifest
-            SET active_writer_or_attachment=latest.active,
-                last_activity_ms=GREATEST(
-                    manifest.last_activity_ms,
-                    latest.created_at_ms
-                ),
-                manifest_revision=manifest.manifest_revision + 1
-           FROM (
-                SELECT DISTINCT ON (session_id)
-                       session_id,
-                       COALESCE(
-                           jsonb_array_length(
-                               (event_json::jsonb)->'snapshot'->'attachments'
-                           ) > 0,
-                           FALSE
-                       ) AS active,
-                       created_at_ms
-                  FROM session_events
-                 WHERE event_type='session.lifecycle.v1'
-                 ORDER BY session_id, sequence DESC
-           ) AS latest
-          WHERE manifest.session_id=latest.session_id",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0008.durable-session-input-authority",
-    domain: SESSION_DOMAIN,
-    version: 8,
-    description: "add durable classified input, admission generation and fenced ownership",
-    statements: &[
-        "ALTER TABLE session_records
-             ADD COLUMN IF NOT EXISTS input_generation BIGINT NOT NULL DEFAULT 1",
-        "ALTER TABLE session_records
-             ADD COLUMN IF NOT EXISTS input_admission_open BOOLEAN NOT NULL DEFAULT TRUE",
-        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS input_id TEXT",
-        "ALTER TABLE session_runtime_outbox
-             ADD COLUMN IF NOT EXISTS session_generation BIGINT NOT NULL DEFAULT 1",
-        "ALTER TABLE session_runtime_outbox
-             ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'start_new_turn'",
-        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS target_turn_id TEXT",
-        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS classification_json TEXT",
-        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS claim_token TEXT",
-        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS terminal_at_ms BIGINT",
-        "UPDATE session_runtime_outbox
-            SET input_id=request_id
-          WHERE input_id IS NULL OR btrim(input_id)=''",
-        "UPDATE session_runtime_outbox
-            SET status=CASE status
-                WHEN 'pending' THEN 'queued'
-                WHEN 'retry_scheduled' THEN 'queued'
-                WHEN 'materialized' THEN 'completed'
-                WHEN 'blocked_materialization' THEN 'blocked'
-                ELSE status
-            END",
-        "UPDATE session_runtime_outbox
-            SET terminal_at_ms=COALESCE(terminal_at_ms,updated_at_ms)
-          WHERE status IN ('completed','supplemented','failed','cancelled','expired')",
-        "ALTER TABLE session_runtime_outbox ALTER COLUMN input_id SET NOT NULL",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_runtime_outbox_input_id
-             ON session_runtime_outbox(input_id)",
-        "DROP INDEX IF EXISTS idx_session_runtime_outbox_claim",
-        "CREATE INDEX idx_session_runtime_outbox_claim
-             ON session_runtime_outbox(
-                 status, next_attempt_at_ms, claim_expires_at_ms,
-                 session_id, sequence, request_id
-             )",
-        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_session_head
-             ON session_runtime_outbox(
-                 session_id, session_generation, sequence, request_id, status
-             )",
-        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
-             target_session_id TEXT,
-             bump_history BOOLEAN
-         )
-         RETURNS VOID
-         LANGUAGE plpgsql
-         AS $$
-         BEGIN
-             INSERT INTO session_recovery_manifest(
-                 session_id,durable_cursor,history_revision,
-                 transcript_messages,transcript_bytes,in_flight_turn,
-                 active_writer_or_attachment,
-                 mission_agent_team_continuation,last_activity_ms,
-                 manifest_revision
-             )
-             SELECT
-                 record.session_id,
-                 COALESCE((
-                     SELECT MAX(sequence)+1 FROM session_messages
-                      WHERE session_id=record.session_id
-                 ),0),
-                 CASE WHEN bump_history THEN 1 ELSE 0 END,
-                 COALESCE((
-                     SELECT COUNT(*) FROM session_messages
-                      WHERE session_id=record.session_id
-                 ),0),
-                 COALESCE((
-                     SELECT SUM(
-                         octet_length(stable_message_id)
-                         + octet_length(session_id)
-                         + octet_length(role)
-                         + octet_length(content_json)
-                         + octet_length(COALESCE(token_usage_json,''))
-                         + octet_length(COALESCE(tool_use_id,''))
-                         + octet_length(COALESCE(tool_name,''))
-                     )
-                     FROM session_messages WHERE session_id=record.session_id
-                 ),0),
-                 EXISTS(
-                     SELECT 1 FROM session_runtime_outbox
-                      WHERE session_id=record.session_id
-                        AND status IN (
-                            'accepted','classified','queued','claimed',
-                            'running','reclassified','blocked'
-                        )
-                 ),
-                 COALESCE((
-                     SELECT jsonb_array_length(
-                         (event_json::jsonb)->'snapshot'->'attachments'
-                     ) > 0
-                       FROM session_events
-                      WHERE session_id=record.session_id
-                        AND event_type='session.lifecycle.v1'
-                      ORDER BY sequence DESC
-                      LIMIT 1
-                 ),FALSE),
-                 EXISTS(
-                     SELECT 1 FROM session_mission_outbox
-                      WHERE session_id=record.session_id
-                        AND operation='start'
-                        AND status IN ('pending','claimed','retry_scheduled')
-                 ),
-                 GREATEST(record.created_at_ms,record.updated_at_ms),
-                 1
-             FROM session_records AS record
-             WHERE record.session_id=target_session_id
-             ON CONFLICT(session_id) DO UPDATE SET
-                 durable_cursor=EXCLUDED.durable_cursor,
-                 history_revision=session_recovery_manifest.history_revision
-                     + CASE WHEN bump_history THEN 1 ELSE 0 END,
-                 transcript_messages=EXCLUDED.transcript_messages,
-                 transcript_bytes=EXCLUDED.transcript_bytes,
-                 in_flight_turn=EXCLUDED.in_flight_turn,
-                 active_writer_or_attachment=
-                     EXCLUDED.active_writer_or_attachment,
-                 mission_agent_team_continuation=
-                     EXCLUDED.mission_agent_team_continuation,
-                 last_activity_ms=GREATEST(
-                     session_recovery_manifest.last_activity_ms,
-                     EXCLUDED.last_activity_ms
-                 ),
-                 manifest_revision=
-                     session_recovery_manifest.manifest_revision+1;
-         END
-         $$",
-        "CREATE OR REPLACE FUNCTION cowd_session_runtime_input_recovery_trigger()
-         RETURNS TRIGGER
-         LANGUAGE plpgsql
-         AS $$
-         BEGIN
-             PERFORM cowd_refresh_session_recovery_manifest(NEW.session_id, FALSE);
-             UPDATE session_recovery_manifest
-                SET in_flight_turn=EXISTS(
-                        SELECT 1 FROM session_runtime_outbox
-                         WHERE session_id=NEW.session_id
-                           AND status IN (
-                               'accepted','classified','queued','claimed',
-                               'running','reclassified','blocked'
-                           )
-                    ),
-                    manifest_revision=manifest_revision + 1
-              WHERE session_id=NEW.session_id;
-             RETURN NEW;
-         END
-         $$",
-        "DROP TRIGGER IF EXISTS session_recovery_runtime_outbox_change
-             ON session_runtime_outbox",
-        "CREATE TRIGGER session_recovery_runtime_outbox_change
-             AFTER INSERT OR UPDATE OF status ON session_runtime_outbox
-              FOR EACH ROW
-              EXECUTE FUNCTION cowd_session_runtime_input_recovery_trigger()",
-        "UPDATE session_recovery_manifest AS manifest
-            SET in_flight_turn=EXISTS(
-                    SELECT 1 FROM session_runtime_outbox
-                     WHERE session_id=manifest.session_id
-                       AND status IN (
-                           'accepted','classified','queued','claimed',
-                           'running','reclassified','blocked'
-                       )
-                ),
-                manifest_revision=manifest_revision + 1",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0009.lifecycle-and-branch-recovery",
-    domain: SESSION_DOMAIN,
-    version: 9,
-    description: "add durable Session lifecycle intents and branch activation receipts",
-    statements: &[
-        "CREATE TABLE IF NOT EXISTS session_lifecycle_intents (
-            operation_id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
-            disposition TEXT NOT NULL,
-            phase TEXT NOT NULL,
-            last_stable_phase TEXT NOT NULL,
-            expected_generation BIGINT NOT NULL,
-            created_at_ms BIGINT NOT NULL,
-            updated_at_ms BIGINT NOT NULL,
-            last_error TEXT,
-            revision BIGINT NOT NULL DEFAULT 0
-        )",
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_lifecycle_active
-             ON session_lifecycle_intents(session_id)
-             WHERE phase != 'unloaded'",
-        "CREATE INDEX IF NOT EXISTS idx_session_lifecycle_recovery
-             ON session_lifecycle_intents(phase, updated_at_ms, operation_id)",
-        "CREATE TABLE IF NOT EXISTS session_branch_activations (
-            operation_id TEXT PRIMARY KEY,
-            source_session_id TEXT NOT NULL
-                REFERENCES session_records(session_id) ON DELETE CASCADE,
-            target_session_id TEXT NOT NULL UNIQUE
-                REFERENCES session_records(session_id) ON DELETE CASCADE,
-            source_message_count BIGINT NOT NULL,
-            phase TEXT NOT NULL,
-            created_at_ms BIGINT NOT NULL,
-            updated_at_ms BIGINT NOT NULL,
-            last_error TEXT,
-            revision BIGINT NOT NULL DEFAULT 0
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_branch_activation_recovery
-             ON session_branch_activations(phase, updated_at_ms, operation_id)",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0010.terminal-claim-fence-epoch",
-    domain: SESSION_DOMAIN,
-    version: 10,
-    description: "separate immutable terminal claim fence epoch from mutable lease revision",
-    statements: &[
-        "ALTER TABLE session_runtime_outbox
-             ADD COLUMN IF NOT EXISTS claim_fence_epoch BIGINT",
-        "UPDATE session_runtime_outbox
-            SET claim_fence_epoch=revision
-          WHERE claim_fence_epoch IS NULL
-            AND claim_token IS NOT NULL
-            AND status IN ('claimed','running')",
-        "ALTER TABLE session_runtime_outbox
-             DROP CONSTRAINT IF EXISTS session_runtime_claim_fence_epoch_positive",
-        "ALTER TABLE session_runtime_outbox
-             ADD CONSTRAINT session_runtime_claim_fence_epoch_positive
-             CHECK (claim_fence_epoch IS NULL OR claim_fence_epoch > 0)",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0011.activation-index",
-    domain: SESSION_DOMAIN,
-    version: 11,
-    description: "add checkpoint-first activation manifest and rebuildable context index",
-    statements: &[
-        "ALTER TABLE session_recovery_manifest
-             ADD COLUMN IF NOT EXISTS event_cursor BIGINT NOT NULL DEFAULT 0",
-        "ALTER TABLE session_recovery_manifest
-             ADD COLUMN IF NOT EXISTS latest_checkpoint_sequence BIGINT",
-        "ALTER TABLE session_recovery_manifest
-             ADD COLUMN IF NOT EXISTS latest_checkpoint_event_id TEXT",
-        "ALTER TABLE session_recovery_manifest
-             ADD COLUMN IF NOT EXISTS index_generation BIGINT NOT NULL DEFAULT 0",
-        "ALTER TABLE session_recovery_manifest
-             ADD COLUMN IF NOT EXISTS indexed_through_sequence BIGINT",
-        "ALTER TABLE session_recovery_manifest
-             ADD COLUMN IF NOT EXISTS index_card_count BIGINT NOT NULL DEFAULT 0",
-        "ALTER TABLE session_recovery_manifest
-             ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE",
-        "CREATE TABLE IF NOT EXISTS session_context_index_outbox (
-            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
-            source_sequence BIGINT NOT NULL,
-            operation TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            attempts BIGINT NOT NULL DEFAULT 0,
-            created_at_ms BIGINT NOT NULL DEFAULT 0,
-            updated_at_ms BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY(session_id, source_sequence, operation)
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_context_index_outbox_pending
-             ON session_context_index_outbox(status, updated_at_ms, session_id)",
-        "CREATE TABLE IF NOT EXISTS session_context_index_cards (
-            card_id TEXT PRIMARY KEY,
-            parent_card_id TEXT,
-            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
-            source_start_sequence BIGINT NOT NULL,
-            source_end_sequence BIGINT NOT NULL,
-            source_message_count BIGINT NOT NULL,
-            source_digest TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            authority TEXT NOT NULL,
-            generation BIGINT NOT NULL,
-            created_at_ms BIGINT NOT NULL,
-            updated_at_ms BIGINT NOT NULL
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_session_context_cards_range
-             ON session_context_index_cards(
-                 session_id, source_start_sequence, source_end_sequence, generation
-             )",
-        "CREATE INDEX IF NOT EXISTS idx_session_context_cards_parent
-             ON session_context_index_cards(session_id, parent_card_id)",
-        "UPDATE session_recovery_manifest AS manifest
-            SET event_cursor=COALESCE((
-                    SELECT MAX(sequence) + 1 FROM session_events
-                     WHERE session_id=manifest.session_id
-                ), 0),
-                latest_checkpoint_sequence=(
-                    SELECT MAX(sequence) FROM session_events
-                     WHERE session_id=manifest.session_id
-                       AND event_type='SessionDomainEvent'
-                       AND event_json::jsonb ->> 'kind'=
-                           'memory.semantic_checkpoint.created'
-                ),
-                latest_checkpoint_event_id=(
-                    SELECT event_json::jsonb ->> 'event_id' FROM session_events
-                     WHERE session_id=manifest.session_id
-                       AND event_type='SessionDomainEvent'
-                       AND event_json::jsonb ->> 'kind'=
-                           'memory.semantic_checkpoint.created'
-                     ORDER BY sequence DESC LIMIT 1
-                )",
-        "CREATE OR REPLACE FUNCTION cowd_session_activation_event_trigger()
-         RETURNS TRIGGER LANGUAGE plpgsql AS $$
-         BEGIN
-             UPDATE session_recovery_manifest
-                SET event_cursor=GREATEST(event_cursor, NEW.sequence + 1),
-                    latest_checkpoint_sequence=CASE
-                        WHEN NEW.event_type='SessionDomainEvent'
-                         AND NEW.event_json::jsonb ->> 'kind'=
-                             'memory.semantic_checkpoint.created'
-                        THEN NEW.sequence ELSE latest_checkpoint_sequence END,
-                    latest_checkpoint_event_id=CASE
-                        WHEN NEW.event_type='SessionDomainEvent'
-                         AND NEW.event_json::jsonb ->> 'kind'=
-                             'memory.semantic_checkpoint.created'
-                        THEN NEW.event_json::jsonb ->> 'event_id'
-                        ELSE latest_checkpoint_event_id END,
-                    last_activity_ms=GREATEST(last_activity_ms, NEW.created_at_ms),
-                    manifest_revision=manifest_revision + 1
-              WHERE session_id=NEW.session_id;
-             RETURN NEW;
-         END
-         $$",
-        "DROP TRIGGER IF EXISTS session_activation_event_insert ON session_events",
-        "CREATE TRIGGER session_activation_event_insert
-             AFTER INSERT ON session_events FOR EACH ROW
-             EXECUTE FUNCTION cowd_session_activation_event_trigger()",
-        "CREATE OR REPLACE FUNCTION cowd_session_context_index_trigger()
-         RETURNS TRIGGER LANGUAGE plpgsql AS $$
-         DECLARE
-             target_session_id TEXT;
-             target_sequence BIGINT;
-             target_operation TEXT;
-             target_time BIGINT;
-         BEGIN
-             target_session_id := CASE WHEN TG_OP='DELETE' THEN OLD.session_id ELSE NEW.session_id END;
-             target_sequence := 0;
-             target_operation := 'reconcile';
-             target_time := CASE WHEN TG_OP='DELETE' THEN OLD.created_at_ms ELSE NEW.created_at_ms END;
-             IF NOT EXISTS (
-                 SELECT 1 FROM session_records
-                  WHERE session_id=target_session_id
-             ) THEN
-                 IF TG_OP='DELETE' THEN
-                     RETURN OLD;
-                 END IF;
-                 RETURN NEW;
-             END IF;
-             INSERT INTO session_context_index_outbox(
-                 session_id, source_sequence, operation, status,
-                 created_at_ms, updated_at_ms
-             ) VALUES (
-                 target_session_id, target_sequence, target_operation, 'pending',
-                 target_time, target_time
-             )
-             ON CONFLICT(session_id, source_sequence, operation) DO UPDATE
-                 SET status='pending',
-                     updated_at_ms=GREATEST(
-                         session_context_index_outbox.updated_at_ms,
-                         EXCLUDED.updated_at_ms
-                     );
-             UPDATE session_recovery_manifest
-                SET index_pending=TRUE,
-                    manifest_revision=manifest_revision + 1
-              WHERE session_id=target_session_id;
-             IF TG_OP='DELETE' THEN
-                 RETURN OLD;
-             END IF;
-             RETURN NEW;
-         END
-         $$",
-        "DROP TRIGGER IF EXISTS session_context_index_message_change ON session_messages",
-        "CREATE TRIGGER session_context_index_message_change
-             AFTER INSERT OR UPDATE OR DELETE ON session_messages FOR EACH ROW
-             EXECUTE FUNCTION cowd_session_context_index_trigger()",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0012.checkpoint-index-outbox",
-    domain: SESSION_DOMAIN,
-    version: 12,
-    description: "enqueue context index reconciliation with semantic checkpoints",
-    statements: &[
-        "CREATE OR REPLACE FUNCTION cowd_session_activation_event_trigger()
-         RETURNS TRIGGER LANGUAGE plpgsql AS $$
-         BEGIN
-             UPDATE session_recovery_manifest
-                SET event_cursor=GREATEST(event_cursor, NEW.sequence + 1),
-                    latest_checkpoint_sequence=CASE
-                        WHEN NEW.event_type='SessionDomainEvent'
-                         AND NEW.event_json::jsonb ->> 'kind'=
-                             'memory.semantic_checkpoint.created'
-                        THEN NEW.sequence ELSE latest_checkpoint_sequence END,
-                    latest_checkpoint_event_id=CASE
-                        WHEN NEW.event_type='SessionDomainEvent'
-                         AND NEW.event_json::jsonb ->> 'kind'=
-                             'memory.semantic_checkpoint.created'
-                        THEN NEW.event_json::jsonb ->> 'event_id'
-                        ELSE latest_checkpoint_event_id END,
-                    index_pending=CASE
-                        WHEN NEW.event_type='SessionDomainEvent'
-                         AND NEW.event_json::jsonb ->> 'kind'=
-                             'memory.semantic_checkpoint.created'
-                        THEN TRUE ELSE index_pending END,
-                    last_activity_ms=GREATEST(last_activity_ms, NEW.created_at_ms),
-                    manifest_revision=manifest_revision + 1
-              WHERE session_id=NEW.session_id;
-             IF NEW.event_type='SessionDomainEvent'
-                AND NEW.event_json::jsonb ->> 'kind'=
-                    'memory.semantic_checkpoint.created' THEN
-                 INSERT INTO session_context_index_outbox(
-                     session_id, source_sequence, operation, status,
-                     created_at_ms, updated_at_ms
-                 ) VALUES (
-                     NEW.session_id, 0, 'reconcile', 'pending',
-                     NEW.created_at_ms, NEW.created_at_ms
-                 )
-                 ON CONFLICT(session_id, source_sequence, operation) DO UPDATE
-                     SET status='pending',
-                         updated_at_ms=GREATEST(
-                             session_context_index_outbox.updated_at_ms,
-                             EXCLUDED.updated_at_ms
-                         );
-             END IF;
-             RETURN NEW;
-         END
-         $$",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0013.catalog-and-runtime-indexes",
-    domain: SESSION_DOMAIN,
-    version: 13,
-    description: "index owner-scoped catalog pages and batched runtime recovery",
-    statements: &[
-        "CREATE INDEX IF NOT EXISTS idx_session_records_owner_activity
-            ON session_records(
-                (metadata_json::jsonb ->> 'owner_principal_id'),
-                last_activity DESC,
-                session_id ASC
-            )",
-        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_session_activity
-            ON session_runtime_outbox(
-                session_id,
-                updated_at_ms DESC,
-                sequence DESC,
-                request_id DESC
-            )",
-        "CREATE INDEX IF NOT EXISTS idx_session_domain_global_kind
-            ON session_events(
-                (event_json::jsonb ->> 'kind'),
-                session_id,
-                sequence
-            )
-            WHERE event_type='SessionDomainEvent'",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0014.mutable-presence-projection",
-    domain: SESSION_DOMAIN,
-    version: 14,
-    description: "replace append-only lifecycle snapshots with mutable presence projection",
-    statements: &[
-        "CREATE TABLE IF NOT EXISTS session_presence_projection (
-            session_id TEXT PRIMARY KEY REFERENCES session_records(session_id) ON DELETE CASCADE,
-            state TEXT NOT NULL,
-            attachments_json JSONB NOT NULL,
-            next_sequence BIGINT NOT NULL,
-            revision BIGINT NOT NULL,
-            updated_at_ms BIGINT NOT NULL,
-            CHECK (jsonb_typeof(attachments_json) = 'array')
-        )",
-        "DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_change ON session_events",
-        "DELETE FROM session_events WHERE event_type='session.lifecycle.v1'",
-        "UPDATE session_recovery_manifest AS manifest
-            SET active_writer_or_attachment=COALESCE(
-                    jsonb_array_length(presence.attachments_json) > 0,
-                    FALSE
-                )
-           FROM session_records AS record
-           LEFT JOIN session_presence_projection AS presence
-             ON presence.session_id=record.session_id
-          WHERE manifest.session_id=record.session_id",
-        "CREATE OR REPLACE FUNCTION cowd_session_recovery_presence_trigger()
-         RETURNS TRIGGER
-         LANGUAGE plpgsql
-         AS $$
-         DECLARE
-             target_session_id TEXT;
-             active BOOLEAN;
-             observed_at BIGINT;
-         BEGIN
-             IF TG_OP='DELETE' THEN
-                 target_session_id := OLD.session_id;
-                 active := FALSE;
-                 observed_at := OLD.updated_at_ms;
-             ELSE
-                 target_session_id := NEW.session_id;
-                 active := jsonb_array_length(NEW.attachments_json) > 0;
-                 observed_at := NEW.updated_at_ms;
-             END IF;
-             UPDATE session_recovery_manifest
-                SET active_writer_or_attachment=active,
-                    last_activity_ms=GREATEST(last_activity_ms, observed_at),
-                    manifest_revision=manifest_revision + 1
-              WHERE session_id=target_session_id;
-             RETURN COALESCE(NEW, OLD);
-         END
-         $$",
-        "DROP TRIGGER IF EXISTS session_recovery_presence_change
-             ON session_presence_projection",
-        "CREATE TRIGGER session_recovery_presence_change
-             AFTER INSERT OR UPDATE OR DELETE ON session_presence_projection
-              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_presence_trigger()",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0015.remove-redundant-message-sequence-index",
-    domain: SESSION_DOMAIN,
-    version: 15,
-    description: "remove the message sequence index duplicated by the unique constraint",
-    statements: &["DROP INDEX IF EXISTS idx_session_messages_session_sequence"],
-}, PostgresMigrationSpec {
-    id: "session.0016.task-route-hint",
-    domain: SESSION_DOMAIN,
-    version: 16,
-    description: "persist the Runtime-owned task routing hint with durable Session ingress",
-    statements: &[
-        "ALTER TABLE session_runtime_outbox
-             ADD COLUMN IF NOT EXISTS task_route_hint_json TEXT",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0017.remove-mission-outbox",
-    domain: SESSION_DOMAIN,
-    version: 17,
-    description: "remove the obsolete Session-owned Mission delivery path",
-    statements: &[
-        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
-             target_session_id TEXT,
-             bump_history BOOLEAN
-         )
-         RETURNS VOID
-         LANGUAGE plpgsql
-         AS $$
-         BEGIN
-             INSERT INTO session_recovery_manifest(
-                 session_id,durable_cursor,history_revision,
-                 transcript_messages,transcript_bytes,in_flight_turn,
-                 active_writer_or_attachment,
-                 mission_agent_team_continuation,last_activity_ms,
-                 manifest_revision
-             )
-             SELECT
-                 record.session_id,
-                 COALESCE((
-                     SELECT MAX(sequence)+1 FROM session_messages
-                      WHERE session_id=record.session_id
-                 ),0),
-                 CASE WHEN bump_history THEN 1 ELSE 0 END,
-                 COALESCE((
-                     SELECT COUNT(*) FROM session_messages
-                      WHERE session_id=record.session_id
-                 ),0),
-                 COALESCE((
-                     SELECT SUM(
-                         octet_length(stable_message_id)
-                         + octet_length(session_id)
-                         + octet_length(role)
-                         + octet_length(content_json)
-                         + octet_length(COALESCE(token_usage_json,''))
-                         + octet_length(COALESCE(tool_use_id,''))
-                         + octet_length(COALESCE(tool_name,''))
-                     )
-                     FROM session_messages WHERE session_id=record.session_id
-                 ),0),
-                 EXISTS(
-                     SELECT 1 FROM session_runtime_outbox
-                      WHERE session_id=record.session_id
-                        AND status IN (
-                            'accepted','classified','queued','claimed',
-                            'running','reclassified','blocked'
-                        )
-                 ),
-                 COALESCE((
-                     SELECT jsonb_array_length(
-                         (event_json::jsonb)->'snapshot'->'attachments'
-                     ) > 0
-                       FROM session_events
-                      WHERE session_id=record.session_id
-                        AND event_type='session.lifecycle.v1'
-                      ORDER BY sequence DESC
-                      LIMIT 1
-                 ),FALSE),
-                 FALSE,
-                 GREATEST(record.created_at_ms,record.updated_at_ms),
-                 1
-             FROM session_records AS record
-             WHERE record.session_id=target_session_id
-             ON CONFLICT(session_id) DO UPDATE SET
-                 durable_cursor=EXCLUDED.durable_cursor,
-                 history_revision=session_recovery_manifest.history_revision
-                     + CASE WHEN bump_history THEN 1 ELSE 0 END,
-                 transcript_messages=EXCLUDED.transcript_messages,
-                 transcript_bytes=EXCLUDED.transcript_bytes,
-                 in_flight_turn=EXCLUDED.in_flight_turn,
-                 active_writer_or_attachment=
-                     EXCLUDED.active_writer_or_attachment,
-                 mission_agent_team_continuation=FALSE,
-                 last_activity_ms=GREATEST(
-                     session_recovery_manifest.last_activity_ms,
-                     EXCLUDED.last_activity_ms
-                 ),
-                 manifest_revision=
-                     session_recovery_manifest.manifest_revision+1;
-         END
-         $$",
-        "DROP TRIGGER IF EXISTS session_recovery_mission_outbox_change
-             ON session_mission_outbox",
-        "DROP TABLE IF EXISTS session_mission_outbox_history",
-        "DROP TABLE IF EXISTS session_mission_outbox",
-        "UPDATE session_recovery_manifest
-            SET mission_agent_team_continuation=FALSE,
-                manifest_revision=manifest_revision+1
-          WHERE mission_agent_team_continuation=TRUE",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0018.input-application-receipt",
-    domain: SESSION_DOMAIN,
-    version: 18,
-    description: "persist Runtime input disposition materialization receipts",
-    statements: &[
-        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS application_receipt_json TEXT",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0019.runtime-outbox-target-turn-index",
-    domain: SESSION_DOMAIN,
-    version: 19,
-    description: "index Runtime input continuations by target turn without mutating prior migrations",
-    statements: &[
-        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_target_turn
-             ON session_runtime_outbox(
-                 target_turn_id, session_id, session_generation, sequence
-             )
-             WHERE target_turn_id IS NOT NULL",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0020.provider-attempt-epoch-index",
-    domain: SESSION_DOMAIN,
-    version: 20,
-    description: "index provider attempt evidence by execution and turn epoch",
-    statements: &[
-        "CREATE INDEX IF NOT EXISTS idx_session_domain_epoch_kind_sequence
-             ON session_events(
-                 session_id,
-                 (event_json::jsonb ->> 'kind'),
-                 (event_json::jsonb #>> '{payload,execution_id}'),
-                 (event_json::jsonb #>> '{payload,turn_id}'),
-                 sequence
-             )
-             WHERE event_type='SessionDomainEvent'",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0021.recovery-refresh-uses-presence-projection",
-    domain: SESSION_DOMAIN,
-    version: 21,
-    description: "keep attachment recovery state when Session metadata refreshes",
-    statements: &[
-        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
+         $$"#,
+        r#"CREATE FUNCTION cowd_refresh_session_recovery_manifest(
              target_session_id TEXT,
              bump_history BOOLEAN
          )
@@ -1263,26 +368,174 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
                  ),
                  manifest_revision=session_recovery_manifest.manifest_revision+1;
          END
-         $$",
-    ],
-}, PostgresMigrationSpec {
-    id: "session.0022.context-discovery-snapshots",
-    domain: SESSION_DOMAIN,
-    version: 22,
-    description: "stable authorized Session and message discovery without offset or scope truncation",
-    statements: &[r#"
-        ALTER TABLE session_records ADD COLUMN discovery_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id();
-        ALTER TABLE session_messages ADD COLUMN discovery_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id();
-        CREATE TABLE session_discovery_invalidations (key TEXT PRIMARY KEY, revision BIGINT NOT NULL);
-        CREATE FUNCTION session_discovery_actor_key(platform TEXT,user_id TEXT,metadata_json TEXT) RETURNS TEXT LANGUAGE SQL IMMUTABLE AS $$
+         $$"#,
+        r#"CREATE FUNCTION cowd_session_recovery_manifest_trigger()
+         RETURNS TRIGGER
+         LANGUAGE plpgsql
+         AS $$
+         DECLARE
+             target_session_id TEXT;
+         BEGIN
+             IF TG_OP = 'DELETE' THEN
+                 target_session_id := OLD.session_id;
+                 PERFORM cowd_refresh_session_recovery_manifest(
+                     target_session_id,
+                     TG_TABLE_NAME = 'session_messages'
+                 );
+                 RETURN OLD;
+             ELSE
+                 target_session_id := NEW.session_id;
+                 PERFORM cowd_refresh_session_recovery_manifest(
+                     target_session_id,
+                     TG_TABLE_NAME = 'session_messages'
+                 );
+                 RETURN NEW;
+             END IF;
+         END
+         $$"#,
+        r#"CREATE FUNCTION cowd_session_runtime_input_recovery_trigger()
+         RETURNS TRIGGER
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             PERFORM cowd_refresh_session_recovery_manifest(NEW.session_id, FALSE);
+             UPDATE session_recovery_manifest
+                SET in_flight_turn=EXISTS(
+                        SELECT 1 FROM session_runtime_outbox
+                         WHERE session_id=NEW.session_id
+                           AND status IN (
+                               'accepted','classified','queued','claimed',
+                               'running','reclassified','blocked'
+                           )
+                    ),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=NEW.session_id;
+             RETURN NEW;
+         END
+         $$"#,
+        r#"CREATE FUNCTION cowd_session_activation_event_trigger()
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN
+             UPDATE session_recovery_manifest
+                SET event_cursor=GREATEST(event_cursor, NEW.sequence + 1),
+                    latest_checkpoint_sequence=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN NEW.sequence ELSE latest_checkpoint_sequence END,
+                    latest_checkpoint_event_id=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN NEW.event_json::jsonb ->> 'event_id'
+                        ELSE latest_checkpoint_event_id END,
+                    index_pending=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN TRUE ELSE index_pending END,
+                    last_activity_ms=GREATEST(last_activity_ms, NEW.created_at_ms),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=NEW.session_id;
+             IF NEW.event_type='SessionDomainEvent'
+                AND NEW.event_json::jsonb ->> 'kind'=
+                    'memory.semantic_checkpoint.created' THEN
+                 INSERT INTO session_context_index_outbox(
+                     session_id, source_sequence, operation, status,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (
+                     NEW.session_id, 0, 'reconcile', 'pending',
+                     NEW.created_at_ms, NEW.created_at_ms
+                 )
+                 ON CONFLICT(session_id, source_sequence, operation) DO UPDATE
+                     SET status='pending',
+                         updated_at_ms=GREATEST(
+                             session_context_index_outbox.updated_at_ms,
+                             EXCLUDED.updated_at_ms
+                         );
+             END IF;
+             RETURN NEW;
+         END
+         $$"#,
+        r#"CREATE FUNCTION cowd_session_context_index_trigger()
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         DECLARE
+             target_session_id TEXT;
+             target_sequence BIGINT;
+             target_operation TEXT;
+             target_time BIGINT;
+         BEGIN
+             target_session_id := CASE WHEN TG_OP='DELETE' THEN OLD.session_id ELSE NEW.session_id END;
+             target_sequence := 0;
+             target_operation := 'reconcile';
+             target_time := CASE WHEN TG_OP='DELETE' THEN OLD.created_at_ms ELSE NEW.created_at_ms END;
+             IF NOT EXISTS (
+                 SELECT 1 FROM session_records
+                  WHERE session_id=target_session_id
+             ) THEN
+                 IF TG_OP='DELETE' THEN
+                     RETURN OLD;
+                 END IF;
+                 RETURN NEW;
+             END IF;
+             INSERT INTO session_context_index_outbox(
+                 session_id, source_sequence, operation, status,
+                 created_at_ms, updated_at_ms
+             ) VALUES (
+                 target_session_id, target_sequence, target_operation, 'pending',
+                 target_time, target_time
+             )
+             ON CONFLICT(session_id, source_sequence, operation) DO UPDATE
+                 SET status='pending',
+                     updated_at_ms=GREATEST(
+                         session_context_index_outbox.updated_at_ms,
+                         EXCLUDED.updated_at_ms
+                     );
+             UPDATE session_recovery_manifest
+                SET index_pending=TRUE,
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=target_session_id;
+             IF TG_OP='DELETE' THEN
+                 RETURN OLD;
+             END IF;
+             RETURN NEW;
+         END
+         $$"#,
+        r#"CREATE FUNCTION cowd_session_recovery_presence_trigger()
+         RETURNS TRIGGER
+         LANGUAGE plpgsql
+         AS $$
+         DECLARE
+             target_session_id TEXT;
+             active BOOLEAN;
+             observed_at BIGINT;
+         BEGIN
+             IF TG_OP='DELETE' THEN
+                 target_session_id := OLD.session_id;
+                 active := FALSE;
+                 observed_at := OLD.updated_at_ms;
+             ELSE
+                 target_session_id := NEW.session_id;
+                 active := jsonb_array_length(NEW.attachments_json) > 0;
+                 observed_at := NEW.updated_at_ms;
+             END IF;
+             UPDATE session_recovery_manifest
+                SET active_writer_or_attachment=active,
+                    last_activity_ms=GREATEST(last_activity_ms, observed_at),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=target_session_id;
+             RETURN COALESCE(NEW, OLD);
+         END
+         $$"#,
+        r#"CREATE FUNCTION session_discovery_actor_key(platform TEXT,user_id TEXT,metadata_json TEXT) RETURNS TEXT LANGUAGE SQL IMMUTABLE AS $$
             SELECT CASE WHEN NULLIF(metadata_json::JSONB->>'workspace_root','') IS NULL THEN NULL
                 WHEN NULLIF(metadata_json::JSONB->>'owner_principal_id','') IS NOT NULL
                     THEN 'actor:'||jsonb_build_array(metadata_json::JSONB->>'workspace_root','owner',metadata_json::JSONB->>'owner_principal_id')::TEXT
                 WHEN NULLIF(user_id,'') IS NOT NULL
                     THEN 'actor:'||jsonb_build_array(metadata_json::JSONB->>'workspace_root','channel',platform,user_id)::TEXT
                 ELSE NULL END
-        $$;
-        CREATE FUNCTION session_discovery_record_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+        $$"#,
+        r#"CREATE FUNCTION session_discovery_record_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE changed_key TEXT; old_actor TEXT; new_actor TEXT;
         BEGIN
             IF TG_OP='UPDATE' AND ROW(OLD.platform,OLD.chat_id,OLD.user_id,OLD.model,OLD.reset_policy,OLD.metadata_json,OLD.status,OLD.created_at)
@@ -1295,8 +548,8 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
                     ON CONFLICT(key) DO UPDATE SET revision=session_discovery_invalidations.revision+1;
             END LOOP;
             RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
-        END $$;
-        CREATE FUNCTION session_discovery_message_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+        END $$"#,
+        r#"CREATE FUNCTION session_discovery_message_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE changed_key TEXT;
         BEGIN
             IF TG_OP='UPDATE' AND (to_jsonb(OLD)-'token_usage_json') IS NOT DISTINCT FROM (to_jsonb(NEW)-'token_usage_json') THEN RETURN NEW; END IF;
@@ -1312,18 +565,154 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
                     ON CONFLICT(key) DO UPDATE SET revision=session_discovery_invalidations.revision+1;
             END LOOP;
             RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
-        END $$;
-        CREATE TRIGGER session_discovery_record_invalidation AFTER UPDATE OR DELETE ON session_records FOR EACH ROW EXECUTE FUNCTION session_discovery_record_invalidate();
-        CREATE TRIGGER session_discovery_message_invalidation AFTER UPDATE OR DELETE ON session_messages FOR EACH ROW EXECUTE FUNCTION session_discovery_message_invalidate();
-    "#],
-}, PostgresMigrationSpec {
-    id: "session.0023.casefolded-list-filter",
-    domain: SESSION_DOMAIN,
-    version: 23,
-    description: "index the canonical case-insensitive Session status/model listing",
-    statements: &[
-        "CREATE INDEX IF NOT EXISTS idx_session_records_casefold_status_model
-             ON session_records(lower(status), lower(model), last_activity DESC, session_id ASC)",
+        END $$"#,
+        r#"CREATE FUNCTION cowd_invalidate_terminal_message_binding()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.session_id IS DISTINCT FROM OLD.session_id
+     OR NEW.stable_message_id IS DISTINCT FROM OLD.stable_message_id THEN
+    RAISE EXCEPTION 'session message identity is immutable';
+  END IF;
+  IF convert_to(NEW.content_json, 'UTF8')
+       IS DISTINCT FROM convert_to(OLD.content_json, 'UTF8')
+     OR NEW.sequence IS DISTINCT FROM OLD.sequence
+     OR NEW.role IS DISTINCT FROM OLD.role
+     OR NEW.tool_use_id IS DISTINCT FROM OLD.tool_use_id
+     OR NEW.tool_name IS DISTINCT FROM OLD.tool_name THEN
+    NEW.terminal_runtime_commit_cursor := NULL;
+    NEW.terminal_content_digest := NULL;
+  ELSIF NEW.terminal_runtime_commit_cursor
+          IS DISTINCT FROM OLD.terminal_runtime_commit_cursor
+     OR NEW.terminal_content_digest IS DISTINCT FROM OLD.terminal_content_digest THEN
+    IF NEW.terminal_runtime_commit_cursor IS NOT NULL
+       OR NEW.terminal_content_digest IS NOT NULL THEN
+      RAISE EXCEPTION 'existing session message cannot acquire terminal binding';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$"#,
+        r#"CREATE INDEX idx_session_records_activity
+            ON session_records(last_activity DESC, session_id ASC)"#,
+        r#"CREATE INDEX idx_session_records_platform
+            ON session_records(platform, last_activity DESC, session_id ASC)"#,
+        r#"CREATE INDEX idx_session_records_status_model
+            ON session_records(status, model, last_activity DESC, session_id ASC)"#,
+        r#"CREATE INDEX idx_session_messages_search
+            ON session_messages USING GIN(to_tsvector('simple', coalesce(role, '') || ' ' || coalesce(content_json, '') || ' ' || coalesce(tool_name, '')))"#,
+        r#"CREATE INDEX idx_session_events_type_sequence
+            ON session_events(session_id, event_type, sequence ASC)"#,
+        r#"CREATE UNIQUE INDEX uq_session_domain_event_id
+            ON session_events(session_id, (event_json::jsonb ->> 'event_id'))
+            WHERE event_type = 'SessionDomainEvent'
+              AND (event_json::jsonb ->> 'event_id') IS NOT NULL"#,
+        r#"CREATE INDEX idx_session_domain_kind_sequence
+            ON session_events(session_id, (event_json::jsonb ->> 'kind'), sequence ASC)
+            WHERE event_type = 'SessionDomainEvent'"#,
+        r#"CREATE INDEX idx_session_snapshots_latest
+            ON session_snapshots(session_id, event_idx DESC)"#,
+        r#"CREATE INDEX idx_session_runtime_outbox_session
+            ON session_runtime_outbox(session_id, created_at_ms DESC)"#,
+        r#"CREATE INDEX idx_session_records_updated_ms
+            ON session_records(updated_at_ms DESC, session_id ASC)"#,
+        r#"CREATE INDEX idx_session_recovery_required
+            ON session_recovery_manifest(
+                in_flight_turn,
+                pending_approval,
+                active_writer_or_attachment,
+                mission_agent_team_continuation,
+                last_activity_ms DESC
+            )"#,
+        r#"CREATE UNIQUE INDEX idx_session_runtime_outbox_input_id
+             ON session_runtime_outbox(input_id)"#,
+        r#"CREATE INDEX idx_session_runtime_outbox_claim
+             ON session_runtime_outbox(
+                 status, next_attempt_at_ms, claim_expires_at_ms,
+                 session_id, sequence, request_id
+             )"#,
+        r#"CREATE INDEX idx_session_runtime_outbox_session_head
+             ON session_runtime_outbox(
+                 session_id, session_generation, sequence, request_id, status
+             )"#,
+        r#"CREATE UNIQUE INDEX uq_session_lifecycle_active
+             ON session_lifecycle_intents(session_id)
+             WHERE phase != 'unloaded'"#,
+        r#"CREATE INDEX idx_session_lifecycle_recovery
+             ON session_lifecycle_intents(phase, updated_at_ms, operation_id)"#,
+        r#"CREATE INDEX idx_session_branch_activation_recovery
+             ON session_branch_activations(phase, updated_at_ms, operation_id)"#,
+        r#"CREATE INDEX idx_session_context_index_outbox_pending
+             ON session_context_index_outbox(status, updated_at_ms, session_id)"#,
+        r#"CREATE INDEX idx_session_context_cards_range
+             ON session_context_index_cards(
+                 session_id, source_start_sequence, source_end_sequence, generation
+             )"#,
+        r#"CREATE INDEX idx_session_context_cards_parent
+             ON session_context_index_cards(session_id, parent_card_id)"#,
+        r#"CREATE INDEX idx_session_records_owner_activity
+            ON session_records(
+                (metadata_json::jsonb ->> 'owner_principal_id'),
+                last_activity DESC,
+                session_id ASC
+            )"#,
+        r#"CREATE INDEX idx_session_runtime_outbox_session_activity
+            ON session_runtime_outbox(
+                session_id,
+                updated_at_ms DESC,
+                sequence DESC,
+                request_id DESC
+            )"#,
+        r#"CREATE INDEX idx_session_domain_global_kind
+            ON session_events(
+                (event_json::jsonb ->> 'kind'),
+                session_id,
+                sequence
+            )
+            WHERE event_type='SessionDomainEvent'"#,
+        r#"CREATE INDEX idx_session_runtime_outbox_target_turn
+             ON session_runtime_outbox(
+                 target_turn_id, session_id, session_generation, sequence
+             )
+             WHERE target_turn_id IS NOT NULL"#,
+        r#"CREATE INDEX idx_session_domain_epoch_kind_sequence
+             ON session_events(
+                 session_id,
+                 (event_json::jsonb ->> 'kind'),
+                 (event_json::jsonb #>> '{payload,execution_id}'),
+                 (event_json::jsonb #>> '{payload,turn_id}'),
+                 sequence
+             )
+             WHERE event_type='SessionDomainEvent'"#,
+        r#"CREATE INDEX idx_session_records_casefold_status_model
+             ON session_records(lower(status), lower(model), last_activity DESC, session_id ASC)"#,
+        r#"CREATE INDEX idx_session_runtime_outbox_terminal_receipt_context
+  ON session_runtime_outbox(session_id, runtime_commit_cursor, request_id)
+  WHERE status='completed' AND runtime_commit_cursor IS NOT NULL"#,
+        r#"CREATE TRIGGER session_recovery_record_change
+             AFTER INSERT OR UPDATE OF status, last_activity, updated_at_ms
+                ON session_records
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()"#,
+        r#"CREATE TRIGGER session_recovery_message_change
+             AFTER INSERT OR UPDATE OR DELETE ON session_messages
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()"#,
+        r#"CREATE TRIGGER session_recovery_runtime_outbox_change
+             AFTER INSERT OR UPDATE OF status ON session_runtime_outbox
+              FOR EACH ROW
+              EXECUTE FUNCTION cowd_session_runtime_input_recovery_trigger()"#,
+        r#"CREATE TRIGGER session_activation_event_insert
+             AFTER INSERT ON session_events FOR EACH ROW
+             EXECUTE FUNCTION cowd_session_activation_event_trigger()"#,
+        r#"CREATE TRIGGER session_context_index_message_change
+             AFTER INSERT OR UPDATE OR DELETE ON session_messages FOR EACH ROW
+             EXECUTE FUNCTION cowd_session_context_index_trigger()"#,
+        r#"CREATE TRIGGER session_recovery_presence_change
+             AFTER INSERT OR UPDATE OR DELETE ON session_presence_projection
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_presence_trigger()"#,
+        r#"CREATE TRIGGER session_discovery_record_invalidation AFTER UPDATE OR DELETE ON session_records FOR EACH ROW EXECUTE FUNCTION session_discovery_record_invalidate()"#,
+        r#"CREATE TRIGGER session_discovery_message_invalidation AFTER UPDATE OR DELETE ON session_messages FOR EACH ROW EXECUTE FUNCTION session_discovery_message_invalidate()"#,
+        r#"CREATE TRIGGER session_terminal_binding_invalidation
+BEFORE UPDATE ON session_messages FOR EACH ROW
+EXECUTE FUNCTION cowd_invalidate_terminal_message_binding()"#,
     ],
 }];
 
@@ -1332,117 +721,56 @@ pub struct PostgresSessionStore {
     executor: PostgresExecutor,
 }
 
-/// Migration 0003 predates tolerant usage parsing and its checksum is already
-/// part of the production migration ledger, so it cannot be rewritten.
-/// Quarantine only unusable legacy usage payloads before that migration runs.
-/// Valid JSON with bounded numeric token fields is preserved byte-for-byte.
-fn prepare_legacy_session_usage_for_migration(
-    executor: &PostgresExecutor,
-) -> session::SessionResult<()> {
-    let mut connection = executor.checkout_background().map_err(storage_error)?;
-    let mut transaction = connection.transaction().map_err(postgres_error)?;
-    // This compatibility preflight creates helper functions before the
-    // immutable migration ledger can run migration 0003. It must share the
-    // exact domain lock used by `PostgresExecutor::apply_migrations`;
-    // otherwise concurrent Gateway processes can both enter PostgreSQL's
-    // `CREATE OR REPLACE FUNCTION` catalogue path and one fails on
-    // `pg_proc_proname_args_nsp_index`.
-    transaction
-        .query_one(
-            "SELECT pg_advisory_xact_lock(hashtext($1))",
-            &[&format!("cowd-storage:{SESSION_DOMAIN}")],
+fn validate_current_session_catalog(executor: &PostgresExecutor) -> session::SessionResult<()> {
+    let mut connection = executor.checkout_online_read().map_err(storage_error)?;
+    let mut connection = connection.transaction().map_err(postgres_error)?;
+    connection
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .map_err(postgres_error)?;
+    let tables = SESSION_MIGRATIONS
+        .iter()
+        .flat_map(|spec| spec.statements.iter())
+        .filter_map(|statement| {
+            statement
+                .trim_start()
+                .strip_prefix("CREATE TABLE ")
+                .and_then(|tail| tail.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    let row = connection.query_one("SELECT to_regclass('cowd_schema_migrations') IS NOT NULL, (SELECT COUNT(*) FROM unnest($1::TEXT[]) names(name) WHERE to_regclass(name) IS NOT NULL)", &[&tables]).map_err(postgres_error)?;
+    let has_ledger: bool = row.get(0);
+    let table_count: i64 = row.get(1);
+    if !has_ledger {
+        if table_count != 0 {
+            return Err(storage_error(storage::StorageError::Other(
+                "unsupported Session catalog".into(),
+            )));
+        }
+        connection.commit().map_err(postgres_error)?;
+        return Ok(());
+    }
+    let rows = connection
+        .query(
+            "SELECT id,checksum FROM cowd_schema_migrations WHERE domain=$1",
+            &[&SESSION_DOMAIN],
         )
         .map_err(postgres_error)?;
-    transaction
-        .batch_execute(
-            "CREATE OR REPLACE FUNCTION cowd_session_usage_json_is_reconcilable(raw TEXT)
-             RETURNS BOOLEAN
-             LANGUAGE plpgsql
-             IMMUTABLE
-             STRICT
-             AS $$
-             DECLARE
-                 parsed JSONB;
-                 token_text TEXT;
-                 token_key TEXT;
-             BEGIN
-                 parsed := raw::jsonb;
-                 FOREACH token_key IN ARRAY ARRAY['input_tokens', 'output_tokens'] LOOP
-                     token_text := parsed ->> token_key;
-                     IF token_text IS NOT NULL
-                        AND (jsonb_typeof(parsed -> token_key) <> 'number'
-                             OR token_text !~ '^[0-9]+$'
-                             OR token_text::numeric > 9223372036854775807::numeric) THEN
-                         RETURN FALSE;
-                     END IF;
-                 END LOOP;
-                 RETURN TRUE;
-             EXCEPTION WHEN OTHERS THEN
-                 RETURN FALSE;
-             END
-             $$;
-             CREATE OR REPLACE FUNCTION cowd_session_usage_json_for_legacy_cast(raw TEXT)
-             RETURNS TEXT
-             LANGUAGE plpgsql
-             IMMUTABLE
-             STRICT
-             AS $$
-             DECLARE
-                 parsed JSONB;
-                 token_text TEXT;
-                 token_key TEXT;
-                 token_value BIGINT;
-             BEGIN
-                 BEGIN
-                     parsed := raw::jsonb;
-                 EXCEPTION WHEN OTHERS THEN
-                     parsed := '{}'::jsonb;
-                 END;
-                 FOREACH token_key IN ARRAY ARRAY['input_tokens', 'output_tokens'] LOOP
-                     token_text := parsed ->> token_key;
-                     token_value := 0;
-                     IF jsonb_typeof(parsed -> token_key) = 'number'
-                        AND token_text ~ '^[0-9]+$'
-                        AND token_text::numeric <= 9223372036854775807::numeric THEN
-                         token_value := token_text::bigint;
-                     END IF;
-                     parsed := jsonb_set(
-                         parsed,
-                         ARRAY[token_key],
-                         to_jsonb(token_value),
-                         TRUE
-                     );
-                 END LOOP;
-                 RETURN parsed::text;
-             END
-             $$;
-             DO $$
-             DECLARE
-                 migration_applied BOOLEAN := FALSE;
-             BEGIN
-                 IF to_regclass('cowd_schema_migrations') IS NOT NULL THEN
-                     EXECUTE
-                         'SELECT EXISTS(
-                              SELECT 1
-                                FROM cowd_schema_migrations
-                               WHERE id = $1
-                          )'
-                        INTO migration_applied
-                       USING 'session.0003.reconcile-message-summaries';
-                 END IF;
-                 IF to_regclass('session_messages') IS NOT NULL
-                    AND NOT migration_applied THEN
-                     UPDATE session_messages
-                        SET token_usage_json =
-                            cowd_session_usage_json_for_legacy_cast(token_usage_json)
-                      WHERE token_usage_json IS NOT NULL
-                        AND NOT cowd_session_usage_json_is_reconcilable(token_usage_json);
-                 END IF;
-             END
-             $$;",
-        )
-        .map_err(postgres_error)?;
-    transaction.commit().map_err(postgres_error)?;
+    if rows.is_empty() && table_count == 0 {
+        connection.commit().map_err(postgres_error)?;
+        return Ok(());
+    }
+    let current = &SESSION_MIGRATIONS[0];
+    if usize::try_from(table_count).ok() != Some(tables.len())
+        || rows.len() != 1
+        || rows[0].get::<_, String>(0) != current.id
+        || rows[0].get::<_, String>(1) != current.checksum()
+    {
+        return Err(storage_error(storage::StorageError::Other(
+            "unsupported Session catalog; select a clean namespace".into(),
+        )));
+    }
+    connection.commit().map_err(postgres_error)?;
     Ok(())
 }
 
@@ -2415,6 +1743,7 @@ fn append_terminal_transcript_tx(
     session_id: &str,
     messages: &[SessionMessage],
     created_at_ms: u64,
+    runtime_commit_cursor: u64,
 ) -> session::SessionResult<(Vec<SessionMessage>, bool)> {
     transaction
         .query_one(
@@ -2460,7 +1789,20 @@ fn append_terminal_transcript_tx(
             }
             committed.push(existing);
         }
-        committed.sort_by_key(|message| message.sequence);
+        if committed
+            .windows(2)
+            .any(|pair| pair[0].sequence >= pair[1].sequence)
+        {
+            return Err(session::SessionError::StaleExecutionFence(
+                "terminal transcript order changed".into(),
+            ));
+        }
+        verify_terminal_message_binding_tx(
+            transaction,
+            session_id,
+            terminal_message_id,
+            runtime_commit_cursor,
+        )?;
         return Ok((committed, false));
     }
     if loaded.iter().any(Option::is_some) {
@@ -2495,7 +1837,15 @@ fn append_terminal_transcript_tx(
         let mut message = requested.clone();
         message.sequence = first_sequence.saturating_add(index);
         message.created_at_ms = created_at_ms.saturating_add(index as u64);
-        insert_message_tx(transaction, &message)?;
+        if index + 1 == messages.len() {
+            message = insert_terminal_message_with_binding_tx(
+                transaction,
+                &message,
+                runtime_commit_cursor,
+            )?;
+        } else {
+            insert_message_tx(transaction, &message)?;
+        }
         committed.push(message);
     }
     let last_created_at = committed
@@ -2652,6 +2002,80 @@ fn insert_message_tx(
         )
         .map_err(postgres_error)?;
     Ok(())
+}
+
+fn insert_terminal_message_with_binding_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    message: &SessionMessage,
+    runtime_commit_cursor: u64,
+) -> session::SessionResult<SessionMessage> {
+    let payload = session::public_terminal_payload_v1(&message.content_json).map_err(|_| {
+        session::SessionError::InvalidArgument("terminal public payload unavailable".into())
+    })?;
+    let row = transaction.query_one(
+        "INSERT INTO session_messages(stable_message_id,session_id,sequence,role,content_json,blocks_count,
+            tool_use_id,tool_name,token_usage_json,created_at_ms,terminal_runtime_commit_cursor,terminal_content_digest)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         RETURNING stable_message_id,session_id,sequence,role,content_json,blocks_count,
+            tool_use_id,tool_name,token_usage_json,created_at_ms,terminal_runtime_commit_cursor,terminal_content_digest",
+        &[&message.stable_message_id, &message.session_id, &to_i64(message.sequence,"message sequence")?,
+          &message.role, &message.content_json, &to_i64(message.blocks_count,"message blocks")?,
+          &message.tool_use_id, &message.tool_name, &message.token_usage_json,
+          &to_u64_i64(message.created_at_ms,"message time")?, &to_u64_i64(runtime_commit_cursor,"receipt cursor")?, &payload.content_digest]
+    ).map_err(postgres_error)?;
+    let actual = row_to_message(&row)?;
+    let returned = session::public_terminal_payload_v1(&actual.content_json).map_err(|_| {
+        session::SessionError::Store("stored terminal public payload unavailable".into())
+    })?;
+    if actual.content_json != message.content_json
+        || returned != payload
+        || row.try_get::<_, i64>(10).map_err(postgres_error)?
+            != to_u64_i64(runtime_commit_cursor, "receipt cursor")?
+        || row.try_get::<_, String>(11).map_err(postgres_error)? != returned.content_digest
+    {
+        return Err(session::SessionError::Store(
+            "stored terminal binding mismatch".into(),
+        ));
+    }
+    Ok(actual)
+}
+
+fn verify_terminal_message_binding_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    message_id: &str,
+    cursor: u64,
+) -> session::SessionResult<()> {
+    let row = transaction
+        .query_one(
+            "SELECT terminal_runtime_commit_cursor,terminal_content_digest,
+            CASE WHEN octet_length(content_json)<=8388608 THEN content_json END
+         FROM session_messages WHERE session_id=$1 AND stable_message_id=$2",
+            &[&session_id, &message_id],
+        )
+        .map_err(postgres_error)?;
+    let bound: Option<i64> = row.try_get(0).map_err(postgres_error)?;
+    let digest: Option<String> = row.try_get(1).map_err(postgres_error)?;
+    match (bound, digest) {
+        (None, None) => Ok(()),
+        (Some(bound), Some(digest)) => {
+            let raw: Option<String> = row.try_get(2).map_err(postgres_error)?;
+            let payload = raw
+                .as_deref()
+                .and_then(|raw| session::public_terminal_payload_v1(raw).ok());
+            if bound != to_u64_i64(cursor, "receipt cursor")?
+                || payload.is_none_or(|payload| payload.content_digest != digest)
+            {
+                return Err(session::SessionError::StaleExecutionFence(
+                    "terminal binding differs from replay".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(session::SessionError::Store(
+            "invalid terminal binding pair".into(),
+        )),
+    }
 }
 
 fn row_to_session_search(row: &Row) -> session::SessionResult<SessionSearchResult> {
@@ -2831,6 +2255,30 @@ fn i64_to_u32(value: i64, label: &str) -> session::SessionResult<u32> {
 // Session operation fails compilation until PostgreSQL has a real owner.
 #[allow(clippy::too_many_arguments)]
 impl session::SessionStoreBackend for PostgresSessionStore {
+    fn get_terminal_message_receipt_context(
+        &self,
+        query: &session::SessionTerminalReceiptQuery,
+    ) -> session::SessionResult<session::SessionTerminalReceiptContext> {
+        self.get_terminal_message_receipt_context(query)
+    }
+    fn record_terminal_message_ack(
+        &self,
+        command: &session::SessionTerminalAckCommand,
+    ) -> session::SessionResult<harness_contract::live::SessionMessageAck> {
+        self.record_terminal_message_ack(command)
+    }
+    fn list_terminal_message_acks(
+        &self,
+        query: &session::SessionTerminalAckListQuery,
+    ) -> session::SessionResult<Vec<harness_contract::live::SessionMessageAckHistory>> {
+        self.list_terminal_message_acks(query)
+    }
+    fn mutate_session_presence_if_revision(
+        &self,
+        command: &session::SessionPresenceMutation,
+    ) -> session::SessionResult<Option<session::SessionPresenceMutationResult>> {
+        self.mutate_session_presence_if_revision(command)
+    }
     fn discover_context_page(
         &self,
         request: &session::SessionDiscoveryRequest,
@@ -3250,8 +2698,9 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         b: u64,
         c: u64,
         d: usize,
+        excluded_session_ids: &[String],
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
-        self.claim_session_runtime_outbox(a, b, c, d)
+        self.claim_session_runtime_outbox(a, b, c, d, excluded_session_ids)
     }
     fn ack_session_runtime_outbox(
         &self,

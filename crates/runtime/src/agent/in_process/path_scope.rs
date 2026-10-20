@@ -451,15 +451,24 @@ pub(super) fn resource_paths_from_input(input: &serde_json::Value) -> Vec<String
     paths
 }
 
-pub(super) fn delegated_tool_supports_bounded_scope(
-    host: &dyn RuntimeExecutionHost,
-    tool_name: &str,
+#[cfg(test)]
+pub(super) fn delegated_tool_is_eligible(
+    lease: Option<&tools::ToolHostLease>,
+    metadata: Option<&harness_contract::tool::ToolDiscoveryReceipt>,
+    definition: &crate::ProviderToolDefinition,
+    requested: &BTreeSet<String>,
+    ceiling: harness_contract::tool::ToolPermissionMode,
+    scopes: Option<&[String]>,
 ) -> bool {
-    host.delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))
-        .is_some_and(|descriptor| crate::delegated_tool_effect_is_bounded(&descriptor))
+    lease.zip(metadata).is_some_and(|(lease, metadata)| {
+        crate::tool_host::discover_delegated_tool(
+            lease, metadata, definition, requested, ceiling, scopes,
+        )
+        .is_some()
+    })
 }
 
-pub(super) fn resource_path_is_authorized(
+pub(crate) fn resource_path_is_authorized(
     resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     requested: &str,
     allowed_scopes: &[String],
@@ -521,7 +530,7 @@ pub(super) fn resource_path_is_authorized(
 
 pub(super) fn normalized_relative_parts(value: &str) -> Option<Vec<String>> {
     let normalized = value.trim().replace('\\', "/");
-    if normalized.is_empty() {
+    if crate::governed_tool_plan::validate_relative_scope_path(&normalized).is_err() {
         return None;
     }
     let mut parts = Vec::new();

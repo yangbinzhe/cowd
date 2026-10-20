@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "selection": {
+          "const": "bound_source_terminal",
+          "type": "string"
+        }
+      },
+      "required": [
+        "selection"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "type": "string"
+        },
+        "selection": {
+          "const": "message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "selection",
+        "message_id"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "SessionTerminalReceiptReadInputV1"
+}

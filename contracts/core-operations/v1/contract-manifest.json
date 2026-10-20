@@ -1,7 +1,7 @@
 {
   "catalog": {
     "path": "catalog.json",
-    "sha256": "sha256:b81c9951e39649a5880b02cc324f1b1b0d9e06568e3f5e534ada0939997464af"
+    "sha256": "sha256:a3f3e4604b596436ff2f415f9aee9435b754a13b959cec3bdd4fa57be1e7e7b5"
   },
   "contract_id": "cowd.core-business-operations.v1",
   "schema_version": 1,
@@ -69,6 +69,22 @@
     {
       "path": "schemas/core.runtime.structured_task.start.output.schema.json",
       "sha256": "sha256:a5be4020ffd201e4a1b0a121905e48faf877bd6f5ebba2d542240758766f837e"
+    },
+    {
+      "path": "schemas/core.session.terminal_receipt.ack.input.schema.json",
+      "sha256": "sha256:8698e8d31955bd41aaeba11113bde0b85e4a2497fd05d4cac83c9c8c36eee792"
+    },
+    {
+      "path": "schemas/core.session.terminal_receipt.ack.output.schema.json",
+      "sha256": "sha256:12b89a1813b1d8a3aa027a54f1095326596778c57b6a49eae5234df8c0f5e73e"
+    },
+    {
+      "path": "schemas/core.session.terminal_receipt.read.input.schema.json",
+      "sha256": "sha256:6aadba727fd1305fb5165184cf36ccf8a14024ae51153938863111df22f0a3a1"
+    },
+    {
+      "path": "schemas/core.session.terminal_receipt.read.output.schema.json",
+      "sha256": "sha256:cd9aeef56df335d4599a372b53132a804a370df2dba006ea33b024bebb41d74d"
     },
     {
       "path": "schemas/core.work_context.application_execution_summary.append.input.schema.json",

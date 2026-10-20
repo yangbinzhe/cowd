@@ -1,91 +1,220 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-pub(crate) fn init_logging(version: &str) -> bool {
-    use tracing_appender::rolling;
-    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+use tracing_subscriber::prelude::*;
 
-    let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let retention = log_retention_config_from_env();
-    let cleanup_summary = cleanup_cowd_logs(&log_dir, &retention).ok();
+static DIAGNOSTICS: OnceLock<Arc<BoundedDiagnostics>> = OnceLock::new();
 
-    let file_appender = rolling::daily(&log_dir, "cowd");
-    let default_level = if cfg!(debug_assertions) {
-        // Keep Cowd diagnostics detailed without enabling per-statement DEBUG
-        // logging in database and network dependencies.
-        "info,gateway=debug"
-    } else {
-        // These bounded Runtime phase markers are needed to locate the last
-        // awaited stage when a long-lived execution stalls in production.
-        // Keep the filter narrow: records carry correlation IDs and timings,
-        // never request/response text.
-        "warn,gateway=info,cowd::synthesize=info,cowd::terminal_provider=info,cowd::graph_runner=info"
-    };
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+pub(crate) struct LogFlushGuard;
+impl Drop for LogFlushGuard {
+    fn drop(&mut self) {
+        flush_logging();
+    }
+}
 
-    let json_logs = std::env::var("COWD_LOG_FORMAT")
-        .map(|value| value.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-    let stderr_enabled = cfg!(debug_assertions) && std::env::var("COWD_LOG_STDERR").is_ok();
+pub(crate) fn flush_logging() {
+    if let Some(diagnostics) = DIAGNOSTICS.get() {
+        diagnostics.flush();
+    }
+}
 
-    let installed = if json_logs {
-        let file_layer = fmt::layer()
-            .json()
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_writer(file_appender);
-        if stderr_enabled {
-            let stderr_layer = fmt::layer().with_target(false).with_writer(std::io::stderr);
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(file_layer)
-                .with(stderr_layer)
-                .try_init()
-                .is_ok()
+struct DiagnosticState {
+    counts: [u64; 8],
+    last_flush: Instant,
+    writer: Box<dyn Write + Send>,
+}
+
+struct BoundedDiagnostics {
+    state: Mutex<DiagnosticState>,
+    json: bool,
+    stderr: bool,
+}
+
+impl BoundedDiagnostics {
+    fn write_record(&self, state: &mut DiagnosticState, record: &serde_json::Value) {
+        let serialized = if self.json {
+            serde_json::to_string(record)
         } else {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(file_layer)
-                .try_init()
-                .is_ok()
+            serde_json::to_string(record).map(|json| format!("cowd_diagnostic {json}"))
+        };
+        if let Ok(serialized) = serialized {
+            let _ = writeln!(state.writer, "{serialized}");
+            if self.stderr {
+                let _ = writeln!(std::io::stderr().lock(), "{serialized}");
+            }
         }
-    } else {
-        let file_layer = fmt::layer()
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_writer(file_appender);
-        if stderr_enabled {
-            let stderr_layer = fmt::layer().with_target(false).with_writer(std::io::stderr);
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(file_layer)
-                .with(stderr_layer)
-                .try_init()
-                .is_ok()
-        } else {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(file_layer)
-                .try_init()
-                .is_ok()
-        }
-    };
-
-    tracing::info!(installed, "COWD v{} logging initialized", version);
-    if let Some(summary) = cleanup_summary {
-        tracing::info!(
-            removed_files = summary.removed_files,
-            removed_bytes = summary.removed_bytes,
-            retained_bytes = summary.retained_bytes,
-            retention_days = retention.retention_days,
-            max_total_bytes = retention.max_total_bytes,
-            json_logs,
-            "log retention applied"
-        );
     }
 
+    fn flush_state(&self, state: &mut DiagnosticState) {
+        for bucket in 0..state.counts.len() {
+            let count = std::mem::take(&mut state.counts[bucket]);
+            if count > 0 {
+                self.write_record(
+                    state,
+                    &serde_json::json!({"class":"normal_aggregate","bucket":bucket,"count":count}),
+                );
+            }
+        }
+        state.last_flush = Instant::now();
+        let _ = state.writer.flush();
+    }
+
+    fn flush(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            self.flush_state(&mut state);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DiagnosticLayer(Arc<BoundedDiagnostics>);
+
+#[derive(Default)]
+struct SafeFields {
+    values: serde_json::Map<String, serde_json::Value>,
+    fact: bool,
+}
+
+impl SafeFields {
+    fn observe(&mut self, field: &tracing::field::Field) {
+        self.fact |= field.name().contains("security")
+            || field.name().contains("error")
+            || field.name().contains("failure");
+    }
+    fn correlation(&mut self, field: &tracing::field::Field, value: &[u8]) {
+        self.observe(field);
+        if self.values.len() < 16
+            && (field.name().ends_with("_id")
+                || matches!(field.name(), "phase" | "class" | "error_class"))
+        {
+            self.values.insert(
+                format!("{}_sha256", field.name()),
+                format!("{:x}", Sha256::digest(value)).into(),
+            );
+        }
+    }
+}
+
+impl tracing::field::Visit for SafeFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.observe(field);
+        if field.name().ends_with("_id") {
+            self.correlation(field, format!("{value:?}").as_bytes());
+        }
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.correlation(field, value.as_bytes());
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.observe(field);
+        if self.values.len() < 16
+            && matches!(
+                field.name(),
+                "count"
+                    | "attempt"
+                    | "attempts"
+                    | "elapsed_ms"
+                    | "duration_ms"
+                    | "sequence"
+                    | "revision"
+                    | "bytes"
+                    | "events"
+                    | "status_code"
+            )
+        {
+            self.values.insert(field.name().into(), value.into());
+        }
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.observe(field);
+        if self.values.len() < 16
+            && matches!(
+                field.name(),
+                "count"
+                    | "elapsed_ms"
+                    | "duration_ms"
+                    | "sequence"
+                    | "revision"
+                    | "bytes"
+                    | "status_code"
+            )
+        {
+            self.values.insert(field.name().into(), value.into());
+        }
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.observe(field);
+        if self.values.len() < 16 {
+            self.values.insert(field.name().into(), value.into());
+        }
+    }
+}
+
+impl<Subscriber: tracing::Subscriber> tracing_subscriber::Layer<Subscriber> for DiagnosticLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, Subscriber>,
+    ) {
+        let metadata = event.metadata();
+        let target = metadata.target();
+        let mut fields = SafeFields::default();
+        event.record(&mut fields);
+        let security = ["security", "audit", "auth", "policy", "permission"]
+            .iter()
+            .any(|part| target.contains(part));
+        let immediate = fields.fact || security || *metadata.level() <= tracing::Level::WARN;
+        let Ok(mut state) = self.0.state.lock() else {
+            return;
+        };
+        if immediate {
+            let time = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_millis());
+            self.0.write_record(&mut state, &serde_json::json!({"class":"unsampled_fact","time_ms":time.to_string(),"level":metadata.level().as_str(),"target":target,"event":metadata.name(),"line":metadata.line(),"fields":fields.values}));
+        } else {
+            let bucket = [
+                "graph", "artifact", "storage", "provider", "tool", "session", "gateway",
+            ]
+            .iter()
+            .position(|part| target.contains(part))
+            .unwrap_or(7);
+            state.counts[bucket] = state.counts[bucket].saturating_add(1);
+            if state.counts.iter().sum::<u64>() >= 100
+                || state.last_flush.elapsed() >= Duration::from_secs(1)
+            {
+                self.0.flush_state(&mut state);
+            }
+        }
+    }
+}
+
+pub(crate) fn init_logging(_version: &str) -> bool {
+    let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let _ = cleanup_cowd_logs(&log_dir, &log_retention_config_from_env());
+    let writer = tracing_appender::rolling::daily(&log_dir, "cowd");
+    let diagnostics = Arc::new(BoundedDiagnostics {
+        state: Mutex::new(DiagnosticState {
+            counts: [0; 8],
+            last_flush: Instant::now(),
+            writer: Box::new(writer),
+        }),
+        json: std::env::var("COWD_LOG_FORMAT")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("json")),
+        stderr: cfg!(debug_assertions) && std::env::var("COWD_LOG_STDERR").is_ok(),
+    });
+    let installed = tracing_subscriber::registry()
+        .with(DiagnosticLayer(Arc::clone(&diagnostics)))
+        .try_init()
+        .is_ok();
+    if installed {
+        let _ = DIAGNOSTICS.set(diagnostics);
+    }
     installed
 }
 
@@ -185,7 +314,105 @@ fn cleanup_cowd_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{LogRetentionConfig, cleanup_cowd_logs, init_logging};
+    #[derive(Clone)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn diagnostic_capture(json: bool) -> (std::sync::Arc<super::BoundedDiagnostics>, Capture) {
+        let capture = Capture(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let diagnostics = std::sync::Arc::new(super::BoundedDiagnostics {
+            state: std::sync::Mutex::new(super::DiagnosticState {
+                counts: [0; 8],
+                last_flush: std::time::Instant::now(),
+                writer: Box::new(capture.clone()),
+            }),
+            json,
+            stderr: false,
+        });
+        (diagnostics, capture)
+    }
+
+    #[test]
+    fn r1_secret_normal_aggregation_preserves_errors_and_security_facts() {
+        use tracing_subscriber::prelude::*;
+        let (diagnostics, capture) = diagnostic_capture(true);
+        let subscriber =
+            tracing_subscriber::registry().with(super::DiagnosticLayer(diagnostics.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            for identity in 0..10000 {
+                tracing::info!(request_id = %identity, "normal operation");
+            }
+            for identity in 0..7 {
+                tracing::error!(request_id = %identity, error="sensitive error", "failed");
+            }
+            for identity in 0..13 {
+                tracing::info!(target:"cowd::security", request_id = %identity, "security fact");
+            }
+        });
+        diagnostics.flush();
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let aggregated: u64 = rows.iter().filter_map(|row| row["count"].as_u64()).sum();
+        assert_eq!(aggregated, 10000);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["class"] == "unsampled_fact")
+                .count(),
+            20
+        );
+        assert!(rows.len() <= 120);
+        assert_eq!(diagnostics.state.lock().unwrap().counts.len(), 8);
+    }
+
+    #[test]
+    fn r1_secret_ref_paths_and_shutdown_never_log_content_or_credentials() {
+        use tracing_subscriber::prelude::*;
+        for json in [true, false] {
+            let (diagnostics, capture) = diagnostic_capture(json);
+            let subscriber =
+                tracing_subscriber::registry().with(super::DiagnosticLayer(diagnostics.clone()));
+            let bait = "credential-body-password-token-https://secret.invalid/?key=private";
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("request", authorization = bait, content = bait);
+                let _entered = span.enter();
+                tracing::error!(
+                    request_id = bait,
+                    error = bait,
+                    body = bait,
+                    password = 123456789u64,
+                    "{bait}"
+                );
+                tracing::info!(target:"cowd::security", credential=bait, "{bait}");
+                tracing::info!(request_id = bait, "{bait}");
+            });
+            diagnostics.flush();
+            let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(!output.contains(bait));
+            assert!(!output.contains("123456789"));
+            assert!(output.contains("unsampled_fact"));
+            assert!(output.contains("normal_aggregate"));
+            assert!(output.contains("request_id_sha256"));
+            assert!(diagnostics
+                .state
+                .lock()
+                .unwrap()
+                .counts
+                .iter()
+                .all(|count| *count == 0));
+        }
+    }
+    use super::{cleanup_cowd_logs, init_logging, LogRetentionConfig};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -129,6 +129,7 @@ impl PostgresSessionStore {
         now_ms: u64,
         lease_ms: u64,
         limit: usize,
+        excluded_session_ids: &[String],
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         if worker_id.trim().is_empty() || lease_ms == 0 || limit == 0 {
             return Err(session::SessionError::Store(
@@ -159,6 +160,7 @@ impl PostgresSessionStore {
                         )
                     AND o.session_generation=s.input_generation
                     AND s.input_admission_open=TRUE
+                    AND NOT (o.session_id = ANY($5::text[]))
              ), candidates AS (
                  SELECT o.request_id,o.status AS previous_status
                    FROM session_runtime_outbox o
@@ -195,7 +197,7 @@ impl PostgresSessionStore {
                     runtime_options_json,claim_fence_epoch,application_receipt_json,previous_status
                FROM updated
               ORDER BY next_attempt_at_ms ASC,sequence ASC,request_id ASC",
-            &[&now,&limit,&worker_id,&expires],
+            &[&now,&limit,&worker_id,&expires,&excluded_session_ids],
         ).map_err(postgres_error)?;
         let mut claimed = Vec::with_capacity(rows.len());
         for row in rows {

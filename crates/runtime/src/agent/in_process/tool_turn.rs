@@ -514,21 +514,193 @@ pub(super) fn agent_autonomy_checkpoint(
     }))
 }
 
+impl ScopedRuntimeToolExecutor {
+    fn project_search_output(
+        &self,
+        lease: &tools::ToolHostLease,
+        ceiling: harness_contract::tool::ToolPermissionMode,
+        input: &str,
+    ) -> Result<String, ToolError> {
+        let value: serde_json::Value =
+            serde_json::from_str(input).map_err(|error| ToolError::new(error.to_string()))?;
+        let query = value
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("search query is required"))?;
+        let max_results = value
+            .get("max_results")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| ToolError::new("invalid search max_results"))
+            })
+            .transpose()?
+            .unwrap_or(5)
+            .max(1);
+        let permitted = self.tool_discovery_receipt_for_step(lease, ceiling);
+        let permitted_ids = permitted
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.canonical_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut ranked = lease.search(query, usize::MAX);
+        ranked
+            .descriptors
+            .retain(|descriptor| permitted_ids.contains(descriptor.canonical_id.as_str()));
+        ranked.descriptors.truncate(max_results);
+        ranked.activation_candidates = ranked
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                permitted
+                    .activation_candidates
+                    .contains(&descriptor.canonical_id)
+            })
+            .map(|descriptor| descriptor.canonical_id.clone())
+            .collect();
+        serde_json::to_string(&ranked).map_err(|error| ToolError::new(error.to_string()))
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolExecutor for ScopedRuntimeToolExecutor {
+    fn durable_tool_effect_parent(
+        &self,
+    ) -> Option<(
+        harness_contract::execution_graph::ExecutionParentBinding,
+        u32,
+    )> {
+        Some((
+            harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(),
+                node_id: self.node_id.clone(),
+            },
+            self.attempt,
+        ))
+    }
+
     fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
         self.host.pin_step_catalog()
+    }
+
+    fn prepare_step_catalog(
+        &self,
+        ceiling: harness_contract::tool::ToolPermissionMode,
+    ) -> Result<Option<tools::ToolHostLease>, ToolError> {
+        let lease = self.host.pin_step_catalog().ok_or_else(|| {
+            ToolError::new("agent_tool_inventory_drift: live ToolHost catalog unavailable")
+        })?;
+        let receipt = self.tool_discovery_receipt_for_step(&lease, ceiling);
+        let eligible = receipt
+            .activation_candidates
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if eligible != self.allowed_tools {
+            return Err(ToolError::new("agent_tool_inventory_drift: allowed catalog permission/resource intersection changed"));
+        }
+        let exposed = self
+            .host
+            .delegated_tool_definitions(&self.allowed_tools.iter().cloned().collect::<Vec<_>>());
+        for definition in lease
+            .snapshot()
+            .catalog
+            .definitions(Some(&self.allowed_tools))
+        {
+            if !exposed.iter().any(|actual| {
+                actual.name == definition.name
+                    && actual.input_schema == definition.input_schema
+                    && actual.description == definition.description
+            }) {
+                return Err(ToolError::new(
+                    "agent_tool_inventory_drift: host exposure differs from catalog",
+                ));
+            }
+        }
+        Ok(Some(lease))
+    }
+
+    fn tool_discovery_receipt_for_step(
+        &self,
+        lease: &tools::ToolHostLease,
+        ceiling: harness_contract::tool::ToolPermissionMode,
+    ) -> harness_contract::tool::ToolDiscoveryReceipt {
+        let mut receipt = lease.catalog_receipt();
+        let mut requested = self.allowed_tools.clone();
+        requested.insert("tool_search".into());
+        let exposed = self
+            .host
+            .delegated_tool_definitions(&requested.iter().cloned().collect::<Vec<_>>());
+        let mut actual = BTreeMap::new();
+        for definition in &exposed {
+            actual
+                .entry(definition.name.as_str())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(definition));
+        }
+        let projection =
+            crate::tool_host::DelegatedCatalogProjection::new(lease, &receipt, &requested);
+        let descriptors = projection
+            .definitions()
+            .filter(|definition| definition.name != "checkpoint")
+            .filter(|definition| {
+                actual
+                    .get(definition.name.as_str())
+                    .and_then(|entry| *entry)
+                    .is_some_and(|exposed| {
+                        exposed.input_schema == definition.input_schema
+                            && exposed.description == definition.description
+                    })
+            })
+            .filter_map(|definition| {
+                projection.discover(
+                    definition,
+                    &requested,
+                    ceiling,
+                    self.resource_scopes.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        receipt.activation_candidates = descriptors
+            .iter()
+            .filter(|descriptor| self.allowed_tools.contains(&descriptor.canonical_id))
+            .map(|descriptor| descriptor.canonical_id.clone())
+            .collect();
+        receipt.descriptors = descriptors;
+        receipt.query = "delegated-agent".into();
+        receipt
     }
 
     async fn recover_step_tool_receipt(
         &self,
         call: &crate::conversation::ModelToolCall,
-    ) -> Result<Option<(harness_contract::tool::GovernedToolInvocation, crate::RuntimeToolExecutionOutcome, u64)>, ToolError> {
-        let Some((binding, commit)) = call.binding.as_ref().zip(self.commit_service.as_ref()) else { return Ok(None); };
-        if !self.allowed_tools.contains(&call.name) { return Err(ToolError::new("receipt tool is outside the bound Agent allow-list")); }
-        harness_contract::step::parse_strict_json(&call.input).map_err(|error| ToolError::new(error.to_string()))?;
-        let input = normalize_delegated_resource_paths(&call.name, &call.input, &self.workspace_root,
-            &self.path_identity_resolver, self.resource_scopes.as_deref())?;
+    ) -> Result<
+        Option<(
+            harness_contract::tool::GovernedToolInvocation,
+            crate::RuntimeToolExecutionOutcome,
+            u64,
+        )>,
+        ToolError,
+    > {
+        let Some((binding, commit)) = call.binding.as_ref().zip(self.commit_service.as_ref())
+        else {
+            return Ok(None);
+        };
+        if call.name != "tool_search" && !self.allowed_tools.contains(&call.name) {
+            return Err(ToolError::new(
+                "receipt tool is outside the bound Agent allow-list",
+            ));
+        }
+        harness_contract::step::parse_strict_json(&call.input)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let input = normalize_delegated_resource_paths(
+            &call.name,
+            &call.input,
+            &self.workspace_root,
+            &self.path_identity_resolver,
+            self.resource_scopes.as_deref(),
+        )?;
         let parent = harness_contract::execution_graph::ExecutionParentBinding {
             execution_id: self.execution_id.clone(),
             node_id: self.node_id.clone(),
@@ -551,14 +723,40 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             return Ok(None);
         };
         if let Some(scopes) = &self.resource_scopes {
-            let requested = crate::governed_tool_plan::resource_scope_from_effect(&replay.invocation.effect);
-            for path in &requested.paths {
+            let mut accesses = crate::tool_host::effect_file_accesses(&replay.invocation.effect);
+            if replay.invocation.effect.effect_kind
+                == harness_contract::tool::ToolEffectKind::Unknown
+            {
+                accesses.push((".".into(), false));
+            }
+            for (path, _) in &accesses {
                 if !resource_path_is_authorized(&self.path_identity_resolver, path, scopes, false) {
-                    return Err(ToolError::new("receipt read is outside the bound Agent resource lease"));
+                    return Err(ToolError::new(
+                        "receipt read is outside the bound Agent resource lease",
+                    ));
                 }
             }
         }
-        Ok(Some((replay.invocation, replay.outcome, replay.completed_at_ms)))
+        let mut outcome = replay.outcome;
+        if call.name == "tool_search" {
+            let body = outcome
+                .output
+                .as_deref()
+                .ok_or_else(|| ToolError::new("retained search receipt has no output"))?;
+            let mut receipt: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+                ToolError::new(format!("invalid retained search receipt: {error}"))
+            })?;
+            let object = receipt
+                .as_object_mut()
+                .ok_or_else(|| ToolError::new("retained search receipt is not an object"))?;
+            object.insert("activation_candidates".into(), serde_json::json!([]));
+            object.insert("provenance".into(), serde_json::json!("retained_replay"));
+            outcome.output = Some(
+                serde_json::to_string(&receipt)
+                    .map_err(|error| ToolError::new(error.to_string()))?,
+            );
+        }
+        Ok(Some((replay.invocation, outcome, replay.completed_at_ms)))
     }
 
     async fn execute_output(
@@ -579,7 +777,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             let mut receipt = self.tool_discovery_receipt();
             receipt.query = query;
             return serde_json::to_string(&receipt)
-                .map(|output| delegated_tool_draft(output, None))
+                .map(|output| delegated_tool_draft(output, None, tool_name))
                 .map_err(|error| {
                     ToolError::new(format!("serialize agent tool discovery: {error}"))
                 });
@@ -605,43 +803,39 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
         self.execute_scoped(tool_name, &normalized_input, None, None)
             .await
-            .map(|output| delegated_tool_draft(output, None))
+            .map(|output| delegated_tool_draft(output, None, tool_name))
     }
 
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
-        use harness_contract::tool::{
-            ToolDescriptorHealth, ToolDescriptorRef, ToolDiscoveryReceipt, ToolPermissionMode,
-        };
+        use harness_contract::tool::{ToolDescriptorHealth, ToolDiscoveryReceipt};
 
-        let mut descriptors = Vec::with_capacity(self.allowed_tools.len().saturating_add(1));
-        descriptors.push(ToolDescriptorRef {
-            canonical_id: "tool_search".to_string(),
-            display_name: "tool_search".to_string(),
-            source: "delegated-agent".to_string(),
-            schema_hash: "delegated-agent:tool-search:v1".to_string(),
-            required_permission: ToolPermissionMode::ReadOnly,
-            permission_source: "runtime bootstrap".to_string(),
-            health: ToolDescriptorHealth::Healthy,
+        let Some(lease) = self.host.pin_step_catalog() else {
+            return ToolDiscoveryReceipt {
+                query: "delegated-agent".into(),
+                catalog_revision: 0,
+                descriptors: Vec::new(),
+                activation_candidates: Vec::new(),
+            };
+        };
+        let mut receipt = lease.catalog_receipt();
+        receipt.descriptors.retain(|descriptor| {
+            descriptor.health == ToolDescriptorHealth::Healthy
+                && descriptor.canonical_id != "checkpoint"
+                && (descriptor.canonical_id == "tool_search"
+                    || self.allowed_tools.contains(&descriptor.canonical_id))
         });
-        descriptors.extend(self.allowed_tools.iter().filter_map(|tool_name| {
-            let descriptor = self
-                .host
-                .delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))?;
-            Some(ToolDescriptorRef {
-                canonical_id: tool_name.clone(),
-                display_name: tool_name.clone(),
-                source: "delegated-agent".to_string(),
-                schema_hash: descriptor.descriptor_hash,
-                required_permission: descriptor.required_permission,
-                permission_source: "runtime binding plus host snapshot".to_string(),
-                health: ToolDescriptorHealth::Healthy,
-            })
-        }));
+        let mut candidates = receipt
+            .descriptors
+            .iter()
+            .filter(|descriptor| self.allowed_tools.contains(&descriptor.canonical_id))
+            .map(|descriptor| descriptor.canonical_id.clone())
+            .collect::<Vec<_>>();
+        candidates.sort();
         ToolDiscoveryReceipt {
             query: "delegated-agent".to_string(),
-            catalog_revision: 0,
-            descriptors,
-            activation_candidates: self.allowed_tools.iter().cloned().collect(),
+            catalog_revision: receipt.catalog_revision,
+            descriptors: receipt.descriptors,
+            activation_candidates: candidates,
         }
     }
 
@@ -660,25 +854,9 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 });
         }
         if tool_name == "tool_search" {
-            // Advertised in this agent's discovery receipt, but a read-only
-            // control-plane capability rather than a governed host effect.
-            // Resolve it with a synthetic read-only descriptor so a delegated
-            // agent can activate deferred tools instead of being rejected with
-            // a missing-descriptor error before it can do any real work.
-            return Some(harness_contract::tool::ToolEffectDescriptor {
-                tool_id: "tool_search".to_string(),
-                descriptor_hash: "delegated-agent:tool-search:v1".to_string(),
-                effect_kind: harness_contract::tool::ToolEffectKind::Read,
-                idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
-                scopes: Vec::new(),
-                required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
-                approval_class: harness_contract::tool::ToolApprovalClass::None,
-                uses_network: false,
-                spawns_process: false,
-                mutates_packages: false,
-                mutates_system: false,
-                assessment: harness_contract::policy::EffectAssessment::default(),
-            });
+            let lease = self.host.pin_step_catalog()?;
+            lease.snapshot().catalog.canonical_name(tool_name)?;
+            return Some(lease.describe_effect(tool_name, input));
         }
         self.allowed_tools.contains(tool_name).then(|| {
             let normalized = normalize_delegated_resource_value(
@@ -699,6 +877,9 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        if tool_name == "tool_search" {
+            return Err(ToolError::new("production_tool_origin_required"));
+        }
         if authorization.tool_id != tool_name {
             return Err(ToolError::new(
                 "agent tool authorization does not match the allowed tool request",
@@ -708,7 +889,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             return self
                 .execute_internal_checkpoint(input, authorization.clone(), None)
                 .await
-                .map(|output| delegated_tool_draft(output, None));
+                .map(|output| delegated_tool_draft(output, None, tool_name));
         }
         // Runtime-owned collaborative tools must be delegated back to the
         // Gateway RuntimeExecutionHost. They are not pure ToolHost adapters;
@@ -731,7 +912,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             return self
                 .execute_delegated_runtime_tool(tool_name, input, authorization.clone(), None)
                 .await
-                .map(|output| delegated_tool_draft(output, None));
+                .map(|output| delegated_tool_draft(output, None, tool_name));
         }
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
@@ -754,7 +935,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             None,
         )
         .await
-        .map(|output| delegated_tool_draft(output, None))
+        .map(|output| delegated_tool_draft(output, None, tool_name))
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -813,7 +994,14 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        self.execute_step_authorized_invocation_output(None, provider_invocation_id, authorization, tool_name, input).await
+        self.execute_step_authorized_invocation_output(
+            None,
+            provider_invocation_id,
+            authorization,
+            tool_name,
+            input,
+        )
+        .await
     }
 
     async fn execute_step_authorized_invocation_output(
@@ -824,39 +1012,66 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        if tool_name == "tool_search" && binding.is_none() {
+            return Err(ToolError::new("production_tool_origin_required"));
+        }
         if binding.is_none() && self.host.pin_step_catalog().is_some() {
             return Err(ToolError::new("production_tool_origin_required"));
         }
         if tool_name == "checkpoint" {
-            if binding.is_some_and(|binding| !matches!(binding.origin.source, harness_contract::step::CallSource::SystemDerived { .. })) {
-                return Err(ToolError::new("checkpoint requires a Runtime SystemDerived origin"));
+            if binding.is_some_and(|binding| {
+                !matches!(
+                    binding.origin.source,
+                    harness_contract::step::CallSource::SystemDerived { .. }
+                )
+            }) {
+                return Err(ToolError::new(
+                    "checkpoint requires a Runtime SystemDerived origin",
+                ));
             }
-            return self.execute_internal_checkpoint(input, authorization.clone(), binding).await
-                .map(|output| delegated_tool_draft(output, None));
+            return self
+                .execute_internal_checkpoint(input, authorization.clone(), binding)
+                .await
+                .map(|output| delegated_tool_draft(output, None, tool_name));
         }
         if matches!(
-                tool_name,
-                "evidence_retrieve"
-                    | "working_context"
-                    | "private_note"
-                    | "artifact_publish"
-                    | "artifact_materialize"
-            )
-            || is_agent_action_tool(tool_name)
+            tool_name,
+            "evidence_retrieve"
+                | "working_context"
+                | "private_note"
+                | "artifact_publish"
+                | "artifact_materialize"
+        ) || is_agent_action_tool(tool_name)
         {
             // Pointer-based tools (working_context / evidence_retrieve /
             // artifact_publish) already hand the model a ref, so the generic
             // retrieval hint is correct for them.
             if binding.is_some() && tool_name != "checkpoint" {
                 if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
-                    return Err(ToolError::new("agent tool authorization does not match the allowed tool request"));
+                    return Err(ToolError::new(
+                        "agent tool authorization does not match the allowed tool request",
+                    ));
                 }
-                return self.execute_delegated_runtime_tool(tool_name, input, authorization.clone(), binding)
-                    .await.map(|output| delegated_tool_draft(output, Some(provider_invocation_id)));
+                return self
+                    .execute_delegated_runtime_tool(
+                        tool_name,
+                        input,
+                        authorization.clone(),
+                        binding,
+                    )
+                    .await
+                    .map(|output| {
+                        delegated_tool_draft(output, Some(provider_invocation_id), tool_name)
+                    });
             }
-            return self.execute_authorized_output(authorization, tool_name, input).await;
+            return self
+                .execute_authorized_output(authorization, tool_name, input)
+                .await;
         }
-        if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
+        if authorization.tool_id != tool_name
+            || (!self.allowed_tools.contains(tool_name)
+                && !(tool_name == "tool_search" && self.has_tool(tool_name)))
+        {
             return Err(ToolError::new(
                 "agent tool authorization does not match the allowed tool request",
             ));
@@ -870,25 +1085,61 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             self.resource_scopes.as_deref(),
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
-        self.execute_scoped_bound(
-            tool_name,
-            &normalized_input,
-            Some(authorization.clone()),
+        let search_step = if tool_name == "tool_search" {
+            Some(
+                binding
+                    .ok_or_else(|| ToolError::new("production_tool_origin_required"))?
+                    .resolve(self.host.pin_step_catalog())
+                    .map_err(|error| ToolError::new(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let output = self
+            .execute_scoped_bound(
+                tool_name,
+                &normalized_input,
+                Some(authorization.clone()),
+                Some(provider_invocation_id),
+                binding,
+            )
+            .await?;
+        let output = if let Some(step) = search_step {
+            self.project_search_output(
+                step.lease(),
+                authorization.authorization_lease.ceiling,
+                &normalized_input,
+            )?
+        } else {
+            output
+        };
+        Ok(delegated_tool_draft(
+            output,
             Some(provider_invocation_id),
-            binding,
-        )
-        .await
-        .map(|output| delegated_tool_draft(output, Some(provider_invocation_id)))
+            tool_name,
+        ))
     }
 
     fn has_tool(&self, tool_name: &str) -> bool {
-        tool_name == "tool_search"
-            || self.allowed_tools.contains(tool_name)
-            || (tool_name == "checkpoint"
-                && self
-                    .host
-                    .delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))
-                    .is_some())
+        (matches!(tool_name, "tool_search" | "checkpoint")
+            || self.allowed_tools.contains(tool_name))
+            && self.host.pin_step_catalog().is_some_and(|lease| {
+                lease
+                    .snapshot()
+                    .catalog
+                    .canonical_name(tool_name)
+                    .as_deref()
+                    == Some(tool_name)
+                    && lease
+                        .catalog_receipt()
+                        .descriptors
+                        .iter()
+                        .any(|descriptor| {
+                            descriptor.canonical_id == tool_name
+                                && descriptor.health
+                                    == harness_contract::tool::ToolDescriptorHealth::Healthy
+                        })
+            })
     }
 
     fn classify_tool_safety(
@@ -910,7 +1161,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
 /// crate, which would otherwise bypass this executor's `allowed_tools` check.
 /// Validate every requested sub-call up front so the whole call fails closed
 /// before any sub-call executes.
-fn reject_orchestrated_tools_outside_allow_list(
+pub(super) fn reject_orchestrated_tools_outside_allow_list(
     allowed: &std::collections::BTreeSet<String>,
     tool_name: &str,
     input: &str,
@@ -952,14 +1203,12 @@ mod tests {
         })
         .to_string();
 
-        assert!(
-            reject_orchestrated_tools_outside_allow_list(
-                &allowed(&["glob_search", "read_file"]),
-                "tool_orchestrate",
-                &input
-            )
-            .is_ok()
-        );
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&["glob_search", "read_file"]),
+            "tool_orchestrate",
+            &input
+        )
+        .is_ok());
 
         let error = reject_orchestrated_tools_outside_allow_list(
             &allowed(&["glob_search"]),
@@ -969,14 +1218,12 @@ mod tests {
         .expect_err("read_file is not allowed");
         assert!(error.to_string().contains("read_file"), "got: {error}");
 
-        assert!(
-            reject_orchestrated_tools_outside_allow_list(
-                &allowed(&[]),
-                "read_file",
-                "{\"path\":\"x\"}"
-            )
-            .is_ok()
-        );
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&[]),
+            "read_file",
+            "{\"path\":\"x\"}"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -985,30 +1232,28 @@ mod tests {
             "steps": [{"id": "c", "op": "compute", "language": "python", "code": "print(1)", "input": []}]
         })
         .to_string();
-        assert!(
-            reject_orchestrated_tools_outside_allow_list(
-                &allowed(&["execute_code"]),
-                "tool_orchestrate",
-                &input
-            )
-            .is_ok()
-        );
-        assert!(
-            reject_orchestrated_tools_outside_allow_list(&allowed(&[]), "tool_orchestrate", &input)
-                .is_err()
-        );
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&["execute_code"]),
+            "tool_orchestrate",
+            &input
+        )
+        .is_ok());
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&[]),
+            "tool_orchestrate",
+            &input
+        )
+        .is_err());
     }
 
     #[test]
     fn invalid_orchestration_input_fails_closed() {
-        assert!(
-            reject_orchestrated_tools_outside_allow_list(
-                &allowed(&["read_file"]),
-                "tool_orchestrate",
-                "not json"
-            )
-            .is_err()
-        );
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&["read_file"]),
+            "tool_orchestrate",
+            "not json"
+        )
+        .is_err());
     }
 }
 
@@ -1022,14 +1267,16 @@ const DELEGATED_TOOL_INLINE_TOKEN_BUDGET: u64 = 12_000;
 const DELEGATED_TOOL_PREVIEW_CHARS: usize = 4_000;
 const DELEGATED_TOOL_TAIL_CHARS: usize = 1_000;
 
-/// Build the delegated Agent's tool draft: the whole output when it fits the
-/// inline budget, otherwise a head/tail preview plus an explicit pointer to the
-/// durable receipt. The pointer is derived from the provider invocation id the
-/// caller already holds, so it can never be a fabricated ref.
+/// Reads reach the trusted evidence owner whole; model presentation is budgeted
+/// there. Other tools retain the existing inline budget and head/tail preview.
 fn delegated_tool_draft(
     output: String,
     provider_invocation_id: Option<&str>,
+    tool_name: &str,
 ) -> harness_contract::context::ToolOutputDraft {
+    if matches!(tool_name, "read_file" | "read_ref" | "evidence_retrieve") {
+        return harness_contract::context::ToolOutputDraft::bounded_inline(output);
+    }
     let tokens = crate::context_ledger::estimate_text_tokens(&output);
     if tokens <= DELEGATED_TOOL_INLINE_TOKEN_BUDGET {
         return harness_contract::context::ToolOutputDraft::bounded_inline(output);
@@ -1053,12 +1300,12 @@ fn delegated_tool_draft(
 
 #[cfg(test)]
 mod delegated_draft_tests {
-    use super::{DELEGATED_TOOL_INLINE_TOKEN_BUDGET, delegated_tool_draft};
+    use super::{delegated_tool_draft, DELEGATED_TOOL_INLINE_TOKEN_BUDGET};
 
     #[test]
     fn a_whole_file_stays_inline() {
         let body = "fn main() {}\n".repeat(400);
-        let draft = delegated_tool_draft(body.clone(), Some("call-1"));
+        let draft = delegated_tool_draft(body.clone(), Some("call-1"), "read_file");
         let rendered = format!("{draft:?}");
         assert!(
             rendered.contains("fn main()"),
@@ -1070,7 +1317,7 @@ mod delegated_draft_tests {
     #[test]
     fn a_huge_output_is_compacted_with_a_retrieval_hint() {
         let huge = "x".repeat(400_000);
-        let draft = delegated_tool_draft(huge, Some("call-2"));
+        let draft = delegated_tool_draft(huge, Some("call-2"), "grep_search");
         let rendered = format!("{draft:?}");
         assert!(rendered.contains("compacted to protect the provider prompt"));
         assert!(rendered.contains("call-2"));
@@ -1085,5 +1332,18 @@ mod delegated_draft_tests {
 
     fn huge_len_for_assertion() -> usize {
         400_000
+    }
+
+    #[test]
+    fn large_read_body_reaches_original_evidence_owner_without_preclip() {
+        for tool_name in ["read_file", "read_ref", "evidence_retrieve"] {
+            let body = format!(
+                "{}middle-sentinel{}",
+                "before".repeat(20_000),
+                "after".repeat(20_000)
+            );
+            let draft = delegated_tool_draft(body.clone(), Some("read-large"), tool_name);
+            assert_eq!(draft.model_text(), body);
+        }
     }
 }

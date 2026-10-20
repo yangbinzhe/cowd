@@ -10,6 +10,7 @@ use axum::{
     body::Body,
     extract::{Path as AxumPath, State as AxumState},
     http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
+    response::IntoResponse,
     routing::{delete, get, post},
     Extension, Json, Router,
 };
@@ -21,11 +22,12 @@ use cowd_app_protocol::{
     AppLifecycleV1, AppManifestV1, AppProviderResponseV1, AppStreamAckV1, AppStreamFrameV1,
     AppTuiViewActionResponseV1, AppTuiViewOpenRequestV1, AppTuiViewOpenResponseV1,
     AppTuiViewStreamRequestV1, DelegationKindV1, DurableReceiptV1, ExecutionContextV1,
-    OperationDescriptorV1, OperationKindV1, PrincipalContextV1, ProtocolValidate, Sha256Digest,
-    APP_RECEIPT_PATH_V1, APP_SUBSCRIPTION_ACK_PATH_V1, APP_SUBSCRIPTION_PATH_V1,
-    HEADER_APP_GENERATION_V1, HEADER_APP_ID_V1, HEADER_AUTHORIZATION_V1, HEADER_CONTENT_TYPE_V1,
-    HEADER_CORRELATION_ID_V1, HEADER_DEADLINE_UNIX_MS_V1, HEADER_PROTOCOL_VERSION_V1,
-    HEADER_REQUEST_ID_V1, PROTOCOL_REVISION_V1, STREAM_CONTENT_TYPE_V1, UNARY_CONTENT_TYPE_V1,
+    OperationDescriptorV1, OperationKindV1, PrincipalContextV1, ProtocolValidate,
+    ProtocolValidationError, APP_RECEIPT_PATH_V1, APP_SUBSCRIPTION_ACK_PATH_V1,
+    APP_SUBSCRIPTION_PATH_V1, HEADER_APP_GENERATION_V1, HEADER_APP_ID_V1, HEADER_AUTHORIZATION_V1,
+    HEADER_CONTENT_TYPE_V1, HEADER_CORRELATION_ID_V1, HEADER_DEADLINE_UNIX_MS_V1,
+    HEADER_PROTOCOL_VERSION_V1, HEADER_REQUEST_ID_V1, PROTOCOL_REVISION_V1, STREAM_CONTENT_TYPE_V1,
+    UNARY_CONTENT_TYPE_V1,
 };
 use harness_contract::security::PrincipalKind;
 use http_body_util::{BodyExt, Full};
@@ -36,13 +38,17 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::app_platform::{
-    GatewayAppConnection, GatewayAppConnector, GatewayAppPlatform, PROTOCOL_DIGEST_V1,
+    canonical_protocol_digest_v1, GatewayAppConnection, GatewayAppConnector, GatewayAppPlatform,
 };
 
 const APP_STATIC_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 
 pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::AppState>> {
     Router::new()
+        .route(
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS.template(),
+            post(create_frame_source_binding).delete(detach_frame_source_binding),
+        )
         .route(
             surface::gateway_api::paths::API_APPS.template(),
             get(list_apps),
@@ -409,7 +415,7 @@ async fn project_catalog(
     let catalog = AppCatalogV1 {
         schema_version: 1,
         protocol_revision: PROTOCOL_REVISION_V1,
-        protocol_digest: Sha256Digest(PROTOCOL_DIGEST_V1.to_owned()),
+        protocol_digest: canonical_protocol_digest_v1().map_err(protocol_metadata_error)?,
         catalog_generation: platform.catalog().generation().clone(),
         apps,
     };
@@ -434,6 +440,253 @@ struct InvokeInput {
     expected_revision: Option<String>,
     #[serde(default)]
     deadline_ms: Option<u64>,
+}
+
+impl super::AppState {
+    pub(crate) async fn revalidate_frame_session(
+        &self,
+        principal: &super::AuthenticatedPrincipal,
+        session_id: &str,
+    ) -> Result<(), String> {
+        super::projection_stream_principal_current(&self.config_home, principal)?;
+        super::session_routes::authorize_session_access(
+            self,
+            principal,
+            session_id,
+            super::session_routes::SessionAccess::Read,
+        )
+        .await
+        .map_err(|_| "frame Session access revoked".into())
+    }
+}
+
+fn host_frame_guard(
+    state: &super::AppState,
+    principal: &super::AuthenticatedPrincipal,
+    headers: &HeaderMap,
+) -> Result<(), Response<Body>> {
+    let denied = || {
+        proxy_error(
+            StatusCode::FORBIDDEN,
+            "host_source_required",
+            "trusted same-origin human Host required",
+        )
+    };
+    let unique = |name: &str| -> Option<&str> {
+        if headers.get_all(name).iter().count() != 1 {
+            return None;
+        }
+        headers.get(name)?.to_str().ok()
+    };
+    let origin = unique("origin").ok_or_else(denied)?;
+    let uri: axum::http::Uri = origin.parse().map_err(|_| denied())?;
+    if principal.0.claims().kind != PrincipalKind::Human
+        || !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().map(|value| value.as_str()) != unique("host")
+        || uri.path() != "/"
+        || uri.query().is_some()
+        || unique("sec-fetch-site") != Some("same-origin")
+        || unique("content-type")
+            .is_none_or(|value| value.split(';').next().map(str::trim) != Some("application/json"))
+    {
+        return Err(denied());
+    }
+    super::projection_stream_principal_current(&state.config_home, principal).map_err(|_| denied())
+}
+
+use crate::services::core_platform_operations::{resolve_host_frame, validate_frame_lineage};
+
+async fn create_frame_source_binding(
+    AxumState(state): AxumState<Arc<super::AppState>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumPath(app_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(input): Json<cowd_app_protocol::AppFrameSourceBindingRequestV1>,
+) -> Response<Body> {
+    let result = async {
+        host_frame_guard(&state, &principal, &headers)?;
+        let denied =
+            |detail: &str| proxy_error(StatusCode::FORBIDDEN, "frame_source_unavailable", detail);
+        super::session_routes::authorize_session_access(
+            &state,
+            &principal,
+            &input.session_id,
+            super::session_routes::SessionAccess::Read,
+        )
+        .await
+        .map_err(|_| denied("Session access required"))?;
+        let platform = state
+            .services
+            .app_platform
+            .as_ref()
+            .ok_or_else(|| denied("APP platform unavailable"))?;
+        let admitted = platform
+            .catalog()
+            .get(&AppId(app_id.clone()))
+            .ok_or_else(|| denied("APP unavailable"))?;
+        let claims = principal.0.claims();
+        if claims.app_profile(&app_id).is_none()
+            || uuid::Uuid::parse_str(&input.frame_nonce).is_err()
+        {
+            return Err(denied("APP profile and unique frame nonce required"));
+        }
+        let (authority, source) = if let Some(reference) = input.frame_binding_ref.as_deref() {
+            let (authority, source) = resolve_host_frame(&state, &principal, &app_id, reference)
+                .await
+                .map_err(|_| denied("frame renewal rejected"))?;
+            if source.frame_nonce != input.frame_nonce
+                || source.session_id != input.session_id
+                || source.turn_id != input.turn_id
+                || source.execution_id != input.execution_id
+                || source.root_task_id != input.root_task_id
+                || source.lineage_generation != input.lineage_generation
+            {
+                return Err(denied("frame renewal cannot change source"));
+            }
+            (authority, source)
+        } else {
+            let now = now_unix_ms().map_err(|_| denied("clock unavailable"))?;
+            let expires_at_ms = claims
+                .expires_at_ms
+                .unwrap_or(u64::MAX)
+                .min(now.saturating_add(300_000));
+            let encoded = input
+                .session_id
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let reference = format!("{encoded}.{}", uuid::Uuid::new_v4());
+            let source = session::SessionReceiptSource {
+                principal_id: claims.principal_id.clone(),
+                tenant_id: claims.tenant_id.clone(),
+                workspace_id: format!(
+                    "sha256:{:x}",
+                    Sha256::digest(state.workspace_root.to_string_lossy().as_bytes())
+                ),
+                app_id: app_id.clone(),
+                app_generation: admitted.generation.0.clone(),
+                profile_revision: claims.profile_revision.to_string(),
+                credential_epoch: claims.credential_epoch.to_string(),
+                frame_nonce: input.frame_nonce.clone(),
+                transport_id: reference.clone(),
+                attachment_revision: "1".into(),
+                expires_at_ms,
+                session_id: input.session_id.clone(),
+                turn_id: input.turn_id.clone(),
+                execution_id: input.execution_id.clone(),
+                root_task_id: input.root_task_id.clone(),
+                lineage_generation: input.lineage_generation.clone(),
+                purpose: "terminal_receipt".into(),
+            };
+            validate_frame_lineage(&state, &source)
+                .map_err(|_| denied("canonical source lineage required"))?;
+            (
+                session::SessionReceiptAuthority {
+                    session_id: input.session_id.clone(),
+                    actor_id: format!(
+                        "principal:{}:surface:app_frame:{reference}",
+                        claims.principal_id
+                    ),
+                    principal_id: claims.principal_id.clone(),
+                    client_id: String::new(),
+                    credential_expires_at_ms: claims.expires_at_ms,
+                    receipt_source: Some(source.clone()),
+                },
+                source,
+            )
+        };
+        let actor = session::SessionActor {
+            id: authority.actor_id.clone(),
+            surface: "app_frame".into(),
+            role: Some("reader".into()),
+        };
+        let attached = state
+            .services
+            .session
+            .attach_session_with_receipt_value(authority, actor)
+            .await
+            .map_err(|_| denied("frame attachment could not be committed"))?;
+        let grant = &attached["receipt_attachment"];
+        let response = cowd_app_protocol::AppFrameSourceBindingV1 {
+            frame_binding_ref: source.transport_id,
+            client_id: grant["client_id"]
+                .as_str()
+                .ok_or_else(|| denied("client missing"))?
+                .into(),
+            client_expires_at_ms: grant["client_expires_at_ms"]
+                .as_u64()
+                .ok_or_else(|| denied("expiry missing"))?,
+            receipt_protocol: "session-public-v1".into(),
+            presence_revision: grant["presence_revision"]
+                .as_str()
+                .ok_or_else(|| denied("revision missing"))?
+                .into(),
+        };
+        Ok(Json(response).into_response())
+    }
+    .await;
+    let mut response = result.unwrap_or_else(|response| response);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn detach_frame_source_binding(
+    AxumState(state): AxumState<Arc<super::AppState>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumPath(app_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(input): Json<cowd_app_protocol::AppFrameSourceBindingRequestV1>,
+) -> Response<Body> {
+    let result = async {
+        host_frame_guard(&state, &principal, &headers)?;
+        let reference = input.frame_binding_ref.as_deref().ok_or_else(|| {
+            proxy_error(
+                StatusCode::BAD_REQUEST,
+                "frame_reference_required",
+                "exact frame reference required",
+            )
+        })?;
+        let (authority, source) = resolve_host_frame(&state, &principal, &app_id, reference)
+            .await
+            .map_err(|_| {
+                proxy_error(
+                    StatusCode::FORBIDDEN,
+                    "frame_source_unavailable",
+                    "current frame required",
+                )
+            })?;
+        if source.frame_nonce != input.frame_nonce
+            || source.session_id != input.session_id
+            || source.turn_id != input.turn_id
+            || source.execution_id != input.execution_id
+            || source.root_task_id != input.root_task_id
+            || source.lineage_generation != input.lineage_generation
+        {
+            return Err(proxy_error(
+                StatusCode::FORBIDDEN,
+                "frame_source_mismatch",
+                "exact source required",
+            ));
+        }
+        state
+            .services
+            .session
+            .detach_session_with_receipt_value(authority)
+            .await
+            .map_err(|_| {
+                proxy_error(StatusCode::CONFLICT, "frame_detach_failed", "frame changed")
+            })?;
+        Ok(Json(serde_json::json!({"ok":true})).into_response())
+    }
+    .await;
+    let mut response = result.unwrap_or_else(|response| response);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn invoke_operation(
@@ -725,6 +978,9 @@ async fn proxy_unary(
             &envelope,
             app_id,
             &admitted.manifest,
+            headers
+                .get(cowd_app_protocol::HEADER_FRAME_BINDING_V1)
+                .and_then(|value| value.to_str().ok()),
         ) {
             return proxy_error(
                 StatusCode::BAD_GATEWAY,
@@ -939,6 +1195,9 @@ async fn proxy_stream(
             &envelope,
             app_id,
             &admitted.manifest,
+            headers
+                .get(cowd_app_protocol::HEADER_FRAME_BINDING_V1)
+                .and_then(|value| value.to_str().ok()),
         ) {
             return proxy_error(
                 StatusCode::BAD_GATEWAY,
@@ -1411,6 +1670,18 @@ fn invocation_envelope(
     descriptor: &OperationDescriptorV1,
     input: InvokeInput,
 ) -> Result<AppInvocationEnvelopeV1, Response<Body>> {
+    if headers
+        .get_all(cowd_app_protocol::HEADER_FRAME_BINDING_V1)
+        .iter()
+        .count()
+        > 1
+    {
+        return Err(proxy_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_frame_selector",
+            "duplicate frame selector",
+        ));
+    }
     if !descriptor.operation_id.starts_with(&format!("{app_id}.")) {
         return Err(proxy_error(
             StatusCode::BAD_GATEWAY,
@@ -1833,6 +2104,16 @@ fn response(status: StatusCode, body: Body) -> Response<Body> {
     *response.status_mut() = status;
     response
 }
+fn protocol_metadata_error(
+    error: ProtocolValidationError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    typed_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "catalog_projection_invalid",
+        &error.to_string(),
+    )
+}
+
 fn typed_error(
     status: StatusCode,
     code: &str,
@@ -1860,6 +2141,167 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn r1_client_receipt_catalog_metadata_failure_is_not_success() {
+        let snapshot =
+            cowd_app_host::catalog::AppCatalogSnapshot::from_admitted_for_tests(Vec::new())
+                .expect("in-memory catalog");
+        let generation = snapshot.generation().clone();
+        let platform = GatewayAppPlatform::for_test_catalog(snapshot);
+        let principal = super::super::AuthenticatedPrincipal(
+            runtime::VerifiedPrincipal::from_test_claims(PrincipalClaims {
+                principal_id: "metadata-human".to_owned(),
+                tenant_id: "tenant".to_owned(),
+                grant_id: "grant".to_owned(),
+                kind: PrincipalKind::Human,
+                scopes: Vec::new(),
+                capabilities: Vec::new(),
+                assurance: PrincipalAssurance::Normal,
+                issuer: "fixture".to_owned(),
+                issued_at_ms: 1,
+                expires_at_ms: None,
+                credential_fingerprint: "fixture".to_owned(),
+                credential_epoch: 1,
+                profile_revision: 1,
+                app_profiles: BTreeMap::new(),
+            }),
+        );
+        let catalog = project_catalog(&platform, &principal)
+            .await
+            .expect("catalog projection");
+        catalog.validate().expect("valid catalog");
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../app-protocol/contracts/v1/contract-manifest.json"
+        ))
+        .expect("canonical manifest");
+        assert_eq!(
+            catalog.protocol_digest.0,
+            manifest["protocol_digest"]
+                .as_str()
+                .expect("manifest digest")
+        );
+        assert_eq!(
+            catalog.protocol_digest,
+            canonical_protocol_digest_v1().expect("digest")
+        );
+        assert_eq!(catalog.catalog_generation, generation);
+        assert_eq!(
+            serde_json::to_value(&catalog).expect("catalog JSON"),
+            json!({
+                "schema_version": 1,
+                "protocol_revision": PROTOCOL_REVISION_V1,
+                "protocol_digest": manifest["protocol_digest"],
+                "catalog_generation": generation,
+                "apps": []
+            })
+        );
+        for error in [
+            ProtocolValidationError::InvalidJson("malformed manifest".to_owned()),
+            ProtocolValidationError::InvalidField {
+                field: "protocol_digest",
+                reason: "invalid digest".to_owned(),
+            },
+            ProtocolValidationError::UnsupportedSchema {
+                type_name: "contract_manifest",
+                actual: 2,
+            },
+            ProtocolValidationError::UnsupportedProtocol { actual: 2 },
+        ] {
+            let detail = error.to_string();
+            let (status, Json(body)) = protocol_metadata_error(error);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!status.is_success());
+            assert_eq!(
+                body,
+                json!({"error": {"code": "catalog_projection_invalid", "detail": detail}})
+            );
+            let (expected_status, Json(expected_body)) = typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "catalog_projection_invalid",
+                &detail,
+            );
+            assert_eq!(status, expected_status);
+            assert_eq!(body, expected_body);
+        }
+    }
+
+    #[test]
+    fn r1_surface_axes_frame_source_requires_host_intent() {
+        let state = super::super::tests::test_state();
+        let principal = super::super::AuthenticatedPrincipal(
+            runtime::VerifiedPrincipal::from_test_claims(PrincipalClaims {
+                principal_id: "frame-human".into(),
+                tenant_id: "tenant".into(),
+                grant_id: "grant".into(),
+                kind: PrincipalKind::Human,
+                scopes: vec!["session:owned-one".into(), "session:owned-two".into()],
+                capabilities: vec![],
+                assurance: PrincipalAssurance::Normal,
+                issuer: "fixture".into(),
+                issued_at_ms: 1,
+                expires_at_ms: None,
+                credential_fingerprint: "fixture".into(),
+                credential_epoch: 1,
+                profile_revision: 1,
+                app_profiles: BTreeMap::new(),
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:8642"));
+        headers.insert("origin", HeaderValue::from_static("http://localhost:8642"));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        assert!(host_frame_guard(&state, &principal, &headers).is_ok());
+        for (header, value) in [
+            ("origin", "null"),
+            ("origin", "https://attacker.invalid"),
+            ("sec-fetch-site", "cross-site"),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ] {
+            let mut forged = headers.clone();
+            forged.insert(header, HeaderValue::from_str(value).unwrap());
+            assert!(host_frame_guard(&state, &principal, &forged).is_err());
+        }
+        let mut missing = headers.clone();
+        missing.remove("origin");
+        assert!(host_frame_guard(&state, &principal, &missing).is_err());
+        let mut service_claims = principal.0.claims().clone();
+        service_claims.kind = PrincipalKind::Service;
+        let service = super::super::AuthenticatedPrincipal(
+            runtime::VerifiedPrincipal::from_test_claims(service_claims),
+        );
+        assert!(host_frame_guard(&state, &service, &headers).is_err());
+        assert!(serde_json::from_value::<cowd_app_protocol::AppFrameSourceBindingRequestV1>(json!({
+            "session_id":"owned-one","turn_id":"turn","execution_id":"execution","root_task_id":"root",
+            "lineage_generation":"1","frame_nonce":"nonce","frame_binding_ref":null,"principal_id":"injected"
+        })).is_err());
+    }
+
+    #[test]
+    fn r1_client_receipt_subscription_progress_never_acknowledges_message() {
+        let progress = AppStreamAckV1 {
+            schema_version: 1,
+            subscription_id: "subscription".into(),
+            maximum_contiguous_sequence: 99,
+            cursor: "9007199254740993".into(),
+        };
+        let progress = serde_json::to_value(progress).unwrap();
+        assert!(
+            serde_json::from_value::<harness_contract::live::SessionMessageAckRequest>(
+                progress.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<cowd_app_protocol::SessionTerminalReceiptAckInputV1>(progress)
+                .is_err()
+        );
+        assert_eq!(
+            cowd_app_protocol::HEADER_FRAME_BINDING_V1,
+            "x-cowd-frame-binding"
+        );
+    }
 
     #[test]
     fn app_static_headers_allow_only_same_origin_embedding() {

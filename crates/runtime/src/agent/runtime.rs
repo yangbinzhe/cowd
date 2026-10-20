@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use harness_contract::agent::{
     AgentBindingSnapshot, AgentCommand, AgentCommandReceipt, AgentCommandRejectReason,
     AgentCommandRequest, AgentLifecycleEvent, AgentReturnPacket, AgentStatus, AgentTaskPacket,
@@ -19,9 +21,9 @@ use crate::runtime_event_store::{
     RuntimeEventScope,
 };
 use crate::{
-    AgentLifecyclePhase, AgentRunEvaluation, AgentSelfModel, CowdEvent, CowdExecutionContext,
-    CowdExecutionLineage, ProviderRegistry, RuntimeEventStore, RuntimeServices,
-    project_self_models,
+    project_self_models, AgentLifecyclePhase, AgentRunEvaluation, AgentSelfModel, CowdEvent,
+    CowdExecutionContext, CowdExecutionLineage, ProviderRegistry, RuntimeEventStore,
+    RuntimeServices,
 };
 use sha2::{Digest, Sha256};
 
@@ -127,31 +129,464 @@ struct AgentRunRecord {
     snapshot: Option<AgentRunSnapshot>,
     receipts: BTreeMap<String, AgentCommandReceipt>,
     returned: Option<AgentReturnPacket>,
+    retained: Option<Arc<RetainedAgentRun>>,
+    retiring: Vec<Arc<RetainedAgentRun>>,
+    release_after_completion: bool,
+}
+
+struct RetainedAgentRun {
+    packet_sha256: String,
+    run_key: (String, String, String, u32),
+    result: tokio::sync::watch::Sender<Option<Result<AgentReturnPacket, String>>>,
+    join: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pending_exit: Mutex<Option<RunExitFact>>,
+    exit_committed: AtomicBool,
+}
+
+impl RetainedAgentRun {
+    fn physically_exited(&self) -> bool {
+        self.exit_committed.load(Ordering::Acquire)
+            && self
+                .pending_exit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(RunExitFact::positive)
+    }
+
+    fn locally_settled(&self) -> bool {
+        self.result.borrow().is_some() && self.physically_exited()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalRunPhase {
+    Admitted,
+    NotStarted,
+    BackendPending,
+    LocalReturned,
+    ProcessReaped,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RunExitFact {
+    schema_version: u32,
+    agent_id: String,
+    run_id: String,
+    graph_id: String,
+    node_id: String,
+    attempt: u32,
+    packet_sha256: String,
+    backend_packet_sha256: Option<String>,
+    owner_epoch: String,
+    backend: AgentBackendKind,
+    phase: LocalRunPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_envelope: Option<crate::agent_process_jsonl_adapter::ProcessPhysicalEnvelope>,
+}
+
+fn run_packet_sha256(packet: &AgentTaskPacket) -> Result<String, String> {
+    serde_json::to_vec(packet)
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|error| error.to_string())
+}
+
+fn run_cancellation_key(packet: &AgentTaskPacket) -> (String, String, String, u32) {
+    (
+        packet.run_id().into(),
+        packet.graph_id().into(),
+        packet.node_id().into(),
+        packet.attempt,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunExitEvidence {
+    fact: RunExitFact,
+}
+
+impl RunExitFact {
+    fn matches(&self, packet: &AgentTaskPacket, packet_sha256: &str) -> Result<bool, String> {
+        Ok(self.schema_version == 1
+            && self.agent_id == packet.agent_id()
+            && self.run_id == packet.run_id()
+            && self.graph_id == packet.graph_id()
+            && self.node_id == packet.node_id()
+            && self.attempt == packet.attempt
+            && self.packet_sha256 == packet_sha256
+            && self.backend == backend_from_packet(packet)?
+            && uuid::Uuid::parse_str(&self.owner_epoch).is_ok()
+            && self.backend_packet_sha256.as_ref().is_none_or(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            && self.process_envelope.as_ref().is_none_or(|envelope| {
+                self.backend == AgentBackendKind::ProcessJsonl
+                    && self.backend_packet_sha256.as_ref().is_some_and(|backend| {
+                        envelope.authentic_for(packet, packet_sha256, backend)
+                    })
+            }))
+    }
+
+    fn positive(&self) -> bool {
+        matches!(self.phase, LocalRunPhase::NotStarted)
+            || (self.backend_packet_sha256.is_some()
+                && matches!(
+                    (&self.backend, &self.phase),
+                    (AgentBackendKind::InProcess, LocalRunPhase::LocalReturned)
+                        | (AgentBackendKind::ProcessJsonl, LocalRunPhase::ProcessReaped)
+                ))
+    }
+}
+
+pub(crate) fn confirmed_run_exit(
+    store: &RuntimeEventStore,
+    packet: &AgentTaskPacket,
+) -> Result<Option<(RunExitEvidence, Vec<ExpectedStreamRevision>)>, String> {
+    let lifecycle = authenticated_run_lifecycle(store, packet)?;
+    Ok(lifecycle
+        .exit
+        .filter(RunExitFact::positive)
+        .map(|fact| (RunExitEvidence { fact }, lifecycle.sources)))
+}
+
+pub(crate) struct AuthenticatedRunLifecycle {
+    exit: Option<RunExitFact>,
+    backend: Option<RunExitFact>,
+    pub(crate) sources: Vec<ExpectedStreamRevision>,
+}
+
+impl AuthenticatedRunLifecycle {
+    pub(crate) fn closed_for_governed_effects(&self) -> bool {
+        self.exit.as_ref().is_some_and(|fact| {
+            fact.positive()
+                && (fact.backend == AgentBackendKind::InProcess || self.no_direct_effects())
+        })
+    }
+
+    pub(crate) fn no_direct_effects(&self) -> bool {
+        self.exit
+            .as_ref()
+            .is_some_and(|fact| fact.phase == LocalRunPhase::NotStarted)
+            || self
+                .backend
+                .as_ref()
+                .and_then(|fact| fact.process_envelope.as_ref())
+                .is_some_and(|envelope| envelope.host_only())
+    }
+
+    pub(crate) fn semantic_fact(&self) -> serde_json::Value {
+        serde_json::json!({"envelope":self.backend.as_ref().and_then(|fact| fact.process_envelope.as_ref()),
+            "not_started":self.exit.as_ref().is_some_and(|fact| fact.phase == LocalRunPhase::NotStarted),
+            "no_direct_effects":self.no_direct_effects()})
+    }
+}
+
+pub(crate) fn authenticated_run_lifecycle(
+    store: &RuntimeEventStore,
+    packet: &AgentTaskPacket,
+) -> Result<AuthenticatedRunLifecycle, String> {
+    let stream_id = agent_stream_id(packet.agent_id());
+    let revision = store
+        .stream_revision(&stream_id)
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+    for kind in [
+        "agent.run_admitted",
+        "agent.backend_admitted",
+        "agent.local_exit",
+    ] {
+        let key = format!("{kind}:{}", packet.run_id());
+        if let Some(record) = store
+            .event_by_idempotency_key(&stream_id, &key)
+            .map_err(|error| error.to_string())?
+        {
+            records.push(Arc::new(record));
+        }
+    }
+    let lifecycle = authenticate_run_lifecycle_records(packet, revision, &records)?;
+    if store
+        .stream_revision(&stream_id)
+        .map_err(|error| error.to_string())?
+        != revision
+    {
+        return Err("Agent exit source changed during authentication".into());
+    }
+    Ok(lifecycle)
+}
+
+pub(crate) fn projection_run_closed_from_records(
+    packet: &AgentTaskPacket,
+    revision: u64,
+    records: &[Arc<crate::DurableRuntimeEvent>],
+) -> Result<bool, String> {
+    let lifecycle = authenticate_run_lifecycle_records(packet, revision, records)?;
+    Ok(lifecycle.closed_for_governed_effects())
+}
+
+fn authenticate_run_lifecycle_records(
+    packet: &AgentTaskPacket,
+    revision: u64,
+    records: &[Arc<crate::DurableRuntimeEvent>],
+) -> Result<AuthenticatedRunLifecycle, String> {
+    let stream_id = agent_stream_id(packet.agent_id());
+    let packet_sha256 = run_packet_sha256(packet)?;
+    let kinds = [
+        "agent.run_admitted",
+        "agent.backend_admitted",
+        "agent.local_exit",
+    ];
+    if records.len() > kinds.len()
+        || records
+            .iter()
+            .any(|record| !kinds.contains(&record.kind.as_str()))
+        || kinds
+            .iter()
+            .any(|kind| records.iter().filter(|record| record.kind == *kind).count() > 1)
+    {
+        return Err("ambiguous Agent exit lifecycle source records".into());
+    }
+    let mut admission: Option<RunExitFact> = None;
+    let mut backend_admission: Option<RunExitFact> = None;
+    let mut exited = None;
+    let mut previous_sequence = 0;
+    let mut previous_cursor = 0;
+    for kind in kinds {
+        let key = format!("{kind}:{}", packet.run_id());
+        let Some(event) = records.iter().find(|record| record.kind == kind) else {
+            continue;
+        };
+        if event.scope != RuntimeEventScope::Agent
+            || event.actor.as_deref() != Some("agent_runtime")
+            || event.stream_id != stream_id
+            || event.kind != kind
+            || event.sequence <= previous_sequence
+            || event.sequence > revision
+            || event.commit_cursor <= previous_cursor
+            || event.transaction_index != 0
+        {
+            return Err("untrusted or out-of-order Agent exit lifecycle event".into());
+        }
+        previous_sequence = event.sequence;
+        previous_cursor = event.commit_cursor;
+        let fact: RunExitFact =
+            serde_json::from_value(event.payload.clone()).map_err(|error| error.to_string())?;
+        if !fact.matches(packet, &packet_sha256)? {
+            return Err("Agent exit schema or exact identity mismatch".into());
+        }
+        if event.schema_version != 1
+            || event.idempotency_key.as_deref() != Some(key.as_str())
+            || event.transaction_id
+                != format!(
+                    "{}:{}:{}:{}",
+                    event.kind, fact.run_id, fact.owner_epoch, fact.packet_sha256
+                )
+        {
+            return Err("Agent exit original transaction identity mismatch".into());
+        }
+        if !event
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "run" && reference.id == fact.run_id)
+        {
+            return Err("Agent exit lifecycle run reference missing".into());
+        }
+        match kind {
+            "agent.run_admitted" => {
+                if admission.is_some()
+                    || fact.phase != LocalRunPhase::Admitted
+                    || fact.backend_packet_sha256.is_some()
+                    || fact.process_envelope.is_some()
+                {
+                    return Err("ambiguous Agent run admission".into());
+                }
+                admission = Some(fact);
+            }
+            "agent.backend_admitted" => {
+                let Some(original) = admission.as_ref() else {
+                    return Err("Agent backend admission lacks original run admission".into());
+                };
+                if original.owner_epoch != fact.owner_epoch
+                    || backend_admission.is_some()
+                    || exited.is_some()
+                    || fact.phase != LocalRunPhase::BackendPending
+                    || fact.backend_packet_sha256.is_none()
+                {
+                    return Err("Agent backend admission identity or phase mismatch".into());
+                }
+                backend_admission = Some(fact);
+            }
+            "agent.local_exit" => {
+                let Some(original) = admission.as_ref() else {
+                    return Err("Agent exit lacks original admission".into());
+                };
+                if original.owner_epoch != fact.owner_epoch || exited.is_some() {
+                    return Err("Agent exit owner epoch mismatch or duplicate exit".into());
+                }
+                if let Some(backend) = backend_admission.as_ref() {
+                    if backend.backend_packet_sha256 != fact.backend_packet_sha256
+                        || backend.process_envelope != fact.process_envelope
+                    {
+                        return Err("Agent exit backend packet mismatch".into());
+                    }
+                } else if fact.phase != LocalRunPhase::NotStarted
+                    || fact.backend_packet_sha256.is_some()
+                    || fact.process_envelope.is_some()
+                {
+                    return Err("Agent exit lacks exact backend admission".into());
+                }
+                if matches!(
+                    fact.phase,
+                    LocalRunPhase::Admitted | LocalRunPhase::BackendPending
+                ) {
+                    return Err("Agent exit has no local exit phase".into());
+                }
+                exited = Some(fact);
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(AuthenticatedRunLifecycle {
+        exit: exited,
+        backend: backend_admission,
+        sources: vec![ExpectedStreamRevision {
+            stream_id,
+            expected_revision: revision,
+        }],
+    })
 }
 
 #[derive(Clone)]
 struct RegisteredAgentBackend {
     backend: Arc<dyn AgentRuntimeBackend>,
     observation_authority: bool,
+    process_exit_owner: Option<Arc<crate::ProcessJsonlAdapter>>,
 }
 
 /// Single workspace-scoped owner of agent lifecycle state. The event store is
-/// canonical; the in-memory map is only a replayable command/cache projection.
+/// canonical; original records also retain process-local work to actual exit.
 pub struct AgentRuntime {
     event_store: Arc<RuntimeEventStore>,
     selector: AgentModelSelector,
     catalog: Arc<AgentCatalog>,
-    records: RwLock<BTreeMap<String, AgentRunRecord>>,
-    graph_agent_ids: RwLock<BTreeMap<String, BTreeSet<String>>>,
-    backends: RwLock<BTreeMap<AgentBackendKind, RegisteredAgentBackend>>,
-    process_jsonl_adapter: RwLock<Option<Arc<crate::ProcessJsonlAdapter>>>,
-    services: RwLock<Option<Weak<RuntimeServices>>>,
-    pending_cancellations: Mutex<BTreeSet<String>>,
-    run_locks: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    lifecycle_locks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    records: Arc<RwLock<BTreeMap<String, AgentRunRecord>>>,
+    graph_agent_ids: Arc<RwLock<BTreeMap<String, BTreeSet<String>>>>,
+    backends: Arc<RwLock<BTreeMap<AgentBackendKind, RegisteredAgentBackend>>>,
+    process_jsonl_adapter: Arc<RwLock<Option<Arc<crate::ProcessJsonlAdapter>>>>,
+    services: Arc<RwLock<Option<Weak<RuntimeServices>>>>,
+    pending_cancellations: Arc<Mutex<BTreeSet<(String, String, String, u32)>>>,
+    run_locks: Arc<Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>>,
+    lifecycle_locks: Arc<Mutex<BTreeMap<String, Weak<Mutex<()>>>>>,
+    closing: Arc<AtomicBool>,
+    owner_epoch: Arc<String>,
+    #[cfg(test)]
+    exit_append_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    exit_append_failed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    backend_append_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    backend_append_failed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    run_admission_gate: Arc<Mutex<Option<Arc<ProcessRunAdmissionGate>>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ProcessRunAdmissionGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
 impl AgentRuntime {
+    #[cfg(test)]
+    pub(crate) fn validate_process_fixture_boundary(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Result<(), String> {
+        self.process_jsonl_adapter
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .validate_packet_command(packet)
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_next_process_run_admission(&self) -> Arc<ProcessRunAdmissionGate> {
+        let gate = Arc::new(ProcessRunAdmissionGate::default());
+        *self.run_admission_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+    #[cfg(test)]
+    pub(crate) fn process_fixture_exit_gate(
+        &self,
+        unknown: bool,
+    ) -> Arc<crate::agent_process_jsonl_adapter::ProcessExitGate> {
+        self.process_jsonl_adapter
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .fixture_exit_gate(unknown)
+    }
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) fn install_process_fixture_scratch(
+        &self,
+        root: std::path::PathBuf,
+    ) -> Result<(), String> {
+        self.process_jsonl_adapter
+            .read()
+            .map_err(|_| "Process adapter poisoned")?
+            .as_ref()
+            .ok_or("Process adapter missing")?
+            .install_fixture_scratch(root)
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) fn process_fixture_scratch(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Result<std::path::PathBuf, String> {
+        self.process_jsonl_adapter
+            .read()
+            .map_err(|_| "Process adapter poisoned")?
+            .as_ref()
+            .ok_or("Process adapter missing")?
+            .fixture_scratch_directory(packet)
+    }
+
+    fn shared_owner(&self) -> Self {
+        Self {
+            event_store: self.event_store.clone(),
+            selector: self.selector.clone(),
+            catalog: self.catalog.clone(),
+            records: self.records.clone(),
+            graph_agent_ids: self.graph_agent_ids.clone(),
+            backends: self.backends.clone(),
+            process_jsonl_adapter: self.process_jsonl_adapter.clone(),
+            services: self.services.clone(),
+            pending_cancellations: self.pending_cancellations.clone(),
+            run_locks: self.run_locks.clone(),
+            lifecycle_locks: self.lifecycle_locks.clone(),
+            closing: self.closing.clone(),
+            owner_epoch: self.owner_epoch.clone(),
+            #[cfg(test)]
+            exit_append_failures: self.exit_append_failures.clone(),
+            #[cfg(test)]
+            exit_append_failed: self.exit_append_failed.clone(),
+            #[cfg(test)]
+            backend_append_failures: self.backend_append_failures.clone(),
+            #[cfg(test)]
+            backend_append_failed: self.backend_append_failed.clone(),
+            #[cfg(test)]
+            run_admission_gate: self.run_admission_gate.clone(),
+        }
+    }
+
     #[must_use]
     pub fn new(
         event_store: Arc<RuntimeEventStore>,
@@ -161,14 +596,26 @@ impl AgentRuntime {
             event_store,
             selector: AgentModelSelector::new(provider_registry),
             catalog: Arc::new(AgentCatalog::new()),
-            records: RwLock::new(BTreeMap::new()),
-            graph_agent_ids: RwLock::new(BTreeMap::new()),
-            backends: RwLock::new(BTreeMap::new()),
-            process_jsonl_adapter: RwLock::new(None),
-            services: RwLock::new(None),
-            pending_cancellations: Mutex::new(BTreeSet::new()),
-            run_locks: Mutex::new(BTreeMap::new()),
-            lifecycle_locks: Mutex::new(BTreeMap::new()),
+            records: Arc::new(RwLock::new(BTreeMap::new())),
+            graph_agent_ids: Arc::new(RwLock::new(BTreeMap::new())),
+            backends: Arc::new(RwLock::new(BTreeMap::new())),
+            process_jsonl_adapter: Arc::new(RwLock::new(None)),
+            services: Arc::new(RwLock::new(None)),
+            pending_cancellations: Arc::new(Mutex::new(BTreeSet::new())),
+            run_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            lifecycle_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            closing: Arc::new(AtomicBool::new(false)),
+            owner_epoch: Arc::new(uuid::Uuid::new_v4().to_string()),
+            #[cfg(test)]
+            exit_append_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            exit_append_failed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            backend_append_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            backend_append_failed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            run_admission_gate: Arc::new(Mutex::new(None)),
         };
         runtime.restore_projection();
         runtime
@@ -259,6 +706,7 @@ impl AgentRuntime {
                 RegisteredAgentBackend {
                     backend,
                     observation_authority: false,
+                    process_exit_owner: None,
                 },
             );
     }
@@ -279,6 +727,7 @@ impl AgentRuntime {
                 RegisteredAgentBackend {
                     backend,
                     observation_authority: true,
+                    process_exit_owner: None,
                 },
             );
     }
@@ -290,7 +739,17 @@ impl AgentRuntime {
         &self,
         adapter: Arc<crate::ProcessJsonlAdapter>,
     ) {
-        self.register_observation_authority_backend(adapter.clone());
+        self.backends
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                AgentBackendKind::ProcessJsonl,
+                RegisteredAgentBackend {
+                    backend: adapter.clone(),
+                    observation_authority: true,
+                    process_exit_owner: Some(adapter.clone()),
+                },
+            );
         *self
             .process_jsonl_adapter
             .write()
@@ -337,8 +796,17 @@ impl AgentRuntime {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
+            .filter(|record| {
+                record
+                    .retained
+                    .as_ref()
+                    .is_some_and(|run| !run.physically_exited())
+                    || record
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|run| !run.status.is_terminal())
+            })
             .filter_map(|record| record.snapshot.as_ref())
-            .filter(|run| !run.status.is_terminal())
             .filter_map(|run| run.agentic_binding.as_ref())
             .filter(|binding| binding.program_id == program_id)
             .map(|binding| binding.agent_id.clone())
@@ -377,15 +845,16 @@ impl AgentRuntime {
 
     #[must_use]
     pub fn get(&self, agent_id: &str) -> Option<AgentRunSnapshot> {
-        self.records
+        let cached = self
+            .records
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
-            .and_then(|record| record.snapshot.clone())
-            .or_else(|| {
-                self.latest_durable_record(agent_id)
-                    .and_then(|record| record.snapshot)
-            })
+            .and_then(|record| record.snapshot.clone());
+        cached.or_else(|| {
+            self.latest_durable_record(agent_id)
+                .and_then(|record| record.snapshot)
+        })
     }
 
     /// Return the canonical terminal packet retained with an Agent lifecycle
@@ -393,40 +862,107 @@ impl AgentRuntime {
     /// this read API.
     #[must_use]
     pub fn terminal_return(&self, agent_id: &str) -> Option<AgentReturnPacket> {
-        self.records
+        let cached = self
+            .records
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
-            .and_then(|record| record.returned.clone())
-            .or_else(|| {
-                self.event_store
-                    .list_stream(&agent_stream_id(agent_id))
-                    .ok()?
-                    .into_iter()
-                    .rev()
-                    .filter_map(|event| {
-                        serde_json::from_value::<PersistedAgentEvent>(event.payload).ok()
-                    })
-                    .find_map(|payload| payload.returned)
-            })
+            .and_then(|record| record.returned.clone());
+        cached.or_else(|| {
+            self.latest_agent_payload_at_head(agent_id, |payload| payload.returned.is_some())
+                .ok()?
+                .0
+                .and_then(|payload| payload.returned)
+        })
     }
 
     fn latest_durable_record(&self, agent_id: &str) -> Option<AgentRunRecord> {
-        let event = self
-            .event_store
-            .latest_for_stream(&agent_stream_id(agent_id))
-            .ok()
-            .flatten()?;
-        let payload = serde_json::from_value::<PersistedAgentEvent>(event.payload).ok()?;
-        let mut receipts = BTreeMap::new();
-        if let Some(receipt) = payload.receipt {
-            receipts.insert(receipt.command_id.clone(), receipt);
+        match self.latest_durable_record_at_head(agent_id) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(agent_id, %error, "Agent lifecycle cold lookup failed closed");
+                None
+            }
         }
-        Some(AgentRunRecord {
-            snapshot: Some(payload.snapshot),
-            returned: payload.returned,
-            receipts,
-        })
+    }
+
+    fn latest_durable_record_at_head(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<AgentRunRecord>, String> {
+        let (payload, head) = self.latest_agent_payload_at_head(agent_id, |_| true)?;
+        Ok(payload.map(|mut payload| {
+            payload.snapshot.revision = head;
+            let mut receipts = BTreeMap::new();
+            if let Some(receipt) = payload.receipt {
+                receipts.insert(receipt.command_id.clone(), receipt);
+            }
+            AgentRunRecord {
+                snapshot: Some(payload.snapshot),
+                returned: payload.returned,
+                receipts,
+                retained: None,
+                retiring: Vec::new(),
+                release_after_completion: false,
+            }
+        }))
+    }
+
+    fn latest_agent_payload_at_head(
+        &self,
+        agent_id: &str,
+        select: impl Fn(&PersistedAgentEvent) -> bool,
+    ) -> Result<(Option<PersistedAgentEvent>, u64), String> {
+        let stream_id = agent_stream_id(agent_id);
+        let head = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let mut through = head;
+        while through > 0 {
+            let start = through.saturating_sub(128);
+            let mut cursor = start;
+            let mut latest = None;
+            while cursor < through {
+                let page = self.event_store.list_stream_after(
+                    &stream_id,
+                    cursor,
+                    through,
+                    128,
+                    256 * 1024,
+                )?;
+                let last = page
+                    .last()
+                    .ok_or("Agent lifecycle keyset page has an unexpected gap")?
+                    .sequence;
+                if last <= cursor || last > through {
+                    return Err(
+                        "Agent lifecycle keyset did not advance inside its fixed head".into(),
+                    );
+                }
+                for event in page {
+                    if event.payload.get("snapshot").is_none() {
+                        continue;
+                    }
+                    let payload: PersistedAgentEvent =
+                        serde_json::from_value(event.payload).map_err(|error| error.to_string())?;
+                    if payload.snapshot.agent_id != agent_id
+                        || payload.snapshot.revision != event.sequence
+                    {
+                        return Err("Agent lifecycle snapshot stream identity mismatch".into());
+                    }
+                    if select(&payload) {
+                        latest = Some(payload);
+                    }
+                }
+                cursor = last;
+            }
+            if latest.is_some() {
+                return Ok((latest, head));
+            }
+            through = start;
+        }
+        Ok((None, head))
     }
 
     /// Restore a verified durable run projection during Runtime recovery.
@@ -662,12 +1198,52 @@ impl AgentRuntime {
     }
 
     pub async fn execute_task(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String> {
-        let _run_guard = self.acquire_run_lock(packet.agent_id()).await;
+        let run_guard = self.acquire_run_lock(packet.agent_id()).await;
+        let admitted_packet = self.original_run_packet(&packet)?;
+        let digest = run_packet_sha256(&admitted_packet)?;
+        let retained = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(packet.agent_id())
+            .and_then(|record| {
+                record
+                    .retiring
+                    .iter()
+                    .chain(record.retained.iter())
+                    .find(|run| run.packet_sha256 == digest)
+                    .cloned()
+                    .or_else(|| record.retained.clone())
+            });
+        if let Some(retained) = retained {
+            if retained.packet_sha256 == digest {
+                drop(run_guard);
+                return Self::wait_retained(&retained).await;
+            }
+            if !retained.physically_exited() {
+                return Err("Agent still owns a physical run".into());
+            }
+        }
         if let Some(existing) = self.get(packet.agent_id()) {
-            if existing.run_id == packet.run_id() && existing.status.is_terminal() {
-                return self.terminal_return(packet.agent_id()).ok_or_else(|| {
-                    "terminal AgentRuntime state lacks a canonical return packet".to_string()
-                });
+            if existing.run_id == packet.run_id() {
+                if confirmed_run_exit(&self.event_store, &admitted_packet)?.is_some() {
+                    return self
+                        .latest_agent_payload_at_head(packet.agent_id(), |event| {
+                            event.snapshot.run_id == packet.run_id()
+                                && event.snapshot.graph_id == packet.graph_id()
+                                && event.snapshot.node_id == packet.node_id()
+                                && event.snapshot.attempt == packet.attempt
+                                && event.returned.is_some()
+                        })?
+                        .0
+                        .and_then(|event| event.returned)
+                        .ok_or_else(|| {
+                            "exact exited Agent run lacks a canonical return packet".to_string()
+                        });
+                }
+                return Err(
+                    "original Agent run requires reconciliation; no exact durable exit".into(),
+                );
             }
             if existing.run_id != packet.run_id() && !existing.status.is_terminal() {
                 return Err(format!(
@@ -676,10 +1252,417 @@ impl AgentRuntime {
                 ));
             }
         }
-        let result = self.execute_task_locked(packet.clone()).await;
+        if self
+            .event_store
+            .event_by_idempotency_key(
+                &agent_stream_id(packet.agent_id()),
+                &format!("agent.run_admitted:{}", packet.run_id()),
+            )
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("original Agent admission cannot be replayed as a new owner epoch".into());
+        }
+        let (result, _) = tokio::sync::watch::channel(None);
+        let retained = Arc::new(RetainedAgentRun {
+            packet_sha256: digest.clone(),
+            run_key: run_cancellation_key(&packet),
+            result,
+            join: tokio::sync::Mutex::new(None),
+            pending_exit: Mutex::new(None),
+            exit_committed: AtomicBool::new(false),
+        });
+        let evidence = RunExitFact {
+            schema_version: 1,
+            agent_id: packet.agent_id().into(),
+            run_id: packet.run_id().into(),
+            graph_id: packet.graph_id().into(),
+            node_id: packet.node_id().into(),
+            attempt: packet.attempt,
+            packet_sha256: digest.clone(),
+            backend_packet_sha256: None,
+            owner_epoch: self.owner_epoch.as_ref().clone(),
+            backend: backend_from_packet(&packet)?,
+            phase: LocalRunPhase::Admitted,
+            process_envelope: None,
+        };
+        {
+            let mut records = self
+                .records
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.closing.load(Ordering::Acquire) {
+                drop(records);
+                return self.reject_unstarted_run(
+                    &admitted_packet,
+                    "AgentRuntime admission is fenced for shutdown",
+                );
+            }
+            if records
+                .values()
+                .flat_map(|record| record.retained.iter().chain(record.retiring.iter()))
+                .filter(|run| !run.locally_settled())
+                .count()
+                >= 1024
+            {
+                drop(records);
+                return self.reject_unstarted_run(
+                    &admitted_packet,
+                    "AgentRuntime retained run capacity exhausted",
+                );
+            }
+            let record = records.entry(packet.agent_id().into()).or_default();
+            if let Some(previous) = record.retained.take() {
+                let finishing = previous.result.borrow().is_none();
+                if finishing {
+                    record.retiring.push(previous);
+                }
+            }
+            record.retained = Some(retained.clone());
+            record.release_after_completion = false;
+            let runtime = self.shared_owner();
+            let owned_run = retained.clone();
+            let handle = tokio::spawn(async move {
+                let agent_id = packet.agent_id().to_string();
+                let result = std::panic::AssertUnwindSafe(
+                    runtime.execute_task_owned(packet, run_guard, evidence, &owned_run),
+                )
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err("original Agent run owner completion panicked".into()));
+                owned_run.result.send_replace(Some(result));
+                {
+                    let mut records = runtime
+                        .records
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(record) = records.get_mut(&agent_id) {
+                        record.retiring.retain(|run| !Arc::ptr_eq(run, &owned_run));
+                    }
+                }
+                runtime.release_completed_record(&agent_id);
+            });
+            *retained
+                .join
+                .try_lock()
+                .expect("new retained run join is uncontended") = Some(handle);
+        }
+        Self::wait_retained(&retained).await
+    }
+
+    async fn wait_retained(run: &RetainedAgentRun) -> Result<AgentReturnPacket, String> {
+        let mut receiver = run.result.subscribe();
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| "Agent run completion channel closed".to_string())?;
+        }
+    }
+
+    fn original_run_packet(&self, supplied: &AgentTaskPacket) -> Result<AgentTaskPacket, String> {
+        let Some(services) = self.services() else {
+            return Ok(supplied.clone());
+        };
+        let graph = match services.graph_state_store().load(supplied.graph_id()) {
+            Ok(graph) => graph,
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                return Ok(supplied.clone())
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == supplied.node_id() && node.kind == ExecutionNodeKind::AgentTask)
+            .ok_or("original Agent admission node missing")?;
+        let original: AgentTaskPacket =
+            serde_json::from_str(&node.payload_ref).map_err(|error| error.to_string())?;
+        if original.assignment != supplied.assignment
+            || original.attempt != supplied.attempt
+            || original.expected_graph_revision != supplied.expected_graph_revision
+            || original.binding != supplied.binding
+        {
+            return Err("Agent run does not match its immutable graph admission".into());
+        }
+        Ok(original)
+    }
+
+    fn reject_unstarted_run(
+        &self,
+        packet: &AgentTaskPacket,
+        reason: &str,
+    ) -> Result<AgentReturnPacket, String> {
+        let mut evidence = RunExitFact {
+            schema_version: 1,
+            agent_id: packet.agent_id().into(),
+            run_id: packet.run_id().into(),
+            graph_id: packet.graph_id().into(),
+            node_id: packet.node_id().into(),
+            attempt: packet.attempt,
+            packet_sha256: run_packet_sha256(packet)?,
+            backend_packet_sha256: None,
+            owner_epoch: self.owner_epoch.as_ref().clone(),
+            backend: backend_from_packet(packet)?,
+            phase: LocalRunPhase::Admitted,
+            process_envelope: None,
+        };
+        self.persist_run_fact(&evidence, "agent.run_admitted")?;
+        evidence.phase = LocalRunPhase::NotStarted;
+        self.persist_run_fact(&evidence, "agent.local_exit")?;
+        Err(reason.to_string())
+    }
+
+    pub(crate) fn fence_run_admission(&self) {
+        let _records = self
+            .records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closing.store(true, Ordering::Release);
+    }
+
+    fn release_completed_record(&self, agent_id: &str) {
+        let removed = {
+            let mut records = self
+                .records
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !records.get(agent_id).is_some_and(|record| {
+                record.release_after_completion
+                    && record.retiring.is_empty()
+                    && record
+                        .retained
+                        .as_ref()
+                        .is_none_or(|run| run.locally_settled())
+            }) {
+                return;
+            }
+            records.remove(agent_id)
+        };
+        if let Some(snapshot) = removed.and_then(|record| record.snapshot) {
+            let mut index = self
+                .graph_agent_ids
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(agents) = index.get_mut(&snapshot.graph_id) {
+                agents.remove(agent_id);
+                if agents.is_empty() {
+                    index.remove(&snapshot.graph_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn drain_retained_runs(&self) -> Result<(), String> {
+        self.fence_run_admission();
+        let runs = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flat_map(|record| {
+                record
+                    .retained
+                    .iter()
+                    .chain(record.retiring.iter())
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for run in runs {
+            let mut join = run.join.lock().await;
+            if let Some(handle) = join.as_mut() {
+                if let Err(error) = handle.await {
+                    errors.push(format!("Agent physical run join failed: {error}"));
+                }
+            }
+            join.take();
+            if let Some(Err(error)) = run.result.borrow().as_ref() {
+                errors.push(format!(
+                    "Agent run owner did not complete normally: {error}"
+                ));
+            }
+            if run
+                .pending_exit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_none_or(|evidence| !evidence.positive())
+            {
+                errors.push("Agent physical run finished without authenticated local exit".into());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn persist_run_fact(&self, evidence: &RunExitFact, kind: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if kind == "agent.backend_admitted"
+            && self
+                .backend_append_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            self.backend_append_failed.notify_one();
+            return Err("test injected original Agent backend admission append failure".into());
+        }
+        #[cfg(test)]
+        if kind == "agent.local_exit"
+            && self
+                .exit_append_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            self.exit_append_failed.notify_one();
+            return Err("test injected original Agent exit append failure".into());
+        }
+        let lock = self.lifecycle_lock(&evidence.agent_id);
+        let _guard = lock
+            .lock()
+            .map_err(|_| "Agent lifecycle lock poisoned".to_string())?;
+        let stream_id = agent_stream_id(&evidence.agent_id);
+        let fact_key = format!("{kind}:{}", evidence.run_id);
+        if let Some(event) = self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &fact_key)
+            .map_err(|error| error.to_string())?
+        {
+            if event.kind != kind || event.actor.as_deref() != Some("agent_runtime") {
+                return Err("untrusted original Agent run fact replay".into());
+            }
+            let existing: RunExitFact =
+                serde_json::from_value(event.payload).map_err(|error| error.to_string())?;
+            if existing != *evidence {
+                return Err("conflicting original Agent run fact".into());
+            }
+            self.refresh_run_fact_revision(evidence)?;
+            return Ok(());
+        }
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!(
+                    "{kind}:{}:{}:{}",
+                    evidence.run_id, evidence.owner_epoch, evidence.packet_sha256
+                ),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Agent,
+                        kind: kind.into(),
+                        status: None,
+                        actor: Some("agent_runtime".into()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "run".into(),
+                            id: evidence.run_id.clone(),
+                        }],
+                        payload: serde_json::to_value(evidence)
+                            .map_err(|error| error.to_string())?,
+                    },
+                    idempotency_key: Some(fact_key),
+                    schema_version: 1,
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        self.refresh_run_fact_revision(evidence)?;
+        Ok(())
+    }
+
+    fn refresh_run_fact_revision(&self, evidence: &RunExitFact) -> Result<(), String> {
+        let revision = self
+            .event_store
+            .stream_revision(&agent_stream_id(&evidence.agent_id))
+            .map_err(|error| error.to_string())?;
+        if let Some(snapshot) = self
+            .records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&evidence.agent_id)
+            .and_then(|record| record.snapshot.as_mut())
+        {
+            if snapshot.run_id == evidence.run_id {
+                snapshot.revision = snapshot.revision.max(revision);
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_run_fact_until_durable(&self, evidence: &RunExitFact, kind: &str) {
+        let mut retry_delay = std::time::Duration::from_millis(100);
+        loop {
+            match self.persist_run_fact(evidence, kind) {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(run_id = %evidence.run_id, %error, kind, "retaining original Agent run fact until durable commit");
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    async fn execute_task_owned(
+        &self,
+        packet: AgentTaskPacket,
+        run_guard: tokio::sync::OwnedMutexGuard<()>,
+        mut evidence: RunExitFact,
+        retained: &RetainedAgentRun,
+    ) -> Result<AgentReturnPacket, String> {
+        #[cfg(test)]
+        if evidence.backend == AgentBackendKind::ProcessJsonl {
+            let gate = self.run_admission_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        self.persist_run_fact_until_durable(&evidence, "agent.run_admitted")
+            .await;
+        evidence.phase = LocalRunPhase::NotStarted;
+        let result =
+            std::panic::AssertUnwindSafe(self.execute_task_locked(packet.clone(), &mut evidence))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err("Agent backend owner panicked; physical exit unconfirmed".into())
+                });
+        if evidence.phase == LocalRunPhase::BackendPending {
+            evidence.phase = LocalRunPhase::Unknown;
+        }
+        *retained
+            .pending_exit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence.clone());
+        self.persist_run_fact_until_durable(&evidence, "agent.local_exit")
+            .await;
+        retained.exit_committed.store(true, Ordering::Release);
+        self.pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_cancellation_key(&packet));
         // The next opportunity may choose this same Agent. Never await its
         // dispatch while retaining the previous run's exclusive lock.
-        drop(_run_guard);
+        drop(run_guard);
         if let Some(services) = self.services() {
             // Why a Submitted Task can sit with no reviewer: this reconcile is
             // the only thing that admits Review work after an agent finishes,
@@ -702,14 +1685,19 @@ impl AgentRuntime {
                 tracing::warn!(run_id = packet.run_id(), %error, "Agent attempt settlement awaits durable recovery");
             }
             if let Some(binding) = packet.agentic_binding.as_ref() {
-                match services.dispatch_ready_agentic_work(&binding.program_id).await {
+                match services
+                    .dispatch_ready_agentic_work(&binding.program_id)
+                    .await
+                {
                     Ok(receipts) => tracing::info!(
                         run_id = packet.run_id(),
                         program_id = %binding.program_id,
                         dispatched = receipts.len(),
                         "worker-exit reconcile ran after an agent finished"
                     ),
-                    Err(error) => tracing::warn!(run_id = packet.run_id(), %error, "ready Agent work awaits recovery after worker exit"),
+                    Err(error) => {
+                        tracing::warn!(run_id = packet.run_id(), %error, "ready Agent work awaits recovery after worker exit")
+                    }
                 }
             } else {
                 tracing::info!(
@@ -730,7 +1718,9 @@ impl AgentRuntime {
     async fn execute_task_locked(
         &self,
         packet: AgentTaskPacket,
+        exit_evidence: &mut RunExitFact,
     ) -> Result<AgentReturnPacket, String> {
+        let original_packet = self.original_run_packet(&packet)?;
         let packet = self.attach_predecessor_context(packet).await?;
         let packet = self.ensure_runtime_binding(packet)?;
         let backend_kind = backend_from_packet(&packet)?;
@@ -749,7 +1739,7 @@ impl AgentRuntime {
             .pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(packet.agent_id())
+            .remove(&run_cancellation_key(&packet))
         {
             let returned = cancelled_return(
                 &packet,
@@ -910,7 +1900,7 @@ impl AgentRuntime {
             .pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(packet.agent_id())
+            .remove(&run_cancellation_key(&packet))
         {
             let returned = cancelled_return(
                 &packet,
@@ -969,9 +1959,9 @@ impl AgentRuntime {
         let observation_authority = backend
             .as_ref()
             .is_some_and(|registered| registered.observation_authority);
-        // Both Native and ProcessJsonl share this physical worker lifetime.
-        // The keeper waits for the Agent's own first claim; dropping the
-        // execute future (including cancellation) aborts renewal.
+        let process_exit_owner = backend
+            .as_ref()
+            .and_then(|registered| registered.process_exit_owner.clone());
         let claim_heartbeat = self
             .services()
             .map(|services| {
@@ -979,8 +1969,49 @@ impl AgentRuntime {
             })
             .transpose()?
             .flatten();
-        let mut returned = match backend {
-            Some(registered) => match registered.backend.execute(packet.clone(), selection).await {
+        let mut process_prepared = match &process_exit_owner {
+            Some(adapter) => match adapter
+                .prepare_packet_launch(&original_packet, packet.clone(), &selection)
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    let _ = adapter.take_local_exit_evidence(&packet);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        if backend.is_some() {
+            exit_evidence.backend_packet_sha256 = Some(run_packet_sha256(&packet)?);
+            exit_evidence.phase = LocalRunPhase::BackendPending;
+            exit_evidence.process_envelope = process_prepared
+                .as_ref()
+                .map(|prepared| prepared.envelope().clone());
+            self.persist_run_fact_until_durable(exit_evidence, "agent.backend_admitted")
+                .await;
+            exit_evidence.phase = LocalRunPhase::Unknown;
+        }
+        let cancelled_before_start = self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_cancellation_key(&packet))
+            || self
+                .get(packet.agent_id())
+                .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled);
+        let mut returned = if cancelled_before_start {
+            drop(process_prepared.take());
+            if let Some(adapter) = &process_exit_owner {
+                let _ = adapter.take_local_exit_evidence(&packet);
+            }
+            exit_evidence.phase = LocalRunPhase::NotStarted;
+            cancelled_return(&packet, "cancelled before backend invocation".into())
+        } else {
+            match backend {
+            Some(registered) => match if let Some(prepared) = process_prepared.take() {
+                process_exit_owner.as_ref().ok_or("prepared Process owner missing")?.execute_prepared(prepared).await
+            } else { registered.backend.execute(packet.clone(), selection).await } {
                 Ok(returned) => returned,
                 Err(error) => failed_return(&packet, error),
             },
@@ -990,7 +2021,25 @@ impl AgentRuntime {
                     "agent backend {backend_kind:?} is not installed for this RuntimeServices instance"
                 ),
             ),
+        }
         };
+        if !cancelled_before_start && exit_evidence.backend_packet_sha256.is_some() {
+            if backend_kind == AgentBackendKind::InProcess {
+                exit_evidence.phase = LocalRunPhase::LocalReturned;
+            } else {
+                if let Some(witness) =
+                    process_exit_owner.and_then(|adapter| adapter.take_local_exit_evidence(&packet))
+                {
+                    if witness.matches_packet(&packet) {
+                        if witness.is_reaped() {
+                            exit_evidence.phase = LocalRunPhase::ProcessReaped;
+                        } else if witness.is_not_started() {
+                            exit_evidence.phase = LocalRunPhase::NotStarted;
+                        }
+                    }
+                }
+            }
+        }
         drop(claim_heartbeat);
         if !observation_authority {
             // Extension/process backends may return business output, but they
@@ -1045,7 +2094,7 @@ impl AgentRuntime {
             .pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(packet.agent_id());
+            .remove(&run_cancellation_key(&packet));
         if cancellation_requested
             || self
                 .get(packet.agent_id())
@@ -1345,7 +2394,10 @@ impl AgentRuntime {
     /// New executable packets are compiled before graph registration; Runtime
     /// intentionally rejects an unbound payload rather than selecting a
     /// default Definition during execution or recovery.
-    fn ensure_runtime_binding(&self, mut packet: AgentTaskPacket) -> Result<AgentTaskPacket, String> {
+    fn ensure_runtime_binding(
+        &self,
+        mut packet: AgentTaskPacket,
+    ) -> Result<AgentTaskPacket, String> {
         packet
             .assignment
             .validate()
@@ -1421,18 +2473,34 @@ impl AgentRuntime {
             if let Some(agentic) = packet.agentic_binding.as_mut() {
                 let task_ref = match &agentic.focus {
                     harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref }
-                    | harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => Some(task_ref),
+                    | harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => {
+                        Some(task_ref)
+                    }
                     _ => None,
                 };
                 if let Some(task_ref) = task_ref {
-                    let program = services.agent_action_service().project(&agentic.program_id)
-                        .map_err(|error| format!("AgentTaskPacket purpose source unavailable: {error}"))?;
+                    let program = services
+                        .agent_action_service()
+                        .project(&agentic.program_id)
+                        .map_err(|error| {
+                            format!("AgentTaskPacket purpose source unavailable: {error}")
+                        })?;
                     if program.session_id != session_id {
-                        return Err("AgentTaskPacket purpose source belongs to another Session".into());
+                        return Err(
+                            "AgentTaskPacket purpose source belongs to another Session".into()
+                        );
                     }
-                    let task = program.tasks.get(task_ref).ok_or("AgentTaskPacket purpose source Task missing")?;
-                    if agentic.task_purpose.is_some_and(|purpose| purpose != task.purpose) {
-                        return Err("AgentTaskPacket purpose differs from its immutable Task".into());
+                    let task = program
+                        .tasks
+                        .get(task_ref)
+                        .ok_or("AgentTaskPacket purpose source Task missing")?;
+                    if agentic
+                        .task_purpose
+                        .is_some_and(|purpose| purpose != task.purpose)
+                    {
+                        return Err(
+                            "AgentTaskPacket purpose differs from its immutable Task".into()
+                        );
                     }
                     agentic.task_purpose = Some(task.purpose);
                 }
@@ -1688,7 +2756,7 @@ impl AgentRuntime {
         mut snapshot: AgentRunSnapshot,
         kind: &str,
         message: &str,
-        receipt: Option<AgentCommandReceipt>,
+        mut receipt: Option<AgentCommandReceipt>,
         returned: Option<AgentReturnPacket>,
         evaluation: Option<AgentRunEvaluation>,
         input_event: Option<(
@@ -1756,6 +2824,9 @@ impl AgentRuntime {
             .stream_revision(&stream_id)
             .map_err(|error| error.to_string())?
             .saturating_add(1);
+        if let Some(receipt) = receipt.as_mut().filter(|receipt| receipt.accepted) {
+            receipt.accepted_revision = snapshot.revision;
+        }
         let payload = PersistedAgentEvent {
             snapshot: snapshot.clone(),
             receipt: receipt.clone(),
@@ -2071,8 +3142,22 @@ impl AgentRuntime {
                 .last()
                 .map(|event| (event.commit_cursor, event.transaction_index));
             for event in events {
+                if event.payload.get("snapshot").is_none() {
+                    if let Some(agent_id) = event.stream_id.strip_prefix("agent:") {
+                        if let Some(snapshot) = records
+                            .get_mut(agent_id)
+                            .and_then(|record| record.snapshot.as_mut())
+                        {
+                            snapshot.revision = snapshot.revision.max(event.sequence);
+                        }
+                    }
+                    continue;
+                }
                 let Ok(payload) = serde_json::from_value::<PersistedAgentEvent>(event.payload)
                 else {
+                    if let Some(agent_id) = event.stream_id.strip_prefix("agent:") {
+                        records.remove(agent_id);
+                    }
                     continue;
                 };
                 if payload.snapshot.status.is_terminal() {
@@ -2150,15 +3235,26 @@ impl AgentTaskBackend for AgentRuntime {
         self.pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(packet.agent_id().to_string());
+            .insert(run_cancellation_key(packet));
         let Some(snapshot) = self.get(packet.agent_id()) else {
             return Ok(());
         };
+        if snapshot.run_id != packet.run_id()
+            || snapshot.graph_id != packet.graph_id()
+            || snapshot.node_id != packet.node_id()
+            || snapshot.attempt != packet.attempt
+        {
+            self.pending_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&run_cancellation_key(packet));
+            return Err("Agent cancellation does not match the current exact run".into());
+        }
         if snapshot.status.is_terminal() {
             self.pending_cancellations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(packet.agent_id());
+                .remove(&run_cancellation_key(packet));
             return Ok(());
         }
         let receipt = self
@@ -2179,7 +3275,7 @@ impl AgentTaskBackend for AgentRuntime {
             self.pending_cancellations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(packet.agent_id());
+                .remove(&run_cancellation_key(packet));
             Ok(())
         } else {
             Err(format!(
@@ -2191,31 +3287,48 @@ impl AgentTaskBackend for AgentRuntime {
     }
 
     fn terminal_committed(&self, packet: &AgentTaskPacket) {
-        let removed = self
-            .records
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(packet.agent_id());
-        if removed.is_none() {
-            return;
-        }
-        let mut index = self
-            .graph_agent_ids
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(agent_ids) = index.get_mut(packet.graph_id()) {
-            agent_ids.remove(packet.agent_id());
-            if agent_ids.is_empty() {
-                index.remove(packet.graph_id());
+        {
+            let mut records = self
+                .records
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(record) = records.get_mut(packet.agent_id()) else {
+                return;
+            };
+            if record.snapshot.as_ref().is_none_or(|snapshot| {
+                snapshot.run_id != packet.run_id()
+                    || snapshot.graph_id != packet.graph_id()
+                    || snapshot.node_id != packet.node_id()
+                    || snapshot.attempt != packet.attempt
+            }) {
+                return;
             }
+            record.release_after_completion = true;
         }
+        self.release_completed_record(packet.agent_id());
     }
 
     fn cancellation_finalized(&self, packet: &AgentTaskPacket) {
+        let key = run_cancellation_key(packet);
+        let owned = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(packet.agent_id())
+            .is_some_and(|record| {
+                record
+                    .retained
+                    .iter()
+                    .chain(record.retiring.iter())
+                    .any(|run| run.run_key == key && !run.physically_exited())
+            });
+        if owned {
+            return;
+        }
         self.pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(packet.agent_id());
+            .remove(&key);
     }
 }
 
@@ -2596,6 +3709,58 @@ mod tests {
     use harness_contract::context::ChildExecutionBudgetReservation;
 
     #[test]
+    fn own834_governed_exit_keeps_process_envelope_requirement() {
+        for backend in [AgentBackendKind::InProcess, AgentBackendKind::ProcessJsonl] {
+            for phase in [
+                LocalRunPhase::Admitted,
+                LocalRunPhase::BackendPending,
+                LocalRunPhase::LocalReturned,
+                LocalRunPhase::ProcessReaped,
+                LocalRunPhase::NotStarted,
+                LocalRunPhase::Unknown,
+            ] {
+                for backend_digest in [None, Some("a".repeat(64))] {
+                    let fact = RunExitFact {
+                        schema_version: 1,
+                        agent_id: "agent".into(),
+                        run_id: "run".into(),
+                        graph_id: "graph".into(),
+                        node_id: "node".into(),
+                        attempt: 1,
+                        packet_sha256: "b".repeat(64),
+                        backend_packet_sha256: backend_digest.clone(),
+                        owner_epoch: uuid::Uuid::new_v4().to_string(),
+                        backend,
+                        phase: phase.clone(),
+                        process_envelope: None,
+                    };
+                    let expected = phase == LocalRunPhase::NotStarted
+                        || (backend == AgentBackendKind::InProcess
+                            && phase == LocalRunPhase::LocalReturned
+                            && backend_digest.is_some());
+                    let lifecycle = AuthenticatedRunLifecycle {
+                        exit: Some(fact.clone()),
+                        backend: Some(fact),
+                        sources: Vec::new(),
+                    };
+                    assert_eq!(lifecycle.closed_for_governed_effects(), expected);
+                    assert_eq!(
+                        lifecycle.no_direct_effects(),
+                        phase == LocalRunPhase::NotStarted,
+                    );
+                }
+            }
+        }
+        let missing = AuthenticatedRunLifecycle {
+            exit: None,
+            backend: None,
+            sources: Vec::new(),
+        };
+        assert!(!missing.closed_for_governed_effects());
+        assert!(!missing.no_direct_effects());
+    }
+
+    #[test]
     fn canonical_predecessor_section_preserves_complete_role_result() {
         let outcome = format!(
             "verified {} COMPLETE_INVESTIGATOR_TAIL",
@@ -2610,6 +3775,1063 @@ mod tests {
     }
 
     struct CompletedBackend(AgentBackendKind);
+
+    struct HeldExitBackend {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: std::sync::atomic::AtomicUsize,
+        returned_status: Option<AgentTerminalStatus>,
+        panic_on_return: bool,
+        reject_commands: AtomicBool,
+    }
+
+    #[async_trait]
+    impl AgentRuntimeBackend for HeldExitBackend {
+        fn kind(&self) -> AgentBackendKind {
+            AgentBackendKind::InProcess
+        }
+        fn capabilities(&self) -> AgentBackendCapabilities {
+            AgentBackendCapabilities::in_process()
+        }
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            selection: AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            assert!(
+                !self.panic_on_return,
+                "controlled backend panic is not exit evidence"
+            );
+            match self.returned_status {
+                Some(status) => {
+                    let mut returned = CompletedBackend(AgentBackendKind::InProcess)
+                        .execute(packet, selection)
+                        .await?;
+                    returned.status = status;
+                    Ok(returned)
+                }
+                None => Err("controlled ordinary local backend error".into()),
+            }
+        }
+        async fn command(
+            &self,
+            _: &AgentRunHandle,
+            _: &AgentCommandRequest,
+        ) -> Result<(), AgentCommandRejectReason> {
+            if self.reject_commands.load(Ordering::SeqCst) {
+                Err(AgentCommandRejectReason::UnsupportedByBackend)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn held_exit_runtime(
+        status: Option<AgentTerminalStatus>,
+        panic_on_return: bool,
+    ) -> (Arc<AgentRuntime>, Arc<HeldExitBackend>) {
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        let backend = Arc::new(HeldExitBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            returned_status: status,
+            panic_on_return,
+            reject_commands: AtomicBool::new(false),
+        });
+        runtime.register_observation_authority_backend(backend.clone());
+        (runtime, backend)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_prepared_admission_failure_never_launches_or_rebinds() {
+        for cancel in [false, true] {
+            let (_temporary, _services, adapter, packet) =
+                crate::agent_process_jsonl_adapter::tests::driver_exit_fixture();
+            let adapter = Arc::new(adapter);
+            let runtime = Arc::new(AgentRuntime::new(
+                Arc::new(RuntimeEventStore::for_test()),
+                configured_registry(),
+            ));
+            runtime.register_runtime_process_jsonl_backend(adapter.clone());
+            runtime
+                .backend_append_failures
+                .store(1000, Ordering::SeqCst);
+            let supplied = packet.clone();
+            let owner = runtime.clone();
+            let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                runtime.backend_append_failed.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(adapter.fixture_spawn_count(), 0);
+            assert_eq!(adapter.fixture_prepare_count(), 1);
+            let stream = agent_stream_id(packet.agent_id());
+            assert!(runtime
+                .event_store
+                .event_by_idempotency_key(
+                    &stream,
+                    &format!("agent.backend_admitted:{}", packet.run_id())
+                )
+                .unwrap()
+                .is_none());
+            let pending = runtime
+                .records
+                .read()
+                .unwrap()
+                .get(packet.agent_id())
+                .unwrap()
+                .retained
+                .clone()
+                .unwrap();
+            assert!(!pending.physically_exited());
+            let binding = packet.binding.as_ref().unwrap();
+            let (command_ref, command_digest) = match &binding.executor {
+                harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
+                    command_ref,
+                    command_digest,
+                } => (command_ref, command_digest),
+                _ => panic!("driver fixture must have a real approved Process definition"),
+            };
+            let changed = crate::ProcessJsonlSpec::new(command_ref, "another-worker.py", vec![]);
+            assert_ne!(&changed.command_digest, command_digest);
+            assert!(adapter.register_command(changed).is_err());
+            if cancel {
+                let snapshot = runtime.get(packet.agent_id()).unwrap();
+                assert!(
+                    runtime
+                        .command(AgentCommandRequest {
+                            command_id: "cancel-during-backend-admission-retry".into(),
+                            agent_id: packet.agent_id().into(),
+                            expected_revision: snapshot.revision,
+                            command: AgentCommand::Cancel,
+                            input: None,
+                        })
+                        .await
+                        .accepted
+                );
+            }
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                adapter.fixture_spawn_count(),
+                0,
+                "caller abort must not release or execute the carrier"
+            );
+            runtime.backend_append_failures.store(0, Ordering::SeqCst);
+            let returned = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                runtime.execute_task(packet.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(adapter.fixture_spawn_count(), usize::from(!cancel));
+            assert_eq!(
+                adapter.fixture_prepare_count(),
+                1,
+                "admission retry must retain the same prepared carrier"
+            );
+            let (exit, _) = confirmed_run_exit(&runtime.event_store, &packet)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                exit.fact.phase,
+                if cancel {
+                    LocalRunPhase::NotStarted
+                } else {
+                    LocalRunPhase::ProcessReaped
+                }
+            );
+            let admission = runtime
+                .event_store
+                .event_by_idempotency_key(
+                    &stream,
+                    &format!("agent.backend_admitted:{}", packet.run_id()),
+                )
+                .unwrap()
+                .unwrap();
+            let admitted: RunExitFact = serde_json::from_value(admission.payload.clone()).unwrap();
+            assert_eq!(admitted.process_envelope, exit.fact.process_envelope);
+            assert_eq!(
+                admitted.backend_packet_sha256,
+                exit.fact.backend_packet_sha256
+            );
+            assert!(admitted.process_envelope.is_some());
+            assert!(!admission.payload.to_string().contains("environment_refs"));
+            assert!(admission.payload.get("argv").is_none());
+            let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
+            restarted.register_runtime_process_jsonl_backend(adapter.clone());
+            assert_eq!(
+                restarted.execute_task(packet.clone()).await.unwrap(),
+                returned
+            );
+            assert_eq!(adapter.fixture_spawn_count(), usize::from(!cancel));
+            if cancel {
+                continue;
+            }
+            let events = [
+                "agent.run_admitted",
+                "agent.backend_admitted",
+                "agent.local_exit",
+            ]
+            .map(|kind| {
+                runtime
+                    .event_store
+                    .event_by_idempotency_key(&stream, &format!("{kind}:{}", packet.run_id()))
+                    .unwrap()
+                    .unwrap()
+            });
+            for defect in [
+                "legacy",
+                "version",
+                "enforcement",
+                "original_packet_sha256",
+                "backend_packet_sha256",
+                "command_ref",
+                "command_digest",
+                "workspace",
+                "workspace_writable",
+                "network_enabled",
+                "policy_revision",
+                "policy_digest",
+                "network_restrictions_digest",
+                "private_network_allowed",
+                "hardened",
+                "protected_roots_denied",
+                "inherited_fds_closed",
+                "environment_allowlist_enforced",
+                "piped_stdio",
+                "control_scratch",
+                "digest",
+                "exit-mismatch",
+            ] {
+                let negative = RuntimeEventStore::for_test();
+                let mut copied = events.clone();
+                for event in &mut copied[1..] {
+                    if defect == "legacy" {
+                        event
+                            .payload
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("process_envelope");
+                    } else if defect == "exit-mismatch" {
+                        if event.kind == "agent.local_exit" {
+                            event
+                                .payload
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("process_envelope");
+                        }
+                    } else {
+                        let value = &mut event.payload["process_envelope"][defect];
+                        *value = match defect {
+                            "version" => serde_json::json!(999),
+                            "policy_revision" => serde_json::json!(999),
+                            "workspace" | "control_scratch" => serde_json::json!("/foreign/root"),
+                            _ if value.is_boolean() => serde_json::json!(!value.as_bool().unwrap()),
+                            _ => serde_json::json!("foreign"),
+                        };
+                    }
+                }
+                for event in copied {
+                    let revision = negative.stream_revision(&stream).unwrap();
+                    negative
+                        .append_transaction(AppendTransactionRequest {
+                            transaction_id: event.transaction_id,
+                            expected_streams: vec![ExpectedStreamRevision {
+                                stream_id: stream.clone(),
+                                expected_revision: revision,
+                            }],
+                            events: vec![
+                                crate::runtime_event_store::RuntimeTransactionEventInput {
+                                    event: RuntimeEventInput {
+                                        stream_id: stream.clone(),
+                                        scope: event.scope,
+                                        kind: event.kind,
+                                        status: event.status,
+                                        actor: event.actor,
+                                        refs: event.refs,
+                                        payload: event.payload,
+                                    },
+                                    idempotency_key: event.idempotency_key,
+                                    schema_version: event.schema_version,
+                                },
+                            ],
+                        })
+                        .unwrap();
+                }
+                if defect == "legacy" {
+                    assert!(confirmed_run_exit(&negative, &packet).unwrap().is_some());
+                    assert!(!authenticated_run_lifecycle(&negative, &packet)
+                        .unwrap()
+                        .no_direct_effects());
+                } else {
+                    assert!(
+                        authenticated_run_lifecycle(&negative, &packet).is_err(),
+                        "explicit test-only negative injection: {defect}"
+                    );
+                }
+            }
+            runtime.drain_retained_runs().await.unwrap();
+        }
+
+        for freeze in [false, true] {
+            let fixture =
+                crate::agentic::execution::reviewed_goal_fixture::PhysicalProcessFixture::new(
+                    crate::config::AgentExecutorSandboxProfile::WorkspaceReadWrite,
+                    if freeze {
+                        "prepared-real-freeze"
+                    } else {
+                        "prepared-real-revision"
+                    },
+                )
+                .await;
+            let runtime = fixture.services.agent_runtime();
+            runtime
+                .backend_append_failures
+                .store(1000, Ordering::SeqCst);
+            let worker = fixture
+                .dispatch(
+                    "prepared-real-transition",
+                    vec!["read:.".into()],
+                    false,
+                    false,
+                    false,
+                )
+                .await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                runtime.backend_append_failed.notified(),
+            )
+            .await
+            .unwrap();
+            let adapter = runtime
+                .process_jsonl_adapter
+                .read()
+                .unwrap()
+                .clone()
+                .unwrap();
+            assert_eq!(adapter.fixture_prepare_count(), 1);
+            assert_eq!(adapter.fixture_spawn_count(), 0);
+            assert!(!worker.directory().join("started.json").exists());
+            worker.withdraw().await;
+            if freeze {
+                fixture.services.freeze_session_execution_policy_admission(
+                    worker.packet.session_id(),
+                    "physical-transition",
+                );
+            } else {
+                let control = fixture
+                    .services
+                    .session_execution_policy_control(worker.packet.session_id())
+                    .unwrap();
+                let original = control.snapshot();
+                control
+                    .replace(
+                        harness_contract::policy::SessionExecutionPolicy::from_profile(
+                            harness_contract::policy::AutonomyProfileId::Cautious,
+                            original.revision + 1,
+                            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+                        ),
+                    )
+                    .unwrap();
+            }
+            runtime.backend_append_failures.store(0, Ordering::SeqCst);
+            worker.wait_terminal().await;
+            let reason = worker.terminal_failure();
+            assert!(
+                reason.contains("physical_grant")
+                    && (reason.contains("frozen") || reason.contains("revision")),
+                "{reason}"
+            );
+            let (exit, _) = confirmed_run_exit(fixture.services.event_store(), &worker.packet)
+                .unwrap()
+                .unwrap();
+            assert_eq!(exit.fact.phase, LocalRunPhase::NotStarted);
+            assert!(
+                exit.fact.process_envelope.is_some(),
+                "post-admission NotStarted must retain the same prepared facts"
+            );
+            assert_eq!(adapter.fixture_spawn_count(), 0);
+            assert_eq!(adapter.fixture_prepare_count(), 1);
+            assert!(
+                !worker.directory().exists(),
+                "discarded unspawned carrier owns exact scratch cleanup"
+            );
+            if freeze {
+                assert!(fixture
+                    .services
+                    .unfreeze_session_execution_policy_admission(
+                        worker.packet.session_id(),
+                        "physical-transition"
+                    ));
+            }
+            println!(
+                "PHYSICAL_PREPARED_TRANSITION freeze={freeze} same_carrier=true actual_spawn=0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_exit_ack_and_caller_drop_retain_the_original_run() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), false);
+        let packet = task("exact-exit-drop");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        let snapshot = runtime.get(packet.agent_id()).unwrap();
+        let receipt = runtime
+            .command(AgentCommandRequest {
+                command_id: "ack-only".into(),
+                agent_id: packet.agent_id().into(),
+                expected_revision: snapshot.revision,
+                command: AgentCommand::Cancel,
+                input: None,
+            })
+            .await;
+        assert!(receipt.accepted);
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        AgentTaskBackend::terminal_committed(runtime.as_ref(), &packet);
+        assert!(runtime
+            .records
+            .read()
+            .unwrap()
+            .get(packet.agent_id())
+            .unwrap()
+            .retained
+            .is_some());
+        backend.release.notify_one();
+        let returned = runtime.execute_task(packet.clone()).await.unwrap();
+        assert_eq!(returned.status, AgentTerminalStatus::Cancelled);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let (evidence, _) = confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.fact.phase, LocalRunPhase::LocalReturned);
+        let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
+        assert_eq!(
+            confirmed_run_exit(&restarted.event_store, &packet)
+                .unwrap()
+                .unwrap()
+                .0,
+            evidence
+        );
+        assert_eq!(
+            restarted.execute_task(packet.clone()).await.unwrap().status,
+            AgentTerminalStatus::Cancelled
+        );
+        assert_ne!(restarted.owner_epoch, runtime.owner_epoch);
+    }
+
+    #[tokio::test]
+    async fn projection_426_cut_reader_reuses_authentication_without_future_event_invariants() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), false);
+        let packet = task("projection-cut-426");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        let cut = runtime.event_store.durable_commit_cursor().unwrap();
+        backend.release.notify_one();
+        assert_eq!(
+            caller.await.unwrap().unwrap().status,
+            AgentTerminalStatus::Completed
+        );
+        let stream = agent_stream_id(packet.agent_id());
+        let head = runtime.event_store.stream_revision(&stream).unwrap();
+        let records = [
+            "agent.run_admitted",
+            "agent.backend_admitted",
+            "agent.local_exit",
+        ]
+        .iter()
+        .map(|kind| {
+            Arc::new(
+                runtime
+                    .event_store
+                    .event_by_idempotency_key(&stream, &format!("{kind}:{}", packet.run_id()))
+                    .unwrap()
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+        assert!(records.last().unwrap().commit_cursor > cut);
+        let at_cut = records
+            .iter()
+            .filter(|record| record.commit_cursor <= cut)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!projection_run_closed_from_records(&packet, head, &at_cut).unwrap());
+        assert!(projection_run_closed_from_records(&packet, head, &records).unwrap());
+        let mut forged = records.clone();
+        let mut exit = (*forged.pop().unwrap()).clone();
+        exit.payload["owner_epoch"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        forged.push(Arc::new(exit));
+        assert!(projection_run_closed_from_records(&packet, head, &forged).is_err());
+        let mut duplicate = records.clone();
+        duplicate.push(records.last().unwrap().clone());
+        assert!(projection_run_closed_from_records(&packet, head, &duplicate).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_exit_finalization_and_stale_cancel_cannot_erase_live_run_intent() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), false);
+        let packet = task("exact-exit-finalization");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        backend.reject_commands.store(true, Ordering::SeqCst);
+        assert!(AgentTaskBackend::cancel(runtime.as_ref(), &packet)
+            .await
+            .is_err());
+        assert!(runtime
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .contains(&run_cancellation_key(&packet)));
+        AgentTaskBackend::cancellation_finalized(runtime.as_ref(), &packet);
+        let mut stale = packet.clone();
+        stale.attempt += 1;
+        assert!(AgentTaskBackend::cancel(runtime.as_ref(), &stale)
+            .await
+            .is_err());
+        AgentTaskBackend::cancellation_finalized(runtime.as_ref(), &stale);
+        assert!(runtime
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .contains(&run_cancellation_key(&packet)));
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        backend.release.notify_one();
+        assert_eq!(
+            caller.await.unwrap().unwrap().status,
+            AgentTerminalStatus::Cancelled
+        );
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_some());
+        assert!(!runtime
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .contains(&run_cancellation_key(&packet)));
+    }
+
+    #[tokio::test]
+    async fn exact_exit_failed_cancelled_and_local_errors_are_not_remote_exit_claims() {
+        for status in [
+            Some(AgentTerminalStatus::Failed),
+            Some(AgentTerminalStatus::Cancelled),
+            None,
+        ] {
+            let (runtime, backend) = held_exit_runtime(status, false);
+            let packet = task("exact-exit-errors");
+            let owner = runtime.clone();
+            let supplied = packet.clone();
+            let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+            backend.entered.notified().await;
+            assert!(confirmed_run_exit(&runtime.event_store, &packet)
+                .unwrap()
+                .is_none());
+            let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
+            assert!(restarted.execute_task(packet.clone()).await.is_err());
+            assert!(confirmed_run_exit(&restarted.event_store, &packet)
+                .unwrap()
+                .is_none());
+            backend.release.notify_one();
+            caller.await.unwrap().unwrap();
+            let (fact, sources) = confirmed_run_exit(&runtime.event_store, &packet)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fact.fact.phase, LocalRunPhase::LocalReturned);
+            let mut wrong = packet.clone();
+            wrong.attempt += 1;
+            assert!(confirmed_run_exit(&runtime.event_store, &wrong).is_err());
+            wrong = packet.clone();
+            wrong.objective.push_str("foreign digest");
+            assert!(confirmed_run_exit(&runtime.event_store, &wrong).is_err());
+            wrong = packet.clone();
+            wrong.assignment = crate::test_support::agent_assignment(
+                Some(packet.assignment.definition_ref.clone()),
+                packet.agent_id(),
+                "foreign-run",
+                packet.task_id(),
+                packet.session_id(),
+                packet.mission_id(),
+                packet.team_id(),
+                packet.graph_id(),
+                packet.node_id(),
+            );
+            assert!(confirmed_run_exit(&runtime.event_store, &wrong)
+                .unwrap()
+                .is_none());
+            runtime
+                .event_store
+                .append(RuntimeEventInput {
+                    stream_id: agent_stream_id(packet.agent_id()),
+                    scope: RuntimeEventScope::Agent,
+                    kind: "test.source_advanced".into(),
+                    status: None,
+                    actor: Some("test".into()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+            let stale = runtime
+                .event_store
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: "exact-exit-stale-source".into(),
+                    expected_streams: sources,
+                    events: vec![RuntimeEventInput {
+                        stream_id: agent_stream_id(packet.agent_id()),
+                        scope: RuntimeEventScope::Agent,
+                        kind: "test.must_not_commit".into(),
+                        status: None,
+                        actor: Some("test".into()),
+                        refs: Vec::new(),
+                        payload: serde_json::json!({}),
+                    }
+                    .into()],
+                });
+            assert!(stale.is_err());
+            assert!(runtime
+                .event_store
+                .list_stream(&agent_stream_id(packet.agent_id()))
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "test.must_not_commit"));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_exit_drain_survives_an_interrupted_wait_and_fences_admission() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), false);
+        let packet = task("exact-exit-drain");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        caller.abort();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            runtime.drain_retained_runs()
+        )
+        .await
+        .is_err());
+        assert!(runtime
+            .execute_task(task("fenced-new-run"))
+            .await
+            .unwrap_err()
+            .contains("shutdown"));
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        backend.release.notify_one();
+        runtime.drain_retained_runs().await.unwrap();
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_some());
+        runtime.drain_retained_runs().await.unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_exit_append_failure_retains_the_original_fact_until_retry() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), false);
+        let packet = task("exact-exit-append-failure");
+        runtime.exit_append_failures.store(1000, Ordering::SeqCst);
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        caller.abort();
+        backend.release.notify_one();
+        runtime.exit_append_failed.notified().await;
+        let retained = runtime
+            .records
+            .read()
+            .unwrap()
+            .get(packet.agent_id())
+            .unwrap()
+            .retained
+            .clone()
+            .unwrap();
+        let original = retained.pending_exit.lock().unwrap().clone().unwrap();
+        assert_eq!(original.phase, LocalRunPhase::LocalReturned);
+        assert!(!retained.exit_committed.load(Ordering::Acquire));
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            runtime.drain_retained_runs()
+        )
+        .await
+        .is_err());
+        runtime.exit_append_failures.store(0, Ordering::SeqCst);
+        runtime.drain_retained_runs().await.unwrap();
+        let (proof, _) = confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.fact, original);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime
+                .event_store
+                .list_stream(&agent_stream_id(packet.agent_id()))
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "agent.local_exit")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_exit_panic_and_unwitnessed_process_return_stay_unknown() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), true);
+        let packet = task("exact-exit-panic");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        backend.release.notify_one();
+        assert!(caller.await.unwrap().is_err());
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        assert!(runtime.drain_retained_runs().await.is_err());
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        );
+        runtime.register_backend(Arc::new(CompletedBackend(AgentBackendKind::ProcessJsonl)));
+        let mut packet = task("exact-exit-process-no-os-owner");
+        packet.binding.as_mut().unwrap().executor =
+            harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
+                command_ref: "test/no-os-owner".into(),
+                command_digest: "a".repeat(64),
+            };
+        runtime.execute_task(packet.clone()).await.unwrap();
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        assert!(runtime.drain_retained_runs().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_exit_explicit_not_started_is_durable_without_a_backend() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            Arc::new(ProviderRegistry::empty()),
+        );
+        let packet = task("exact-exit-not-started");
+        runtime.execute_task(packet.clone()).await.unwrap();
+        let (fact, _) = confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.fact.phase, LocalRunPhase::NotStarted);
+        assert!(fact.fact.backend_packet_sha256.is_none());
+        let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
+        assert_eq!(
+            confirmed_run_exit(&restarted.event_store, &packet)
+                .unwrap()
+                .unwrap()
+                .0,
+            fact
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_exit_foreign_epoch_and_unknown_schema_cannot_extend_a_real_witness() {
+        for mutation in ["owner_epoch", "schema_version", "node_id"] {
+            let runtime = AgentRuntime::new(
+                Arc::new(RuntimeEventStore::for_test()),
+                configured_registry(),
+            );
+            runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+                AgentBackendKind::InProcess,
+            )));
+            let packet = task("exact-exit-forged-suffix");
+            runtime.execute_task(packet.clone()).await.unwrap();
+            let (fact, _) = confirmed_run_exit(&runtime.event_store, &packet)
+                .unwrap()
+                .unwrap();
+            let mut invalid = serde_json::to_value(fact.fact.clone()).unwrap();
+            invalid[mutation] = if mutation == "schema_version" {
+                serde_json::json!(999)
+            } else {
+                serde_json::json!("foreign")
+            };
+            let invalid: RunExitFact = serde_json::from_value(invalid).unwrap();
+            assert!(runtime
+                .persist_run_fact(&invalid, "agent.local_exit")
+                .is_err());
+            assert_eq!(
+                confirmed_run_exit(&runtime.event_store, &packet)
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                fact
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_exit_point_lookup_rejects_out_of_order_or_foreign_indexed_facts() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        );
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::InProcess,
+        )));
+        let packet = task("exact-exit-indexed-negative");
+        runtime.execute_task(packet.clone()).await.unwrap();
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_some());
+        let stream = agent_stream_id(packet.agent_id());
+        let mut original = Vec::new();
+        for kind in [
+            "agent.run_admitted",
+            "agent.backend_admitted",
+            "agent.local_exit",
+        ] {
+            original.push(
+                runtime
+                    .event_store
+                    .event_by_idempotency_key(&stream, &format!("{kind}:{}", packet.run_id()))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        for defect in ["order", "epoch", "backend_digest", "actor", "phase"] {
+            let negative_store = RuntimeEventStore::for_test();
+            let mut events = original.clone();
+            match defect {
+                "order" => events.swap(1, 2),
+                "epoch" => {
+                    events[2].payload["owner_epoch"] = serde_json::json!("foreign-epoch");
+                    events[2].transaction_id = format!(
+                        "agent.local_exit:{}:foreign-epoch:{}",
+                        packet.run_id(),
+                        run_packet_sha256(&packet).unwrap()
+                    );
+                }
+                "backend_digest" => {
+                    events[2].payload["backend_packet_sha256"] = serde_json::json!("f".repeat(64))
+                }
+                "actor" => events[2].actor = Some("untrusted_supervisor".into()),
+                "phase" => events[2].payload["phase"] = serde_json::json!("admitted"),
+                _ => unreachable!(),
+            }
+            for event in events {
+                let revision = negative_store.stream_revision(&stream).unwrap();
+                negative_store
+                    .append_transaction(AppendTransactionRequest {
+                        transaction_id: event.transaction_id,
+                        expected_streams: vec![ExpectedStreamRevision {
+                            stream_id: stream.clone(),
+                            expected_revision: revision,
+                        }],
+                        events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                            event: RuntimeEventInput {
+                                stream_id: stream.clone(),
+                                scope: event.scope,
+                                kind: event.kind,
+                                status: event.status,
+                                actor: event.actor,
+                                refs: event.refs,
+                                payload: event.payload,
+                            },
+                            idempotency_key: event.idempotency_key,
+                            schema_version: event.schema_version,
+                        }],
+                    })
+                    .unwrap();
+            }
+            assert!(
+                confirmed_run_exit(&negative_store, &packet).is_err(),
+                "{defect}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_exit_legacy_terminal_is_not_a_local_witness() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        );
+        let packet = task("exact-exit-legacy");
+        let returned = CompletedBackend(AgentBackendKind::InProcess)
+            .execute(
+                packet.clone(),
+                AgentModelSelection {
+                    model: "fast".into(),
+                    provider: "test".into(),
+                    registry_revision: 1,
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .import_legacy_state_records(
+                "exact-exit-legacy-source",
+                vec![LegacyAgentStateRecord {
+                    source_ref: "legacy/exact-exit".into(),
+                    snapshot: legacy_snapshot(&packet, AgentStatus::Completed),
+                    returned: Some(returned),
+                }],
+            )
+            .unwrap();
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
+        assert!(confirmed_run_exit(&restarted.event_store, &packet)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_exit_physical_sequences_fence_old_commands_and_receipts() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), false);
+        let packet = task("exact-exit-command-revisions");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        let stream = agent_stream_id(packet.agent_id());
+        let running = runtime
+            .event_store
+            .latest_for_stream_kind(&stream, "agent.running")
+            .unwrap()
+            .unwrap();
+        assert!(runtime.get(packet.agent_id()).unwrap().revision > running.sequence);
+        let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
+        assert_eq!(
+            restarted.get(packet.agent_id()).unwrap().revision,
+            runtime.event_store.stream_revision(&stream).unwrap()
+        );
+        let stale = runtime
+            .command(AgentCommandRequest {
+                command_id: "before-physical-sequence".into(),
+                agent_id: packet.agent_id().into(),
+                expected_revision: running.sequence,
+                command: AgentCommand::Cancel,
+                input: None,
+            })
+            .await;
+        assert!(!stale.accepted);
+        assert_eq!(
+            stale.reject_reason,
+            Some(AgentCommandRejectReason::StaleRevision)
+        );
+        let receipt = runtime
+            .command(AgentCommandRequest {
+                command_id: "current-physical-sequence".into(),
+                agent_id: packet.agent_id().into(),
+                expected_revision: runtime.get(packet.agent_id()).unwrap().revision,
+                command: AgentCommand::Cancel,
+                input: None,
+            })
+            .await;
+        assert!(receipt.accepted);
+        let command = runtime
+            .event_store
+            .latest_for_stream_kind(&stream, "agent.command")
+            .unwrap()
+            .unwrap();
+        let payload: PersistedAgentEvent = serde_json::from_value(command.payload).unwrap();
+        assert_eq!(receipt.accepted_revision, command.sequence);
+        assert_eq!(payload.receipt.unwrap().accepted_revision, command.sequence);
+        assert_eq!(
+            runtime.get(packet.agent_id()).unwrap().revision,
+            command.sequence
+        );
+        backend.release.notify_one();
+        caller.await.unwrap().unwrap();
+        assert!(runtime.get(packet.agent_id()).unwrap().revision > receipt.accepted_revision);
+    }
+
+    #[tokio::test]
+    async fn exact_exit_cold_lookup_crosses_arbitrary_physical_pages_at_a_fixed_head() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        );
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::InProcess,
+        )));
+        let packet = task("exact-exit-keyset");
+        runtime.execute_task(packet.clone()).await.unwrap();
+        let stream = agent_stream_id(packet.agent_id());
+        for index in 0..400 {
+            runtime
+                .event_store
+                .append(RuntimeEventInput {
+                    stream_id: stream.clone(),
+                    scope: RuntimeEventScope::Agent,
+                    kind: "test.physical_page_tail".into(),
+                    status: None,
+                    actor: Some("test".into()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"index": index}),
+                })
+                .unwrap();
+        }
+        let head = runtime.event_store.stream_revision(&stream).unwrap();
+        let changed = AtomicBool::new(false);
+        let (found, pinned) = runtime
+            .latest_agent_payload_at_head(packet.agent_id(), |_| {
+                if !changed.swap(true, Ordering::SeqCst) {
+                    let mut snapshot = runtime.get(packet.agent_id()).unwrap();
+                    snapshot.status = AgentStatus::Cancelled;
+                    runtime
+                        .persist_snapshot(
+                            snapshot,
+                            "agent.command_rejected",
+                            "test concurrent logical head",
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                }
+                true
+            })
+            .unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(pinned, head);
+        assert_eq!(found.unwrap().snapshot.status, AgentStatus::Completed);
+        let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
+        let current = restarted.get(packet.agent_id()).unwrap();
+        assert_eq!(current.status, AgentStatus::Cancelled);
+        assert_eq!(
+            current.revision,
+            runtime.event_store.stream_revision(&stream).unwrap()
+        );
+        assert!(restarted.terminal_return(packet.agent_id()).is_some());
+    }
 
     struct ClaimLifetimeBackend {
         kind: AgentBackendKind,
@@ -2839,11 +5061,17 @@ mod tests {
                 ));
                 runtime.bind_services(services.clone());
                 let normalized = runtime.ensure_runtime_binding(packet.clone()).unwrap();
-                assert_eq!(normalized.agentic_binding.as_ref().unwrap().task_purpose,
-                    Some(harness_contract::agent_action::TaskPurpose::Delivery));
+                assert_eq!(
+                    normalized.agentic_binding.as_ref().unwrap().task_purpose,
+                    Some(harness_contract::agent_action::TaskPurpose::Delivery)
+                );
                 let mut tampered = packet.clone();
-                tampered.agentic_binding.as_mut().unwrap().task_purpose = Some(harness_contract::agent_action::TaskPurpose::Exploration);
-                assert!(runtime.ensure_runtime_binding(tampered).unwrap_err().contains("purpose differs"));
+                tampered.agentic_binding.as_mut().unwrap().task_purpose =
+                    Some(harness_contract::agent_action::TaskPurpose::Exploration);
+                assert!(runtime
+                    .ensure_runtime_binding(tampered)
+                    .unwrap_err()
+                    .contains("purpose differs"));
                 runtime.register_backend(Arc::new(ClaimLifetimeBackend {
                     kind,
                     services: services.clone(),
@@ -2870,16 +5098,12 @@ mod tests {
                 }
                 let before = actions.project("lifetime-program").unwrap();
                 let logical_member = &packet.agentic_binding.as_ref().unwrap().agent_id;
-                assert!(
-                    runtime
-                        .running_agentic_members("lifetime-program")
-                        .contains(logical_member)
-                );
-                assert!(
-                    runtime
-                        .running_agentic_members("foreign-program")
-                        .is_empty()
-                );
+                assert!(runtime
+                    .running_agentic_members("lifetime-program")
+                    .contains(logical_member));
+                assert!(runtime
+                    .running_agentic_members("foreign-program")
+                    .is_empty());
                 let recovered =
                     AgentRuntime::new(services.event_store().clone(), configured_registry());
                 assert!(
@@ -2929,17 +5153,13 @@ mod tests {
                 }
                 release.notify_one();
                 worker.await.unwrap().unwrap();
-                assert!(
-                    runtime
-                        .running_agentic_members("lifetime-program")
-                        .is_empty()
-                );
+                assert!(runtime
+                    .running_agentic_members("lifetime-program")
+                    .is_empty());
                 let after = actions.project("lifetime-program").unwrap();
-                assert!(
-                    !after.tasks[&work]
-                        .active_attempts
-                        .contains_key(packet.graph_id())
-                );
+                assert!(!after.tasks[&work]
+                    .active_attempts
+                    .contains_key(packet.graph_id()));
                 assert_eq!(after.tasks[&work].failed_attempts, 1);
                 assert_eq!(after.tasks[&work].claim_generation, 1);
                 tokio::time::advance(std::time::Duration::from_secs(60)).await;
@@ -3184,11 +5404,9 @@ mod tests {
             ),
         ] {
             packet.binding.as_mut().expect("binding").executor = executor;
-            assert!(
-                backend_from_packet(&packet)
-                    .expect_err("unsupported definition must not start an AgentTask backend")
-                    .contains(expected)
-            );
+            assert!(backend_from_packet(&packet)
+                .expect_err("unsupported definition must not start an AgentTask backend")
+                .contains(expected));
         }
     }
 
@@ -3218,12 +5436,10 @@ mod tests {
         );
         assert_eq!(returned.model, "external-model-profile");
         assert_eq!(returned.provider, "external_process");
-        assert!(
-            returned
-                .failure
-                .as_deref()
-                .is_some_and(|failure| failure.contains("non-satisfied Runtime acceptance"))
-        );
+        assert!(returned
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("non-satisfied Runtime acceptance")));
         assert_eq!(
             runtime.get(packet.agent_id()).expect("projection").status,
             AgentStatus::Failed
@@ -3255,12 +5471,10 @@ mod tests {
                 .status,
             AgentStatus::Cancelled
         );
-        assert!(
-            runtime
-                .events(packet.agent_id())
-                .iter()
-                .any(|event| event.status == AgentStatus::Cancelled)
-        );
+        assert!(runtime
+            .events(packet.agent_id())
+            .iter()
+            .any(|event| event.status == AgentStatus::Cancelled));
     }
 
     #[tokio::test]
@@ -3304,12 +5518,10 @@ mod tests {
             .expect("validation failure is a terminal Agent result");
 
         assert_eq!(returned.status, AgentTerminalStatus::Failed);
-        assert!(
-            returned
-                .failure
-                .as_deref()
-                .is_some_and(|failure| failure.contains("Runtime rejected Agent terminal result"))
-        );
+        assert!(returned
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("Runtime rejected Agent terminal result")));
         assert_eq!(returned.input_tokens, 3);
         assert_eq!(returned.output_tokens, 2);
         assert_eq!(
@@ -3332,12 +5544,10 @@ mod tests {
                 .status,
             AgentStatus::Failed
         );
-        assert!(
-            runtime
-                .events(packet.agent_id())
-                .iter()
-                .any(|event| event.status == AgentStatus::Failed)
-        );
+        assert!(runtime
+            .events(packet.agent_id())
+            .iter()
+            .any(|event| event.status == AgentStatus::Failed));
     }
 
     #[test]
@@ -3358,11 +5568,9 @@ mod tests {
 
         let mut stale_running = stale_prepared;
         stale_running.status = AgentStatus::Running;
-        assert!(
-            runtime
-                .persist_snapshot(stale_running, "agent.running", "running", None, None)
-                .is_err()
-        );
+        assert!(runtime
+            .persist_snapshot(stale_running, "agent.running", "running", None, None)
+            .is_err());
         assert_eq!(
             runtime.get(packet.agent_id()).expect("terminal").status,
             AgentStatus::Cancelled
@@ -3411,11 +5619,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![packet.agent_id()],
         );
-        assert!(
-            runtime
-                .list_for_graphs(&BTreeSet::from(["graph-other".to_string()]))
-                .is_empty()
-        );
+        assert!(runtime
+            .list_for_graphs(&BTreeSet::from(["graph-other".to_string()]))
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3508,12 +5714,10 @@ mod tests {
             )
             .expect_err("unbound records are rejected");
         assert!(runtime.get(valid.agent_id()).is_none());
-        assert!(
-            store
-                .list_stream(&legacy_import_stream_id("bad-upgrade-manifest"))
-                .expect("marker stream")
-                .is_empty()
-        );
+        assert!(store
+            .list_stream(&legacy_import_stream_id("bad-upgrade-manifest"))
+            .expect("marker stream")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3607,10 +5811,9 @@ mod tests {
         let packet = team_task("team-lineage", "team-run-1");
         let snapshot = legacy_snapshot(&packet, AgentStatus::Running);
         let refs = snapshot_identity_refs(&snapshot);
-        assert!(
-            refs.iter()
-                .any(|reference| reference.kind == "team_run" && reference.id == "team-run-1")
-        );
+        assert!(refs
+            .iter()
+            .any(|reference| reference.kind == "team_run" && reference.id == "team-run-1"));
         assert!(refs.iter().any(|reference| {
             reference.kind == "agent_instance" && reference.id == packet.agent_id()
         }));
@@ -3725,17 +5928,15 @@ mod tests {
         assert!(!runtime.command(different_command).await.accepted);
         let mut premature_terminal = runtime.get(packet.agent_id()).unwrap();
         premature_terminal.status = AgentStatus::Completed;
-        assert!(
-            runtime
-                .persist_snapshot(
-                    premature_terminal,
-                    "agent.terminal",
-                    "must not lose input",
-                    None,
-                    None
-                )
-                .is_err()
-        );
+        assert!(runtime
+            .persist_snapshot(
+                premature_terminal,
+                "agent.terminal",
+                "must not lose input",
+                None,
+                None
+            )
+            .is_err());
         let mut conflicting = request.clone();
         conflicting.input = Some(harness_contract::agent::AgentInput::UserSupplement(
             "other payload".into(),
@@ -3749,12 +5950,10 @@ mod tests {
                 .unwrap(),
             vec![request.clone()]
         );
-        assert!(
-            restored
-                .pending_agent_inputs(packet.agent_id(), "different-run")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(restored
+            .pending_agent_inputs(packet.agent_id(), "different-run")
+            .unwrap()
+            .is_empty());
         let inbox = crate::SessionInputStream::new(packet.session_id());
         let turn = TurnId::from_string("input-checkpoint");
         inbox.set_active_turn(Some(turn.clone()));
@@ -3773,33 +5972,29 @@ mod tests {
         assert_eq!(records.len(), 1);
         let mut forged = records.clone();
         forged[0].envelope.content = "forged".into();
-        assert!(
-            restored
-                .agent_input_consumption_events(&packet, &forged)
-                .is_err()
-        );
+        assert!(restored
+            .agent_input_consumption_events(&packet, &forged)
+            .is_err());
         let events = restored
             .agent_input_consumption_events(&packet, &records)
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert!(
-            store
-                .append_transaction(AppendTransactionRequest {
-                    transaction_id: "input-consumption-fault".into(),
-                    expected_streams: vec![
-                        ExpectedStreamRevision {
-                            stream_id: "test-model-node".into(),
-                            expected_revision: 1
-                        },
-                        ExpectedStreamRevision {
-                            stream_id: events[0].event.stream_id.clone(),
-                            expected_revision: 1
-                        }
-                    ],
-                    events: events.clone(),
-                })
-                .is_err()
-        );
+        assert!(store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: "input-consumption-fault".into(),
+                expected_streams: vec![
+                    ExpectedStreamRevision {
+                        stream_id: "test-model-node".into(),
+                        expected_revision: 1
+                    },
+                    ExpectedStreamRevision {
+                        stream_id: events[0].event.stream_id.clone(),
+                        expected_revision: 1
+                    }
+                ],
+                events: events.clone(),
+            })
+            .is_err());
         assert_eq!(
             restored
                 .pending_agent_inputs(packet.agent_id(), packet.run_id())
@@ -3819,12 +6014,10 @@ mod tests {
             .unwrap();
         drop(restored);
         let recovered = AgentRuntime::new(store, configured_registry());
-        assert!(
-            recovered
-                .pending_agent_inputs(packet.agent_id(), packet.run_id())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(recovered
+            .pending_agent_inputs(packet.agent_id(), packet.run_id())
+            .unwrap()
+            .is_empty());
         assert_eq!(recovered.command(request).await, receipt);
     }
 
@@ -4040,13 +6233,11 @@ mod tests {
         );
         let snapshot = runtime.get(packet.agent_id()).expect("blocked run");
         assert_eq!(snapshot.status, AgentStatus::Blocked);
-        assert!(
-            snapshot
-                .failure
-                .as_deref()
-                .unwrap_or_default()
-                .contains("backend handle")
-        );
+        assert!(snapshot
+            .failure
+            .as_deref()
+            .unwrap_or_default()
+            .contains("backend handle"));
     }
 
     #[test]
@@ -4081,12 +6272,10 @@ mod tests {
             })
             .expect("restore");
 
-        assert!(
-            runtime
-                .block_unrecoverable_replayed_runs()
-                .expect("recovery sweep")
-                .is_empty()
-        );
+        assert!(runtime
+            .block_unrecoverable_replayed_runs()
+            .expect("recovery sweep")
+            .is_empty());
         assert_eq!(
             runtime.get(packet.agent_id()).expect("prepared run").status,
             AgentStatus::Prepared
@@ -4125,12 +6314,10 @@ mod tests {
             })
             .expect("restore");
 
-        assert!(
-            runtime
-                .block_unrecoverable_replayed_runs()
-                .expect("recovery sweep")
-                .is_empty()
-        );
+        assert!(runtime
+            .block_unrecoverable_replayed_runs()
+            .expect("recovery sweep")
+            .is_empty());
         let snapshot = runtime.get(packet.agent_id()).expect("requeued run");
         assert_eq!(snapshot.status, AgentStatus::Prepared);
         assert_eq!(snapshot.failure, None);

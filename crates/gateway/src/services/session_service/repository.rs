@@ -40,6 +40,38 @@ pub(crate) struct SessionRepository {
 }
 
 impl SessionRepository {
+    pub(crate) async fn get_terminal_message_receipt_context(
+        &self,
+        query: session::SessionTerminalReceiptQuery,
+    ) -> session::SessionResult<session::SessionTerminalReceiptContext> {
+        self.durable_store()?
+            .get_terminal_message_receipt_context(query)
+            .await
+    }
+    pub(crate) async fn record_terminal_message_ack(
+        &self,
+        command: session::SessionTerminalAckCommand,
+    ) -> session::SessionResult<harness_contract::live::SessionMessageAck> {
+        self.durable_store()?
+            .record_terminal_message_ack(command)
+            .await
+    }
+    pub(crate) async fn list_terminal_message_acks(
+        &self,
+        query: session::SessionTerminalAckListQuery,
+    ) -> session::SessionResult<Vec<harness_contract::live::SessionMessageAckHistory>> {
+        self.durable_store()?
+            .list_terminal_message_acks(query)
+            .await
+    }
+    pub(crate) async fn mutate_session_presence_if_revision(
+        &self,
+        command: session::SessionPresenceMutation,
+    ) -> session::SessionResult<Option<session::SessionPresenceMutationResult>> {
+        self.durable_store()?
+            .mutate_session_presence_if_revision(command)
+            .await
+    }
     #[must_use]
     pub(crate) fn new(
         active_sessions: Arc<ActiveSessionDirectory>,
@@ -731,9 +763,10 @@ impl SessionRepository {
         now_ms: u64,
         lease_ms: u64,
         limit: usize,
+        excluded_session_ids: &[String],
     ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
         self.durable_store()?
-            .claim_session_runtime_outbox(worker_id, now_ms, lease_ms, limit)
+            .claim_session_runtime_outbox(worker_id, now_ms, lease_ms, limit, excluded_session_ids)
             .await
     }
 

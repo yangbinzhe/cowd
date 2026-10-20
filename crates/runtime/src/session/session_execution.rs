@@ -5,6 +5,7 @@
 //! row only after the graph commit is durable. There is deliberately no
 //! process-global dispatcher or graph-external session execution API.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -463,6 +464,8 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
                 idempotency_key: Some(ticket.idempotency_key.clone()),
                 schema_version: 1,
             }],
+            source_revisions: BTreeMap::new(),
+            no_dispatch: None,
             replan: None,
         })
     }
@@ -965,7 +968,7 @@ impl SessionInputRouter {
             .test_store
             .as_ref()
             .expect("test store checked")
-            .claim_session_runtime_outbox(&self.worker_id, now, self.lease_ms, limit)
+            .claim_session_runtime_outbox(&self.worker_id, now, self.lease_ms, limit, &[])
             .await?;
         let mut report = SessionInputRouteReport {
             claimed: claimed.len(),
@@ -1336,14 +1339,12 @@ mod tests {
             .unwrap();
         assert_eq!(stored.status, session::SessionRuntimeInputStatus::Completed);
         assert_eq!(stored.runtime_commit_cursor, Some(42));
-        assert!(
-            router
-                .route_pending_with(&Executor, 8)
-                .await
-                .unwrap()
-                .receipts
-                .is_empty()
-        );
+        assert!(router
+            .route_pending_with(&Executor, 8)
+            .await
+            .unwrap()
+            .receipts
+            .is_empty());
     }
 
     #[test]
@@ -1478,7 +1479,7 @@ mod tests {
             .await
             .unwrap();
         let claimed = store
-            .claim_session_runtime_outbox("fence-worker", now_ms(), 30_000, 1)
+            .claim_session_runtime_outbox("fence-worker", now_ms(), 30_000, 1, &[])
             .await
             .unwrap()
             .pop()
@@ -1655,8 +1656,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_dispatch_routes_into_the_real_target_session_stream_without_fabricating_a_result()
-     {
+    async fn session_dispatch_routes_into_the_real_target_session_stream_without_fabricating_a_result(
+    ) {
         let (store, services, router) = fixture().await;
         let now = chrono::Utc::now().to_rfc3339();
         store
@@ -1728,17 +1729,15 @@ mod tests {
         assert_eq!(report.completed, 0);
         assert_eq!(report.waiting, 1);
         let claimed = store
-            .claim_session_runtime_outbox("target-worker", now_ms(), 1_000, 8)
+            .claim_session_runtime_outbox("target-worker", now_ms(), 1_000, 8, &[])
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].session_id, "s2");
         let messages = store.get_messages_from_sequence("s2", 0, 8).await.unwrap();
-        assert!(
-            messages[0]
-                .content_json
-                .contains("review the active change")
-        );
+        assert!(messages[0]
+            .content_json
+            .contains("review the active change"));
         let error = router
             .record_target_terminal(
                 &crate::session_runtime_port::to_runtime_input_record(claimed[0].clone()),
@@ -1747,12 +1746,10 @@ mod tests {
             )
             .expect_err("a missing target graph must not become a fake successful handoff");
         assert!(error.contains("without the target's durable execution graph"));
-        assert!(
-            router
-                .handoff_result("correlation-test")
-                .expect("read result")
-                .is_none()
-        );
+        assert!(router
+            .handoff_result("correlation-test")
+            .expect("read result")
+            .is_none());
     }
 
     #[test]
@@ -1949,7 +1946,7 @@ mod tests {
             .await
             .unwrap();
         let claimed = store
-            .claim_session_runtime_outbox("target-worker", now_ms(), 1_000, 8)
+            .claim_session_runtime_outbox("target-worker", now_ms(), 1_000, 8, &[])
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
@@ -1993,12 +1990,10 @@ mod tests {
         );
         assert_eq!(resolution.packet.input_tokens, 13);
         assert_eq!(resolution.packet.output_tokens, 29);
-        assert!(
-            resolution
-                .packet
-                .evidence_refs
-                .contains(&"runtime-commit:777".to_string())
-        );
+        assert!(resolution
+            .packet
+            .evidence_refs
+            .contains(&"runtime-commit:777".to_string()));
 
         let result_stream = dispatch_correlation_stream("correlation-real-terminal");
         let revision = services

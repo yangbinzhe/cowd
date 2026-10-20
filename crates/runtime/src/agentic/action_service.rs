@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_contract::agent_action::{
@@ -20,7 +21,60 @@ use super::program::{AgenticProgramProjection, AgenticTaskStatus, AgenticTopicEn
 mod authorization;
 mod delegation;
 
-use authorization::validate_transition;
+#[cfg(test)]
+mod native_effect_history_tests;
+
+use authorization::{validate_transition, validate_transition_with_admission_contexts};
+
+pub(crate) fn validate_receipt_index_record(
+    event: &crate::DurableRuntimeEvent,
+    source: &str,
+    sequence: u64,
+    revision: u64,
+) -> Result<(), String> {
+    if sequence == 0
+        || event.stream_id != source
+        || event.sequence != sequence
+        || event.sequence > revision
+        || (event.kind == "execution.agent_tool.intent" && event.schema_version != 1)
+        || (event.kind == "execution.agent_tool.receipt"
+            && crate::ExecutionCommitService::receipt_observation_sequence(event).is_none())
+        || event.scope != RuntimeEventScope::ExecutionNode
+        || event.actor.as_deref() != Some("governed_tool")
+    {
+        return Err("receipt-index structural identity mismatch".into());
+    }
+    let identity = event.payload["idempotency_key"]
+        .as_str()
+        .filter(|identity| !identity.is_empty())
+        .ok_or("receipt-index structural payload identity missing")?;
+    let prefix = match event.kind.as_str() {
+        "execution.agent_tool.intent" => "agent-tool-intent",
+        "execution.agent_tool.receipt" => "agent-tool-receipt",
+        _ => return Err("receipt-index structural kind unsupported".into()),
+    };
+    if event.idempotency_key.as_deref() != Some(format!("{prefix}:{identity}").as_str()) {
+        return Err("receipt-index structural idempotency identity mismatch".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod receipt_index_791_tests;
+
+fn retirement_execute_claim_matches(
+    task: &super::program::AgenticTaskProjection,
+    attempt: &super::program::AgenticTaskAttemptProjection,
+) -> bool {
+    task.claim_generation > attempt.generation
+        && match (task.claim_execution_id.as_deref(), task.claimant.as_deref()) {
+            (None, None) => true,
+            (Some(execution), Some(agent)) => {
+                execution == attempt.execution_id && agent == attempt.agent_id
+            }
+            _ => false,
+        }
+}
 
 const ACTION_EVENT_KIND: &str = "agentic.action_applied";
 /// Durable record of what the root barrier's resolver decided.
@@ -52,12 +106,45 @@ pub(crate) struct AgenticWaitDisposition<'a> {
     pub barrier_rejections: serde_json::Value,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONCLUSION_APPEND_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&AppendTransactionRequest)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn with_conclusion_append_hook<Output>(
+    hook: impl FnOnce(&AppendTransactionRequest) + 'static,
+    commit: impl FnOnce() -> Output,
+) -> Output {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CONCLUSION_APPEND_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    CONCLUSION_APPEND_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    let _reset = Reset;
+    commit()
+}
+
 impl AgentActionService {
     /// Append one barrier disposition record. It goes on its own stream so it never
     /// advances the semantic Program revision, and its scope is deliberately not
     /// `Program`: the resolver lane's interest is `agentic.action_applied`, and a
     /// diagnostic record must not be able to re-arm that lane.
     pub(crate) fn record_wait_disposition(&self, record: AgenticWaitDisposition<'_>) {
+        if self
+            .program_recovery_is_excluded(record.program_id)
+            .unwrap_or(true)
+        {
+            return;
+        }
         let stream_id = format!("agentic-program-wait:{}", record.program_id);
         // Fence the append on the stream head and retry the fence, not the write.
         // The synchronous reconcile in the tool path and the barrier's own bounded
@@ -142,6 +229,12 @@ impl AgentActionService {
     /// and a fenced append that retries the fence rather than dropping the
     /// second writer.
     pub(crate) fn record_dispatch_decline(&self, record: AgenticDispatchDecline<'_>) {
+        if self
+            .program_recovery_is_excluded(record.program_id)
+            .unwrap_or(true)
+        {
+            return;
+        }
         let stream_id = format!("agentic-dispatch:{}", record.program_id);
         let payload = serde_json::json!({
             "program_id": record.program_id,
@@ -337,22 +430,1190 @@ pub enum AgentActionServiceError {
 pub struct AgentActionService {
     store: Arc<RuntimeEventStore>,
     artifacts: Option<Arc<crate::ArtifactStore>>,
+    process_input_verifier: Option<crate::agentic::review_evidence::ProcessInputVerifier>,
+    proof_session_queries: Option<Arc<OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>>>,
     graphs: Option<crate::ExecutionGraphStateStore>,
     read_model: Arc<super::AgenticReadModel>,
 }
 
+struct RuntimeRetirementAdmission {
+    request_digest: String,
+    program_id: String,
+    program_revision: u64,
+    sources: Vec<ExpectedStreamRevision>,
+}
+
+impl RuntimeRetirementAdmission {
+    fn covers(
+        &self,
+        projection: &AgenticProgramProjection,
+        envelope: &AgentActionEnvelope,
+    ) -> bool {
+        self.program_revision == projection.revision
+            && self.program_id == projection.program_id
+            && projection.program_id == envelope.actor.program_id
+            && envelope.actor.kind == AgentActorKind::Supervisor
+            && envelope.actor.actor_id == "runtime.program-supervisor"
+            && self.request_digest == super::review_evidence::proof_value_digest(envelope)
+            && matches!(&envelope.action, AgentAction::TaskAttemptFail(_))
+    }
+}
+
 impl AgentActionService {
+    fn validate_native_retirement_target_guard(
+        original: &harness_contract::execution_graph::ExecutionGraph,
+        child: &harness_contract::execution_graph::ExecutionGraph,
+        guard: &harness_contract::execution_graph::ExecutionNodeSpec,
+    ) -> Result<(), String> {
+        use crate::execution_core::graph::{ExecutionCompileRequest, ExecutionGraphCompiler};
+        use crate::execution_core::RuntimeCompileTarget;
+        use harness_contract::execution_graph::ExecutionNodeKind;
+        if original.id != child.id
+            || original.parent_execution.is_none()
+            || original.lineage.is_none()
+            || original.parent_execution != child.parent_execution
+            || original.lineage != child.lineage
+            || original.service_class != child.service_class
+            || !original.nodes.iter().any(|node| node == guard)
+            || !child.nodes.iter().any(|node| node == guard)
+        {
+            return Err("runtime retirement Native target guard owner changed".into());
+        }
+        let base = original
+            .nodes
+            .iter()
+            .find(|node| {
+                node.id == format!("{}:model", original.id)
+                    && node.kind == ExecutionNodeKind::InlineModel
+                    && node.executor_kind == "inline_model"
+            })
+            .ok_or("runtime retirement Native target guard original model missing")?;
+        if guard.payload_ref != base.payload_ref {
+            return Err("runtime retirement Native target guard payload changed".into());
+        }
+        let initial: serde_json::Value =
+            serde_json::from_str(&base.payload_ref).map_err(|error| error.to_string())?;
+        let target: RuntimeCompileTarget =
+            serde_json::from_value(initial["compile_target"].clone())
+                .map_err(|error| error.to_string())?;
+        if !matches!(
+            target,
+            RuntimeCompileTarget::EvidenceGraph | RuntimeCompileTarget::ExecutionGraph
+        ) {
+            return Err("runtime retirement Native target has no compiler guard".into());
+        }
+        let scopes = original
+            .nodes
+            .iter()
+            .find(|node| node.id == format!("{}:resource-constraint", original.id))
+            .map(|node| node.resource_scopes.clone())
+            .unwrap_or_default();
+        let compiled = ExecutionGraphCompiler
+            .compile_conversation_turn(ExecutionCompileRequest {
+                objective: original.objective.clone(),
+                payload_ref: base.payload_ref.clone(),
+                target,
+                resource_scopes: scopes,
+            })
+            .map_err(|error| error.to_string())?;
+        let prefix = format!("{}:", original.id);
+        let suffix = guard
+            .id
+            .strip_prefix(&prefix)
+            .ok_or("runtime retirement Native target guard has a foreign node owner")?;
+        let mut expected = compiled
+            .nodes
+            .iter()
+            .find(|node| {
+                node.id == format!("{}:{suffix}", compiled.id)
+                    && node.kind == ExecutionNodeKind::Verify
+            })
+            .cloned()
+            .ok_or("runtime retirement Native target guard is not compiler-authored")?;
+        expected.id.clone_from(&guard.id);
+        expected.idempotency_key = format!("{}:attempt", guard.id);
+        if expected != *guard {
+            return Err("runtime retirement Native target guard shape/criterion mismatch".into());
+        }
+        Ok(())
+    }
+
+    fn validate_retired_native_child(
+        &self,
+        child: &harness_contract::execution_graph::ExecutionGraph,
+        packet: &harness_contract::agent::AgentTaskPacket,
+        pin: &mut impl FnMut(&str) -> Result<u64, String>,
+    ) -> Result<(), String> {
+        use crate::execution_core::graph::{
+            ExecutionCommitService, ExecutionGraphStateStore, ExecutionNodeBinding,
+        };
+        use harness_contract::agent::AgentExecutorPolicy;
+        use harness_contract::execution_graph::{
+            ExecutionNodeKind, ExecutionNodeStatus, ExecutionServiceClass,
+        };
+        let compiled = packet
+            .binding
+            .as_ref()
+            .ok_or("runtime retirement Native binding missing")?;
+        if compiled.executor != AgentExecutorPolicy::CowdNative {
+            return Err("runtime retirement non-Native conversation child".into());
+        }
+        if !matches!(
+            child.service_class,
+            ExecutionServiceClass::Foreground | ExecutionServiceClass::Background
+        ) || child.nodes.is_empty()
+        {
+            return Err("runtime retirement Native child service class/shape mismatch".into());
+        }
+        let turn_id = packet
+            .assignment
+            .execution_identity
+            .turn_id()
+            .ok_or("runtime retirement Native original turn missing")?;
+        let (_, exit_sources) = crate::agent_runtime::confirmed_run_exit(&self.store, packet)?
+            .ok_or("runtime retirement Native child has no exact exit")?;
+        for source in exit_sources {
+            if pin(&source.stream_id)? != source.expected_revision {
+                return Err("runtime retirement Native lifecycle changed".into());
+            }
+        }
+        let agent_stream = format!("agent:{}", packet.agent_id());
+        let backend = self
+            .store
+            .event_by_idempotency_key(
+                &agent_stream,
+                &format!("agent.backend_admitted:{}", packet.run_id()),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or("runtime retirement Native child has no original backend admission")?;
+        let exit = self
+            .store
+            .event_by_idempotency_key(
+                &agent_stream,
+                &format!("agent.local_exit:{}", packet.run_id()),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or("runtime retirement Native child exit missing")?;
+        let genesis = self
+            .store
+            .list_stream_after(&child.id, 0, 1, 1, 4 * 1024 * 1024)?;
+        if genesis.first().is_none_or(|event| {
+            event.commit_cursor <= backend.commit_cursor
+                || event.commit_cursor >= exit.commit_cursor
+        }) {
+            return Err(
+                "runtime retirement Native child is outside original backend lifetime".into(),
+            );
+        }
+        let original = self.store.resolve_graph_record(&genesis[0])?;
+        let original: crate::execution_core::graph::ExecutionGraphEvent =
+            serde_json::from_value(original).map_err(|error| error.to_string())?;
+        let crate::execution_core::graph::ExecutionGraphEvent::Planned { graph: original } =
+            original
+        else {
+            return Err("runtime retirement Native original graph plan missing".into());
+        };
+        if original.id != child.id
+            || original.service_class != child.service_class
+            || original.lineage != child.lineage
+            || original.parent_execution != child.parent_execution
+        {
+            return Err("runtime retirement Native original graph ownership changed".into());
+        }
+        let base = child
+            .nodes
+            .iter()
+            .find(|node| node.id == format!("{}:model", child.id))
+            .ok_or("runtime retirement Native original model missing")?;
+        if !original.nodes.iter().any(|node| node == base) {
+            return Err("runtime retirement Native original model changed".into());
+        }
+        let initial: serde_json::Value =
+            serde_json::from_str(&base.payload_ref).map_err(|error| error.to_string())?;
+        if base.kind != ExecutionNodeKind::InlineModel
+            || base.executor_kind != "inline_model"
+            || initial["kind"] != "conversation_turn"
+            || initial["session_id"] != packet.session_id()
+            || initial["objective"] != child.objective
+        {
+            return Err("runtime retirement Native conversation origin mismatch".into());
+        }
+        let commits = ExecutionCommitService::new(Arc::clone(&self.store));
+        let state = ExecutionGraphStateStore::new(Arc::clone(&self.store));
+        let mut effect_streams = std::collections::BTreeSet::new();
+        for child_node in &child.nodes {
+            let status = child
+                .node_statuses
+                .get(&child_node.id)
+                .filter(|status| status.is_terminal())
+                .ok_or("runtime retirement Native child node is not terminal")?;
+            let expected_executor = match child_node.kind {
+                ExecutionNodeKind::InlineModel => "inline_model",
+                ExecutionNodeKind::Verify => {
+                    Self::validate_native_retirement_target_guard(&original, child, child_node)?;
+                    crate::execution_core::graph::executors::CompileTargetGuardExecutor::KIND
+                }
+                ExecutionNodeKind::ToolBatch => "tool_batch",
+                ExecutionNodeKind::Synthesize => "synthesize",
+                _ => return Err("runtime retirement Native child has unmodelled node kind".into()),
+            };
+            if child_node.executor_kind != expected_executor
+                || !child_node.id.starts_with(&format!("{}:", child.id))
+            {
+                return Err("runtime retirement Native child executor/identity mismatch".into());
+            }
+            if child_node.kind == ExecutionNodeKind::ToolBatch {
+                let payload = crate::step_snapshot::decode_persisted_tool_batch_value(
+                    &child_node.payload_ref,
+                )
+                .map_err(|error| error.to_string())?;
+                let steps = payload["step_snapshots"]
+                    .as_object()
+                    .filter(|steps| !steps.is_empty())
+                    .ok_or("runtime retirement Native tool Steps missing")?;
+                for step in steps.values() {
+                    let identity = &step["identity"];
+                    if identity["session_id"] != packet.session_id()
+                        || identity["turn_id"] != turn_id
+                        || identity["execution_id"] != packet.run_id()
+                        || identity["run_ref"] != packet.run_id()
+                        || identity["task_ref"] != packet.task_id()
+                    {
+                        return Err(
+                            "runtime retirement Native tool Step has a foreign owner".into()
+                        );
+                    }
+                }
+                continue;
+            }
+            if child_node.idempotency_key != format!("{}:attempt", child_node.id) {
+                return Err("runtime retirement Native effect key mismatch".into());
+            }
+            let attempt = child
+                .recovery_cursor
+                .node_attempts
+                .get(&child_node.id)
+                .copied()
+                .unwrap_or(0);
+            if attempt == 0 {
+                if *status == ExecutionNodeStatus::Cancelled {
+                    continue;
+                }
+                return Err("runtime retirement Native child has no original attempt".into());
+            }
+            let binding = state
+                .current_binding(child, &child_node.id, attempt)
+                .map_err(|error| error.to_string())?;
+            let (ticket, original_spec) = state
+                .binding_start_ticket(child, &child_node.id, &binding)
+                .map_err(|error| error.to_string())?;
+            if original_spec != *child_node {
+                return Err("runtime retirement Native current attempt spec changed".into());
+            }
+            let stream = ExecutionNodeBinding::effect_stream_id(&ticket);
+            effect_streams.insert(stream);
+        }
+        self.validate_native_effect_history(child, &commits, effect_streams, pin)?;
+        Ok(())
+    }
+
+    fn validate_native_effect_history(
+        &self,
+        child: &harness_contract::execution_graph::ExecutionGraph,
+        commits: &crate::execution_core::graph::ExecutionCommitService,
+        mut effect_streams: std::collections::BTreeSet<String>,
+        pin: &mut impl FnMut(&str) -> Result<u64, String>,
+    ) -> Result<(), String> {
+        use crate::execution_core::graph::{
+            ExecutionEffectState, ExecutionGraphStateStore, ExecutionNodeBinding,
+            NodeExecutionTicket,
+        };
+        use harness_contract::execution_graph::ExecutionNodeKind;
+        let state = ExecutionGraphStateStore::new(Arc::clone(&self.store));
+        let mut after = 0;
+        let mut historical_tickets = BTreeMap::new();
+        let mut expected_records = 0usize;
+        while after < child.revision {
+            let (next, starts) = state
+                .binding_starts_page(&child.id, after, child.revision)
+                .map_err(|error| error.to_string())?;
+            if next <= after {
+                return Err("runtime retirement Native start history did not advance".into());
+            }
+            for (node_id, binding, position) in starts {
+                let node =
+                    child.nodes.iter().find(|node| node.id == node_id).ok_or(
+                        "runtime retirement Native child has an unmodelled historical node",
+                    )?;
+                let (ticket, original_spec) = state
+                    .binding_start_ticket(child, &node_id, &binding)
+                    .map_err(|error| error.to_string())?;
+                if original_spec != *node {
+                    return Err("runtime retirement Native historical spec changed".into());
+                }
+                let completed = state
+                    .committed_binding_result(child, &node_id, &binding)
+                    .map_err(|error| error.to_string())?;
+                let retirement = state
+                    .binding_retirement_record(child, &node_id, &binding)
+                    .map_err(|error| error.to_string())?;
+                if completed.is_none() && retirement.is_none() {
+                    return Err("runtime retirement Native historical attempt is unfinished".into());
+                }
+                if !state
+                    .binding_lease_closure(child, &node_id, &binding, position)
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(
+                        "runtime retirement Native historical callback or physical closure missing"
+                            .into(),
+                    );
+                }
+                if node.kind == ExecutionNodeKind::ToolBatch {
+                    if let Some(sources) = commits
+                        .authenticated_no_dispatch_sources(child, &node_id, &binding)
+                        .map_err(|error| error.to_string())?
+                    {
+                        for source in sources {
+                            if pin(&source.stream_id)? != source.expected_revision {
+                                return Err(
+                                    "runtime retirement Native NoDispatch physical source changed"
+                                        .into(),
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let stream = ExecutionNodeBinding::effect_stream_id(&ticket);
+                if historical_tickets.contains_key(&stream) {
+                    return Err("runtime retirement Native duplicate historical effect".into());
+                }
+                let records = if let Some((result, finished)) = completed {
+                    match commits
+                        .inspect_execution_effect(&ticket)
+                        .map_err(|error| error.to_string())?
+                    {
+                        ExecutionEffectState::Completed(outcome) if outcome.result == result => {}
+                        _ => {
+                            return Err(
+                                "runtime retirement Native historical result conflict".into()
+                            )
+                        }
+                    }
+                    let receipt = self
+                        .store
+                        .event_by_idempotency_key(
+                            &stream,
+                            &format!("{}:receipt", ticket.idempotency_key),
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("runtime retirement Native historical receipt missing")?;
+                    if receipt.transaction_id != finished.transaction_id
+                        || receipt.commit_cursor != finished.commit_cursor
+                    {
+                        return Err(
+                            "runtime retirement Native historical result is not atomic".into()
+                        );
+                    }
+                    2u64
+                } else {
+                    if !matches!(
+                        commits
+                            .inspect_execution_effect(&ticket)
+                            .map_err(|error| error.to_string())?,
+                        ExecutionEffectState::Uncertain
+                    ) {
+                        return Err("runtime retirement Native retired attempt has no exact original intent".into());
+                    }
+                    1u64
+                };
+                if pin(&stream)? != records {
+                    return Err(
+                        "runtime retirement Native effect head conflicts with original disposition"
+                            .into(),
+                    );
+                }
+                expected_records = expected_records
+                    .checked_add(usize::try_from(records).map_err(|error| error.to_string())?)
+                    .ok_or("runtime retirement Native effect count overflow")?;
+                effect_streams.insert(stream.clone());
+                historical_tickets.insert(stream, ticket);
+            }
+            after = next;
+        }
+        if effect_streams.len() != historical_tickets.len() {
+            return Err("runtime retirement Native effect has no canonical start".into());
+        }
+        let prefix = ExecutionNodeBinding::effect_stream_prefix(&child.id);
+        let max_records = expected_records;
+        let mut position = None;
+        let mut observed = 0usize;
+        loop {
+            let page = self.store.list_scope_stream_prefix_page_asc(
+                RuntimeEventScope::ExecutionNode,
+                &prefix,
+                position,
+                16,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            if page.len() > 16 {
+                return Err("runtime retirement Native effect page overflow".into());
+            }
+            for record in page {
+                let next = (record.commit_cursor, record.transaction_index);
+                if record.commit_cursor == 0
+                    || position.is_some_and(|previous| next <= previous)
+                    || record.scope != RuntimeEventScope::ExecutionNode
+                    || !record.stream_id.starts_with(&prefix)
+                {
+                    return Err("runtime retirement Native effect page source mismatch".into());
+                }
+                position = Some(next);
+                let ticket = historical_tickets
+                    .get(&record.stream_id)
+                    .ok_or("runtime retirement Native child has an unmodelled historical effect")?;
+                let (suffix, status, sequence) = match record.kind.as_str() {
+                    "execution.effect.intent" => ("intent", "inflight", 1),
+                    "execution.effect.receipt" => ("receipt", "completed", 2),
+                    _ => return Err("runtime retirement Native effect kind mismatch".into()),
+                };
+                if record.schema_version != 1
+                    || record.sequence != sequence
+                    || record.actor.as_deref() != Some(ticket.executor_kind.as_str())
+                    || record.status.as_deref() != Some(status)
+                    || record.idempotency_key.as_deref()
+                        != Some(format!("{}:{suffix}", ticket.idempotency_key).as_str())
+                {
+                    return Err("runtime retirement Native effect identity mismatch".into());
+                }
+                if suffix == "intent" {
+                    let original: NodeExecutionTicket = serde_json::from_value(record.payload)
+                        .map_err(|error| error.to_string())?;
+                    if original != *ticket
+                        || ExecutionNodeBinding::effect_stream_id(&original) != record.stream_id
+                    {
+                        return Err("runtime retirement Native effect ticket mismatch".into());
+                    }
+                }
+                observed += 1;
+                if observed > max_records {
+                    return Err(
+                        "runtime retirement Native effect history exceeds original protocol".into(),
+                    );
+                }
+            }
+        }
+        if observed != max_records {
+            return Err("runtime retirement Native effect history is incomplete".into());
+        }
+        Ok(())
+    }
+
+    fn runtime_retirement_admission(
+        &self,
+        projection: &AgenticProgramProjection,
+        envelope: &AgentActionEnvelope,
+    ) -> Result<Option<RuntimeRetirementAdmission>, String> {
+        use harness_contract::agent::{AgentTaskPacket, AgenticExecutionFocus};
+        use harness_contract::agent_action::AgentAttemptMode;
+        use harness_contract::execution_graph::ExecutionNodeKind;
+        let AgentAction::TaskAttemptFail(input) = &envelope.action else {
+            return Ok(None);
+        };
+        let Some(task) = projection.tasks.get(&input.task_ref) else {
+            return Ok(None);
+        };
+        if task.status != AgenticTaskStatus::CancelRequested
+            || task.pending_retirement != Some(super::program::AgenticTaskRetirement::Withdrawn)
+            || envelope.actor.kind != AgentActorKind::Supervisor
+        {
+            return Ok(None);
+        }
+        if envelope.actor.actor_id != "runtime.program-supervisor"
+            || envelope.actor.execution_id.as_deref() != Some(input.execution_id.as_str())
+            || envelope.actor.agent_id.is_some()
+            || envelope.actor.team_id.is_some()
+            || task
+                .cancel_requested_by
+                .as_ref()
+                .is_none_or(|value| value.is_empty())
+            || task
+                .cancel_reason_ref
+                .as_ref()
+                .is_none_or(|value| value.is_empty())
+            || task.cancel_evidence_refs.is_empty()
+        {
+            return Err("runtime retirement actor or withdrawal binding mismatch".into());
+        }
+        let attempt = task
+            .active_attempts
+            .get(&input.execution_id)
+            .ok_or("runtime retirement has no registered attempt")?;
+        if attempt.mode != input.mode || attempt.execution_id != input.execution_id {
+            return Err("runtime retirement registered mode mismatch".into());
+        }
+        let graphs = crate::ExecutionGraphStateStore::new(Arc::clone(&self.store));
+        let graph = graphs
+            .load(&input.execution_id)
+            .map_err(|error| error.to_string())?;
+        let mut nodes = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask);
+        let node = nodes
+            .next()
+            .ok_or("runtime retirement Agent node missing")?;
+        if nodes.next().is_some() {
+            return Err("runtime retirement Agent node ambiguous".into());
+        }
+        let packet: AgentTaskPacket =
+            serde_json::from_str(&node.payload_ref).map_err(|error| error.to_string())?;
+        let binding = packet
+            .agentic_binding
+            .as_ref()
+            .ok_or("runtime retirement Program binding missing")?;
+        let focus_matches = match (&binding.focus, input.mode) {
+            (AgenticExecutionFocus::TaskExecute { task_ref }, AgentAttemptMode::Execute) => {
+                task_ref == &input.task_ref
+                    && retirement_execute_claim_matches(task, attempt)
+            }
+            (AgenticExecutionFocus::TaskReview { task_ref }, AgentAttemptMode::Review) => {
+                task_ref == &input.task_ref && task.review_generation == attempt.generation
+            }
+            _ => false,
+        };
+        if !focus_matches
+            || packet.graph_id() != graph.id
+            || graph.id != input.execution_id
+            || packet.node_id() != node.id
+            || packet.session_id() != projection.session_id
+            || packet.attempt == 0
+            || u64::from(packet.attempt) != attempt.generation.saturating_add(1)
+            || binding.program_id != projection.program_id
+            || binding.agent_id != attempt.agent_id
+            || binding.membership_id != attempt.membership_id
+            || binding.task_team_id != task.team_id
+            || !projection
+                .membership_for(&binding.agent_id, &binding.team_id)
+                .is_some_and(|member| member.membership_id == binding.membership_id)
+            || packet.binding.as_ref().is_none_or(|compiled| {
+                !crate::agent::binding::recompute_binding_digest(compiled)
+                    .is_ok_and(|digest| digest == compiled.binding_digest)
+            })
+            || graph.lineage.as_ref().is_none_or(|lineage| {
+                lineage.session_id != projection.session_id
+                    || lineage.turn_id != projection.turn_id
+                    || lineage.task_id != input.task_ref
+            })
+            || graph.recovery_cursor.node_attempts.get(&node.id) != Some(&packet.attempt)
+        {
+            return Err("runtime retirement immutable attempt binding mismatch".into());
+        }
+        let (_, exit_sources) = crate::agent_runtime::confirmed_run_exit(&self.store, &packet)?
+            .ok_or("runtime retirement has no authenticated exact local backend exit")?;
+        let mut sources = std::collections::BTreeMap::new();
+        for source in exit_sources {
+            if sources
+                .insert(source.stream_id, source.expected_revision)
+                .is_some_and(|previous| previous != source.expected_revision)
+            {
+                return Err("runtime retirement local exit source changed".into());
+            }
+        }
+        if matches!(
+            packet.binding.as_ref().map(|binding| &binding.executor),
+            Some(harness_contract::agent::AgentExecutorPolicy::ProcessJsonl { .. })
+        ) {
+            let lifecycle =
+                crate::agent_runtime::authenticated_run_lifecycle(&self.store, &packet)?;
+            if !lifecycle.no_direct_effects() {
+                return Err(
+                    "effect_review_pending: reaped Process retains opaque past effects".into(),
+                );
+            }
+            for source in lifecycle.sources {
+                if sources
+                    .insert(source.stream_id, source.expected_revision)
+                    .is_some_and(|previous| previous != source.expected_revision)
+                {
+                    return Err("runtime retirement physical envelope source changed".into());
+                }
+            }
+        }
+        let mut process_sources = std::collections::BTreeMap::new();
+        let mut pin = |source: &str| -> Result<u64, String> {
+            let revision = self
+                .store
+                .stream_revision(source)
+                .map_err(|error| error.to_string())?;
+            if sources
+                .insert(source.to_string(), revision)
+                .is_some_and(|previous| previous != revision)
+            {
+                return Err("runtime retirement source changed during admission".into());
+            }
+            Ok(revision)
+        };
+        let mut allowed_programs =
+            std::collections::BTreeSet::from([projection.program_id.clone()]);
+        let mut roots = projection
+            .root_execution_id
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut continuation = projection.continuation.clone();
+        while let Some(binding) = continuation {
+            if !allowed_programs.insert(binding.source_program_id.clone()) {
+                return Err("runtime retirement has cyclic Program provenance".into());
+            }
+            let origin = self
+                .project(&binding.source_program_id)
+                .map_err(|error| error.to_string())?;
+            if origin.session_id != projection.session_id
+                || origin.objective_id != binding.source_objective_id
+                || origin.root_execution_id.as_deref() != Some(binding.source_root_id.as_str())
+                || pin(&format!("agentic-program:{}", origin.program_id))? != origin.revision
+            {
+                return Err("runtime retirement historical Program binding changed".into());
+            }
+            roots.push(binding.source_root_id);
+            continuation = origin.continuation;
+        }
+        if roots.is_empty() {
+            return Err("runtime retirement physical history has no authenticated root".into());
+        }
+        let discovery_cursor = self
+            .store
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
+        let mut pending = roots
+            .into_iter()
+            .map(|root| (root, None, false))
+            .collect::<Vec<_>>();
+        let mut parents = std::collections::BTreeMap::new();
+        while let Some((graph_id, expected_parent, inherited_relevance)) = pending.pop() {
+            if let Some(previous) = parents.insert(graph_id.clone(), expected_parent.clone()) {
+                if previous != expected_parent {
+                    return Err(
+                        "runtime retirement physical lineage has ambiguous ownership".into(),
+                    );
+                }
+                continue;
+            }
+            let historical = graphs.load(&graph_id).map_err(|error| error.to_string())?;
+            let genesis = self
+                .store
+                .list_stream_after(&graph_id, 0, 1, 1, 4 * 1024 * 1024)?;
+            if genesis
+                .first()
+                .is_none_or(|event| event.commit_cursor > discovery_cursor)
+                || historical.parent_execution != expected_parent
+                || historical
+                    .lineage
+                    .as_ref()
+                    .is_none_or(|lineage| lineage.session_id != projection.session_id)
+                || pin(&graph_id)? != historical.revision
+            {
+                return Err("runtime retirement physical history changed during discovery".into());
+            }
+            pin(&format!("execution-lineage:{graph_id}"))?;
+            let mut relevant_graph = inherited_relevance;
+            for historical_node in &historical.nodes {
+                if historical_node.kind != ExecutionNodeKind::AgentTask {
+                    continue;
+                }
+                let original: AgentTaskPacket = serde_json::from_str(&historical_node.payload_ref)
+                    .map_err(|error| error.to_string())?;
+                let relevant_packet = inherited_relevance
+                    || original.agentic_binding.as_ref().is_none_or(|binding| {
+                        !allowed_programs.contains(&binding.program_id)
+                            || (binding.program_id == projection.program_id
+                                && match &binding.focus {
+                                    AgenticExecutionFocus::TaskExecute { task_ref }
+                                    | AgenticExecutionFocus::TaskReview { task_ref } => {
+                                        task_ref == &input.task_ref
+                                    }
+                                    AgenticExecutionFocus::Coordination { wake_ref } => projection
+                                        .coordination_wake_ref(wake_ref)
+                                        .and_then(|(_, wake)| wake.intent.as_ref())
+                                        .is_none_or(|intent| intent.task_ref == input.task_ref),
+                                    _ => true,
+                                })
+                    });
+                relevant_graph |= relevant_packet;
+                if original.binding.as_ref().is_some_and(|binding| {
+                    binding.executor == harness_contract::agent::AgentExecutorPolicy::CowdNative
+                }) {
+                    continue;
+                }
+                let lifecycle =
+                    crate::agent_runtime::authenticated_run_lifecycle(&self.store, &original)?;
+                for source in &lifecycle.sources {
+                    if pin(&source.stream_id)? != source.expected_revision {
+                        return Err("runtime retirement historical Agent cut changed".into());
+                    }
+                }
+                if original.graph_id() != graph_id
+                    || original.node_id() != historical_node.id
+                    || original
+                        .agentic_binding
+                        .as_ref()
+                        .is_none_or(|binding| !allowed_programs.contains(&binding.program_id))
+                    || (relevant_packet
+                        && (historical
+                            .recovery_cursor
+                            .node_attempts
+                            .get(&historical_node.id)
+                            .copied()
+                            .unwrap_or(original.attempt)
+                            > original.attempt
+                            || !lifecycle.no_direct_effects()))
+                {
+                    return Err(
+                        "effect_review_pending: opaque Process history remains after physical reap"
+                            .into(),
+                    );
+                }
+            }
+            for link in graphs
+                .child_links(&graph_id)
+                .map_err(|error| error.to_string())?
+            {
+                if link.parent_execution_id != graph_id
+                    || link.child_execution_id == graph_id
+                    || !historical
+                        .nodes
+                        .iter()
+                        .any(|node| node.id == link.parent_node_id)
+                {
+                    return Err("runtime retirement historical child binding invalid".into());
+                }
+                pending.push((
+                    link.child_execution_id,
+                    Some(harness_contract::execution_graph::ExecutionParentBinding {
+                        execution_id: graph_id.clone(),
+                        node_id: link.parent_node_id,
+                    }),
+                    relevant_graph,
+                ));
+            }
+        }
+        if pin(&graph.id)? != graph.revision {
+            return Err("runtime retirement graph changed during admission".into());
+        }
+        if graph.nodes.is_empty()
+            || graph.nodes.iter().any(|node| {
+                graph
+                    .node_statuses
+                    .get(&node.id)
+                    .is_none_or(|status| !status.is_terminal())
+            })
+        {
+            return Err("runtime retirement physical graph is not terminal".into());
+        }
+        pin(&format!("execution-lineage:{}", graph.id))?;
+        let children = graphs
+            .child_links(&graph.id)
+            .map_err(|error| error.to_string())?;
+        for link in children {
+            if link.parent_execution_id != graph.id || link.parent_node_id != node.id {
+                return Err("runtime retirement child has a foreign parent".into());
+            }
+            let child = graphs
+                .load(&link.child_execution_id)
+                .map_err(|error| error.to_string())?;
+            if pin(&child.id)? != child.revision
+                || child.lineage != graph.lineage
+                || child.parent_execution.as_ref().is_none_or(|parent| {
+                    parent.execution_id != graph.id || parent.node_id != node.id
+                })
+                || child.nodes.iter().any(|node| {
+                    child
+                        .node_statuses
+                        .get(&node.id)
+                        .is_none_or(|status| !status.is_terminal())
+                })
+            {
+                return Err(
+                    "runtime retirement child is not an authenticated terminal graph".into(),
+                );
+            }
+            pin(&format!("execution-lineage:{}", child.id))?;
+            if !graphs
+                .child_links(&child.id)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+            {
+                return Err("runtime retirement tool child has unmodelled descendants".into());
+            }
+            if !crate::execution_core::graph::executors::agent_tool::is_bound_agent_tool_graph(
+                &child,
+            ) {
+                self.validate_retired_native_child(&child, &packet, &mut pin)?;
+                continue;
+            }
+            if child.service_class != graph.service_class {
+                return Err("runtime retirement tool child service class mismatch".into());
+            }
+            let bound =
+                crate::execution_core::graph::executors::agent_tool::decode_bound_agent_tool_graph(
+                    &child,
+                )
+                .map_err(|error| error.to_string())?;
+            let request = bound.request;
+            if bound.agent_id != packet.agent_id()
+                || bound.run_id != packet.run_id()
+                || request.parent_execution.as_ref().is_none_or(|parent| {
+                    parent.execution_id != graph.id || parent.node_id != node.id
+                })
+                || request.parent_execution_attempt != Some(packet.attempt)
+                || request.session_id.as_deref() != Some(projection.session_id.as_str())
+                || request.governed_plan_id != graph.id
+                || !packet.allowed_tools.contains(&request.tool_name)
+                || !packet.binding.as_ref().is_some_and(|compiled| {
+                    compiled.tool_contract_refs.contains(&request.tool_name)
+                })
+            {
+                return Err("runtime retirement tool child request mismatch".into());
+            }
+            let tool_node = &child.nodes[0];
+            let attempt = child
+                .recovery_cursor
+                .node_attempts
+                .get(&tool_node.id)
+                .copied()
+                .ok_or("runtime retirement NoDispatch tool original attempt missing")?;
+            let binding = graphs
+                .current_binding(&child, &tool_node.id, attempt)
+                .map_err(|error| error.to_string())?;
+            let proof_commits =
+                crate::execution_core::graph::ExecutionCommitService::new(self.store.clone());
+            if let Some(sources) = proof_commits
+                .authenticated_no_dispatch_sources(&child, &tool_node.id, &binding)
+                .map_err(|error| error.to_string())?
+            {
+                for source in sources {
+                    if pin(&source.stream_id)? != source.expected_revision {
+                        return Err("runtime retirement bound NoDispatch source changed".into());
+                    }
+                }
+                continue;
+            }
+            let primary_source = format!("execution-effect:{}", request.idempotency_key);
+            let index_source = format!(
+                "execution-agent-receipts:{}:{}:{}",
+                graph.id, node.id, packet.attempt
+            );
+            pin(&primary_source)?;
+            pin(&index_source)?;
+            let intent = self
+                .store
+                .event_by_idempotency_key(
+                    &primary_source,
+                    &format!("{}:intent", request.idempotency_key),
+                )
+                .map_err(|error| error.to_string())?;
+            let read = intent.is_none();
+            let primary = if let Some(intent) = intent {
+                intent
+            } else {
+                self.store
+                    .event_by_idempotency_key(
+                        &primary_source,
+                        &format!("{}:read-receipt", request.idempotency_key),
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or("runtime retirement tool read receipt missing")?
+            };
+            let index = self
+                .store
+                .event_by_idempotency_key(
+                    &index_source,
+                    &format!(
+                        "agent-tool-{}:{}",
+                        if read { "receipt" } else { "intent" },
+                        request.idempotency_key
+                    ),
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or("runtime retirement original tool index missing")?;
+            crate::execution_core::graph::ExecutionCommitService::validate_proof_bound_tool_request(&request, &primary, &index)
+                .map_err(|error| error.to_string())?;
+            let descriptor_value = if read {
+                &primary.payload["replay"]["invocation"]["effect"]
+            } else {
+                &primary.payload["effect"]
+            };
+            let descriptor: harness_contract::tool::ToolEffectDescriptor =
+                serde_json::from_value(descriptor_value.clone())
+                    .map_err(|_| "runtime retirement original typed descriptor missing")?;
+            if primary.payload["resolved_effect_scope"] != index.payload["resolved_effect_scope"] {
+                return Err("runtime retirement original primary/index scope conflict".into());
+            }
+            if read && primary.payload["resolved_effect_scope"].is_null() {
+                let seal = crate::context_evidence::decode_read_acquisition(
+                    &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
+                )
+                .map_err(str::to_string)?;
+                if !matches!(
+                    seal.body.extent,
+                    crate::context_evidence::ReadExtent::ArtifactChunks { .. }
+                ) || descriptor.effect_kind != harness_contract::tool::ToolEffectKind::Read
+                    || descriptor.scopes.iter().any(|scope| {
+                        scope.resource == harness_contract::policy::PermissionResource::File
+                    })
+                    || descriptor.uses_network
+                    || descriptor.spawns_process
+                    || descriptor.mutates_packages
+                    || descriptor.mutates_system
+                {
+                    return Err("runtime retirement read lacks original physical scope v2".into());
+                }
+            } else {
+                super::review_evidence::validate_original_effect_scope(
+                    &primary.payload["resolved_effect_scope"],
+                    &descriptor,
+                )?;
+            }
+            if primary.commit_cursor != index.commit_cursor {
+                return Err(
+                    "runtime retirement tool provenance was not atomically admitted".into(),
+                );
+            }
+            if !read {
+                let receipt = self
+                    .store
+                    .event_by_idempotency_key(
+                        &primary_source,
+                        &format!("{}:receipt", request.idempotency_key),
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or("runtime retirement physical effect is still pending")?;
+                let index_receipt = self
+                    .store
+                    .event_by_idempotency_key(
+                        &index_source,
+                        &format!("agent-tool-receipt:{}", request.idempotency_key),
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or("runtime retirement effect index is still pending")?;
+                if receipt.kind != "execution.effect.receipt"
+                    || receipt.actor.as_deref() != Some("governed_tool")
+                    || index_receipt.kind != "execution.agent_tool.receipt"
+                    || index_receipt.actor.as_deref() != Some("governed_tool")
+                    || receipt.commit_cursor != index_receipt.commit_cursor
+                    || receipt.payload["idempotency_key"] != request.idempotency_key
+                    || index_receipt.payload["idempotency_key"] != request.idempotency_key
+                    || receipt.payload["tool_name"] != request.tool_name
+                    || crate::ExecutionCommitService::receipt_observation_sequence(&index_receipt)
+                        != Some(request.observation_wave_sequence)
+                    || index_receipt.payload["effect_kind"] != index.payload["effect_kind"]
+                    || index_receipt.payload["effect_scope"] != index.payload["effect_scope"]
+                    || index_receipt.payload["outcome"]["tool_use_id"] != request.tool_use_id
+                    || index_receipt.payload["outcome"]["tool_name"] != request.tool_name
+                    || receipt.payload["descriptor_hash"]
+                        != primary.payload["effect"]["descriptor_hash"]
+                    || receipt.payload["replay"] != primary.payload["replay"]
+                    || receipt.payload["resolved_effect_scope"]
+                        != primary.payload["resolved_effect_scope"]
+                    || receipt.payload["resolved_effect_scope"]
+                        != index_receipt.payload["resolved_effect_scope"]
+                    || receipt.payload["outcome"] != index_receipt.payload["outcome"]
+                    || !matches!(
+                        receipt.payload["outcome"]["status"].as_str(),
+                        Some("executed" | "blocked_permission")
+                    )
+                {
+                    return Err("runtime retirement effect receipt is not known settled".into());
+                }
+                if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Process {
+                    for cut in super::review_evidence::validate_bounded_process_retirement(
+                        &self.store,
+                        &receipt,
+                        self.artifacts.as_deref(),
+                    )? {
+                        if process_sources
+                            .insert(cut.stream_id, cut.expected_revision)
+                            .is_some_and(|previous| previous != cut.expected_revision)
+                        {
+                            return Err("runtime retirement process source moved".into());
+                        }
+                    }
+                }
+            } else if !matches!(
+                primary.payload["outcome"]["status"].as_str(),
+                Some("executed" | "blocked_permission")
+            ) {
+                return Err("runtime retirement tool read is not known settled".into());
+            }
+        }
+        for attempt_number in 1..=packet.attempt {
+            let source = format!(
+                "execution-agent-receipts:{}:{}:{attempt_number}",
+                graph.id, node.id
+            );
+            let revision = pin(&source)?;
+            let mut after = 0;
+            let mut pending = std::collections::BTreeSet::new();
+            let mut settled = std::collections::BTreeSet::new();
+            while after < revision {
+                let events =
+                    self.store
+                        .list_stream_after(&source, after, revision, 64, 4 * 1024 * 1024)?;
+                if events.is_empty() {
+                    return Err("runtime retirement receipt history is incomplete".into());
+                }
+                for event in events {
+                    validate_receipt_index_record(&event, &source, after + 1, revision)?;
+                    after = event.sequence;
+                    if event.actor.as_deref() != Some("governed_tool") {
+                        return Err("runtime retirement receipt owner mismatch".into());
+                    }
+                    let identity = event.payload["idempotency_key"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("runtime retirement receipt identity missing")?;
+                    match event.kind.as_str() {
+                        "execution.agent_tool.intent" => {
+                            pending.insert(identity.to_string());
+                        }
+                        "execution.agent_tool.receipt"
+                            if matches!(
+                                event.payload["outcome"]["status"].as_str(),
+                                Some("executed" | "blocked_permission")
+                            ) =>
+                        {
+                            if event.payload["effect_kind"] == "process" {
+                                let stream = format!("execution-effect:{identity}");
+                                let primary = self
+                                    .store
+                                    .event_by_idempotency_key(
+                                        &stream,
+                                        &format!("{identity}:receipt"),
+                                    )
+                                    .map_err(|error| error.to_string())?
+                                    .ok_or(
+                                        "runtime retirement original process terminal missing",
+                                    )?;
+                                for cut in
+                                    super::review_evidence::validate_bounded_process_retirement(
+                                        &self.store,
+                                        &primary,
+                                        self.artifacts.as_deref(),
+                                    )?
+                                {
+                                    if process_sources
+                                        .insert(cut.stream_id, cut.expected_revision)
+                                        .is_some_and(|previous| previous != cut.expected_revision)
+                                    {
+                                        return Err(
+                                            "runtime retirement process source moved".into()
+                                        );
+                                    }
+                                }
+                            }
+                            settled.insert(identity.to_string());
+                        }
+                        _ => {
+                            return Err("runtime retirement receipt is unknown or unsettled".into());
+                        }
+                    }
+                }
+            }
+            if !pending.is_subset(&settled) {
+                return Err("runtime retirement still has a pending physical effect".into());
+            }
+        }
+        for (source, revision) in process_sources {
+            if sources
+                .insert(source, revision)
+                .is_some_and(|previous| previous != revision)
+            {
+                return Err("runtime retirement process source changed before settlement".into());
+            }
+        }
+        for (source, revision) in &sources {
+            if self
+                .store
+                .stream_revision(source)
+                .map_err(|error| error.to_string())?
+                != *revision
+            {
+                return Err("runtime retirement source changed before settlement".into());
+            }
+        }
+        Ok(Some(RuntimeRetirementAdmission {
+            request_digest: super::review_evidence::proof_value_digest(envelope),
+            program_id: projection.program_id.clone(),
+            program_revision: projection.revision,
+            sources: sources
+                .into_iter()
+                .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                    stream_id,
+                    expected_revision,
+                })
+                .collect(),
+        }))
+    }
+
     #[must_use]
     pub fn new(store: Arc<RuntimeEventStore>) -> Self {
         Self {
             store,
             artifacts: None,
+            process_input_verifier: None,
+            proof_session_queries: None,
             graphs: None,
             read_model: Arc::new(super::AgenticReadModel::default()),
         }
     }
 
     #[must_use]
+    pub(crate) fn program_recovery_is_excluded(&self, program_id: &str) -> Result<bool, String> {
+        if !self.store.has_session_recovery_exclusions() {
+            return Ok(false);
+        }
+        let stream = program_stream(program_id);
+        let opened = self
+            .store
+            .event_by_idempotency_key(&stream, "agentic-program-opened")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "session_recovery_program_opening_missing".to_string())?;
+        if opened.stream_id != stream
+            || opened.scope != RuntimeEventScope::Program
+            || opened.kind != PROGRAM_OPENED_EVENT_KIND
+            || opened.schema_version != 1
+            || opened.sequence != 1
+        {
+            return Err("session_recovery_program_opening_invalid".into());
+        }
+        let session_id = opened
+            .payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session| !session.trim().is_empty())
+            .ok_or_else(|| "session_recovery_program_session_missing".to_string())?;
+        Ok(self.store.is_session_recovery_excluded(session_id))
+    }
+
+    pub(crate) fn recovery_session_is_excluded(&self, session_id: &str) -> bool {
+        self.store.is_session_recovery_excluded(session_id)
+    }
+
+    fn ensure_recovery_session_admitted(
+        &self,
+        session_id: &str,
+    ) -> Result<(), AgentActionServiceError> {
+        self.store
+            .ensure_session_recovery_admitted(session_id)
+            .map_err(|reason| {
+                AgentActionServiceError::Store(RuntimeEventStoreError::InvalidTransaction(reason))
+            })
+    }
+
     pub(crate) fn with_graph_store(mut self, graphs: crate::ExecutionGraphStateStore) -> Self {
         self.graphs = Some(graphs);
         self
@@ -367,8 +1628,25 @@ impl AgentActionService {
     /// Bind the physical artifact authority used by production Runtime
     /// services. Unit projections may omit it; an active Runtime never does.
     #[must_use]
+    pub(crate) fn with_process_input_verifier(
+        mut self,
+        verifier: crate::agentic::review_evidence::ProcessInputVerifier,
+    ) -> Self {
+        self.process_input_verifier = Some(verifier);
+        self
+    }
+
     pub fn with_artifact_store(mut self, artifacts: Arc<crate::ArtifactStore>) -> Self {
         self.artifacts = Some(artifacts);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_session_query_slot(
+        mut self,
+        queries: Arc<OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>>,
+    ) -> Self {
+        self.proof_session_queries = Some(queries);
         self
     }
 
@@ -409,6 +1687,12 @@ impl AgentActionService {
         }
         let program_stream_id = program_stream(&envelope.actor.program_id);
         let mut streams = vec![program_stream_id.clone(), goal_stream_id.clone()];
+        streams.extend(
+            verification
+                .and_then(|proof| proof.input_set.as_ref())
+                .into_iter()
+                .flat_map(|inputs| inputs.source_revisions.keys().cloned()),
+        );
         streams.extend(
             verification
                 .into_iter()
@@ -475,8 +1759,25 @@ impl AgentActionService {
         envelope: &AgentActionEnvelope,
         verification: &ObjectiveReviewVerification,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        let explicit = match &envelope.action {
+            AgentAction::TaskReview(input) => input.evidence_refs.as_slice(),
+            AgentAction::ObjectiveReview(input) => input.evidence_refs.as_slice(),
+            _ => &[],
+        };
+        super::review_evidence::validate_explicit_process_evidence(
+            &self.store,
+            verification,
+            explicit,
+        )
+        .map_err(AgentActionServiceError::Corrupt)?;
         let stream_id = program_stream(&envelope.actor.program_id);
         let mut streams = vec![stream_id.clone()];
+        streams.extend(
+            verification
+                .input_set
+                .iter()
+                .flat_map(|inputs| inputs.source_revisions.keys().cloned()),
+        );
         streams.extend(verification.result_source_revisions.keys().cloned());
         if verification.effect_manifest_digest.is_some() {
             streams.push(format!("session:{}", envelope.actor.session_id));
@@ -494,10 +1795,25 @@ impl AgentActionService {
         goal_event: Option<(String, u64, RuntimeTransactionEventInput)>,
         verification: Option<&ObjectiveReviewVerification>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        self.ensure_recovery_session_admitted(&envelope.actor.session_id)?;
         if let Some(replay) = self.replay_if_applied(envelope)? {
             return Ok(replay);
         }
 
+        let history = self
+            .proof_session_queries
+            .as_ref()
+            .and_then(|queries| queries.get())
+            .and_then(|queries| queries.history_reader());
+        let process_frame = self
+            .process_input_verifier
+            .as_ref()
+            .map(super::review_evidence::ProcessInputVerifier::frame);
+        let readers = super::review_evidence::ResultContentReaders {
+            artifacts: self.artifacts.as_deref(),
+            history: history.as_deref(),
+            process_inputs: process_frame.as_ref(),
+        };
         let mut projection = match self.project_snapshot(&envelope.actor.program_id) {
             Ok(projection) => projection,
             Err(AgentActionServiceError::Corrupt(message)) if message == "program_not_found" => {
@@ -531,6 +1847,7 @@ impl AgentActionService {
             }
             Err(error) => return Err(error),
         };
+        self.ensure_recovery_session_admitted(&projection.session_id)?;
         if projection.objective_id != envelope.actor.objective_id {
             return Ok(rejected(
                 envelope,
@@ -628,178 +1945,6 @@ impl AgentActionService {
             }
             return Ok(inspected_observation(envelope, &projection, goal.as_ref()));
         }
-        if verification.is_some_and(|proof| {
-            proof.work_manifest_digest != super::review_evidence::work_manifest_digest(&projection)
-        }) {
-            return Ok(rejected(
-                envelope,
-                projection.revision,
-                "stale_review_evidence",
-                "source work changed while review evidence was being verified",
-            ));
-        }
-        let mut policy_sources = Vec::new();
-        if let Some(proof) = verification.filter(|proof| !proof.independence_required) {
-            if envelope.actor.kind != AgentActorKind::Root
-                || !matches!(envelope.action, AgentAction::ObjectiveReview(_))
-                || goal_event.is_none()
-            {
-                return Ok(rejected(
-                    envelope,
-                    projection.revision,
-                    "invalid_review_policy",
-                    "self review is confined to the bound Root Objective",
-                ));
-            }
-            let root = envelope
-                .actor
-                .root_execution_id
-                .as_deref()
-                .ok_or_else(|| AgentActionServiceError::Corrupt("review has no root".into()))?;
-            let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
-                .get(&format!("goal:{root}"))
-                .map_err(AgentActionServiceError::EventStore)?
-                .ok_or_else(|| AgentActionServiceError::Corrupt("review has no Goal".into()))?;
-            let policy =
-                super::review_evidence::root_self_review_policy(&self.store, &projection, &goal)
-                    .map_err(AgentActionServiceError::EventStore)?;
-            let Some(policy) = policy.filter(|policy| {
-                proof.review_policy_digest.as_deref() == Some(policy.digest.as_str())
-            }) else {
-                return Ok(rejected(
-                    envelope,
-                    projection.revision,
-                    "stale_review_policy",
-                    "Runtime risk or tool effects no longer permit this review",
-                ));
-            };
-            policy_sources.push(policy.source);
-        }
-        if let Some(digest) = verification.and_then(|proof| proof.effect_manifest_digest.as_deref())
-        {
-            let root = envelope.actor.root_execution_id.as_deref().ok_or_else(|| {
-                AgentActionServiceError::Corrupt("effect review has no root".into())
-            })?;
-            let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
-                .get(&format!("goal:{root}"))
-                .map_err(AgentActionServiceError::EventStore)?;
-            let effect_sources = &verification
-                .expect("effect digest requires proof")
-                .effect_source_refs;
-            // The snapshot fences the root Session stream (and delegated effect
-            // streams) at one revision. Under concurrent writers the stream can
-            // move during the multi-page scan, which used to surface as a hard
-            // tool error on an otherwise correct review. Retry the scan a bounded
-            // number of times so a transient race is not reported as a failure;
-            // a genuinely unstable set still fails after the bound, so the
-            // digest/revision fence keeps its correctness guarantee.
-            let snapshot = {
-                const MAX_ATTEMPTS: u8 = 8;
-                let mut attempt = 0;
-                loop {
-                    attempt += 1;
-                    match super::review_evidence::effect_review_snapshot(
-                        &self.store,
-                        &projection,
-                        goal.as_ref(),
-                        effect_sources,
-                    ) {
-                        Ok(snapshot) => break snapshot,
-                        Err(error)
-                            if attempt < MAX_ATTEMPTS
-                                && (error.contains("source changed")
-                                    || error.contains("retry current effects")) =>
-                        {
-                            std::thread::yield_now();
-                        }
-                        Err(error) => return Err(AgentActionServiceError::EventStore(error)),
-                    }
-                }
-            };
-            if snapshot.digest != digest {
-                return Ok(rejected(
-                    envelope,
-                    projection.revision,
-                    "stale_effect_review",
-                    "admitted effects changed after verification; inspect the current target again",
-                ));
-            }
-            policy_sources.retain(|source| source.stream_id != snapshot.source.stream_id);
-            policy_sources.push(snapshot.source);
-            policy_sources.extend(snapshot.additional_sources);
-        }
-        if let Some(expected) = envelope.expected_revision {
-            if expected != projection.revision {
-                return Ok(rejected(
-                    envelope,
-                    projection.revision,
-                    "stale_revision",
-                    &format!(
-                        "expected Program revision {expected}, actual {}",
-                        projection.revision
-                    ),
-                ));
-            }
-        }
-        // ── Exception exit (blocked) ────────────────────────────────────────
-        // The DECISION that a goal is unreachable belongs to the model. Runtime
-        // only verifies that progress really has stopped, and never masks a real
-        // gap: an accepted blocked exit ends as an honest Partial whose
-        // `unresolved` stays visible.
-        if let AgentAction::ObjectiveCompleteRequest(input) = &envelope.action {
-            if input.blocked {
-                if input
-                    .blocked_reason
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-                    || !input.human_review_required
-                    || input.recommended_next_actions.is_empty()
-                {
-                    return Ok(rejected(
-                        envelope,
-                        projection.revision,
-                        "blocked_exit_incomplete",
-                        "a blocked exit requires a non-empty blocked_reason, human_review_required=true and at least one recommended_next_action",
-                    ));
-                }
-                if !agentic_program_is_quiescent(&projection) {
-                    return Ok(rejected(
-                        envelope,
-                        projection.revision,
-                        "blocked_exit_unearned",
-                        "the Program still has work in flight; a blocked exit is not permitted until the remaining work is exhausted",
-                    ));
-                }
-            }
-        }
-        if let Some((code, message)) =
-            validate_transition(&projection, envelope, now_ms(), self.graphs.as_ref())
-        {
-            if matches!(
-                code,
-                "objective_not_verifiable" | "objective_blocked_for_human_review"
-            ) && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_))
-            {
-                // F2b: an authorization-time completion rejection never became a
-                // durable reopen, so record it durably to keep the completion
-                // loop bounded by the reopen count.
-                self.record_completion_rejection(&projection, envelope, &message);
-            }
-            // T3.0 diagnostic: surface the exact rejection code so a failing
-            // tool call (e.g. task_review accept) is readable, not a bare
-            // "execution_error". Logs only; no behaviour change.
-            tracing::warn!(
-                code,
-                action = %envelope.action.kind(),
-                program_id = %envelope.actor.program_id,
-                agent_id = envelope.actor.agent_id.as_deref().unwrap_or("-"),
-                message = %message,
-                "agent action rejected at transition validation"
-            );
-            return Ok(rejected(envelope, projection.revision, code, &message));
-        }
         let mut review_source = None;
         if let AgentAction::TaskReview(input) = &envelope.action {
             if input.decision != harness_contract::agent_action::TaskReviewDecision::Accept {
@@ -859,6 +2004,217 @@ impl AgentActionService {
                         &format!("operator_requirement does not occur in the bound original operator objective. Copy an exact relevant substring of the original objective below, not a translation or added Task acceptance. Explain the actual missing deliverable separately in reason. Bound original operator objective: {objective:?}. Rejected operator_requirement: {requirement:?}")));
                 }
             }
+        }
+        let review_requires_proof = matches!(&envelope.action, AgentAction::TaskReview(_))
+            || matches!(&envelope.action, AgentAction::ObjectiveReview(input)
+                if input.decision == harness_contract::agent_action::ObjectiveReviewDecision::Satisfied);
+        if (review_requires_proof && verification.is_none())
+            || verification.is_some_and(|proof| {
+                !proof
+                    .input_set
+                    .as_ref()
+                    .is_some_and(|inputs| inputs.version == 2)
+            })
+        {
+            return Ok(rejected(
+                envelope,
+                projection.revision,
+                "unsupported_review_inputs",
+                "new reviews require complete supported v2 verification",
+            ));
+        }
+        let mut policy_sources = Vec::new();
+        if let Some(proof) = verification {
+            let goal = envelope
+                .actor
+                .root_execution_id
+                .as_deref()
+                .map(|root| {
+                    crate::execution_core::GoalStore::new(Arc::clone(&self.store))
+                        .get(&format!("goal:{root}"))
+                })
+                .transpose()
+                .map_err(AgentActionServiceError::EventStore)?
+                .flatten();
+            match super::review_evidence::validate_proof_inputs(
+                &self.store,
+                &projection,
+                goal.as_ref(),
+                proof,
+                readers,
+            ) {
+                Ok(snapshot) => policy_sources.extend(snapshot.sources),
+                Err(error) => {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "stale_review_evidence",
+                        &error,
+                    ));
+                }
+            }
+        }
+        if let Some(proof) = verification.filter(|proof| !proof.independence_required) {
+            if envelope.actor.kind != AgentActorKind::Root
+                || !matches!(envelope.action, AgentAction::ObjectiveReview(_))
+                || goal_event.is_none()
+            {
+                return Ok(rejected(
+                    envelope,
+                    projection.revision,
+                    "invalid_review_policy",
+                    "self review is confined to the bound Root Objective",
+                ));
+            }
+            let root = envelope
+                .actor
+                .root_execution_id
+                .as_deref()
+                .ok_or_else(|| AgentActionServiceError::Corrupt("review has no root".into()))?;
+            let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
+                .get(&format!("goal:{root}"))
+                .map_err(AgentActionServiceError::EventStore)?
+                .ok_or_else(|| AgentActionServiceError::Corrupt("review has no Goal".into()))?;
+            let policy =
+                super::review_evidence::root_self_review_policy(&self.store, &projection, &goal)
+                    .map_err(AgentActionServiceError::EventStore)?;
+            let Some(policy) = policy else {
+                return Ok(rejected(
+                    envelope,
+                    projection.revision,
+                    "stale_review_policy",
+                    "Runtime risk or tool effects no longer permit this review",
+                ));
+            };
+            policy_sources.push(policy.source);
+        }
+        if let Some(expected) = envelope.expected_revision {
+            if expected != projection.revision {
+                return Ok(rejected(
+                    envelope,
+                    projection.revision,
+                    "stale_revision",
+                    &format!(
+                        "expected Program revision {expected}, actual {}",
+                        projection.revision
+                    ),
+                ));
+            }
+        }
+        // ── Exception exit (blocked) ────────────────────────────────────────
+        // The DECISION that a goal is unreachable belongs to the model. Runtime
+        // only verifies that progress really has stopped, and never masks a real
+        // gap: an accepted blocked exit ends as an honest Partial whose
+        // `unresolved` stays visible.
+        if let AgentAction::ObjectiveCompleteRequest(input) = &envelope.action {
+            if input.blocked {
+                if input
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                    || !input.human_review_required
+                    || input.recommended_next_actions.is_empty()
+                {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "blocked_exit_incomplete",
+                        "a blocked exit requires a non-empty blocked_reason, human_review_required=true and at least one recommended_next_action",
+                    ));
+                }
+                if !agentic_program_is_quiescent(&projection) {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "blocked_exit_unearned",
+                        "the Program still has work in flight; a blocked exit is not permitted until the remaining work is exhausted",
+                    ));
+                }
+            }
+        }
+        let completion_context = if matches!(&envelope.action, AgentAction::ObjectiveCompleteRequest(input) if !input.blocked)
+            && matches!(
+                envelope.actor.kind,
+                AgentActorKind::Root | AgentActorKind::Supervisor
+            )
+            && matches!(
+                projection.status,
+                super::program::AgenticProgramStatus::Open
+                    | super::program::AgenticProgramStatus::Waiting
+                    | super::program::AgenticProgramStatus::Draining
+            ) {
+            match super::review_evidence::completion_admission_context(
+                &self.store,
+                &projection,
+                envelope,
+                readers,
+            ) {
+                Ok(context) => context,
+                Err(message) => {
+                    self.record_completion_rejection(&projection, envelope, &message);
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "objective_not_verifiable",
+                        &message,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let retirement_context = match self.runtime_retirement_admission(&projection, envelope) {
+            Ok(context) => context,
+            Err(message) => {
+                return Ok(rejected(
+                    envelope,
+                    projection.revision,
+                    "runtime_retirement_not_settled",
+                    &message,
+                ));
+            }
+        };
+        let transition = match (completion_context.as_ref(), retirement_context.as_ref()) {
+            (None, None) => {
+                validate_transition(&projection, envelope, now_ms(), self.graphs.as_ref())
+            }
+            (completion, retirement) => validate_transition_with_admission_contexts(
+                &projection,
+                envelope,
+                now_ms(),
+                self.graphs.as_ref(),
+                completion,
+                retirement,
+            ),
+        };
+        if let Some((code, message)) = transition {
+            if matches!(
+                code,
+                "objective_not_verifiable" | "objective_blocked_for_human_review"
+            ) && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_))
+            {
+                // F2b: an authorization-time completion rejection never became a
+                // durable reopen, so record it durably to keep the completion
+                // loop bounded by the reopen count.
+                self.record_completion_rejection(&projection, envelope, &message);
+            }
+            // T3.0 diagnostic: surface the exact rejection code so a failing
+            // tool call (e.g. task_review accept) is readable, not a bare
+            // "execution_error". Logs only; no behaviour change.
+            tracing::warn!(
+                code,
+                action = %envelope.action.kind(),
+                program_id = %envelope.actor.program_id,
+                agent_id = envelope.actor.agent_id.as_deref().unwrap_or("-"),
+                message = %message,
+                "agent action rejected at transition validation"
+            );
+            return Ok(rejected(envelope, projection.revision, code, &message));
+        }
+        if let Some(context) = completion_context {
+            policy_sources.extend(context.sources().iter().cloned());
         }
         // A Task may support several original Goal conditions, but it cannot
         // manufacture them. Keep the read revision in this same transaction so
@@ -1055,6 +2411,11 @@ impl AgentActionService {
         }];
         expected_streams.extend(policy_sources);
         expected_streams.extend(
+            retirement_context
+                .iter()
+                .flat_map(|context| context.sources.iter().cloned()),
+        );
+        expected_streams.extend(
             verification
                 .into_iter()
                 .flat_map(|proof| &proof.result_source_revisions)
@@ -1076,6 +2437,24 @@ impl AgentActionService {
             });
             events.push(goal_event);
         }
+        let mut unique_sources = std::collections::BTreeMap::new();
+        for source in expected_streams {
+            if unique_sources
+                .insert(source.stream_id, source.expected_revision)
+                .is_some_and(|previous| previous != source.expected_revision)
+            {
+                return Err(AgentActionServiceError::Corrupt(
+                    "review source changed during preparation".into(),
+                ));
+            }
+        }
+        let expected_streams = unique_sources
+            .into_iter()
+            .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                stream_id,
+                expected_revision,
+            })
+            .collect();
         self.store
             .append_transaction_locked(AppendTransactionRequest {
                 transaction_id: format!(
@@ -1144,122 +2523,175 @@ impl AgentActionService {
                 return Ok(cached);
             }
             if cached.revision < durable_revision {
-                let delta = self
-                    .store
-                    .list_stream_after(
-                        &stream_id,
-                        cached.revision,
-                        durable_revision,
-                        10_000,
-                        32 * 1024 * 1024,
-                    )
-                    .map_err(AgentActionServiceError::EventStore)?;
-                if delta.last().map(|event| event.sequence) == Some(durable_revision) {
-                    apply_projection_events(Arc::make_mut(&mut cached), delta)?;
-                    self.refresh_completion_gaps(Arc::make_mut(&mut cached));
-                    self.remember_projection(&cached);
-                    return Ok(cached);
-                }
+                self.catch_up_projection(Arc::make_mut(&mut cached), &stream_id, durable_revision)?;
+                self.refresh_completion_gaps(Arc::make_mut(&mut cached));
+                self.remember_projection(&cached);
+                return Ok(cached);
             }
         }
         if let Some(mut persisted) = self.persisted_projection(program_id, durable_revision)? {
-            if persisted.revision < durable_revision {
-                let delta = self
-                    .store
-                    .list_stream_after(
-                        &stream_id,
-                        persisted.revision,
-                        durable_revision,
-                        10_000,
-                        32 * 1024 * 1024,
-                    )
-                    .map_err(AgentActionServiceError::EventStore)?;
-                if delta.last().map(|event| event.sequence) == Some(durable_revision) {
-                    apply_projection_events(&mut persisted, delta)?;
-                    self.refresh_completion_gaps(&mut persisted);
-                    let persisted = Arc::new(persisted);
-                    self.remember_projection(&persisted);
-                    return Ok(persisted);
-                }
-            } else {
-                let persisted = Arc::new(persisted);
-                self.read_model.put(Arc::clone(&persisted));
-                return Ok(persisted);
-            }
+            self.catch_up_projection(&mut persisted, &stream_id, durable_revision)?;
+            self.refresh_completion_gaps(&mut persisted);
+            let persisted = Arc::new(persisted);
+            self.remember_projection(&persisted);
+            return Ok(persisted);
         }
         let events = self
             .store
-            .list_stream(&stream_id)
+            .list_stream_after(&stream_id, 0, durable_revision, 100, 1024 * 1024)
             .map_err(AgentActionServiceError::EventStore)?;
         let opened = events
             .iter()
             .find(|event| event.kind == PROGRAM_OPENED_EVENT_KIND)
             .ok_or_else(|| AgentActionServiceError::Corrupt("program_not_found".to_string()))?;
-        let objective_id = opened
-            .payload
-            .get("objective_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                AgentActionServiceError::Corrupt("program_opened_missing_objective".to_string())
-            })?;
-        let mut projection = AgenticProgramProjection::empty(program_id, objective_id);
-        projection.session_id = opened
-            .payload
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        projection.turn_id = opened
-            .payload
-            .get("turn_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        projection.root_execution_id = opened
-            .payload
-            .get("root_execution_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        projection.required_team_count = opened
-            .payload
-            .get("required_team_count")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u8::try_from(value).ok())
-            .unwrap_or_default();
-        projection.exact_team_count = opened
-            .payload
-            .get("exact_team_count")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u8::try_from(value).ok());
-        projection.objective_summary = opened
-            .payload
-            .get("objective_summary")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        projection.model_lease = opened
-            .payload
-            .get("model_lease")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("default")
-            .to_string();
-        projection.permission_ceiling = opened
-            .payload
-            .get("permission_ceiling")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or(harness_contract::policy::PermissionMode::ReadOnly);
-        projection.resource_scopes = opened
-            .payload
-            .get("resource_scopes")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default();
+        let mut projection = projection_from_opened(program_id, opened)?;
         apply_projection_events(&mut projection, events)?;
+        self.catch_up_projection(&mut projection, &stream_id, durable_revision)?;
         self.refresh_completion_gaps(&mut projection);
         let projection = Arc::new(projection);
         self.remember_projection(&projection);
         Ok(projection)
+    }
+
+    pub(crate) fn project_snapshot_bounded<Failure>(
+        &self,
+        program_id: &str,
+        durable_revision: u64,
+        opened: &crate::DurableRuntimeEvent,
+        goal: Option<&harness_contract::goal::GoalContract>,
+        mut read_page: impl FnMut(u64, u64) -> Result<Vec<crate::DurableRuntimeEvent>, Failure>,
+        map_error: impl Fn(AgentActionServiceError) -> Failure,
+    ) -> Result<Arc<AgenticProgramProjection>, Failure> {
+        let stream = program_stream(program_id);
+        if durable_revision == 0
+            || opened.stream_id != stream
+            || opened.sequence != 1
+            || opened.scope != RuntimeEventScope::Program
+            || opened.schema_version != 1
+            || opened.kind != PROGRAM_OPENED_EVENT_KIND
+        {
+            return Err(map_error(AgentActionServiceError::Corrupt(
+                "invalid bounded Program opening".into(),
+            )));
+        }
+        let cached = self.read_model.get(program_id);
+        let cached_revision = cached.as_ref().map(|snapshot| snapshot.revision);
+        let mut snapshot = match cached {
+            Some(cached) if cached.revision <= durable_revision => cached,
+            _ => {
+                let mut projection =
+                    projection_from_opened(program_id, opened).map_err(&map_error)?;
+                apply_projection_events(&mut projection, vec![opened.clone()])
+                    .map_err(&map_error)?;
+                Arc::new(projection)
+            }
+        };
+        while snapshot.revision < durable_revision {
+            let page = read_page(snapshot.revision, durable_revision)?;
+            if page.is_empty() {
+                return Err(map_error(AgentActionServiceError::Corrupt(
+                    "bounded Program sequence gap".into(),
+                )));
+            }
+            let mut expected = snapshot.revision;
+            for event in &page {
+                expected = expected.checked_add(1).ok_or_else(|| {
+                    map_error(AgentActionServiceError::Corrupt(
+                        "Program sequence overflow".into(),
+                    ))
+                })?;
+                if event.stream_id != stream
+                    || event.sequence != expected
+                    || expected > durable_revision
+                    || event.scope != RuntimeEventScope::Program
+                    || event.schema_version != 1
+                {
+                    return Err(map_error(AgentActionServiceError::Corrupt(
+                        "invalid bounded Program tail".into(),
+                    )));
+                }
+            }
+            apply_projection_events(Arc::make_mut(&mut snapshot), page).map_err(&map_error)?;
+            if snapshot.revision != expected {
+                return Err(map_error(AgentActionServiceError::Corrupt(
+                    "bounded Program reducer coverage".into(),
+                )));
+            }
+        }
+        if snapshot.program_id != program_id
+            || snapshot.objective_id != opened.payload["objective_id"].as_str().unwrap_or_default()
+            || snapshot.root_execution_id.as_deref() != opened.payload["root_execution_id"].as_str()
+            || snapshot.session_id != opened.payload["session_id"].as_str().unwrap_or_default()
+            || snapshot.turn_id != opened.payload["turn_id"].as_str().unwrap_or_default()
+        {
+            return Err(map_error(AgentActionServiceError::Corrupt(
+                "bounded Program identity mismatch".into(),
+            )));
+        }
+        if let Some(goal) = goal {
+            if goal.session_id != snapshot.session_id
+                || goal.execution_binding.as_ref().is_some_and(|binding| {
+                    Some(binding.root_execution_id.as_str())
+                        != snapshot.root_execution_id.as_deref()
+                        || binding.agentic_program_id != snapshot.program_id
+                        || binding.objective_id != snapshot.objective_id
+                        || binding.session_id != snapshot.session_id
+                        || binding.turn_id != snapshot.turn_id
+                })
+            {
+                return Err(map_error(AgentActionServiceError::Corrupt(
+                    "bounded Program Goal binding mismatch".into(),
+                )));
+            }
+        }
+        let gaps = completion_gaps_from_goal(&snapshot, goal);
+        if snapshot.unresolved != gaps {
+            Arc::make_mut(&mut snapshot).unresolved = gaps;
+        }
+        if cached_revision.is_none_or(|revision| revision < snapshot.revision) {
+            self.read_model.put(Arc::clone(&snapshot));
+        }
+        Ok(snapshot)
+    }
+
+    fn catch_up_projection(
+        &self,
+        projection: &mut AgenticProgramProjection,
+        stream: &str,
+        head: u64,
+    ) -> Result<(), AgentActionServiceError> {
+        while projection.revision < head {
+            let page = self
+                .store
+                .list_stream_after(stream, projection.revision, head, 100, 1024 * 1024)
+                .map_err(AgentActionServiceError::EventStore)?;
+            if page.is_empty() {
+                return Err(AgentActionServiceError::Corrupt(
+                    "Program tail has a sequence gap".into(),
+                ));
+            }
+            let mut expected = projection.revision;
+            for event in &page {
+                expected = expected.checked_add(1).ok_or_else(|| {
+                    AgentActionServiceError::Corrupt("Program sequence overflow".into())
+                })?;
+                if event.stream_id != stream
+                    || event.sequence != expected
+                    || event.schema_version != 1
+                {
+                    return Err(AgentActionServiceError::Corrupt(
+                        "unsupported or discontinuous Program tail".into(),
+                    ));
+                }
+            }
+            apply_projection_events(projection, page)?;
+            if projection.revision != expected {
+                return Err(AgentActionServiceError::Corrupt(
+                    "Program reducer did not consume tail".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn persisted_projection(
@@ -1282,7 +2714,7 @@ impl AgentActionService {
             );
             return Ok(None);
         }
-        Ok(decode_read_snapshot(&checkpoint, program_id))
+        Ok(decode_read_snapshot(&checkpoint, program_id, &self.store))
     }
 
     fn remember_projection(&self, projection: &Arc<AgenticProgramProjection>) {
@@ -1295,11 +2727,22 @@ impl AgentActionService {
                 return;
             }
         };
-        let digest = format!(
-            "sha256:{:x}",
-            Sha256::digest(payload.to_string().as_bytes())
-        );
-        let payload = json!({"schema_version":1,"projection":payload,"sha256":digest});
+        let body = match self.store.prepare_content(
+            &format!("session:{}", projection.session_id),
+            &format!("{projection_id}:{}", projection.revision),
+            &payload,
+            &crate::PreparedArtifactOrigin::CheckpointBody {
+                projection_id: projection_id.clone(),
+                source_cursor: projection.revision,
+            },
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(program_id=%projection.program_id,%error,"current Program checkpoint preparation failed");
+                return;
+            }
+        };
+        let payload = json!({"schema_version":2,"session_id":projection.session_id,"body":body});
         // Concurrent Program readers race the same snapshot row. Re-read the
         // authoritative row revision and retry the CAS instead of dropping the
         // snapshot on the first stale revision.
@@ -1315,7 +2758,8 @@ impl AgentActionService {
                         .store
                         .stream_revision(&program_stream(&projection.program_id))
                         .is_ok_and(|head| checkpoint.source_cursor <= head)
-                    && decode_read_snapshot(checkpoint, &projection.program_id).is_some()
+                    && decode_read_snapshot(checkpoint, &projection.program_id, &self.store)
+                        .is_some()
             }) {
                 return;
             }
@@ -1459,6 +2903,14 @@ impl AgentActionService {
         &self,
         request: AgenticTopicObservationAck,
     ) -> Result<(), AgentActionServiceError> {
+        if self
+            .program_recovery_is_excluded(&request.program_id)
+            .map_err(AgentActionServiceError::EventStore)?
+        {
+            return Err(AgentActionServiceError::Store(
+                RuntimeEventStoreError::InvalidTransaction("session_recovery_quarantined".into()),
+            ));
+        }
         let stream_id = topic_cursor_stream(&request.program_id, &request.execution_id);
         self.store.with_stream_lock(&stream_id, || {
             let (through_revision, cursor_revision) = self.topic_cursor(&stream_id)?;
@@ -1538,6 +2990,12 @@ impl AgentActionService {
         envelope: &AgentActionEnvelope,
         gap: &str,
     ) {
+        if self
+            .store
+            .is_session_recovery_excluded(&projection.session_id)
+        {
+            return;
+        }
         let stream_id = program_stream(&projection.program_id);
         let event = RuntimeTransactionEventInput {
             event: RuntimeEventInput {
@@ -1593,8 +3051,338 @@ impl AgentActionService {
     pub(crate) fn commit_program_conclusion(
         &self,
         projection: &AgenticProgramProjection,
-        prepared: crate::execution_core::goal::PreparedProgramConclusion,
+        mut prepared: crate::execution_core::goal::PreparedProgramConclusion,
     ) -> Result<AgenticProgramProjection, AgentActionServiceError> {
+        self.ensure_recovery_session_admitted(&projection.session_id)?;
+        self.ensure_recovery_session_admitted(&prepared.goal.session_id)?;
+        let original_revision = projection.revision;
+        let own_stream = program_stream(&projection.program_id);
+        if prepared.goal.completion == harness_contract::goal::GoalCompletion::Satisfied
+            && !prepared.policy_sources.iter().any(|source| {
+                source.stream_id == own_stream && source.expected_revision == original_revision
+            })
+        {
+            return Err(AgentActionServiceError::Corrupt(
+                "prepared own Program carrier cut is missing".into(),
+            ));
+        }
+        let current = self.project(&projection.program_id)?;
+        let lease_rebased = current.revision != original_revision;
+        if lease_rebased {
+            let delta = self
+                .store
+                .list_stream_after(
+                    &own_stream,
+                    original_revision,
+                    current.revision,
+                    1_024,
+                    4 * 1024 * 1024,
+                )
+                .map_err(AgentActionServiceError::EventStore)?;
+            if current.revision <= original_revision
+                || current.revision - original_revision != delta.len() as u64
+                || !delta.iter().enumerate().all(|(offset, event)| {
+                    event.sequence == original_revision + offset as u64 + 1
+                        && event.scope == RuntimeEventScope::Program
+                        && event.kind == TASK_LEASE_RENEWED_EVENT_KIND
+                })
+                || super::review_evidence::proof_value_digest(&current.completion_request)
+                    != super::review_evidence::proof_value_digest(&projection.completion_request)
+            {
+                return Err(RuntimeEventStoreError::StaleRevision {
+                    stream_id: own_stream,
+                    expected: original_revision,
+                    actual: current.revision,
+                }
+                .into());
+            }
+        }
+        let projection = &current;
+        let history = self
+            .proof_session_queries
+            .as_ref()
+            .and_then(|queries| queries.get())
+            .and_then(|queries| queries.history_reader());
+        let process_frame = self
+            .process_input_verifier
+            .as_ref()
+            .map(super::review_evidence::ProcessInputVerifier::frame);
+        let readers = super::review_evidence::ResultContentReaders {
+            artifacts: self.artifacts.as_deref(),
+            history: history.as_deref(),
+            process_inputs: process_frame.as_ref(),
+        };
+        if prepared.goal.completion == harness_contract::goal::GoalCompletion::Satisfied {
+            let mut current_sources = std::collections::BTreeMap::new();
+            let request = projection.completion_request.as_ref().ok_or_else(|| {
+                AgentActionServiceError::Corrupt("missing completion request before A".into())
+            })?;
+            let event = self
+                .store
+                .event_by_idempotency_key(
+                    &program_stream(&projection.program_id),
+                    &action_key(&request.action_id),
+                )?
+                .ok_or_else(|| {
+                    AgentActionServiceError::Corrupt(
+                        "completion request action disappeared before A".into(),
+                    )
+                })?;
+            let envelope: AgentActionEnvelope =
+                serde_json::from_value(event.payload["envelope"].clone())?;
+            let AgentAction::ObjectiveCompleteRequest(input) = &envelope.action else {
+                return Err(AgentActionServiceError::Corrupt(
+                    "completion request action changed before A".into(),
+                ));
+            };
+            if event.kind != ACTION_EVENT_KIND
+                || event.sequence != request.program_revision
+                || envelope.action_id != request.action_id
+                || envelope.actor.actor_id != request.requested_by
+                || envelope.actor.program_id != projection.program_id
+                || envelope.actor.objective_id != projection.objective_id
+                || envelope.actor.session_id != projection.session_id
+                || envelope.actor.turn_id != projection.turn_id
+                || envelope.actor.root_execution_id != projection.root_execution_id
+                || request.result_refs != input.result_refs
+                || request.evidence_refs != input.evidence_refs
+                || request.unresolved != input.unresolved
+                || input.blocked
+            {
+                return Err(AgentActionServiceError::Corrupt(
+                    "completion request provenance changed before A".into(),
+                ));
+            }
+            let context = super::review_evidence::completion_admission_context(
+                &self.store,
+                projection,
+                &envelope,
+                readers,
+            )
+            .map_err(AgentActionServiceError::EventStore)?;
+            if context.as_ref().is_some_and(|context| {
+                !context.matches_goal(&prepared.goal, prepared.expected_stream_revision)
+            }) {
+                return Err(AgentActionServiceError::EventStore(
+                    "completion context Goal cut changed before A".into(),
+                ));
+            }
+            if let Some(gap) =
+                super::supervision::completion_gap_with_context(projection, input, context.as_ref())
+            {
+                return Err(AgentActionServiceError::EventStore(format!(
+                    "completion admission changed before A:{gap}"
+                )));
+            }
+            if let Some(context) = context {
+                for source in context.sources() {
+                    current_sources.insert(source.stream_id.clone(), source.expected_revision);
+                }
+            }
+            if prepared.goal.criteria.iter().any(|criterion| {
+                use harness_contract::goal::AcceptanceStatus;
+                !matches!(
+                    criterion.status,
+                    AcceptanceStatus::Satisfied | AcceptanceStatus::Waived
+                ) || (criterion.status == AcceptanceStatus::Waived
+                    && !criterion.waiver.as_ref().is_some_and(|waiver| {
+                        !waiver.actor.trim().is_empty()
+                            && !waiver.reason.trim().is_empty()
+                            && !waiver.permission_receipt.trim().is_empty()
+                    }))
+            }) {
+                return Err(AgentActionServiceError::Corrupt(
+                    "prepared acceptance status cannot bypass required review or waiver".into(),
+                ));
+            }
+            let conditions = super::review_evidence::required_review_conditions(&prepared.goal);
+            for condition in conditions {
+                let review = prepared
+                    .goal
+                    .reviews
+                    .iter()
+                    .rev()
+                    .find(|review| review.criterion_ref == condition)
+                    .ok_or_else(|| {
+                        AgentActionServiceError::Corrupt(
+                            "required review disappeared before A".into(),
+                        )
+                    })?;
+                let proof = review.verification.as_ref().ok_or_else(|| {
+                    AgentActionServiceError::Corrupt(format!(
+                        "required review {condition} has no verification"
+                    ))
+                })?;
+                let inputs = proof
+                    .input_set
+                    .as_ref()
+                    .filter(|inputs| inputs.version == 2)
+                    .ok_or_else(|| {
+                        AgentActionServiceError::Corrupt(format!(
+                            "unsupported required review {condition}"
+                        ))
+                    })?;
+                if review.decision != "satisfied"
+                    || review.spec_revision != prepared.goal.spec_revision
+                    || review.input_manifest_digest != prepared.goal.spec_digest
+                    || inputs.condition_ref.as_deref() != Some(condition.as_str())
+                {
+                    return Err(AgentActionServiceError::Corrupt(format!(
+                        "invalid required review {condition}"
+                    )));
+                }
+                let snapshot = super::review_evidence::validate_proof_inputs(
+                    &self.store,
+                    projection,
+                    Some(&prepared.goal),
+                    proof,
+                    readers,
+                )
+                .map_err(AgentActionServiceError::EventStore)?;
+                if !snapshot.reviewer_matches(projection, review)
+                    || proof.goal_spec_revision != Some(prepared.goal.spec_revision)
+                    || proof.goal_spec_digest.as_deref() != Some(prepared.goal.spec_digest.as_str())
+                    || inputs.material_events.is_empty()
+                    || review.evidence_refs.is_empty()
+                    || review.producer_refs.is_empty()
+                    || review.result_refs.is_empty()
+                    || proof.producer_execution_ids.is_empty()
+                    || proof.reviewer_execution_id.is_empty()
+                    || proof.producer_execution_ids.iter().any(|producer| {
+                        producer.is_empty()
+                            || (proof.independence_required
+                                && producer == &proof.reviewer_execution_id)
+                    })
+                    || (proof.independence_required
+                        && review.producer_refs.contains(&review.reviewer_actor))
+                {
+                    return Err(AgentActionServiceError::Corrupt(format!(
+                        "invalid required review identity {condition}"
+                    )));
+                }
+                let mut required_results = review.result_refs.clone();
+                if prepared.goal.user_intent_criterion_id.as_ref() == Some(&condition) {
+                    required_results.extend(crate::execution_core::goal::delivered_result_refs(
+                        projection,
+                        &prepared.goal,
+                        &request.result_refs,
+                    ));
+                }
+                for obligation in prepared.goal.obligations.iter().filter(|obligation| {
+                    obligation.required && obligation.obligation_id == condition
+                }) {
+                    required_results.extend(obligation.artifact_refs.iter().cloned());
+                }
+                for reference in required_results {
+                    let identity =
+                        super::review_evidence::review_result_identity(projection, &reference)
+                            .map_err(AgentActionServiceError::Corrupt)?;
+                    let covers = |refs: &[String]| {
+                        refs.iter().any(|reference| {
+                            super::review_evidence::review_result_identity(projection, reference)
+                                .is_ok_and(|current| current == identity)
+                        })
+                    };
+                    if !covers(&review.result_refs)
+                        || !covers(&inputs.result_refs)
+                        || !proof.reads.iter().any(|read| {
+                            super::review_evidence::review_result_identity(
+                                projection,
+                                &read.result_ref,
+                            )
+                            .is_ok_and(|current| current == identity)
+                                && !read.sha256.is_empty()
+                                && !read.receipt_refs.is_empty()
+                                && (read.result_kind
+                                    != harness_contract::goal::GoalResultKind::ToolEffect
+                                    || !read.effect_observation_refs.is_empty())
+                        })
+                    {
+                        return Err(AgentActionServiceError::Corrupt(format!(
+                            "required result coverage missing for {condition}"
+                        )));
+                    }
+                }
+                for source in snapshot.sources {
+                    if current_sources
+                        .insert(source.stream_id, source.expected_revision)
+                        .is_some_and(|previous| previous != source.expected_revision)
+                    {
+                        return Err(AgentActionServiceError::EventStore(
+                            "proof sources changed between required reviews before A".into(),
+                        ));
+                    }
+                }
+            }
+            let stored_goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
+                .projection(&prepared.goal.id)
+                .map_err(AgentActionServiceError::EventStore)?
+                .ok_or_else(|| {
+                    AgentActionServiceError::Corrupt("prepared Goal disappeared before A".into())
+                })?;
+            let terminal = prepared.goal.terminal.as_ref().ok_or_else(|| {
+                AgentActionServiceError::Corrupt("Satisfied A has no terminal".into())
+            })?;
+            if stored_goal.stream_revision != prepared.expected_stream_revision
+                || stored_goal.goal.scope != prepared.goal.scope
+                || stored_goal.goal.session_id != prepared.goal.session_id
+                || stored_goal.goal.objective != prepared.goal.objective
+                || stored_goal.goal.spec_revision != prepared.goal.spec_revision
+                || stored_goal.goal.spec_digest != prepared.goal.spec_digest
+                || stored_goal.goal.user_sequence != prepared.goal.user_sequence
+                || stored_goal.goal.reviews != prepared.goal.reviews
+                || stored_goal.goal.obligations != prepared.goal.obligations
+                || stored_goal.goal.execution_binding != prepared.goal.execution_binding
+                || stored_goal.goal.user_intent_criterion_id
+                    != prepared.goal.user_intent_criterion_id
+                || prepared.goal.user_intent_criterion_id.is_none()
+                || crate::execution_core::goal::goal_spec_digest(&stored_goal.goal)
+                    != crate::execution_core::goal::goal_spec_digest(&prepared.goal)
+                || prepared.goal.revision != stored_goal.goal.revision.saturating_add(1)
+                || terminal.kind != harness_contract::goal::ObjectiveTerminalKind::Satisfied
+                || terminal.authority_revision != request.program_revision
+                || terminal.terminal_fence
+                    != format!(
+                        "agentic-objective:{}:request:{}",
+                        projection.program_id, request.program_revision
+                    )
+                || prepared.event.event.stream_id != format!("goal:{}", prepared.goal.id)
+                || prepared.event.event.payload["goal"] != serde_json::to_value(&prepared.goal)?
+            {
+                return Err(AgentActionServiceError::Corrupt(
+                    "prepared Goal, review or request identity changed before A".into(),
+                ));
+            }
+            for source in &prepared.policy_sources {
+                let revision = if lease_rebased && source.stream_id == own_stream {
+                    if source.expected_revision != original_revision {
+                        return Err(AgentActionServiceError::EventStore(
+                            "own Program prepared cut is inconsistent".into(),
+                        ));
+                    }
+                    projection.revision
+                } else {
+                    source.expected_revision
+                };
+                if let Some(previous) = current_sources.insert(source.stream_id.clone(), revision) {
+                    if previous != revision {
+                        return Err(RuntimeEventStoreError::StaleRevision {
+                            stream_id: source.stream_id.clone(),
+                            expected: revision,
+                            actual: previous,
+                        }
+                        .into());
+                    }
+                }
+            }
+            prepared.policy_sources = current_sources
+                .into_iter()
+                .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                    stream_id,
+                    expected_revision,
+                })
+                .collect();
+        }
         let request = projection
             .completion_request
             .as_ref()
@@ -1625,9 +3413,6 @@ impl AgentActionService {
                 }),
             )
         };
-        let program_is_proof_source = prepared.policy_sources.iter().any(|source| {
-            source.stream_id == program_stream_id
-        });
         let mut expected_streams = prepared.policy_sources;
         expected_streams.extend([
             ExpectedStreamRevision {
@@ -1639,7 +3424,25 @@ impl AgentActionService {
                 expected_revision: prepared.expected_stream_revision,
             },
         ]);
-        let mut transaction = AppendTransactionRequest {
+        let mut unique_sources = std::collections::BTreeMap::new();
+        for source in expected_streams {
+            if unique_sources
+                .insert(source.stream_id, source.expected_revision)
+                .is_some_and(|previous| previous != source.expected_revision)
+            {
+                return Err(AgentActionServiceError::EventStore(
+                    "conclusion source changed before A".into(),
+                ));
+            }
+        }
+        let expected_streams = unique_sources
+            .into_iter()
+            .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                stream_id,
+                expected_revision,
+            })
+            .collect();
+        let transaction = AppendTransactionRequest {
             transaction_id: format!(
                 "program-conclusion:{}:{}",
                 projection.program_id, request.program_revision
@@ -1668,33 +3471,28 @@ impl AgentActionService {
                 },
             ],
         };
-        let stream_ids = transaction.expected_streams.iter()
-            .map(|source| source.stream_id.clone()).collect::<Vec<_>>();
+        let stream_ids = transaction
+            .expected_streams
+            .iter()
+            .map(|source| source.stream_id.clone())
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        CONCLUSION_APPEND_HOOK.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook(&transaction);
+            }
+        });
         self.store.with_stream_locks(&stream_ids, || {
             let stream_id = program_stream(&projection.program_id);
             let actual = self.store.stream_revision(&stream_id)?;
             if actual != projection.revision {
-                let delta = self.store.list_stream_after(
-                    &stream_id, projection.revision, actual, 1_024, 4 * 1024 * 1024,
-                ).map_err(AgentActionServiceError::EventStore)?;
-                let renewal_only = !program_is_proof_source
-                    && actual > projection.revision
-                    && actual - projection.revision == delta.len() as u64
-                    && delta.iter().enumerate().all(|(offset, event)| {
-                        event.sequence == projection.revision + offset as u64 + 1
-                            && event.scope == RuntimeEventScope::Program
-                            && event.kind == TASK_LEASE_RENEWED_EVENT_KIND
-                    });
-                if !renewal_only {
-                    return Err(RuntimeEventStoreError::StaleRevision {
-                        stream_id, expected: projection.revision, actual,
-                    }.into());
+                return Err(RuntimeEventStoreError::StaleRevision {
+                    stream_id,
+                    expected: projection.revision,
+                    actual,
                 }
-                for source in &mut transaction.expected_streams {
-                    if source.stream_id == stream_id {
-                        source.expected_revision = actual;
-                    }
-                }
+                .into());
             }
             self.store.append_transaction_locked(transaction)?;
             Ok::<_, AgentActionServiceError>(())
@@ -1711,6 +3509,7 @@ impl AgentActionService {
         goal: &harness_contract::goal::GoalContract,
     ) -> Result<AgenticProgramProjection, AgentActionServiceError> {
         let projection = self.project(program_id)?;
+        self.ensure_recovery_session_admitted(&projection.session_id)?;
         let Some(request) = projection.completion_request.as_ref() else {
             return Err(AgentActionServiceError::Corrupt(
                 "objective_verdict_without_completion_request".to_string(),
@@ -1789,12 +3588,102 @@ impl AgentActionService {
             kind: terminal.kind,
         };
         let stream_id = program_stream(program_id);
+        let actual_goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
+            .projection(&goal.id)
+            .map_err(AgentActionServiceError::EventStore)?
+            .ok_or_else(|| {
+                AgentActionServiceError::Corrupt("bound verdict Goal disappeared".into())
+            })?;
+        if actual_goal.goal != *goal {
+            return Err(AgentActionServiceError::Corrupt(
+                "bound verdict Goal cut changed".into(),
+            ));
+        }
+        // A Program action applied after the Goal reached its terminal (a late
+        // completion request is recorded but not adopted, for instance) advances
+        // the Program stream without invalidating the terminal. The verdict is
+        // fenced by the terminal fence and authority revision checked above, by
+        // the fresh Goal cut, and by the proof source cuts below, so the carrier
+        // cut is read at the current revision instead of freezing the entry-time
+        // projection revision - which made any post-terminal Program event block
+        // verdict binding permanently.
+        let carrier_revision = self
+            .store
+            .stream_revision(&stream_id)
+            .map_err(AgentActionServiceError::Store)?;
+        let mut source_cuts = std::collections::BTreeMap::from([
+            (stream_id.clone(), carrier_revision),
+            (format!("goal:{}", goal.id), actual_goal.stream_revision),
+        ]);
+        let process_frame = self
+            .process_input_verifier
+            .as_ref()
+            .map(super::review_evidence::ProcessInputVerifier::frame);
+        if goal.completion == harness_contract::goal::GoalCompletion::Satisfied {
+            let history = self
+                .proof_session_queries
+                .as_ref()
+                .and_then(|queries| queries.get())
+                .and_then(|queries| queries.history_reader());
+            let readers = super::review_evidence::ResultContentReaders {
+                artifacts: self.artifacts.as_deref(),
+                history: history.as_deref(),
+                process_inputs: process_frame.as_ref(),
+            };
+            for source in
+                super::review_evidence::committed_proof_sources(&self.store, goal, readers)
+                    .map_err(AgentActionServiceError::EventStore)?
+            {
+                if source_cuts
+                    .insert(source.stream_id, source.expected_revision)
+                    .is_some_and(|previous| previous != source.expected_revision)
+                {
+                    return Err(AgentActionServiceError::EventStore(
+                        "bound verdict proof source changed".into(),
+                    ));
+                }
+            }
+            for condition in super::review_evidence::required_review_conditions(goal) {
+                let proof = goal
+                    .reviews
+                    .iter()
+                    .rev()
+                    .find(|review| review.criterion_ref == condition)
+                    .and_then(|review| review.verification.as_ref())
+                    .ok_or_else(|| {
+                        AgentActionServiceError::Corrupt(
+                            "bound verdict requires current review".into(),
+                        )
+                    })?;
+                let snapshot = super::review_evidence::validate_proof_inputs(
+                    &self.store,
+                    &projection,
+                    Some(goal),
+                    proof,
+                    readers,
+                )
+                .map_err(AgentActionServiceError::EventStore)?;
+                for source in snapshot.sources {
+                    if source_cuts
+                        .insert(source.stream_id, source.expected_revision)
+                        .is_some_and(|previous| previous != source.expected_revision)
+                    {
+                        return Err(AgentActionServiceError::EventStore(
+                            "bound verdict current proof cut changed".into(),
+                        ));
+                    }
+                }
+            }
+        }
         self.store.append_transaction(AppendTransactionRequest {
             transaction_id: format!("agentic-objective-verdict:{program_id}:{}", goal.revision),
-            expected_streams: vec![ExpectedStreamRevision {
-                stream_id: stream_id.clone(),
-                expected_revision: projection.revision,
-            }],
+            expected_streams: source_cuts
+                .into_iter()
+                .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                    stream_id,
+                    expected_revision,
+                })
+                .collect(),
             events: vec![RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id,
@@ -1970,21 +3859,97 @@ impl AgentActionService {
         let Ok(Some(goal)) = goal_store.projection(&format!("goal:{root_execution_id}")) else {
             return Vec::new();
         };
-        if goal.goal.completion != harness_contract::goal::GoalCompletion::Open {
-            // The Goal already reached a terminal completion; nothing is pending.
-            return Vec::new();
-        }
-        let satisfied = crate::agentic::ingress::current_reviews_satisfy_the_goal(&goal.goal);
-        let uncovered =
-            crate::agentic::ingress::uncovered_delivered_result_refs(projection, &goal.goal);
-        crate::agentic::ingress::objective_completion_waiting_gap(
-            goal.goal.waiting.as_ref(),
-            satisfied,
-            &uncovered,
-        )
-        .map(|gap| vec![gap])
-        .unwrap_or_default()
+        completion_gaps_from_goal(projection, Some(&goal.goal))
     }
+}
+
+fn completion_gaps_from_goal(
+    projection: &AgenticProgramProjection,
+    goal: Option<&harness_contract::goal::GoalContract>,
+) -> Vec<String> {
+    let Some(goal) = goal else {
+        return Vec::new();
+    };
+    if goal.completion != harness_contract::goal::GoalCompletion::Open {
+        // The Goal already reached a terminal completion; nothing is pending.
+        return Vec::new();
+    }
+    let satisfied = crate::agentic::ingress::current_reviews_satisfy_the_goal(&goal);
+    let uncovered = crate::agentic::ingress::uncovered_delivered_result_refs(projection, &goal);
+    crate::agentic::ingress::objective_completion_waiting_gap(
+        goal.waiting.as_ref(),
+        satisfied,
+        &uncovered,
+    )
+    .map(|gap| vec![gap])
+    .unwrap_or_default()
+}
+
+fn projection_from_opened(
+    program_id: &str,
+    opened: &crate::DurableRuntimeEvent,
+) -> Result<AgenticProgramProjection, AgentActionServiceError> {
+    let objective_id = opened
+        .payload
+        .get("objective_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AgentActionServiceError::Corrupt("program_opened_missing_objective".to_string())
+        })?;
+    let mut projection = AgenticProgramProjection::empty(program_id, objective_id);
+    projection.session_id = opened
+        .payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    projection.turn_id = opened
+        .payload
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    projection.root_execution_id = opened
+        .payload
+        .get("root_execution_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    projection.required_team_count = opened
+        .payload
+        .get("required_team_count")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or_default();
+    projection.exact_team_count = opened
+        .payload
+        .get("exact_team_count")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok());
+    projection.objective_summary = opened
+        .payload
+        .get("objective_summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    projection.model_lease = opened
+        .payload
+        .get("model_lease")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    projection.permission_ceiling = opened
+        .payload
+        .get("permission_ceiling")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(harness_contract::policy::PermissionMode::ReadOnly);
+    projection.resource_scopes = opened
+        .payload
+        .get("resource_scopes")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    Ok(projection)
 }
 
 fn apply_projection_events(
@@ -2522,12 +4487,20 @@ fn inspected_observation(
         //
         // The execution id is the agent's own graph, which is stable for the whole
         // run and is exactly the scope in which "you already asked" is true.
-        let inspection_scope = envelope
-            .actor
-            .execution_id
-            .as_deref()
-            .map_or_else(|| crate::repetition_guard::RepetitionScope::turn(&envelope.actor.session_id, &envelope.actor.turn_id),
-                |execution_id| crate::repetition_guard::RepetitionScope::execution(&envelope.actor.session_id, execution_id));
+        let inspection_scope = envelope.actor.execution_id.as_deref().map_or_else(
+            || {
+                crate::repetition_guard::RepetitionScope::turn(
+                    &envelope.actor.session_id,
+                    &envelope.actor.turn_id,
+                )
+            },
+            |execution_id| {
+                crate::repetition_guard::RepetitionScope::execution(
+                    &envelope.actor.session_id,
+                    execution_id,
+                )
+            },
+        );
         if crate::repetition_guard::record_unchanged_inspection(
             &inspection_scope,
             &input_hash,
@@ -3095,7 +5068,11 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         ));
     }
     if projection.teams.is_empty() {
-        actions.push("create a Team or complete directly with a committed artifact".to_string());
+        if projection.artifacts.is_empty() {
+            actions.push(super::order_contract::ARTIFACT_CONTENT_REF_CONTRACT.to_string());
+        } else {
+            actions.push(super::order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE.to_string());
+        }
     }
     // Authoring facts recorded when they were created. A model that invented an
     // acceptance standard sees it named as its own on every subsequent receipt,
@@ -3186,25 +5163,28 @@ fn read_model_projection_id(program_id: &str) -> String {
 fn decode_read_snapshot(
     checkpoint: &crate::RuntimeProjectionCheckpoint,
     program_id: &str,
+    store: &RuntimeEventStore,
 ) -> Option<AgenticProgramProjection> {
     let payload = &checkpoint.payload;
-    let body = &payload["projection"];
-    let expected_digest = format!("sha256:{:x}", Sha256::digest(body.to_string().as_bytes()));
-    if payload["schema_version"].as_u64() != Some(1)
-        || payload["sha256"].as_str() != Some(expected_digest.as_str())
-    {
-        tracing::warn!(
-            program_id,
-            "discarding unversioned or corrupt Agentic read snapshot"
-        );
+    if payload["schema_version"] != 2 {
         return None;
     }
-    let Ok(projection) = serde_json::from_value::<AgenticProgramProjection>(body.clone()) else {
-        tracing::warn!(program_id, "discarding malformed Agentic read snapshot");
-        return None;
-    };
-    if projection.program_id != program_id || projection.revision != checkpoint.source_cursor {
-        tracing::warn!(program_id, "discarding misbound Agentic read snapshot");
+    let session = payload["session_id"].as_str()?;
+    let body = store
+        .resolve_content(
+            &format!("session:{session}"),
+            &payload["body"],
+            &crate::PreparedArtifactOrigin::CheckpointBody {
+                projection_id: read_model_projection_id(program_id),
+                source_cursor: checkpoint.source_cursor,
+            },
+        )
+        .ok()?;
+    let projection: AgenticProgramProjection = serde_json::from_value(body).ok()?;
+    if projection.program_id != program_id
+        || projection.revision != checkpoint.source_cursor
+        || projection.session_id != session
+    {
         return None;
     }
     Some(projection)
@@ -3221,6 +5201,167 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod native_retirement_guard_tests {
+    use super::AgentActionService;
+    use crate::execution_core::graph::executors::CompileTargetGuardExecutor;
+    use crate::execution_core::graph::{
+        ExecutionCompileRequest, ExecutionGraphCompiler, NodeExecutor,
+    };
+    use crate::execution_core::RuntimeCompileTarget;
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionParentBinding,
+    };
+
+    fn compiled_child(target: RuntimeCompileTarget) -> ExecutionGraph {
+        let objective = "Real compiler Native retirement guards";
+        let payload = serde_json::json!({
+            "kind":"conversation_turn", "compile_target":target,
+            "session_id":"guard-session", "objective":objective, "content":objective,
+        })
+        .to_string();
+        let mut graph = ExecutionGraphCompiler
+            .compile_conversation_turn(ExecutionCompileRequest {
+                objective: objective.into(),
+                payload_ref: payload,
+                target,
+                resource_scopes: vec!["read:.".into(), "write:out/a".into()],
+            })
+            .unwrap();
+        graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Foreground;
+        graph.parent_execution = Some(ExecutionParentBinding {
+            execution_id: "original-agent-graph".into(),
+            node_id: "original-agent-node".into(),
+        });
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: "guard-session".into(),
+            turn_id: "guard-turn".into(),
+            root_task_id: "guard-root-task".into(),
+            task_id: "guard-task".into(),
+            generation: 1,
+        });
+        graph
+    }
+
+    #[test]
+    fn r1_native_retirement_accepts_real_evidence_and_execution_compiler_guards() {
+        for (target, criteria) in [
+            (
+                RuntimeCompileTarget::EvidenceGraph,
+                vec!["evidence_read_before_synthesis"],
+            ),
+            (
+                RuntimeCompileTarget::ExecutionGraph,
+                vec![
+                    "permission_and_policy_gate_required",
+                    "mutation_resources_must_be_leased",
+                ],
+            ),
+        ] {
+            let original = compiled_child(target);
+            let guards = original
+                .nodes
+                .iter()
+                .filter(|node| node.kind == ExecutionNodeKind::Verify)
+                .collect::<Vec<_>>();
+            assert_eq!(guards.len(), criteria.len());
+            for (guard, criterion) in guards.into_iter().zip(criteria) {
+                assert_eq!(guard.executor_kind, CompileTargetGuardExecutor::KIND);
+                assert_eq!(guard.acceptance.criteria, vec![criterion.to_string()]);
+                CompileTargetGuardExecutor.validate(guard).unwrap();
+                AgentActionService::validate_native_retirement_target_guard(
+                    &original, &original, guard,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn r1_native_retirement_rejects_foreign_compiler_guard_executor_criterion_and_owner() {
+        for target in [
+            RuntimeCompileTarget::EvidenceGraph,
+            RuntimeCompileTarget::ExecutionGraph,
+        ] {
+            let original = compiled_child(target);
+            let guards = original
+                .nodes
+                .iter()
+                .filter(|node| node.kind == ExecutionNodeKind::Verify)
+                .cloned()
+                .collect::<Vec<_>>();
+            for guard in guards {
+                for mutation in [
+                    "executor",
+                    "legacy-verify",
+                    "criterion",
+                    "extra-criterion",
+                    "parent",
+                    "parent-graph",
+                    "missing-owner",
+                    "lineage",
+                    "graph",
+                    "node",
+                    "payload",
+                ] {
+                    let mut before = original.clone();
+                    let mut child = original.clone();
+                    let index = child
+                        .nodes
+                        .iter()
+                        .position(|node| node.id == guard.id)
+                        .unwrap();
+                    match mutation {
+                        "executor" => child.nodes[index].executor_kind = "foreign-guard".into(),
+                        "legacy-verify" => child.nodes[index].executor_kind = "verify".into(),
+                        "criterion" => {
+                            child.nodes[index].acceptance.criteria =
+                                vec!["foreign-criterion".into()]
+                        }
+                        "extra-criterion" => child.nodes[index]
+                            .acceptance
+                            .criteria
+                            .push("foreign-criterion".into()),
+                        "parent" => child
+                            .parent_execution
+                            .as_mut()
+                            .unwrap()
+                            .node_id
+                            .push_str(":foreign"),
+                        "parent-graph" => child
+                            .parent_execution
+                            .as_mut()
+                            .unwrap()
+                            .execution_id
+                            .push_str(":foreign"),
+                        "missing-owner" => child.parent_execution = None,
+                        "lineage" => child.lineage.as_mut().unwrap().generation += 1,
+                        "graph" => child.id.push_str(":foreign"),
+                        "node" => child.nodes[index].id.push_str(":foreign"),
+                        "payload" => child.nodes[index].payload_ref = "foreign-payload".into(),
+                        _ => unreachable!(),
+                    }
+                    if matches!(
+                        mutation,
+                        "executor" | "legacy-verify" | "criterion" | "extra-criterion"
+                    ) {
+                        before.nodes[index] = child.nodes[index].clone();
+                    }
+                    assert!(
+                        AgentActionService::validate_native_retirement_target_guard(
+                            &before,
+                            &child,
+                            &child.nodes[index]
+                        )
+                        .is_err(),
+                        "{target:?}/{mutation}"
+                    );
+                }
+            }
+        }
+    }
+}
 
 /// A blocked exit is only "earned" when the Program is quiescent — the model has
 /// already exhausted the work it can do. While any Task can still be claimed,

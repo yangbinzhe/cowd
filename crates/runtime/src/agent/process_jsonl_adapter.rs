@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -14,7 +14,7 @@ use harness_contract::agent::{
     AgentCommand, AgentCommandRejectReason, AgentCommandRequest, AgentReturnPacket, AgentTaskPacket,
 };
 use harness_contract::context::ArtifactWriteDescriptor;
-use sandbox_launcher::{SandboxLaunchSpec, SandboxWorkspaceAccess, program_command_with_args};
+use sandbox_launcher::{program_command_with_args, SandboxLaunchSpec, SandboxWorkspaceAccess};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -22,7 +22,7 @@ use crate::agent_model_selector::AgentModelSelection;
 use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentRunHandle};
 use crate::agent_runtime::AgentRuntimeBackend;
 use crate::config::AgentProcessTransportLimits;
-use crate::{RuntimeServices, agent_in_process_worker::ProcessJsonlToolSession};
+use crate::{agent_in_process_worker::ProcessJsonlToolSession, RuntimeServices};
 
 /// V2 permits arbitrarily large business content only through the content
 /// plane. Control/action JSONL frames stay bounded so one broken worker cannot
@@ -369,6 +369,66 @@ struct ProcessContentUpload {
 struct ProcessJsonlRegistry {
     specs: Mutex<BTreeMap<String, ProcessJsonlSpec>>,
     lifecycle: Mutex<ProcessJsonlLifecycle>,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fixture_scratch: Mutex<Option<PathBuf>>,
+    #[cfg(test)]
+    driver_panic: Arc<Mutex<Option<(String, ProcessDriverFault)>>>,
+    #[cfg(test)]
+    exit_gate: Mutex<Option<Arc<ProcessExitGate>>>,
+    #[cfg(test)]
+    spawn_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    prepare_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ProcessExitGate {
+    pub(crate) entered: AtomicBool,
+    released: Mutex<bool>,
+    condition: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ProcessExitGate {
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.condition.notify_all();
+    }
+    fn wait(&self) {
+        self.entered.store(true, Ordering::Release);
+        let released = self.released.lock().unwrap();
+        let (_released, timeout) = self
+            .condition
+            .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "Process fixture physical wait gate timed out"
+        );
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcessDriverFault {
+    Reader,
+    Stderr,
+}
+
+#[cfg(test)]
+impl ProcessJsonlRegistry {
+    fn take_driver_panic(&self, packet: &AgentTaskPacket, driver: ProcessDriverFault) -> bool {
+        let mut fault = self.driver_panic.lock().unwrap();
+        if fault.as_ref().is_some_and(|(run_id, requested)| {
+            (run_id == packet.run_id() || run_id == "*") && *requested == driver
+        }) {
+            fault.take();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Default)]
@@ -376,6 +436,65 @@ struct ProcessJsonlLifecycle {
     starting: BTreeSet<String>,
     active: BTreeMap<String, Arc<ActiveProcess>>,
     pending_cancellation: BTreeSet<String>,
+    local_exits: BTreeMap<String, ProcessLocalExitEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLocalExitPhase {
+    NotStarted,
+    Reaped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessLocalExitEvidence {
+    packet_sha256: String,
+    phase: ProcessLocalExitPhase,
+}
+
+impl ProcessLocalExitEvidence {
+    pub(crate) fn matches_packet(&self, packet: &AgentTaskPacket) -> bool {
+        serde_json::to_vec(packet)
+            .is_ok_and(|bytes| crate::context_evidence::read_sha256(&bytes) == self.packet_sha256)
+    }
+
+    pub(crate) fn is_not_started(&self) -> bool {
+        self.phase == ProcessLocalExitPhase::NotStarted
+    }
+
+    pub(crate) fn is_reaped(&self) -> bool {
+        self.phase == ProcessLocalExitPhase::Reaped
+    }
+}
+
+impl ProcessJsonlRegistry {
+    fn record_local_exit(
+        &self,
+        packet: &AgentTaskPacket,
+        phase: ProcessLocalExitPhase,
+    ) -> Result<(), String> {
+        let packet_bytes = serde_json::to_vec(packet).map_err(|error| error.to_string())?;
+        let evidence = ProcessLocalExitEvidence {
+            packet_sha256: crate::context_evidence::read_sha256(&packet_bytes),
+            phase,
+        };
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !lifecycle.starting.contains(packet.run_id()) {
+            return Ok(());
+        }
+        if let Some(existing) = lifecycle.local_exits.get(packet.run_id()) {
+            if existing != &evidence {
+                return Err("conflicting physical Process exit evidence".into());
+            }
+        } else {
+            lifecycle
+                .local_exits
+                .insert(packet.run_id().into(), evidence);
+        }
+        Ok(())
+    }
 }
 
 struct StartingRunGuard {
@@ -406,7 +525,273 @@ pub struct ProcessJsonlAdapter {
     services: Option<Weak<RuntimeServices>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProcessPhysicalEnvelope {
+    version: u32,
+    enforcement: String,
+    original_packet_sha256: String,
+    backend_packet_sha256: String,
+    command_ref: String,
+    command_digest: String,
+    workspace: PathBuf,
+    workspace_writable: bool,
+    network_enabled: bool,
+    policy_revision: Option<u64>,
+    policy_digest: String,
+    network_restrictions_digest: String,
+    private_network_allowed: bool,
+    hardened: bool,
+    protected_roots_denied: bool,
+    inherited_fds_closed: bool,
+    environment_allowlist_enforced: bool,
+    piped_stdio: bool,
+    control_scratch: Option<PathBuf>,
+    digest: String,
+}
+
+impl ProcessPhysicalEnvelope {
+    fn computed_digest(&self) -> Result<String, String> {
+        let mut value = self.clone();
+        value.digest.clear();
+        serde_json::to_vec(&value)
+            .map(|bytes| crate::context_evidence::read_sha256(&bytes))
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn authentic_for(
+        &self,
+        packet: &AgentTaskPacket,
+        original: &str,
+        backend: &str,
+    ) -> bool {
+        self.version == 1 && self.enforcement == "process-physical-v1-named-ipc-28"
+            && self.original_packet_sha256 == original && self.backend_packet_sha256 == backend
+            && packet.binding.as_ref().is_some_and(|binding| matches!(&binding.executor,
+                harness_contract::agent::AgentExecutorPolicy::ProcessJsonl { command_ref, command_digest }
+                if command_ref == &self.command_ref && command_digest == &self.command_digest))
+            && self.workspace.is_absolute() && self.hardened && self.protected_roots_denied
+            && self.policy_revision.is_none_or(|revision| revision > 0 && revision == packet.policy_revision)
+            && self.control_scratch.as_ref().is_none_or(|directory| directory.is_absolute()
+                && !directory.starts_with(&self.workspace)
+                && directory.file_name().is_some_and(|name| name.to_string_lossy() == format!("{}-{}",
+                    crate::context_evidence::read_sha256(packet.run_id().as_bytes()).trim_start_matches("sha256:"), packet.attempt)))
+            && self.inherited_fds_closed && self.environment_allowlist_enforced && self.piped_stdio
+            && self.computed_digest().is_ok_and(|digest| digest == self.digest)
+    }
+
+    pub(crate) fn host_only(&self) -> bool {
+        self.policy_revision.is_some()
+            && !self.workspace_writable
+            && !self.network_enabled
+            && self.hardened
+            && self.protected_roots_denied
+            && self.inherited_fds_closed
+            && self.environment_allowlist_enforced
+            && self.piped_stdio
+    }
+}
+
+pub(crate) struct PreparedProcessLaunch {
+    adapter: ProcessJsonlAdapter,
+    starting: StartingRunGuard,
+    packet: AgentTaskPacket,
+    spec: ProcessJsonlSpec,
+    tool_session: Option<Arc<ProcessJsonlToolSession>>,
+    command: Option<sandbox_launcher::PreparedSandboxCommand>,
+    launch_spec: SandboxLaunchSpec,
+    envelope: ProcessPhysicalEnvelope,
+    runtime_handle: tokio::runtime::Handle,
+    network_policy: tools::network_policy::NetworkDomainPolicy,
+    private_network_allowed: bool,
+}
+
+impl PreparedProcessLaunch {
+    pub(crate) fn envelope(&self) -> &ProcessPhysicalEnvelope {
+        &self.envelope
+    }
+}
+
+#[cfg(test)]
+static CLEANUP_DRIVER_OBSERVERS: std::sync::OnceLock<
+    Mutex<BTreeMap<String, std::sync::mpsc::Sender<String>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn observe_cleanup_driver_for_test(
+    packet: &AgentTaskPacket,
+) -> std::sync::mpsc::Receiver<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let key = format!("{}:{}", packet.run_id(), packet.attempt);
+    assert!(CLEANUP_DRIVER_OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(key, sender)
+        .is_none());
+    receiver
+}
+
+fn cleanup_owned_scratch(
+    packet: &AgentTaskPacket,
+    directory: &Path,
+    phase: &str,
+) -> Result<(), String> {
+    match std::fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            tracing::warn!(run_id = packet.run_id(), attempt = packet.attempt,
+                path = %directory.display(), phase, error = %error, "ProcessJsonl scratch cleanup failed");
+            Err(format!("ProcessJsonl scratch cleanup failed: run={} attempt={} path={} phase={phase}: {error}",
+                packet.run_id(), packet.attempt, directory.display()) + &format!(" [kind={:?}]", error.kind()))
+        }
+    }
+}
+
+fn combine_process_cleanup<Output>(
+    primary: Result<Output, String>,
+    cleanup: Result<(), String>,
+) -> Result<Output, String> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
+}
+
+fn record_exit_and_cleanup(
+    registry: &ProcessJsonlRegistry,
+    packet: &AgentTaskPacket,
+    exit: ProcessLocalExitPhase,
+    scratch: Option<&Path>,
+    phase: &str,
+) -> Result<(), String> {
+    let recorded = registry.record_local_exit(packet, exit);
+    if let Err(error) = &recorded {
+        tracing::warn!(run_id = packet.run_id(), attempt = packet.attempt, phase,
+            path = ?scratch, error = %error, "ProcessJsonl local exit recording failed");
+    }
+    let cleanup = scratch
+        .map(|directory| cleanup_owned_scratch(packet, directory, phase))
+        .unwrap_or(Ok(()));
+    combine_process_cleanup(recorded, cleanup)
+}
+
+#[cfg(test)]
+pub(crate) fn retry_owned_scratch_for_test(
+    packet: &AgentTaskPacket,
+    directory: &Path,
+) -> Result<(), String> {
+    cleanup_owned_scratch(packet, directory, "explicit_retry")
+}
+
+impl Drop for PreparedProcessLaunch {
+    fn drop(&mut self) {
+        if self.command.is_some() {
+            if let Err(error) = record_exit_and_cleanup(
+                &self.adapter.registry,
+                &self.packet,
+                ProcessLocalExitPhase::NotStarted,
+                self.envelope.control_scratch.as_deref(),
+                "drop_not_started",
+            ) {
+                tracing::warn!(run_id = self.packet.run_id(), attempt = self.packet.attempt,
+                    path = ?self.envelope.control_scratch, phase = "drop_not_started", error = %error,
+                    "ProcessJsonl prepared launch Drop failed");
+            }
+        }
+    }
+}
+
+fn packet_digest(packet: &AgentTaskPacket) -> Result<String, String> {
+    serde_json::to_vec(packet)
+        .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
+        .map_err(|error| error.to_string())
+}
+
+fn launch_authority_does_not_expand(original: &AgentTaskPacket, packet: &AgentTaskPacket) -> bool {
+    original.assignment == packet.assignment
+        && original.attempt == packet.attempt
+        && original.expected_graph_revision == packet.expected_graph_revision
+        && original.policy_revision == packet.policy_revision
+        && original
+            .permission_ceiling
+            .permits(packet.permission_ceiling)
+        && packet
+            .resource_scopes
+            .iter()
+            .all(|scope| original.resource_scopes.contains(scope))
+        && packet
+            .allowed_tools
+            .iter()
+            .all(|tool| original.allowed_tools.contains(tool))
+        && packet
+            .allowed_skills
+            .iter()
+            .all(|skill| original.allowed_skills.contains(skill))
+        && original
+            .binding
+            .as_ref()
+            .zip(packet.binding.as_ref())
+            .is_some_and(|(before, after)| {
+                before.executor == after.executor
+                    && before.definition_ref == after.definition_ref
+                    && after
+                        .effective_capabilities
+                        .iter()
+                        .all(|capability| before.effective_capabilities.contains(capability))
+                    && before.data_lease == after.data_lease
+                    && after
+                        .tool_contract_refs
+                        .iter()
+                        .all(|tool| before.tool_contract_refs.contains(tool))
+                    && after
+                        .skill_refs
+                        .iter()
+                        .all(|skill| before.skill_refs.contains(skill))
+            })
+}
+
 impl ProcessJsonlAdapter {
+    #[cfg(test)]
+    pub(crate) fn fixture_spawn_count(&self) -> usize {
+        self.registry.spawn_count.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_prepare_count(&self) -> usize {
+        self.registry.prepare_count.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_exit_gate(&self, unknown: bool) -> Arc<ProcessExitGate> {
+        let gate = Arc::new(ProcessExitGate::default());
+        *self.registry.exit_gate.lock().unwrap() = Some(gate.clone());
+        if unknown {
+            *self.registry.driver_panic.lock().unwrap() =
+                Some(("*".into(), ProcessDriverFault::Stderr));
+        }
+        gate
+    }
+    pub(crate) fn take_local_exit_evidence(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Option<ProcessLocalExitEvidence> {
+        let mut lifecycle = self
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle
+            .local_exits
+            .get(packet.run_id())
+            .is_some_and(|evidence| evidence.matches_packet(packet))
+        {
+            lifecycle.local_exits.remove(packet.run_id())
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn for_workspace(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -456,7 +841,443 @@ impl ProcessJsonlAdapter {
     /// from `execute`: a missing capability must not consume a provider/model
     /// turn merely to discover that no command can be launched.
     pub(crate) fn validate_packet_command(&self, packet: &AgentTaskPacket) -> Result<(), String> {
-        self.resolve_packet_command(packet).map(|_| ())
+        let spec = self.resolve_packet_command(packet)?;
+        self.physical_launch_spec(packet, &spec).map(|_| ())
+    }
+
+    fn current_launch_policy(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Result<Option<harness_contract::policy::SessionExecutionPolicy>, String> {
+        let policy = match &self.services {
+            Some(weak) => {
+                let services = weak
+                    .upgrade()
+                    .ok_or("physical_grant: Runtime owner unavailable")?;
+                if services
+                    .session_execution_policy_admission_blocks_handle()
+                    .read()
+                    .map_err(|_| "physical_grant: admission fence poisoned")?
+                    .contains_key(packet.session_id())
+                {
+                    return Err("physical_grant: Session admission frozen".into());
+                }
+                let policy = services
+                    .session_execution_policy_control(packet.session_id())
+                    .ok_or("physical_grant: Runtime Session policy missing")?
+                    .snapshot();
+                if packet.policy_revision != policy.revision {
+                    return Err("physical_grant: Session revision changed".into());
+                }
+                Some(policy)
+            }
+            None => None,
+        };
+        Ok(policy)
+    }
+
+    fn physical_launch_spec(
+        &self,
+        packet: &AgentTaskPacket,
+        spec: &ProcessJsonlSpec,
+    ) -> Result<
+        (
+            SandboxLaunchSpec,
+            Option<u64>,
+            String,
+            tools::network_policy::NetworkDomainPolicy,
+            bool,
+        ),
+        String,
+    > {
+        use crate::agent_in_process_worker::resource_path_is_authorized;
+        use harness_contract::agent::AgentCapability;
+        use harness_contract::policy::PermissionMode;
+        let binding = packet
+            .binding
+            .as_ref()
+            .ok_or("physical_grant: Binding missing")?;
+        let workspace = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(&workspace)
+            .map_err(|error| error.to_string())?;
+        if !binding
+            .effective_capabilities
+            .contains(&AgentCapability::Read)
+            || !resource_path_is_authorized(&resolver, ".", &packet.resource_scopes, false)
+        {
+            return Err(
+                "physical_grant: Process whole workspace mount requires whole-read grant".into(),
+            );
+        }
+        let policy = self.current_launch_policy(packet)?;
+        let mut launch = SandboxLaunchSpec::workspace(&workspace);
+        let profile_write = matches!(
+            spec.sandbox_profile,
+            crate::config::AgentExecutorSandboxProfile::WorkspaceReadWrite
+                | crate::config::AgentExecutorSandboxProfile::IsolatedReadWrite
+        );
+        let profile_network = matches!(
+            spec.sandbox_profile,
+            crate::config::AgentExecutorSandboxProfile::WorkspaceReadWrite
+                | crate::config::AgentExecutorSandboxProfile::WorkspaceReadOnly
+        );
+        let writable = profile_write
+            && binding
+                .effective_capabilities
+                .contains(&AgentCapability::Write)
+            && packet
+                .permission_ceiling
+                .permits(PermissionMode::WorkspaceWrite)
+            && policy.as_ref().is_none_or(|policy| {
+                policy
+                    .permission_mode
+                    .permits(PermissionMode::WorkspaceWrite)
+            })
+            && policy.as_ref().is_none_or(|policy| {
+                policy.sandbox_posture != harness_contract::policy::SandboxPosture::ReadOnlySandbox
+            })
+            && resource_path_is_authorized(&resolver, ".", &packet.resource_scopes, true);
+        launch.workspace_access = if writable {
+            SandboxWorkspaceAccess::ReadWrite
+        } else {
+            SandboxWorkspaceAccess::ReadOnly
+        };
+        let network = tools::network_policy::NetworkDomainPolicy::from_env();
+        let private_allowed = std::env::var("COWD_ALLOW_PRIVATE_NETWORK").is_ok();
+        launch.network_enabled = profile_network
+            && binding
+                .effective_capabilities
+                .contains(&AgentCapability::Network)
+            && packet
+                .resource_scopes
+                .iter()
+                .any(|scope| scope == "network:*")
+            && network.mode == tools::network_policy::NetworkDomainMode::Allow
+            && network.allow.is_empty()
+            && network.block.is_empty()
+            && private_allowed;
+        launch.working_directory = spec
+            .working_directory
+            .as_deref()
+            .map(|directory| workspace_path(&workspace, directory))
+            .transpose()?;
+        let policy_digest = serde_json::to_vec(&policy)
+            .map(|bytes| crate::context_evidence::read_sha256(&bytes))
+            .map_err(|error| error.to_string())?;
+        Ok((
+            launch,
+            policy.map(|policy| policy.revision),
+            policy_digest,
+            network,
+            private_allowed,
+        ))
+    }
+
+    pub(crate) async fn prepare_packet_launch(
+        &self,
+        original: &AgentTaskPacket,
+        packet: AgentTaskPacket,
+        selection: &AgentModelSelection,
+    ) -> Result<PreparedProcessLaunch, String> {
+        if !launch_authority_does_not_expand(original, &packet) {
+            return Err("physical_grant: final backend packet expands immutable authority".into());
+        }
+        let run_id = packet.run_id().to_string();
+        {
+            let mut lifecycle = self
+                .registry
+                .lifecycle
+                .lock()
+                .map_err(|_| "Process lifecycle poisoned")?;
+            if lifecycle.starting.contains(&run_id)
+                || lifecycle.active.contains_key(&run_id)
+                || lifecycle.local_exits.contains_key(&run_id)
+            {
+                return Err("ProcessJsonl run is already active or awaiting exit handoff".into());
+            }
+            lifecycle.starting.insert(run_id.clone());
+        }
+        let starting = StartingRunGuard {
+            registry: self.registry.clone(),
+            run_id,
+        };
+        #[cfg(test)]
+        self.registry.prepare_count.fetch_add(1, Ordering::SeqCst);
+        let result = (|| {
+            let spec = self.resolve_packet_command(&packet)?;
+            let (mut launch, revision, policy_digest, network_policy, private_allowed) =
+                self.physical_launch_spec(&packet, &spec)?;
+            launch.environment = spec.resolve_environment()?;
+            let tool_session = match &self.services {
+                Some(weak) => Some(Arc::new(ProcessJsonlToolSession::prepare(
+                    &weak.upgrade().ok_or("Process Runtime owner unavailable")?,
+                    &packet,
+                    selection,
+                )?)),
+                None if packet.allowed_tools.is_empty() => None,
+                None => return Err(
+                    "ProcessJsonl task requests tools but adapter is not Runtime ToolHost-bound"
+                        .into(),
+                ),
+            };
+            #[cfg(any(test, feature = "test-fixtures"))]
+            if let Some(root) = self
+                .registry
+                .fixture_scratch
+                .lock()
+                .map_err(|_| "fixture scratch poisoned")?
+                .as_ref()
+            {
+                let directory = root.join(format!(
+                    "{}-{}",
+                    crate::context_evidence::read_sha256(packet.run_id().as_bytes())
+                        .trim_start_matches("sha256:"),
+                    packet.attempt
+                ));
+                std::fs::create_dir(&directory).map_err(|error| {
+                    format!("private scratch already exists or unavailable: {error}")
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(error) =
+                        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                    {
+                        return combine_process_cleanup(Err(format!(
+                            "ProcessJsonl scratch permissions failed: run={} attempt={} path={} phase=prepare_permissions: {error}",
+                            packet.run_id(), packet.attempt, directory.display())),
+                            cleanup_owned_scratch(&packet, &directory, "prepare_permissions"));
+                    }
+                }
+                launch.writable_roots.push(directory);
+            }
+            Ok::<_, String>((
+                spec,
+                launch,
+                revision,
+                policy_digest,
+                network_policy,
+                private_allowed,
+                tool_session,
+            ))
+        })();
+        let (spec, launch, revision, policy_digest, network_policy, private_allowed, tool_session) =
+            match result {
+                Ok(value) => value,
+                Err(error) => {
+                    return combine_process_cleanup(
+                        Err(error),
+                        record_exit_and_cleanup(
+                            &self.registry,
+                            &packet,
+                            ProcessLocalExitPhase::NotStarted,
+                            None,
+                            "prepare_failed",
+                        ),
+                    );
+                }
+            };
+        let adapter = self.clone();
+        let original_sha = packet_digest(original)?;
+        let backend_sha = packet_digest(&packet)?;
+        let runtime_handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let prepared = match workspace_path(&launch.workspace_root, &spec.executable).and_then(
+                |executable| {
+                    program_command_with_args(&executable, &spec.args, &launch)
+                        .map_err(|error| error.to_string())
+                },
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    let mut cleanup = record_exit_and_cleanup(
+                        &adapter.registry,
+                        &packet,
+                        ProcessLocalExitPhase::NotStarted,
+                        None,
+                        "sandbox_prepare",
+                    );
+                    for directory in &launch.writable_roots {
+                        cleanup = combine_process_cleanup(
+                            cleanup,
+                            cleanup_owned_scratch(&packet, directory, "sandbox_prepare"),
+                        );
+                    }
+                    return combine_process_cleanup(
+                        Err(format!(
+                            "prepare hardened ProcessJsonl sandbox failed: {error}"
+                        )),
+                        cleanup,
+                    );
+                }
+            };
+            let receipt = prepared.launch_receipt();
+            let mut envelope = ProcessPhysicalEnvelope {
+                version: 1,
+                enforcement: "process-physical-v1-named-ipc-28".into(),
+                original_packet_sha256: original_sha,
+                backend_packet_sha256: backend_sha,
+                command_ref: spec.command_ref.clone(),
+                command_digest: spec.command_digest.clone(),
+                workspace: launch.workspace_root.clone(),
+                workspace_writable: receipt.workspace_access == SandboxWorkspaceAccess::ReadWrite,
+                network_enabled: receipt.network_enabled,
+                policy_revision: revision,
+                policy_digest,
+                network_restrictions_digest: crate::context_evidence::read_sha256(
+                    &serde_json::to_vec(&(&network_policy, private_allowed))
+                        .map_err(|error| error.to_string())?,
+                ),
+                private_network_allowed: private_allowed,
+                hardened: receipt.kernel_hardening_applied,
+                protected_roots_denied: receipt.protected_roots_denied,
+                inherited_fds_closed: receipt.inherited_fds_closed,
+                environment_allowlist_enforced: receipt.environment_allowlist_enforced,
+                piped_stdio: true,
+                control_scratch: launch.writable_roots.first().cloned(),
+                digest: String::new(),
+            };
+            envelope.digest = envelope.computed_digest()?;
+            Ok(PreparedProcessLaunch {
+                adapter,
+                starting,
+                packet,
+                spec,
+                tool_session,
+                command: Some(prepared),
+                launch_spec: launch,
+                envelope,
+                runtime_handle,
+                network_policy,
+                private_network_allowed: private_allowed,
+            })
+        })
+        .await
+        .map_err(|error| format!("Process prepare join failed: {error}"))?
+    }
+
+    pub(crate) async fn execute_prepared(
+        &self,
+        mut prepared: PreparedProcessLaunch,
+    ) -> Result<AgentReturnPacket, String> {
+        if !Arc::ptr_eq(&self.registry, &prepared.adapter.registry) {
+            return Err("Process prepared carrier belongs to another adapter".into());
+        }
+        tokio::task::spawn_blocking(move || {
+            let policy = prepared.adapter.current_launch_policy(&prepared.packet)?;
+            let revision = policy.as_ref().map(|policy| policy.revision);
+            let digest = crate::context_evidence::read_sha256(
+                &serde_json::to_vec(&policy).map_err(|error| error.to_string())?,
+            );
+            let network_policy = tools::network_policy::NetworkDomainPolicy::from_env();
+            let private_allowed = std::env::var("COWD_ALLOW_PRIVATE_NETWORK").is_ok();
+            if revision != prepared.envelope.policy_revision
+                || digest != prepared.envelope.policy_digest
+                || network_policy != prepared.network_policy
+                || private_allowed != prepared.private_network_allowed
+            {
+                return Err("physical_grant: prepared policy changed before spawn".into());
+            }
+            if prepared.launch_spec.workspace_root != prepared.envelope.workspace
+                || (prepared.launch_spec.workspace_access == SandboxWorkspaceAccess::ReadWrite)
+                    != prepared.envelope.workspace_writable
+                || prepared.launch_spec.network_enabled != prepared.envelope.network_enabled
+            {
+                return Err("physical_grant: owned launch facts diverged".into());
+            }
+            if prepared
+                .adapter
+                .registry
+                .lifecycle
+                .lock()
+                .map_err(|_| "Process lifecycle poisoned")?
+                .pending_cancellation
+                .contains(prepared.packet.run_id())
+            {
+                return Err("Process cancelled before prepared launch".into());
+            }
+            let command = prepared
+                .command
+                .take()
+                .ok_or("Process prepared command already consumed")?;
+            execute_prepared_child(
+                &prepared.adapter.registry,
+                &prepared.spec,
+                &prepared.packet,
+                prepared.tool_session.clone(),
+                prepared.runtime_handle.clone(),
+                Duration::from_millis(prepared.spec.transport_limits.handshake_timeout_ms),
+                command,
+                prepared.envelope.control_scratch.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| format!("process-jsonl worker join failed: {error}"))?
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) fn install_fixture_scratch(&self, root: PathBuf) -> Result<(), String> {
+        if std::fs::symlink_metadata(&root)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("fixture scratch root cannot be a symlink".into());
+        }
+        let canonical = root.canonicalize().map_err(|error| error.to_string())?;
+        if canonical != root {
+            return Err(
+                "fixture scratch root must already be canonical without symlink aliases".into(),
+            );
+        }
+        let root = canonical;
+        let workspace = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let launch = SandboxLaunchSpec::workspace(&workspace);
+        if root.starts_with(&workspace)
+            || launch
+                .protected_roots
+                .iter()
+                .any(|protected| root.starts_with(protected))
+        {
+            return Err("fixture control scratch must be outside business/protected roots".into());
+        }
+        let mut installed = self
+            .registry
+            .fixture_scratch
+            .lock()
+            .map_err(|_| "fixture scratch poisoned")?;
+        if installed.as_ref().is_some_and(|existing| existing != &root) {
+            return Err("fixture control scratch root cannot be rebound".into());
+        }
+        *installed = Some(root);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) fn fixture_scratch_directory(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Result<PathBuf, String> {
+        let root = self
+            .registry
+            .fixture_scratch
+            .lock()
+            .map_err(|_| "fixture scratch poisoned")?;
+        Ok(root
+            .as_ref()
+            .ok_or("fixture scratch root missing")?
+            .join(format!(
+                "{}-{}",
+                crate::context_evidence::read_sha256(packet.run_id().as_bytes())
+                    .trim_start_matches("sha256:"),
+                packet.attempt
+            )))
     }
 
     fn resolve_packet_command(&self, packet: &AgentTaskPacket) -> Result<ProcessJsonlSpec, String> {
@@ -521,50 +1342,10 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
         packet: AgentTaskPacket,
         selection: AgentModelSelection,
     ) -> Result<AgentReturnPacket, String> {
-        let spec = self.resolve_packet_command(&packet)?;
-        let tool_session = match self.services.as_ref().and_then(Weak::upgrade) {
-            Some(services) => Some(Arc::new(ProcessJsonlToolSession::prepare(
-                &services, &packet, &selection,
-            )?)),
-            None if packet.allowed_tools.is_empty() => None,
-            None => return Err(
-                "ProcessJsonl task requests tools but this adapter is not Runtime ToolHost-bound"
-                    .to_string(),
-            ),
-        };
-        let runtime_handle = tokio::runtime::Handle::try_current().map_err(|error| {
-            format!("ProcessJsonl bridge requires an active Tokio Runtime: {error}")
-        })?;
-        let registry = Arc::clone(&self.registry);
-        let workspace_root = Arc::clone(&self.workspace_root);
-        let run_id = packet.run_id().to_string();
-        {
-            let mut lifecycle = registry
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if lifecycle.starting.contains(&run_id) || lifecycle.active.contains_key(&run_id) {
-                return Err("ProcessJsonl run is already active".to_string());
-            }
-            lifecycle.starting.insert(run_id.clone());
-        }
-        let starting = StartingRunGuard {
-            registry: Arc::clone(&registry),
-            run_id,
-        };
-        tokio::task::spawn_blocking(move || {
-            let _starting = starting;
-            execute_child(
-                &registry,
-                &workspace_root,
-                &spec,
-                &packet,
-                tool_session,
-                runtime_handle,
-            )
-        })
-        .await
-        .map_err(|error| format!("process-jsonl worker join failed: {error}"))?
+        let prepared = self
+            .prepare_packet_launch(&packet, packet.clone(), &selection)
+            .await?;
+        self.execute_prepared(prepared).await
     }
 
     async fn command(
@@ -686,6 +1467,7 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
     }
 }
 
+#[cfg(test)]
 fn execute_child(
     registry: &ProcessJsonlRegistry,
     workspace_root: &PathBuf,
@@ -705,6 +1487,7 @@ fn execute_child(
     )
 }
 
+#[cfg(test)]
 fn execute_child_with_handshake_timeout(
     registry: &ProcessJsonlRegistry,
     workspace_root: &PathBuf,
@@ -714,53 +1497,78 @@ fn execute_child_with_handshake_timeout(
     runtime_handle: tokio::runtime::Handle,
     handshake_timeout: Duration,
 ) -> Result<AgentReturnPacket, String> {
-    let mut launch_spec = SandboxLaunchSpec::workspace(workspace_root);
-    launch_spec.working_directory = spec
-        .working_directory
-        .as_deref()
-        .map(|directory| workspace_path(workspace_root, directory))
-        .transpose()?;
+    let adapter = ProcessJsonlAdapter::for_workspace(workspace_root);
+    let (mut launch_spec, _, _, _, _) = adapter.physical_launch_spec(packet, spec)?;
     launch_spec.environment = spec.resolve_environment()?;
-    match spec.sandbox_profile {
-        crate::config::AgentExecutorSandboxProfile::WorkspaceReadWrite => {}
-        crate::config::AgentExecutorSandboxProfile::WorkspaceReadOnly => {
-            launch_spec.workspace_access = SandboxWorkspaceAccess::ReadOnly;
-        }
-        crate::config::AgentExecutorSandboxProfile::IsolatedReadWrite => {
-            launch_spec.network_enabled = false;
-        }
-        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly => {
-            launch_spec.workspace_access = SandboxWorkspaceAccess::ReadOnly;
-            launch_spec.network_enabled = false;
-        }
-    }
     let executable = workspace_path(workspace_root, &spec.executable)?;
     let prepared = program_command_with_args(&executable, &spec.args, &launch_spec)
         .map_err(|error| format!("prepare hardened ProcessJsonl sandbox failed: {error}"))?;
+    execute_prepared_child(
+        registry,
+        spec,
+        packet,
+        tool_session,
+        runtime_handle,
+        handshake_timeout,
+        prepared,
+        None,
+    )
+}
+
+fn execute_prepared_child(
+    registry: &ProcessJsonlRegistry,
+    spec: &ProcessJsonlSpec,
+    packet: &AgentTaskPacket,
+    tool_session: Option<Arc<ProcessJsonlToolSession>>,
+    runtime_handle: tokio::runtime::Handle,
+    handshake_timeout: Duration,
+    prepared: sandbox_launcher::PreparedSandboxCommand,
+    scratch: Option<&Path>,
+) -> Result<AgentReturnPacket, String> {
     let mut command = prepared.into_command();
-    // The sandbox launcher may fork an inner namespace process. Give the
-    // entire launch tree its own process group before spawn so cancellation
-    // cannot leave a re-parented descendant holding JSONL pipes open.
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command
+    let launch = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("failed to start ProcessJsonl worker: {error}"))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ProcessJsonl worker stdin is unavailable".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ProcessJsonl worker stdout is unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "ProcessJsonl worker stderr is unavailable".to_string())?;
+        .map_err(|error| format!("failed to start ProcessJsonl worker: {error}"));
+    let mut child = match launch {
+        Ok(child) => child,
+        Err(error) => {
+            return combine_process_cleanup(
+                Err(error),
+                record_exit_and_cleanup(
+                    registry,
+                    packet,
+                    ProcessLocalExitPhase::NotStarted,
+                    scratch,
+                    "spawn_failed",
+                ),
+            );
+        }
+    };
+    #[cfg(test)]
+    registry.spawn_count.fetch_add(1, Ordering::SeqCst);
+    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
+        let _ = terminate_process_tree(&mut child);
+        let cleanup = match child.wait() {
+            Ok(_) => record_exit_and_cleanup(
+                registry,
+                packet,
+                ProcessLocalExitPhase::Reaped,
+                scratch,
+                "pipes_unavailable",
+            ),
+            Err(error) => Err(format!("ProcessJsonl local exit remains unknown: {error}")),
+        };
+        return combine_process_cleanup(
+            Err("ProcessJsonl piped stdio is unavailable".into()),
+            cleanup,
+        );
+    };
     let active = Arc::new(ActiveProcess {
         child: Mutex::new(child),
         stdin: Mutex::new(stdin),
@@ -794,7 +1602,32 @@ fn execute_child_with_handshake_timeout(
     }
 
     let stderr_limit = spec.transport_limits.stderr_tail_bytes;
-    let stderr_tail = std::thread::spawn(move || read_stderr_tail(stderr, stderr_limit));
+    #[cfg(test)]
+    let panic_stderr = registry.take_driver_panic(packet, ProcessDriverFault::Stderr);
+    #[cfg(test)]
+    let stderr_fault = Arc::clone(&registry.driver_panic);
+    #[cfg(test)]
+    let stderr_run_id = packet.run_id().to_string();
+    let stderr_tail = std::thread::spawn(move || {
+        #[cfg(test)]
+        if panic_stderr {
+            panic!("ProcessJsonl exact-run stderr driver fault");
+        }
+        let tail = read_stderr_tail(stderr, stderr_limit);
+        #[cfg(test)]
+        {
+            let mut fault = stderr_fault.lock().unwrap();
+            if fault.as_ref().is_some_and(|(run_id, driver)| {
+                (run_id == &stderr_run_id || run_id == "*") && *driver == ProcessDriverFault::Stderr
+            }) {
+                fault.take();
+                drop(fault);
+                panic!("ProcessJsonl exact-run stderr driver fault");
+            }
+        }
+        tail
+    });
+    let mut reader_joined = true;
     let result = (|| {
         write_process_message(
             active.as_ref(),
@@ -821,6 +1654,9 @@ fn execute_child_with_handshake_timeout(
         let reader_spec = spec.clone();
         let reader_tool_session = tool_session.clone();
         let reader_runtime_handle = runtime_handle.clone();
+        #[cfg(test)]
+        let panic_reader = registry.take_driver_panic(packet, ProcessDriverFault::Reader);
+        reader_joined = false;
         let reader = std::thread::spawn(move || {
             let mut stdout = BufReader::new(stdout);
             let child_capabilities =
@@ -837,6 +1673,10 @@ fn execute_child_with_handshake_timeout(
             exchange_rx.recv().map_err(|_| {
                 "Runtime abandoned ProcessJsonl before the V2 exchange could start".to_string()
             })?;
+            #[cfg(test)]
+            if panic_reader {
+                panic!("ProcessJsonl exact-run protocol reader fault");
+            }
             read_process_exchange(
                 &mut stdout,
                 &reader_packet,
@@ -899,9 +1739,13 @@ fn execute_child_with_handshake_timeout(
         // finalized; the outer error path physically terminates the process.
         drop(exchange_tx);
         match handshake {
-            Ok(()) => reader.join().map_err(|_| {
-                "ProcessJsonl reader thread panicked during the V2 exchange".to_string()
-            })?,
+            Ok(()) => match reader.join() {
+                Ok(result) => {
+                    reader_joined = true;
+                    result
+                }
+                Err(_) => Err("ProcessJsonl reader thread panicked during the V2 exchange".into()),
+            },
             Err(error) => {
                 // The reader may still be blocked in an OS pipe read (for
                 // example after the handshake deadline). Close its producer
@@ -913,7 +1757,7 @@ fn execute_child_with_handshake_timeout(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let _ = terminate_process_tree(&mut child);
                 drop(child);
-                let _ = reader.join();
+                reader_joined = reader.join().is_ok();
                 Err(error)
             }
         }
@@ -931,6 +1775,10 @@ fn execute_child_with_handshake_timeout(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = terminate_process_tree(&mut child);
     }
+    #[cfg(test)]
+    if let Some(gate) = registry.exit_gate.lock().unwrap().take() {
+        gate.wait();
+    }
     let exit_status = active
         .child
         .lock()
@@ -944,7 +1792,9 @@ fn execute_child_with_handshake_timeout(
         .active
         .remove(packet.run_id());
 
-    let stderr_tail = stderr_tail.join().unwrap_or_else(|_| ProcessStderrTail {
+    let stderr_result = stderr_tail.join();
+    let stderr_joined = stderr_result.is_ok();
+    let stderr_tail = stderr_result.unwrap_or_else(|_| ProcessStderrTail {
         tail: String::new(),
         dropped_bytes: None,
         read_error: Some("stderr collector panicked".into()),
@@ -957,28 +1807,58 @@ fn execute_child_with_handshake_timeout(
         "ProcessJsonl stderr drain observation"
     );
     let status = exit_status?;
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            let error = if spec.environment_refs.is_empty() {
-                error
-            } else {
-                // Child-controlled frame fields and parser diagnostics may contain
-                // transformed or truncated credentials. Exact-value replacement
-                // cannot safely declassify these diagnostics.
-                "worker protocol failure (credential-bearing diagnostic withheld)".into()
-            };
-            return Err(format!(
-                "ProcessJsonl protocol failed: {error}; stderr tail: {stderr_tail}"
-            ));
-        }
-    };
-    if !status.success() && !terminal_received {
+    if !reader_joined || !stderr_joined {
         return Err(format!(
-            "ProcessJsonl worker exited with {status}; stderr tail: {stderr_tail}"
+            "ProcessJsonl local exit remains unknown after driver join failure: reader_joined={reader_joined}, stderr_joined={stderr_joined}"
         ));
     }
-    Ok(result)
+    let cleanup = record_exit_and_cleanup(
+        registry,
+        packet,
+        ProcessLocalExitPhase::Reaped,
+        scratch,
+        "reaped",
+    );
+    let primary = (|| {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let error = if spec.environment_refs.is_empty() {
+                    error
+                } else {
+                    // Child-controlled frame fields and parser diagnostics may contain
+                    // transformed or truncated credentials. Exact-value replacement
+                    // cannot safely declassify these diagnostics.
+                    "worker protocol failure (credential-bearing diagnostic withheld)".into()
+                };
+                return Err(format!(
+                    "ProcessJsonl protocol failed: {error}; stderr tail: {stderr_tail}"
+                ));
+            }
+        };
+        if !status.success() && !terminal_received {
+            return Err(format!(
+                "ProcessJsonl worker exited with {status}; stderr tail: {stderr_tail}"
+            ));
+        }
+        Ok(result)
+    })();
+    let outcome = combine_process_cleanup(primary, cleanup);
+    #[cfg(test)]
+    if let Some(sender) = CLEANUP_DRIVER_OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&format!("{}:{}", packet.run_id(), packet.attempt))
+    {
+        let observed = outcome
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| "unexpected successful driver".into());
+        let _ = sender.send(observed);
+    }
+    outcome
 }
 
 #[cfg(unix)]
@@ -1287,13 +2167,23 @@ fn read_process_exchange(
                             "error": error,
                         }),
                     };
+                    let response = runtime_handle.block_on(session.bounded_transport_response(
+                        &request_id,
+                        &tool_name,
+                        response,
+                        limits.frame_bytes,
+                    ))?;
                     session.complete_transport_request(&request_id, &fingerprint, &response)?;
                     response
                 };
                 if handled_tool_requests.len() == limits.cached_tool_responses {
                     handled_tool_requests.pop_front();
                 }
-                handled_tool_requests.push_back((request_id, fingerprint, response.clone()));
+                handled_tool_requests.push_back((
+                    request_id.clone(),
+                    fingerprint.clone(),
+                    response.clone(),
+                ));
                 response
             };
             let mut response = response;
@@ -1306,13 +2196,31 @@ fn read_process_exchange(
                     )?
                     .unwrap_or(serde_json::Value::Null);
             }
-            write_process_message(
+            let confirmation_revision = tool_session
+                .map(|session| session.process_read_confirmation_revision(&tool_name, &response))
+                .transpose()?
+                .flatten();
+            let (sent, frame_sha256, frame_bytes) = write_process_message_recorded(
                 active.ok_or_else(|| {
                     "ProcessJsonl worker requested a tool without an active child process"
                         .to_string()
                 })?,
                 &response,
             )?;
+            if let (Some(session), Some(confirmation_revision)) =
+                (tool_session, confirmation_revision)
+            {
+                session.record_process_read_delivery(
+                    &tool_name,
+                    &fingerprint,
+                    &sent,
+                    &frame_sha256,
+                    frame_bytes,
+                    confirmation_revision,
+                ).map_err(|error| {
+                    format!("Process delivery confirmation unknown after actual send; do not resend: {error}")
+                })?;
+            }
             continue;
         }
         if envelope.kind.as_deref() == Some("content_chunk") {
@@ -1611,6 +2519,13 @@ fn write_process_message(
     active: &ActiveProcess,
     message: &serde_json::Value,
 ) -> Result<(), String> {
+    write_process_message_recorded(active, message).map(|_| ())
+}
+
+fn write_process_message_recorded(
+    active: &ActiveProcess,
+    message: &serde_json::Value,
+) -> Result<(serde_json::Value, String, usize), String> {
     let mut stdin = active
         .stdin
         .lock()
@@ -1640,15 +2555,118 @@ fn write_process_message(
     stdin
         .write_all(format!("{payload}\n").as_bytes())
         .and_then(|()| stdin.flush())
-        .map_err(|error| format!("write ProcessJsonl Runtime message: {error}"))
+        .map_err(|error| format!("write ProcessJsonl Runtime message: {error}"))?;
+    let digest = crate::context_evidence::read_sha256(payload.as_bytes());
+    Ok((message, digest, payload.len()))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use harness_contract::context::ChildExecutionBudgetReservation;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_drop_reports_not_started_and_exact_path_retry() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?};", field.name()));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let (temporary, _services, adapter, packet) = driver_exit_fixture();
+        let scratch_root = temporary.path().join("scratch");
+        std::fs::create_dir(&scratch_root).unwrap();
+        adapter
+            .install_fixture_scratch(scratch_root.clone())
+            .unwrap();
+        let prepared = adapter
+            .prepare_packet_launch(
+                &packet,
+                packet.clone(),
+                &AgentModelSelection {
+                    model: "test-model".into(),
+                    provider: "test".into(),
+                    registry_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(prepared.command.is_some());
+        let exact = prepared.envelope.control_scratch.clone().unwrap();
+        let isolated = scratch_root.join("isolated-original");
+        let other = scratch_root.join("other-run");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("sentinel"), "other run").unwrap();
+        std::fs::rename(&exact, &isolated).unwrap();
+        std::fs::write(&exact, "do not delete").unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(captured.clone()), || drop(prepared));
+        let events = captured.lock().unwrap().join("\n");
+        assert!(events.contains("scratch cleanup failed"), "{events}");
+        assert!(events.contains("drop_not_started"), "{events}");
+        assert!(events.contains(packet.run_id()), "{events}");
+        assert!(events.contains("attempt=1"), "{events}");
+        assert!(events.contains(&exact.display().to_string()), "{events}");
+        let exit = adapter.take_local_exit_evidence(&packet).unwrap();
+        assert!(exit.matches_packet(&packet));
+        assert!(exit.is_not_started());
+        assert!(!exit.is_reaped());
+        assert_eq!(std::fs::read_to_string(&exact).unwrap(), "do not delete");
+        assert!(isolated.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(other.join("sentinel")).unwrap(),
+            "other run"
+        );
+        std::fs::remove_file(&exact).unwrap();
+        std::fs::rename(&isolated, &exact).unwrap();
+        cleanup_owned_scratch(&packet, &exact, "explicit_retry").unwrap();
+        assert!(!exact.exists());
+        assert!(other.is_dir());
+        cleanup_owned_scratch(&packet, &exact, "idempotent_retry").unwrap();
+    }
+
     fn task() -> AgentTaskPacket {
+        let services = RuntimeServices::in_memory().unwrap();
+        let mut request = crate::AgentBindingRequest::new(
+            harness_contract::agent::AgentDefinitionId::new(
+                harness_contract::agent::DefinitionScope::Builtin,
+                "cowd/execute",
+            )
+            .unwrap(),
+            harness_contract::agent::RevisionSelector::LatestApprovedStable,
+            "process-agent-1",
+            "process-session-1",
+            "process-task-1",
+        );
+        request.granted_capabilities = vec![harness_contract::agent::AgentCapability::Read];
+        let binding = crate::AgentBindingCompiler::new(services.definition_registry().clone())
+            .compile(request)
+            .unwrap()
+            .snapshot;
         AgentTaskPacket {
             assignment: crate::test_support::agent_assignment(
                 None,
@@ -1672,7 +2690,7 @@ mod tests {
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
-            resource_scopes: Vec::new(),
+            resource_scopes: vec!["read:.".into()],
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
@@ -1686,7 +2704,7 @@ mod tests {
                 1,
             ),
             deadline_at_ms: u64::MAX,
-            binding: None,
+            binding: Some(binding),
             managed_invocation: None,
             idempotency_key: "process-idempotency-1".into(),
             agentic_binding: None,
@@ -1747,6 +2765,184 @@ mod tests {
             runtime_observed_resource_scopes: vec!["network:*".to_string()],
             failure: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn driver_exit_fixture() -> (
+        tempfile::TempDir,
+        Arc<RuntimeServices>,
+        ProcessJsonlAdapter,
+        AgentTaskPacket,
+    ) {
+        use harness_contract::agent::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        sandbox_launcher::probe()
+            .expect("Process driver gates require the original sandbox launcher");
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let services = RuntimeServices::test_builder(temporary.path().join("home"), &workspace)
+            .build()
+            .unwrap();
+        let adapter = ProcessJsonlAdapter::for_workspace(&workspace);
+        let mut spec = ProcessJsonlSpec::new("command:driver-exit", "driver-exit.py", Vec::new());
+        spec.sandbox_profile = crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly;
+        spec.command_digest = ProcessJsonlSpec::digest_for(
+            &spec.command_ref,
+            &spec.executable,
+            &spec.args,
+            spec.working_directory.as_deref(),
+            &spec.environment_refs,
+            spec.sandbox_profile,
+            &spec.transport_limits,
+        );
+        adapter.register_command(spec.clone()).unwrap();
+        let registry = services.definition_registry();
+        let base = registry
+            .resolve_agent(
+                &AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap(),
+                RevisionSelector::LatestApprovedStable,
+            )
+            .unwrap();
+        let mut manifest = base.revision.manifest.clone();
+        manifest.definition_id =
+            AgentDefinitionId::new(DefinitionScope::Workspace, "driver/exit").unwrap();
+        manifest.executor = AgentExecutorPolicy::ProcessJsonl {
+            command_ref: spec.command_ref.clone(),
+            command_digest: spec.command_digest.clone(),
+        };
+        manifest.model_policy.allowed_models = vec!["test-model".into()];
+        manifest.model_policy.fallback_allowed = false;
+        let stored = registry
+            .agents()
+            .store_revision(manifest, &base.agent_markdown)
+            .unwrap();
+        registry
+            .agents()
+            .record_release_assignment(&ReleaseAssignment {
+                scope: DefinitionScope::Workspace,
+                revision_ref: stored.revision.revision_ref.clone(),
+                channel: ReleaseChannel::Stable,
+                status: ReleaseAssignmentStatus::Active,
+                authorization: ReleaseAuthorization::HumanApproval {
+                    approval_ref: "fixture:driver-exit".into(),
+                },
+                content_digest: stored.revision.content_digest,
+            })
+            .unwrap();
+        let mut packet = task();
+        let mut request = crate::AgentBindingRequest::new(
+            stored.revision.revision_ref.definition_id,
+            RevisionSelector::LatestApprovedStable,
+            packet.agent_id(),
+            packet.session_id(),
+            packet.task_id(),
+        );
+        request.granted_capabilities = vec![AgentCapability::Read];
+        let binding = crate::AgentBindingCompiler::new(Arc::clone(registry))
+            .compile(request)
+            .unwrap()
+            .snapshot;
+        packet.assignment = crate::test_support::agent_assignment(
+            Some(binding.definition_ref.clone()),
+            packet.agent_id(),
+            packet.run_id(),
+            packet.task_id(),
+            packet.session_id(),
+            packet.mission_id(),
+            None,
+            packet.graph_id(),
+            packet.node_id(),
+        );
+        packet.binding = Some(binding);
+        let mut returned = completed_return(&packet);
+        returned.observed_acceptance = Default::default();
+        returned.acceptance.clear();
+        returned.runtime_observed_resource_scopes.clear();
+        returned.tool_calls = 0;
+        let terminal_json =
+            serde_json::to_string(&serde_json::to_string(&returned).unwrap()).unwrap();
+        let worker = workspace.join(&spec.executable);
+        std::fs::write(&worker, format!(r#"#!/usr/bin/env python3
+import json, sys
+hello = json.loads(sys.stdin.readline())
+identity = {{'protocol_version': 3, 'run_id': hello['run_id'], 'agent_id': hello['agent_id']}}
+ready = dict(identity, sequence=1, kind='ready', manifest_digest=hello['manifest_digest'],
+    focus=hello['focus'], model_control='external_configured', capabilities={{
+        'features': ['step_binding_v1'], 'commands': ['result', 'error'],
+        'supports_recovery': False, 'evidence_mode': 'runtime_receipts',
+        'model_control': 'external_configured'}})
+print(json.dumps(ready), flush=True)
+start = json.loads(sys.stdin.readline())
+assert start['kind'] == 'start'
+print(json.dumps(dict(identity, sequence=2, kind='result', result=json.loads({terminal_json}))), flush=True)
+"#)).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (temporary, services, adapter, packet)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r1_optional_unknown_process_driver_join_errors_cannot_mint_reaped() {
+        for driver in [ProcessDriverFault::Reader, ProcessDriverFault::Stderr] {
+            let (_temporary, _services, adapter, packet) = driver_exit_fixture();
+            *adapter.registry.driver_panic.lock().unwrap() = Some((packet.run_id().into(), driver));
+            let returned = tokio::time::timeout(
+                Duration::from_secs(20),
+                adapter.execute(
+                    packet.clone(),
+                    AgentModelSelection {
+                        model: "test-model".into(),
+                        provider: "test".into(),
+                        registry_revision: 0,
+                    },
+                ),
+            )
+            .await
+            .expect("driver failure must complete physical cleanup");
+            assert!(returned
+                .unwrap_err()
+                .contains("local exit remains unknown after driver join failure"));
+            assert!(adapter.registry.driver_panic.lock().unwrap().is_none());
+            assert!(adapter.take_local_exit_evidence(&packet).is_none());
+            let lifecycle = adapter.registry.lifecycle.lock().unwrap();
+            assert!(!lifecycle.starting.contains(packet.run_id()));
+            assert!(!lifecycle.active.contains_key(packet.run_id()));
+            assert!(!lifecycle.local_exits.contains_key(packet.run_id()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r1_optional_unknown_process_exit_witness_is_exact_and_single_use() {
+        let (_temporary, _services, adapter, packet) = driver_exit_fixture();
+        let returned = tokio::time::timeout(
+            Duration::from_secs(20),
+            adapter.execute(
+                packet.clone(),
+                AgentModelSelection {
+                    model: "test-model".into(),
+                    provider: "test".into(),
+                    registry_revision: 0,
+                },
+            ),
+        )
+        .await
+        .expect("original driver must really return")
+        .unwrap();
+        assert_eq!(returned.run_id, packet.run_id());
+        assert!(returned.acceptance_evaluation.is_none());
+        let mut foreign = packet.clone();
+        foreign.objective.push_str(" changed immutable packet");
+        assert!(adapter.take_local_exit_evidence(&foreign).is_none());
+        let exit = adapter
+            .take_local_exit_evidence(&packet)
+            .expect("actual OS wait and drivers produced the original witness");
+        assert!(exit.matches_packet(&packet));
+        assert!(exit.is_reaped());
+        assert!(!exit.is_not_started());
+        assert!(adapter.take_local_exit_evidence(&packet).is_none());
     }
 
     #[test]
@@ -1922,17 +3118,13 @@ mod tests {
             "agent_id": packet.agent_id(),
             "result": completed_return(&packet),
         });
-        assert!(
-            read_process_result(format!("{v1}\n").as_bytes(), &packet)
-                .expect_err("V1 is not accepted")
-                .contains("V2")
-        );
+        assert!(read_process_result(format!("{v1}\n").as_bytes(), &packet)
+            .expect_err("V1 is not accepted")
+            .contains("V2"));
         let oversized = format!("{}\n", "x".repeat(MAX_PROCESS_FRAME_BYTES));
-        assert!(
-            read_process_result(oversized.as_bytes(), &packet)
-                .expect_err("oversized frame is rejected")
-                .contains("transport limit")
-        );
+        assert!(read_process_result(oversized.as_bytes(), &packet)
+            .expect_err("oversized frame is rejected")
+            .contains("transport limit"));
     }
 
     #[test]
@@ -2080,14 +3272,12 @@ mod tests {
                     let _ = terminate_process_tree(&mut watchdog_active.child.lock().unwrap());
                 }
             });
-            assert!(
-                write_process_message(
-                    &active,
-                    &serde_json::json!({"kind":"agent_command",
+            assert!(write_process_message(
+                &active,
+                &serde_json::json!({"kind":"agent_command",
             "input":"x".repeat(MAX_PROCESS_FRAME_BYTES + 1)})
-                )
-                .is_err()
-            );
+            )
+            .is_err());
             assert_eq!(
                 *active.next_runtime_sequence.lock().unwrap(),
                 1,
@@ -2251,15 +3441,13 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active
             .remove(packet.run_id());
-        assert!(
-            adapter
-                .registry
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .active
-                .is_empty()
-        );
+        assert!(adapter
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -2354,16 +3542,12 @@ mod tests {
             let mut missing = ack("ack-test", 17, true);
             missing.accepted = None;
             assert!(active.acknowledge_command(&missing).is_err());
-            assert!(
-                active
-                    .acknowledge_command(&ack("unknown", 17, true))
-                    .is_err()
-            );
-            assert!(
-                active
-                    .acknowledge_command(&ack("ack-test", 18, true))
-                    .is_err()
-            );
+            assert!(active
+                .acknowledge_command(&ack("unknown", 17, true))
+                .is_err());
+            assert!(active
+                .acknowledge_command(&ack("ack-test", 18, true))
+                .is_err());
             assert_eq!(active.command_slots.available_permits(), 1);
             active
                 .acknowledge_command(&ack("ack-test", 17, accepted))
@@ -2526,15 +3710,13 @@ mod tests {
             )
             .await;
         assert!(receipt.is_ok());
-        assert!(
-            adapter
-                .registry
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_cancellation
-                .contains(packet.run_id())
-        );
+        assert!(adapter
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_cancellation
+            .contains(packet.run_id()));
     }
 
     #[cfg(unix)]
@@ -2582,11 +3764,9 @@ mod tests {
         .expect("malformed worker must be terminated instead of waiting for sleep")
         .expect("worker thread");
 
-        assert!(
-            result
-                .expect_err("malformed worker cannot complete")
-                .contains("malformed ProcessJsonl V3 envelope")
-        );
+        assert!(result
+            .expect_err("malformed worker cannot complete")
+            .contains("malformed ProcessJsonl V3 envelope"));
     }
 
     #[cfg(unix)]
@@ -2695,11 +3875,9 @@ mod tests {
         .expect("handshake timeout must reap a silent worker")
         .expect("worker thread");
 
-        assert!(
-            result
-                .expect_err("a worker without ready cannot run")
-                .contains("ready handshake")
-        );
+        assert!(result
+            .expect_err("a worker without ready cannot run")
+            .contains("ready handshake"));
     }
 
     #[cfg(unix)]
@@ -2886,8 +4064,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn real_process_topic_bridge_delivers_start_and_tool_deltas_without_replaying_cached_tool()
-     {
+    async fn real_process_topic_bridge_delivers_start_and_tool_deltas_without_replaying_cached_tool(
+    ) {
         exercise_real_process_topic_bridge(false, None).await;
     }
 
@@ -2959,8 +4137,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn real_process_pending_transport_request_requires_effect_reconciliation_without_reexecution()
-     {
+    async fn real_process_pending_transport_request_requires_effect_reconciliation_without_reexecution(
+    ) {
         exercise_real_process_topic_bridge(false, Some("pending-request")).await;
     }
 
@@ -3222,12 +4400,10 @@ mod tests {
         )
         .unwrap();
         if content_case == Some("pending-request") {
-            assert!(
-                bridge
-                    .replay_or_begin_transport_request("pending-crash", &read_fingerprint)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(bridge
+                .replay_or_begin_transport_request("pending-crash", &read_fingerprint)
+                .unwrap()
+                .is_none());
         }
         let binding = packet.binding.as_ref().unwrap();
         let context = memory::MemoryTurnContext::new(
@@ -3420,13 +4596,11 @@ else:
                     .unwrap(),
                 expected
             );
-            assert!(
-                services
-                    .artifact_store()
-                    .read(&artifact, "session:unrelated", None)
-                    .await
-                    .is_err()
-            );
+            assert!(services
+                .artifact_store()
+                .read(&artifact, "session:unrelated", None)
+                .await
+                .is_err());
         } else if content_case == Some("sequential") {
             let artifacts: Vec<harness_contract::context::ArtifactRef> =
                 serde_json::from_str(&received.unwrap().outcome).unwrap();
@@ -3447,11 +4621,9 @@ else:
                 );
             }
         } else if content_case == Some("pending-request") {
-            assert!(
-                received
-                    .unwrap_err()
-                    .contains("unresolved transport completion")
-            );
+            assert!(received
+                .unwrap_err()
+                .contains("unresolved transport completion"));
         } else if content_case == Some("offset") {
             assert!(received.unwrap_err().contains("offset"));
         } else if content_case == Some("digest") {
@@ -3459,11 +4631,9 @@ else:
         } else if content_case == Some("eof") {
             assert!(received.is_err(), "EOF cannot commit or complete an upload");
         } else if content_case == Some("capacity") {
-            assert!(
-                received
-                    .unwrap_err()
-                    .contains("pending content uploads transport limit")
-            );
+            assert!(received
+                .unwrap_err()
+                .contains("pending content uploads transport limit"));
         } else if changed_retry {
             assert!(received.unwrap_err().contains("request_id was reused"));
         } else {
@@ -3517,32 +4687,24 @@ else:
             .replay_or_begin_transport_request("read-1", &read_fingerprint)
             .unwrap()
             .expect("the real response survives cache eviction and bridge reconstruction");
-        assert!(
-            replay["output"]
-                .as_str()
-                .unwrap()
-                .contains("actual-source-body")
-        );
-        assert!(
-            rebuilt_bridge
-                .replay_or_begin_transport_request("read-1", "different-fingerprint")
-                .unwrap_err()
-                .contains("request_id was reused")
-        );
-        assert!(
-            rebuilt_bridge
-                .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
-                .unwrap()
-                .is_none()
-        );
+        assert!(replay["output"]
+            .as_str()
+            .unwrap()
+            .contains("actual-source-body"));
+        assert!(rebuilt_bridge
+            .replay_or_begin_transport_request("read-1", "different-fingerprint")
+            .unwrap_err()
+            .contains("request_id was reused"));
+        assert!(rebuilt_bridge
+            .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
+            .unwrap()
+            .is_none());
         let another_bridge =
             ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
-        assert!(
-            another_bridge
-                .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
-                .unwrap_err()
-                .contains("unresolved transport completion")
-        );
+        assert!(another_bridge
+            .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
+            .unwrap_err()
+            .contains("unresolved transport completion"));
         let mut another_run = packet.clone();
         another_run.assignment.run_id = "different-physical-run".into();
         let isolated =
@@ -3560,27 +4722,23 @@ else:
         let mut updated = control.snapshot();
         updated.revision += 1;
         control.replace(updated).unwrap();
-        assert!(
-            bridge
-                .execute_tool("stale-policy", "read_file", r#"{"path":"source.txt"}"#)
-                .await
-                .unwrap_err()
-                .contains("policy revision is stale")
-        );
+        assert!(bridge
+            .execute_tool("stale-policy", "read_file", r#"{"path":"source.txt"}"#)
+            .await
+            .unwrap_err()
+            .contains("policy revision is stale"));
         assert_eq!(host.reads.load(Ordering::SeqCst), 2);
-        assert!(
-            actions
-                .topic_observations(
-                    &root.program_id,
-                    &agent,
-                    &packet.agentic_binding.as_ref().unwrap().team_id,
-                    packet.graph_id(),
-                    16,
-                    48 * 1024
-                )
-                .unwrap()
-                .is_none()
-        );
+        assert!(actions
+            .topic_observations(
+                &root.program_id,
+                &agent,
+                &packet.agentic_binding.as_ref().unwrap().team_id,
+                packet.graph_id(),
+                16,
+                48 * 1024
+            )
+            .unwrap()
+            .is_none());
     }
 }
 #[cfg(all(test, unix))]
@@ -3659,16 +4817,14 @@ send('result',result=json.loads(RESULT_JSON))
                 .settled
         );
         let revision = projection.revision;
-        assert!(
-            fixture
-                .services
-                .agent_runtime()
-                .execute_task(fixture.packet.clone())
-                .await
-                .unwrap()
-                .failure
-                .is_none()
-        );
+        assert!(fixture
+            .services
+            .agent_runtime()
+            .execute_task(fixture.packet.clone())
+            .await
+            .unwrap()
+            .failure
+            .is_none());
         let projection = fixture
             .services
             .agent_action_service()
@@ -3681,14 +4837,12 @@ send('result',result=json.loads(RESULT_JSON))
                 .as_deref(),
             Some("primary-execution")
         );
-        assert!(
-            fixture
-                .services
-                .dispatch_ready_agentic_work("coord-program")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture
+            .services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // G29 WIP: real child + host write/read + TaskExecute fixture are wired, but

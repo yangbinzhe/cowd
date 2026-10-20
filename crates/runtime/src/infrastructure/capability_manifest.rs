@@ -179,7 +179,9 @@ fn action_purpose(action: &str) -> &'static str {
         "task_review" => "Independently accept, challenge, or request rework.",
         "message_publish" => "Publish a durable scoped discussion entry.",
         "artifact_commit" => "Attach a durable content reference and provenance.",
-        "objective_review" => "Settle one open Objective criterion with a satisfied/gap/blocked verdict over a set of delivered results.",
+        "objective_review" => {
+            "Settle one open Objective criterion with a satisfied/gap/blocked verdict over a set of delivered results."
+        }
         "objective_complete_request" => "Ask the Supervisor to verify terminal invariants.",
         _ => "Apply one bounded semantic collaboration action.",
     }
@@ -209,8 +211,8 @@ pub fn runtime_capability_primer() -> String {
         "## Recovery",
         "On rejection or restart, inspect current state and continue from the returned revision; never repeat an unchanged failing action.",
         "## Collaboration rules (Agent-first)",
-        "1. Sub-agents run the work. While any sub-task is in flight your only role is to coordinate: WAIT for it before yielding, and DO NOT redo its work yourself.",
-        "2. Wait with `state_inspect(wait_for_workers=true)`; scale the wait to the outstanding work rather than guessing a fixed timeout.",
+        "1. Do not duplicate delegated work or overlap its write set. While sub-tasks run, you may do independent work within your own authorization, claim, revision and lease fences.",
+        "2. When progress depends on workers and no independent work remains, wait with `state_inspect(wait_for_workers=true)`; scale the wait to the outstanding work.",
         "3. Close what you finished: release a claim you no longer own, and withdraw a Task that is no longer needed. Dangling work keeps the Objective open.",
         "4. When you delegate, tell the delegate explicitly: (a) it is NOT alone and must not revert or overwrite others' committed work; (b) whether it may spawn further agents (default: it may NOT, to prevent unbounded recursion).",
         "5. Spawn a Team or a Task only when the work is genuinely large, spans independent responsibility domains, or needs an independent reviewer. For simple or straightforward work you do not need to spawn anything at all.",
@@ -235,7 +237,10 @@ pub fn runtime_capability_primer() -> String {
 const PRIMER_SECTION_BUDGETS: &[(&str, usize)] = &[
     ("## Agent-first collaboration contract", 600),
     ("## Shortest path first", 380),
-    ("## Text tool-call frame (only if you emit calls as text markup)", 1040),
+    (
+        "## Text tool-call frame (only if you emit calls as text markup)",
+        1040,
+    ),
     ("## Closure discipline", 420),
     ("## Canonical references", 260),
     ("## Instruction precedence", 260),
@@ -248,10 +253,30 @@ const PRIMER_SECTION_BUDGETS: &[(&str, usize)] = &[
 /// a capability it cannot use — and the prompt stays proportional to the surface.
 #[must_use]
 pub fn render_tool_guidance(present: &std::collections::BTreeSet<String>) -> String {
+    let execute_guidance = present.contains("execute_code").then(|| {
+        let languages = tools::mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "execute_code")
+            .and_then(|spec| {
+                spec.input_schema["properties"]["language"]["enum"]
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+            })
+            .unwrap_or_else(|| "see the current native schema".to_string());
+        format!(
+            "- `execute_code`: deterministic reduction ({languages}); the current native schema is authoritative. File-tool paths resolve in the leased host workspace; their returned absolute paths are not sandbox aliases. Bounded code runs with cwd=/project, a read-only snapshot of only the explicit workspace-relative input_files: [\"input.txt\"] maps to /project/input.txt, while [] copies no workspace files. Private /tmp is scratch and never writes back to the workspace. Print computed data to stdout; governed results retain stdout, stderr, terminal facts and an archived body reference. This describes the bounded-code contract, not a claim that any process or mount already exists."
+        )
+    });
     let mut lines: Vec<&str> = Vec::new();
     if present.contains("tool_orchestrate") {
         lines.push(
-            "- `tool_orchestrate`: run a bounded PROGRAM of many calls in ONE round. `batch` a known file set, `map` a list, `filter`/`collect` to aggregate (count|first|last|join|sum), `compute` to reduce. `on_error=collect` returns per-item {ok,output,error,durationMs} instead of aborting.",
+            "- `tool_orchestrate`: run a bounded PROGRAM of many calls in ONE round. `batch` a known file set, `map` a list, `filter`/`collect` to aggregate (count|first|last|join|sum), `compute` to reduce prior result data (python/javascript, not ambient workspace files). `on_error=collect` returns per-item {ok,output,error,durationMs} instead of aborting.",
         );
     }
     if present.contains("glob_search") {
@@ -264,14 +289,22 @@ pub fn render_tool_guidance(present: &std::collections::BTreeSet<String>) -> Str
             "- `grep_search`: `searches:[...]` runs several independent content searches in ONE ordered batch; `language` sweeps one language's extensions.",
         );
     }
-    if present.contains("execute_code") {
-        lines.push(
-            "- `execute_code`: deterministic reduction OUTSIDE the model (python/javascript/bash/ruby/lua/go/rust). Count, aggregate, filter and compare across many files; only stdout returns.",
-        );
+    if let Some(guidance) = execute_guidance.as_deref() {
+        lines.push(guidance);
+        if present.contains("edit") {
+            lines.push(
+                "- To persist computed output, you may pass its text to authorized `edit` (action=write) using a workspace-relative path; sandbox execution does not grant write authority.",
+            );
+            if present.contains("read_file") {
+                lines.push(
+                    "- Read the persisted file back with `read_file` when verification is needed; a scratch file or successful process is not a delivered or accepted result.",
+                );
+            }
+        }
     }
     if present.contains("read_file") {
         lines.push(
-            "- `read_file`: one bounded window; `complete=true` yields a verifiable EOF receipt. On truncation continue from `nextOffset` instead of re-reading whole files.",
+            "- `read_file`: one bounded window; `complete=true` yields a verifiable EOF receipt. On truncation continue from `nextOffset` instead of re-reading whole files. content is line-rendered, not byte-exact: byteLength, sha256 and endsWithNewline describe the original file bytes.",
         );
     }
     if present.contains("objective_review") {
@@ -415,7 +448,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
 
 #[cfg(test)]
 mod prompt_core_tests {
-    use super::{render_tool_guidance, runtime_capability_primer, PRIMER_SECTION_BUDGETS};
+    use super::{PRIMER_SECTION_BUDGETS, render_tool_guidance, runtime_capability_primer};
 
     fn set(items: &[&str]) -> std::collections::BTreeSet<String> {
         items.iter().map(|item| (*item).to_string()).collect()
@@ -528,6 +561,93 @@ mod prompt_core_tests {
     }
 
     #[test]
+    fn bounded_code_guidance_uses_spec_languages_and_preserves_namespaces() {
+        let present = set(&["execute_code", "edit", "read_file"]);
+        let guidance = render_tool_guidance(&present);
+        let spec = tools::mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "execute_code")
+            .expect("execute_code spec");
+        let languages = spec.input_schema["properties"]["language"]["enum"]
+            .as_array()
+            .expect("language enum");
+        let expected = languages
+            .iter()
+            .map(|language| language.as_str().expect("language string"))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(guidance.contains(&format!("({expected})")));
+        for fragment in [
+            "not sandbox aliases",
+            "cwd=/project",
+            "[] copies no workspace files",
+            "/project/input.txt",
+            "/tmp is scratch and never writes back",
+            "stdout, stderr, terminal facts",
+            "authorized `edit`",
+            "Read the persisted file back",
+            "not byte-exact",
+            "not a claim that any process or mount already exists",
+        ] {
+            assert!(guidance.contains(fragment), "missing contract: {fragment}");
+        }
+        for obsolete in ["ruby/lua/go/rust", "only stdout", "output_files"] {
+            assert!(
+                !guidance.contains(obsolete),
+                "obsolete contract: {obsolete}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_code_bridge_examples_validate_without_granting_authority() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let lease = tools::ToolHost::builtin("bridge-schema", workspace.path()).pin_snapshot();
+        for (tool, input) in [
+            (
+                "execute_code",
+                serde_json::json!({
+                    "language": "python",
+                    "input_files": ["input.txt"],
+                    "code": "print(sum(bool(line.strip()) for line in open('/project/input.txt')))"
+                }),
+            ),
+            (
+                "execute_code",
+                serde_json::json!({"language": "python", "input_files": [], "code": "print(3)"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"action": "write", "path": "result.txt", "content": "nonempty_lines=3\n"}),
+            ),
+            (
+                "read_file",
+                serde_json::json!({"path": "result.txt", "complete": true}),
+            ),
+        ] {
+            lease.validate_input(tool, &input).expect("bridge schema");
+        }
+        for input in [
+            serde_json::json!({"language": "python", "code": "pass"}),
+            serde_json::json!({"language": "ruby", "input_files": [], "code": "puts 3"}),
+            serde_json::json!({"language": "python", "input_files": [], "code": "pass", "output_files": ["result.txt"]}),
+        ] {
+            assert!(lease.validate_input("execute_code", &input).is_err());
+        }
+        assert!(!workspace.path().join("result.txt").exists());
+    }
+
+    #[test]
+    fn persistence_guidance_does_not_activate_absent_tools() {
+        let guidance = render_tool_guidance(&set(&["execute_code"]));
+        assert!(!guidance.contains("`edit`"));
+        assert!(!guidance.contains("`read_file`"));
+        let guidance = render_tool_guidance(&set(&["execute_code", "edit"]));
+        assert!(guidance.contains("authorized `edit`"));
+        assert!(!guidance.contains("`read_file`"));
+    }
+
+    #[test]
     fn no_callable_tool_yields_no_guidance_section() {
         assert!(render_tool_guidance(&std::collections::BTreeSet::new()).is_empty());
         assert!(render_tool_guidance(&set(&["state_inspect"])).is_empty());
@@ -541,8 +661,12 @@ mod collaboration_rule_tests {
     #[test]
     fn collaboration_rules_pin_waiting_role_separation_and_lifecycle() {
         let primer = runtime_capability_primer();
-        assert!(primer.contains("WAIT for it before yielding"));
-        assert!(primer.contains("DO NOT redo its work yourself"));
+        assert!(!primer.contains("WAIT for it before yielding"));
+        assert!(!primer.contains("your only role is to coordinate"));
+        assert!(primer.contains("Do not duplicate delegated work or overlap its write set"));
+        assert!(primer.contains("you may do independent work"));
+        assert!(primer.contains("authorization, claim, revision and lease fences"));
+        assert!(primer.contains("no independent work remains"));
         assert!(primer.contains("release a claim you no longer own"));
         assert!(primer.contains("withdraw a Task that is no longer needed"));
         assert!(primer.contains("must not revert or overwrite others' committed work"));

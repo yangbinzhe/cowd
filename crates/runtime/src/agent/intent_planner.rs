@@ -66,7 +66,7 @@ fn recommended_tools_for(intent: TaskIntent) -> Vec<String> {
         TaskIntent::Backend => vec!["workspace_snapshot", "grep_search", "tool_orchestrate"],
         TaskIntent::Docs => vec!["tool_orchestrate", "tool_orchestrate"],
         TaskIntent::Release => vec!["workspace_snapshot", "tool_orchestrate"],
-        TaskIntent::Test => vec!["workspace_snapshot", "grep_search"],
+        TaskIntent::Test => Vec::new(),
         TaskIntent::Explore => vec!["workspace_snapshot", "grep_search", "tool_orchestrate"],
     };
     tools.into_iter().map(str::to_string).collect()
@@ -82,7 +82,9 @@ fn reason_for(intent: TaskIntent, understanding: &TaskUnderstanding) -> String {
         TaskIntent::Backend => "backend tasks need runtime/module search and source context",
         TaskIntent::Docs => "documentation tasks need related document discovery and batch reads",
         TaskIntent::Release => "release tasks need status, tests, build, and release-gate context",
-        TaskIntent::Test => "test tasks need test targets and validation commands",
+        TaskIntent::Test => {
+            "verification intent does not prescribe tools or repository inspection; choose evidence for the user's actual outcome. Software test discovery and execution remain available when relevant, subject to the current tool schema and authorization"
+        }
         TaskIntent::Explore => "exploration starts with workspace snapshot and fanout search/read",
     };
     format!(
@@ -184,6 +186,51 @@ mod tests {
             TaskIntent::Review
         );
         assert_eq!(classify_intent("修复这个失败").intent, TaskIntent::Bugfix);
+    }
+
+    #[test]
+    fn verification_understanding_does_not_prescribe_engineering_tools() {
+        let mut understanding = understand(&StrategyInput::from_prompt("verify an outcome"));
+        understanding.domain = TaskDomain::Test;
+        let plan = classify_understanding(&understanding);
+        assert_eq!(plan.intent, TaskIntent::Test);
+        assert!(plan.recommended_tools.is_empty());
+        assert!(
+            plan.reason
+                .contains("does not prescribe tools or repository inspection")
+        );
+        assert!(
+            plan.reason
+                .contains("Software test discovery and execution remain available when relevant")
+        );
+        assert!(!plan.reason.contains("test tasks need test targets"));
+        assert!(plan.reason.contains("task_complexity="));
+        assert!(plan.reason.contains("risk="));
+        let serialized = serde_json::to_value(&plan).expect("intent projection");
+        assert_eq!(serialized["recommended_tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn evidence_caller_preserves_optional_tools_for_file_and_software_verification() {
+        for prompt in [
+            "验证 result.txt 的实际字节和末尾换行",
+            "run cargo test for the parser",
+        ] {
+            let mut understanding = understand(&StrategyInput::from_prompt(prompt));
+            understanding.domain = TaskDomain::Test;
+            let plan =
+                crate::evidence_planner::plan_evidence_with_understanding(prompt, &understanding);
+            assert_eq!(plan.intent, TaskIntent::Test);
+            assert!(plan.recommended_calls.is_empty());
+            let rendered = crate::evidence_planner::evidence_plan_prompt(&plan);
+            assert!(rendered.contains("does not prescribe tools or repository inspection"));
+            assert!(!rendered.contains("test tasks need test targets"));
+            assert!(!rendered.contains("`workspace_snapshot` with"));
+        }
+        let specs = tools::mvp_tool_specs();
+        assert!(specs.iter().any(|spec| spec.name == "bash"));
+        assert!(specs.iter().any(|spec| spec.name == "glob_search"));
+        assert!(specs.iter().any(|spec| spec.name == "grep_search"));
     }
 
     #[test]

@@ -3,6 +3,176 @@
 mod cli;
 mod process;
 mod setup;
+#[tokio::test]
+async fn r1_integrated_original_obligations_remain_enforced() {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        Router,
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        route: &str,
+        observer: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(route)
+            .header("content-type", "application/json");
+        if let Some(observer) = observer {
+            request = request.header("x-cowd-observer-id", observer);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    let state = crate::api_routes::tests::test_state();
+    let app = crate::api_routes::api_router(Arc::clone(&state));
+    let (status, session) = call(
+        &app,
+        "POST",
+        "/api/sessions",
+        None,
+        Some(serde_json::json!({"model":"test-model","execution_policy_preset":"supervised"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session["id"].as_str().unwrap();
+    let route = format!("/api/sessions/{session_id}/execution-policy");
+    let (status, initial) = call(&app, "GET", &route, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let revision = initial["policy"]["revision"].as_u64().unwrap();
+    let update = serde_json::json!({"preset":"yolo","expected_revision":revision});
+    assert_eq!(
+        call(&app, "PUT", &route, None, Some(update.clone()))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(call(&app, "GET", &route, None, None).await.1, initial);
+    let observer = "r1-integrated-policy-writer";
+    let (status, attached) = call(&app, "POST", &format!("/api/sessions/{session_id}/attach"), Some(observer),
+        Some(serde_json::json!({"surface":"webui","role":"writer","receipt_protocol":"session-public-v1"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let runtime = state.services.runtime.as_ref().unwrap();
+    let turn_id = format!("r1-policy-turn:{}", uuid::Uuid::new_v4());
+    let execution_id = format!("r1-policy-execution:{}", uuid::Uuid::new_v4());
+    let active = runtime.spawn_test_active_session_execution(session_id, &turn_id, &execution_id);
+    let (status, desired) = call(&app, "PUT", &route, Some(observer), Some(update.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(desired["policy"]["revision"], revision + 1);
+    assert_eq!(desired["permission_revision"], revision);
+    assert_eq!(desired["transition"]["phase"], "draining");
+    assert!(!active.is_finished());
+    assert_eq!(
+        call(&app, "PUT", &route, Some(observer), Some(update.clone()))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let (status, latest) = call(
+        &app,
+        "PUT",
+        &route,
+        Some(observer),
+        Some(serde_json::json!({"preset":"cautious","expected_revision":revision + 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(latest["policy"]["revision"], revision + 2);
+    assert_eq!(latest["permission_revision"], revision);
+    assert_eq!(latest["transition"]["phase"], "draining");
+    assert!(!active.is_finished());
+    assert!(runtime.cancel_active_execution(
+        session_id,
+        &turn_id,
+        &execution_id,
+        "owned active-turn fixture cleanup"
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(2), active)
+        .await
+        .unwrap()
+        .unwrap();
+    let stable = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let (status, value) = call(&app, "GET", &route, None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            if value["permission_revision"].as_u64() == Some(revision + 2)
+                && (value["transition"].is_null() || value["transition"]["phase"] == "stable")
+            {
+                break value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(stable["policy"]["permission_mode"], "read-only");
+    assert_eq!(stable["policy"]["revision"], revision + 2);
+    assert_eq!(
+        call(&app, "PUT", &route, Some(observer), Some(update))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let (status, next) = call(
+        &app,
+        "PUT",
+        &route,
+        Some(observer),
+        Some(serde_json::json!({"preset":"supervised","expected_revision":revision + 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next["policy"]["revision"], revision + 3);
+    assert_eq!(next["permission_revision"], revision + 3);
+    let detached = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{session_id}/detach"))
+                .header("content-type", "application/json")
+                .header("x-cowd-observer-id", observer)
+                .header(
+                    "x-cowd-client-id",
+                    attached["receipt_attachment"]["client_id"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .body(Body::from(
+                    serde_json::json!({"surface":"webui","receipt_protocol":"session-public-v1"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detached.status(), StatusCode::OK);
+    runtime.gateway_tasks().shutdown().await;
+    assert!(runtime
+        .runtime_services()
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
 use super::{
     build_memory_config, build_system_prompt_for_mode, cli_turn_context_profile,
     embeddings_endpoint, filter_tool_specs, format_bughunter_report,

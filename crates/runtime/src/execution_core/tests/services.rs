@@ -449,9 +449,11 @@ async fn episode_set_pair(real_skill: bool) {
     };
     let mut builder = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
         .provider_registry(Arc::new(
-            crate::ProviderRegistry::new_with_context_windows(providers,
+            crate::ProviderRegistry::new_with_context_windows(
+                providers,
                 std::collections::BTreeMap::from([("fast".into(), 128_000)]),
-            ).expect("providers"),
+            )
+            .expect("providers"),
         ))
         .evolution_eval_runner(Arc::new(ReadinessOnlyEvolutionEvalRunner));
     if let Some(local) = &local {
@@ -695,14 +697,12 @@ async fn episode_set_pair(real_skill: bool) {
         assert_eq!(repeated.1, candidate_observation);
         assert!(repeated.0.succeeded && repeated.1.succeeded);
         local.verify(&services).await;
-        assert!(
-            services
-                .execution_supervisor()
-                .shutdown()
-                .await
-                .errors
-                .is_empty()
-        );
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
         return;
     }
     let packets = captured_packets
@@ -832,13 +832,11 @@ fn startup_recovers_task_outbox_without_mutating_mission_membership() {
             )],
         })
         .expect("commit Task without running its Runtime port");
-    assert!(
-        first
-            .event_reader()
-            .list_stream("task:task-startup-recovery")
-            .expect("task event stream")
-            .is_empty()
-    );
+    assert!(first
+        .event_reader()
+        .list_stream("task:task-startup-recovery")
+        .expect("task event stream")
+        .is_empty());
     assert_eq!(
         first
             .task_aggregate_service()
@@ -994,12 +992,10 @@ async fn maintenance_supervisor_backpressures_instead_of_growing_owner_queue() {
     );
 
     release.notify_one();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), overflow)
-            .await
-            .expect("capacity is released")
-            .expect("overflow submitter joins")
-    );
+    assert!(tokio::time::timeout(Duration::from_secs(1), overflow)
+        .await
+        .expect("capacity is released")
+        .expect("overflow submitter joins"));
     supervisor.shutdown_and_drain().await;
     assert_eq!(supervisor.tracked_task_count(), 0);
 }
@@ -1230,11 +1226,9 @@ fn concurrent_task_terminal_observation_replays_the_committed_receipt() {
         .map(|worker| worker.join().expect("worker join").expect("observation"))
         .collect::<Vec<_>>();
     let first_event_id = receipts[0].event_id.clone();
-    assert!(
-        receipts
-            .iter()
-            .all(|receipt| receipt.event_id == first_event_id)
-    );
+    assert!(receipts
+        .iter()
+        .all(|receipt| receipt.event_id == first_event_id));
     assert_eq!(
         services
             .event_store
@@ -1652,26 +1646,22 @@ fn workspace_instances_isolate_provider_tool_and_registry_ownership() {
         left.executor_registry().available_kinds(),
         right.executor_registry().available_kinds()
     );
-    assert!(
-        left.executor_registry()
-            .available_kinds()
-            .contains("inline_model")
-    );
-    assert!(
-        left.executor_registry()
-            .available_kinds()
-            .contains("tool_batch")
-    );
-    assert!(
-        left.executor_registry()
-            .available_kinds()
-            .contains("session_dispatch")
-    );
-    assert!(
-        left.executor_registry()
-            .available_kinds()
-            .contains("cross_plane_connector")
-    );
+    assert!(left
+        .executor_registry()
+        .available_kinds()
+        .contains("inline_model"));
+    assert!(left
+        .executor_registry()
+        .available_kinds()
+        .contains("tool_batch"));
+    assert!(left
+        .executor_registry()
+        .available_kinds()
+        .contains("session_dispatch"));
+    assert!(left
+        .executor_registry()
+        .available_kinds()
+        .contains("cross_plane_connector"));
     assert!(!Arc::ptr_eq(
         left.cross_plane_connector_executor(),
         right.cross_plane_connector_executor()
@@ -1771,13 +1761,11 @@ fn definition_catalog_refresh_only_exposes_active_stable_revisions() {
     services
         .refresh_definition_catalog()
         .expect("catalog refresh");
-    assert!(
-        services
-            .agent_runtime()
-            .catalog()
-            .get(definition_id.as_str())
-            .is_none()
-    );
+    assert!(services
+        .agent_runtime()
+        .catalog()
+        .get(definition_id.as_str())
+        .is_none());
 }
 
 #[test]
@@ -2084,13 +2072,11 @@ fn explicit_toml_import_is_runtime_owned_and_never_enters_runnable_catalog() {
     services
         .refresh_definition_catalog()
         .expect("catalog refresh");
-    assert!(
-        services
-            .agent_runtime()
-            .catalog()
-            .get("workspace/external/reviewer")
-            .is_none()
-    );
+    assert!(services
+        .agent_runtime()
+        .catalog()
+        .get("workspace/external/reviewer")
+        .is_none());
 }
 
 #[test]
@@ -2398,15 +2384,19 @@ async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it(
         .await
         .unwrap();
     let graph = services.graph_state_store().load(&graph_id).unwrap();
-    assert!(
-        graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::WaitingExternal)
-    );
+    assert!(graph
+        .node_statuses
+        .values()
+        .all(|status| *status == ExecutionNodeStatus::WaitingExternal));
 
     let target_outbox = store
-        .claim_session_runtime_outbox("schedule-test", due_at_ms.saturating_add(5_000), 1_000, 8)
+        .claim_session_runtime_outbox(
+            "schedule-test",
+            due_at_ms.saturating_add(5_000),
+            1_000,
+            8,
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(target_outbox.len(), 1);
@@ -2542,11 +2532,9 @@ async fn recovery_marker_blocks_runner_start_run_and_command_entries() {
         services.workspace_root(),
         "0.9.472",
     );
-    assert!(
-        importer
-            .import_receipt_file(temp.path().join("missing-receipt.json"))
-            .is_err()
-    );
+    assert!(importer
+        .import_receipt_file(temp.path().join("missing-receipt.json"))
+        .is_err());
 
     let graph = harness_contract::execution_graph::ExecutionGraph::new("blocked");
     let graph_id = graph.id.clone();
@@ -3476,13 +3464,11 @@ async fn policy_drain_tracks_and_terminalizes_an_admitted_pre_graph_task() {
             .expect("exact cancellation"),
         1
     );
-    assert!(
-        services
-            .active_tasks_for_session_policy_revision("policy-drain-session", 1)
-            .await
-            .expect("drained")
-            .is_empty()
-    );
+    assert!(services
+        .active_tasks_for_session_policy_revision("policy-drain-session", 1)
+        .await
+        .expect("drained")
+        .is_empty());
     assert_eq!(
         services
             .task_aggregate_service()
@@ -3575,12 +3561,10 @@ async fn policy_drain_terminalizes_graph_and_its_owning_task_from_one_snapshot()
         .graph_state_store()
         .load(&graph.id)
         .expect("cancelled graph");
-    assert!(
-        cancelled_graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::Cancelled)
-    );
+    assert!(cancelled_graph
+        .node_statuses
+        .values()
+        .all(|status| *status == ExecutionNodeStatus::Cancelled));
     assert_eq!(
         services
             .task_aggregate_service()
@@ -3641,34 +3625,30 @@ async fn session_cancellation_terminalizes_descendants_of_an_already_terminal_ro
         )
         .await
         .expect("cancel root");
-    assert!(
-        services
-            .graph_state_store()
-            .load(&child.id)
-            .expect("child before propagation")
-            .node_statuses
-            .values()
-            .any(|status| !status.is_terminal())
-    );
+    assert!(services
+        .graph_state_store()
+        .load(&child.id)
+        .expect("child before propagation")
+        .node_statuses
+        .values()
+        .any(|status| !status.is_terminal()));
 
     let cancelled = services
         .cancel_execution_tree(&parent.id, "user cancelled Session")
         .await
         .expect("cancel execution tree");
     assert_eq!(cancelled, vec![child.id.clone()]);
-    assert!(
-        services
-            .graph_state_store()
-            .load(&child.id)
-            .expect("child after propagation")
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::Cancelled)
-    );
+    assert!(services
+        .graph_state_store()
+        .load(&child.id)
+        .expect("child after propagation")
+        .node_statuses
+        .values()
+        .all(|status| *status == ExecutionNodeStatus::Cancelled));
 }
 
 #[test]
-fn runtime_timeline_position_never_skips_events_inside_one_transaction() {
+fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
     let store = Arc::new(crate::RuntimeEventStore::for_test());
     store
         .append_transaction(crate::AppendTransactionRequest {
@@ -3701,6 +3681,19 @@ fn runtime_timeline_position_never_skips_events_inside_one_transaction() {
             ],
         })
         .expect("transaction commits");
+    for sequence in 0..250 {
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: "foreign-session".into(),
+                scope: crate::RuntimeEventScope::SessionInput,
+                kind: "foreign.event".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"sequence":sequence}),
+            })
+            .unwrap();
+    }
     let reader = super::RuntimeEventReader { store };
 
     let first = reader
@@ -3718,6 +3711,28 @@ fn runtime_timeline_position_never_skips_events_inside_one_transaction() {
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].transaction_index, 1);
     assert_eq!(second[0].kind, "timeline.second");
+    assert!(reader
+        .session_timeline_events(
+            "timeline-session",
+            Some((second[0].commit_cursor, second[0].transaction_index)),
+            1
+        )
+        .unwrap()
+        .is_empty());
+    assert!(reader
+        .session_timeline_events("timeline-session", None, 0)
+        .unwrap()
+        .is_empty());
+    assert!(reader
+        .session_timeline_events("timeline-session", Some((u64::MAX, 0)), 1)
+        .is_err());
+    assert_eq!(
+        reader
+            .session_timeline_events("foreign-session", None, usize::MAX)
+            .unwrap()
+            .len(),
+        100
+    );
 }
 
 #[test]
@@ -3989,19 +4004,15 @@ fn prepared_session_terminal_defers_cancellation_until_terminal_winner_commits()
             projection_revision: 0,
         })
         .unwrap();
-    assert!(
-        services
-            .resolve_requested_cancellation("completion-wins-cancellation")
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        !services
-            .execution_live(execution_id)
-            .unwrap()
-            .status
-            .is_terminal()
-    );
+    assert!(services
+        .resolve_requested_cancellation("completion-wins-cancellation")
+        .unwrap()
+        .is_none());
+    assert!(!services
+        .execution_live(execution_id)
+        .unwrap()
+        .status
+        .is_terminal());
 
     assert_eq!(
         services
@@ -4031,4 +4042,558 @@ fn prepared_session_terminal_defers_cancellation_until_terminal_winner_commits()
         live.terminal_ref.as_deref(),
         Some("completion-wins-terminal")
     );
+}
+
+async fn mixed_lease_start_442(
+    services: &RuntimeServices,
+    completed_effect: bool,
+    successor_status: ExecutionNodeStatus,
+    calls: Arc<AtomicUsize>,
+) -> (
+    ExecutionGraph,
+    crate::execution_core::graph::ExecutionNodeBinding,
+) {
+    use crate::execution_core::graph::{
+        ExecutionNodeBinding, NodeExecutor, ScopeLockMode, ScopeLockRequest, ScopedResource,
+    };
+    services
+        .model_step_executor()
+        .install_resolver(Arc::new(ServiceScopedResolver {
+            payload_ref: "mixed-startup-442".into(),
+            backend: Arc::new(ServiceScopedBackend { calls }),
+        }));
+    let mut graph = ExecutionGraph::new("mixed terminal lease startup reconciliation");
+    crate::test_support::attach_execution_graph_lineage(&mut graph);
+    for node_id in ["mixed-old-442", "mixed-next-442"] {
+        let mut spec = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "mixed-startup-442",
+        );
+        spec.id = node_id.into();
+        spec.idempotency_key = format!("{node_id}:1");
+        graph.nodes.push(spec);
+    }
+    graph
+        .edges
+        .push(harness_contract::execution_graph::ExecutionEdge {
+            from: "mixed-old-442".into(),
+            to: "mixed-next-442".into(),
+            kind: harness_contract::execution_graph::ExecutionEdgeKind::DependsOn,
+        });
+    let graph = services
+        .commit_service()
+        .register_graph(graph)
+        .unwrap()
+        .graph;
+    let graph = services
+        .commit_service()
+        .transition_node(
+            &graph,
+            "mixed-old-442",
+            ExecutionNodeStatus::Ready,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    let resource = services
+        .resource_manager()
+        .acquire(
+            crate::execution_core::graph::ExecutionResourceKind::Provider,
+            None,
+        )
+        .await
+        .unwrap();
+    let scope = services
+        .scope_locks()
+        .try_acquire([ScopeLockRequest {
+            scope: ScopedResource::Resource {
+                namespace: "442".into(),
+                key: "mixed-old".into(),
+            },
+            mode: ScopeLockMode::Read,
+        }])
+        .unwrap()
+        .unwrap();
+    let binding = ExecutionNodeBinding {
+        executor_kind: "inline_model".into(),
+        ticket_idempotency_key: "mixed-old-442:1".into(),
+        attempt: 1,
+        resource_lease_refs: vec![resource.projection_reference()],
+        scope_lease_ref: Some(scope.projection_reference()),
+        worktree_lease_ref: None,
+    };
+    let key = binding.lease_closure_key(&graph, "mixed-old-442");
+    let admitted = crate::execution_core::graph::NodeExecutionTicket {
+        graph_id: graph.id.clone(),
+        node_id: "mixed-old-442".into(),
+        executor_kind: "inline_model".into(),
+        service_class: graph.service_class,
+        attempt: 1,
+        idempotency_key: binding.ticket_idempotency_key.clone(),
+        payload_ref: "mixed-startup-442".into(),
+    };
+    let node = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == admitted.node_id)
+        .unwrap();
+    let fence = services
+        .scope_locks()
+        .acquire_binding_owner(key.rsplit(':').next().unwrap(), || {
+            services
+                .commit_service()
+                .validate_unadmitted_binding_start(&graph, node, &admitted)
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    let graph = services
+        .commit_service()
+        .bind_and_start_nodes(
+            &graph,
+            std::collections::BTreeMap::from([("mixed-old-442".into(), binding.clone())]),
+            vec![admitted.clone()],
+        )
+        .unwrap()
+        .graph;
+    let (ticket, _) = services
+        .graph_state_store()
+        .binding_start_ticket(&graph, "mixed-old-442", &binding)
+        .unwrap();
+    assert_eq!(ticket, admitted);
+    let graph = if completed_effect {
+        let outcome = services
+            .model_step_executor()
+            .poll_or_await(&ticket)
+            .await
+            .unwrap();
+        services
+            .commit_service()
+            .transition_execution_outcome(
+                &graph,
+                &ticket,
+                &outcome,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+            .graph
+    } else {
+        let result = harness_contract::execution_graph::ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: None,
+            wait_class: None,
+            summary: None,
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: Default::default(),
+            finished_at_ms: 1,
+        };
+        services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "mixed-old-442",
+                ExecutionNodeStatus::Completed,
+                Some(result),
+                Vec::new(),
+            )
+            .unwrap()
+            .graph
+    };
+    let mut graph = services
+        .commit_service()
+        .transition_node(
+            &graph,
+            "mixed-next-442",
+            ExecutionNodeStatus::Ready,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    if successor_status == ExecutionNodeStatus::Paused {
+        graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "mixed-next-442",
+                ExecutionNodeStatus::Paused,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+    }
+    scope.try_release().unwrap();
+    drop(resource);
+    drop(fence);
+    (graph, binding)
+}
+
+#[tokio::test]
+async fn r1_442_mixed_startup_reconciles_old_lease_before_ready_or_paused_successor() {
+    for successor_status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Paused] {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let backends = TestRuntimeBackends::new(temp.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let original = backends.builder(&home, &workspace).build().unwrap();
+        let (graph, binding) =
+            mixed_lease_start_442(&original, true, successor_status, Arc::clone(&calls)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let key = binding.lease_closure_key(&graph, "mixed-old-442");
+        assert!(backends
+            .events
+            .event_by_idempotency_key(&graph.id, &key)
+            .unwrap()
+            .is_none());
+        drop(original);
+        let restarted = backends.builder(&home, &workspace).build().unwrap();
+        restarted
+            .model_step_executor()
+            .install_resolver(Arc::new(ServiceScopedResolver {
+                payload_ref: "mixed-startup-442".into(),
+                backend: Arc::new(ServiceScopedBackend {
+                    calls: Arc::clone(&calls),
+                }),
+            }));
+        let report = restarted
+            .recover_execution_graphs_on_startup()
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let closure = backends
+            .events
+            .event_by_idempotency_key(&graph.id, &key)
+            .unwrap()
+            .unwrap();
+        let recovered = restarted.graph_state_store().load(&graph.id).unwrap();
+        let position = restarted
+            .graph_state_store()
+            .binding_start_position(&recovered, "mixed-old-442", &binding)
+            .unwrap()
+            .unwrap();
+        assert!(restarted
+            .graph_state_store()
+            .binding_lease_closure(&recovered, "mixed-old-442", &binding, position,)
+            .unwrap());
+        if successor_status == ExecutionNodeStatus::Ready {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let current = restarted.graph_state_store().load(&graph.id).unwrap();
+                    if current.node_statuses["mixed-next-442"] == ExecutionNodeStatus::Completed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let current = restarted.graph_state_store().load(&graph.id).unwrap();
+            let binding = restarted
+                .graph_state_store()
+                .current_binding(&current, "mixed-next-442", 1)
+                .unwrap();
+            let (ticket, _) = restarted
+                .graph_state_store()
+                .binding_start_ticket(&current, "mixed-next-442", &binding)
+                .unwrap();
+            let intent = backends
+                .events
+                .event_by_idempotency_key(
+                    &crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(&ticket),
+                    &format!("{}:intent", ticket.idempotency_key),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(intent.commit_cursor > closure.commit_cursor);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        } else {
+            assert_eq!(
+                recovered.node_statuses["mixed-next-442"],
+                ExecutionNodeStatus::Paused
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let repeated = restarted
+                .recover_execution_graphs_on_startup()
+                .await
+                .unwrap();
+            assert!(repeated.errors.is_empty(), "{:?}", repeated.errors);
+            assert_eq!(
+                restarted
+                    .graph_state_store()
+                    .load(&graph.id)
+                    .unwrap()
+                    .revision,
+                recovered.revision
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_442_mixed_startup_unknown_old_operation_blocks_notify_and_preserves_graph() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let original = backends.builder(&home, &workspace).build().unwrap();
+    let (graph, binding) = mixed_lease_start_442(
+        &original,
+        false,
+        ExecutionNodeStatus::Ready,
+        Arc::clone(&calls),
+    )
+    .await;
+    let key = binding.lease_closure_key(&graph, "mixed-old-442");
+    drop(original);
+    let restarted = backends.builder(&home, &workspace).build().unwrap();
+    restarted
+        .model_step_executor()
+        .install_resolver(Arc::new(ServiceScopedResolver {
+            payload_ref: "mixed-startup-442".into(),
+            backend: Arc::new(ServiceScopedBackend {
+                calls: Arc::clone(&calls),
+            }),
+        }));
+    for _ in 0..2 {
+        let report = restarted
+            .recover_execution_graphs_on_startup()
+            .await
+            .unwrap();
+        assert!(report.errors.iter().any(|error| error.graph_id == graph.id));
+        assert_eq!(report.notified_graphs, 0);
+        assert_eq!(
+            restarted
+                .graph_state_store()
+                .load(&graph.id)
+                .unwrap()
+                .revision,
+            graph.revision
+        );
+        assert!(backends
+            .events
+            .event_by_idempotency_key(&graph.id, &key)
+            .unwrap()
+            .is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+async fn terminal_lease_start_423(
+    services: &RuntimeServices,
+) -> (
+    ExecutionGraph,
+    crate::execution_core::graph::ExecutionNodeBinding,
+    crate::execution_core::graph::resources::BindingOwnerFence,
+) {
+    use crate::execution_core::graph::{
+        ExecutionNodeBinding, ScopeLockMode, ScopeLockRequest, ScopedResource,
+    };
+    let mut graph = ExecutionGraph::new("423 already terminal startup lease reconciliation");
+    crate::test_support::attach_execution_graph_lineage(&mut graph);
+    let mut spec =
+        ExecutionNodeSpec::new(ExecutionNodeKind::Materialize, "materialize", "payload:423");
+    spec.id = "startup-lease-423".into();
+    spec.idempotency_key = "startup-lease-423:1".into();
+    graph.nodes.push(spec);
+    let graph = services
+        .commit_service()
+        .register_graph(graph)
+        .unwrap()
+        .graph;
+    let graph = services
+        .commit_service()
+        .transition_node(
+            &graph,
+            "startup-lease-423",
+            ExecutionNodeStatus::Ready,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    let resource = services
+        .resource_manager()
+        .acquire(
+            crate::execution_core::graph::ExecutionResourceKind::Tool,
+            None,
+        )
+        .await
+        .unwrap();
+    let scope = services
+        .scope_locks()
+        .try_acquire([ScopeLockRequest {
+            scope: ScopedResource::Resource {
+                namespace: "423".into(),
+                key: "startup-reader".into(),
+            },
+            mode: ScopeLockMode::Read,
+        }])
+        .unwrap()
+        .unwrap();
+    let binding = ExecutionNodeBinding {
+        executor_kind: "materialize".into(),
+        ticket_idempotency_key: "startup-lease-423:1".into(),
+        attempt: 1,
+        resource_lease_refs: vec![resource.projection_reference()],
+        scope_lease_ref: Some(scope.projection_reference()),
+        worktree_lease_ref: None,
+    };
+    let key = binding.lease_closure_key(&graph, "startup-lease-423");
+    let node = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "startup-lease-423")
+        .unwrap();
+    let admitted = crate::execution_core::graph::NodeExecutionTicket {
+        graph_id: graph.id.clone(),
+        node_id: node.id.clone(),
+        executor_kind: node.executor_kind.clone(),
+        service_class: graph.service_class,
+        attempt: binding.attempt,
+        idempotency_key: binding.ticket_idempotency_key.clone(),
+        payload_ref: node.payload_ref.clone(),
+    };
+    let fence = services
+        .scope_locks()
+        .acquire_binding_owner(key.rsplit(':').next().unwrap(), || {
+            services
+                .commit_service()
+                .validate_unadmitted_binding_start(&graph, node, &admitted)
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    let graph = services
+        .commit_service()
+        .bind_and_start_node(&graph, "startup-lease-423", binding.clone())
+        .unwrap()
+        .graph;
+    let graph = services
+        .commit_service()
+        .transition_node(
+            &graph,
+            "startup-lease-423",
+            ExecutionNodeStatus::Completed,
+            Some(harness_contract::execution_graph::ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: None,
+                wait_class: None,
+                summary: None,
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            }),
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    scope.try_release().unwrap();
+    drop(resource);
+    (graph, binding, fence)
+}
+
+#[tokio::test]
+async fn r1_423b_startup_blocks_unknown_operation_without_releasing_or_rewriting_terminal() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
+    let original = backends.builder(&home, &workspace).build().unwrap();
+    let (graph, binding, fence) = terminal_lease_start_423(&original).await;
+    let before = graph.revision;
+    let key = binding.lease_closure_key(&graph, "startup-lease-423");
+    drop(fence);
+    drop(original);
+    let restarted = backends.builder(&home, &workspace).build().unwrap();
+    assert_eq!(restarted.scope_locks().active_lease_count().unwrap(), 0);
+    let report = restarted
+        .recover_execution_graphs_on_startup()
+        .await
+        .unwrap();
+    assert!(report.errors.iter().any(|error| error.graph_id == graph.id));
+    assert!(report
+        .records
+        .iter()
+        .any(|record| record.graph_id == graph.id
+            && record.action == "terminal_lease_reconciliation"));
+    let after = restarted.graph_state_store().load(&graph.id).unwrap();
+    assert_eq!(after.revision, before);
+    assert_eq!(after.node_statuses, graph.node_statuses);
+    assert_eq!(after.node_results, graph.node_results);
+    assert!(backends
+        .events
+        .event_by_idempotency_key(&graph.id, &key)
+        .unwrap()
+        .is_none());
+    restarted
+        .recover_execution_graphs_on_startup()
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .graph_state_store()
+            .load(&graph.id)
+            .unwrap()
+            .revision,
+        after.revision
+    );
+}
+
+#[tokio::test]
+async fn r1_423_startup_preserves_excluded_session_and_live_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
+    let original = backends.builder(&home, &workspace).build().unwrap();
+    let (graph, binding, fence) = terminal_lease_start_423(&original).await;
+    let restarted = backends.builder(&home, &workspace).build().unwrap();
+    let session = graph.lineage.as_ref().unwrap().session_id.clone();
+    let excluded = std::collections::BTreeSet::from([session]);
+    restarted
+        .recover_execution_graphs_on_startup_excluding_sessions(&excluded)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .graph_state_store()
+            .load(&graph.id)
+            .unwrap()
+            .revision,
+        graph.revision
+    );
+    let report = restarted
+        .recover_execution_graphs_on_startup()
+        .await
+        .unwrap();
+    assert!(report.errors.iter().any(|error| error.graph_id == graph.id));
+    let key = binding.lease_closure_key(&graph, "startup-lease-423");
+    assert!(backends
+        .events
+        .event_by_idempotency_key(&graph.id, &key)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        restarted
+            .graph_state_store()
+            .load(&graph.id)
+            .unwrap()
+            .revision,
+        graph.revision
+    );
+    drop(fence);
 }

@@ -5,6 +5,67 @@ use std::collections::BTreeMap;
 use cowd_app_protocol::*;
 use serde_json::json;
 
+#[test]
+fn r1_client_receipt_current_selector_is_closed() {
+    let current = json!({"selection":"bound_source_terminal"});
+    let parsed: SessionTerminalReceiptReadInputV1 =
+        serde_json::from_value(current.clone()).expect("current-source selection");
+    assert_eq!(
+        serde_json::to_value(parsed).expect("selection wire"),
+        current
+    );
+    let exact = json!({"selection":"message","message_id":"message-a"});
+    let parsed: SessionTerminalReceiptReadInputV1 =
+        serde_json::from_value(exact.clone()).expect("explicit message selection");
+    assert_eq!(serde_json::to_value(parsed).expect("message wire"), exact);
+    for invalid in [
+        json!({"message_id":"message-a"}),
+        json!({"selection":"latest"}),
+        json!({"selection":"bound_source_terminal","message_id":"message-a"}),
+        json!({"selection":"bound_source_terminal","session_id":"foreign"}),
+        json!({"selection":"message"}),
+        json!({"selection":"message","message_id":12}),
+        json!({"selection":"message","message_id":"message-a","client_id":"forged"}),
+    ] {
+        assert!(serde_json::from_value::<SessionTerminalReceiptReadInputV1>(invalid).is_err());
+    }
+}
+
+#[test]
+fn r1_surface_axes_frame_binding_export_manifest_is_complete() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("contracts/v1");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("contract-manifest.json")).unwrap())
+            .unwrap();
+    for path in [
+        "schemas/app-frame-source-binding-request.schema.json",
+        "schemas/app-frame-source-binding.schema.json",
+        "schemas/iframe-api.schema.json",
+    ] {
+        let bytes = std::fs::read(root.join(path)).unwrap();
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            manifest["files"][path],
+            format!("sha256:{:x}", Sha256::digest(bytes))
+        );
+    }
+    let request = json!({"session_id":"session","turn_id":"turn","execution_id":"execution","root_task_id":"root",
+        "lineage_generation":"1","frame_nonce":"nonce","frame_binding_ref":null,"principal_id":"injected"});
+    assert!(serde_json::from_value::<AppFrameSourceBindingRequestV1>(request).is_err());
+    let port = json!({"kind":"app_terminal_save","schema_version":1,"request_id":"save","payload":{
+        "session_id":"session","message_id":"message","client_id":"client","message_sequence":"9007199254740993",
+        "runtime_commit_cursor":"9223372036854775807","content_digest":format!("session-public-v1:sha256:{}", "a".repeat(64)),
+        "payload_kind":"session-public-v1","payload_json":"{}"
+    }});
+    serde_json::from_value::<IframeApiFrameV1>(port.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let mut wrong = port;
+    wrong["payload"]["runtime_commit_cursor"] = json!(9007199254740993u64);
+    assert!(serde_json::from_value::<IframeApiFrameV1>(wrong).is_err());
+}
+
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn digest() -> Sha256Digest {

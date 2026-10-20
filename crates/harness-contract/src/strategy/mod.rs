@@ -2410,12 +2410,13 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let normalized = normalize(&input.prompt);
     let domain = classify_domain(&normalized);
     let forbids_workspace_write = explicitly_forbids_workspace_write(&normalized);
-    let requests_artifact = requests_persisted_artifact(&normalized)
+    let affirmative_actions = affirmative_action_clauses(&normalized);
+    let requests_artifact = requests_persisted_artifact(&affirmative_actions)
         && !explicitly_forbids_persisted_artifact(&normalized)
-        && (!forbids_workspace_write || explicitly_requests_new_artifact(&normalized));
+        && (!forbids_workspace_write || explicitly_requests_new_artifact(&affirmative_actions));
     let requires_write = input.explicit_write
         || requests_artifact
-        || (contains_any(&normalized, WRITE_TERMS) && !forbids_workspace_write);
+        || (contains_any(&affirmative_actions, WRITE_TERMS) && !forbids_workspace_write);
     // A user can mention tools only to rule them out for an otherwise direct
     // request. Do not turn an explicit prohibition into an evidence-seeking
     // strategy merely because the word "tool" occurs in the prompt.
@@ -2429,7 +2430,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     // occurrence of "team" as an affirmative collaboration request turns a
     // user-selected single-agent execution mode into its opposite.
     let forbids_team = explicitly_forbids_collaboration(&normalized);
-    let affirmative_collaboration = affirmative_collaboration_text(&normalized);
+    let affirmative_collaboration = affirmative_collaboration_text(&affirmative_actions);
     // Binding team topology comes only from an operator-named count. A bare
     // request to "use teams" (no countable noun) is a capability hint the model
     // may honour, not a framework-inferred obligation, so it never raises
@@ -3028,6 +3029,39 @@ fn independent_workstreams(normalized: &str) -> u8 {
         .clamp(1, 8)
 }
 
+fn affirmative_action_clauses(normalized: &str) -> String {
+    normalized
+        .split([
+            '，', ',', '。', '.', '；', ';', '！', '!', '？', '?', '\n', '\r',
+        ])
+        .map(|clause| {
+            let instruction = clause.trim();
+            let instruction = instruction.strip_prefix("请").unwrap_or(instruction);
+            let instruction = instruction.strip_prefix("please ").unwrap_or(instruction);
+            let negated = [
+                "不要",
+                "不得",
+                "禁止",
+                "无需",
+                "不需要",
+                "勿",
+                "do not ",
+                "don't ",
+                "must not ",
+                "without ",
+            ]
+            .iter()
+            .any(|marker| instruction.starts_with(marker));
+            if negated {
+                ""
+            } else {
+                clause
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn requests_persisted_artifact(normalized: &str) -> bool {
     const ACTIONS: &[&str] = &[
         "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "编写",
@@ -3554,10 +3588,10 @@ fn is_cjk(character: char) -> bool {
 /// `一个 team 协作机制说明`) and must not count. This is a heuristic, not a
 /// parser; the safe failure mode is under-counting, never over-forcing.
 const TEAM_FOLLOW_VERBS: &[&str] = &[
-    "并行", "分别", "负责", "执行", "完成", "开展", "进行", "汇总", "综合", "独立", "交叉",
-    "分工", "给出", "取得", "开始", "启动", "复核", "检查", "处理", "生成", "撰写", "输出",
-    "交付", "汇报", "制定", "实现", "提供", "列出", "整理", "推进", "参与", "支撑", "覆盖",
-    "实际", "真正", "实时", "共同", "各自", "自主", "同时", "依次", "分批",
+    "并行", "分别", "负责", "执行", "完成", "开展", "进行", "汇总", "综合", "独立", "交叉", "分工",
+    "给出", "取得", "开始", "启动", "复核", "检查", "处理", "生成", "撰写", "输出", "交付", "汇报",
+    "制定", "实现", "提供", "列出", "整理", "推进", "参与", "支撑", "覆盖", "实际", "真正", "实时",
+    "共同", "各自", "自主", "同时", "依次", "分批",
 ];
 
 /// Drop English `team`/`teams` tokens that modify a following Chinese noun, e.g.

@@ -9,6 +9,126 @@ use sha2::{Digest, Sha256};
 
 use crate::{SessionBranchActivation, SessionLifecycleTransition};
 
+pub const SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1: &str = "session-public-v1";
+pub const SESSION_TERMINAL_PUBLIC_PAYLOAD_DIGEST_PREFIX_V1: &str = "session-public-v1:sha256:";
+pub const SESSION_TERMINAL_PUBLIC_PAYLOAD_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReceiptSource {
+    pub principal_id: String,
+    pub tenant_id: String,
+    pub workspace_id: String,
+    pub app_id: String,
+    pub app_generation: String,
+    pub profile_revision: String,
+    pub credential_epoch: String,
+    pub frame_nonce: String,
+    pub transport_id: String,
+    pub attachment_revision: String,
+    pub expires_at_ms: u64,
+    pub session_id: String,
+    pub turn_id: String,
+    pub execution_id: String,
+    pub root_task_id: String,
+    pub lineage_generation: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReceiptAuthority {
+    pub session_id: String,
+    pub actor_id: String,
+    pub principal_id: String,
+    pub client_id: String,
+    pub credential_expires_at_ms: Option<u64>,
+    pub receipt_source: Option<SessionReceiptSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTerminalMessageBinding {
+    pub runtime_commit_cursor: u64,
+    pub content_digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTerminalReceiptContext {
+    pub context: harness_contract::live::SessionMessageReceiptContext,
+    pub input: Option<SessionRuntimeOutboxRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTerminalReceiptQuery {
+    pub authority: SessionReceiptAuthority,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTerminalAckCommand {
+    pub query: SessionTerminalReceiptQuery,
+    pub binding: SessionTerminalMessageBinding,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTerminalAckListQuery {
+    pub authority: SessionReceiptAuthority,
+    pub after_cursor: u64,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionPresenceMutationKind {
+    AttachOrReaffirm {
+        actor: crate::SessionActor,
+        candidate_client_id: String,
+        ttl_ms: u64,
+    },
+    Detach,
+    Expire,
+    RevokeExactActor,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPresenceMutation {
+    pub authority: SessionReceiptAuthority,
+    pub expected_revision: Option<u64>,
+    pub kind: SessionPresenceMutationKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPresenceMutationResult {
+    pub projection: SessionPresenceProjection,
+    pub attachment: Option<crate::SessionAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionTerminalPublicPayload {
+    pub payload_kind: &'static str,
+    pub payload_json: String,
+    pub content_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTerminalPublicPayloadUnavailableReason {
+    #[error("terminal public payload exceeds the byte budget")]
+    PayloadTooLarge,
+    #[error("terminal public payload has malformed JSON")]
+    MalformedJson,
+    #[error("terminal public payload has a duplicate object key")]
+    DuplicateObjectKey,
+    #[error("terminal public payload requires an array of typed block objects")]
+    InvalidBlockShape,
+    #[error("terminal public payload has an unsupported block type")]
+    UnsupportedBlockType,
+    #[error("terminal public payload has an unsupported block field")]
+    UnsupportedBlockField,
+    #[error("terminal public payload has a missing or invalid block field")]
+    InvalidBlockField,
+    #[error("terminal public payload could not be encoded")]
+    EncodingFailed,
+}
+
 /// FTS5 search result for sessions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSearchResult {
@@ -795,13 +915,23 @@ impl SessionRecoveryManifest {
 impl ContextIndexCard {
     #[must_use]
     pub fn matches_source(&self, messages: &[SessionMessage]) -> bool {
-        if messages.is_empty() || self.schema_version != CONTEXT_INDEX_CARD_SCHEMA_VERSION
-            || messages.iter().any(|message| message.session_id != self.session_id)
-            || messages.windows(2).any(|pair| pair[0].sequence >= pair[1].sequence)
+        if messages.is_empty()
+            || self.schema_version != CONTEXT_INDEX_CARD_SCHEMA_VERSION
+            || messages
+                .iter()
+                .any(|message| message.session_id != self.session_id)
+            || messages
+                .windows(2)
+                .any(|pair| pair[0].sequence >= pair[1].sequence)
         {
             return false;
         }
-        let expected = build_leaf_context_card(&self.session_id, messages, self.generation, self.updated_at_ms);
+        let expected = build_leaf_context_card(
+            &self.session_id,
+            messages,
+            self.generation,
+            self.updated_at_ms,
+        );
         self.card_id == expected.card_id
             && self.source_start_sequence == expected.source_start_sequence
             && self.source_end_sequence == expected.source_end_sequence

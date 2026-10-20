@@ -6,6 +6,62 @@
     {
       "type": "object",
       "properties": {
+        "kind": {
+          "type": "string",
+          "const": "app_terminal_save"
+        },
+        "payload": {
+          "$ref": "#/$defs/FrameTerminalSaveV1"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "host_terminal_saved"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "tuple": {
+          "$ref": "#/$defs/FrameTerminalSavedV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "tuple"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "body": true,
         "deadline_unix_ms": {
           "type": "integer",
@@ -292,6 +348,82 @@
         "code",
         "message",
         "retryable"
+      ]
+    },
+    "FrameTerminalSaveV1": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "content_digest": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "message_sequence": {
+          "type": "string"
+        },
+        "payload_json": {
+          "type": "string"
+        },
+        "payload_kind": {
+          "type": "string"
+        },
+        "runtime_commit_cursor": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "message_id",
+        "client_id",
+        "message_sequence",
+        "runtime_commit_cursor",
+        "content_digest",
+        "payload_kind",
+        "payload_json"
+      ]
+    },
+    "FrameTerminalSavedV1": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "content_digest": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "message_sequence": {
+          "type": "string"
+        },
+        "payload_kind": {
+          "type": "string"
+        },
+        "runtime_commit_cursor": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "message_id",
+        "client_id",
+        "message_sequence",
+        "runtime_commit_cursor",
+        "content_digest",
+        "payload_kind"
       ]
     }
   }

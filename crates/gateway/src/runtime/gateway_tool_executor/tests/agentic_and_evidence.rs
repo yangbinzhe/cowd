@@ -111,12 +111,10 @@ async fn external_decision_evidence_uses_runtime_source_and_authenticated_pagina
         )
         .unwrap()
     };
-    assert!(
-        executor
-            .execute_evidence_retrieve(request(), Some("decision-session"), &[])
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_evidence_retrieve(request(), Some("decision-session"), &[])
+        .await
+        .is_err());
     let reason = "Operator checked the proposed work and declined. ".repeat(1200);
     services
         .approval_queue()
@@ -136,22 +134,18 @@ async fn external_decision_evidence_uses_runtime_source_and_authenticated_pagina
             },
         )
         .unwrap();
-    assert!(
-        executor
-            .execute_evidence_retrieve(request(), None, &[])
-            .await
-            .is_err()
-    );
-    assert!(
-        executor
-            .execute_evidence_retrieve(
-                request(),
-                Some("other-session"),
-                &["session:decision-session".into()]
-            )
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_evidence_retrieve(request(), None, &[])
+        .await
+        .is_err());
+    assert!(executor
+        .execute_evidence_retrieve(
+            request(),
+            Some("other-session"),
+            &["session:decision-session".into()]
+        )
+        .await
+        .is_err());
     let mut next = request();
     let mut text = String::new();
     let mut pages = 0;
@@ -192,6 +186,15 @@ async fn external_decision_evidence_uses_runtime_source_and_authenticated_pagina
 
 #[tokio::test]
 async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifact() {
+    publication_creation_identity_gateway_case().await;
+}
+
+#[tokio::test]
+async fn r1_publication_gateway_mint_and_passthrough_keep_creation_identity() {
+    publication_creation_identity_gateway_case().await;
+}
+
+async fn publication_creation_identity_gateway_case() {
     let temporary = tempfile::tempdir().expect("temporary Runtime root");
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -230,8 +233,9 @@ async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifa
     let session_port = crate::session_runtime_data_port::GatewaySessionRuntimePort::new_for_test(
         repository, presence,
     );
+    let runtime_journal = Arc::new(runtime::RuntimeEventStore::for_test());
     let services = runtime::RuntimeServices::builder(temporary.path().join("home"), &workspace)
-        .runtime_event_store(Arc::new(runtime::RuntimeEventStore::for_test()))
+        .runtime_event_store(runtime_journal.clone())
         .task_aggregate_service(Arc::new(runtime::TaskAggregateService::for_test()))
         .artifact_store(Arc::new(runtime::ArtifactStore::for_test_default(
             temporary.path().join("artifacts"),
@@ -356,14 +360,103 @@ async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifa
         .await
         .expect("published body");
     assert_eq!(body, blocks[1]["text"].as_str().unwrap().as_bytes());
+    assert_ne!(published["sha256"], request["sha256"]);
+    let stream = format!("session:{session_id}");
+    let facts = || {
+        runtime_journal
+            .list_stream(&stream)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "artifact.fresh_object_created")
+            .collect::<Vec<_>>()
+    };
+    let message_facts = facts();
+    assert_eq!(message_facts.len(), 1);
+    assert_eq!(
+        message_facts[0].payload["artifact"]["selector"],
+        published["content_ref"]
+    );
+    assert_eq!(
+        message_facts[0].payload["precreation_head"]
+            .as_u64()
+            .unwrap()
+            + 1,
+        message_facts[0].sequence
+    );
+    let file_host = Arc::new(ToolHost::new(
+        "fresh-file",
+        &workspace,
+        ToolHostSnapshot::new(
+            Arc::new(GatewayToolRegistry::builtin()),
+            Arc::new(tools::lsp_client::LspRegistry::new()),
+            None,
+        ),
+    ));
+    let file_executor = GatewayToolExecutor::from_tool_host(None, false, file_host);
+    file_executor.bind_runtime_services(&services).unwrap();
+    std::fs::write(workspace.join("fresh.txt"), &body).unwrap();
+    let file_request = serde_json::json!({"source":"file", "path":"fresh.txt",
+        "sha256":published["sha256"], "media_type":"text/html"});
+    let mut selectors =
+        std::collections::BTreeSet::from([published["content_ref"].as_str().unwrap().to_owned()]);
+    for _ in 0..2 {
+        let before = runtime_journal.stream_revision(&stream).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(
+            &file_executor
+                .execute_content_publication("artifact_publish", file_request.clone(), binding)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(selectors.insert(reply["content_ref"].as_str().unwrap().to_owned()));
+        assert_eq!(reply["sha256"], published["sha256"]);
+        let current = facts();
+        let fact = current.last().unwrap();
+        assert_eq!(fact.payload["artifact"]["selector"], reply["content_ref"]);
+        assert_eq!(fact.payload["precreation_head"], before);
+        assert_eq!(fact.sequence, before + 1);
+    }
+    let before = runtime_journal.stream_revision(&stream).unwrap();
+    let passthrough: serde_json::Value = serde_json::from_str(
+        &executor
+            .execute_content_publication(
+                "artifact_publish",
+                serde_json::json!({
+                    "source":"artifact", "content_ref":published["content_ref"],
+                    "sha256":published["sha256"]
+                }),
+                binding,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(passthrough["content_ref"], published["content_ref"]);
+    assert_eq!(runtime_journal.stream_revision(&stream).unwrap(), before);
+    assert_eq!(facts().len(), 3);
+    assert_eq!(facts()[0], message_facts[0]);
+    let legacy_passthrough: serde_json::Value = serde_json::from_str(
+        &executor
+            .execute_content_publication(
+                "artifact_publish",
+                serde_json::json!({
+                    "source":"artifact", "content_ref":artifact.selector, "sha256":artifact.sha256
+                }),
+                binding,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(legacy_passthrough["content_ref"], artifact.selector);
+    assert_eq!(runtime_journal.stream_revision(&stream).unwrap(), before);
+    assert_eq!(facts().len(), 3);
     let mut other_session = binding;
     other_session.session_id = Some("unrelated-session");
-    assert!(
-        executor
-            .execute_content_publication("artifact_publish", request.clone(), other_session)
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_content_publication("artifact_publish", request.clone(), other_session)
+        .await
+        .is_err());
     for index in [0, 2, 3] {
         let mut wrong = request.clone();
         wrong["block_index"] = serde_json::json!(index);
@@ -373,12 +466,10 @@ async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifa
                 Sha256::digest(serde_json::to_vec(&blocks[2]).unwrap())
             ));
         }
-        assert!(
-            executor
-                .execute_content_publication("artifact_publish", wrong, binding)
-                .await
-                .is_err()
-        );
+        assert!(executor
+            .execute_content_publication("artifact_publish", wrong, binding)
+            .await
+            .is_err());
     }
 
     // An explicitly selected but empty/whitespace-only text block must be
@@ -449,15 +540,13 @@ async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifa
         .await
         .expect("adjudication reasons and evidence use real Session authority");
     adjudication.issue_dispositions[0].reason_ref = "artifact://missing-disposition-reason".into();
-    assert!(
-        services
-            .validate_agent_action_evidence(
-                &actor,
-                &harness_contract::agent_action::AgentAction::MessagePublish(adjudication)
-            )
-            .await
-            .is_err()
-    );
+    assert!(services
+        .validate_agent_action_evidence(
+            &actor,
+            &harness_contract::agent_action::AgentAction::MessagePublish(adjudication)
+        )
+        .await
+        .is_err());
 
     let action = harness_contract::agent_action::AgentAction::TaskSubmit(
         harness_contract::agent_action::TaskSubmitInput {
@@ -635,16 +724,14 @@ async fn bound_root_model_bootstraps_program_and_inherits_evidence_scope() {
         .agent_action_service()
         .project(&program.program_id)
         .expect("Program before rejected foreign root write");
-    assert!(
-        executor
-            .execute_runtime_tool_with_binding(
-                harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
-                serde_json::json!({"name":"Foreign", "mission":"must fail"}),
-                foreign,
-            )
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_runtime_tool_with_binding(
+            harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
+            serde_json::json!({"name":"Foreign", "mission":"must fail"}),
+            foreign,
+        )
+        .await
+        .is_err());
     assert_eq!(
         services
             .agent_action_service()
@@ -997,15 +1084,13 @@ fn successful_gateway_file_fact_has_typed_identity_and_digest() {
                 && scope.path.observed_revision_or_digest.is_some()
     ));
     request.tool_name = "unrelated_tool".to_string();
-    assert!(
-        gateway_observed_evidence(
-            &executor,
-            &request,
-            &output,
-            "gateway-tool:test:7:unrelated",
-        )
-        .is_empty()
-    );
+    assert!(gateway_observed_evidence(
+        &executor,
+        &request,
+        &output,
+        "gateway-tool:test:7:unrelated",
+    )
+    .is_empty());
 }
 
 #[test]
@@ -1043,27 +1128,23 @@ fn gateway_windowed_read_never_mints_exact_content_evidence() {
     });
     let mut truncated = base.clone();
     truncated["truncated"] = serde_json::Value::Bool(true);
-    assert!(
-        gateway_observed_evidence(
-            &executor,
-            &request,
-            &truncated.to_string(),
-            "gateway-tool:test:windowed-truncated",
-        )
-        .is_empty()
-    );
+    assert!(gateway_observed_evidence(
+        &executor,
+        &request,
+        &truncated.to_string(),
+        "gateway-tool:test:windowed-truncated",
+    )
+    .is_empty());
 
     let mut offset = base;
     offset["truncated"] = serde_json::Value::Bool(false);
-    assert!(
-        gateway_observed_evidence(
-            &executor,
-            &request,
-            &offset.to_string(),
-            "gateway-tool:test:windowed-offset",
-        )
-        .is_empty()
-    );
+    assert!(gateway_observed_evidence(
+        &executor,
+        &request,
+        &offset.to_string(),
+        "gateway-tool:test:windowed-offset",
+    )
+    .is_empty());
 }
 
 #[test]
@@ -1229,20 +1310,18 @@ fn compact_write_receipt_keeps_typed_workspace_evidence_after_body_elision() {
 
     let mut malformed = output;
     malformed["content_sha256"] = serde_json::json!("not-a-digest");
-    assert!(
-        gateway_observed_evidence(
-            &executor,
-            &request,
-            &malformed.to_string(),
-            "compact-malformed",
-        )
-        .is_empty()
-    );
+    assert!(gateway_observed_evidence(
+        &executor,
+        &request,
+        &malformed.to_string(),
+        "compact-malformed",
+    )
+    .is_empty());
 }
 
 use serde_json::json;
-use tools::RuntimeToolDefinition;
 use tools::permissions::PermissionMode as ToolPermissionMode;
+use tools::RuntimeToolDefinition;
 
 #[tokio::test]
 async fn explicit_publication_roundtrip_and_scope_checks() {
@@ -1301,15 +1380,31 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
     assert_eq!(published["sha256"], format!("sha256:{hash}"));
     let (parent, decision) = admitted_agent_action_root(&services, "publication-session");
     let root_actor = root_agent_action_actor(RuntimeToolExecutionBinding {
-        parent_execution: Some(&parent), execution_decision: Some(&decision), ..binding
+        parent_execution: Some(&parent),
+        execution_decision: Some(&decision),
+        ..binding
     });
-    let root_action = |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
-        action_id: action_id.into(), actor: root_actor.clone(), expected_revision: None, action,
-    };
-    let team = services.submit_agent_action(&root_action("file-team",
-        harness_contract::agent_action::AgentAction::TeamCreate(serde_json::from_value(json!({
-            "name":"File delivery", "mission":"deliver the exact required HTML file"
-        })).unwrap()))).await.unwrap().changed_refs[0].clone();
+    let root_action =
+        |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
+            action_id: action_id.into(),
+            actor: root_actor.clone(),
+            expected_revision: None,
+            action,
+        };
+    let team = services
+        .submit_agent_action(&root_action(
+            "file-team",
+            harness_contract::agent_action::AgentAction::TeamCreate(
+                serde_json::from_value(json!({
+                    "name":"File delivery", "mission":"deliver the exact required HTML file"
+                }))
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap()
+        .changed_refs[0]
+        .clone();
     let author = services.submit_agent_action(&root_action("file-author",
         harness_contract::agent_action::AgentAction::AgentInvite(serde_json::from_value(json!({
             "team_ref":team,"role":"Author","mission":"deliver the HTML file","required_capabilities":["read"]
@@ -1325,34 +1420,93 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
     worker.agent_id = Some(author.clone());
     worker.team_id = Some(team);
     worker.execution_id = Some("file-worker-claim".into());
-    let worker_action = |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
-        action_id: action_id.into(), actor: worker.clone(), expected_revision: None, action,
-    };
-    assert_eq!(services.submit_agent_action(&worker_action("file-claim",
-        harness_contract::agent_action::AgentAction::TaskClaim(harness_contract::agent_action::TaskClaimInput {
-            task_ref: task.clone(), reason: None,
-        }))).await.unwrap().status, harness_contract::agent_action::AgentActionStatus::Applied);
-    let committed = services.submit_agent_action(&worker_action("file-commit",
-        harness_contract::agent_action::AgentAction::ArtifactCommit(harness_contract::agent_action::ArtifactCommitInput {
-            content_ref: published["content_ref"].as_str().unwrap().into(), kind: "file".into(),
-            title: "Original HTML".into(), relates_to: vec![task.clone()],
-        }))).await.unwrap();
-    assert_eq!(committed.status, harness_contract::agent_action::AgentActionStatus::Applied);
-    let submitted = services.submit_agent_action(&worker_action("file-submit",
-        harness_contract::agent_action::AgentAction::TaskSubmit(harness_contract::agent_action::TaskSubmitInput {
-            task_ref: task.clone(), artifact_refs: committed.changed_refs.clone(),
-            evidence_refs: vec![published["content_ref"].as_str().unwrap().into()],
-            unresolved: vec![], deliverable: None,
-        }))).await.unwrap();
-    assert_eq!(submitted.status, harness_contract::agent_action::AgentActionStatus::Applied);
-    let program = services.agent_action_service().project(&root_actor.program_id).unwrap();
-    assert_eq!(program.tasks[&task].status, runtime::AgenticTaskStatus::Submitted);
+    let worker_action =
+        |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
+            action_id: action_id.into(),
+            actor: worker.clone(),
+            expected_revision: None,
+            action,
+        };
+    assert_eq!(
+        services
+            .submit_agent_action(&worker_action(
+                "file-claim",
+                harness_contract::agent_action::AgentAction::TaskClaim(
+                    harness_contract::agent_action::TaskClaimInput {
+                        task_ref: task.clone(),
+                        reason: None,
+                    }
+                )
+            ))
+            .await
+            .unwrap()
+            .status,
+        harness_contract::agent_action::AgentActionStatus::Applied
+    );
+    let committed = services
+        .submit_agent_action(&worker_action(
+            "file-commit",
+            harness_contract::agent_action::AgentAction::ArtifactCommit(
+                harness_contract::agent_action::ArtifactCommitInput {
+                    content_ref: published["content_ref"].as_str().unwrap().into(),
+                    kind: "file".into(),
+                    title: "Original HTML".into(),
+                    relates_to: vec![task.clone()],
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        committed.status,
+        harness_contract::agent_action::AgentActionStatus::Applied
+    );
+    let submitted = services
+        .submit_agent_action(&worker_action(
+            "file-submit",
+            harness_contract::agent_action::AgentAction::TaskSubmit(
+                harness_contract::agent_action::TaskSubmitInput {
+                    task_ref: task.clone(),
+                    artifact_refs: committed.changed_refs.clone(),
+                    evidence_refs: vec![published["content_ref"].as_str().unwrap().into()],
+                    unresolved: vec![],
+                    deliverable: None,
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        submitted.status,
+        harness_contract::agent_action::AgentActionStatus::Applied
+    );
+    let program = services
+        .agent_action_service()
+        .project(&root_actor.program_id)
+        .unwrap();
+    assert_eq!(
+        program.tasks[&task].status,
+        runtime::AgenticTaskStatus::Submitted
+    );
     assert_eq!(program.tasks[&task].artifact_refs, committed.changed_refs);
     let result = &program.artifacts[&program.tasks[&task].artifact_refs[0]];
     assert_eq!(result.committed_by, author);
-    assert_eq!(result.claim_execution_id.as_deref(), Some("file-worker-claim"));
-    let artifact = services.artifact_store().resolve(&result.content_ref).unwrap();
-    assert_eq!(services.artifact_store().read(&artifact, "session:publication-session", None).await.unwrap(), body.as_bytes());
+    assert_eq!(
+        result.claim_execution_id.as_deref(),
+        Some("file-worker-claim")
+    );
+    let artifact = services
+        .artifact_store()
+        .resolve(&result.content_ref)
+        .unwrap();
+    assert_eq!(
+        services
+            .artifact_store()
+            .read(&artifact, "session:publication-session", None)
+            .await
+            .unwrap(),
+        body.as_bytes()
+    );
     assert!(program.objective_verdict.is_none());
     let export = serde_json::json!({"content_ref": published["content_ref"], "sha256": published["sha256"], "path":"result.html"});
     host.pin_snapshot()
@@ -1380,12 +1534,10 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
         session_id: Some("other-session"),
         ..binding
     };
-    assert!(
-        executor
-            .execute_runtime_tool_with_binding("artifact_materialize", export.clone(), denied)
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_runtime_tool_with_binding("artifact_materialize", export.clone(), denied)
+        .await
+        .is_err());
     let parent = harness_contract::execution_graph::ExecutionParentBinding {
         execution_id: "parent".into(),
         node_id: "agent".into(),
@@ -1399,25 +1551,21 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
         authorized_scopes: &scopes,
         ..binding
     };
-    assert!(
-        executor
-            .execute_runtime_tool_with_binding("artifact_materialize", export, scoped)
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_runtime_tool_with_binding("artifact_materialize", export, scoped)
+        .await
+        .is_err());
     std::fs::write(temp.path().join("source.html"), "changed").unwrap();
-    assert!(
-        executor
-            .execute_runtime_tool_with_binding(
-                "artifact_publish",
-                serde_json::json!({
-                    "source":"file","path":"source.html","sha256":hash,"media_type":"text/html"
-                }),
-                binding
-            )
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_runtime_tool_with_binding(
+            "artifact_publish",
+            serde_json::json!({
+                "source":"file","path":"source.html","sha256":hash,"media_type":"text/html"
+            }),
+            binding
+        )
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -1516,16 +1664,10 @@ async fn context_program_discovery_uses_one_authorized_revision_and_real_request
         session_id: Some("other-session"),
         ..binding
     };
-    assert!(
-        executor
-            .execute_runtime_tool_with_binding(
-                "context_retrieve",
-                first_next.clone().unwrap(),
-                other
-            )
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_runtime_tool_with_binding("context_retrieve", first_next.clone().unwrap(), other)
+        .await
+        .is_err());
     let focused: serde_json::Value = serde_json::from_str(
         &executor
             .execute_runtime_tool_with_binding(
@@ -1539,12 +1681,10 @@ async fn context_program_discovery_uses_one_authorized_revision_and_real_request
     .unwrap();
     assert_eq!(focused["selected_count"], 1);
     let changed = serde_json::json!({"source":"program","query":"changed","cursor":first_next.unwrap()["cursor"]});
-    assert!(
-        executor
-            .execute_runtime_tool_with_binding("context_retrieve", changed, binding)
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_runtime_tool_with_binding("context_retrieve", changed, binding)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -1687,16 +1827,14 @@ async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_b
             .unwrap(),
         bytes
     );
-    assert!(
-        executor
-            .execute_runtime_tool_with_binding(
-                "evidence_retrieve",
-                serde_json::json!({"evidence_ref":binary.selector,"query":"needle"}),
-                binding
-            )
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_runtime_tool_with_binding(
+            "evidence_retrieve",
+            serde_json::json!({"evidence_ref":binary.selector,"query":"needle"}),
+            binding
+        )
+        .await
+        .is_err());
 }
 
 /// PLAN M2: several Agent actions in ONE provider round, each on exactly the
@@ -2181,14 +2319,9 @@ async fn a_string_that_is_neither_valid_nor_cut_off_is_still_refused() {
     let error = executor
         .validate_tool_input("agent_action_batch", r#"{"actions": "team_create please"}"#)
         .expect_err("prose is not a cut-off container");
-    assert!(
-        error.to_string().contains("$.actions"),
-        "{error}"
-    );
-    let coercions = executor.tool_input_coercions(
-        "agent_action_batch",
-        r#"{"actions": "team_create please"}"#,
-    );
+    assert!(error.to_string().contains("$.actions"), "{error}");
+    let coercions =
+        executor.tool_input_coercions("agent_action_batch", r#"{"actions": "team_create please"}"#);
     assert!(
         coercions.is_empty(),
         "nothing was repaired, so nothing may be reported: {coercions:?}"
@@ -2315,9 +2448,9 @@ async fn every_structured_input_tool_advertises_an_example_that_validates() {
     let mut checked = 0_usize;
     let mut skipped = 0_usize;
     for definition in crate::runtime_bootstrap::runtime_capability_tool_definitions() {
-        let Some(example) = harness_contract::tool_input_contract::input_example(
-            &definition.input_schema,
-        ) else {
+        let Some(example) =
+            harness_contract::tool_input_contract::input_example(&definition.input_schema)
+        else {
             // Nothing to fill in: an example of `{}` would be noise.
             skipped += 1;
             continue;
@@ -2325,7 +2458,12 @@ async fn every_structured_input_tool_advertises_an_example_that_validates() {
         let rendered = serde_json::to_string(&example).expect("example renders");
         executor
             .validate_tool_input(&definition.name, &rendered)
-            .unwrap_or_else(|error| panic!("example for `{}` fails its own schema: {error}\n{rendered}", definition.name));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "example for `{}` fails its own schema: {error}\n{rendered}",
+                    definition.name
+                )
+            });
         let description = definition.description.unwrap_or_default();
         assert!(
             description.contains("Example input:"),
@@ -2343,7 +2481,10 @@ async fn every_structured_input_tool_advertises_an_example_that_validates() {
         checked > 20,
         "expected the runtime tool surface to be covered, checked {checked}"
     );
-    assert!(skipped > 0, "some tools legitimately have nothing to fill in");
+    assert!(
+        skipped > 0,
+        "some tools legitimately have nothing to fill in"
+    );
 }
 
 /// The case this whole patch exists for: the batch entry wrapper.
@@ -2368,8 +2509,14 @@ async fn the_batch_tool_advertises_the_entry_wrapper() {
         .expect("one entry")
         .as_object()
         .expect("entry object");
-    assert!(entry.contains_key("tool"), "the wrapper must be shown: {rendered}");
-    assert!(entry.contains_key("input"), "the payload must be shown: {rendered}");
+    assert!(
+        entry.contains_key("tool"),
+        "the wrapper must be shown: {rendered}"
+    );
+    assert!(
+        entry.contains_key("input"),
+        "the payload must be shown: {rendered}"
+    );
 }
 
 /// Cross-channel contract invariants.
@@ -2440,7 +2587,9 @@ mod cross_channel_contract_invariants {
             };
             let second = executor
                 .validate_tool_input("agent_action_batch", &first)
-                .unwrap_or_else(|error| panic!("{label}: the repaired bytes must still be legal: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("{label}: the repaired bytes must still be legal: {error}")
+                });
             assert_eq!(
                 first, second,
                 "{label}: repairing an already-repaired frame changed it, so the transcript \\

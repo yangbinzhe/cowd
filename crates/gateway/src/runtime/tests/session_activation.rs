@@ -139,7 +139,7 @@ async fn terminal_primary_failure_rolls_attached_input_into_a_new_turn() {
         .await
         .unwrap();
     let claimed = store
-        .claim_session_runtime_outbox("failure-worker", 2, LEASE_MS, 1)
+        .claim_session_runtime_outbox("failure-worker", 2, LEASE_MS, 1, &[])
         .await
         .unwrap()
         .pop()
@@ -310,7 +310,7 @@ async fn enqueue_fenced_terminal(
     request_id: &str,
     turn_id: &str,
     ingress_message_id: &str,
-    artifacts: &runtime::ArtifactStore,
+    artifacts: &Arc<runtime::ArtifactStore>,
     terminal_payload: serde_json::Value,
 ) -> u64 {
     store
@@ -337,7 +337,7 @@ async fn enqueue_fenced_terminal(
         .unwrap();
     let now = now_ms();
     let claimed = store
-        .claim_session_runtime_outbox("session-worker", now, 30_000, 1)
+        .claim_session_runtime_outbox("session-worker", now, 30_000, 1, &[])
         .await
         .unwrap()
         .pop()
@@ -354,27 +354,34 @@ async fn enqueue_fenced_terminal(
         )
         .await
         .unwrap();
-    let terminal_payload = serde_json::to_vec(&terminal_payload).unwrap();
-    let artifact = artifacts
-        .write_bytes(
-            harness_contract::context::ArtifactWriteDescriptor {
-                media_type: "application/vnd.cowd.session-terminal+json".to_string(),
-                visibility_scope: "session:s1".to_string(),
-                expected_bytes: Some(terminal_payload.len() as u64),
-                original_name: Some(format!("{terminal_id}.json")),
-            },
-            &terminal_payload,
-        )
-        .await
-        .unwrap();
-    artifacts
-        .pin(
-            &artifact,
-            terminal_id,
-            runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
-        )
-        .unwrap();
-    let payload_ref = runtime::encode_session_terminal_artifact_ref(&artifact).unwrap();
+    assert_eq!(terminal_payload["ingress_message_id"], ingress_message_id);
+    assert_eq!(
+        terminal_payload["consumed_input_sequence"],
+        running.sequence
+    );
+    decode_terminal_payload(&serde_json::to_vec(&terminal_payload).unwrap()).unwrap();
+    let mut terminal = runtime::SessionTerminalInput {
+        terminal_id: terminal_id.to_string(),
+        message_id: message_id.to_string(),
+        session_id: "s1".to_string(),
+        execution_id: Some(format!("execution:{request_id}")),
+        turn_id: Some(turn_id.to_string()),
+        request_id: Some(request_id.to_string()),
+        session_generation: Some(running.session_generation),
+        input_sequence: Some(running.sequence as u64),
+        input_claim_owner: running.claim_owner,
+        input_claim_token: running.claim_token,
+        input_claim_revision: running.claim_fence_epoch,
+        controlled_recovery_claim_fingerprints: Vec::new(),
+        payload_ref: String::new(),
+    };
+    crate::current_terminal_fixture::publish(
+        runtime_event_store,
+        artifacts,
+        &mut terminal,
+        &terminal_payload,
+    )
+    .await;
     runtime_event_store
         .append_transaction_with_terminal(
             runtime::AppendTransactionRequest {
@@ -397,21 +404,7 @@ async fn enqueue_fenced_terminal(
                     schema_version: 1,
                 }],
             },
-            runtime::SessionTerminalInput {
-                terminal_id: terminal_id.to_string(),
-                message_id: message_id.to_string(),
-                session_id: "s1".to_string(),
-                execution_id: Some(format!("execution:{request_id}")),
-                turn_id: Some(turn_id.to_string()),
-                request_id: Some(request_id.to_string()),
-                session_generation: Some(running.session_generation),
-                input_sequence: Some(running.sequence as u64),
-                input_claim_owner: running.claim_owner,
-                input_claim_token: running.claim_token,
-                input_claim_revision: running.claim_fence_epoch,
-                controlled_recovery_claim_fingerprints: Vec::new(),
-                payload_ref,
-            },
+            terminal,
         )
         .unwrap()
         .commit_cursor
@@ -419,20 +412,61 @@ async fn enqueue_fenced_terminal(
 
 #[test]
 fn terminal_payload_requires_the_canonical_artifact_schema() {
-    let payload = decode_terminal_payload(
-            br#"{"schema_version":1,"text":"done","ingress_message_id":"ingress-1","consumed_input_sequence":0,"token_usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"done"}]}]}"#,
-        )
-        .unwrap();
+    let mut current =
+        crate::current_terminal_fixture::current_payload("terminal-1", "ingress-1", 0, "done");
+    current["token_usage"]["input_tokens"] = serde_json::json!(12);
+    current["token_usage"]["output_tokens"] = serde_json::json!(3);
+    assert_eq!(current["schema_version"], 3);
+    let payload = decode_terminal_payload(&serde_json::to_vec(&current).unwrap()).unwrap();
     assert_eq!(payload.text, "done");
     assert!(payload
         .token_usage_json
         .as_deref()
         .is_some_and(|usage| usage.contains("\"input_tokens\":12")));
-    assert!(decode_terminal_payload(
-            br#"{"schema_version":1,"text":"done","ingress_message_id":"ingress-1","consumed_input_sequence":0,"token_usage":{"input_tokens":"12","output_tokens":3},"transcript":[]}"#
-        )
-        .is_err());
-    assert!(decode_terminal_payload(b"not-json").is_err());
+    for schema_version in [1, 2] {
+        let mut legacy = current.clone();
+        legacy["schema_version"] = serde_json::json!(schema_version);
+        let (class, reason) =
+            decode_terminal_payload(&serde_json::to_vec(&legacy).unwrap()).unwrap_err();
+        assert_eq!(
+            class,
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+        );
+        assert_eq!(reason, "terminal artifact schema_version must equal 3");
+    }
+
+    let mut invalid_usage = current.clone();
+    invalid_usage["token_usage"]["input_tokens"] = serde_json::json!("12");
+    let (class, reason) =
+        decode_terminal_payload(&serde_json::to_vec(&invalid_usage).unwrap()).unwrap_err();
+    assert_eq!(
+        class,
+        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+    );
+    assert_eq!(
+        reason,
+        "terminal token_usage.input_tokens must be a non-negative 64-bit database integer"
+    );
+
+    let mut empty_transcript = current;
+    empty_transcript["transcript"] = serde_json::json!([]);
+    let (class, reason) =
+        decode_terminal_payload(&serde_json::to_vec(&empty_transcript).unwrap()).unwrap_err();
+    assert_eq!(
+        class,
+        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+    );
+    assert_eq!(
+        reason,
+        "terminal transcript must contain 1..=10000 messages"
+    );
+
+    let (class, reason) = decode_terminal_payload(b"not-json").unwrap_err();
+    assert_eq!(
+        class,
+        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+    );
+    assert!(reason.contains("expected ident"), "{reason}");
 }
 
 #[test]
@@ -481,76 +515,145 @@ fn terminal_session_errors_preserve_retryable_unknown_outcomes() {
 
 #[test]
 fn terminal_payload_schema_three_round_trips_collaboration_terminal() {
-    let terminal_presentation = serde_json::json!({
-        "presentation_id": "presentation-1",
-        "attempt_id": "attempt-1",
-        "envelope_id": "envelope-1",
-        "envelope_revision": 3,
-        "state": "committed",
-        "answer_origin": "terminal_narrator",
-        "models_attempted": [],
-        "validation": {"status": "valid", "findings": []},
-        "generated_at_ms": 10,
-        "committed_at_ms": 11
-    });
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "schema_version": runtime::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
-        "text": "complete collaboration answer.",
-        "collaboration_evidence": "{\"kind\":\"cowd.runtime.collaboration_evidence.v1\"}",
-        "terminal_presentation": terminal_presentation,
-        "ingress_message_id": "ingress-1",
-        "consumed_input_sequence": 0,
-        "token_usage": {"input_tokens": 12, "output_tokens": 3},
-        "transcript": [{
-            "role": "assistant",
-            "blocks": [{"type": "text", "text": "complete collaboration answer."}]
-        }]
-    }))
-    .unwrap();
-
-    let decoded = decode_terminal_payload(&payload).unwrap();
-    assert_eq!(decoded.text, "complete collaboration answer.");
-    assert_eq!(
-        decoded
-            .terminal_presentation
-            .as_ref()
-            .map(|presentation| presentation.state),
-        Some(harness_contract::outcome::TerminalPresentationState::Committed)
+    let mut payload = crate::current_terminal_fixture::current_payload(
+        "terminal-1",
+        "ingress-1",
+        0,
+        "complete collaboration answer.",
     );
+    payload["goal_completion"] = serde_json::json!("satisfied");
+    payload["collaboration_evidence"] =
+        serde_json::json!("{\"kind\":\"cowd.runtime.collaboration_evidence.v1\"}");
+    payload["token_usage"] = serde_json::json!({"input_tokens": 12, "output_tokens": 3});
+    payload["terminal_presentation"]["presentation_id"] = serde_json::json!("presentation-1");
+    payload["terminal_presentation"]["attempt_id"] = serde_json::json!("attempt-1");
+    payload["terminal_presentation"]["envelope_id"] = serde_json::json!("envelope-1");
+    payload["terminal_presentation"]["envelope_revision"] = serde_json::json!(3);
+    for collaboration_evidence in [
+        payload["collaboration_evidence"].clone(),
+        serde_json::Value::Null,
+    ] {
+        payload["collaboration_evidence"] = collaboration_evidence;
+        let decoded = decode_terminal_payload(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(decoded.text, "complete collaboration answer.");
+        assert_eq!(
+            decoded
+                .terminal_presentation
+                .as_ref()
+                .map(|presentation| presentation.state),
+            Some(harness_contract::outcome::TerminalPresentationState::Committed)
+        );
+        let usage = decoded.token_usage_json.as_deref().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(usage).unwrap(),
+            serde_json::json!({"input_tokens": 12, "output_tokens": 3})
+        );
+        assert_eq!(
+            decoded
+                .transcript
+                .as_ref()
+                .unwrap()
+                .last()
+                .unwrap()
+                .token_usage_json,
+            decoded.token_usage_json
+        );
+    }
 }
 
 #[test]
 fn terminal_payload_schema_three_fails_closed_on_partial_migration() {
-    let common = serde_json::json!({
-        "text": "done.",
-        "ingress_message_id": "ingress-1",
-        "consumed_input_sequence": 0,
-        "token_usage": {"input_tokens": 1, "output_tokens": 1},
-        "transcript": [{
-            "role": "assistant",
-            "blocks": [{"type": "text", "text": "done."}]
-        }],
-        "terminal_presentation": {
-            "presentation_id": "presentation-1",
-            "attempt_id": "attempt-1",
-            "envelope_id": "envelope-1",
-            "envelope_revision": 3,
-            "state": "committed",
-            "answer_origin": "terminal_narrator",
-            "models_attempted": [],
-            "validation": {"status": "valid", "findings": []},
-            "generated_at_ms": 10,
-            "committed_at_ms": 11
-        }
-    });
-    let mut missing_evidence = common.clone();
-    missing_evidence["schema_version"] = serde_json::json!(3);
-    assert!(decode_terminal_payload(&serde_json::to_vec(&missing_evidence).unwrap()).is_err());
+    let mut common =
+        crate::current_terminal_fixture::current_payload("terminal-1", "ingress-1", 0, "done.");
+    common["goal_completion"] = serde_json::json!("satisfied");
+    common["token_usage"] = serde_json::json!({"input_tokens": 1, "output_tokens": 1});
+    decode_terminal_payload(&serde_json::to_vec(&common).unwrap()).unwrap();
+    let assert_rejected = |payload: &serde_json::Value, expected_reason: &str| {
+        let (class, reason) =
+            decode_terminal_payload(&serde_json::to_vec(payload).unwrap()).unwrap_err();
+        assert_eq!(
+            class,
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+        );
+        assert!(reason.contains(expected_reason), "{reason}");
+    };
 
-    let mut future_schema = common;
-    future_schema["schema_version"] = serde_json::json!(4);
-    future_schema["collaboration_evidence"] = serde_json::Value::Null;
-    assert!(decode_terminal_payload(&serde_json::to_vec(&future_schema).unwrap()).is_err());
+    let mut missing_presentation = common.clone();
+    missing_presentation
+        .as_object_mut()
+        .unwrap()
+        .remove("terminal_presentation");
+    assert_rejected(
+        &missing_presentation,
+        "requires a committed terminal_presentation",
+    );
+    for presentation in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!("committed"),
+    ] {
+        let mut invalid = common.clone();
+        invalid["terminal_presentation"] = presentation;
+        assert_rejected(&invalid, "invalid presentation");
+    }
+    for state in [
+        "started",
+        "streaming",
+        "validating",
+        "aborted",
+        "superseded",
+    ] {
+        let mut invalid = common.clone();
+        invalid["terminal_presentation"]["state"] = serde_json::json!(state);
+        assert_rejected(&invalid, "requires a committed terminal_presentation");
+    }
+    let mut invalid_state = common.clone();
+    invalid_state["terminal_presentation"]["state"] = serde_json::json!("unknown");
+    assert_rejected(&invalid_state, "invalid presentation");
+
+    let mut missing_evidence = common.clone();
+    missing_evidence
+        .as_object_mut()
+        .unwrap()
+        .remove("collaboration_evidence");
+    assert_rejected(&missing_evidence, "requires collaboration_evidence");
+    for evidence in [
+        serde_json::json!(""),
+        serde_json::json!(" \t\n"),
+        serde_json::json!(0),
+        serde_json::json!(false),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let mut invalid = common.clone();
+        invalid["collaboration_evidence"] = evidence;
+        assert_rejected(
+            &invalid,
+            "collaboration_evidence must be null or a non-empty string",
+        );
+    }
+
+    let mut missing_schema = common.clone();
+    missing_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    assert_rejected(&missing_schema, "schema_version must equal 3");
+    for schema_version in [
+        serde_json::Value::Null,
+        serde_json::json!("3"),
+        serde_json::json!(0),
+        serde_json::json!(-1),
+        serde_json::json!(3.5),
+        serde_json::json!(false),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!(4),
+    ] {
+        let mut invalid = common.clone();
+        invalid["schema_version"] = schema_version;
+        assert_rejected(&invalid, "schema_version must equal 3");
+    }
 }
 
 #[tokio::test]
@@ -681,30 +784,21 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
         runtime::provider_transcript::seal_provider_transcript(private_reasoning).unwrap();
     let sealed_signature =
         runtime::provider_transcript::seal_provider_transcript(provider_signature).unwrap();
-    let terminal_payload = serde_json::json!({
-        "schema_version": 1,
-        "text": "done",
-        "ingress_message_id": "ingress-1",
-        "consumed_input_sequence": 0,
-        "token_usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
-        },
-        "transcript": [{
-            "role": "assistant",
-            "blocks": [
-                {"type": "reasoning_summary", "text": "public summary"},
-                {
-                    "type": "thinking",
-                    "thinking": sealed_reasoning,
-                    "signature": sealed_signature
-                },
-                {"type": "text", "text": "done"}
-            ]
-        }]
-    });
+    let mut terminal_payload =
+        crate::current_terminal_fixture::current_payload("t1", "ingress-1", 0, "done");
+    terminal_payload["goal_completion"] = serde_json::json!("satisfied");
+    terminal_payload["transcript"] = serde_json::json!([{
+        "role": "assistant",
+        "blocks": [
+            {"type": "reasoning_summary", "text": "public summary"},
+            {
+                "type": "thinking",
+                "thinking": sealed_reasoning,
+                "signature": sealed_signature
+            },
+            {"type": "text", "text": "done"}
+        ]
+    }]);
     let commit_cursor = enqueue_fenced_terminal(
         &runtime_event_store,
         &store,
@@ -754,6 +848,9 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
         1,
         "terminal_state={terminal_state:?}, persisted={persisted:?}"
     );
+    let presentation_event = rx.try_recv().unwrap().to_transport_value();
+    assert_eq!(presentation_event["type"], "TerminalDelivery");
+    assert_eq!(presentation_event["delivery"]["event"], "terminal_presentation_committed");
     let terminal_event = rx.try_recv().unwrap().to_transport_value();
     assert_eq!(terminal_event["type"], "TerminalCommitted");
     assert_eq!(terminal_event["terminal_id"], "t1");
@@ -797,6 +894,9 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
             .count(),
         1
     );
+    let replayed_presentation = rx.try_recv().unwrap().to_transport_value();
+    assert_eq!(replayed_presentation["type"], "TerminalDelivery");
+    assert_eq!(replayed_presentation, presentation_event);
     let replayed = rx
         .try_recv()
         .expect("retry must rebroadcast")
@@ -804,7 +904,7 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
     assert_eq!(replayed["terminal_id"], "t1");
     assert_eq!(replayed["message_id"], "m1");
     assert_eq!(replayed["replayed"], true);
-    assert!(rx.try_recv().is_err(), "one retry emits one notification");
+    assert!(rx.try_recv().is_err(), "one retry emits one presentation and one committed notification");
     assert_eq!(
         event_store.get("t1").unwrap().unwrap().status,
         "materialized"
@@ -839,22 +939,16 @@ async fn generation_change_after_delivery_claim_rejects_terminal_without_project
         "turn-stale-generation",
         "ingress-stale-generation",
         &artifacts,
-        serde_json::json!({
-            "schema_version": 1,
-            "text": "must not commit",
-            "ingress_message_id": "ingress-stale-generation",
-            "consumed_input_sequence": 0,
-            "token_usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0
-            },
-            "transcript": [{
-                "role": "assistant",
-                "blocks": [{"type":"text","text":"must not commit"}]
-            }]
-        }),
+        {
+            let mut payload = crate::current_terminal_fixture::current_payload(
+                "terminal-stale-generation",
+                "ingress-stale-generation",
+                0,
+                "must not commit",
+            );
+            payload["goal_completion"] = serde_json::json!("satisfied");
+            payload
+        },
     )
     .await;
     let claim_at = now_ms();
@@ -983,10 +1077,29 @@ async fn corrupt_terminal_is_poisoned_and_visible_to_operations() {
         "poison-request",
         "poison-turn",
         "poison-ingress",
-        artifacts.as_ref(),
-        serde_json::json!({"not": "a terminal payload"}),
+        &artifacts,
+        {
+            let mut payload = crate::current_terminal_fixture::current_payload(
+                "poison",
+                "poison-ingress",
+                0,
+                "valid before fault",
+            );
+            payload["goal_completion"] = serde_json::json!("satisfied");
+            payload
+        },
     )
     .await;
+    let pending = runtime_event_store
+        .session_terminal("poison")
+        .unwrap()
+        .unwrap();
+    crate::current_terminal_fixture::poison_terminal_ref(
+        &_topology.postgres_executor,
+        "poison",
+        &pending.payload_ref,
+        "bad payload",
+    );
     let record = event_store
         .claim("worker", 100, 10, 1)
         .unwrap()
@@ -1007,6 +1120,12 @@ async fn corrupt_terminal_is_poisoned_and_visible_to_operations() {
     assert_eq!(poison.len(), 1);
     assert_eq!(poison[0].terminal_id, "poison");
     assert_eq!(poison[0].failure_class.as_deref(), Some("corrupt_payload"));
+    assert!(_store
+        .get_all_messages("s1")
+        .await
+        .unwrap()
+        .iter()
+        .all(|message| message.role != "assistant"));
 }
 
 #[tokio::test]
@@ -1031,22 +1150,12 @@ async fn typed_terminal_atomically_materializes_usage_and_session_counters_befor
         "usage-turn",
         "usage-ingress",
         &artifacts,
-        serde_json::json!({
-            "schema_version": 1,
-            "text": "done",
-            "ingress_message_id": "usage-ingress",
-            "consumed_input_sequence": 0,
-            "token_usage": {
-                "input_tokens": 12,
-                "output_tokens": 3,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0
-            },
-            "transcript": [{
-                "role": "assistant",
-                "blocks": [{"type":"text","text":"done"}]
-            }]
-        }),
+        {
+            let mut payload = crate::current_terminal_fixture::current_payload("usage-terminal", "usage-ingress", 0, "done");
+            payload["goal_completion"] = serde_json::json!("satisfied");
+            payload["token_usage"] = serde_json::json!({"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0});
+            payload
+        },
     )
     .await;
     let record = event_store
@@ -1140,15 +1249,17 @@ async fn cancelled_execution_fence_suppresses_late_terminal_materialization() {
         "cancel-wins-turn",
         "cancel-wins-ingress",
         &artifacts,
-        serde_json::json!({
-            "schema_version": 1,
-            "text": "late answer",
-            "goal_completion": "satisfied",
-            "ingress_message_id": "cancel-wins-ingress",
-            "consumed_input_sequence": 0,
-            "token_usage": {"input_tokens": 0, "output_tokens": 2},
-            "transcript": [{"role":"assistant","blocks":[{"type":"text","text":"late answer"}]}]
-        }),
+        {
+            let mut payload = crate::current_terminal_fixture::current_payload(
+                "cancel-wins-terminal",
+                "cancel-wins-ingress",
+                0,
+                "late answer",
+            );
+            payload["goal_completion"] = serde_json::json!("satisfied");
+            payload["token_usage"] = serde_json::json!({"input_tokens":0,"output_tokens":2});
+            payload
+        },
     )
     .await;
     let record = event_store
@@ -1222,25 +1333,27 @@ async fn partial_terminal_claims_error_instead_of_complete() {
         "partial-terminal-turn".to_string(),
     );
     enqueue_fenced_terminal(
-            &runtime_event_store,
-            &store,
-            "partial-terminal",
-            "partial-message",
-            request_id,
-            "partial-terminal-turn",
-            "partial-ingress",
-            &artifacts,
-            serde_json::json!({
-                "schema_version": 1,
-                "text": "partial answer with preserved findings",
-                "goal_completion": "partial",
-                "ingress_message_id": "partial-ingress",
-                "consumed_input_sequence": 0,
-                "token_usage": {"input_tokens": 1, "output_tokens": 5},
-                "transcript": [{"role":"assistant","blocks":[{"type":"text","text":"partial answer with preserved findings"}]}]
-            }),
-        )
-        .await;
+        &runtime_event_store,
+        &store,
+        "partial-terminal",
+        "partial-message",
+        request_id,
+        "partial-terminal-turn",
+        "partial-ingress",
+        &artifacts,
+        {
+            let mut payload = crate::current_terminal_fixture::current_payload(
+                "partial-terminal",
+                "partial-ingress",
+                0,
+                "partial answer with preserved findings",
+            );
+            payload["goal_completion"] = serde_json::json!("partial");
+            payload["token_usage"] = serde_json::json!({"input_tokens":1,"output_tokens":5});
+            payload
+        },
+    )
+    .await;
     let record = event_store
         .claim("partial-worker", now_ms(), 30_000, 1)
         .unwrap()
@@ -1309,22 +1422,12 @@ async fn delivery_worker_waits_for_recovery_release_then_wakes_and_shuts_down() 
         "wake-turn",
         "wake-ingress",
         &artifacts,
-        serde_json::json!({
-            "schema_version": 1,
-            "text": "awake",
-            "ingress_message_id": "wake-ingress",
-            "consumed_input_sequence": 0,
-            "token_usage": {
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0
-            },
-            "transcript": [{
-                "role": "assistant",
-                "blocks": [{"type":"text","text":"awake"}]
-            }]
-        }),
+        {
+            let mut payload = crate::current_terminal_fixture::current_payload("wake-terminal", "wake-ingress", 0, "awake");
+            payload["goal_completion"] = serde_json::json!("satisfied");
+            payload["token_usage"] = serde_json::json!({"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0});
+            payload
+        },
     )
     .await;
     tokio::time::timeout(Duration::from_secs(1), commit_observer.changed())

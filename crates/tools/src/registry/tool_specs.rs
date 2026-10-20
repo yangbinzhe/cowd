@@ -1,7 +1,7 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::permissions::PermissionMode;
 use crate::RuntimeToolDefinition;
+use crate::permissions::PermissionMode;
 use harness_contract::tool::ToolEffectResolverSpec;
 
 /// The capability family a tool belongs to.
@@ -90,8 +90,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         // registered read-only/no-network effect must stay truthful at
         // execution time.
         "execute_code" => "builtin.sandboxed_command",
-        // Effect is the strictest effect among the orchestrated sub-calls; the
-        // host computes the escalation and this resolver shapes the descriptor.
         "tool_orchestrate" => "builtin.orchestrate",
         "read_file"
         | "glob_search"
@@ -107,11 +105,8 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "get_context_remaining" => "builtin.readonly",
         "lsp" => "builtin.readonly_process",
         "vision_analyze" => "builtin.readonly_process",
-        "todo_write"
-        | "config"
-        | "plan_mode" => "builtin.workspace_write",
-        "web_fetch" | "web_search" | "remote_trigger"
- => "builtin.network",
+        "todo_write" | "config" | "plan_mode" => "builtin.workspace_write",
+        "web_fetch" | "web_search" | "remote_trigger" => "builtin.network",
         "request_plugin_install" => "builtin.external_unknown",
         "skill" => "runtime.action_skill",
         "sleep" => "builtin.process",
@@ -120,7 +115,11 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     };
     ToolEffectResolverSpec {
         resolver_id: resolver_id.to_string(),
-        resolver_version: 1,
+        resolver_version: if resolver_id == "runtime.action_edit" {
+            3
+        } else {
+            2
+        },
     }
 }
 
@@ -909,26 +908,35 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Reduce,
             tier: ToolTier::Direct,
             permission_key: "code",
-            description: "Deterministic reduction OUTSIDE the model. Runs python/javascript/bash/ruby/lua in a kernel-hardened, read-only, network-off sandbox and returns ONLY stdout/stderr (30s cap, nothing persisted). This is the tool for work that would otherwise mean pulling many files or many lines into context: count, aggregate, filter, compare, compute. The workspace is mounted read-only with the working directory inside it, so the code CAN read authorised workspace files; it cannot write and cannot reach the network. Boundary: it cannot write files or touch the network - feed it data from read_file/grep_search, or dispatch it as tool_orchestrate's compute step where the program already holds the data.",
+            description: "Run python/javascript/bash over an explicit finite input_files set in a kernel-hardened read-only /project snapshot with no network. input_files is mandatory; use [] for inline data. Only listed regular files are copied, so omitted modules fail rather than reading the live workspace. Private /tmp is writable. Default timeout 30s, maximum 120s. Full bounded stdout/stderr and actual execution facts are archived by governed Runtime; exit0 is not business acceptance. Boundary: one bounded snapshot run over the declared inputs; it never mutates the workspace and cannot keep a long-running process alive, so servers must run under bash while file changes go through edit.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "language": {
                         "type": "string",
-                        "enum": ["python", "javascript", "bash", "ruby", "lua", "go", "rust"],
+                        "enum": ["python", "javascript", "bash"],
                         "description": "Programming language to execute"
                     },
                     "code": {
                         "type": "string",
-                        "description": "Code to execute. Use console.log/print to output results. Only stdout enters context."
+                        "maxLength": 65536,
+                        "description": "Code to execute. Use console.log/print for computed output. Governed results include bounded stdout/stderr summaries, terminal facts and a body artifact reference; full captured bytes and capture completeness are retained in that artifact. A successful process does not persist workspace files or establish business acceptance."
+                    },
+                    "input_files": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "uniqueItems": true,
+                        "items": {"type":"string", "minLength":1, "maxLength":1024},
+                        "description": "Exact workspace-relative regular files, no directories, symlinks, aliases or escape. Explicit [] means no project files."
                     },
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
+                        "maximum": 120000,
                         "description": "Optional wall-clock timeout in milliseconds; defaults to the sandbox budget."
                     }
                 },
-                "required": ["language", "code"],
+                "required": ["language", "code", "input_files"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -939,6 +947,78 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
 mod tests {
     use super::{builtin_effect_resolver_spec, mvp_tool_specs, normalize_tool_name};
     use crate::permissions::PermissionMode;
+
+    #[test]
+    fn bounded_execute_code_native_definition_describes_actual_result_shape() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "execute_code")
+            .expect("execute_code spec");
+        let description = spec.input_schema["properties"]["code"]["description"]
+            .as_str()
+            .expect("code description");
+        for fragment in [
+            "bounded stdout/stderr summaries",
+            "terminal facts",
+            "body artifact reference",
+            "capture completeness",
+            "does not persist workspace files",
+        ] {
+            assert!(
+                description.contains(fragment),
+                "missing output contract: {fragment}"
+            );
+        }
+        assert!(!description.contains("Only stdout"));
+        let definition = crate::ToolCatalog::builtin()
+            .definitions(None)
+            .into_iter()
+            .find(|definition| definition.name == "execute_code")
+            .expect("native definition");
+        assert_eq!(definition.input_schema, spec.input_schema);
+        assert_eq!(spec.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(spec.permission_key, "code");
+        assert!(
+            definition
+                .description
+                .expect("native description")
+                .contains("Input contract (from the schema):")
+        );
+    }
+
+    #[test]
+    fn bounded_execute_code_schema_requires_finite_files_and_supported_languages() {
+        let specs = mvp_tool_specs();
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == "execute_code")
+            .unwrap();
+        assert_eq!(
+            spec.input_schema["required"],
+            serde_json::json!(["language", "code", "input_files"])
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["language"]["enum"],
+            serde_json::json!(["python", "javascript", "bash"])
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["input_files"]["maxItems"],
+            64
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["input_files"]["uniqueItems"],
+            true
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["timeout_ms"]["maximum"],
+            120000
+        );
+        assert_eq!(spec.input_schema["additionalProperties"], false);
+        assert_eq!(
+            builtin_effect_resolver_spec("execute_code").resolver_id,
+            "builtin.sandboxed_command"
+        );
+    }
 
     #[test]
     fn read_file_guides_bounded_window_and_deterministic_pagination() {
@@ -966,8 +1046,10 @@ mod tests {
             read_file.input_schema["properties"]["complete"]["type"],
             "boolean"
         );
-        assert!(grep_search.description.contains("locator")
-            || grep_search.description.contains("Locate"));
+        assert!(
+            grep_search.description.contains("locator")
+                || grep_search.description.contains("Locate")
+        );
         // grep must steer the model toward locate-then-read, not line-by-line.
         assert!(grep_search.description.contains("locate"));
     }
@@ -988,9 +1070,11 @@ mod tests {
         // iterating small tools. The old blanket bash-forbid must be gone.
         assert!(bash.description.contains("read_file"));
         assert!(bash.description.contains("small output"));
-        assert!(!bash
-            .description
-            .contains("Prefer grep_search/read_file over bash"));
+        assert!(
+            !bash
+                .description
+                .contains("Prefer grep_search/read_file over bash")
+        );
     }
 
     #[test]
@@ -1028,6 +1112,96 @@ mod tests {
             unknown.is_empty(),
             "builtin tools without an effect resolver: {unknown:?}"
         );
+    }
+
+    #[test]
+    fn composite_and_file_resolver_identities_publish_the_same_hash_semantics() {
+        for tool in mvp_tool_specs() {
+            assert_eq!(
+                builtin_effect_resolver_spec(tool.name).resolver_version,
+                if tool.name == "edit" { 3 } else { 2 },
+                "{}",
+                tool.name
+            );
+        }
+        assert_eq!(
+            builtin_effect_resolver_spec("tool_orchestrate").resolver_id,
+            "builtin.orchestrate"
+        );
+        assert_eq!(
+            builtin_effect_resolver_spec("edit").resolver_id,
+            "runtime.action_edit"
+        );
+        assert_eq!(
+            builtin_effect_resolver_spec("read_file").resolver_id,
+            "builtin.readonly"
+        );
+        assert_eq!(
+            builtin_effect_resolver_spec("web-fetch"),
+            builtin_effect_resolver_spec("web_fetch")
+        );
+        assert!(
+            mvp_tool_specs()
+                .iter()
+                .find(|tool| tool.name == "web_fetch")
+                .unwrap()
+                .input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("prompt"))
+        );
+    }
+
+    #[test]
+    fn original_filesystem_resolvers_keep_the_existing_catalog_and_epoch() {
+        use harness_contract::policy::PermissionResource;
+        use harness_contract::tool::ToolPermissionMode;
+        for (name, input) in [
+            (
+                "glob_search",
+                serde_json::json!({"pattern":"*.rs","path":"src"}),
+            ),
+            (
+                "grep_search",
+                serde_json::json!({"pattern":"needle","path":"src"}),
+            ),
+            ("workspace_snapshot", serde_json::json!({"roots":["src"]})),
+            (
+                "checkpoint",
+                serde_json::json!({"action":"restore","id":"checkpoint-example"}),
+            ),
+            (
+                "vision_analyze",
+                serde_json::json!({"image_path":"image.png","prompt":"describe"}),
+            ),
+        ] {
+            let spec = mvp_tool_specs()
+                .into_iter()
+                .find(|spec| spec.name == name)
+                .unwrap();
+            let resolver = builtin_effect_resolver_spec(spec.name);
+            assert_eq!(resolver.resolver_version, 2);
+            let effect = crate::tool_orchestrator::resolve_registered_tool_effect(
+                &resolver,
+                spec.name,
+                &input,
+                ToolPermissionMode::ReadOnly,
+            );
+            assert!(
+                effect
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.resource == PermissionResource::File),
+                "{name}"
+            );
+            assert!(
+                effect
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.resource == PermissionResource::Tool),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1293,88 +1467,101 @@ pub(crate) fn tool_definitions_for_exposure_filter(
 mod cache_determinism_tests {
     use super::*;
 
-/// PLAN A3: the tool catalog must serialize to identical bytes every time.
-///
-/// `tool_definitions_for_exposure` filters the catalog into the array that the
-/// provider request carries, and `apply_inline_cache_breakpoints` puts a
-/// `cache_control` marker on the LAST tool definition - so the whole tool array
-/// is inside cache breakpoint 2. If that array's bytes move, the provider's
-/// cache is invalidated from the tools onward, i.e. every message after it.
-///
-/// The array is filtered from a `BTreeSet` of active ids, which is already
-/// deterministic, but nothing enforced it. This pins the three properties that
-/// make the array cache-safe:
-///
-/// 1. the same input set yields the same order and the same bytes;
-/// 2. filtering is a pure function of the active set (adding one id appends one
-///    entry and leaves the prefix untouched) - so incremental activation cannot
-///    rewrite what came before;
-/// 3. the catalog contains no duplicate names (a duplicate would make the
-///    filter order dependent on the catalog, which is not keyed by anything).
-#[test]
-fn the_tool_catalog_serializes_deterministically_for_provider_caching() {
-    let specs = mvp_tool_specs();
+    /// PLAN A3: the tool catalog must serialize to identical bytes every time.
+    ///
+    /// `tool_definitions_for_exposure` filters the catalog into the array that the
+    /// provider request carries, and `apply_inline_cache_breakpoints` puts a
+    /// `cache_control` marker on the LAST tool definition - so the whole tool array
+    /// is inside cache breakpoint 2. If that array's bytes move, the provider's
+    /// cache is invalidated from the tools onward, i.e. every message after it.
+    ///
+    /// The array is filtered from a `BTreeSet` of active ids, which is already
+    /// deterministic, but nothing enforced it. This pins the three properties that
+    /// make the array cache-safe:
+    ///
+    /// 1. the same input set yields the same order and the same bytes;
+    /// 2. filtering is a pure function of the active set (adding one id appends one
+    ///    entry and leaves the prefix untouched) - so incremental activation cannot
+    ///    rewrite what came before;
+    /// 3. the catalog contains no duplicate names (a duplicate would make the
+    ///    filter order dependent on the catalog, which is not keyed by anything).
+    #[test]
+    fn the_tool_catalog_serializes_deterministically_for_provider_caching() {
+        let specs = mvp_tool_specs();
 
-    // (3) no duplicate tool names anywhere in the catalog.
-    let mut names = specs.iter().map(|spec| spec.name).collect::<Vec<_>>();
-    let total = names.len();
-    names.sort_unstable();
-    names.dedup();
-    assert_eq!(names.len(), total, "the catalog must not contain duplicate names");
+        // (3) no duplicate tool names anywhere in the catalog.
+        let mut names = specs.iter().map(|spec| spec.name).collect::<Vec<_>>();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "the catalog must not contain duplicate names"
+        );
 
-    // (1) a fixed input set always yields the same bytes. This is what lets the
-    // provider cache key on the tools array at all.
-    let active = ["read_file", "grep_search", "tool_orchestrate", "glob_search"]
+        // (1) a fixed input set always yields the same bytes. This is what lets the
+        // provider cache key on the tools array at all.
+        let active = [
+            "read_file",
+            "grep_search",
+            "tool_orchestrate",
+            "glob_search",
+        ]
         .into_iter()
         .map(str::to_owned)
         .collect::<std::collections::BTreeSet<_>>();
-    let render = |active: &std::collections::BTreeSet<String>| -> String {
-        super::tool_definitions_for_exposure_filter(&specs, active)
-            .into_iter()
-            .map(|spec| {
-                // `ToolSpec` is not Serialize, so compare the two things that
-                // actually reach the wire: the ordered names and each input
-                // schema serialized deterministically.
-                format!(
-                    "{}:{}",
-                    spec.name,
-                    serde_json::to_string(&spec.input_schema).unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("|")
-    };
-    let first = render(&active);
-    for _ in 0..8 {
-        assert_eq!(first, render(&active), "the filtered catalog must be byte-stable");
-    }
+        let render = |active: &std::collections::BTreeSet<String>| -> String {
+            super::tool_definitions_for_exposure_filter(&specs, active)
+                .into_iter()
+                .map(|spec| {
+                    // `ToolSpec` is not Serialize, so compare the two things that
+                    // actually reach the wire: the ordered names and each input
+                    // schema serialized deterministically.
+                    format!(
+                        "{}:{}",
+                        spec.name,
+                        serde_json::to_string(&spec.input_schema).unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        let first = render(&active);
+        for _ in 0..8 {
+            assert_eq!(
+                first,
+                render(&active),
+                "the filtered catalog must be byte-stable"
+            );
+        }
 
-    // (2) growing the active set appends; the shared prefix is untouched.
-    let mut wider = active.clone();
-    wider.insert("execute_code".to_owned());
-    let wider_bytes = render(&wider);
-    let shared = first
-        .as_bytes()
-        .iter()
-        .zip(wider_bytes.as_bytes())
-        .take_while(|(left, right)| left == right)
-        .count();
-    assert!(
-        shared >= first.len().saturating_sub(64),
-        "adding an entry must not rewrite the stable prefix: shared {shared} of {} bytes",
-        first.len()
-    );
-    assert_eq!(
-        super::tool_definitions_for_exposure_filter(&specs, &active).len(),
-        4,
-        "the filter is exactly the active set"
-    );
-    assert_eq!(
-        super::tool_definitions_for_exposure_filter(&specs, &wider).len(),
-        5,
-        "one more active id yields exactly one more entry"
-    );
-}
+        // (2) growing the active set appends; the shared prefix is untouched.
+        let mut wider = active.clone();
+        wider.insert("execute_code".to_owned());
+        let wider_bytes = render(&wider);
+        let shared = first
+            .as_bytes()
+            .iter()
+            .zip(wider_bytes.as_bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        assert!(
+            shared >= first.len().saturating_sub(64),
+            "adding an entry must not rewrite the stable prefix: shared {shared} of {} bytes",
+            first.len()
+        );
+        assert_eq!(
+            super::tool_definitions_for_exposure_filter(&specs, &active).len(),
+            4,
+            "the filter is exactly the active set"
+        );
+        assert_eq!(
+            super::tool_definitions_for_exposure_filter(&specs, &wider).len(),
+            5,
+            "one more active id yields exactly one more entry"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1400,7 +1587,10 @@ mod family_taxonomy_tests {
                 spec.name
             );
         }
-        let families = specs.iter().map(|spec| spec.family).collect::<BTreeSet<_>>();
+        let families = specs
+            .iter()
+            .map(|spec| spec.family)
+            .collect::<BTreeSet<_>>();
         assert!(
             families.len() >= 10,
             "the taxonomy must actually partition the catalog"
@@ -1466,8 +1656,7 @@ mod family_taxonomy_tests {
     /// ledger may only shrink.
     #[test]
     fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
-        const LEGACY: &[(&str, &str, &str, usize)] = &[
-        ];
+        const LEGACY: &[(&str, &str, &str, usize)] = &[];
         let mut slots: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
         for spec in mvp_tool_specs() {
             if ALIASES.contains(&spec.name) {
@@ -1504,7 +1693,11 @@ mod family_taxonomy_tests {
             let exposed = ids.contains(&spec.name);
             match spec.tier {
                 ToolTier::Direct | ToolTier::EscapeHatch => {
-                    assert!(exposed, "`{}` is Direct/EscapeHatch and must be bootstrap", spec.name)
+                    assert!(
+                        exposed,
+                        "`{}` is Direct/EscapeHatch and must be bootstrap",
+                        spec.name
+                    )
                 }
                 ToolTier::Orchestration | ToolTier::Operator => assert!(
                     !exposed,
@@ -1514,7 +1707,10 @@ mod family_taxonomy_tests {
                 ),
             }
         }
-        assert!(ids.contains(&"tool_search"), "discovery must stay reachable");
+        assert!(
+            ids.contains(&"tool_search"),
+            "discovery must stay reachable"
+        );
         assert!(
             !ids.contains(&"testing_permission"),
             "operator-tier tools never enter the model surface"
@@ -1531,14 +1727,39 @@ mod family_taxonomy_tests {
     #[test]
     fn retired_tool_names_do_not_reappear_in_the_live_registry() {
         const RETIRED: &[&str] = &[
-            "read_many", "glob_many", "grep_many", "ast_grep_search", "tool_batch_readonly",
-            "write_file", "edit_file", "apply_patch_transaction", "mutation_preview",
-            "edit_many_preview", "patch_plan", "notebook_edit", "repl", "power_shell",
-            "send_user_message", "question", "ask_user_question",
-            "checkpoint_create", "checkpoint_list", "checkpoint_diff", "checkpoint_restore",
-            "skill_install_plan", "skill_install_commit", "skill_status", "skill_rollback",
-            "skill_deactivate", "list_mcp_resources", "read_mcp_resource", "mcp_auth",
-            "enter_plan_mode", "exit_plan_mode", "background_task_status", "background_task_kill",
+            "read_many",
+            "glob_many",
+            "grep_many",
+            "ast_grep_search",
+            "tool_batch_readonly",
+            "write_file",
+            "edit_file",
+            "apply_patch_transaction",
+            "mutation_preview",
+            "edit_many_preview",
+            "patch_plan",
+            "notebook_edit",
+            "repl",
+            "power_shell",
+            "send_user_message",
+            "question",
+            "ask_user_question",
+            "checkpoint_create",
+            "checkpoint_list",
+            "checkpoint_diff",
+            "checkpoint_restore",
+            "skill_install_plan",
+            "skill_install_commit",
+            "skill_status",
+            "skill_rollback",
+            "skill_deactivate",
+            "list_mcp_resources",
+            "read_mcp_resource",
+            "mcp_auth",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "background_task_status",
+            "background_task_kill",
         ];
         // `ToolCatalog::builtin()` carries no runtime or plugin tools, so asserting
         // over it only re-tests `mvp_tool_specs()`. Register the same runtime and
@@ -1578,14 +1799,39 @@ mod family_taxonomy_tests {
     #[test]
     fn retired_tool_names_do_not_reappear_in_the_catalog() {
         const RETIRED: &[&str] = &[
-            "read_many", "glob_many", "grep_many", "ast_grep_search", "tool_batch_readonly",
-            "write_file", "edit_file", "apply_patch_transaction", "mutation_preview",
-            "edit_many_preview", "patch_plan", "notebook_edit", "repl", "power_shell",
-            "send_user_message", "question", "ask_user_question",
-            "checkpoint_create", "checkpoint_list", "checkpoint_diff", "checkpoint_restore",
-            "skill_install_plan", "skill_install_commit", "skill_status", "skill_rollback",
-            "skill_deactivate", "list_mcp_resources", "read_mcp_resource", "mcp_auth",
-            "enter_plan_mode", "exit_plan_mode", "background_task_status", "background_task_kill",
+            "read_many",
+            "glob_many",
+            "grep_many",
+            "ast_grep_search",
+            "tool_batch_readonly",
+            "write_file",
+            "edit_file",
+            "apply_patch_transaction",
+            "mutation_preview",
+            "edit_many_preview",
+            "patch_plan",
+            "notebook_edit",
+            "repl",
+            "power_shell",
+            "send_user_message",
+            "question",
+            "ask_user_question",
+            "checkpoint_create",
+            "checkpoint_list",
+            "checkpoint_diff",
+            "checkpoint_restore",
+            "skill_install_plan",
+            "skill_install_commit",
+            "skill_status",
+            "skill_rollback",
+            "skill_deactivate",
+            "list_mcp_resources",
+            "read_mcp_resource",
+            "mcp_auth",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "background_task_status",
+            "background_task_kill",
         ];
         let names = mvp_tool_specs()
             .into_iter()

@@ -8,7 +8,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var_os("COWD_GENERATION_FROZEN_SOURCESET").is_none() {
+        return Err("canonical generation requires frozen R1 source manifest".into());
+    }
     let output = output_directory()?;
+    if output.exists() {
+        return Err("private APP export root must not already exist".into());
+    }
     let schemas = output.join("schemas");
     let golden = output.join("golden");
     fs::create_dir_all(&schemas)?;
@@ -38,6 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     add_schema::<AppTuiViewStreamRequestV1>(&mut files, "tui-stream-request.schema.json")?;
     add_schema::<IframeBridgeMessageV1>(&mut files, "iframe-bridge.schema.json")?;
     add_schema::<IframeApiFrameV1>(&mut files, "iframe-api.schema.json")?;
+    add_schema::<AppFrameSourceBindingRequestV1>(
+        &mut files,
+        "app-frame-source-binding-request.schema.json",
+    )?;
+    add_schema::<AppFrameSourceBindingV1>(&mut files, "app-frame-source-binding.schema.json")?;
     add_schema::<ApplicationExecutionOutcomeV1>(
         &mut files,
         "application-execution-outcome.schema.json",

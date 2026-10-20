@@ -262,6 +262,9 @@ where
             turn_stable_prefix_metrics: std::sync::Mutex::new(TurnStablePrefixMetrics::default()),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_generated_model_receipts: std::sync::Mutex::new(Vec::new()),
+            turn_native_tool_sources: std::sync::Mutex::new(BTreeMap::new()),
+            turn_native_root_owners: std::sync::Mutex::new(BTreeMap::new()),
+            native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
             turn_model_observations: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
                 initial_budget_plan.subsystem_budget_tokens,
@@ -625,6 +628,7 @@ where
                     artifacts: Arc::clone(artifacts),
                     session_port: Arc::clone(session_port),
                     cache_dimensions: Arc::clone(&self.cache_dimensions_observation),
+                    native_wire_receipts: Arc::clone(&self.native_wire_receipts),
                 }) as Arc<dyn crate::ProviderWireEvidenceWriter>
             });
         self.api_client.configure_provider_wire_evidence(writer);

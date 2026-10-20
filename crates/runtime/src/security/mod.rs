@@ -307,7 +307,7 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn test_human_interactive_principal() -> VerifiedPrincipal {
     VerifiedPrincipal {
         claims: PrincipalClaims {

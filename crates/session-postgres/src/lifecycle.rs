@@ -2,6 +2,386 @@
 
 use super::*;
 
+fn protect_receipt_attachments(
+    previous: Option<&SessionPresenceProjection>,
+    candidate: Option<&SessionPresenceProjection>,
+) -> session::SessionResult<()> {
+    let tagged = |projection: Option<&SessionPresenceProjection>| -> session::SessionResult<Vec<session::SessionAttachment>> {
+        Ok(projection.map(receipt_attachments).transpose()?.unwrap_or_default().into_iter().filter(|attachment|
+            attachment.receipt_protocol.is_some() || attachment.client_id.is_some()
+                || attachment.client_expires_at_ms.is_some() || attachment.receipt_source.is_some()).collect())
+    };
+    if let (Some(previous), Some(candidate)) = (previous, candidate) {
+        if !tagged(Some(previous))?.is_empty()
+            && previous.revision.checked_add(1) != Some(candidate.revision)
+        {
+            return Err(receipt_conflict());
+        }
+    }
+    let mut previous = tagged(previous)?;
+    let mut candidate = tagged(candidate)?;
+    previous.sort_by(|left, right| left.actor.id.cmp(&right.actor.id));
+    candidate.sort_by(|left, right| left.actor.id.cmp(&right.actor.id));
+    if previous != candidate {
+        return Err(receipt_conflict());
+    }
+    Ok(())
+}
+
+fn write_legacy_presence_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    projection: &SessionPresenceProjection,
+    expected_revision: Option<u64>,
+) -> session::SessionResult<u64> {
+    transaction.execute(
+        "INSERT INTO session_presence_projection(session_id,state,attachments_json,next_sequence,revision,updated_at_ms)
+         VALUES($1,$2,$3::text::jsonb,$4,$5,$6) ON CONFLICT(session_id) DO UPDATE SET
+         state=EXCLUDED.state,attachments_json=EXCLUDED.attachments_json,next_sequence=EXCLUDED.next_sequence,
+         revision=EXCLUDED.revision,updated_at_ms=EXCLUDED.updated_at_ms
+         WHERE session_presence_projection.revision=$7",
+        &[&projection.session_id,&projection.state,&projection.attachments_json,&to_i64(projection.next_sequence,"presence sequence")?,
+            &to_u64_i64(projection.revision,"presence revision")?,&to_u64_i64(projection.updated_at_ms,"presence time")?,
+            &expected_revision.map(|revision| to_u64_i64(revision,"presence expected revision")).transpose()?],
+    ).map_err(postgres_error)
+}
+
+pub(super) fn receipt_conflict() -> session::SessionError {
+    session::SessionError::StaleExecutionFence(
+        "receipt attachment or binding is no longer eligible".into(),
+    )
+}
+
+pub(super) fn receipt_clock_tx(
+    transaction: &mut PostgresTransaction<'_>,
+) -> session::SessionResult<u64> {
+    let row = transaction
+        .query_one(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )
+        .map_err(postgres_error)?;
+    i64_to_u64(row.try_get(0).map_err(postgres_error)?, "receipt time")
+}
+
+pub(super) fn receipt_parent_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+) -> session::SessionResult<()> {
+    transaction
+        .query_opt(
+            "SELECT session_id FROM session_records WHERE session_id=$1 FOR KEY SHARE",
+            &[&session_id],
+        )
+        .map_err(postgres_error)?
+        .ok_or_else(|| session::SessionError::NotFound("session".into()))?;
+    Ok(())
+}
+
+pub(super) fn receipt_presence_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    lock: bool,
+) -> session::SessionResult<Option<SessionPresenceProjection>> {
+    let sql = if lock {
+        "SELECT session_id,state,attachments_json::text,next_sequence,revision,updated_at_ms FROM session_presence_projection WHERE session_id=$1 FOR UPDATE"
+    } else {
+        "SELECT session_id,state,attachments_json::text,next_sequence,revision,updated_at_ms FROM session_presence_projection WHERE session_id=$1"
+    };
+    transaction
+        .query_opt(sql, &[&session_id])
+        .map_err(postgres_error)?
+        .map(|row| {
+            Ok(SessionPresenceProjection {
+                session_id: row.try_get(0).map_err(postgres_error)?,
+                state: row.try_get(1).map_err(postgres_error)?,
+                attachments_json: row.try_get(2).map_err(postgres_error)?,
+                next_sequence: from_i64(
+                    row.try_get(3).map_err(postgres_error)?,
+                    "presence sequence",
+                )?,
+                revision: i64_to_u64(row.try_get(4).map_err(postgres_error)?, "presence revision")?,
+                updated_at_ms: i64_to_u64(
+                    row.try_get(5).map_err(postgres_error)?,
+                    "presence time",
+                )?,
+            })
+        })
+        .transpose()
+}
+
+pub(super) fn receipt_attachments(
+    projection: &SessionPresenceProjection,
+) -> session::SessionResult<Vec<session::SessionAttachment>> {
+    serde_json::from_str(&projection.attachments_json)
+        .map_err(|_| session::SessionError::Store("invalid durable presence".into()))
+}
+
+pub(super) fn receipt_attachment_current(
+    projection: &SessionPresenceProjection,
+    authority: &session::SessionReceiptAuthority,
+    now: u64,
+) -> session::SessionResult<session::SessionAttachment> {
+    if authority
+        .credential_expires_at_ms
+        .is_some_and(|deadline| now >= deadline)
+        || authority.principal_id.is_empty()
+        || authority.client_id.is_empty()
+        || !authority
+            .actor_id
+            .starts_with(&format!("principal:{}:surface:", authority.principal_id))
+    {
+        return Err(receipt_conflict());
+    }
+    let attachments = receipt_attachments(projection)?;
+    let mut selected = attachments
+        .into_iter()
+        .filter(|attachment| attachment.actor.id == authority.actor_id);
+    let attachment = selected.next().ok_or_else(receipt_conflict)?;
+    if selected.next().is_some()
+        || attachment.session_id != authority.session_id
+        || attachment.receipt_protocol.as_deref()
+            != Some(session::SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1)
+        || attachment.client_id.as_deref() != Some(authority.client_id.as_str())
+        || attachment
+            .client_expires_at_ms
+            .is_none_or(|deadline| now >= deadline)
+        || attachment.receipt_source != authority.receipt_source
+    {
+        return Err(receipt_conflict());
+    }
+    if let Some(source) = &attachment.receipt_source {
+        validate_receipt_source(source, authority, now)?;
+        if source.principal_id != authority.principal_id
+            || source.session_id != authority.session_id
+            || source.expires_at_ms <= now
+            || source.purpose != "terminal_receipt"
+            || source.frame_nonce.is_empty()
+            || source.transport_id.is_empty()
+            || source.execution_id.is_empty()
+            || source.turn_id.is_empty()
+        {
+            return Err(receipt_conflict());
+        }
+    }
+    Ok(attachment)
+}
+
+pub(super) fn validate_receipt_source(
+    source: &session::SessionReceiptSource,
+    authority: &session::SessionReceiptAuthority,
+    now: u64,
+) -> session::SessionResult<()> {
+    if source.principal_id != authority.principal_id
+        || source.session_id != authority.session_id
+        || source.expires_at_ms <= now
+        || source.purpose != "terminal_receipt"
+        || [
+            &source.tenant_id,
+            &source.workspace_id,
+            &source.app_id,
+            &source.frame_nonce,
+            &source.transport_id,
+            &source.turn_id,
+            &source.execution_id,
+            &source.root_task_id,
+        ]
+        .iter()
+        .any(|value| value.is_empty())
+    {
+        return Err(receipt_conflict());
+    }
+    let digest = source
+        .app_generation
+        .strip_prefix("sha256:")
+        .ok_or_else(receipt_conflict)?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(receipt_conflict());
+    }
+    for value in [
+        &source.profile_revision,
+        &source.credential_epoch,
+        &source.attachment_revision,
+        &source.lineage_generation,
+    ] {
+        harness_contract::live::ReceiptCursor::parse(value).map_err(|_| receipt_conflict())?;
+    }
+    Ok(())
+}
+
+impl PostgresSessionStore {
+    pub fn mutate_session_presence_if_revision(
+        &self,
+        command: &session::SessionPresenceMutation,
+    ) -> session::SessionResult<Option<session::SessionPresenceMutationResult>> {
+        let authority = &command.authority;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        receipt_parent_tx(&mut transaction, &authority.session_id)?;
+        let previous = receipt_presence_tx(&mut transaction, &authority.session_id, true)?;
+        if previous.as_ref().map(|projection| projection.revision) != command.expected_revision {
+            return Ok(None);
+        }
+        let now = receipt_clock_tx(&mut transaction)?;
+        let mut attachments = previous
+            .as_ref()
+            .map(receipt_attachments)
+            .transpose()?
+            .unwrap_or_default();
+        let existing = attachments
+            .iter()
+            .find(|attachment| attachment.actor.id == authority.actor_id)
+            .cloned();
+        let mut selected = None;
+        match &command.kind {
+            session::SessionPresenceMutationKind::AttachOrReaffirm {
+                actor,
+                candidate_client_id,
+                ttl_ms,
+            } => {
+                if let Some(existing) = &existing {
+                    let has_tag = existing.client_id.is_some()
+                        || existing.receipt_protocol.is_some()
+                        || existing.client_expires_at_ms.is_some()
+                        || existing.receipt_source.is_some();
+                    if has_tag
+                        && (existing.client_id.as_ref().is_none_or(String::is_empty)
+                            || existing.receipt_protocol.as_deref()
+                                != Some(session::SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1)
+                            || existing.client_expires_at_ms.is_none())
+                    {
+                        return Err(receipt_conflict());
+                    }
+                }
+                if actor.id != authority.actor_id
+                    || authority.principal_id.is_empty()
+                    || *ttl_ms == 0
+                    || !actor
+                        .id
+                        .starts_with(&format!("principal:{}:surface:", authority.principal_id))
+                    || actor.surface.is_empty()
+                    || !matches!(actor.role.as_deref(), Some("reader" | "writer"))
+                {
+                    return Err(receipt_conflict());
+                }
+                let active = existing.as_ref().filter(|attachment| {
+                    attachment.receipt_protocol.is_some()
+                        && attachment
+                            .client_expires_at_ms
+                            .is_none_or(|deadline| now < deadline)
+                });
+                let client_id = if let Some(existing) = active {
+                    let projection = previous.as_ref().ok_or_else(receipt_conflict)?;
+                    receipt_attachment_current(projection, authority, now)?;
+                    if existing.actor != *actor {
+                        return Err(receipt_conflict());
+                    }
+                    authority.client_id.clone()
+                } else {
+                    if !authority.client_id.is_empty()
+                        || candidate_client_id.len() != 36
+                        || !candidate_client_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+                    {
+                        return Err(receipt_conflict());
+                    }
+                    candidate_client_id.clone()
+                };
+                let mut deadline = now.checked_add(*ttl_ms).ok_or_else(receipt_conflict)?;
+                if let Some(expiry) = authority.credential_expires_at_ms {
+                    deadline = deadline.min(expiry);
+                }
+                if let Some(source) = &authority.receipt_source {
+                    validate_receipt_source(source, authority, now)?;
+                    if source.principal_id != authority.principal_id
+                        || source.session_id != authority.session_id
+                    {
+                        return Err(receipt_conflict());
+                    }
+                    deadline = deadline.min(source.expires_at_ms);
+                }
+                if deadline <= now {
+                    return Err(receipt_conflict());
+                }
+                let attachment = session::SessionAttachment {
+                    session_id: authority.session_id.clone(),
+                    actor: actor.clone(),
+                    attached_at_ms: active.map_or(now, |attachment| attachment.attached_at_ms),
+                    last_seen_ms: now,
+                    client_id: Some(client_id),
+                    client_expires_at_ms: Some(deadline),
+                    receipt_protocol: Some(session::SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1.into()),
+                    receipt_source: authority.receipt_source.clone(),
+                };
+                attachments.retain(|attachment| attachment.actor.id != authority.actor_id);
+                attachments.push(attachment.clone());
+                selected = Some(attachment);
+            }
+            session::SessionPresenceMutationKind::Detach => {
+                receipt_attachment_current(
+                    previous.as_ref().ok_or_else(receipt_conflict)?,
+                    authority,
+                    now,
+                )?;
+                attachments.retain(|attachment| attachment.actor.id != authority.actor_id);
+            }
+            session::SessionPresenceMutationKind::Expire => {
+                let existing = existing.ok_or_else(receipt_conflict)?;
+                if existing
+                    .client_expires_at_ms
+                    .is_none_or(|deadline| now < deadline)
+                {
+                    return Err(receipt_conflict());
+                }
+                attachments.retain(|attachment| attachment.actor.id != authority.actor_id);
+            }
+            session::SessionPresenceMutationKind::RevokeExactActor => {
+                if existing.is_none() || authority.actor_id.is_empty() {
+                    return Err(receipt_conflict());
+                }
+                attachments.retain(|attachment| attachment.actor.id != authority.actor_id);
+            }
+        }
+        let revision = command
+            .expected_revision
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(receipt_conflict)?;
+        let projection = SessionPresenceProjection {
+            session_id: authority.session_id.clone(),
+            state: if attachments.is_empty() {
+                "detached"
+            } else {
+                "attached"
+            }
+            .into(),
+            attachments_json: serde_json::to_string(&attachments)?,
+            next_sequence: previous
+                .as_ref()
+                .map_or(0, |projection| projection.next_sequence)
+                .checked_add(1)
+                .ok_or_else(receipt_conflict)?,
+            revision,
+            updated_at_ms: now,
+        };
+        let changed = if previous.is_some() {
+            transaction.execute("UPDATE session_presence_projection SET state=$2,attachments_json=$3::text::jsonb,next_sequence=$4,revision=$5,updated_at_ms=$6 WHERE session_id=$1",
+                &[&projection.session_id,&projection.state,&projection.attachments_json,&to_i64(projection.next_sequence,"presence sequence")?,&to_u64_i64(revision,"presence revision")?,&to_u64_i64(now,"presence time")?])
+        } else {
+            transaction.execute("INSERT INTO session_presence_projection(session_id,state,attachments_json,next_sequence,revision,updated_at_ms) VALUES($1,$2,$3::text::jsonb,$4,$5,$6) ON CONFLICT DO NOTHING",
+                &[&projection.session_id,&projection.state,&projection.attachments_json,&to_i64(projection.next_sequence,"presence sequence")?,&to_u64_i64(revision,"presence revision")?,&to_u64_i64(now,"presence time")?])
+        }.map_err(postgres_error)?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        transaction.commit().map_err(postgres_error)?;
+        Ok(Some(session::SessionPresenceMutationResult {
+            projection,
+            attachment: selected,
+        }))
+    }
+}
+
 /// Canonical current actor/workspace predicate shared by catalog and active search.
 pub(super) const BROWSABLE_SESSION_AUTHORITY: &str = r"(
                     s.session_id=current.session_id
@@ -27,7 +407,7 @@ pub(super) const BROWSABLE_SESSION_AUTHORITY: &str = r"(
 
 impl PostgresSessionStore {
     pub fn new(executor: PostgresExecutor) -> session::SessionResult<Self> {
-        prepare_legacy_session_usage_for_migration(&executor)?;
+        validate_current_session_catalog(&executor)?;
         executor
             .apply_migrations(SESSION_DOMAIN, SESSION_MIGRATIONS)
             .map_err(storage_error)?;
@@ -174,32 +554,20 @@ impl PostgresSessionStore {
         &self,
         projection: &SessionPresenceProjection,
     ) -> session::SessionResult<()> {
-        let next_sequence = to_i64(projection.next_sequence, "presence next sequence")?;
-        let revision = to_u64_i64(projection.revision, "presence revision")?;
-        let updated_at_ms = to_u64_i64(projection.updated_at_ms, "presence updated time")?;
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        connection
-            .execute(
-                "INSERT INTO session_presence_projection(
-                     session_id,state,attachments_json,next_sequence,revision,updated_at_ms
-                 ) VALUES ($1,$2,$3::text::jsonb,$4,$5,$6)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                     state=EXCLUDED.state,
-                     attachments_json=EXCLUDED.attachments_json,
-                     next_sequence=EXCLUDED.next_sequence,
-                     revision=EXCLUDED.revision,
-                     updated_at_ms=EXCLUDED.updated_at_ms",
-                &[
-                    &projection.session_id,
-                    &projection.state,
-                    &projection.attachments_json,
-                    &next_sequence,
-                    &revision,
-                    &updated_at_ms,
-                ],
-            )
-            .map_err(postgres_error)?;
-        Ok(())
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        receipt_parent_tx(&mut transaction, &projection.session_id)?;
+        let current = receipt_presence_tx(&mut transaction, &projection.session_id, true)?;
+        protect_receipt_attachments(current.as_ref(), Some(projection))?;
+        if write_legacy_presence_tx(
+            &mut transaction,
+            projection,
+            current.as_ref().map(|projection| projection.revision),
+        )? != 1
+        {
+            return Err(receipt_conflict());
+        }
+        transaction.commit().map_err(postgres_error)
     }
 
     pub fn compare_and_upsert_session_presence_projection(
@@ -207,49 +575,16 @@ impl PostgresSessionStore {
         projection: &SessionPresenceProjection,
         expected_revision: Option<u64>,
     ) -> session::SessionResult<bool> {
-        let next_sequence = to_i64(projection.next_sequence, "presence next sequence")?;
-        let revision = to_u64_i64(projection.revision, "presence revision")?;
-        let updated_at_ms = to_u64_i64(projection.updated_at_ms, "presence updated time")?;
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        let changed = match expected_revision {
-            Some(expected_revision) => {
-                let expected_revision =
-                    to_u64_i64(expected_revision, "presence expected revision")?;
-                connection.execute(
-                    "UPDATE session_presence_projection
-                        SET state=$2,
-                            attachments_json=$3::text::jsonb,
-                            next_sequence=$4,
-                            revision=$5,
-                            updated_at_ms=$6
-                      WHERE session_id=$1 AND revision=$7",
-                    &[
-                        &projection.session_id,
-                        &projection.state,
-                        &projection.attachments_json,
-                        &next_sequence,
-                        &revision,
-                        &updated_at_ms,
-                        &expected_revision,
-                    ],
-                )
-            }
-            None => connection.execute(
-                "INSERT INTO session_presence_projection(
-                     session_id,state,attachments_json,next_sequence,revision,updated_at_ms
-                 ) VALUES ($1,$2,$3::text::jsonb,$4,$5,$6)
-                 ON CONFLICT(session_id) DO NOTHING",
-                &[
-                    &projection.session_id,
-                    &projection.state,
-                    &projection.attachments_json,
-                    &next_sequence,
-                    &revision,
-                    &updated_at_ms,
-                ],
-            ),
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        receipt_parent_tx(&mut transaction, &projection.session_id)?;
+        let current = receipt_presence_tx(&mut transaction, &projection.session_id, true)?;
+        if current.as_ref().map(|projection| projection.revision) != expected_revision {
+            return Ok(false);
         }
-        .map_err(postgres_error)?;
+        protect_receipt_attachments(current.as_ref(), Some(projection))?;
+        let changed = write_legacy_presence_tx(&mut transaction, projection, expected_revision)?;
+        transaction.commit().map_err(postgres_error)?;
         Ok(changed == 1)
     }
 
@@ -258,13 +593,21 @@ impl PostgresSessionStore {
         session_id: &str,
     ) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        connection
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        match receipt_parent_tx(&mut transaction, session_id) {
+            Ok(()) => {}
+            Err(session::SessionError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let current = receipt_presence_tx(&mut transaction, session_id, true)?;
+        protect_receipt_attachments(current.as_ref(), None)?;
+        transaction
             .execute(
                 "DELETE FROM session_presence_projection WHERE session_id=$1",
                 &[&session_id],
             )
             .map_err(postgres_error)?;
-        Ok(())
+        transaction.commit().map_err(postgres_error)
     }
 
     pub fn get_session_recovery_manifests_by_ids(

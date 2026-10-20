@@ -2,7 +2,20 @@
 use super::{GatewayHttpMethod, GatewayPathKey, GatewayRouteSpec};
 
 pub mod paths {
+    pub const API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS: GatewayPathKey = GatewayPathKey::new(
+        "api_apps_by_app_id_frame_source_bindings",
+        "/api/apps/:app_id/frame-source-bindings",
+    );
     use super::GatewayPathKey;
+    pub const API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT: GatewayPathKey =
+        GatewayPathKey::new(
+            "api_sessions_by_id_messages_by_message_id_receipt_context",
+            "/api/sessions/:id/messages/:message_id/receipt-context",
+        );
+    pub const API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK: GatewayPathKey = GatewayPathKey::new(
+        "api_sessions_by_id_messages_by_message_id_ack",
+        "/api/sessions/:id/messages/:message_id/ack",
+    );
     pub const API_AGENTS_ASSEMBLE: GatewayPathKey =
         GatewayPathKey::new("api_agents_assemble", "/api/agents/assemble");
     pub const API_AGENTS_CATALOG: GatewayPathKey =
@@ -1266,6 +1279,30 @@ pub mod paths {
 }
 
 pub mod routes {
+    pub const POST_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS: GatewayRouteSpec =
+        GatewayRouteSpec::new(
+            "post_api_apps_by_app_id_frame_source_bindings",
+            GatewayHttpMethod::Post,
+            paths::API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS,
+        );
+    pub const DELETE_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS: GatewayRouteSpec =
+        GatewayRouteSpec::new(
+            "delete_api_apps_by_app_id_frame_source_bindings",
+            GatewayHttpMethod::Delete,
+            paths::API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS,
+        );
+    pub const GET_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT: GatewayRouteSpec =
+        GatewayRouteSpec::new(
+            "get_api_sessions_by_id_messages_by_message_id_receipt_context",
+            GatewayHttpMethod::Get,
+            paths::API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT,
+        );
+    pub const POST_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK: GatewayRouteSpec =
+        GatewayRouteSpec::new(
+            "post_api_sessions_by_id_messages_by_message_id_ack",
+            GatewayHttpMethod::Post,
+            paths::API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK,
+        );
     use super::{paths, GatewayHttpMethod, GatewayRouteSpec};
     pub const DELETE_API_APPS_BY_APP_ID_SUBSCRIPTIONS_BY_SUBSCRIPTION_ID: GatewayRouteSpec =
         GatewayRouteSpec::new(
@@ -3667,6 +3704,7 @@ pub mod routes {
 }
 
 pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
+    paths::API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS,
     paths::API_AGENTS_ASSEMBLE,
     paths::API_AGENTS_CATALOG,
     paths::API_AGENTS_DIRECTORY,
@@ -3991,6 +4029,8 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_RECLASSIFY,
     paths::API_SESSIONS_BY_ID_LIFECYCLE,
     paths::API_SESSIONS_BY_ID_MESSAGES,
+    paths::API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT,
+    paths::API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK,
     paths::API_SESSIONS_BY_ID_MISSION_FOCUS,
     paths::API_SESSIONS_BY_ID_REPLAY,
     paths::API_SESSIONS_BY_ID_STATS,
@@ -4104,6 +4144,8 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
 ];
 
 pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
+    routes::POST_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS,
+    routes::DELETE_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS,
     routes::DELETE_API_APPS_BY_APP_ID_SUBSCRIPTIONS_BY_SUBSCRIPTION_ID,
     routes::DELETE_API_CROSS_PLANE_GRANTS_BY_ID,
     routes::DELETE_API_CROSS_PLANE_IDENTITIES_BY_ID,
@@ -4326,6 +4368,7 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::GET_API_SESSIONS_BY_ID_INPUTS,
     routes::GET_API_SESSIONS_BY_ID_LIFECYCLE,
     routes::GET_API_SESSIONS_BY_ID_MESSAGES,
+    routes::GET_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT,
     routes::GET_API_SESSIONS_BY_ID_MISSION_FOCUS,
     routes::GET_API_SESSIONS_BY_ID_REPLAY,
     routes::GET_API_SESSIONS_BY_ID_STATS,
@@ -4521,6 +4564,7 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::POST_API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_CANCEL,
     routes::POST_API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_RECLASSIFY,
     routes::POST_API_SESSIONS_BY_ID_MESSAGES,
+    routes::POST_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK,
     routes::POST_API_SKILLS,
     routes::POST_API_SKILLS_BY_ID_ACTIONS_PLAN,
     routes::POST_API_SKILLS_BY_ID_ACTIONS_RUN,
@@ -4626,6 +4670,6 @@ mod tests {
         // template-driven collaboration route. Keep the reviewed catalog
         // cardinality explicit so a future route change must update its
         // contract and tests deliberately.
-        assert_eq!(routes.len(), 475);
+        assert_eq!(routes.len(), 479);
     }
 }

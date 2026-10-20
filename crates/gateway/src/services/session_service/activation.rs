@@ -703,6 +703,10 @@ impl SessionActivationCoordinator {
         if session_id.is_empty() {
             return Err("session id is required".to_string());
         }
+        self.runtime
+            .runtime_services()
+            .ensure_session_recovery_admitted(session_id)
+            .map_err(|error| error.to_string())?;
         let lock = self.lock_for(session_id).await;
         let _guard = lock.lock().await;
         let session_repository = &self.repository;

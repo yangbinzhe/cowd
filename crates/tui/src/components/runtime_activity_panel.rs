@@ -48,6 +48,8 @@ struct ProcessEvent {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeActivityPanel {
+    terminal_axes: String,
+    client_receipt: String,
     // ── Context / Ctx fields ───────────────────────────────────────
     token_count: u64,
     context_window: u64,
@@ -147,6 +149,55 @@ impl RuntimeActivityPanel {
     }
 
     fn sync_execution_projection(&mut self, app: &App) {
+        self.terminal_axes = app
+            .execution
+            .latest_execution_projection
+            .as_ref()
+            .map(|projection| {
+                let axes = &projection.terminal_axes;
+                format!(
+                    "Outcome {:?} · Execution {:?}/{:?} · Delivery {:?}",
+                    axes.outcome.outcome,
+                    axes.execution.phase,
+                    axes.execution.settlement,
+                    axes.delivery.runtime_terminal_ref
+                )
+            })
+            .unwrap_or_else(|| "Outcome unknown · Execution unknown · Delivery unknown".into());
+        self.client_receipt = app
+            .terminal_receipt
+            .as_ref()
+            .filter(|receipt| {
+                receipt.session_id == app.shell.session_id
+                    && receipt.expires_at_ms
+                        > std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(u64::MAX, |time| time.as_millis() as u64)
+                    && app
+                        .execution
+                        .current_turn_id
+                        .as_ref()
+                        .is_none_or(|turn| turn == &receipt.turn_id)
+                    && app.terminal_receipt_selection.as_ref().is_some_and(
+                        |(session, client, epoch)| {
+                            session == &receipt.session_id
+                                && client == &receipt.client_id
+                                && *epoch == receipt.epoch
+                        },
+                    )
+            })
+            .map(|receipt| {
+                format!(
+                    "This client {} · {}",
+                    receipt.client_id,
+                    if receipt.received {
+                        "received (fresh)"
+                    } else {
+                        "pending"
+                    }
+                )
+            })
+            .unwrap_or_else(|| "This client unknown · requires fresh context".into());
         // ── Context / Ctx info ────────────────────────────────────
         self.token_count = app.shell.token_count;
         self.context_window = app.execution.context_window;
@@ -760,6 +811,8 @@ fn canonical_policy_transition(
 impl Component for RuntimeActivityPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(self.terminal_axes.clone()));
+        lines.push(Line::from(self.client_receipt.clone()));
         lines.push(Line::from(vec![
             Span::styled("Execution policy: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -1393,6 +1446,7 @@ mod tests {
             schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "execution-547".to_string(),
             agentic_collaboration: Default::default(),
+            terminal_axes: Default::default(),
             revision: 4,
             cursor: 4,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

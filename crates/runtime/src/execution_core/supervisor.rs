@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,7 @@ use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::graph::{
@@ -344,9 +344,77 @@ pub struct RuntimeExecutionSupervisor {
     shutdown_timeout: Duration,
     graph_settled_observer: Arc<OnceLock<GraphSettledObserver>>,
     graph_producer_gate: StdMutex<GraphProducerGate>,
+    session_recovery_owner: OnceLock<Arc<crate::RuntimeEventStore>>,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    verdict_resolutions: StdMutex<
+        HashMap<String, tokio::sync::oneshot::Sender<(u64, tokio::sync::oneshot::Sender<()>)>>,
+    >,
 }
 
 impl RuntimeExecutionSupervisor {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn observe_verdict_resolution_for_test(
+        &self,
+        program: &str,
+    ) -> Result<tokio::sync::oneshot::Receiver<(u64, tokio::sync::oneshot::Sender<()>)>, String>
+    {
+        if program.is_empty() {
+            return Err("verdict resolution requires exact Program".into());
+        }
+        let mut observers = self
+            .verdict_resolutions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observers.contains_key(program) {
+            return Err("duplicate verdict resolution observer".into());
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        observers.insert(program.into(), sender);
+        Ok(receiver)
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) async fn observe_committed_verdict_for_test(
+        &self,
+        program: &str,
+        revision: u64,
+    ) -> Result<(), String> {
+        let observer = self
+            .verdict_resolutions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(program);
+        if let Some(observer) = observer {
+            let (release, released) = tokio::sync::oneshot::channel();
+            if observer.send((revision, release)).is_ok() {
+                tokio::select! {
+                    _ = released => {},
+                    _ = self.cancellation.cancelled() => return Err("verdict resolution interrupted before checkpoint".into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn active_binding_for_ticket_for_test(
+        &self,
+        ticket: &super::graph::NodeExecutionTicket,
+    ) -> Option<super::graph::ExecutionNodeBinding> {
+        self.runner.active_binding_for_ticket_for_test(ticket).await
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn reject_stale_binding_for_test(
+        &self,
+        graph: &str,
+        node: &str,
+        binding: &super::graph::ExecutionNodeBinding,
+    ) -> Result<(), super::graph::ExecutionRunnerError> {
+        self.runner
+            .reject_stale_binding_for_test(graph, node, binding)
+            .await
+    }
     #[must_use]
     pub(crate) fn submission_capacity_snapshot(&self) -> ExecutionSubmissionCapacitySnapshot {
         let slots = self
@@ -458,10 +526,13 @@ impl RuntimeExecutionSupervisor {
             queue_partitions: DEFAULT_QUEUE_PARTITIONS,
             shutdown_timeout,
             graph_settled_observer: Arc::new(OnceLock::new()),
+            #[cfg(any(test, feature = "test-fixtures"))]
+            verdict_resolutions: StdMutex::new(HashMap::new()),
             graph_producer_gate: StdMutex::new(GraphProducerGate {
                 released: graph_producers_released,
                 deferred_graphs: std::collections::BTreeSet::new(),
             }),
+            session_recovery_owner: OnceLock::new(),
         }
     }
 
@@ -538,6 +609,7 @@ impl RuntimeExecutionSupervisor {
         let cancellation = self.cancellation.clone();
         let metrics = Arc::clone(&self.metrics);
         let graph_settled_observer = Arc::clone(&self.graph_settled_observer);
+        let session_recovery_owner = self.session_recovery_owner.get().cloned();
         *dispatcher = Some(tokio::spawn(async move {
             dispatch_loop(
                 receiver,
@@ -550,6 +622,7 @@ impl RuntimeExecutionSupervisor {
                 cancellation,
                 metrics,
                 graph_settled_observer,
+                session_recovery_owner,
             )
             .await;
         }));
@@ -587,6 +660,10 @@ impl RuntimeExecutionSupervisor {
         &self,
         graph_id: &str,
     ) -> Result<(Arc<DriverSlot>, u64), ExecutionRunnerError> {
+        if self.has_session_recovery_exclusions() {
+            let graph = self.runner.state_store().load_async(graph_id).await?;
+            self.ensure_graph_session_recovery_admitted(&graph)?;
+        }
         let slot = self.slot(graph_id);
         let generation = slot.request(now_ms());
         {
@@ -618,18 +695,131 @@ impl RuntimeExecutionSupervisor {
     /// caller decides which are bound enough to wake: a conversation-owned
     /// graph must not be woken before its Session host rebinds the turn-scoped
     /// executors, or the node fails as `executor ... is unavailable`.
-    pub(crate) fn take_deferred_recovered_graphs(&self) -> Vec<String> {
-        let mut gate = self
+    pub(crate) fn install_session_recovery_owner(
+        &self,
+        store: Arc<crate::RuntimeEventStore>,
+    ) -> Result<(), ExecutionRunnerError> {
+        self.session_recovery_owner.set(store).map_err(|_| {
+            ExecutionRunnerError::MutationBlocked("session_recovery_owner_already_installed".into())
+        })
+    }
+
+    fn has_session_recovery_exclusions(&self) -> bool {
+        self.session_recovery_owner
+            .get()
+            .is_some_and(|store| store.has_session_recovery_exclusions())
+    }
+
+    pub(crate) fn ensure_graph_session_recovery_admitted(
+        &self,
+        graph: &ExecutionGraph,
+    ) -> Result<(), ExecutionRunnerError> {
+        if let Some(store) = self
+            .session_recovery_owner
+            .get()
+            .filter(|store| store.has_session_recovery_exclusions())
+        {
+            let lineage = graph.lineage.as_ref().ok_or_else(|| {
+                ExecutionRunnerError::MutationBlocked(
+                    "session_recovery_graph_lineage_missing".into(),
+                )
+            })?;
+            lineage
+                .validate()
+                .map_err(|error| ExecutionRunnerError::MutationBlocked(error.to_string()))?;
+            store
+                .ensure_session_recovery_admitted(&lineage.session_id)
+                .map_err(ExecutionRunnerError::MutationBlocked)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_startup_recovery_exclusions(
+        &self,
+        store: &crate::RuntimeEventStore,
+        excluded: BTreeSet<String>,
+    ) -> Result<(), ExecutionRunnerError> {
+        let gate = self
             .graph_producer_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if gate.released {
-            return Vec::new();
+            return Err(ExecutionRunnerError::MutationBlocked(
+                "startup_recovery_partition_already_released".into(),
+            ));
+        }
+        if self
+            .session_recovery_owner
+            .get()
+            .is_none_or(|owner| !std::ptr::eq(owner.as_ref(), store))
+        {
+            return Err(ExecutionRunnerError::MutationBlocked(
+                "startup_recovery_owner_mismatch".into(),
+            ));
+        }
+        store.replace_session_recovery_exclusions(excluded);
+        Ok(())
+    }
+
+    pub(crate) fn deferred_recovered_graphs(&self) -> Option<Vec<String>> {
+        let gate = self
+            .graph_producer_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gate.released {
+            return None;
+        }
+        Some(gate.deferred_graphs.iter().cloned().collect())
+    }
+
+    pub(crate) fn prepare_recovered_producers(&self) -> Result<(), ExecutionRunnerError> {
+        if self.metrics.lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
+            return Err(ExecutionRunnerError::SupervisorUnavailable(
+                "shutdown has started".into(),
+            ));
+        }
+        let dispatcher = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.sender.is_closed()
+            || dispatcher.as_ref().is_some_and(JoinHandle::is_finished)
+            || (dispatcher.is_none()
+                && (self
+                    .receiver
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none()
+                    || self
+                        .reaper_receiver
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_none()))
+        {
+            return Err(ExecutionRunnerError::SupervisorUnavailable(
+                "execution dispatcher is unavailable before recovery release".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_prepared_recovered_graphs(
+        &self,
+        expected: &[String],
+    ) -> Result<(), ExecutionRunnerError> {
+        let mut gate = self
+            .graph_producer_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prepare_recovered_producers()?;
+        if gate.released || gate.deferred_graphs.iter().ne(expected.iter()) {
+            return Err(ExecutionRunnerError::MutationBlocked(
+                "recovery_deferred_source_changed_before_release".into(),
+            ));
         }
         gate.released = true;
-        std::mem::take(&mut gate.deferred_graphs)
-            .into_iter()
-            .collect()
+        gate.deferred_graphs.clear();
+        Ok(())
     }
 
     pub(crate) async fn spawn_owned(
@@ -789,6 +979,10 @@ impl RuntimeExecutionSupervisor {
         graph_id: &str,
         command: ExecutionGraphCommand,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
+        if self.has_session_recovery_exclusions() {
+            let graph = self.runner.state_store().load_async(graph_id).await?;
+            self.ensure_graph_session_recovery_admitted(&graph)?;
+        }
         self.runner.command(graph_id, command).await
     }
 
@@ -1128,7 +1322,7 @@ impl ExecutionGraphHost for RuntimeExecutionSupervisor {
         command: ExecutionGraphCommand,
     ) -> Result<ExecutionGraphHostReceipt, ExecutionRunnerError> {
         let should_wake = command_advances(&command);
-        let graph = self.runner.command(graph_id, command).await?;
+        let graph = self.command(graph_id, command).await?;
         if should_wake {
             self.notify_graph(graph_id).await?;
         }
@@ -1154,6 +1348,7 @@ async fn dispatch_loop(
     cancellation: CancellationToken,
     metrics: Arc<SupervisorMetrics>,
     graph_settled_observer: Arc<OnceLock<GraphSettledObserver>>,
+    session_recovery_owner: Option<Arc<crate::RuntimeEventStore>>,
 ) {
     let mut workers = JoinSet::new();
     let mut active = HashMap::<String, u64>::new();
@@ -1263,6 +1458,24 @@ async fn dispatch_loop(
             Some(message) = receiver.recv() => {
                 match message {
                     SupervisorMessage::Wake(graph_id) => {
+                        if let Some(store) = session_recovery_owner.as_ref().filter(|store| store.has_session_recovery_exclusions()) {
+                            let admission = match runner.state_store().load_async(&graph_id).await {
+                                Ok(graph) => graph.lineage.as_ref()
+                                    .ok_or_else(|| "session_recovery_graph_lineage_missing".to_string())
+                                    .and_then(|lineage| {
+                                        lineage.validate().map_err(|error| error.to_string())?;
+                                        store.ensure_session_recovery_admitted(&lineage.session_id)
+                                    }),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            if let Err(error) = admission {
+                                metrics.record_error(error.clone());
+                                if let Some((generation, slot)) = prepare_worker(&slots, &graph_id) {
+                                    slot.finish(generation, DriverOutcome::Failed(error));
+                                }
+                                continue;
+                            }
+                        }
                         if active.contains_key(&graph_id) {
                             pending.insert(graph_id);
                             continue;
@@ -1516,8 +1729,13 @@ async fn run_completion_pump(
             .into_iter()
             .take(available)
             .collect::<Vec<_>>();
+        let mut admission_deferred = false;
         let prepared = match runner.prepare_ready_wave(graph_id, ready).await {
             Ok(prepared) => prepared,
+            Err(ExecutionRunnerError::ResourceDeferred { .. }) => {
+                admission_deferred = true;
+                Vec::new()
+            }
             Err(error) => {
                 active_nodes.abort_all();
                 while active_nodes.join_next().await.is_some() {}
@@ -1567,6 +1785,10 @@ async fn run_completion_pump(
         }
 
         if active_nodes.is_empty() {
+            if admission_deferred {
+                runner.wait_for_resource_change().await;
+                continue;
+            }
             match runner.terminal_report(graph_id).await {
                 Ok(Some(report)) => return DriverOutcome::Completed(report),
                 Ok(None) if snapshot.report.waiting > 0 => {
@@ -2010,13 +2232,11 @@ mod completion_pump_tests {
             registry.register(executor).expect("register executor");
         }
         let workspace_id = format!("completion-pump-{}", uuid::Uuid::new_v4());
-        let leases = WorktreeLeaseManager::open(
-            std::env::temp_dir()
-                .join("cowd-completion-pump-tests")
-                .join(&workspace_id)
-                .join("leases.json"),
-        )
-        .expect("worktree leases");
+        let workspace = std::env::temp_dir()
+            .join("cowd-completion-pump-tests")
+            .join(&workspace_id);
+        let leases = WorktreeLeaseManager::open(workspace.join("leases.json"))
+            .expect("worktree leases");
         let runner = ExecutionGraphRunner::new(
             registry,
             ExecutionGraphStateStore::new(Arc::clone(&event_store)),
@@ -2038,10 +2258,10 @@ mod completion_pump_tests {
                         .expect("tool quota"),
                 ),
             ])),
-            Arc::new(ScopeLockManager::new()),
+            Arc::new(ScopeLockManager::persistent(workspace.join("scope-locks")).unwrap()),
             Arc::new(leases),
             workspace_id,
-            std::env::temp_dir(),
+            workspace,
         );
         RuntimeExecutionSupervisor::with_limits(
             Arc::new(runner),
@@ -2086,16 +2306,12 @@ mod completion_pump_tests {
             let supervisor = supervisor.clone();
             tokio::spawn(async move { supervisor.shutdown().await })
         };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut second)
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut third)
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut third)
+            .await
+            .is_err());
         assert_eq!(supervisor.health().lifecycle, "closing");
         release.notify_one();
         let second = tokio::time::timeout(Duration::from_secs(1), second)
@@ -2207,7 +2423,13 @@ mod completion_pump_tests {
                 execution_id: parent.id.clone(),
                 node_id: "parent-agent".into(),
             });
-        let payload = serde_json::json!({"kind":"agent_tool_batch.v1", "agent_id":"agent", "run_id":"run", "request":request}).to_string();
+        request.session_id = Some(parent.lineage.as_ref().unwrap().session_id.clone());
+        let payload = crate::execution_core::graph::executors::agent_tool::encode_bound_agent_tool(
+            "agent",
+            "run",
+            request.clone(),
+        )
+        .unwrap();
         let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
         let mut child = ExecutionGraph::new("bound tool child");
         child.id = format!("agent-tool-batch:{digest}");
@@ -2531,7 +2753,7 @@ mod completion_pump_tests {
             state.clone(),
             ExecutionCommitService::new(event_store.clone()),
             resources.clone(),
-            Arc::new(ScopeLockManager::new()),
+            Arc::new(ScopeLockManager::persistent(workspace.join("scope-locks")).unwrap()),
             Arc::new(WorktreeLeaseManager::open(workspace.join("leases.json")).unwrap()),
             "panic-quota-workspace",
             workspace,
@@ -2587,8 +2809,15 @@ mod completion_pump_tests {
         assert_eq!(drained.queued_waiters, 0);
         let (_, panic_report) = panic_result.unwrap().unwrap();
         assert_eq!(panic_report.failed, 1);
+        let canonical = state.load(&panic_graph_id).unwrap();
+        let binding = state.current_binding(&canonical, "panic-node", 1).unwrap();
+        let (ticket, _) = state
+            .binding_start_ticket(&canonical, "panic-node", &binding)
+            .unwrap();
         let effects = event_store
-            .list_stream("execution-effect:idempotency:panic-node:1")
+            .list_stream(
+                &crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(&ticket),
+            )
             .unwrap();
         assert_eq!(
             effects
@@ -2657,8 +2886,14 @@ mod completion_pump_tests {
         let before_shutdown = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
         let current = state.load(&graph_id).unwrap();
         let health = supervisor.health();
+        let binding = state.current_binding(&current, "panic-node", 1).unwrap();
+        let (ticket, _) = state
+            .binding_start_ticket(&current, "panic-node", &binding)
+            .unwrap();
         let effects = events
-            .list_stream("execution-effect:idempotency:panic-node:1")
+            .list_stream(
+                &crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(&ticket),
+            )
             .unwrap();
         supervisor.shutdown().await;
         drop(supervisor);

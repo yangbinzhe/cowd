@@ -2,16 +2,234 @@
 
 use super::*;
 
+pub(crate) const RECENT_EVENT_LINE_METADATA_SQL: &str =
+    "SELECT commit_cursor,transaction_index,
+        384::BIGINT + 6::BIGINT * (octet_length(event_id)::BIGINT + octet_length(stream_id)::BIGINT
+        + octet_length(scope)::BIGINT + octet_length(kind)::BIGINT
+        + COALESCE(octet_length(status),0)::BIGINT + COALESCE(octet_length(actor),0)::BIGINT)
+     FROM runtime_events WHERE commit_cursor<=$3 AND
+        (stream_id=$1 OR EXISTS (SELECT 1 FROM jsonb_array_elements($2::JSONB) AS selected(reference)
+            WHERE refs @> jsonb_build_array(selected.reference)))
+     ORDER BY commit_cursor DESC,transaction_index DESC LIMIT $4";
+
 /// Complete PostgreSQL implementation of the Runtime event backend contract.
 #[derive(Clone, Debug)]
 pub struct PostgresRuntimeEventStore {
     executor: PostgresExecutor,
+    #[cfg(test)]
+    recent_read_counts: Arc<std::sync::Mutex<(usize, usize, usize)>>,
+    #[cfg(test)]
+    sequence_read_counts: Arc<std::sync::Mutex<(usize, usize)>>,
+    #[cfg(test)]
+    recent_interleave: Arc<std::sync::Mutex<Option<RuntimeEventInput>>>,
 }
 
 impl PostgresRuntimeEventStore {
+    fn put_source_checkpoint(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &Value,
+        updated_at_ms: u64,
+        source_fence: Option<&RuntimeSourceMutationFence>,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        validate_projection_id(projection_id)?;
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        pg(tx.batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))?;
+        if let Some(expected) = source_fence {
+            pg(tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':cowd-runtime-source-mutation', 0))",
+                &[],
+            ))?;
+            let row = pg(tx.query_one("SELECT incarnation,mutation_epoch FROM runtime_event_source_fence WHERE singleton=TRUE", &[]))?;
+            let current = RuntimeSourceMutationFence {
+                incarnation: pg(row.try_get(0))?,
+                mutation_epoch: from_i64(pg(row.try_get(1))?, "source mutation epoch")?,
+            };
+            if current != *expected {
+                return Err(RuntimeEventStoreError::Corrupt("source mutation fence changed".into()));
+            }
+        }
+        let lock_key = format!("cowd-runtime-projection:{projection_id}");
+        pg(tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock_key],
+        ))?;
+        let current = pg(tx.query_opt(
+            "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
+               FROM runtime_projection_checkpoints
+              WHERE projection_id=$1 FOR UPDATE",
+            &[&projection_id],
+        ))?
+        .map(|row| row_to_projection_checkpoint(&row))
+        .transpose()?;
+        let checkpoint = match current {
+            Some(current) => {
+                if current.revision != expected_revision {
+                    return Err(RuntimeEventStoreError::StaleRevision {
+                        stream_id: format!("projection:{projection_id}"),
+                        expected: expected_revision,
+                        actual: current.revision,
+                    });
+                }
+                if source_cursor < current.source_cursor {
+                    return Err(RuntimeEventStoreError::StaleRevision {
+                        stream_id: format!("projection-source:{projection_id}"),
+                        expected: source_cursor,
+                        actual: current.source_cursor,
+                    });
+                }
+                if source_cursor == current.source_cursor && current.payload == *payload {
+                    return Ok(current);
+                }
+                let row = pg(tx.query_one(
+                    "UPDATE runtime_projection_checkpoints
+                        SET source_cursor=$1, revision=revision+1, payload=$2, updated_at_ms=$3
+                      WHERE projection_id=$4 AND revision=$5
+                  RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
+                    &[
+                        &to_i64(source_cursor, "source_cursor")?,
+                        payload,
+                        &to_i64(updated_at_ms, "updated_at_ms")?,
+                        &projection_id,
+                        &to_i64(expected_revision, "expected_revision")?,
+                    ],
+                ))?;
+                row_to_projection_checkpoint(&row)?
+            }
+            None => {
+                if expected_revision != 0 {
+                    return Err(RuntimeEventStoreError::StaleRevision {
+                        stream_id: format!("projection:{projection_id}"),
+                        expected: expected_revision,
+                        actual: 0,
+                    });
+                }
+                let row = pg(tx.query_one(
+                    "INSERT INTO runtime_projection_checkpoints
+                        (projection_id, source_cursor, revision, payload, updated_at_ms)
+                     VALUES ($1,$2,1,$3,$4)
+                     RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
+                    &[
+                        &projection_id,
+                        &to_i64(source_cursor, "source_cursor")?,
+                        payload,
+                        &to_i64(updated_at_ms, "updated_at_ms")?,
+                    ],
+                ))?;
+                row_to_projection_checkpoint(&row)?
+            }
+        };
+        pg(tx.commit())?;
+        Ok(checkpoint)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_recent_read_counts(&self) -> (usize, usize, usize) {
+        std::mem::take(&mut *self.recent_read_counts.lock().unwrap())
+    }
+    #[cfg(test)]
+    pub(crate) fn take_sequence_read_counts(&self) -> (usize, usize) {
+        std::mem::take(&mut *self.sequence_read_counts.lock().unwrap())
+    }
+    #[cfg(test)]
+    pub(crate) fn interleave_recent_append(&self, input: RuntimeEventInput) {
+        *self.recent_interleave.lock().unwrap() = Some(input);
+    }
+    #[cfg(test)]
+    pub(crate) fn recent_interleave_pending(&self) -> bool {
+        self.recent_interleave.lock().unwrap().is_some()
+    }
+    fn sequence_page(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+        descending: bool,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        let after_sequence =
+            to_i64(after_sequence, "after_sequence").map_err(|error| error.to_string())?;
+        let through_sequence =
+            to_i64(through_sequence, "through_sequence").map_err(|error| error.to_string())?;
+        if max_events == 0 || max_bytes == 0 || through_sequence <= after_sequence {
+            return Ok(Vec::new());
+        }
+        let limit =
+            i64::try_from(max_events.min(100)).map_err(|_| "page limit overflow".to_string())?;
+        let order = if descending { "DESC" } else { "ASC" };
+        let mut connection = self
+            .checkout_event_read()
+            .map_err(|error| error.to_string())?;
+        let rows = connection.query(
+            &format!("SELECT event_id, encoded_bytes FROM runtime_events WHERE stream_id=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence {order} LIMIT $4"),
+            &[&stream_id, &after_sequence, &through_sequence, &limit],
+        ).map_err(|_| "runtime event metadata read failed".to_string())?;
+        #[cfg(test)]
+        {
+            self.sequence_read_counts.lock().unwrap().0 += rows.len();
+        }
+        let mut selected: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        let budget = max_bytes.min(1024 * 1024);
+        for row in rows {
+            let identity: String = row
+                .try_get(0)
+                .map_err(|_| "event identity is corrupt".to_string())?;
+            let encoded: i64 = row
+                .try_get(1)
+                .map_err(|_| "event encoded bytes are missing".to_string())?;
+            let bytes = usize::try_from(encoded)
+                .ok()
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| "event encoded bytes are corrupt".to_string())?;
+            if bytes > budget.saturating_sub(total) {
+                if selected.is_empty() {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(identity).to_string());
+                }
+                break;
+            }
+            total += bytes;
+            selected.push(identity);
+        }
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let events = pg(connection.query(
+            &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE event_id=ANY($1) ORDER BY sequence {order}"), &[&selected],
+        )).and_then(rows_to_events).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        {
+            self.sequence_read_counts.lock().unwrap().1 += events.len();
+        }
+        let actual_bytes = events.iter().try_fold(0usize, |total, event| {
+            let bytes = serde_json::to_vec(event)
+                .map_err(|error| error.to_string())?
+                .len();
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| "event page bytes overflow".to_string())
+        })?;
+        if events.len() != selected.len() || actual_bytes != total {
+            return Err("event metadata changed during hydration".to_string());
+        }
+        Ok(events)
+    }
     pub fn new(executor: PostgresExecutor) -> RuntimeEventStoreResult<Self> {
+        validate_clean_domain_catalog(&executor, RUNTIME_EVENT_DOMAIN, RUNTIME_EVENT_MIGRATIONS)?;
         executor.apply_migrations(RUNTIME_EVENT_DOMAIN, RUNTIME_EVENT_MIGRATIONS)?;
-        Ok(Self { executor })
+        Ok(Self {
+            executor,
+            #[cfg(test)]
+            recent_read_counts: Arc::new(std::sync::Mutex::new((0, 0, 0))),
+            #[cfg(test)]
+            sequence_read_counts: Arc::new(std::sync::Mutex::new((0, 0))),
+            #[cfg(test)]
+            recent_interleave: Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     pub fn connect(
@@ -49,10 +267,515 @@ impl PostgresRuntimeEventStore {
 }
 
 impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
+    fn bounded_event_by_idempotency_key(
+        &self,
+        stream: &str,
+        key: &str,
+        through: u64,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<runtime::RuntimeBoundedEventLookup> {
+        let mut connection = self.checkout_event_read()?;
+        let through = to_i64(through, "bounded source cut")?;
+        let Some(metadata) = pg(connection.query_opt(
+            "SELECT encoded_bytes FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2 AND commit_cursor<=$3",
+            &[&stream, &key, &through],
+        ))? else {
+            return Ok(runtime::RuntimeBoundedEventLookup::Absent);
+        };
+        let bytes = usize::try_from(from_i64(pg(metadata.try_get(0))?, "bounded event extent")?)
+            .map_err(|_| RuntimeEventStoreError::Corrupt("bounded event extent overflow".into()))?;
+        if bytes == 0 {
+            return Err(RuntimeEventStoreError::Corrupt("zero bounded event extent".into()));
+        }
+        if bytes > max_bytes {
+            return Ok(runtime::RuntimeBoundedEventLookup::Deferred { required_bytes: bytes });
+        }
+        let row = pg(connection.query_opt(
+            &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2 AND commit_cursor<=$3 AND encoded_bytes=$4"),
+            &[&stream, &key, &through, &to_i64(bytes as u64, "bounded event extent")?],
+        ))?.ok_or_else(|| RuntimeEventStoreError::Corrupt("bounded source changed during read".into()))?;
+        let record = row_to_event(&row)?;
+        if serde_json::to_vec(&record)?.len() != bytes {
+            return Err(RuntimeEventStoreError::Corrupt("bounded event extent mismatch".into()));
+        }
+        Ok(runtime::RuntimeBoundedEventLookup::Record { record: Box::new(record), encoded_bytes: bytes })
+    }
+
+    fn recent_event_lines(
+        &self,
+        stream_id: &str,
+        references: &[runtime::RuntimeEventRef],
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<runtime::MissionControlEventLine>, String> {
+        let through =
+            to_i64(through_cursor, "through_cursor").map_err(|error| error.to_string())?;
+        let directory_bytes = references
+            .iter()
+            .try_fold(stream_id.len(), |bytes, reference| {
+                bytes
+                    .checked_add(reference.kind.len())?
+                    .checked_add(reference.id.len())
+            })
+            .ok_or_else(|| "HistoryBudgetExceeded: recent scope directory overflow".to_string())?;
+        if references.len() > 4096 || directory_bytes > 1024 * 1024 {
+            return Err("HistoryBudgetExceeded: recent scope directory".into());
+        }
+        if max_events == 0 || max_bytes == 0 || through == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = max_events.min(50) as i64;
+        let budget = max_bytes.min(1024 * 1024);
+        let references = serde_json::to_value(references).map_err(|error| error.to_string())?;
+        let mut connection = self
+            .checkout_event_read()
+            .map_err(|error| error.to_string())?;
+        let rows = connection
+            .query(
+                RECENT_EVENT_LINE_METADATA_SQL,
+                &[&stream_id, &references, &through, &limit],
+            )
+            .map_err(|_| "recent metadata query failed".to_string())?;
+        #[cfg(test)]
+        {
+            let mut counts = self.recent_read_counts.lock().unwrap();
+            counts.0 += rows.len();
+            counts.2 += rows.len() * 24;
+        }
+        let mut cursors = Vec::with_capacity(rows.len());
+        let mut indexes = Vec::with_capacity(rows.len());
+        let mut total = 0usize;
+        let mut previous = None;
+        for row in rows {
+            let cursor: i64 = row.try_get(0).map_err(|error| error.to_string())?;
+            let index: i64 = row.try_get(1).map_err(|error| error.to_string())?;
+            let encoded: i64 = row.try_get(2).map_err(|error| error.to_string())?;
+            let size =
+                usize::try_from(encoded).map_err(|_| "recent scalar size overflow".to_string())?;
+            let position = (cursor, index);
+            if cursor <= 0
+                || cursor > through
+                || index < 0
+                || index > i64::from(u32::MAX)
+                || previous.is_some_and(|previous| position >= previous)
+            {
+                return Err("recent metadata position mismatch".into());
+            }
+            if size > budget.saturating_sub(total) {
+                return Err("HistoryBudgetExceeded: recent event line scalars".into());
+            }
+            previous = Some(position);
+            total += size;
+            cursors.push(cursor);
+            indexes.push(index);
+        }
+        if cursors.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        {
+            let interleave = self.recent_interleave.lock().unwrap().take();
+            if let Some(input) = interleave {
+                self.append(input)?;
+            }
+        }
+        let rows = connection.query(
+            "SELECT event_id,stream_id,commit_cursor,transaction_index,scope,kind,status,actor,created_at_ms
+             FROM runtime_events WHERE commit_cursor<=$3 AND (commit_cursor,transaction_index) IN
+                (SELECT * FROM unnest($1::BIGINT[],$2::BIGINT[]))
+             ORDER BY commit_cursor DESC,transaction_index DESC", &[&cursors,&indexes,&through],
+        ).map_err(|_| "recent scalar query failed".to_string())?;
+        if rows.len() != cursors.len() {
+            return Err("recent metadata selected rows missing".into());
+        }
+        let mut lines = Vec::with_capacity(rows.len());
+        let mut seen = BTreeSet::new();
+        let mut actual = 0usize;
+        for (offset, row) in rows.iter().enumerate() {
+            let cursor: i64 = row.try_get(2).map_err(|error| error.to_string())?;
+            let index: i64 = row.try_get(3).map_err(|error| error.to_string())?;
+            if (cursor, index) != (cursors[offset], indexes[offset]) {
+                return Err("recent metadata position changed".into());
+            }
+            let created: i64 = row.try_get(8).map_err(|error| error.to_string())?;
+            let line = runtime::MissionControlEventLine {
+                event_id: row.try_get(0).map_err(|error| error.to_string())?,
+                stream_id: row.try_get(1).map_err(|error| error.to_string())?,
+                cursor: from_i64(cursor, "recent cursor").map_err(|error| error.to_string())?,
+                transaction_index: u32::try_from(index)
+                    .map_err(|_| "recent index overflow".to_string())?,
+                scope: row.try_get(4).map_err(|error| error.to_string())?,
+                kind: row.try_get(5).map_err(|error| error.to_string())?,
+                status: row.try_get(6).map_err(|error| error.to_string())?,
+                actor: row.try_get(7).map_err(|error| error.to_string())?,
+                created_at_ms: from_i64(created, "recent timestamp")
+                    .map_err(|error| error.to_string())?,
+            };
+            #[cfg(test)]
+            {
+                let mut counts = self.recent_read_counts.lock().unwrap();
+                counts.1 += 1;
+                counts.2 += 24
+                    + line.event_id.len()
+                    + line.stream_id.len()
+                    + line.scope.len()
+                    + line.kind.len()
+                    + line.status.as_ref().map_or(0, String::len)
+                    + line.actor.as_ref().map_or(0, String::len);
+            }
+            if !seen.insert(line.event_id.clone()) {
+                return Err("recent event identity duplicated".into());
+            }
+            actual = actual
+                .checked_add(
+                    serde_json::to_vec(&line)
+                        .map_err(|error| error.to_string())?
+                        .len(),
+                )
+                .ok_or_else(|| "recent line bytes overflow".to_string())?;
+            if actual > budget || actual > total {
+                return Err("recent metadata size mismatch".into());
+            }
+            lines.push(line);
+        }
+        Ok(lines)
+    }
+    fn transaction_stream_revision_exact(
+        &self,
+        transaction_id: &str,
+        stream_id: &str,
+    ) -> RuntimeEventStoreResult<Option<CommittedStreamRevision>> {
+        let row = pg(self.executor.checkout_online_read()?.query_opt("SELECT expected_revision,committed_revision FROM runtime_transaction_streams WHERE transaction_id=$1 AND stream_id=$2", &[&transaction_id,&stream_id]))?;
+        row.map(|row| {
+            Ok(CommittedStreamRevision {
+                stream_id: stream_id.into(),
+                expected_revision: from_i64(row.get(0), "expected revision")?,
+                committed_revision: from_i64(row.get(1), "committed revision")?,
+            })
+        })
+        .transpose()
+    }
+
+    fn prepared_content_root(
+        &self,
+        origin: &runtime::PreparedArtifactOrigin,
+        artifact: &runtime::ArtifactRef,
+    ) -> RuntimeEventStoreResult<runtime::PreparedContentRoot> {
+        use runtime::{PreparedArtifactOrigin, PreparedContentRoot};
+        origin
+            .validate()
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+        let mut connection = self.executor.checkout_online_read()?;
+        let root = match origin {
+            PreparedArtifactOrigin::EventBody {
+                stream_id,
+                idempotency_key,
+                kind,
+            } => {
+                if kind == "execution.host.transcript" {
+                    let primary = Self::host_transcript_root_event(
+                        &mut connection,
+                        stream_id,
+                        idempotency_key,
+                    )?;
+                    let mut node = None;
+                    let mut graph = None;
+                    if let Some(primary) = primary.as_ref() {
+                        if let Ok((graph_id, _, _)) =
+                            RuntimeEventStore::host_transcript_root_identity(primary)
+                        {
+                            node = Self::host_transcript_pair_metadata(
+                                &mut connection,
+                                primary,
+                                stream_id,
+                                true,
+                            )?;
+                            graph = Self::host_transcript_pair_metadata(
+                                &mut connection,
+                                primary,
+                                &graph_id,
+                                false,
+                            )?;
+                        }
+                    }
+                    return Ok(RuntimeEventStore::host_transcript_root(
+                        primary.as_ref(),
+                        node.as_ref(),
+                        graph.as_ref(),
+                        artifact,
+                    ));
+                }
+                let row = connection.query_opt(
+                    "SELECT CASE WHEN octet_length(kind)<=1024 THEN kind ELSE '' END,schema_version,CASE WHEN octet_length(scope)<=64 THEN scope ELSE '' END,
+                     CASE WHEN octet_length((payload->'observation_schema')::TEXT)<=16 THEN payload->'observation_schema' END,
+                     jsonb_build_object('content_schema',CASE WHEN octet_length((e->'content_schema')::TEXT)<=16 THEN e->'content_schema' END,
+                        'sha256',CASE WHEN octet_length((e->'sha256')::TEXT)<=80 THEN e->'sha256' END,
+                        'bytes',CASE WHEN octet_length((e->'bytes')::TEXT)<=20 THEN e->'bytes' END,
+                        'body',CASE WHEN octet_length(((e->'body')-'value')::TEXT)<=8192 THEN (e->'body')-'value' ELSE NULL END),
+                     CASE WHEN kind='goal.observation' AND octet_length(payload->>'session_id')<=1024 THEN payload->>'session_id'
+                        WHEN kind<>'goal.observation' AND octet_length(payload#>>'{_runtime_activity_binding,session_id}')<=1024 THEN payload#>>'{_runtime_activity_binding,session_id}' END
+                     FROM runtime_events CROSS JOIN LATERAL (SELECT CASE WHEN kind='goal.observation' THEN payload->'observation_body' ELSE payload END AS e) selected
+                     WHERE stream_id=$1 AND idempotency_key=$2", &[&stream_id,&idempotency_key]).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+                match row {
+                    None => PreparedContentRoot::Absent,
+                    Some(row) => {
+                        let actual_kind: String = row.get(0);
+                        let scope: String = row.get(2);
+                        if row.get::<_, Option<String>>(5).is_none_or(|session| {
+                            artifact.visibility_scope != format!("session:{session}")
+                        }) {
+                            return Ok(PreparedContentRoot::Blocked);
+                        }
+                        if actual_kind != *kind
+                            || row.get::<_, i64>(1) != 2
+                            || (kind == "goal.observation"
+                                && (scope != "goal"
+                                    || row.get::<_, Option<Value>>(3)
+                                        != Some(serde_json::json!(2))))
+                            || (kind != "goal.observation" && scope != "execution_graph")
+                        {
+                            return Ok(PreparedContentRoot::Blocked);
+                        }
+                        RuntimeEventStore::prepared_slot_root(&row.get::<_, Value>(4), artifact)
+                    }
+                }
+            }
+            PreparedArtifactOrigin::ToolEffectClosure {
+                stream_id,
+                idempotency_key,
+            } => {
+                let primary =
+                    Self::process_closure_root_event(&mut connection, stream_id, idempotency_key)?;
+                let identity = primary.as_ref().and_then(|primary| {
+                    RuntimeEventStore::process_closure_index_identity(
+                        &primary.payload,
+                        &primary.refs,
+                    )
+                    .ok()
+                });
+                let index = match identity {
+                    Some((stream, key)) => {
+                        Self::process_closure_root_event(&mut connection, &stream, &key)?
+                    }
+                    None => None,
+                };
+                RuntimeEventStore::process_closure_root(primary.as_ref(), index.as_ref(), artifact)
+            }
+            PreparedArtifactOrigin::CheckpointBody {
+                projection_id,
+                source_cursor,
+            } => {
+                let row = connection.query_opt(
+                    "SELECT source_cursor,
+                     CASE WHEN octet_length((payload->'schema')::TEXT)<=16 THEN payload->'schema' END,
+                     CASE WHEN octet_length((payload->'schema_version')::TEXT)<=16 THEN payload->'schema_version' END,
+                     jsonb_build_object('content_schema',CASE WHEN octet_length((payload#>'{body,content_schema}')::TEXT)<=16 THEN payload#>'{body,content_schema}' END,
+                        'sha256',CASE WHEN octet_length((payload#>'{body,sha256}')::TEXT)<=80 THEN payload#>'{body,sha256}' END,
+                        'bytes',CASE WHEN octet_length((payload#>'{body,bytes}')::TEXT)<=20 THEN payload#>'{body,bytes}' END,
+                        'body',CASE WHEN octet_length(((payload#>'{body,body}')-'value')::TEXT)<=8192 THEN (payload#>'{body,body}')-'value' ELSE NULL END),
+                     CASE WHEN octet_length(payload->>'scope')<=1024 THEN payload->>'scope'
+                        WHEN octet_length(payload->>'session_id')<=1024 THEN 'session:'||(payload->>'session_id') END,
+                     COALESCE(jsonb_typeof(payload->'source_fence')='object',FALSE)
+                     FROM runtime_projection_checkpoints WHERE projection_id=$1", &[&projection_id]).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+                match row {
+                    None => PreparedContentRoot::Absent,
+                    Some(row) => {
+                        let schema: Option<Value> = row.get(
+                            if projection_id.starts_with("runtime:agentic-read-model:v1:") {
+                                2
+                            } else {
+                                1
+                            },
+                        );
+                        let valid_schema = if projection_id.starts_with("projection-history:") {
+                            matches!(schema.as_ref().and_then(Value::as_u64), Some(3 | 4 | 5 | 6))
+                                && (schema != Some(serde_json::json!(6)) || row.get::<_, bool>(5))
+                        } else {
+                            schema == Some(serde_json::json!(2))
+                        };
+                        if !valid_schema {
+                            return Ok(PreparedContentRoot::Blocked);
+                        }
+                        if row.get::<_, Option<String>>(4).as_ref()
+                            != Some(&artifact.visibility_scope)
+                        {
+                            return Ok(PreparedContentRoot::Blocked);
+                        }
+                        match RuntimeEventStore::prepared_slot_root(
+                            &row.get::<_, Value>(3),
+                            artifact,
+                        ) {
+                            PreparedContentRoot::Canonical
+                                if from_i64(row.get(0), "checkpoint source")? == *source_cursor =>
+                            {
+                                PreparedContentRoot::Checkpoint
+                            }
+                            PreparedContentRoot::Canonical => PreparedContentRoot::Blocked,
+                            root => root,
+                        }
+                    }
+                }
+            }
+            PreparedArtifactOrigin::TerminalBody {
+                terminal_id,
+                session_id,
+                execution_id,
+                turn_id,
+                event_stream,
+                event_key,
+            } => {
+                let mut found = false;
+                let mut outbox_reference = None;
+                if let Some(row) = connection
+                    .query_opt(
+                        "SELECT CASE WHEN octet_length(session_id)<=1024 THEN session_id END,
+                     CASE WHEN octet_length(execution_id)<=1024 THEN execution_id END,
+                     CASE WHEN octet_length(turn_id)<=1024 THEN turn_id END,
+                     CASE WHEN octet_length(payload_ref)<=8192 THEN payload_ref END
+                     FROM runtime_session_outbox WHERE terminal_id=$1",
+                        &[&terminal_id],
+                    )
+                    .map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?
+                {
+                    if row.get::<_, Option<String>>(0).as_ref() != Some(session_id)
+                        || row.get::<_, Option<String>>(1).as_ref() != Some(execution_id)
+                        || row.get::<_, Option<String>>(2).as_ref() != Some(turn_id)
+                    {
+                        return Ok(PreparedContentRoot::Blocked);
+                    }
+                    match row
+                        .get::<_, Option<String>>(3)
+                        .as_deref()
+                        .ok_or(())
+                        .and_then(|encoded| {
+                            runtime::decode_session_terminal_artifact_ref(encoded).map_err(|_| ())
+                        }) {
+                        Ok(reference) => {
+                            if reference.visibility_scope != format!("session:{session_id}")
+                                || reference.media_type
+                                    != "application/vnd.cowd.session-terminal+json"
+                                || !reference.is_durable()
+                            {
+                                return Ok(PreparedContentRoot::Blocked);
+                            }
+                            found |= &reference == artifact;
+                            outbox_reference = Some(reference);
+                        }
+                        Err(_) => return Ok(PreparedContentRoot::Blocked),
+                    }
+                }
+                if let Some(row) = connection.query_opt(
+                    "SELECT kind,CASE WHEN octet_length((payload-'payload_ref')::TEXT)<=8192 THEN jsonb_build_object('terminal_id',payload->'terminal_id','session_id',payload->'session_id','execution_id',payload->'execution_id','turn_id',payload->'turn_id') END,
+                     CASE WHEN octet_length(payload->>'payload_ref')<=8192 THEN payload->>'payload_ref' END,
+                     CASE WHEN octet_length(scope)<=64 THEN scope ELSE '' END,schema_version
+                     FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2", &[&event_stream,&event_key]).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))? {
+                    let payload: Option<Value> = row.get(1);
+                    let Some(payload) = payload else { return Ok(PreparedContentRoot::Blocked); };
+                    if row.get::<_,String>(3) != "session_input" || row.get::<_,i64>(4) != 1 || row.get::<_,String>(0) != "runtime.session.terminal_requested" || payload["terminal_id"] != *terminal_id
+                        || payload["session_id"] != *session_id || payload["execution_id"] != *execution_id || payload["turn_id"] != *turn_id { return Ok(PreparedContentRoot::Blocked); }
+                    match row.get::<_,Option<String>>(2).as_deref().ok_or(()).and_then(|encoded| runtime::decode_session_terminal_artifact_ref(encoded).map_err(|_| ())) {
+                        Ok(reference) => {
+                            if reference.visibility_scope != format!("session:{session_id}") || reference.media_type != "application/vnd.cowd.session-terminal+json" || !reference.is_durable()
+                                || outbox_reference.as_ref().is_some_and(|outbox| outbox != &reference) { return Ok(PreparedContentRoot::Blocked); }
+                            found |= &reference == artifact;
+                        }
+                        Err(_) => return Ok(PreparedContentRoot::Blocked),
+                    }
+                }
+                if found {
+                    PreparedContentRoot::Terminal
+                } else {
+                    PreparedContentRoot::Absent
+                }
+            }
+        };
+        if root == PreparedContentRoot::Absent {
+            let reference = serde_json::json!([{"kind":"artifact","id":artifact.selector}]);
+            if pg(connection.query_one(
+                "SELECT EXISTS(SELECT 1 FROM runtime_events WHERE refs @> $1::JSONB)",
+                &[&reference],
+            ))?
+            .get::<_, bool>(0)
+            {
+                return Ok(PreparedContentRoot::Canonical);
+            }
+        }
+        Ok(root)
+    }
+    fn position_page(
+        &self,
+        scope: RuntimeEventScope,
+        identity: &str,
+        kind: Option<&str>,
+        after: Option<(u64, u32)>,
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        let through =
+            to_i64(through_cursor, "through_cursor").map_err(|error| error.to_string())?;
+        let (cursor, index) = after.unwrap_or((0, 0));
+        let cursor = to_i64(cursor, "after_cursor").map_err(|error| error.to_string())?;
+        if max_events == 0 || max_bytes == 0 || identity.is_empty() {
+            return Ok(Vec::new());
+        }
+        let predicate = match scope {
+            RuntimeEventScope::Session => "(session_id=$1 OR stream_id=$1 OR stream_id='session:'||$1 OR refs @> jsonb_build_array(jsonb_build_object('kind','session','id',$1::text)))",
+            RuntimeEventScope::ExecutionGraph => "(root_execution_id=$1 OR stream_id=$1 OR refs @> jsonb_build_array(jsonb_build_object('kind','execution_graph','id',$1::text)) OR refs @> jsonb_build_array(jsonb_build_object('kind','execution','id',$1::text)))",
+            RuntimeEventScope::ExecutionNode => "activity_id=$1",
+            _ => return Err("unsupported position query scope".into()),
+        };
+        let kind = kind.unwrap_or("");
+        let limit =
+            i64::try_from(max_events.min(100)).map_err(|_| "page limit overflow".to_string())?;
+        let mut connection = self
+            .checkout_event_read()
+            .map_err(|error| error.to_string())?;
+        let metadata = connection.query(&format!("SELECT event_id,encoded_bytes FROM runtime_events WHERE {predicate} AND ($2='' OR kind=$2) AND (commit_cursor,transaction_index)>($3,$4) AND commit_cursor<=$5 ORDER BY commit_cursor,transaction_index LIMIT $6"),
+            &[&identity,&kind,&cursor,&i64::from(index),&through,&limit]).map_err(|_| "event position metadata read failed".to_string())?;
+        let mut selected: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        let budget = max_bytes.min(1024 * 1024);
+        for row in metadata {
+            let identity: String = row.get(0);
+            let bytes = usize::try_from(row.get::<_, i64>(1))
+                .ok()
+                .filter(|bytes| *bytes > 0)
+                .ok_or("invalid event size metadata")?;
+            if bytes > budget.saturating_sub(total) {
+                if selected.is_empty() {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(identity).to_string());
+                }
+                break;
+            }
+            total += bytes;
+            selected.push(identity);
+        }
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let events = pg(connection.query(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE event_id=ANY($1) ORDER BY commit_cursor,transaction_index"), &[&selected]))
+            .and_then(rows_to_events).map_err(|error| error.to_string())?;
+        let actual = events.iter().try_fold(0usize, |total, event| {
+            total
+                .checked_add(
+                    serde_json::to_vec(event)
+                        .map_err(|error| error.to_string())?
+                        .len(),
+                )
+                .ok_or_else(|| "event page byte overflow".to_string())
+        })?;
+        if events.len() != selected.len() || actual != total {
+            return Err("event position metadata changed during hydration".into());
+        }
+        Ok(events)
+    }
     fn durable_commit_cursor(&self) -> RuntimeEventStoreResult<u64> {
         let mut connection = self.checkout_event_read()?;
         let row = pg(connection.query_one(
-            "SELECT COALESCE(MAX(commit_cursor), 0) FROM runtime_commits", &[],
+            "SELECT COALESCE(MAX(commit_cursor), 0) FROM runtime_commits",
+            &[],
         ))?;
         from_i64(pg(row.try_get(0))?, "commit_cursor")
     }
@@ -261,30 +984,51 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         if max_commits == 0 {
             return Ok(Vec::new());
         }
+        let cursor = to_i64(cursor, "cursor")?;
+        let limit = to_i64(max_commits.min(100) as u64, "max_commits")?;
         let mut connection = self.checkout_event_read()?;
-        let rows = pg(connection.query(
-            &format!(
-                "WITH selected_commits AS (
-                    SELECT commit_cursor FROM runtime_commits
-                     WHERE commit_cursor>$1
-                     ORDER BY commit_cursor ASC LIMIT $2
-                 )
-                 SELECT event_id, stream_id, sequence, scope, kind, status, actor, payload, refs,
-                        created_at_ms, event.commit_cursor, transaction_id, transaction_index,
-                        schema_version, idempotency_key
-                   FROM runtime_events AS event
-                   JOIN selected_commits AS selected
-                     ON selected.commit_cursor=event.commit_cursor
-                  ORDER BY event.commit_cursor ASC, transaction_index ASC"
-            ),
-            &[
-                &to_i64(cursor, "cursor")?,
-                &to_i64(max_commits as u64, "max_commits")?,
-            ],
+        let metadata = pg(connection.query(
+            "SELECT selected.commit_cursor, COALESCE(SUM(event.encoded_bytes),0)::BIGINT
+               FROM (SELECT commit_cursor FROM runtime_commits WHERE commit_cursor>$1 ORDER BY commit_cursor LIMIT $2) selected
+               LEFT JOIN runtime_events event ON event.commit_cursor=selected.commit_cursor
+              GROUP BY selected.commit_cursor ORDER BY selected.commit_cursor",
+            &[&cursor, &limit],
         ))?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            events.push(row_to_event(&row)?);
+        let mut selected = Vec::<i64>::new();
+        let mut total = 0usize;
+        for row in metadata {
+            let position: i64 = pg(row.try_get(0))?;
+            let bytes = usize::try_from(pg(row.try_get::<_, i64>(1))?).map_err(|_| {
+                RuntimeEventStoreError::Corrupt("invalid transaction metadata bytes".into())
+            })?;
+            if bytes > (1024usize * 1024).saturating_sub(total) {
+                if selected.is_empty() {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                        "committed transaction".into(),
+                    ));
+                }
+                break;
+            }
+            total += bytes;
+            selected.push(position);
+        }
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let events = rows_to_events(pg(connection.query(
+            &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE commit_cursor=ANY($1) ORDER BY commit_cursor,transaction_index"),
+            &[&selected],
+        ))?)?;
+        let actual = events.iter().try_fold(0usize, |total, event| {
+            let bytes = serde_json::to_vec(event)?.len();
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| RuntimeEventStoreError::Corrupt("transaction bytes overflow".into()))
+        })?;
+        if actual != total {
+            return Err(RuntimeEventStoreError::Corrupt(
+                "transaction metadata bytes mismatch".into(),
+            ));
         }
         Ok(group_committed_events(events))
     }
@@ -297,6 +1041,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         max_events: usize,
         max_bytes: usize,
     ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
+        let cursor_sql = to_i64(cursor, "cursor")?;
         if max_commits == 0 {
             return Ok(RuntimeProjectionScanPage {
                 scanned_through_cursor: cursor,
@@ -305,14 +1050,10 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         }
         let mut connection = self.checkout_event_read()?;
         let selected_rows = pg(connection.query(
-            "SELECT commit_cursor, transaction_id FROM runtime_commits
-              WHERE commit_cursor > $1 ORDER BY commit_cursor ASC LIMIT $2",
-            &[
-                &to_i64(cursor, "cursor")?,
-                &to_i64(max_commits as u64, "max_commits")?,
-            ],
+            "SELECT commit_cursor, transaction_id FROM runtime_commits WHERE commit_cursor>$1 ORDER BY commit_cursor LIMIT $2",
+            &[&cursor_sql, &to_i64(max_commits.min(100) as u64, "max_commits")?],
         ))?;
-        let selected = selected_rows
+        let mut selected = selected_rows
             .iter()
             .map(|row| {
                 Ok((
@@ -327,43 +1068,69 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 ..RuntimeProjectionScanPage::default()
             });
         };
-        let events = if interest.events.is_empty() {
+        let interest_json = Value::Array(
+            interest
+                .events
+                .iter()
+                .map(|event| serde_json::json!({"scope":event.scope.as_str(),"kind":event.kind}))
+                .collect(),
+        );
+        let predicate = "commit_cursor>$1 AND commit_cursor<=$2 AND EXISTS(SELECT 1 FROM jsonb_array_elements($3::jsonb) wanted WHERE event.scope=wanted->>'scope' AND event.kind=wanted->>'kind')";
+        let metadata = pg(connection.query(
+            &format!("SELECT commit_cursor,COUNT(*)::BIGINT,SUM(encoded_bytes)::BIGINT FROM runtime_events event WHERE {predicate} GROUP BY commit_cursor ORDER BY commit_cursor"),
+            &[&cursor_sql,&to_i64(*highwater,"highwater")?,&interest_json],
+        ))?;
+        let mut sizes = BTreeMap::new();
+        for row in metadata {
+            let position = from_i64(pg(row.try_get(0))?, "commit_cursor")?;
+            let count = usize::try_from(pg(row.try_get::<_, i64>(1))?).map_err(|_| {
+                RuntimeEventStoreError::Corrupt("invalid matched event count".into())
+            })?;
+            let bytes = usize::try_from(pg(row.try_get::<_, i64>(2))?).map_err(|_| {
+                RuntimeEventStoreError::Corrupt("invalid matched event bytes".into())
+            })?;
+            sizes.insert(position, (count, bytes));
+        }
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        let mut accepted = 0usize;
+        for (position, _) in &selected {
+            let (additional_count, additional_bytes) =
+                sizes.get(position).copied().unwrap_or_default();
+            if additional_count > max_events.min(100).saturating_sub(count)
+                || additional_bytes > max_bytes.min(1024 * 1024).saturating_sub(bytes)
+            {
+                if count == 0 {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                        "projection transaction".into(),
+                    ));
+                }
+                break;
+            }
+            count += additional_count;
+            bytes += additional_bytes;
+            accepted += 1;
+        }
+        selected.truncate(accepted);
+        let through = selected.last().map_or(cursor, |(position, _)| *position);
+        let events = if count == 0 {
             Vec::new()
         } else {
-            let interest_json = Value::Array(
-                interest
-                    .events
-                    .iter()
-                    .map(|event| {
-                        serde_json::json!({
-                            "scope": event.scope.as_str(),
-                            "kind": event.kind,
-                        })
-                    })
-                    .collect(),
-            );
-            let rows = pg(connection.query(
-                "SELECT event_id, stream_id, sequence, scope, kind, status, actor, payload, refs,
-                        created_at_ms, commit_cursor, transaction_id, transaction_index,
-                        schema_version, idempotency_key
-                   FROM runtime_events AS event
-                  WHERE commit_cursor > $1 AND commit_cursor <= $2
-                    AND EXISTS (
-                        SELECT 1 FROM jsonb_array_elements($3::jsonb) AS wanted
-                         WHERE event.scope = wanted->>'scope' AND event.kind = wanted->>'kind'
-                    )
-                  ORDER BY commit_cursor ASC, transaction_index ASC",
-                &[
-                    &to_i64(cursor, "cursor")?,
-                    &to_i64(*highwater, "highwater")?,
-                    &interest_json,
-                ],
-            ))?;
-            rows_to_events(rows)?
+            rows_to_events(pg(connection.query(
+                &format!("SELECT {EVENT_COLUMNS} FROM runtime_events event WHERE {predicate} ORDER BY commit_cursor,transaction_index"),
+                &[&cursor_sql,&to_i64(through,"through")?,&interest_json],
+            ))?)?
         };
-        Ok(build_projection_scan_page(
-            cursor, selected, events, max_events, max_bytes,
-        ))
+        let actual = events.iter().try_fold(0usize, |sum, event| {
+            sum.checked_add(serde_json::to_vec(event)?.len())
+                .ok_or_else(|| RuntimeEventStoreError::Corrupt("projection bytes overflow".into()))
+        })?;
+        if actual != bytes || events.len() != count {
+            return Err(RuntimeEventStoreError::Corrupt(
+                "projection metadata bytes mismatch".into(),
+            ));
+        }
+        Ok(build_projection_scan_page(cursor, selected, events))
     }
 
     fn projection_checkpoint(
@@ -480,6 +1247,27 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         Ok(checkpoint)
     }
 
+    fn source_mutation_fence(&self) -> RuntimeEventStoreResult<RuntimeSourceMutationFence> {
+        let mut connection = self.checkout_event_read()?;
+        let row = pg(connection.query_one("SELECT incarnation,mutation_epoch FROM runtime_event_source_fence WHERE singleton=TRUE", &[]))?;
+        Ok(RuntimeSourceMutationFence {
+            incarnation: pg(row.try_get(0))?,
+            mutation_epoch: from_i64(pg(row.try_get(1))?, "source mutation epoch")?,
+        })
+    }
+
+    fn compare_and_put_projection_checkpoint_fenced(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &Value,
+        updated_at_ms: u64,
+        source_fence: &RuntimeSourceMutationFence,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        self.put_source_checkpoint(projection_id, source_cursor, expected_revision, payload, updated_at_ms, Some(source_fence))
+    }
+
     fn compare_and_put_projection_checkpoint(
         &self,
         projection_id: &str,
@@ -488,83 +1276,8 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         payload: &Value,
         updated_at_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
-        validate_projection_id(projection_id)?;
-        let mut connection = self.checkout_event_write()?;
-        let mut tx = pg(connection.transaction())?;
-        let lock_key = format!("cowd-runtime-projection:{projection_id}");
-        pg(tx.query_one(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-            &[&lock_key],
-        ))?;
-        let current = pg(tx.query_opt(
-            "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
-               FROM runtime_projection_checkpoints
-              WHERE projection_id=$1 FOR UPDATE",
-            &[&projection_id],
-        ))?
-        .map(|row| row_to_projection_checkpoint(&row))
-        .transpose()?;
-        let checkpoint = match current {
-            Some(current) => {
-                if current.revision != expected_revision {
-                    return Err(RuntimeEventStoreError::StaleRevision {
-                        stream_id: format!("projection:{projection_id}"),
-                        expected: expected_revision,
-                        actual: current.revision,
-                    });
-                }
-                if source_cursor < current.source_cursor {
-                    return Err(RuntimeEventStoreError::StaleRevision {
-                        stream_id: format!("projection-source:{projection_id}"),
-                        expected: source_cursor,
-                        actual: current.source_cursor,
-                    });
-                }
-                if source_cursor == current.source_cursor && current.payload == *payload {
-                    return Ok(current);
-                }
-                let row = pg(tx.query_one(
-                    "UPDATE runtime_projection_checkpoints
-                        SET source_cursor=$1, revision=revision+1, payload=$2, updated_at_ms=$3
-                      WHERE projection_id=$4 AND revision=$5
-                  RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
-                    &[
-                        &to_i64(source_cursor, "source_cursor")?,
-                        payload,
-                        &to_i64(updated_at_ms, "updated_at_ms")?,
-                        &projection_id,
-                        &to_i64(expected_revision, "expected_revision")?,
-                    ],
-                ))?;
-                row_to_projection_checkpoint(&row)?
-            }
-            None => {
-                if expected_revision != 0 {
-                    return Err(RuntimeEventStoreError::StaleRevision {
-                        stream_id: format!("projection:{projection_id}"),
-                        expected: expected_revision,
-                        actual: 0,
-                    });
-                }
-                let row = pg(tx.query_one(
-                    "INSERT INTO runtime_projection_checkpoints
-                        (projection_id, source_cursor, revision, payload, updated_at_ms)
-                     VALUES ($1,$2,1,$3,$4)
-                     RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
-                    &[
-                        &projection_id,
-                        &to_i64(source_cursor, "source_cursor")?,
-                        payload,
-                        &to_i64(updated_at_ms, "updated_at_ms")?,
-                    ],
-                ))?;
-                row_to_projection_checkpoint(&row)?
-            }
-        };
-        pg(tx.commit())?;
-        Ok(checkpoint)
+        self.put_source_checkpoint(projection_id, source_cursor, expected_revision, payload, updated_at_ms, None)
     }
-
     fn compare_and_repair_projection_checkpoint(
         &self,
         projection_id: &str,
@@ -659,39 +1372,52 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         max_events: usize,
         max_bytes: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
-        if max_events == 0 || max_bytes == 0 || through_sequence <= after_sequence {
-            return Ok(Vec::new());
-        }
+        self.sequence_page(
+            stream_id,
+            after_sequence,
+            through_sequence,
+            max_events,
+            max_bytes,
+            false,
+        )
+    }
+
+    fn list_stream_before(
+        &self,
+        stream_id: &str,
+        through_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.sequence_page(stream_id, 0, through_sequence, max_events, max_bytes, true)
+    }
+
+    fn count_stream_kinds(
+        &self,
+        stream_id: &str,
+        kinds: &[&str],
+        through_sequence: u64,
+    ) -> Result<u64, String> {
+        let through_sequence =
+            to_i64(through_sequence, "through_sequence").map_err(|error| error.to_string())?;
+        let kinds = kinds.iter().copied().collect::<BTreeSet<_>>();
         let mut connection = self
             .checkout_event_read()
             .map_err(|error| error.to_string())?;
-        let after_sequence =
-            to_i64(after_sequence, "after_sequence").map_err(|error| error.to_string())?;
-        let through_sequence =
-            to_i64(through_sequence, "through_sequence").map_err(|error| error.to_string())?;
-        let limit = to_i64(max_events as u64, "max_events").map_err(|error| error.to_string())?;
-        let events = pg(connection.query(
-            &format!(
-                "SELECT {EVENT_COLUMNS} FROM runtime_events \
-                 WHERE stream_id=$1 AND sequence>$2 AND sequence<=$3 \
-                 ORDER BY sequence ASC LIMIT $4"
-            ),
-            &[&stream_id, &after_sequence, &through_sequence, &limit],
-        ))
-        .and_then(rows_to_events)
-        .map_err(|error| error.to_string())?;
-        let mut bytes = 0usize;
-        Ok(events
-            .into_iter()
-            .take_while(|event| {
-                let event_bytes = serde_json::to_vec(event).map_or(0, |value| value.len());
-                let keep = bytes == 0 || bytes.saturating_add(event_bytes) <= max_bytes;
-                if keep {
-                    bytes = bytes.saturating_add(event_bytes);
-                }
-                keep
-            })
-            .collect())
+        let mut total = 0u64;
+        for kind in kinds {
+            let row = connection.query_one("SELECT COUNT(*) FROM runtime_events WHERE stream_id=$1 AND kind=$2 AND sequence<=$3", &[&stream_id, &kind, &through_sequence])
+                .map_err(|_| "runtime event count failed".to_string())?;
+            let count: i64 = row
+                .try_get(0)
+                .map_err(|_| "runtime event count is corrupt".to_string())?;
+            let count =
+                u64::try_from(count).map_err(|_| "runtime event count overflow".to_string())?;
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| "runtime event count overflow".to_string())?;
+        }
+        Ok(total)
     }
 
     fn list_stream_page_desc(
@@ -700,22 +1426,14 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let mut connection = self
-            .checkout_event_read()
+        let offset = u64::try_from(offset).map_err(|_| "history offset overflow".to_string())?;
+        i64::try_from(offset).map_err(|_| "history offset exceeds current schema".to_string())?;
+        let head = self
+            .stream_revision(stream_id)
             .map_err(|error| error.to_string())?;
-        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
-        let offset = to_i64(offset as u64, "offset").map_err(|error| error.to_string())?;
-        pg(connection.query(
-            &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 ORDER BY sequence DESC LIMIT $2 OFFSET $3"),
-            &[&stream_id, &limit, &offset],
-        ))
-        .and_then(rows_to_events)
-        .map_err(|error| error.to_string())
+        let through = head.saturating_sub(offset);
+        self.sequence_page(stream_id, 0, through, limit, 1024 * 1024, true)
     }
-
     fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
         let mut connection = self
             .checkout_event_read()
@@ -1364,6 +2082,31 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         pg(row.try_get(0))
     }
 
+    fn session_terminal_for_execution(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
+        RuntimeEventStore::validate_terminal_execution_selector(session_id, execution_id, turn_id)?;
+        let mut connection = self.checkout_event_read()?;
+        let rows = pg(connection.query(
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                    request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                    input_claim_revision, status, attempts, next_attempt_at, claim_owner, claim_expires_at,
+                    failure_class, last_error, materialized_at, revision
+               FROM runtime_session_outbox
+              WHERE session_id=$1 AND execution_id=$2 AND turn_id=$3 LIMIT 2",
+            &[&session_id, &execution_id, &turn_id],
+        ))?;
+        if rows.len() > 1 {
+            return Err(RuntimeEventStoreError::Corrupt(
+                "ambiguous Session terminal source tuple".into(),
+            ));
+        }
+        rows.first().map(row_to_runtime_session_outbox).transpose()
+    }
+
     fn materialized_session_terminals_after(
         &self,
         session_id: &str,
@@ -1731,6 +2474,7 @@ fn append_transaction_in_tx(
     terminal: Option<&SessionTerminalInput>,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
     validate_transaction(request)?;
+    RuntimeEventStore::validate_current_content_inputs(request)?;
     if let Some(terminal) = terminal {
         validate_fenced_terminal(terminal)?;
         if serde_json::to_vec(&(request, terminal))?.len() > MAX_TRANSACTION_BYTES {
@@ -1813,6 +2557,29 @@ fn append_transaction_in_tx(
         *offset += 1;
         let sequence = expected[stream_id] + *offset;
         let event_id = format!("runtime-event-{}", uuid::Uuid::new_v4());
+        let encoded_bytes = serde_json::to_vec(&DurableRuntimeEvent {
+            event_id: event_id.clone(),
+            stream_id: input.event.stream_id.clone(),
+            sequence,
+            scope: input.event.scope,
+            kind: input.event.kind.clone(),
+            status: input.event.status.clone(),
+            actor: input.event.actor.clone(),
+            payload: input.event.payload.clone(),
+            refs: input.event.refs.clone(),
+            created_at_ms,
+            commit_cursor,
+            transaction_id: request.transaction_id.clone(),
+            transaction_index: u32::try_from(transaction_index).map_err(|_| {
+                RuntimeEventStoreError::InvalidTransaction("transaction index overflow".into())
+            })?,
+            schema_version: input.schema_version,
+            idempotency_key: input.idempotency_key.clone(),
+        })?
+        .len();
+        let encoded_bytes = i64::try_from(encoded_bytes).map_err(|_| {
+            RuntimeEventStoreError::InvalidTransaction("event bytes overflow".into())
+        })?;
         let refs = serde_json::to_value(&input.event.refs)?;
         let activity_binding = input.event.activity_binding();
         let root_execution_id = activity_binding
@@ -1821,11 +2588,22 @@ fn append_transaction_in_tx(
         let activity_id = activity_binding
             .as_ref()
             .map(|binding| binding.activity_id.as_str());
+        let session_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.session_id.as_str())
+            .or_else(|| {
+                input
+                    .event
+                    .refs
+                    .iter()
+                    .find(|reference| reference.kind == "session")
+                    .map(|reference| reference.id.as_str())
+            });
         pg(tx.execute(
             "INSERT INTO runtime_events (event_id, stream_id, sequence, scope, kind, status, actor,
                 payload, refs, created_at_ms, commit_cursor, transaction_id, transaction_index,
-                schema_version, idempotency_key, root_execution_id, activity_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+                schema_version, idempotency_key, root_execution_id, activity_id, encoded_bytes, session_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
             &[
                 &event_id,
                 &input.event.stream_id,
@@ -1844,6 +2622,8 @@ fn append_transaction_in_tx(
                 &input.idempotency_key,
                 &root_execution_id,
                 &activity_id,
+                &encoded_bytes,
+                &session_id,
             ],
         ))?;
         event_ids.push(event_id);
@@ -2135,8 +2915,6 @@ fn build_projection_scan_page(
     cursor: u64,
     selected: Vec<(u64, String)>,
     events: Vec<RuntimeEventRecord>,
-    max_events: usize,
-    max_bytes: usize,
 ) -> RuntimeProjectionScanPage {
     let mut events_by_commit = group_committed_events(events)
         .into_iter()
@@ -2146,26 +2924,14 @@ fn build_projection_scan_page(
         scanned_through_cursor: cursor,
         ..RuntimeProjectionScanPage::default()
     };
-    let mut matched_bytes = 0_usize;
     for (commit_cursor, transaction_id) in selected {
         let events = events_by_commit.remove(&commit_cursor).unwrap_or_default();
-        let batch_bytes = events.iter().fold(0_usize, |total, event| {
-            total.saturating_add(serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
-        });
-        if !page.batches.is_empty()
-            && !events.is_empty()
-            && (page.matched_events.saturating_add(events.len()) > max_events.max(1)
-                || matched_bytes.saturating_add(batch_bytes) > max_bytes.max(1))
-        {
-            break;
-        }
         page.scanned_through_cursor = commit_cursor;
         page.scanned_commits = page.scanned_commits.saturating_add(1);
         if events.is_empty() {
             continue;
         }
         page.matched_events = page.matched_events.saturating_add(events.len());
-        matched_bytes = matched_bytes.saturating_add(batch_bytes);
         page.batches.push(CommittedEventBatch {
             commit_cursor,
             transaction_id,
@@ -2245,4 +3011,284 @@ fn to_i64(value: u64, field: &str) -> RuntimeEventStoreResult<i64> {
     i64::try_from(value).map_err(|_| {
         RuntimeEventStoreError::InvalidTransaction(format!("runtime event `{field}` exceeds i64"))
     })
+}
+
+#[cfg(test)]
+mod current_history_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn r1_bounded_history_reads_checkpoint_and_limited_tail() {
+        let (store, fixture) = crate::tests::open_real_store();
+        for sequence in 0..512 {
+            store
+                .append(RuntimeEventInput {
+                    stream_id: "bounded-checkpoint".into(),
+                    scope: RuntimeEventScope::Session,
+                    kind: "current.fact".into(),
+                    status: None,
+                    actor: None,
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"sequence":sequence}),
+                })
+                .unwrap();
+        }
+        let checkpoint = store
+            .compare_and_put_projection_checkpoint(
+                "bounded-checkpoint-reader",
+                480,
+                0,
+                &serde_json::json!({"count":480}),
+                0,
+            )
+            .unwrap();
+        fixture.reconnect().checkout_critical().unwrap().execute("UPDATE runtime_events SET refs='{}'::JSONB WHERE stream_id='bounded-checkpoint' AND sequence<=480",&[]).unwrap();
+        drop(store);
+        let reopened = PostgresRuntimeEventStore::new(fixture.reconnect())
+            .unwrap()
+            .into_runtime_event_store();
+        assert_eq!(
+            reopened
+                .projection_checkpoint("bounded-checkpoint-reader")
+                .unwrap(),
+            Some(checkpoint.clone())
+        );
+        let fixed_head = reopened.stream_revision("bounded-checkpoint").unwrap();
+        reopened
+            .append(RuntimeEventInput {
+                stream_id: "bounded-checkpoint".into(),
+                scope: RuntimeEventScope::Session,
+                kind: "future.fact".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::Value::Null,
+            })
+            .unwrap();
+        let tail = reopened
+            .list_stream_after(
+                "bounded-checkpoint",
+                checkpoint.source_cursor,
+                fixed_head,
+                100,
+                1024 * 1024,
+            )
+            .unwrap();
+        assert_eq!(tail.len(), 32);
+        assert_eq!(tail.first().unwrap().sequence, 481);
+        assert_eq!(tail.last().unwrap().sequence, 512);
+        assert!(tail.iter().all(|event| event.kind == "current.fact"));
+        let descending = reopened
+            .list_stream_before("bounded-checkpoint", fixed_head, 16, 1024 * 1024)
+            .unwrap();
+        assert_eq!(descending.first().unwrap().sequence, 512);
+        assert_eq!(descending.last().unwrap().sequence, 497);
+        assert_eq!(
+            reopened
+                .count_stream_kinds("bounded-checkpoint", &["current.fact"], fixed_head)
+                .unwrap(),
+            512
+        );
+        assert!(reopened.list_stream("bounded-checkpoint").is_err());
+    }
+}
+
+impl PostgresRuntimeEventStore {
+    fn host_transcript_pair_metadata(
+        connection: &mut PostgresConnection,
+        primary: &DurableRuntimeEvent,
+        stream: &str,
+        node: bool,
+    ) -> RuntimeEventStoreResult<Option<DurableRuntimeEvent>> {
+        let projection = if node {
+            "jsonb_build_object('_runtime_activity_binding',payload->'_runtime_activity_binding',
+                'graph_id',payload->'graph_id','node_id',payload->'node_id',
+                'from',payload->'from','to',payload->'to','graph_revision',payload->'graph_revision',
+                'result',jsonb_build_object('status',payload#>'{result,status}',
+                    'evidence_refs',(SELECT jsonb_agg(reference) FROM jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(payload#>'{result,evidence_refs}')='array'
+                        THEN payload#>'{result,evidence_refs}' ELSE '[]'::JSONB END) AS selected(reference)
+                        WHERE reference->>'retrieval_selector'=$4)))"
+        } else {
+            "jsonb_build_object('_runtime_activity_binding',payload->'_runtime_activity_binding')"
+        };
+        let predicate = if node {
+            "kind='execution_node.transitioned'"
+        } else {
+            "scope='execution_graph'"
+        };
+        let rows = pg(connection.query(
+            &format!("SELECT CASE WHEN octet_length(event_id)<=1024 THEN event_id ELSE '' END,
+                stream_id,sequence,scope,CASE WHEN octet_length(kind)<=1024 THEN kind ELSE '' END,
+                CASE WHEN octet_length(status)<=64 THEN status ELSE '' END,
+                CASE WHEN octet_length(actor)<=128 THEN actor ELSE '' END,
+                CASE WHEN octet_length(proof::TEXT)<=1048576 THEN proof END AS payload,
+                '[]'::JSONB AS refs,created_at_ms,commit_cursor,transaction_id,transaction_index,schema_version,
+                CASE WHEN octet_length(idempotency_key)<=4096 THEN idempotency_key ELSE '' END
+                FROM runtime_events CROSS JOIN LATERAL (SELECT {projection} AS proof) selected
+                WHERE transaction_id=$1 AND commit_cursor=$2 AND stream_id=$3 AND {predicate}
+                    AND $4::TEXT IS NOT NULL
+                ORDER BY transaction_index LIMIT 2"),
+            &[&primary.transaction_id, &to_i64(primary.commit_cursor, "Host transcript cursor")?,
+                &stream, &primary.idempotency_key.as_deref().unwrap_or("")],
+        ))?;
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        if rows[0].get::<_, Option<Value>>(7).is_none() {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                "Host transcript pair root metadata".into(),
+            ));
+        }
+        row_to_event(&rows[0]).map(Some)
+    }
+
+    fn host_transcript_root_event(
+        connection: &mut PostgresConnection,
+        stream: &str,
+        key: &str,
+    ) -> RuntimeEventStoreResult<Option<DurableRuntimeEvent>> {
+        Self::process_closure_root_event(connection, stream, key).map_err(|error| match error {
+            RuntimeEventStoreError::HistoryBudgetExceeded(_) => {
+                RuntimeEventStoreError::HistoryBudgetExceeded("Host transcript root event".into())
+            }
+            error => error,
+        })
+    }
+
+    fn process_closure_root_event(
+        connection: &mut PostgresConnection,
+        stream: &str,
+        key: &str,
+    ) -> RuntimeEventStoreResult<Option<DurableRuntimeEvent>> {
+        let Some(metadata) = pg(connection.query_opt(
+            "SELECT encoded_bytes FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2",
+            &[&stream, &key],
+        ))?
+        else {
+            return Ok(None);
+        };
+        let bytes: i64 = metadata.get(0);
+        if bytes <= 0 || bytes > 1024 * 1024 {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                "process closure root event".into(),
+            ));
+        }
+        pg(connection.query_opt(
+            &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"),
+            &[&stream, &key],
+        ))?.map(|row| row_to_event(&row)).transpose()
+    }
+}
+
+#[cfg(test)]
+mod source_fence_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn own858_pg_source_fence_persists_and_direct_old_mutations_reject_cas() {
+        let (store, fixture) = crate::tests::open_real_store();
+        let initial = store.source_mutation_fence().unwrap();
+        store.append(RuntimeEventInput {
+            stream_id: "858-event".into(), scope: RuntimeEventScope::Session,
+            kind: "858.append".into(), status: None, actor: None,
+            refs: Vec::new(), payload: serde_json::json!({}),
+        }).unwrap();
+        assert_eq!(initial, store.source_mutation_fence().unwrap());
+        let reopened = PostgresRuntimeEventStore::new(fixture.reconnect()).unwrap().into_runtime_event_store();
+        assert_eq!(initial, reopened.source_mutation_fence().unwrap());
+        let payload = serde_json::json!({"verified":true});
+        let cursor = store.durable_commit_cursor().unwrap();
+        let saved = store.compare_and_put_projection_checkpoint_fenced("858-reader", cursor, 0, &payload, 0, &initial).unwrap();
+        fixture.reconnect().checkout_critical().unwrap().execute("UPDATE runtime_events SET actor='changed' WHERE stream_id='858-event'", &[]).unwrap();
+        let updated = store.source_mutation_fence().unwrap();
+        assert_eq!(updated.incarnation, initial.incarnation);
+        assert_eq!(updated.mutation_epoch, initial.mutation_epoch + 1);
+        assert!(store.compare_and_put_projection_checkpoint_fenced("858-reader", cursor, saved.revision, &payload, 0, &initial).is_err());
+        assert_eq!(store.projection_checkpoint("858-reader").unwrap(), Some(saved.clone()));
+        fixture.reconnect().checkout_critical().unwrap().execute("DELETE FROM runtime_events WHERE stream_id='858-event'", &[]).unwrap();
+        let deleted = store.source_mutation_fence().unwrap();
+        assert_eq!(deleted.mutation_epoch, updated.mutation_epoch + 1);
+        assert!(store.compare_and_put_projection_checkpoint_fenced("858-reader", cursor, saved.revision, &payload, 0, &updated).is_err());
+        store.compare_and_put_projection_checkpoint_fenced("858-reader", cursor, saved.revision, &payload, 0, &deleted).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn own858_pg_source_fenced_cas_serializes_with_uncommitted_old_mutation() {
+        let (store, fixture) = crate::tests::open_real_store();
+        store.append(RuntimeEventInput {
+            stream_id: "858-race".into(), scope: RuntimeEventScope::Session,
+            kind: "858.append".into(), status: None, actor: None,
+            refs: Vec::new(), payload: serde_json::json!({}),
+        }).unwrap();
+        let initial = store.source_mutation_fence().unwrap();
+        let executor = fixture.reconnect();
+        let mut connection = executor.checkout_critical().unwrap();
+        let mut transaction = connection.transaction().unwrap();
+        transaction.execute("UPDATE runtime_events SET actor='uncommitted' WHERE stream_id='858-race'", &[]).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = store.compare_and_put_projection_checkpoint_fenced("858-race-reader", 1, 0, &serde_json::json!({}), 0, &initial);
+            sender.send(result).unwrap();
+        });
+        assert!(matches!(receiver.recv_timeout(std::time::Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        transaction.commit().unwrap();
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(matches!(result, Err(RuntimeEventStoreError::Corrupt(message)) if message == "source mutation fence changed"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn own858_pg_foreign_search_path_mutates_only_target_schema_fence_and_blocks_cas() {
+        let (store_a, fixture_a) = crate::tests::open_real_store();
+        let (store_b, fixture_b) = crate::tests::open_real_store();
+        let store_a = std::sync::Arc::new(store_a);
+        let executor_a = fixture_a.reconnect();
+        let executor_b = fixture_b.reconnect();
+        let schema_a: String = executor_a.checkout_critical().unwrap().query_one("SELECT current_schema()", &[]).unwrap().get(0);
+        let schema_b: String = executor_b.checkout_critical().unwrap().query_one("SELECT current_schema()", &[]).unwrap().get(0);
+        assert_ne!(schema_a, schema_b);
+        let source_b = store_b.source_mutation_fence().unwrap();
+        let mut revision_b = 0;
+        for template in [
+            "UPDATE %I.%I SET actor='foreign-search-path' WHERE stream_id='858-cross-schema'",
+            "DELETE FROM %I.%I WHERE stream_id='858-cross-schema'",
+            "TRUNCATE %I.%I",
+        ] {
+            store_a.append(RuntimeEventInput {
+                stream_id: "858-cross-schema".into(), scope: RuntimeEventScope::Session,
+                kind: "858.append".into(), status: None, actor: None,
+                refs: Vec::new(), payload: serde_json::json!({}),
+            }).unwrap();
+            let before_a = store_a.source_mutation_fence().unwrap();
+            let cursor = store_a.durable_commit_cursor().unwrap();
+            let mut connection = executor_b.checkout_critical().unwrap();
+            let mut transaction = connection.transaction().unwrap();
+            let set_path: String = transaction.query_one("SELECT pg_catalog.format('SET LOCAL search_path TO %I, pg_catalog', $1::TEXT)", &[&schema_b]).unwrap().get(0);
+            transaction.batch_execute(&set_path).unwrap();
+            assert_eq!(transaction.query_one("SELECT current_schema()", &[]).unwrap().get::<_, String>(0), schema_b);
+            let mutation: String = transaction.query_one("SELECT pg_catalog.format($1::TEXT, $2::TEXT, 'runtime_events')", &[&template, &schema_a]).unwrap().get(0);
+            transaction.batch_execute(&mutation).unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker_store = std::sync::Arc::clone(&store_a);
+            let old_source = before_a.clone();
+            let worker = std::thread::spawn(move || {
+                sender.send(worker_store.compare_and_put_projection_checkpoint_fenced("858-cross-schema-reader", cursor, 0, &serde_json::json!({}), 0, &old_source)).unwrap();
+            });
+            assert!(matches!(receiver.recv_timeout(std::time::Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+            transaction.commit().unwrap();
+            assert!(matches!(receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), Err(RuntimeEventStoreError::Corrupt(message)) if message == "source mutation fence changed"));
+            worker.join().unwrap();
+            let after_a = store_a.source_mutation_fence().unwrap();
+            assert_eq!(after_a.incarnation, before_a.incarnation);
+            assert_eq!(after_a.mutation_epoch, before_a.mutation_epoch + 1);
+            assert_eq!(store_b.source_mutation_fence().unwrap(), source_b);
+            assert!(store_a.projection_checkpoint("858-cross-schema-reader").unwrap().is_none());
+            revision_b = store_b.compare_and_put_projection_checkpoint_fenced("858-unchanged-schema-reader", 0, revision_b, &serde_json::json!({}), 0, &source_b).unwrap().revision;
+        }
+    }
 }

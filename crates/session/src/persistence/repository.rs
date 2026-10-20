@@ -44,6 +44,37 @@ pub struct UnifiedSessionStore {
 }
 
 impl UnifiedSessionStore {
+    pub async fn get_terminal_message_receipt_context(
+        &self,
+        query: crate::SessionTerminalReceiptQuery,
+    ) -> Result<crate::SessionTerminalReceiptContext> {
+        self.execute_read(move |backend| backend.get_terminal_message_receipt_context(&query))
+            .await
+    }
+
+    pub async fn record_terminal_message_ack(
+        &self,
+        command: crate::SessionTerminalAckCommand,
+    ) -> Result<harness_contract::live::SessionMessageAck> {
+        self.execute_write(move |backend| backend.record_terminal_message_ack(&command))
+            .await
+    }
+
+    pub async fn list_terminal_message_acks(
+        &self,
+        query: crate::SessionTerminalAckListQuery,
+    ) -> Result<Vec<harness_contract::live::SessionMessageAckHistory>> {
+        self.execute_read(move |backend| backend.list_terminal_message_acks(&query))
+            .await
+    }
+
+    pub async fn mutate_session_presence_if_revision(
+        &self,
+        command: crate::SessionPresenceMutation,
+    ) -> Result<Option<crate::SessionPresenceMutationResult>> {
+        self.execute_write(move |backend| backend.mutate_session_presence_if_revision(&command))
+            .await
+    }
     pub async fn discover_context_page(
         &self,
         request: crate::SessionDiscoveryRequest,
@@ -669,6 +700,26 @@ impl UnifiedSessionStore {
             .await
     }
 
+    pub(super) fn count_domain_events_blocking(&self, session_id: &str) -> Result<usize> {
+        self.execution.execute_blocking_read(|| {
+            self.inner
+                .count_events_by_type_from(session_id, SESSION_DOMAIN_EVENT_TYPE, 0)
+        })
+    }
+
+    pub(super) fn get_session_domain_events_by_kind_limited_blocking(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        self.execution.execute_blocking_read(|| {
+            self.inner
+                .get_session_domain_events_by_kind_limited(session_id, kind, from_seq, limit)
+        })
+    }
+
     pub async fn get_session_domain_events_by_kind_limited(
         &self,
         session_id: &str,
@@ -1081,10 +1132,18 @@ impl UnifiedSessionStore {
         now_ms: u64,
         lease_ms: u64,
         limit: usize,
+        excluded_session_ids: &[String],
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
         let worker_id = worker_id.to_string();
+        let excluded_session_ids = excluded_session_ids.to_vec();
         self.execute_write(move |backend| {
-            backend.claim_session_runtime_outbox(&worker_id, now_ms, lease_ms, limit)
+            backend.claim_session_runtime_outbox(
+                &worker_id,
+                now_ms,
+                lease_ms,
+                limit,
+                &excluded_session_ids,
+            )
         })
         .await
     }

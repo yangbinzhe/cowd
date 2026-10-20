@@ -2,6 +2,85 @@
 
 use super::*;
 
+fn native_root_continuation_matches(
+    source: &harness_contract::projection::RuntimeActivityBinding,
+    consumer: &harness_contract::projection::RuntimeActivityBinding,
+    session_id: &str,
+    execution_id: &str,
+    turn_id: &str,
+) -> bool {
+    source.validate().is_ok()
+        && consumer.validate().is_ok()
+        && source.agent_run_id.is_none()
+        && consumer.agent_run_id.is_none()
+        && source.root_execution_id == execution_id
+        && consumer.root_execution_id == execution_id
+        && source.session_id == session_id
+        && consumer.session_id == session_id
+        && source.turn_id == turn_id
+        && consumer.turn_id == turn_id
+        && source.root_task_id == consumer.root_task_id
+        && source.task_id == consumer.task_id
+        && source.generation == consumer.generation
+}
+
+fn native_root_activity_is_original(
+    store: &crate::RuntimeEventStore,
+    binding: &harness_contract::projection::RuntimeActivityBinding,
+) -> Result<bool, RuntimeError> {
+    let Some(node_id) = binding
+        .node_id
+        .as_deref()
+        .filter(|node_id| !node_id.is_empty())
+    else {
+        return Ok(false);
+    };
+    let stream = format!("{}:node:{node_id}", binding.root_execution_id);
+    let key = format!(
+        "{}:{node_id}:{}",
+        binding.root_execution_id, binding.revision
+    );
+    let Some(original) = store
+        .event_by_idempotency_key(&stream, &key)
+        .map_err(|error| RuntimeError::new(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    Ok(original.activity_binding().as_ref() == Some(binding)
+        && original.stream_id == stream
+        && original.kind == "execution_node.transitioned"
+        && original.scope == RuntimeEventScope::ExecutionNode
+        && original.actor.as_deref() == Some("execution_commit_service")
+        && original.status.as_deref() == Some("running")
+        && original.schema_version == 1
+        && original.payload["to"] == "running")
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static NATIVE_DELIVERY_CONFIRMATION_FAILURE: bool;
+    static NATIVE_DELIVERY_CONFIRMATION_SOURCE_RACE: Arc<dyn Fn() + Send + Sync>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_native_delivery_confirmation_failure<Output>(
+    operation: impl std::future::Future<Output = Output>,
+) -> Output {
+    NATIVE_DELIVERY_CONFIRMATION_FAILURE
+        .scope(true, operation)
+        .await
+}
+
+#[cfg(test)]
+pub(crate) async fn with_native_delivery_confirmation_source_race<Output>(
+    after_cut: Arc<dyn Fn() + Send + Sync>,
+    operation: impl std::future::Future<Output = Output>,
+) -> Output {
+    NATIVE_DELIVERY_CONFIRMATION_SOURCE_RACE
+        .scope(after_cut, operation)
+        .await
+}
+
 /// Placeholder the envelope carries where the per-request clock section belongs.
 ///
 /// A sentinel rather than the clock text itself: the envelope is durable, and
@@ -469,6 +548,15 @@ where
         if let Ok(mut guard) = self.turn_generated_model_receipts.lock() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.turn_native_tool_sources.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.turn_native_root_owners.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.native_wire_receipts.lock() {
+            guard.clear();
+        }
         if let Ok(mut guard) = self.turn_model_observations.lock() {
             guard.clear();
         }
@@ -557,6 +645,14 @@ where
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn turn_evidence_audit_count_for_test(&self) -> usize {
+        self.turn_evidence_audits
+            .lock()
+            .expect("turn evidence audit lock poisoned")
+            .len()
+    }
+
     pub(super) fn turn_evidence_audits(&self) -> Vec<EvidenceAuditProjection> {
         self.turn_evidence_audits
             .lock()
@@ -572,10 +668,19 @@ where
         raw_ref: &EvidenceRef,
         receipt: &crate::context_evidence::ModelReceipt,
         is_error: bool,
+        output: &str,
     ) -> Result<(), RuntimeError> {
-        if !requirement.is_exact() || is_error {
+        let read_body = crate::context_evidence::read_body_seal(tool_name, output);
+        if is_error || (!requirement.is_exact() && read_body.is_none()) {
             return Ok(());
         }
+        let source = self
+            .turn_native_tool_sources
+            .lock()
+            .map_err(|_| RuntimeError::new("Native tool source projection poisoned"))?
+            .get(provider_invocation_id)
+            .filter(|source| source.call.name == tool_name)
+            .cloned();
         let generated = GeneratedModelReceipt {
             provider_invocation_id: provider_invocation_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -589,6 +694,9 @@ where
             receipt_tokens: receipt.receipt_tokens,
             omitted_tokens: receipt.omitted_tokens,
             complete: !receipt.truncated && receipt.omitted_tokens == 0,
+            presentation_bytes: receipt.summary.len() as u64,
+            source,
+            read_body,
         };
         let mut receipts = self
             .turn_generated_model_receipts
@@ -607,6 +715,567 @@ where
         }
         receipts.push(generated);
         Ok(())
+    }
+
+    pub(crate) fn remember_native_tool_calls(
+        &self,
+        calls: &[ModelToolCall],
+    ) -> Result<(), RuntimeError> {
+        let Some(bus) = self.cowd_bus.as_ref() else {
+            return Ok(());
+        };
+        let Some(execution) = bus.current_execution_context() else {
+            return Ok(());
+        };
+        let mut sources = self
+            .turn_native_tool_sources
+            .lock()
+            .map_err(|_| RuntimeError::new("Native tool source projection poisoned"))?;
+        for call in calls {
+            if !matches!(
+                call.name.as_str(),
+                "read_file" | "read_ref" | "evidence_retrieve"
+            ) {
+                continue;
+            }
+            let Some(binding) = call.binding.as_ref() else {
+                continue;
+            };
+            if binding.snapshot.identity.session_id != self.session_id()
+                || binding.snapshot.identity.turn_id != execution.turn_id
+                || binding.snapshot.identity.execution_id.as_deref()
+                    != Some(execution.execution_id.as_str())
+                || binding.origin.origin_step_id != binding.snapshot.identity.step_id
+                || binding.origin.call_id != call.id
+                || binding.origin.catalog_digest != binding.snapshot.catalog_digest
+                || !matches!(&binding.origin.source, harness_contract::step::CallSource::Provider { attempt_id }
+                    if attempt_id == &binding.snapshot.provider_attempt.attempt_id)
+            {
+                return Err(RuntimeError::new(
+                    "Native tool source does not match the admitted provider Step",
+                ));
+            }
+            if let Some(existing) = sources.get(&call.id) {
+                if existing.call.binding != call.binding
+                    || existing.call.name != call.name
+                    || existing.call.input != call.input
+                    || existing.execution != execution
+                {
+                    return Err(RuntimeError::new(
+                        "Native tool invocation has conflicting source Step or input",
+                    ));
+                }
+                continue;
+            }
+            sources.insert(
+                call.id.clone(),
+                NativeToolSource {
+                    call: call.clone(),
+                    execution: execution.clone(),
+                    activity_owner: bus.current_activity_binding(),
+                    tool_owner: bus.current_tool_activity_binding(&call.id, &call.name),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn capture_native_root_owner(
+        &self,
+        record: &ToolInvocationRecord,
+        writer_payload: &serde_json::Value,
+        mut after_sequence: u64,
+    ) -> Result<(), RuntimeError> {
+        let Some(store) = self.runtime_event_store.as_ref() else {
+            return Ok(());
+        };
+        let source = self
+            .turn_native_tool_sources
+            .lock()
+            .map_err(|_| RuntimeError::new("Native tool source projection poisoned"))?
+            .get(&record.tool_call_id)
+            .cloned();
+        let Some(source) = source else {
+            return Ok(());
+        };
+        let (Some(binding), Some(tool_owner)) =
+            (source.call.binding.as_ref(), source.tool_owner.as_ref())
+        else {
+            return Ok(());
+        };
+        if source.call.name != record.tool_name
+            || tool_owner.root_execution_id != source.execution.execution_id
+            || record.session_id != self.session_id()
+            || record.status.as_str() != "completed"
+            || record.input_hash != crate::tool_invocation::stable_hash(&source.call.input)
+        {
+            return Ok(());
+        }
+        let mut expected = writer_payload.clone();
+        expected["_runtime_activity_binding"] = serde_json::to_value(tool_owner)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let stream_id = format!("session:{}", self.session_id());
+        let through_sequence = store
+            .stream_revision(&stream_id)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        while after_sequence < through_sequence {
+            let events = store
+                .list_stream_after(
+                    &stream_id,
+                    after_sequence,
+                    through_sequence,
+                    64,
+                    4 * 1024 * 1024,
+                )
+                .map_err(RuntimeError::new)?;
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                after_sequence = event.sequence;
+                if event.kind != "tool.invocation.completed"
+                    || event.scope != RuntimeEventScope::Tool
+                    || event.actor.as_deref() != Some("conversation_runtime")
+                    || event.status.as_deref() != Some("completed")
+                    || event.payload != expected
+                    || event.activity_binding().as_ref() != Some(tool_owner)
+                {
+                    continue;
+                }
+                let owner = crate::context_evidence::RootReadOwner {
+                    stream_id: event.stream_id,
+                    sequence: event.sequence,
+                    event_id: event.event_id,
+                    payload_digest: crate::context_evidence::read_payload_digest(&event.payload),
+                    binding: tool_owner.clone(),
+                };
+                self.turn_native_root_owners
+                    .lock()
+                    .map_err(|_| RuntimeError::new("Native Root owner projection poisoned"))?
+                    .entry(binding.effect_idempotency_key())
+                    .or_insert(owner);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn native_tool_activity_owner(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+    ) -> Result<Option<harness_contract::projection::RuntimeActivityBinding>, RuntimeError> {
+        let source = self
+            .turn_native_tool_sources
+            .lock()
+            .map_err(|_| RuntimeError::new("Native tool source projection poisoned"))?
+            .get(tool_call_id)
+            .cloned();
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let owner = source
+            .activity_owner
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("Native tool source has no original activity"))?;
+        if owner.agent_run_id.is_some() {
+            return Ok(None);
+        }
+        let context = self
+            .cowd_bus()
+            .and_then(crate::CowdEventBus::current_execution_context)
+            .ok_or_else(|| RuntimeError::new("Native tool writer has no original root"))?;
+        let tool = source
+            .tool_owner
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("Native tool source has no original tool activity"))?;
+        let live = self
+            .cowd_bus()
+            .and_then(crate::CowdEventBus::current_activity_binding)
+            .ok_or_else(|| RuntimeError::new("Native tool writer has no live activity"))?;
+        let store = self
+            .runtime_event_store
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("Native tool writer has no original source store"))?;
+        if source.execution != context
+            || !native_root_continuation_matches(
+                owner,
+                &live,
+                &context.session_id,
+                &context.execution_id,
+                &context.turn_id,
+            )
+            || source.call.id != tool_call_id
+            || source.call.name != tool_name
+            || crate::tool_invocation::stable_hash(&source.call.input) != input_hash
+            || owner.root_execution_id != context.execution_id
+            || owner.session_id != context.session_id
+            || owner.turn_id != context.turn_id
+            || !native_root_activity_is_original(store, owner)?
+        {
+            return Err(RuntimeError::new(
+                "Native tool writer source/context/input mismatch",
+            ));
+        }
+        let mut expected = owner.clone();
+        expected.activity_id = tool.activity_id.clone();
+        expected.parent_activity_id = Some(owner.activity_id.clone());
+        expected.initiator_activity_id = Some(owner.activity_id.clone());
+        expected.node_id = None;
+        expected.skill_id = None;
+        expected.skill_revision = None;
+        expected.skill_activation_id = None;
+        expected.tool_contract_id = Some(tool_name.to_string());
+        expected.tool_call_id = Some(tool_call_id.to_string());
+        expected.approval_id = None;
+        if *tool != expected || tool.validate().is_err() {
+            return Err(RuntimeError::new(
+                "Native tool writer original tool activity mismatch",
+            ));
+        }
+        Ok(Some(tool.clone()))
+    }
+
+    fn native_read_recipient(
+        &self,
+        source: &NativeToolSource,
+        acquisition: &NativeReadAcquisition,
+        raw_ref: &EvidenceRef,
+        context: &crate::ProviderRequestEvidenceContext,
+    ) -> Result<Option<crate::context_evidence::ReadDeliveryRecipient>, RuntimeError> {
+        use crate::context_evidence::ReadDeliveryRecipient;
+        if source.execution.session_id != context.session_id
+            || source.execution.turn_id != context.turn_id
+            || source.execution.execution_id != context.execution_id
+        {
+            return Ok(None);
+        }
+        let live_owner = self
+            .cowd_bus
+            .as_ref()
+            .and_then(|bus| bus.current_activity_binding());
+        let Some(source_owner) = source.activity_owner.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(identity) = self.execution_identity.as_ref().filter(|identity| {
+            identity.kind() == harness_contract::execution::ExecutionIdentityKind::AgentNode
+        }) {
+            if source.activity_owner != live_owner
+                || identity.graph_id() != Some(acquisition.seal.graph_id.as_str())
+                || identity.node_id() != Some(acquisition.seal.node_id.as_str())
+                || identity.agent_run_id().is_none()
+                || identity.agent_run_id() != acquisition.seal.step.run_ref.as_deref()
+            {
+                return Ok(None);
+            }
+            return Ok(Some(ReadDeliveryRecipient::AgentTask {
+                identity: identity.clone(),
+            }));
+        }
+        if self.execution_identity.as_ref().is_some_and(|identity| {
+            !matches!(
+                identity.kind(),
+                harness_contract::execution::ExecutionIdentityKind::TaskGraph
+                    | harness_contract::execution::ExecutionIdentityKind::SessionTurn
+            )
+        }) {
+            return Ok(None);
+        }
+        let Some(binding) = source.call.binding.as_ref() else {
+            return Ok(None);
+        };
+        let Some(expected) = source.tool_owner.as_ref() else {
+            return Ok(None);
+        };
+        let Some(live) = live_owner.as_ref() else {
+            return Ok(None);
+        };
+        if !native_root_continuation_matches(
+            source_owner,
+            live,
+            &context.session_id,
+            &context.execution_id,
+            &context.turn_id,
+        ) {
+            return Ok(None);
+        }
+        if expected.root_execution_id != context.execution_id
+            || expected.session_id != context.session_id
+            || expected.turn_id != context.turn_id
+            || expected.root_execution_id != source_owner.root_execution_id
+            || expected.session_id != source_owner.session_id
+            || expected.turn_id != source_owner.turn_id
+            || expected.task_id != source_owner.task_id
+            || expected.root_task_id != source_owner.root_task_id
+            || expected.revision != source_owner.revision
+            || expected.fence != source_owner.fence
+            || expected.generation != source_owner.generation
+            || expected.parent_activity_id.as_deref() != Some(source_owner.activity_id.as_str())
+            || expected.initiator_activity_id.as_deref() != Some(source_owner.activity_id.as_str())
+        {
+            return Ok(None);
+        }
+        let owner = self
+            .turn_native_root_owners
+            .lock()
+            .map_err(|_| RuntimeError::new("Native Root owner projection poisoned"))?
+            .get(&binding.effect_idempotency_key())
+            .cloned();
+        let Some(owner) = owner else {
+            return Ok(None);
+        };
+        let Some(store) = self.runtime_event_store.as_ref() else {
+            return Ok(None);
+        };
+        if !native_root_activity_is_original(store, source_owner)?
+            || !native_root_activity_is_original(store, live)?
+        {
+            return Ok(None);
+        }
+        let events = store
+            .list_stream_after(
+                &owner.stream_id,
+                owner.sequence.saturating_sub(1),
+                owner.sequence,
+                1,
+                4 * 1024 * 1024,
+            )
+            .map_err(RuntimeError::new)?;
+        let Some(event) = events.first() else {
+            return Ok(None);
+        };
+        if &owner.binding != expected
+            || !crate::context_evidence::root_read_owner_matches(&owner, event, &acquisition.seal)
+            || event.commit_cursor <= acquisition.cursor
+            || event.payload["full_output_ref"] != format!("tool://{}", raw_ref.id())
+            || event.payload["input_hash"]
+                != crate::tool_invocation::stable_hash(&source.call.input)
+        {
+            return Ok(None);
+        }
+        Ok(Some(ReadDeliveryRecipient::Root {
+            owner,
+            identity: self.execution_identity.clone(),
+        }))
+    }
+
+    fn native_read_acquisition(
+        &self,
+        source: &NativeToolSource,
+        body: &crate::context_evidence::ReadBodySeal,
+    ) -> Result<Option<NativeReadAcquisition>, RuntimeError> {
+        let Some(store) = self.runtime_event_store.as_ref() else {
+            return Ok(None);
+        };
+        let Some(binding) = source.call.binding.as_ref() else {
+            return Ok(None);
+        };
+        let key = binding.effect_idempotency_key();
+        let primary_stream = format!("execution-effect:{key}");
+        let primary_key = format!("{key}:read-receipt");
+        let Some(primary) = store
+            .event_by_idempotency_key(&primary_stream, &primary_key)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let Some(value) = primary
+            .payload
+            .get(crate::context_evidence::READ_ACQUISITION_FIELD)
+        else {
+            return Ok(None);
+        };
+        let seal =
+            crate::context_evidence::decode_read_acquisition(value).map_err(RuntimeError::new)?;
+        crate::context_evidence::native_acquisition_descriptor(&primary, &seal)
+            .map_err(RuntimeError::new)?;
+        let origin = serde_json::to_value(&binding.origin)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if primary.kind != "execution.read.receipt"
+            || primary.actor.as_deref() != Some("governed_tool")
+            || primary.scope != RuntimeEventScope::ExecutionNode
+            || primary.status.as_deref() != Some("completed")
+            || seal.primary_stream != primary_stream
+            || seal.primary_key != primary_key
+            || seal.index_stream
+                != format!(
+                    "execution-agent-receipts:{}:{}:{}",
+                    seal.graph_id, seal.node_id, seal.attempt
+                )
+            || seal.index_key != format!("agent-tool-receipt:{key}")
+            || seal.invocation_id != source.call.id
+            || seal.tool_name != source.call.name
+            || &seal.body != body
+            || seal.session_id != self.session_id()
+            || seal.step != binding.snapshot.identity
+            || seal.origin != origin
+            || primary.payload["input_sha256"] != seal.input_sha256
+            || primary.payload["replay"]["origin"] != origin
+            || primary.payload["replay"]["invocation"]["origin"] != origin
+            || primary.payload["replay"]["invocation"]["invocation_id"] != source.call.id
+            || primary.payload["replay"]["invocation"]["intent"]["tool_name"] != source.call.name
+            || primary.payload["replay"]["call_id"] != source.call.id
+        {
+            return Ok(None);
+        }
+        {
+            let input = harness_contract::step::parse_strict_json(&source.call.input)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let digest = harness_contract::step::canonical_digest("tool-effect-payload", &input)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if primary.payload["replay"]["payload_digest"] != digest {
+                return Ok(None);
+            }
+        }
+        let Some(index) = store
+            .event_by_idempotency_key(&seal.index_stream, &seal.index_key)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if index.kind != "execution.agent_tool.receipt"
+            || index.actor.as_deref() != Some("governed_tool")
+            || index.payload["effect_kind"] != "read"
+            || index.scope != RuntimeEventScope::ExecutionNode
+            || index.status.as_deref() != Some("completed")
+            || index.transaction_id != primary.transaction_id
+            || index.commit_cursor != primary.commit_cursor
+            || index.transaction_index <= primary.transaction_index
+            || index
+                .payload
+                .get(crate::context_evidence::READ_ACQUISITION_FIELD)
+                != Some(value)
+            || index.payload["resolved_effect_scope"] != primary.payload["resolved_effect_scope"]
+            || index.payload["effect"] != primary.payload["effect"]
+            || index.payload["outcome"] != primary.payload["outcome"]
+            || !index.refs.iter().any(|reference| {
+                reference.kind == "agent_attempt" && reference.id == seal.attempt.to_string()
+            })
+            || !primary.refs.iter().any(|reference| {
+                reference.kind == "agent_attempt" && reference.id == seal.attempt.to_string()
+            })
+            || !primary.refs.iter().any(|reference| {
+                reference.kind == "execution_graph" && reference.id == seal.graph_id
+            })
+            || !primary
+                .refs
+                .iter()
+                .any(|reference| reference.kind == "execution_node" && reference.id == seal.node_id)
+        {
+            return Ok(None);
+        }
+        if primary.payload["replay"]["parent_execution"].is_null() {
+            let intent = store
+                .event_by_idempotency_key(&primary_stream, &format!("{key}:read-intent"))
+                .map_err(|error| RuntimeError::new(error.to_string()))?
+                .ok_or_else(|| {
+                    RuntimeError::new("Native root acquisition has no original read intent")
+                })?;
+            let owner = crate::context_evidence::authenticate_root_read_intent(
+                &intent, &primary, &index, &seal,
+            )
+            .map_err(RuntimeError::new)?;
+            let admitted_graph = store
+                .transaction_stream_revision_exact(&intent.transaction_id, &seal.graph_id)
+                .map_err(|error| RuntimeError::new(error.to_string()))?
+                .ok_or_else(|| {
+                    RuntimeError::new("Native root intent has no atomic graph authority source")
+                })?;
+            if Some(admitted_graph.expected_revision)
+                != intent.payload["root_effect_owner"]["graph_revision"].as_u64()
+                || admitted_graph.committed_revision != admitted_graph.expected_revision
+            {
+                return Err(RuntimeError::new(
+                    "Native root intent graph revision disagrees with admission transaction",
+                ));
+            }
+            if owner.root_execution_id != source.execution.execution_id
+                || owner.session_id != source.execution.session_id
+                || owner.turn_id != source.execution.turn_id
+                || source.activity_owner.as_ref().is_none_or(|source_owner| {
+                    source_owner.root_execution_id != owner.root_execution_id
+                        || source_owner.session_id != owner.session_id
+                        || source_owner.turn_id != owner.turn_id
+                        || source_owner.root_task_id != owner.root_task_id
+                        || source_owner.task_id != owner.task_id
+                        || source_owner.generation != owner.generation
+                        || source_owner.agent_run_id.is_some()
+                })
+            {
+                return Err(RuntimeError::new(
+                    "Native root acquisition original activity differs from raw source",
+                ));
+            }
+            let original_stream = format!("{}:node:{}", seal.graph_id, seal.node_id);
+            let mut through = store
+                .stream_revision(&original_stream)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut original = None;
+            while through > 0 {
+                let page = store
+                    .list_stream_before(&original_stream, through, 64, 4 * 1024 * 1024)
+                    .map_err(RuntimeError::new)?;
+                if page.is_empty() {
+                    return Err(RuntimeError::new(
+                        "Native root node activity history is incomplete",
+                    ));
+                }
+                for event in &page {
+                    if event.commit_cursor <= intent.commit_cursor {
+                        original = Some(event.clone());
+                        break;
+                    }
+                }
+                if original.is_some() {
+                    break;
+                }
+                through = page.last().unwrap().sequence.saturating_sub(1);
+            }
+            if original.as_ref().is_none_or(|event| {
+                event.activity_binding().as_ref() != Some(&owner)
+                    || event.payload["to"] != "running"
+                    || event.kind != "execution_node.transitioned"
+                    || event.actor.as_deref() != Some("execution_commit_service")
+                    || event.scope != RuntimeEventScope::ExecutionNode
+                    || event.status.as_deref() != Some("running")
+            }) {
+                return Err(RuntimeError::new(
+                    "Native root admission has no original running node activity",
+                ));
+            }
+        } else if primary.payload["replay"]["parent_execution"]["execution_id"] != seal.graph_id
+            || primary.payload["replay"]["parent_execution"]["node_id"] != seal.node_id
+        {
+            return Ok(None);
+        }
+        let Ok(outcome) = serde_json::from_value::<crate::RuntimeToolExecutionOutcome>(
+            primary.payload["outcome"].clone(),
+        ) else {
+            return Ok(None);
+        };
+        if outcome.status != crate::RuntimeToolExecutionStatus::Executed
+            || outcome.error.is_some()
+            || outcome.tool_name != seal.tool_name
+            || outcome.tool_use_id != seal.invocation_id
+        {
+            return Ok(None);
+        }
+        if primary.payload["outcome_truncated"] == false
+            && outcome.output.as_ref().is_none_or(|output| {
+                crate::context_evidence::read_body_seal(&seal.tool_name, output).as_ref()
+                    != Some(&seal.body)
+            })
+        {
+            return Err(RuntimeError::new(
+                "Native acquisition body differs from its original outcome",
+            ));
+        }
+        Ok(Some(NativeReadAcquisition {
+            seal,
+            event_id: primary.event_id,
+            cursor: primary.commit_cursor,
+            index_event_id: index.event_id,
+        }))
     }
 
     pub(super) fn packed_model_observation_candidates(
@@ -692,16 +1361,257 @@ where
         &self,
         mut candidates: Vec<harness_contract::context::ProviderModelObservationAttestation>,
         effective_model: &str,
+        context: &crate::ProviderRequestEvidenceContext,
+        accepted_step: Option<&harness_contract::step::StepSnapshot>,
     ) -> Result<(), RuntimeError> {
-        if candidates.is_empty() {
+        if candidates.is_empty()
+            || self.cancellation_token.is_cancelled()
+            || context.execution_id.is_empty()
+            || context.turn_id.is_empty()
+        {
             return Ok(());
+        }
+        let Some(accepted_step) = accepted_step else {
+            return Ok(());
+        };
+        if context.session_id != self.session_id()
+            || accepted_step.identity.session_id != context.session_id
+            || accepted_step.identity.turn_id != context.turn_id
+            || accepted_step.identity.execution_id.as_deref() != Some(context.execution_id.as_str())
+        {
+            return Ok(());
+        }
+        let Some(store) = &self.runtime_event_store else {
+            return Ok(());
+        };
+        let wires = self
+            .native_wire_receipts
+            .lock()
+            .map_err(|_| RuntimeError::new("native wire receipt projection poisoned"))?
+            .iter()
+            .filter(|wire| {
+                wire.context == *context
+                    && wire.outcome_sequence.is_some()
+                    && wire.step_render.as_ref().is_some_and(|render| {
+                        render.step_id == accepted_step.identity.step_id
+                            && render.attempt_id == accepted_step.provider_attempt.attempt_id
+                            && render.catalog_digest == accepted_step.catalog_digest
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if wires.len() != 1 {
+            return Ok(());
+        }
+        let wire = &wires[0];
+        let generated = self
+            .turn_generated_model_receipts
+            .lock()
+            .map_err(|_| RuntimeError::new("generated model receipt ledger is poisoned"))?
+            .clone();
+        let mut confirmed = Vec::new();
+        for candidate in &mut candidates {
+            let Some(receipt) = generated
+                .iter()
+                .find(|receipt| receipt.provider_invocation_id == candidate.provider_invocation_id)
+            else {
+                continue;
+            };
+            let (Some(source), Some(body)) = (&receipt.source, &receipt.read_body) else {
+                continue;
+            };
+            let Some(acquisition) = self.native_read_acquisition(source, body)? else {
+                continue;
+            };
+            let stream_id = format!("session:{}", self.session_id());
+            let confirmation_revision = store
+                .stream_revision(&stream_id)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let Some(recipient) =
+                self.native_read_recipient(source, &acquisition, &candidate.raw_ref, context)?
+            else {
+                continue;
+            };
+            if !wire.results.iter().any(|result| {
+                result.invocation_id == candidate.provider_invocation_id
+                    && !result.is_error
+                    && result.presentation_sha256 == candidate.model_receipt_sha256
+                    && result.presentation_bytes == receipt.presentation_bytes
+            }) {
+                continue;
+            }
+            let material = crate::context_evidence::ReadDeliveryMaterial {
+                schema_version: 1,
+                grade: crate::context_evidence::ReadDeliveryGrade::ProviderModelObserved,
+                acquisition: acquisition.seal.clone(),
+                acquisition_event_id: acquisition.event_id.clone(),
+                acquisition_cursor: acquisition.cursor,
+                index_event_id: acquisition.index_event_id.clone(),
+                session_id: context.session_id.clone(),
+                execution_id: context.execution_id.clone(),
+                turn_id: context.turn_id.clone(),
+                tool_invocation_id: candidate.provider_invocation_id.clone(),
+                recipient,
+                presentation_sha256: candidate.model_receipt_sha256.clone(),
+                presentation_bytes: receipt.presentation_bytes,
+                body_omitted: !candidate.complete,
+                delivered_extent: candidate
+                    .complete
+                    .then(|| acquisition.seal.body.extent.clone()),
+                transport:
+                    crate::context_evidence::ReadDeliveryTransport::NativeProviderContinuation {
+                        request_id: wire.request_id.clone(),
+                        request_sequence: context.request_sequence,
+                        provider_attempt: context.attempt,
+                        step_render: wire.step_render.clone().expect("matched step render"),
+                        wire_body_sha256: wire.wire_sha256.clone(),
+                        wire_artifact: wire.wire_artifact.clone(),
+                        packed_sequence: wire.packed_sequence,
+                        outcome_sequence: wire
+                            .outcome_sequence
+                            .expect("matched successful outcome"),
+                        model: effective_model.to_string(),
+                        raw_ref: candidate.raw_ref.clone(),
+                    },
+            };
+            let payload = serde_json::to_value(&material)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            crate::context_evidence::decode_read_delivery(&payload).map_err(RuntimeError::new)?;
+            let key = format!(
+                "native-read:{}:{}",
+                wire.request_id, candidate.provider_invocation_id
+            );
+            if let Some(existing) = store
+                .event_by_idempotency_key(&stream_id, &key)
+                .map_err(|error| RuntimeError::new(error.to_string()))?
+            {
+                if existing.kind != crate::context_evidence::NATIVE_DELIVERY_KIND
+                    || existing.payload != payload
+                    || existing.actor.as_deref() != Some("conversation_runtime")
+                    || existing.status.as_deref() != Some("confirmed")
+                    || existing.schema_version != 1
+                    || existing.scope != RuntimeEventScope::Session
+                {
+                    return Err(RuntimeError::new(
+                        "conflicting Native read delivery material",
+                    ));
+                }
+            } else {
+                #[cfg(test)]
+                if NATIVE_DELIVERY_CONFIRMATION_FAILURE
+                    .try_with(|enabled| *enabled)
+                    .unwrap_or(false)
+                {
+                    return Err(RuntimeError::new(
+                        "injected Native delivery Runtime confirmation append failure",
+                    ));
+                }
+                let mut refs = vec![
+                    RuntimeEventRef {
+                        kind: "read_acquisition".to_string(),
+                        id: acquisition.event_id.clone(),
+                    },
+                    RuntimeEventRef {
+                        kind: "read_acquisition_index".to_string(),
+                        id: acquisition.index_event_id.clone(),
+                    },
+                    RuntimeEventRef {
+                        kind: "tool_invocation".to_string(),
+                        id: candidate.provider_invocation_id.clone(),
+                    },
+                    RuntimeEventRef {
+                        kind: "step".to_string(),
+                        id: acquisition.seal.step.step_id.clone(),
+                    },
+                ];
+                let mut expected_streams =
+                    vec![crate::runtime_event_store::ExpectedStreamRevision {
+                        stream_id: stream_id.clone(),
+                        expected_revision: confirmation_revision,
+                    }];
+                for source_stream in [
+                    &acquisition.seal.primary_stream,
+                    &acquisition.seal.index_stream,
+                ] {
+                    expected_streams.push(crate::runtime_event_store::ExpectedStreamRevision {
+                        stream_id: source_stream.clone(),
+                        expected_revision: store
+                            .stream_revision(source_stream)
+                            .map_err(|error| RuntimeError::new(error.to_string()))?,
+                    });
+                }
+                let effect_key = acquisition
+                    .seal
+                    .primary_key
+                    .strip_suffix(":read-receipt")
+                    .ok_or_else(|| {
+                        RuntimeError::new(
+                            "Native acquisition primary key has no original effect identity",
+                        )
+                    })?;
+                if let Some(intent) = store
+                    .event_by_idempotency_key(
+                        &acquisition.seal.primary_stream,
+                        &format!("{effect_key}:read-intent"),
+                    )
+                    .map_err(|error| RuntimeError::new(error.to_string()))?
+                {
+                    refs.push(RuntimeEventRef {
+                        kind: "read_intent".into(),
+                        id: intent.event_id,
+                    });
+                    refs.push(RuntimeEventRef {
+                        kind: "execution_graph".into(),
+                        id: acquisition.seal.graph_id.clone(),
+                    });
+                    refs.push(RuntimeEventRef {
+                        kind: "execution_node".into(),
+                        id: acquisition.seal.node_id.clone(),
+                    });
+                }
+                if let crate::context_evidence::ReadDeliveryRecipient::Root { owner, .. } =
+                    &material.recipient
+                {
+                    refs.push(RuntimeEventRef {
+                        kind: "root_read_owner".to_string(),
+                        id: owner.event_id.clone(),
+                    });
+                }
+                #[cfg(test)]
+                let _ = NATIVE_DELIVERY_CONFIRMATION_SOURCE_RACE.try_with(|after_cut| after_cut());
+                store
+                    .append_transaction(crate::runtime_event_store::AppendTransactionRequest {
+                        transaction_id: format!(
+                            "native-read:{}",
+                            crate::context_evidence::read_sha256(key.as_bytes())
+                        ),
+                        expected_streams,
+                        events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                            event: crate::runtime_event_store::RuntimeEventInput {
+                                stream_id,
+                                scope: RuntimeEventScope::Session,
+                                kind: crate::context_evidence::NATIVE_DELIVERY_KIND.to_string(),
+                                status: Some("confirmed".to_string()),
+                                actor: Some("conversation_runtime".to_string()),
+                                refs,
+                                payload,
+                            },
+                            idempotency_key: Some(key),
+                            schema_version: 1,
+                        }],
+                    })
+                    .map_err(|error| {
+                        RuntimeError::new(format!("Native delivery confirmation unknown: {error}"))
+                    })?;
+            }
+            candidate.model = effective_model.to_string();
+            confirmed.push(candidate.clone());
         }
         let mut observations = self
             .turn_model_observations
             .lock()
             .map_err(|_| RuntimeError::new("model observation ledger is poisoned"))?;
-        for candidate in &mut candidates {
-            candidate.model = effective_model.to_string();
+        for candidate in confirmed {
             if let Some(existing) = observations.iter().find(|existing| {
                 existing.provider_invocation_id == candidate.provider_invocation_id
             }) {
@@ -716,7 +1626,7 @@ where
                 }
                 continue;
             }
-            observations.push(candidate.clone());
+            observations.push(candidate);
         }
         Ok(())
     }
@@ -1481,9 +2391,12 @@ where
             provider::model_context_window_resolution(model, Some(&self.model_context_windows))
         };
         if let Some(tokens) = self.api_client.configured_context_window(model) {
-            resolution.tokens = if resolution.source == provider::ModelContextWindowSource::Configured {
-                resolution.tokens.min(tokens)
-            } else { tokens };
+            resolution.tokens =
+                if resolution.source == provider::ModelContextWindowSource::Configured {
+                    resolution.tokens.min(tokens)
+                } else {
+                    tokens
+                };
             resolution.source = provider::ModelContextWindowSource::Configured;
         }
         if let Ok(calibrated) = self.calibrated_model_context_windows.lock() {
@@ -1765,9 +2678,18 @@ where
         model: &str,
         inventory: ProviderContextInventory,
     ) -> Result<ApiRequest, RuntimeError> {
-        let policy_revision = self.permission_policy.execution_policy_control().snapshot().revision;
-        if prompt.context_policy_revision.is_some_and(|revision| revision != policy_revision) {
-            return Err(RuntimeError::new("context_policy_changed_during_compilation"));
+        let policy_revision = self
+            .permission_policy
+            .execution_policy_control()
+            .snapshot()
+            .revision;
+        if prompt
+            .context_policy_revision
+            .is_some_and(|revision| revision != policy_revision)
+        {
+            return Err(RuntimeError::new(
+                "context_policy_changed_during_compilation",
+            ));
         }
         let window_resolution = self.context_window_resolution_for_model(model);
         let context_window_tokens = u64::from(window_resolution.tokens);
@@ -1789,7 +2711,10 @@ where
             prompt,
             messages,
             inventory,
-            model_protocol::fingerprint::hash_serializable(&(self.permission_fingerprint, policy_revision)),
+            model_protocol::fingerprint::hash_serializable(&(
+                self.permission_fingerprint,
+                policy_revision,
+            )),
             model,
         );
         let fixed_input_tokens = prepared.fixed_input_tokens;
@@ -1839,9 +2764,12 @@ where
         }
         let (packed_prompt, dynamic_tokens, omitted_packet_ids, omitted_packet_reasons) = prompt
             .pack_for_hard_cap(budget.dynamic_hard_remaining())
-            .map_err(|error| RuntimeError::context_capacity(
-                crate::context_ledger::ContextCapacityFailure::RequiredOverflow, error.to_string(),
-            ))?;
+            .map_err(|error| {
+                RuntimeError::context_capacity(
+                    crate::context_ledger::ContextCapacityFailure::RequiredOverflow,
+                    error.to_string(),
+                )
+            })?;
         budget.record_dynamic_packets(dynamic_tokens, omitted_packet_ids, omitted_packet_reasons);
         if !budget.executable {
             return Err(RuntimeError::new(format!(
@@ -2253,12 +3181,21 @@ where
 
         let mut items = Vec::new();
         for (score, card) in scored {
-            let messages = context_messages.iter()
-                .filter(|message| message.sequence >= card.source_start_sequence
-                    && message.sequence < card.source_end_sequence)
-                .take(128).cloned().collect::<Vec<_>>();
+            let messages = context_messages
+                .iter()
+                .filter(|message| {
+                    message.sequence >= card.source_start_sequence
+                        && message.sequence < card.source_end_sequence
+                })
+                .take(128)
+                .cloned()
+                .collect::<Vec<_>>();
             if card.session_id != session_id || !card.matches_source(&messages) {
-                tracing::warn!(session_id, card_id = card.card_id, "Session navigation source or summary mismatch; suppressed");
+                tracing::warn!(
+                    session_id,
+                    card_id = card.card_id,
+                    "Session navigation source or summary mismatch; suppressed"
+                );
                 self.degrade_context_source(ContextSourceKind::Conversation);
                 continue;
             }
@@ -2412,6 +3349,129 @@ mod omitted_marker_tests {
     use super::omitted_source_marker;
 
     #[test]
+    fn root_native_recovery_keeps_historical_source_and_accepts_new_consumer_node() {
+        let original: harness_contract::projection::RuntimeActivityBinding = serde_json::from_value(serde_json::json!({
+            "root_execution_id":"root","session_id":"session","turn_id":"turn","root_task_id":"task","task_id":"task",
+            "activity_id":"original-source","node_id":"original-node","revision":3,"fence":3,"generation":2
+        })).unwrap();
+        let mut consumer = original.clone();
+        consumer.activity_id = "continuation-source".into();
+        consumer.node_id = Some("continuation-node".into());
+        consumer.revision = 19;
+        consumer.fence = 19;
+        assert!(super::native_root_continuation_matches(
+            &original, &consumer, "session", "root", "turn"
+        ));
+        assert_eq!(original.node_id.as_deref(), Some("original-node"));
+        assert_eq!(original.revision, 3);
+        for field in [
+            "root",
+            "session",
+            "turn",
+            "task",
+            "generation",
+            "agent",
+            "fence",
+        ] {
+            let mut foreign = consumer.clone();
+            match field {
+                "root" => foreign.root_execution_id = "foreign-root".into(),
+                "session" => foreign.session_id = "foreign-session".into(),
+                "turn" => foreign.turn_id = "foreign-turn".into(),
+                "task" => foreign.task_id = "foreign-task".into(),
+                "generation" => foreign.generation += 1,
+                "agent" => foreign.agent_run_id = Some("foreign-agent".into()),
+                "fence" => foreign.fence = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                !super::native_root_continuation_matches(
+                    &original, &foreign, "session", "root", "turn"
+                ),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_native_activity_checks_original_fence_and_keeps_historical_nodes() {
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionNodeStatus,
+        };
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let commits = crate::execution_core::graph::ExecutionCommitService::new(store.clone());
+        let mut graph = ExecutionGraph::new("original native Root activity");
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            root_task_id: "task".into(),
+            task_id: "task".into(),
+            generation: 1,
+        });
+        for node_id in ["source-node", "consumer-node"] {
+            let mut node =
+                ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "answer");
+            node.id = node_id.into();
+            graph.nodes.push(node);
+        }
+        let mut graph = commits.register_graph(graph).unwrap().graph;
+        for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+            graph = commits
+                .transition_node(&graph, "source-node", status, None, vec![])
+                .unwrap()
+                .graph;
+        }
+        let source_stream = format!("{}:node:source-node", graph.id);
+        let original_event = store.latest_for_stream(&source_stream).unwrap().unwrap();
+        let original = original_event.activity_binding().unwrap();
+        for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+            graph = commits
+                .transition_node(&graph, "consumer-node", status, None, vec![])
+                .unwrap()
+                .graph;
+        }
+        let consumer = store
+            .latest_for_stream(&format!("{}:node:consumer-node", graph.id))
+            .unwrap()
+            .unwrap()
+            .activity_binding()
+            .unwrap();
+        assert_ne!(original.node_id, consumer.node_id);
+        assert_ne!(original.revision, consumer.revision);
+        assert!(super::native_root_continuation_matches(
+            &original, &consumer, "session", &graph.id, "turn"
+        ));
+        assert!(super::native_root_activity_is_original(&store, &original).unwrap());
+        assert!(super::native_root_activity_is_original(&store, &consumer).unwrap());
+        store
+            .append(crate::runtime_event_store::RuntimeEventInput {
+                stream_id: source_stream.clone(),
+                scope: crate::RuntimeEventScope::ExecutionNode,
+                kind: "test.unrelated_note".into(),
+                status: None,
+                actor: Some("native_root_owner_test".into()),
+                refs: vec![],
+                payload: serde_json::json!({"note":"neutral history growth"}),
+            })
+            .unwrap();
+        assert!(super::native_root_activity_is_original(&store, &original).unwrap());
+        let retained = store
+            .event_by_idempotency_key(
+                &source_stream,
+                &format!("{}:source-node:{}", graph.id, original.revision),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, original_event);
+        for candidate in [&original, &consumer] {
+            let mut foreign = (*candidate).clone();
+            foreign.fence += 1;
+            assert!(!super::native_root_activity_is_original(&store, &foreign).unwrap());
+        }
+    }
+
+    #[test]
     fn the_marker_is_a_byte_stable_constant() {
         let first = omitted_source_marker(crate::context_runtime::ContextSourceKind::Memory);
         let second = omitted_source_marker(crate::context_runtime::ContextSourceKind::Memory);
@@ -2437,8 +3497,247 @@ mod omitted_marker_tests {
 }
 
 #[cfg(test)]
+mod immutable_native_acquisition_tests {
+    use super::*;
+
+    struct AcquisitionApi;
+
+    impl ApiClient for AcquisitionApi {
+        fn stream(
+            &mut self,
+            _: ApiRequest,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    #[test]
+    fn original_readonly_writer_preserves_unscoped_artifact_in_native_acquisition() {
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionNodeStatus,
+        };
+        for scoped in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let store = Arc::new(crate::RuntimeEventStore::for_test());
+            let service = crate::execution_core::graph::ExecutionCommitService::new(store.clone());
+            let mut graph = ExecutionGraph::new("immutable Native body");
+            graph.id = "scope2-graph".into();
+            graph.lineage = Some(ExecutionGraphLineage {
+                session_id: "scope2-session".into(),
+                turn_id: "scope2-turn".into(),
+                root_task_id: "task".into(),
+                task_id: "task".into(),
+                generation: 1,
+            });
+            let mut node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::ToolBatch,
+                "tool_batch",
+                "immutable-body",
+            );
+            node.id = "artifact-node".into();
+            graph.nodes.push(node);
+            graph = service.register_graph(graph).unwrap().graph;
+            graph = service
+                .transition_node(
+                    &graph,
+                    "artifact-node",
+                    ExecutionNodeStatus::Ready,
+                    None,
+                    vec![],
+                )
+                .unwrap()
+                .graph;
+            graph = service
+                .bind_and_start_node(
+                    &graph,
+                    "artifact-node",
+                    crate::execution_core::graph::ExecutionNodeBinding {
+                        executor_kind: "tool_batch".into(),
+                        ticket_idempotency_key: "artifact-ticket".into(),
+                        attempt: 1,
+                        resource_lease_refs: vec![],
+                        scope_lease_ref: None,
+                        worktree_lease_ref: None,
+                    },
+                )
+                .unwrap()
+                .graph;
+            let catalog = tools::ToolCatalog::builtin().with_runtime_tools(vec![tools::RuntimeToolDefinition {
+                name:"evidence_retrieve".into(), description:Some("Read immutable evidence".into()),
+                input_schema:serde_json::json!({"type":"object","properties":{"evidence_ref":{"type":"string"}},
+                    "required":["evidence_ref"],"additionalProperties":false}),
+                required_permission:tools::permissions::PermissionMode::ReadOnly,
+                effect_resolver:harness_contract::tool::ToolEffectResolverSpec { resolver_id:"runtime.readonly".into(), resolver_version:1 },
+            }]).unwrap();
+            let host = tools::ToolHost::new(
+                "immutable-native",
+                workspace.path(),
+                tools::ToolHostSnapshot::new(
+                    Arc::new(catalog),
+                    Arc::new(tools::lsp_client::LspRegistry::new()),
+                    None,
+                ),
+            );
+            let mut request = crate::bound_tool_batch::scope_admission_tests::bound_request(
+                &host,
+                "evidence_retrieve",
+                serde_json::json!({"evidence_ref":"artifact://original"}),
+            );
+            request.parent_execution =
+                Some(harness_contract::execution_graph::ExecutionParentBinding {
+                    execution_id: graph.id,
+                    node_id: "artifact-node".into(),
+                });
+            request.parent_execution_attempt = Some(1);
+            let content = "immutable original body";
+            let output = serde_json::json!({"kind":"evidence_retrieve","available":true,"evidence_ref":"artifact://original",
+                "sha256":crate::context_evidence::read_sha256(content.as_bytes()),"bytes":content.len(),
+                "total_chunks":1,"chunks":[{"index":0,"content":content}]}).to_string();
+            let outcome = crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some(output.clone()),
+                error: None,
+                evidence_ref: "immutable-original".into(),
+                observed_evidence: vec![],
+            };
+            if scoped {
+                let resolver =
+                    crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                        .unwrap();
+                let effect = &request.compiled_invocation.as_ref().unwrap().effect;
+                let scope = crate::bound_tool_batch::admitted_effect_scope(
+                    &request,
+                    effect,
+                    Some(host.pin_snapshot()),
+                    &resolver,
+                )
+                .unwrap();
+                assert!(!scope.complete);
+                service
+                    .commit_bound_readonly_tool_receipt(&request, &outcome, effect, &scope)
+                    .unwrap();
+            } else {
+                service
+                    .commit_readonly_tool_receipts(&[(request.clone(), outcome)])
+                    .unwrap();
+            }
+            let primary = store
+                .event_by_idempotency_key(
+                    &format!("execution-effect:{}", request.idempotency_key),
+                    &format!("{}:read-receipt", request.idempotency_key),
+                )
+                .unwrap()
+                .unwrap();
+            let mut session = Session::new();
+            session.session_id = "scope2-session".into();
+            let runtime = ConversationRuntime::new(
+                session,
+                AcquisitionApi,
+                crate::StaticToolExecutor::new(),
+                PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+                vec![],
+            )
+            .without_memory()
+            .with_runtime_event_store(store.clone());
+            let source = NativeToolSource {
+                call: ModelToolCall {
+                    id: request.tool_use_id.clone(),
+                    name: request.tool_name.clone(),
+                    input: request.input.clone(),
+                    depends_on: vec![],
+                    binding: request.step_binding.clone(),
+                },
+                execution: crate::CowdExecutionContext {
+                    execution_id: "scope2-graph".into(),
+                    session_id: "scope2-session".into(),
+                    turn_id: "scope2-turn".into(),
+                },
+                activity_owner: None,
+                tool_owner: None,
+            };
+            let body =
+                crate::context_evidence::read_body_seal("evidence_retrieve", &output).unwrap();
+            let acquisition = runtime
+                .native_read_acquisition(&source, &body)
+                .unwrap()
+                .unwrap();
+            assert_eq!(acquisition.cursor, primary.commit_cursor);
+            assert_eq!(acquisition.event_id, primary.event_id);
+            assert_eq!(acquisition.seal.body, body);
+            assert_eq!(acquisition.seal.attempt, 1);
+            let mut foreign_body = body.clone();
+            foreign_body.source_sha256 = crate::context_evidence::read_sha256(b"foreign-body");
+            assert!(runtime
+                .native_read_acquisition(&source, &foreign_body)
+                .unwrap()
+                .is_none());
+            let mut foreign_source = source.clone();
+            foreign_source.call.input =
+                serde_json::json!({"evidence_ref":"artifact://foreign"}).to_string();
+            assert!(runtime
+                .native_read_acquisition(&foreign_source, &body)
+                .unwrap()
+                .is_none());
+            let mut forged = primary.clone();
+            forged.payload["resolved_effect_scope"] = serde_json::json!({"version":2});
+            assert!(crate::context_evidence::native_acquisition_descriptor(
+                &forged,
+                &acquisition.seal
+            )
+            .is_err());
+            forged = primary.clone();
+            forged.payload["replay"]["parent_execution"] = serde_json::Value::Null;
+            if !scoped {
+                assert!(crate::context_evidence::native_acquisition_descriptor(
+                    &forged,
+                    &acquisition.seal
+                )
+                .is_err());
+            }
+            forged = primary.clone();
+            forged.payload["resolved_effect_scope"] = serde_json::Value::Null;
+            forged.payload["replay"]["invocation"]["effect"]["scopes"] =
+                serde_json::to_value(vec![harness_contract::policy::PermissionScope {
+                    resource: harness_contract::policy::PermissionResource::File,
+                    operation: harness_contract::policy::PermissionOperation::Read,
+                    target: Some("input.txt".into()),
+                }])
+                .unwrap();
+            forged.payload["effect"] = forged.payload["replay"]["invocation"]["effect"].clone();
+            assert!(crate::context_evidence::native_acquisition_descriptor(
+                &forged,
+                &acquisition.seal
+            )
+            .is_err());
+            let mut file_extent = acquisition.seal.clone();
+            file_extent.body.extent = crate::context_evidence::ReadExtent::FileLines {
+                start_line: 1,
+                line_count: 1,
+                total_lines: 1,
+                ends_with_newline: false,
+                body_sha256: crate::context_evidence::read_sha256(content.as_bytes()),
+                body_bytes: content.len() as u64,
+                source_omitted: false,
+            };
+            forged = primary.clone();
+            forged.payload["resolved_effect_scope"] = serde_json::Value::Null;
+            assert!(
+                crate::context_evidence::native_acquisition_descriptor(&forged, &file_extent)
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod degraded_source_marker_tests {
-    use super::{ContextSourceKind, degraded_source_marker_tests_marker};
+    use super::{degraded_source_marker_tests_marker, ContextSourceKind};
 
     #[test]
     fn a_degraded_fact_and_matrix_source_are_marked_separately() {

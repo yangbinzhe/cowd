@@ -57,6 +57,9 @@ pub enum ProjectionResyncReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ProjectionOperation {
+    ReplaceTerminalAxes {
+        terminal_axes: super::ExecutionTerminalAxes,
+    },
     SetProjectionHeader {
         revision: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,6 +194,8 @@ pub fn reduce_projection_delta(
     if current.schema_version != EXECUTION_PROJECTION_SCHEMA_VERSION
         || delta.schema_version != EXECUTION_PROJECTION_SCHEMA_VERSION
         || delta.reducer_version != EXECUTION_PROJECTION_REDUCER_VERSION
+        || current.agentic_collaboration.schema_version
+            != super::AGENTIC_COLLABORATION_PROJECTION_SCHEMA_VERSION
     {
         return Err(ProjectionReduceError::VersionMismatch);
     }
@@ -319,7 +324,15 @@ fn apply_operation(
             projection.concurrency.clone_from(concurrency);
         }
         ProjectionOperation::ReplaceAgenticCollaboration { collaboration } => {
+            if collaboration.schema_version
+                != super::AGENTIC_COLLABORATION_PROJECTION_SCHEMA_VERSION
+            {
+                return Err(ProjectionReduceError::VersionMismatch);
+            }
             projection.agentic_collaboration.clone_from(collaboration);
+        }
+        ProjectionOperation::ReplaceTerminalAxes { terminal_axes } => {
+            projection.terminal_axes.clone_from(terminal_axes);
         }
         ProjectionOperation::UpsertActivity { activity } => {
             upsert_by_key(&mut projection.activities, activity.clone(), |value| {
@@ -503,6 +516,74 @@ mod tests {
             "../../tests/fixtures/projection-v3/materialization.json"
         ))
         .expect("projection golden corpus")
+    }
+
+    #[test]
+    fn r1_outcome_axes_terminal_axes_reducer_matches_current_golden() {
+        let corpus = corpus();
+        assert_eq!(
+            (
+                corpus.initial.schema_version,
+                corpus.delta.reducer_version,
+                corpus.initial.agentic_collaboration.schema_version
+            ),
+            (5, 5, 5)
+        );
+        assert!(corpus
+            .delta
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, ProjectionOperation::ReplaceTerminalAxes { .. })));
+        assert_eq!(
+            reduce_projection_delta(&corpus.initial, &corpus.delta).unwrap(),
+            corpus.expected
+        );
+        let serialized = serde_json::to_string(&corpus.expected.terminal_axes).unwrap();
+        for forbidden in [
+            "materialized_at_ms",
+            "received_at_ms",
+            "client_id",
+            "outbox_revision",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+        let mut wrong = corpus.delta;
+        wrong.execution_id = "foreign".into();
+        assert!(reduce_projection_delta(&corpus.initial, &wrong).is_err());
+    }
+
+    #[test]
+    fn r1_outcome_axes_versions_are_independent_and_fail_closed() {
+        let corpus = corpus();
+        for version in [4, 6] {
+            let mut current = corpus.initial.clone();
+            current.schema_version = version;
+            assert!(reduce_projection_delta(&current, &corpus.delta).is_err());
+            current = corpus.initial.clone();
+            current.agentic_collaboration.schema_version = version;
+            assert!(reduce_projection_delta(&current, &corpus.delta).is_err());
+            let mut delta = corpus.delta.clone();
+            delta.reducer_version = version;
+            assert!(reduce_projection_delta(&corpus.initial, &delta).is_err());
+            delta = corpus.delta.clone();
+            let mut collaboration = corpus.initial.agentic_collaboration.clone();
+            collaboration.schema_version = version;
+            delta
+                .operations
+                .push(ProjectionOperation::ReplaceAgenticCollaboration { collaboration });
+            assert!(reduce_projection_delta(&corpus.initial, &delta).is_err());
+        }
+        assert!(serde_json::from_value::<ProjectionOperation>(
+            serde_json::json!({"op":"ack_message"})
+        )
+        .is_err());
+        let mut value = serde_json::to_value(&corpus.initial).unwrap();
+        value.as_object_mut().unwrap().remove("terminal_axes");
+        let old: ExecutionProjection = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            old.terminal_axes.execution.settlement,
+            super::super::TerminalEffectSettlement::Unknown
+        );
     }
 
     #[test]

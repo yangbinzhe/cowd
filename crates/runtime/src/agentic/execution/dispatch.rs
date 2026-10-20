@@ -10,6 +10,33 @@ use harness_contract::agent::{
 // request, so this estimate cannot become a business-execution budget gate.
 const AGENTIC_TASK_CAPACITY_ESTIMATE_TOKENS: u64 = 1_000_000;
 
+fn agentic_attempt_settlement(
+    projection: &AgenticProgramProjection,
+    task_ref: &str,
+    execution_id: &str,
+    mode: harness_contract::agent_action::AgentAttemptMode,
+    reason: &str,
+    retryable: bool,
+) -> AgentActionEnvelope {
+    AgentActionEnvelope {
+        action_id: format!(
+            "runtime-attempt-settle:{}:{}:{}",
+            projection.program_id, task_ref, execution_id
+        ),
+        actor: agentic_supervisor_actor(projection, Some(execution_id.to_string())),
+        expected_revision: None,
+        action: AgentAction::TaskAttemptFail(
+            harness_contract::agent_action::TaskAttemptFailInput {
+                task_ref: task_ref.to_string(),
+                execution_id: execution_id.to_string(),
+                mode,
+                reason: reason.to_string(),
+                retryable,
+            },
+        ),
+    }
+}
+
 /// Deferral state keyed by `program|task|mode`: consecutive count and the
 /// earliest time this dispatch may be retried. A repeatedly-deferred dispatch
 /// backs off exponentially so a wedged Program is not re-attempted (and logged)
@@ -72,7 +99,10 @@ fn dispatch_starvation_record(key: &str) -> usize {
 
 /// True while a starved dispatch is inside its backoff window: skip it silently
 /// (no re-attempt, no log) until the window elapses.
-fn dispatch_starvation_backing_off(key: &str) -> bool {
+fn dispatch_starvation_backing_off(key: &str, has_free_eligible_member: bool) -> bool {
+    if has_free_eligible_member {
+        return false;
+    }
     let now = crate::tool_invocation::now_ms();
     let ledger = dispatch_starvation_ledger()
         .lock()
@@ -553,6 +583,23 @@ impl RuntimeServices {
         let Some(binding) = packet.agentic_binding.as_ref() else {
             return Ok(());
         };
+        let original = match self.graph_state_store().load(packet.graph_id()) {
+            Ok(graph) => graph
+                .nodes
+                .iter()
+                .find(|node| node.id == packet.node_id())
+                .map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref))
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .ok_or("Agent exit original node missing")?,
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                packet.clone()
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if crate::agent_runtime::confirmed_run_exit(self.event_store(), &original)?.is_none() {
+            return Err("Agent attempt awaits exact durable local exit".into());
+        }
         if let AgenticExecutionFocus::Coordination { wake_ref } = &binding.focus {
             let projection = self
                 .agent_action_service()
@@ -655,25 +702,21 @@ impl RuntimeServices {
         ) {
             return Ok(());
         }
-        let envelope = AgentActionEnvelope {
-            action_id: format!(
-                "runtime-attempt-settle:{}:{}:{}",
-                projection.program_id,
-                task_ref,
-                packet.graph_id()
-            ),
-            actor: agentic_supervisor_actor(&projection, Some(packet.graph_id().into())),
-            expected_revision: None,
-            action: AgentAction::TaskAttemptFail(
-                harness_contract::agent_action::TaskAttemptFailInput {
-                    task_ref: task_ref.clone(),
-                    execution_id: packet.graph_id().into(),
-                    mode,
-                    reason: reason.into(),
-                    retryable: true,
-                },
-            ),
-        };
+        if task.status == AgenticTaskStatus::CancelRequested {
+            return if self.retry_agentic_run_exit(packet.graph_id()).await? {
+                Ok(())
+            } else {
+                Err("Agent retirement awaits graph, exit or effect reconciliation".into())
+            };
+        }
+        let envelope = agentic_attempt_settlement(
+            &projection,
+            task_ref,
+            packet.graph_id(),
+            mode,
+            reason,
+            true,
+        );
         let observation = self.submit_agent_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(
@@ -700,7 +743,21 @@ impl RuntimeServices {
     /// ready Task, but the invited Agent remains the sole owner of the first
     /// durable claim. Semantic reservation, results and completion therefore
     /// all come from the Agent's own action protocol.
-    pub async fn dispatch_agentic_followups(
+    pub fn dispatch_agentic_followups<'dispatch>(
+        self: &'dispatch Arc<Self>,
+        envelope: &'dispatch AgentActionEnvelope,
+        context: AgenticDispatchContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<AgenticDispatchReceipt>, String>>
+                + Send
+                + 'dispatch,
+        >,
+    > {
+        Box::pin(self.dispatch_agentic_followups_inline(envelope, context))
+    }
+
+    async fn dispatch_agentic_followups_inline(
         self: &Arc<Self>,
         envelope: &AgentActionEnvelope,
         context: AgenticDispatchContext,
@@ -900,7 +957,6 @@ impl RuntimeServices {
                 .load_async(execution_graph_id(&attempt.execution_id))
                 .await
             {
-                Ok(graph) if agentic_graph_is_terminal(&graph) => true,
                 Ok(_) => {
                     self.cancel_execution_tree(
                         &attempt.execution_id,
@@ -916,11 +972,7 @@ impl RuntimeServices {
                 }
                 Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
                     ..
-                }) => {
-                    // Supervisor registration is durable before the executor
-                    // can start.  No graph means no effect was admitted.
-                    true
-                }
+                }) => false,
                 Err(error) => return Err(error.to_string()),
             };
             if !terminal {
@@ -943,17 +995,128 @@ impl RuntimeServices {
             }) {
                 continue;
             }
-            self.settle_agentic_task_attempt(
-                projection,
-                task_ref,
-                &attempt.execution_id,
-                attempt.mode,
-                "physical Agent execution cancelled after Task retirement",
-                false,
-            )
-            .await?;
+            if !self.retry_agentic_run_exit(&attempt.execution_id).await? {
+                return Err(format!(
+                    "agentic_task_cancellation_awaits_exact_exit_or_effects:{task_ref}:{}",
+                    attempt.execution_id
+                ));
+            }
         }
         Ok(())
+    }
+
+    pub(crate) async fn retry_agentic_run_exit(
+        self: &Arc<Self>,
+        graph_id: &str,
+    ) -> Result<bool, String> {
+        use harness_contract::agent_action::{AgentActionStatus, AgentAttemptMode};
+        let graph = match self
+            .graph_state_store()
+            .load_async(graph_id.to_string())
+            .await
+        {
+            Ok(graph) => graph,
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                return Ok(false)
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut settled = true;
+        for node in graph.nodes.iter().filter(|node| {
+            node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+        }) {
+            let packet: AgentTaskPacket =
+                serde_json::from_str(&node.payload_ref).map_err(|error| error.to_string())?;
+            let Some(binding) = packet.agentic_binding.as_ref() else {
+                continue;
+            };
+            let (task_ref, mode) = match &binding.focus {
+                AgenticExecutionFocus::TaskExecute { task_ref } => {
+                    (task_ref, AgentAttemptMode::Execute)
+                }
+                AgenticExecutionFocus::TaskReview { task_ref } => {
+                    (task_ref, AgentAttemptMode::Review)
+                }
+                _ => continue,
+            };
+            let projection = self
+                .agent_action_service()
+                .project_snapshot(&binding.program_id)
+                .map_err(|error| error.to_string())?;
+            let Some(task) = projection.tasks.get(task_ref) else {
+                continue;
+            };
+            if task.status != AgenticTaskStatus::CancelRequested
+                || (!task.active_attempts.contains_key(graph_id)
+                    && task.claim_execution_id.as_deref() != Some(graph_id))
+            {
+                continue;
+            }
+            if !agentic_graph_is_terminal(&graph)
+                || crate::agent_runtime::confirmed_run_exit(self.event_store(), &packet)?.is_none()
+            {
+                settled = false;
+                continue;
+            }
+            self.cancel_execution_tree(graph_id, "Original Agent exited during Task retirement")
+                .await
+                .map_err(|error| error.to_string())?;
+            let envelope = agentic_attempt_settlement(
+                &projection,
+                task_ref,
+                graph_id,
+                mode,
+                "original Agent local exit and retirement reconciliation",
+                false,
+            );
+            let observation = self.submit_agent_action(&envelope).await?;
+            if observation.status != AgentActionStatus::Applied {
+                return Err(format!(
+                    "agentic_run_exit_retirement_not_settled:{graph_id}:{task_ref}:{:?}",
+                    observation.error
+                ));
+            }
+        }
+        Ok(settled)
+    }
+
+    pub(crate) async fn retry_pending_agentic_run_exits(self: &Arc<Self>) -> Result<(), String> {
+        let streams = self
+            .event_store()
+            .stream_ids_for_scope(crate::RuntimeEventScope::Program)
+            .map_err(|error| error.to_string())?;
+        let mut executions = BTreeSet::new();
+        let mut errors = Vec::new();
+        for stream in streams {
+            let Some(program_id) = stream.strip_prefix("agentic-program:") else {
+                continue;
+            };
+            let projection = match self.agent_action_service().project_snapshot(program_id) {
+                Ok(projection) => projection,
+                Err(error) => {
+                    errors.push(format!("{program_id}:{error}"));
+                    continue;
+                }
+            };
+            for task in projection
+                .tasks
+                .values()
+                .filter(|task| task.status == AgenticTaskStatus::CancelRequested)
+            {
+                executions.extend(task.active_attempts.keys().cloned());
+                executions.extend(task.claim_execution_id.iter().cloned());
+            }
+        }
+        for execution_id in executions {
+            if let Err(error) = self.retry_agentic_run_exit(&execution_id).await {
+                errors.push(format!("{execution_id}:{error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     async fn settle_agentic_task_attempt(
@@ -965,23 +1128,26 @@ impl RuntimeServices {
         reason: &str,
         retryable: bool,
     ) -> Result<(), String> {
-        let envelope = AgentActionEnvelope {
-            action_id: format!(
-                "runtime-attempt-settle:{}:{}:{}",
-                projection.program_id, task_ref, execution_id
-            ),
-            actor: agentic_supervisor_actor(projection, Some(execution_id.to_string())),
-            expected_revision: None,
-            action: AgentAction::TaskAttemptFail(
-                harness_contract::agent_action::TaskAttemptFailInput {
-                    task_ref: task_ref.to_string(),
-                    execution_id: execution_id.to_string(),
-                    mode,
-                    reason: reason.to_string(),
-                    retryable,
-                },
-            ),
-        };
+        let graph = self
+            .graph_state_store()
+            .load(execution_graph_id(execution_id))
+            .map_err(|error| error.to_string())?;
+        let mut packets = graph.nodes.iter().filter(|node| {
+            node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+        });
+        let node = packets
+            .next()
+            .ok_or("Agent attempt has no original packet")?;
+        if packets.next().is_some() {
+            return Err("Agent attempt original packet is ambiguous".into());
+        }
+        let packet: AgentTaskPacket =
+            serde_json::from_str(&node.payload_ref).map_err(|error| error.to_string())?;
+        if crate::agent_runtime::confirmed_run_exit(self.event_store(), &packet)?.is_none() {
+            return Err("Agent attempt awaits original durable local exit".into());
+        }
+        let envelope =
+            agentic_attempt_settlement(projection, task_ref, execution_id, mode, reason, retryable);
         let observation = self.submit_agent_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(
@@ -1044,7 +1210,8 @@ impl RuntimeServices {
                 .agent_action_service()
                 .project_snapshot(program_id)
                 .map_err(|error| error.to_string())?;
-            if excluded_sessions.contains(&projection.session_id) {
+            if excluded_sessions.contains(&projection.session_id)
+                || self.agent_action_service().recovery_session_is_excluded(&projection.session_id) {
                 return Ok(());
             }
             let cancellation_tasks = projection
@@ -1324,6 +1491,8 @@ impl RuntimeServices {
         context: &AgenticDispatchContext,
         _trigger: &AgentActionEnvelope,
     ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        self.ensure_session_recovery_admitted(&projection.session_id)
+            .map_err(|error| error.to_string())?;
         // Multi-task action/startup passes may carry a semantic snapshot
         // from before their previous dispatch. Availability is always read
         // from the current durable Program, then fenced again at append.
@@ -1337,23 +1506,6 @@ impl RuntimeServices {
             .tasks
             .get(task_ref)
             .ok_or_else(|| format!("agentic_task_not_found:{task_ref}"))?;
-        // Anti-idle-spin: a dispatch that keeps deferring backs off; skip it
-        // silently until its backoff window elapses instead of re-attempting
-        // (and logging) on every reconcile tick.
-        let starvation_key = dispatch_starvation_key(&projection.program_id, task_ref, mode);
-        if dispatch_starvation_backing_off(&starvation_key) {
-            return self.decline_dispatch(
-                &projection.program_id,
-                task_ref,
-                mode,
-                crate::agentic::action_service::AgenticDispatchDeclineReason::StarvationBackoff,
-                &task_status_str(task.status),
-                0,
-                0,
-                dispatch_starvation_count(&starvation_key),
-                task.review_generation,
-            );
-        }
         // Program status is business truth, not renewed execution authority.
         // Late submissions and startup recovery must respect the owning root's
         // terminal fence, even when its business objective remains unresolved.
@@ -1531,6 +1683,21 @@ impl RuntimeServices {
                         && candidate.claimant.as_deref() == Some(member.agent_id.as_str()))
                 })
         };
+        let busy_member_count = members.iter().filter(|member| member_busy(member)).count();
+        let starvation_key = dispatch_starvation_key(&projection.program_id, task_ref, mode);
+        if dispatch_starvation_backing_off(&starvation_key, busy_member_count < members.len()) {
+            return self.decline_dispatch(
+                &projection.program_id,
+                task_ref,
+                mode,
+                crate::agentic::action_service::AgenticDispatchDeclineReason::StarvationBackoff,
+                &task_status_str(task.status),
+                members.len(),
+                busy_member_count,
+                dispatch_starvation_count(&starvation_key),
+                task.review_generation,
+            );
+        }
         if members.is_empty() {
             // This used to be the only decline with any signal at all, and it was
             // a `tracing::info!` - which a release build filters out and which
@@ -1652,7 +1819,7 @@ impl RuntimeServices {
                     reason: crate::agentic::action_service::AgenticDispatchDeclineReason::NoFreeEligibleMember,
                     task_status: &task_status_str(task.status),
                     eligible_members: eligible_member_count,
-                    busy_members: rejected_members.len(),
+                    busy_members: busy_member_count,
                     consecutive_deferrals: consecutive,
                     review_generation: task.review_generation,
                 });
@@ -1835,7 +2002,8 @@ impl RuntimeServices {
                     team_id: member_team_id.to_string(),
                     task_team_id: task.team_id.clone(),
                     source_spec_revision: projection.revision,
-                    task_purpose: (!matches!(mode, DispatchMode::Coordination(_))).then_some(task.purpose),
+                    task_purpose: (!matches!(mode, DispatchMode::Coordination(_)))
+                        .then_some(task.purpose),
                     focus: match mode {
                         DispatchMode::Execute => AgenticExecutionFocus::TaskExecute {
                             task_ref: task.task_id.clone(),
@@ -2011,6 +2179,47 @@ impl RuntimeServices {
 mod cohort_tests {
     use super::*;
 
+    #[test]
+    fn exact_exit_canonical_retirement_id_does_not_depend_on_retry_source() {
+        let projection = AgenticProgramProjection::empty("exit-program", "exit-objective");
+        let first = agentic_attempt_settlement(
+            &projection,
+            "exit-task",
+            "exit-graph",
+            harness_contract::agent_action::AgentAttemptMode::Execute,
+            "original Agent local exit and retirement reconciliation",
+            false,
+        );
+        let second = agentic_attempt_settlement(
+            &projection,
+            "exit-task",
+            "exit-graph",
+            harness_contract::agent_action::AgentAttemptMode::Execute,
+            "original Agent local exit and retirement reconciliation",
+            false,
+        );
+        assert_eq!(
+            first.action_id,
+            "runtime-attempt-settle:exit-program:exit-task:exit-graph"
+        );
+        assert_eq!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::to_value(second).unwrap()
+        );
+        let foreign = agentic_attempt_settlement(
+            &projection,
+            "exit-task",
+            "foreign-graph",
+            harness_contract::agent_action::AgentAttemptMode::Execute,
+            "same reason",
+            false,
+        );
+        assert_ne!(
+            foreign.action_id,
+            "runtime-attempt-settle:exit-program:exit-task:exit-graph"
+        );
+    }
+
     fn program() -> AgenticProgramProjection {
         let mut projection = AgenticProgramProjection::empty("program-cache", "objective-cache");
         projection.session_id = "session-cache".to_string();
@@ -2169,6 +2378,23 @@ mod lane_routing_tests {
             routed_lane_model(Some("deepseek-v4-flash"), "program-model"),
             "deepseek-v4-flash"
         );
+    }
+
+    #[test]
+    fn own864_dispatch_backoff_preserves_busy_delay_but_retries_free_or_invited_member() {
+        use super::{dispatch_starvation_backing_off, dispatch_starvation_clear,
+            dispatch_starvation_count, dispatch_starvation_key, dispatch_starvation_record,
+            DispatchMode};
+        let key = dispatch_starvation_key("own864-program", "own864-task", DispatchMode::Review);
+        dispatch_starvation_clear(&key);
+        assert_eq!(dispatch_starvation_record(&key), 1);
+        assert_eq!(dispatch_starvation_record(&key), 2);
+        assert!(dispatch_starvation_backing_off(&key, false));
+        assert!(!dispatch_starvation_backing_off(&key, true));
+        assert_eq!(dispatch_starvation_count(&key), 2);
+        assert!(dispatch_starvation_backing_off(&key, false));
+        dispatch_starvation_clear(&key);
+        assert!(!dispatch_starvation_backing_off(&key, false));
     }
 
     #[test]

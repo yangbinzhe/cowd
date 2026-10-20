@@ -82,7 +82,7 @@ fn live_tool_write_descriptor_requires_runtime_authorization() {
     let target = root.join("blocked.txt");
 
     let host = test_host("deny-test", &root);
-    let input = json!({"path": target, "content": "must not be written"});
+    let input = json!({"action": "write", "path": target, "content": "must not be written"});
     let effect = host.pin_snapshot().describe_effect("edit", &input);
     assert_eq!(
         effect.required_permission,

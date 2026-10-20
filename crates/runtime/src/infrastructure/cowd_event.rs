@@ -522,6 +522,28 @@ impl CowdEventBus {
             .clone()
     }
 
+    pub(crate) fn root_node_activity_view(
+        &self,
+        binding: harness_contract::projection::RuntimeActivityBinding,
+    ) -> Result<Self, &'static str> {
+        binding.validate()?;
+        let context = self
+            .current_execution_context()
+            .ok_or("node view has no root context")?;
+        if binding.root_execution_id != context.execution_id
+            || binding.session_id != context.session_id
+            || binding.turn_id != context.turn_id
+            || binding.node_id.is_none()
+            || binding.agent_run_id.is_some()
+            || binding.tool_call_id.is_some()
+        {
+            return Err("node view does not match its original root");
+        }
+        let mut view = self.clone();
+        view.activity_binding = Arc::new(Mutex::new(Some(binding)));
+        Ok(view)
+    }
+
     /// Forward this child bus into one root Session bus while preserving the
     /// child's execution identity. The target receives only an immutable
     /// relationship envelope, so concurrent child Runtime instances never

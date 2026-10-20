@@ -241,6 +241,9 @@ pub struct RuntimeEventReactor {
     cancellation: CancellationToken,
     started: AtomicBool,
     workers: Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    notification_sources:
+        Arc<Mutex<BTreeMap<String, (tokio::sync::watch::Receiver<u64>, Arc<AtomicU64>)>>>,
 }
 
 impl std::fmt::Debug for RuntimeEventReactor {
@@ -255,6 +258,26 @@ impl std::fmt::Debug for RuntimeEventReactor {
 }
 
 impl RuntimeEventReactor {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn use_lane_notifications_for_test(
+        &self,
+        lane: &str,
+        source: tokio::sync::watch::Receiver<u64>,
+    ) -> Result<Arc<AtomicU64>, String> {
+        if !self.lanes.contains_key(lane) {
+            return Err("unknown notification lane".into());
+        }
+        let mut sources = self
+            .notification_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sources.contains_key(lane) {
+            return Err("duplicate lane notification source".into());
+        }
+        let hits = Arc::new(AtomicU64::new(0));
+        sources.insert(lane.into(), (source, hits.clone()));
+        Ok(hits)
+    }
     pub fn sealed(
         event_store: Arc<RuntimeEventStore>,
         lanes: impl IntoIterator<Item = RuntimeProjectionLane>,
@@ -291,6 +314,8 @@ impl RuntimeEventReactor {
             cancellation: CancellationToken::new(),
             started: AtomicBool::new(false),
             workers: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-fixtures"))]
+            notification_sources: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -324,6 +349,8 @@ impl RuntimeEventReactor {
             let cancellation = self.cancellation.clone();
             let admission = Arc::clone(&admission);
             let worker_projection_id = projection_id.clone();
+            #[cfg(any(test, feature = "test-fixtures"))]
+            let notification_sources = self.notification_sources.clone();
             let worker = handle.spawn(async move {
                 struct RunningGuard(Arc<LaneRuntimeState>);
                 impl Drop for RunningGuard {
@@ -412,6 +439,14 @@ impl RuntimeEventReactor {
                                 }
                                 continue;
                             }
+                            #[cfg(any(test, feature = "test-fixtures"))]
+                            let safety_hits = {
+                                let sources = notification_sources.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                sources.get(&worker_projection_id).map(|(source, hits)| {
+                                    commits = source.clone();
+                                    hits.clone()
+                                })
+                            };
                             tokio::select! {
                                 _ = cancellation.cancelled() => break,
                                 changed = commits.changed() => {
@@ -419,7 +454,10 @@ impl RuntimeEventReactor {
                                         break;
                                     }
                                 }
-                                _ = tokio::time::sleep(lane.descriptor.safety_tick) => {}
+                                _ = tokio::time::sleep(lane.descriptor.safety_tick) => {
+                                    #[cfg(any(test, feature = "test-fixtures"))]
+                                    if let Some(hits) = safety_hits { hits.fetch_add(1, Ordering::SeqCst); }
+                                }
                             }
                         }
                         Ok(Err(error)) => {
@@ -463,7 +501,9 @@ impl RuntimeEventReactor {
         if !self.lanes.contains_key(projection_id) {
             return Ok(None);
         }
-        let latest_commit_cursor = self.event_store.durable_commit_cursor()
+        let latest_commit_cursor = self
+            .event_store
+            .durable_commit_cursor()
             .map_err(|error| error.to_string())?;
         self.lane_health_at(projection_id, latest_commit_cursor)
     }
@@ -517,7 +557,9 @@ impl RuntimeEventReactor {
 
     pub fn health(&self) -> Result<RuntimeEventReactorHealth, String> {
         let mut lanes = Vec::with_capacity(self.lanes.len());
-        let latest_commit_cursor = self.event_store.durable_commit_cursor()
+        let latest_commit_cursor = self
+            .event_store
+            .durable_commit_cursor()
             .map_err(|error| error.to_string())?;
         for projection_id in self.lanes.keys() {
             if let Some(health) = self.lane_health_at(projection_id, latest_commit_cursor)? {
@@ -652,13 +694,24 @@ mod tests {
         });
         let reactor = Arc::new(RuntimeEventReactor::sealed(store.clone(), [lane]).unwrap());
         reactor.start().unwrap();
-        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
-        store.append(crate::RuntimeEventInput {
-            stream_id: "scan-doorbell-race".into(), scope: RuntimeEventScope::Task,
-            kind: "test.event".into(), status: None, actor: None, refs: vec![], payload: serde_json::json!({}),
-        }).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: "scan-doorbell-race".into(),
+                scope: RuntimeEventScope::Task,
+                kind: "test.event".into(),
+                status: None,
+                actor: None,
+                refs: vec![],
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
         release.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), rescanned.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rescanned.notified())
+            .await
+            .unwrap();
         assert_eq!(passes.load(Ordering::SeqCst), 2);
         assert!(reactor.shutdown().await.timed_out_lanes.is_empty());
     }

@@ -23,6 +23,10 @@ use crate::{
 macro_rules! session_store_backend_contract {
     ($macro:ident) => {
         $macro! {
+            (get_terminal_message_receipt_context, (query: &crate::SessionTerminalReceiptQuery), Result<crate::SessionTerminalReceiptContext>),
+            (record_terminal_message_ack, (command: &crate::SessionTerminalAckCommand), Result<harness_contract::live::SessionMessageAck>),
+            (list_terminal_message_acks, (query: &crate::SessionTerminalAckListQuery), Result<Vec<harness_contract::live::SessionMessageAckHistory>>),
+            (mutate_session_presence_if_revision, (command: &crate::SessionPresenceMutation), Result<Option<crate::SessionPresenceMutationResult>>),
             (discover_context_page, (request: &crate::SessionDiscoveryRequest), Result<crate::SessionDiscoveryPage>),
             (create_session, (session: &SessionRecord), Result<()>),
             (get_session, (session_id: &str), Result<Option<SessionRecord>>),
@@ -96,7 +100,7 @@ macro_rules! session_store_backend_contract {
             (transition_session_branch_activation, (transition: &SessionBranchActivationTransition), Result<SessionBranchActivation>),
             (append_message_with_runtime_outbox, (message: &SessionMessage, request: &SessionRuntimeOutboxRequest), Result<SessionRuntimeOutboxRecord>),
             (append_ingress_with_runtime_outbox, (session_id: &str, role: &str, content_json: Option<&str>, created_at_ms: u64, request: &SessionRuntimeOutboxRequest), Result<SessionRuntimeOutboxRecord>),
-            (claim_session_runtime_outbox, (worker_id: &str, now_ms: u64, lease_ms: u64, limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
+            (claim_session_runtime_outbox, (worker_id: &str, now_ms: u64, lease_ms: u64, limit: usize, excluded_session_ids: &[String]), Result<Vec<SessionRuntimeOutboxRecord>>),
             (mark_session_runtime_outbox_running, (request_id: &str, worker_id: &str, session_generation: u64, claim_token: &str, expected_revision: u64, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
             (attach_session_runtime_outbox, (input_id: &str, session_generation: u64, expected_revision: u64, target_turn_id: &str, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
             (ack_session_runtime_outbox, (request_id: &str, worker_id: &str, session_generation: u64, claim_token: &str, expected_revision: u64, terminal_status: SessionRuntimeInputStatus, runtime_commit_cursor: u64, now_ms: u64), Result<SessionRuntimeOutboxRecord>),

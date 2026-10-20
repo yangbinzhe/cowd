@@ -126,7 +126,7 @@ pub fn checkpoint_diff_in(
             "checkpoint not found",
         ));
     }
-    let manifest = read_manifest(&checkpoint).or_else(|_| build_manifest(&checkpoint))?;
+    let manifest = read_manifest(&checkpoint)?;
     let current_manifest = if manifest.scopes.is_empty() {
         build_manifest(root)?
     } else {
@@ -175,8 +175,17 @@ pub fn checkpoint_restore_in(
             "checkpoint not found",
         ));
     }
-    let manifest = read_manifest(&checkpoint).or_else(|_| build_manifest(&checkpoint))?;
+    let manifest = read_manifest(&checkpoint)?;
     let backup_dir = restore_backup_dir(root, &input.id);
+    if !manifest.scopes.is_empty()
+        && (normalize_scopes(root, &manifest.scopes)? != manifest.scopes
+            || normalize_scopes(&checkpoint, &manifest.scopes)? != manifest.scopes)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checkpoint restore scope is not canonical",
+        ));
+    }
     if backup_dir.exists() {
         let _ = fs::remove_dir_all(&backup_dir);
     }
@@ -262,9 +271,9 @@ fn unique_sequence() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct CheckpointManifest {
     files: BTreeSet<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scopes: Vec<String>,
 }
 
@@ -563,6 +572,349 @@ fn should_skip(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    struct StdOwnedWorkspace {
+        path: PathBuf,
+    }
+
+    impl StdOwnedWorkspace {
+        fn new() -> std::io::Result<Self> {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)?
+                .as_nanos();
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cowd-state-checkpoint-contract-{}-{timestamp}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for StdOwnedWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn r1_scoped_checkpoint_restore_revalidates_ancestors_before_any_mutation() {
+        fn tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            fn visit(
+                root: &Path,
+                path: &Path,
+                files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+            ) {
+                if !path.exists() {
+                    return;
+                }
+                for entry in fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        files.insert(
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            b"directory".to_vec(),
+                        );
+                        visit(root, &path, files);
+                    } else {
+                        files.insert(
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            fs::read(path).unwrap(),
+                        );
+                    }
+                }
+            }
+            let mut files = std::collections::BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+        for corruption in [
+            "missing",
+            "json",
+            "directory",
+            "scopes",
+            "scope",
+            "unknown",
+            "files",
+            "null",
+            "string",
+            "old-whole",
+        ] {
+            let workspace = StdOwnedWorkspace::new().unwrap();
+            let outside = StdOwnedWorkspace::new().unwrap();
+            let root = workspace.path();
+            fs::create_dir(root.join("src")).unwrap();
+            fs::write(root.join("src/a"), "before").unwrap();
+            fs::write(root.join("unrelated"), "workspace sentinel").unwrap();
+            fs::write(outside.path().join("sentinel"), "outside sentinel").unwrap();
+            let created = checkpoint_create_in(
+                root,
+                CheckpointCreateInput {
+                    label: None,
+                    paths: vec!["src/a".into()],
+                },
+            )
+            .unwrap();
+            fs::write(root.join("src/a"), "current").unwrap();
+            let checkpoint = checkpoints_root(root).join(&created.id);
+            let path = manifest_path(&checkpoint);
+            let valid = fs::read(&path).unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            assert_eq!(value["scopes"], serde_json::json!(["src/a"]));
+            match corruption {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "directory" => {
+                    fs::remove_file(&path).unwrap();
+                    fs::create_dir(&path).unwrap();
+                }
+                "json" => fs::write(&path, "{").unwrap(),
+                other => {
+                    match other {
+                        "scopes" | "old-whole" => {
+                            value.as_object_mut().unwrap().remove("scopes");
+                        }
+                        "scope" => {
+                            let scopes = value.as_object_mut().unwrap().remove("scopes").unwrap();
+                            value["scope"] = scopes;
+                        }
+                        "unknown" => value["extra"] = serde_json::json!(true),
+                        "files" => {
+                            value.as_object_mut().unwrap().remove("files");
+                        }
+                        "null" => value["scopes"] = serde_json::Value::Null,
+                        "string" => value["scopes"] = serde_json::json!("src/a"),
+                        _ => unreachable!(),
+                    }
+                    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+            }
+            let before = tree(root);
+            let diff = checkpoint_diff_in(
+                root,
+                CheckpointDiffInput {
+                    id: created.id.clone(),
+                },
+            )
+            .unwrap_err();
+            let restore = checkpoint_restore_in(
+                root,
+                CheckpointRestoreInput {
+                    id: created.id.clone(),
+                },
+            )
+            .unwrap_err();
+            if corruption == "missing" {
+                assert_eq!(diff.kind(), io::ErrorKind::NotFound);
+            }
+            if corruption == "directory" {
+                let actual_read_error = fs::read(&path).unwrap_err().kind();
+                assert_eq!(diff.kind(), actual_read_error);
+                assert_eq!(restore.kind(), actual_read_error);
+            }
+            assert_eq!(tree(root), before, "{corruption}");
+            assert!(!restore_backup_dir(root, &created.id).exists());
+            assert_eq!(
+                fs::read_to_string(outside.path().join("sentinel")).unwrap(),
+                "outside sentinel"
+            );
+            if corruption == "directory" {
+                fs::remove_dir(&path).unwrap();
+            }
+            fs::write(&path, valid).unwrap();
+            let diff = checkpoint_diff_in(
+                root,
+                CheckpointDiffInput {
+                    id: created.id.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(diff.changed_files, vec!["src/a"]);
+            checkpoint_restore_in(root, CheckpointRestoreInput { id: created.id }).unwrap();
+            assert_eq!(fs::read_to_string(root.join("src/a")).unwrap(), "before");
+            assert_eq!(
+                fs::read_to_string(root.join("unrelated")).unwrap(),
+                "workspace sentinel"
+            );
+            assert_eq!(
+                fs::read_to_string(checkpoint.join("src/a")).unwrap(),
+                "before"
+            );
+        }
+        {
+            let workspace = StdOwnedWorkspace::new().unwrap();
+            let root = workspace.path();
+            fs::write(root.join("whole"), "before").unwrap();
+            let created = checkpoint_create_in(
+                root,
+                CheckpointCreateInput {
+                    label: None,
+                    paths: vec![],
+                },
+            )
+            .unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(manifest_path(&checkpoints_root(root).join(&created.id))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["scopes"], serde_json::json!([]));
+            fs::write(root.join("whole"), "current").unwrap();
+            fs::write(root.join("new"), "remove on whole restore").unwrap();
+            let diff = checkpoint_diff_in(
+                root,
+                CheckpointDiffInput {
+                    id: created.id.clone(),
+                },
+            )
+            .unwrap();
+            assert!(diff.changed_files.contains(&"whole".to_string()));
+            assert!(diff.added_files.contains(&"new".to_string()));
+            checkpoint_restore_in(root, CheckpointRestoreInput { id: created.id }).unwrap();
+            assert_eq!(fs::read_to_string(root.join("whole")).unwrap(), "before");
+            assert!(!root.join("new").exists());
+        }
+        for corruption in ["parent", "whitespace", "internal"] {
+            let workspace = StdOwnedWorkspace::new().unwrap();
+            let root = workspace.path();
+            fs::create_dir(root.join("src")).unwrap();
+            fs::write(root.join("src/a"), "before").unwrap();
+            let created = checkpoint_create_in(
+                root,
+                CheckpointCreateInput {
+                    label: None,
+                    paths: vec!["src/a".into()],
+                },
+            )
+            .unwrap();
+            fs::write(root.join("src/a"), "current").unwrap();
+            let checkpoint = checkpoints_root(root).join(&created.id);
+            let mut manifest = read_manifest(&checkpoint).unwrap();
+            manifest.scopes = vec![match corruption {
+                "parent" => "../outside".into(),
+                "whitespace" => " src/a ".into(),
+                "internal" => ".cowd/checkpoints".into(),
+                _ => unreachable!(),
+            }];
+            write_manifest(&checkpoint, &manifest).unwrap();
+            assert_eq!(
+                checkpoint_restore_in(
+                    root,
+                    CheckpointRestoreInput {
+                        id: created.id.clone()
+                    }
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(fs::read_to_string(root.join("src/a")).unwrap(), "current");
+            assert!(!restore_backup_dir(root, &created.id).exists());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            for position in [
+                "workspace-parent",
+                "workspace-leaf",
+                "snapshot-parent",
+                "snapshot-leaf",
+            ] {
+                let workspace = StdOwnedWorkspace::new().unwrap();
+                let outside = StdOwnedWorkspace::new().unwrap();
+                let root = workspace.path();
+                fs::create_dir(root.join("src")).unwrap();
+                fs::write(root.join("src/a"), "before").unwrap();
+                fs::write(outside.path().join("a"), "outside").unwrap();
+                let created = checkpoint_create_in(
+                    root,
+                    CheckpointCreateInput {
+                        label: None,
+                        paths: vec!["src/a".into()],
+                    },
+                )
+                .unwrap();
+                fs::write(root.join("src/a"), "current").unwrap();
+                let checkpoint = checkpoints_root(root).join(&created.id);
+                let target_root = if position.starts_with("workspace") {
+                    root
+                } else {
+                    checkpoint.as_path()
+                };
+                if position.ends_with("parent") {
+                    fs::rename(target_root.join("src"), target_root.join("original-src")).unwrap();
+                    symlink(outside.path(), target_root.join("src")).unwrap();
+                } else {
+                    fs::rename(
+                        target_root.join("src/a"),
+                        target_root.join("src/original-a"),
+                    )
+                    .unwrap();
+                    symlink(outside.path().join("a"), target_root.join("src/a")).unwrap();
+                }
+                let result = checkpoint_restore_in(
+                    root,
+                    CheckpointRestoreInput {
+                        id: created.id.clone(),
+                    },
+                );
+                assert_eq!(
+                    result.unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput,
+                    "{position}"
+                );
+                assert_eq!(
+                    fs::read_to_string(outside.path().join("a")).unwrap(),
+                    "outside",
+                    "{position}"
+                );
+                assert!(
+                    !restore_backup_dir(root, &created.id).exists(),
+                    "{position}"
+                );
+                let original = if position == "workspace-parent" {
+                    root.join("original-src/a")
+                } else if position == "workspace-leaf" {
+                    root.join("src/original-a")
+                } else {
+                    root.join("src/a")
+                };
+                assert_eq!(
+                    fs::read_to_string(original).unwrap(),
+                    "current",
+                    "{position}"
+                );
+            }
+
+            let workspace = StdOwnedWorkspace::new().unwrap();
+            let outside = StdOwnedWorkspace::new().unwrap();
+            let root = workspace.path();
+            fs::write(root.join("a"), "first target").unwrap();
+            fs::create_dir(root.join("zdir")).unwrap();
+            fs::write(outside.path().join("a"), "outside").unwrap();
+            symlink(outside.path(), root.join("zdir/escape")).unwrap();
+            let failed = checkpoint_create_in(
+                root,
+                CheckpointCreateInput {
+                    label: None,
+                    paths: vec!["a".into(), "zdir".into()],
+                },
+            );
+            assert!(failed.is_err());
+            assert!(checkpoint_list_in(root).unwrap().checkpoints.is_empty());
+            assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "first target");
+            assert_eq!(
+                fs::read_to_string(outside.path().join("a")).unwrap(),
+                "outside"
+            );
+        }
+    }
+
     fn temp_workspace(name: &str) -> PathBuf {
         let unique = format!(
             "cowd-checkpoint-{name}-{}-{}",
@@ -575,6 +927,80 @@ mod tests {
         let root = std::env::temp_dir().join(unique);
         fs::create_dir_all(&root).expect("workspace");
         root
+    }
+
+    #[test]
+    fn scoped_restore_backup_failure_preserves_original_manifest_and_can_recover() {
+        let root = temp_workspace("backup-failure-recovery");
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/target"), "preimage").unwrap();
+        fs::write(root.join("src/unrelated"), "unchanged").unwrap();
+        let checkpoint = checkpoint_create_in(
+            &root,
+            CheckpointCreateInput {
+                label: Some("original-maintenance-material".into()),
+                paths: vec!["src/target".into()],
+            },
+        )
+        .unwrap();
+        let directory = checkpoints_root(&root).join(&checkpoint.id);
+        let original_manifest = fs::read(manifest_path(&directory)).unwrap();
+        let original_files = read_manifest(&directory).unwrap();
+        assert_eq!(original_files.scopes, vec!["src/target"]);
+        assert_eq!(
+            original_files.files,
+            BTreeSet::from(["src/target".to_string()])
+        );
+        fs::write(root.join("src/target"), "current").unwrap();
+        fs::write(root.join(".cowd/restore-backups"), "storage blocker").unwrap();
+        let error = checkpoint_restore_in(
+            &root,
+            CheckpointRestoreInput {
+                id: checkpoint.id.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read_to_string(root.join("src/target")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            fs::read(manifest_path(&directory)).unwrap(),
+            original_manifest
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("src/target")).unwrap(),
+            "preimage"
+        );
+        fs::remove_file(root.join(".cowd/restore-backups")).unwrap();
+        checkpoint_restore_in(
+            &root,
+            CheckpointRestoreInput {
+                id: checkpoint.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("src/target")).unwrap(),
+            "preimage"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/unrelated")).unwrap(),
+            "unchanged"
+        );
+        assert_eq!(
+            fs::read(manifest_path(&directory)).unwrap(),
+            original_manifest
+        );
+        assert_eq!(
+            fs::read_dir(root.join(".cowd/restore-backups"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(checkpoint_list_in(&root).unwrap().checkpoints.len(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

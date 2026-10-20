@@ -1,16 +1,28 @@
 use harness_contract::agent_action::{AgentActionEnvelope, ObjectiveCompleteRequestInput};
 use std::collections::BTreeSet;
 
-use super::AgentActionService;
 use super::program::{
     AgenticCompletionRequestProjection, AgenticProgramProjection, AgenticProgramStatus,
     AgenticTaskStatus,
 };
+use super::AgentActionService;
 
 pub(crate) fn completion_gap(
     projection: &AgenticProgramProjection,
     input: &ObjectiveCompleteRequestInput,
 ) -> Option<String> {
+    completion_gap_with_context(projection, input, None)
+}
+
+pub(crate) fn completion_gap_with_context(
+    projection: &AgenticProgramProjection,
+    input: &ObjectiveCompleteRequestInput,
+    completion: Option<&super::review_evidence::CompletionAdmissionContext>,
+) -> Option<String> {
+    if completion.is_some_and(|context| !context.matches_request(projection, input)) {
+        return Some("completion_context_request_mismatch".into());
+    }
+    let excluded = |task: &str| completion.is_some_and(|context| context.excludes_task(task));
     if projection.teams.len() < usize::from(projection.required_team_count) {
         return Some(format!(
             "required_teams_missing:expected={},actual={}",
@@ -21,7 +33,7 @@ pub(crate) fn completion_gap(
     if projection
         .tasks
         .values()
-        .any(|task| !task.active_attempts.is_empty())
+        .any(|task| !excluded(&task.task_id) && !task.active_attempts.is_empty())
     {
         return Some("execution_cleanup_pending".into());
     }
@@ -40,7 +52,11 @@ pub(crate) fn completion_gap(
     let incomplete = projection
         .tasks
         .values()
-        .filter(|task| !task.status.is_retired() && task.status != AgenticTaskStatus::Accepted)
+        .filter(|task| {
+            !excluded(&task.task_id)
+                && !task.status.is_retired()
+                && task.status != AgenticTaskStatus::Accepted
+        })
         .map(|task| task.task_id.clone())
         .collect::<Vec<_>>();
     if !incomplete.is_empty() {
@@ -112,7 +128,8 @@ pub(crate) fn completion_gap(
         .tasks
         .values()
         .filter(|task| {
-            !task.status.is_retired()
+            !excluded(&task.task_id)
+                && !task.status.is_retired()
                 && (task.claimant.is_none()
                     || task.reviewed_by.is_none()
                     || task.claimant.as_deref() == task.reviewed_by.as_deref())
@@ -141,7 +158,7 @@ pub(crate) fn completion_gap(
     None
 }
 
-/// Return final Artifact references that can truthfully close this Program.
+/// Return conservative Artifact integration candidates, not completion authority.
 ///
 /// This is deliberately derived from Runtime projections rather than model
 /// labels: every non-retired Task must be accepted, and a candidate
@@ -303,6 +320,77 @@ mod tests {
             cancel_evidence_refs: Vec::new(),
             pending_retirement: None,
         }
+    }
+
+    #[test]
+    fn completion_without_trusted_context_keeps_retiring_and_required_attempts_visible() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "required".into(),
+            accepted_task("required", "team", vec![], vec![]),
+        );
+        let mut optional = accepted_task("optional", "team", vec![], vec![]);
+        optional.status = AgenticTaskStatus::CancelRequested;
+        optional.pending_retirement = Some(super::super::program::AgenticTaskRetirement::Withdrawn);
+        optional.active_attempts.insert(
+            "physical".into(),
+            super::super::program::AgenticTaskAttemptProjection {
+                execution_id: "physical".into(),
+                agent_id: "agent:author".into(),
+                membership_id: "membership".into(),
+                mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+                generation: 0,
+            },
+        );
+        projection.tasks.insert("optional".into(), optional);
+        let request = ObjectiveCompleteRequestInput {
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: vec![],
+            result_refs: vec!["tool://result".into()],
+            evidence_refs: vec!["tool://evidence".into()],
+            unresolved: vec![],
+        };
+        assert_eq!(
+            completion_gap(&projection, &request),
+            Some("execution_cleanup_pending".into())
+        );
+        assert_eq!(
+            completion_gap(&projection, &request),
+            completion_gap_with_context(&projection, &request, None)
+        );
+        projection
+            .tasks
+            .get_mut("optional")
+            .unwrap()
+            .active_attempts
+            .clear();
+        assert_eq!(
+            completion_gap(&projection, &request),
+            Some("tasks_not_accepted:optional".into())
+        );
+        projection.tasks.get_mut("optional").unwrap().status = AgenticTaskStatus::Withdrawn;
+        assert_eq!(completion_gap(&projection, &request), None);
+        projection
+            .tasks
+            .get_mut("required")
+            .unwrap()
+            .active_attempts
+            .insert(
+                "required-physical".into(),
+                super::super::program::AgenticTaskAttemptProjection {
+                    execution_id: "required-physical".into(),
+                    agent_id: "agent:author".into(),
+                    membership_id: "membership".into(),
+                    mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+                    generation: 0,
+                },
+            );
+        assert_eq!(
+            completion_gap(&projection, &request),
+            Some("execution_cleanup_pending".into())
+        );
     }
 
     #[test]
@@ -823,6 +911,9 @@ pub(crate) fn reconcile_completion_request(
     let projection = actions
         .project(program_id)
         .map_err(|error| error.to_string())?;
+    if actions.recovery_session_is_excluded(&projection.session_id) {
+        return Ok(None);
+    }
     if projection.status == AgenticProgramStatus::Verified {
         return Ok(Some(projection));
     }

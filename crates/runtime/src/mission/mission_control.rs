@@ -6,12 +6,12 @@
 use std::collections::BTreeMap;
 
 use harness_contract::mission::{
-    MISSION_CONTROL_SCHEMA_VERSION, MissionControlActionReadiness, MissionControlAgentNode,
-    MissionControlApprovalNode, MissionControlEventDigest, MissionControlEventLine,
-    MissionControlGraphEdge, MissionControlGraphNode, MissionControlGraphProjection,
-    MissionControlMissionSummary, MissionControlProjection, MissionControlReadiness,
-    MissionControlSessionNode, MissionControlSummary, MissionControlTaskNode,
-    MissionControlTeamNode, MissionWorkspaceProjection,
+    MissionControlActionReadiness, MissionControlAgentNode, MissionControlApprovalNode,
+    MissionControlEventDigest, MissionControlGraphEdge, MissionControlGraphNode,
+    MissionControlGraphProjection, MissionControlMissionSummary, MissionControlProjection,
+    MissionControlReadiness, MissionControlSessionNode, MissionControlSummary,
+    MissionControlTaskNode, MissionControlTeamNode, MissionWorkspaceProjection,
+    MISSION_CONTROL_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -27,13 +27,18 @@ impl MissionControlRuntime {
         sessions: Vec<MissionControlSessionNode>,
         active_session_id: Option<String>,
         selected_mission_id: Option<String>,
-    ) -> MissionControlProjection {
+    ) -> Result<MissionControlProjection, String> {
+        let through_cursor = services
+            .event_store()
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
         build_projection(
             services,
             sessions,
             active_session_id,
             selected_mission_id,
             true,
+            through_cursor,
         )
     }
 
@@ -43,15 +48,112 @@ impl MissionControlRuntime {
         sessions: Vec<MissionControlSessionNode>,
         active_session_id: Option<String>,
         selected_mission_id: Option<String>,
-    ) -> MissionControlProjection {
+    ) -> Result<MissionControlProjection, String> {
+        let through_cursor = services
+            .event_store()
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
         build_projection(
             services,
             sessions,
             active_session_id,
             selected_mission_id,
             false,
+            through_cursor,
         )
     }
+
+    pub(crate) fn projection_through(
+        services: &RuntimeServices,
+        sessions: Vec<MissionControlSessionNode>,
+        active_session_id: Option<String>,
+        selected_mission_id: Option<String>,
+        include_execution_details: bool,
+        through_cursor: u64,
+    ) -> Result<MissionControlProjection, String> {
+        build_projection(
+            services,
+            sessions,
+            active_session_id,
+            selected_mission_id,
+            include_execution_details,
+            through_cursor,
+        )
+    }
+
+    pub(crate) fn directory_revision(services: &RuntimeServices) -> Result<String, String> {
+        mission_directory_revision(services)
+    }
+}
+
+fn mission_directory_revision(services: &RuntimeServices) -> Result<String, String> {
+    let mut tasks = services.task_aggregate_service().list()?;
+    tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    let programs = agentic_program_projections(services)?;
+    let mut count = tasks.len().saturating_add(programs.len());
+    if count > 4096 {
+        return Err("HistoryBudgetExceeded: mission directory count".into());
+    }
+    let mut bytes = 0usize;
+    let mut hasher = Sha256::new();
+    let mut field = |value: &str| -> Result<(), String> {
+        bytes = bytes.saturating_add(value.len());
+        if bytes > 1024 * 1024 {
+            return Err("HistoryBudgetExceeded: mission directory bytes".into());
+        }
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+        Ok(())
+    };
+    for task in &tasks {
+        field("task")?;
+        field(&task.task_id)?;
+        field(&task.mission_id)?;
+        field(&task.origin_session_id)?;
+        field(&task.revision.to_string())?;
+        let mut bindings = services
+            .task_aggregate_service()
+            .bindings_for_task(&task.task_id)?;
+        bindings.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
+        count = count
+            .saturating_add(bindings.len())
+            .saturating_add(task.graph_refs.len());
+        if count > 4096 {
+            return Err("HistoryBudgetExceeded: mission directory count".into());
+        }
+        for graph in &task.graph_refs {
+            field("graph")?;
+            field(&graph.graph_id)?;
+        }
+        for binding in bindings {
+            field("binding")?;
+            field(&binding.binding_id)?;
+            field(&binding.session_id)?;
+            field(&binding.turn_id)?;
+        }
+    }
+    for program in programs {
+        count = count
+            .saturating_add(program.teams.len())
+            .saturating_add(program.agents.len());
+        if count > 4096 {
+            return Err("HistoryBudgetExceeded: mission directory count".into());
+        }
+        field("program")?;
+        field(&program.program_id)?;
+        field(&program.revision.to_string())?;
+        field(&program.session_id)?;
+        field(program.root_execution_id.as_deref().unwrap_or_default())?;
+        for team in program.teams.values() {
+            field("team")?;
+            field(&team.team_id)?;
+        }
+        for agent in program.agents.values() {
+            field("agent")?;
+            field(&agent.agent_id)?;
+        }
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn build_projection(
@@ -60,7 +162,17 @@ fn build_projection(
     active_session_id: Option<String>,
     selected_mission_id: Option<String>,
     include_execution_details: bool,
-) -> MissionControlProjection {
+    through_cursor: u64,
+) -> Result<MissionControlProjection, String> {
+    if services
+        .event_store()
+        .durable_commit_cursor()
+        .map_err(|error| error.to_string())?
+        != through_cursor
+    {
+        return Err("mission projection source changed; resync required".into());
+    }
+    let directory_revision = mission_directory_revision(services)?;
     let mut mission_aggregates = services.mission_runtime().aggregates();
     mission_aggregates.sort_by(|left, right| {
         right
@@ -88,13 +200,58 @@ fn build_projection(
         services.mission_evidence(),
         services.mission_schedules().projection(),
     );
-    let agentic_programs = agentic_program_projections(services);
+    let agentic_programs = agentic_program_projections(services)?;
     let agent_projection = serde_json::json!({
         "kind": "runtime.agents",
         "agents": services.agent_runtime().list(),
     });
     let workspace_approval_projection = services.approval_queue().projection();
-    let all_tasks = services.task_aggregate_service().list().unwrap_or_default();
+    let all_tasks = services.task_aggregate_service().list()?;
+    if all_tasks.len().saturating_add(agentic_programs.len()) > 4096 {
+        return Err("HistoryBudgetExceeded: mission identity directory count".into());
+    }
+    let mut task_session_directory = BTreeMap::new();
+    let mut directory_bytes = 0usize;
+    let mut directory_count = all_tasks.len().saturating_add(agentic_programs.len());
+    for task in &all_tasks {
+        let bindings = services
+            .task_aggregate_service()
+            .bindings_for_task(&task.task_id)?;
+        directory_count = directory_count
+            .saturating_add(bindings.len())
+            .saturating_add(task.graph_refs.len());
+        directory_bytes = directory_bytes
+            .saturating_add(task.task_id.len())
+            .saturating_add(task.mission_id.len())
+            .saturating_add(task.origin_session_id.len());
+        for binding in &bindings {
+            directory_bytes = directory_bytes.saturating_add(binding.session_id.len());
+        }
+        for graph in &task.graph_refs {
+            directory_bytes = directory_bytes.saturating_add(graph.graph_id.len());
+        }
+        if directory_count > 4096 || directory_bytes > 1024 * 1024 {
+            return Err("HistoryBudgetExceeded: mission identity directory".into());
+        }
+        let mut session_ids = std::collections::BTreeSet::from([task.origin_session_id.clone()]);
+        session_ids.extend(bindings.into_iter().map(|binding| binding.session_id));
+        task_session_directory.insert(task.task_id.clone(), session_ids);
+    }
+    for program in &agentic_programs {
+        directory_count = directory_count
+            .saturating_add(program.teams.len())
+            .saturating_add(program.agents.len());
+        directory_bytes = directory_bytes.saturating_add(program.program_id.len());
+        for team in program.teams.values() {
+            directory_bytes = directory_bytes.saturating_add(team.team_id.len());
+        }
+        for agent in program.agents.values() {
+            directory_bytes = directory_bytes.saturating_add(agent.agent_id.len());
+        }
+        if directory_count > 4096 || directory_bytes > 1024 * 1024 {
+            return Err("HistoryBudgetExceeded: mission identity directory".into());
+        }
+    }
     let graph_bindings = all_tasks
         .iter()
         .flat_map(|task| {
@@ -106,7 +263,7 @@ fn build_projection(
             })
         })
         .collect::<BTreeMap<_, _>>();
-    let tasks = task_nodes(services, &all_tasks)
+    let tasks = task_nodes(services, &all_tasks)?
         .into_iter()
         .filter(|task| task.mission_id == selected_mission_id)
         .collect::<Vec<_>>();
@@ -122,7 +279,11 @@ fn build_projection(
         .cloned()
         .filter(|agent| agent.mission_id.as_deref() == Some(selected_mission_id.as_str()))
         .collect::<Vec<_>>();
-    let selected_session_ids = mission_session_ids(services, &all_tasks, &selected_mission_id);
+    let selected_session_ids = all_tasks
+        .iter()
+        .filter(|task| task.mission_id == selected_mission_id)
+        .flat_map(|task| task_session_directory[&task.task_id].iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
     let selected_task_ids = tasks
         .iter()
         .map(|task| task.task_id.clone())
@@ -136,7 +297,7 @@ fn build_projection(
                 .iter()
                 .filter(|task| {
                     task.mission_id == selected_mission_id
-                        && task_sessions(services, task).contains(&session.session_id)
+                        && task_session_directory[&task.task_id].contains(&session.session_id)
                 })
                 .map(|task| task.task_id.clone())
                 .collect::<Vec<_>>();
@@ -184,7 +345,7 @@ fn build_projection(
         .filter(|session_id| {
             let mission_ids = all_tasks
                 .iter()
-                .filter(|task| task_sessions(services, task).contains(*session_id))
+                .filter(|task| task_session_directory[&task.task_id].contains(*session_id))
                 .map(|task| task.mission_id.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             mission_ids.len() == 1 && mission_ids.contains(&selected_mission_id)
@@ -200,7 +361,8 @@ fn build_projection(
         &selected_team_ids,
         &selected_agent_ids,
         &unambiguous_session_ids,
-    );
+        through_cursor,
+    )?;
     let execution_graphs = if include_execution_details {
         mission_execution_graph_summary(services, &selected_graph_ids, &graph_bindings)
     } else {
@@ -265,7 +427,15 @@ fn build_projection(
     );
     let missions = mission_aggregates
         .iter()
-        .map(|aggregate| mission_summary(services, aggregate, &all_tasks, &all_teams, &all_agents))
+        .map(|aggregate| {
+            mission_summary(
+                &task_session_directory,
+                aggregate,
+                &all_tasks,
+                &all_teams,
+                &all_agents,
+            )
+        })
         .collect();
     let mission_graph = mission_graph(
         services,
@@ -284,7 +454,16 @@ fn build_projection(
     );
     let pending_organization_count = summary.pending_organization_count;
 
-    MissionControlProjection {
+    if mission_directory_revision(services)? != directory_revision
+        || services
+            .event_store()
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?
+            != through_cursor
+    {
+        return Err("mission projection source changed; resync required".into());
+    }
+    Ok(MissionControlProjection {
         schema_version: MISSION_CONTROL_SCHEMA_VERSION,
         kind: "mission_control.projection".to_string(),
         workspace,
@@ -307,6 +486,7 @@ fn build_projection(
         capabilities,
         event_digest,
         health: serde_json::json!({
+            "directory_revision": directory_revision,
             "ok": mission_health["ok"].as_bool().unwrap_or(true),
             "status": mission_health["status"].as_str().unwrap_or("ready"),
             "mission": mission_health,
@@ -317,7 +497,7 @@ fn build_projection(
                 "source": "runtime.task.organization_decisions",
             },
         }),
-    }
+    })
 }
 
 fn mission_execution_graph_summary(
@@ -563,7 +743,7 @@ fn summary(
 fn task_nodes(
     services: &RuntimeServices,
     tasks: &[harness_contract::task::TaskAggregate],
-) -> Vec<MissionControlTaskNode> {
+) -> Result<Vec<MissionControlTaskNode>, String> {
     let mut tasks = tasks
         .iter()
         .cloned()
@@ -571,9 +751,8 @@ fn task_nodes(
             let turn_count = services
                 .task_aggregate_service()
                 .bindings_for_task(&task.task_id)
-                .map(|bindings| bindings.len())
-                .unwrap_or_default();
-            MissionControlTaskNode {
+                .map(|bindings| bindings.len())?;
+            Ok(MissionControlTaskNode {
                 task_id: task.task_id,
                 mission_id: task.mission_id,
                 kind: task_kind_name(task.kind).to_string(),
@@ -592,11 +771,11 @@ fn task_nodes(
                 blocker_reason: task.blocker_reason,
                 created_at_ms: task.created_at_ms,
                 updated_at_ms: task.updated_at_ms,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     tasks.sort_by_key(|task| (std::cmp::Reverse(task.updated_at_ms), task.task_id.clone()));
-    tasks
+    Ok(tasks)
 }
 
 fn task_kind_name(kind: harness_contract::task::TaskKind) -> &'static str {
@@ -606,39 +785,13 @@ fn task_kind_name(kind: harness_contract::task::TaskKind) -> &'static str {
     }
 }
 
-fn task_sessions(
+fn agentic_program_projections(
     services: &RuntimeServices,
-    task: &harness_contract::task::TaskAggregate,
-) -> std::collections::BTreeSet<String> {
-    let mut session_ids = std::collections::BTreeSet::from([task.origin_session_id.clone()]);
-    session_ids.extend(
-        services
-            .task_aggregate_service()
-            .bindings_for_task(&task.task_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|binding| binding.session_id),
-    );
-    session_ids
-}
-
-fn mission_session_ids(
-    services: &RuntimeServices,
-    tasks: &[harness_contract::task::TaskAggregate],
-    mission_id: &str,
-) -> std::collections::BTreeSet<String> {
-    tasks
-        .iter()
-        .filter(|task| task.mission_id == mission_id)
-        .flat_map(|task| task_sessions(services, task))
-        .collect()
-}
-
-fn agentic_program_projections(services: &RuntimeServices) -> Vec<crate::AgenticProgramProjection> {
+) -> Result<Vec<crate::AgenticProgramProjection>, String> {
     services
         .agent_action_service()
         .list_programs()
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
 }
 
 fn team_nodes(
@@ -1335,7 +1488,7 @@ fn insert_graph_edge(
 }
 
 fn mission_summary(
-    services: &RuntimeServices,
+    task_session_directory: &BTreeMap<String, std::collections::BTreeSet<String>>,
     aggregate: &harness_contract::mission::MissionAggregate,
     tasks: &[harness_contract::task::TaskAggregate],
     teams: &[MissionControlTeamNode],
@@ -1348,7 +1501,7 @@ fn mission_summary(
     let task_count = mission_tasks.len();
     let session_count = mission_tasks
         .iter()
-        .flat_map(|task| task_sessions(services, task))
+        .flat_map(|task| task_session_directory[&task.task_id].iter())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     let graph_count = mission_tasks
@@ -1408,81 +1561,71 @@ fn event_digest_for_mission(
     team_ids: &std::collections::BTreeSet<String>,
     agent_ids: &std::collections::BTreeSet<String>,
     unambiguous_session_ids: &std::collections::BTreeSet<String>,
-) -> MissionControlEventDigest {
-    let mut events = services
-        .event_store()
-        .list_stream(&format!("mission:{mission_id}"))
-        .unwrap_or_default();
-    for graph_id in graph_ids {
-        let mut after = None;
-        loop {
-            let page = services
-                .event_store()
-                .events_for_root_execution(graph_id, after, limit.max(1))
-                .unwrap_or_default();
-            if page.is_empty() {
-                break;
+    through_cursor: u64,
+) -> Result<MissionControlEventDigest, String> {
+    let stream_id = format!("mission:{mission_id}");
+    let mut references = Vec::new();
+    let mut directory_bytes = stream_id.len();
+    let mission_ids = std::collections::BTreeSet::from([mission_id.to_string()]);
+    for (kinds, identities) in [
+        (&["mission"][..], &mission_ids),
+        (&["task"][..], task_ids),
+        (&["execution", "execution_graph"][..], graph_ids),
+        (&["team", "team_run"][..], team_ids),
+        (&["agent", "agent_instance", "agent_run"][..], agent_ids),
+        (&["session"][..], unambiguous_session_ids),
+    ] {
+        for identity in identities {
+            for kind in kinds {
+                directory_bytes = directory_bytes
+                    .saturating_add(kind.len())
+                    .saturating_add(identity.len());
+                if references.len() >= 4096 || directory_bytes > 1024 * 1024 {
+                    return Err("HistoryBudgetExceeded: mission recent scope directory".into());
+                }
+                references.push(crate::RuntimeEventRef {
+                    kind: (*kind).into(),
+                    id: identity.clone(),
+                });
             }
-            let next = page
-                .last()
-                .map(|event| (event.commit_cursor, event.transaction_index));
-            let page_len = page.len();
-            events.extend(page);
-            if page_len < limit.max(1) || next == after {
-                break;
-            }
-            after = next;
         }
     }
-    for session_id in unambiguous_session_ids {
-        events.extend(
-            services
-                .event_store()
-                .execution_events_for_session(session_id, None, limit.max(1))
-                .unwrap_or_default(),
+    let lines = services.event_store().recent_event_lines(
+        &stream_id,
+        &references,
+        through_cursor,
+        limit.min(50),
+        1024 * 1024,
+    )?;
+    if lines.len() > limit.min(50) {
+        return Err("mission recent metadata exceeded event limit".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut previous = None;
+    let mut bytes = 0usize;
+    for line in &lines {
+        let position = (line.cursor, line.transaction_index);
+        if line.cursor > through_cursor
+            || !seen.insert(line.event_id.as_str())
+            || previous.is_some_and(|previous| position >= previous)
+        {
+            return Err("mission recent metadata identity/order mismatch".into());
+        }
+        previous = Some(position);
+        bytes = bytes.saturating_add(
+            serde_json::to_vec(line)
+                .map_err(|error| error.to_string())?
+                .len(),
         );
+        if bytes > 1024 * 1024 {
+            return Err("HistoryBudgetExceeded: mission recent event lines".into());
+        }
     }
-    events.retain(|event| {
-        event.stream_id == format!("mission:{mission_id}")
-            || event
-                .refs
-                .iter()
-                .any(|reference| match reference.kind.as_str() {
-                    "mission" => reference.id == mission_id,
-                    "task" => task_ids.contains(&reference.id),
-                    "execution" | "execution_graph" => graph_ids.contains(&reference.id),
-                    "team" | "team_run" => team_ids.contains(&reference.id),
-                    "agent" | "agent_instance" | "agent_run" => {
-                        agent_ids.contains(reference.id.as_str())
-                    }
-                    "session" => unambiguous_session_ids.contains(reference.id.as_str()),
-                    _ => false,
-                })
-    });
-    events.sort_by_key(|event| std::cmp::Reverse((event.commit_cursor, event.transaction_index)));
-    events.dedup_by(|left, right| left.event_id == right.event_id);
-    events.truncate(limit);
     let mut scope_counts = BTreeMap::new();
-    for event in &events {
-        *scope_counts
-            .entry(event.scope.as_str().to_string())
-            .or_insert(0) += 1;
+    for line in &lines {
+        *scope_counts.entry(line.scope.clone()).or_insert(0) += 1;
     }
-    let lines = events
-        .iter()
-        .map(|event| MissionControlEventLine {
-            event_id: event.event_id.clone(),
-            stream_id: event.stream_id.clone(),
-            cursor: event.commit_cursor,
-            transaction_index: event.transaction_index,
-            scope: event.scope.as_str().to_string(),
-            kind: event.kind.clone(),
-            status: event.status.clone(),
-            actor: event.actor.clone(),
-            created_at_ms: event.created_at_ms,
-        })
-        .collect::<Vec<_>>();
-    MissionControlEventDigest {
+    Ok(MissionControlEventDigest {
         total_recent_events: lines.len(),
         scope_counts,
         latest_errors: lines
@@ -1505,7 +1648,7 @@ fn event_digest_for_mission(
             .cloned()
             .collect(),
         latest: lines.into_iter().take(20).collect(),
-    }
+    })
 }
 
 fn workspace_recovery_required_count(services: &RuntimeServices) -> usize {
@@ -1579,6 +1722,505 @@ fn value_string(value: &serde_json::Value, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::RuntimeEventInput;
+    use harness_contract::mission::MissionControlEventLine;
+
+    #[derive(Debug, Default)]
+    struct MissionDirectoryFault {
+        inner: crate::task::EphemeralTaskStore,
+        mode: std::sync::atomic::AtomicUsize,
+        hits: std::sync::atomic::AtomicUsize,
+    }
+
+    macro_rules! forward_mission_task_ports {
+        ($(fn $name:ident(&self $(, $argument:ident: $kind:ty)*) -> $result:ty;)*) => {
+            $(fn $name(&self $(, $argument: $kind)*) -> $result {
+                crate::task::TaskStoreBackend::$name(&self.inner, $($argument),*)
+            })*
+        };
+    }
+
+    impl crate::task::TaskStoreBackend for MissionDirectoryFault {
+        fn list(&self) -> Result<Vec<harness_contract::task::TaskAggregate>, String> {
+            if self.mode.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err("mission-directory-list-fault".into());
+            }
+            crate::task::TaskStoreBackend::list(&self.inner)
+        }
+
+        fn bindings_for_task(
+            &self,
+            task_id: &str,
+        ) -> Result<Vec<harness_contract::task::TaskTurnBinding>, String> {
+            if self.mode.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err("mission-directory-bindings-fault".into());
+            }
+            crate::task::TaskStoreBackend::bindings_for_task(&self.inner, task_id)
+        }
+
+        forward_mission_task_ports! {
+            fn bind_turn(&self, binding: &harness_contract::task::TaskTurnBinding) -> Result<harness_contract::task::TaskTurnBinding, String>;
+            fn create_with_origin_binding(&self, aggregate: &harness_contract::task::TaskAggregate, mutation: &crate::task::TaskMutation, binding: &harness_contract::task::TaskTurnBinding) -> Result<(crate::task::TaskMutationResult, harness_contract::task::TaskTurnBinding), String>;
+            fn bindings_for_turn(&self, session_id: &str, turn_id: &str) -> Result<Vec<harness_contract::task::TaskTurnBinding>, String>;
+            fn assign_mission_batch(&self, command: &harness_contract::mission::TaskMissionAssignmentCommand) -> Result<harness_contract::mission::TaskMissionAssignmentReceipt, String>;
+            fn assignment_receipt(&self, operation_id: &str) -> Result<Option<harness_contract::mission::TaskMissionAssignmentReceipt>, String>;
+            fn save_organization_decision(&self, decision: &harness_contract::mission::MissionOrganizationDecision, expected_revision: Option<u64>) -> Result<harness_contract::mission::MissionOrganizationDecision, String>;
+            fn organization_decisions(&self, status: Option<harness_contract::mission::MissionOrganizationStatus>, limit: usize) -> Result<Vec<harness_contract::mission::MissionOrganizationDecision>, String>;
+            fn mutate_task(&self, task_id: &str, mutation: &crate::task::TaskMutation, updater: &mut dyn FnMut(Option<harness_contract::task::TaskAggregate>) -> Result<harness_contract::task::TaskAggregate, String>) -> Result<crate::task::TaskMutationResult, String>;
+            fn pending_outbox(&self, task_id: Option<&str>, limit: usize) -> Result<Vec<crate::task::TaskEvidenceOutboxRecord>, String>;
+            fn list_outbox(&self) -> Result<Vec<crate::task::TaskEvidenceOutboxRecord>, String>;
+            fn list_assignment_outbox(&self) -> Result<Vec<crate::task::TaskMissionAssignmentOutboxRecord>, String>;
+            fn mark_outbox_projected(&self, outbox_id: &str, projected_at_ms: u64) -> Result<(), String>;
+        }
+    }
+
+    #[test]
+    fn r1_bounded_history_mission_directory_io_cannot_become_empty_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = std::sync::Arc::new(MissionDirectoryFault::default());
+        let services =
+            RuntimeServices::test_builder(directory.path().join("home"), directory.path())
+                .task_aggregate_service(std::sync::Arc::new(
+                    crate::TaskAggregateService::from_backend(backend.clone()),
+                ))
+                .build()
+                .unwrap();
+        let mission = services.mission_runtime().ensure_default_mission().unwrap();
+        services.publish_session_execution_policy(
+            "directory-session",
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        let spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "directory-session",
+                None,
+                harness_contract::task::TaskSpec::new("real directory Task"),
+            )
+            .unwrap();
+        services
+            .task_aggregate_service()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "directory-task".into(),
+                mission_id: mission.mission_id.clone(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "directory-session".into(),
+                origin_turn_id: "directory-turn".into(),
+                root_task_id: "directory-task".into(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "test".into(),
+                spec,
+                evidence_refs: Vec::new(),
+            })
+            .unwrap();
+        let port = crate::MissionRuntimePort::new(services.clone());
+        assert!(port
+            .control_summary_projection(Vec::new(), None, Some(mission.mission_id.clone()))
+            .is_ok());
+        for (mode, expected) in [
+            (1, "mission-directory-list-fault"),
+            (2, "mission-directory-bindings-fault"),
+        ] {
+            backend
+                .mode
+                .store(mode, std::sync::atomic::Ordering::SeqCst);
+            for details in [false, true] {
+                let before = backend.hits.load(std::sync::atomic::Ordering::SeqCst);
+                let error = port
+                    .control_projection_through(
+                        Vec::new(),
+                        None,
+                        Some(mission.mission_id.clone()),
+                        details,
+                        port.durable_commit_cursor().unwrap(),
+                    )
+                    .unwrap_err();
+                assert_eq!(error, expected);
+                assert!(
+                    backend.hits.load(std::sync::atomic::Ordering::SeqCst) > before,
+                    "directory fault-hit mode={mode}"
+                );
+            }
+        }
+        backend.mode.store(0, std::sync::atomic::Ordering::SeqCst);
+        let session_only = services
+            .event_store()
+            .append(RuntimeEventInput {
+                stream_id: "session:directory-session".into(),
+                scope: RuntimeEventScope::Session,
+                kind: "session.directory_probe".into(),
+                status: None,
+                actor: None,
+                refs: vec![crate::RuntimeEventRef {
+                    kind: "session".into(),
+                    id: "directory-session".into(),
+                }],
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        let unique = port
+            .control_projection(Vec::new(), None, Some(mission.mission_id.clone()))
+            .unwrap();
+        assert!(unique
+            .event_digest
+            .latest
+            .iter()
+            .any(|line| line.event_id == session_only.event_id));
+        let foreign = services
+            .mission_runtime()
+            .create_mission("directory-foreign-mission", "foreign directory", Vec::new())
+            .unwrap();
+        let before_cursor = port.durable_commit_cursor().unwrap();
+        let before_directory = port.control_directory_revision().unwrap();
+        let spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "directory-session",
+                None,
+                harness_contract::task::TaskSpec::new("second real Task in shared Session"),
+            )
+            .unwrap();
+        services
+            .task_aggregate_service()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "directory-foreign-task".into(),
+                mission_id: foreign.mission_id,
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "directory-session".into(),
+                origin_turn_id: "directory-foreign-turn".into(),
+                root_task_id: "directory-foreign-task".into(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::ExplicitLocked,
+                mission_assigned_by: "test".into(),
+                spec,
+                evidence_refs: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(port.durable_commit_cursor().unwrap(), before_cursor);
+        assert_ne!(port.control_directory_revision().unwrap(), before_directory);
+        let task_authorized = services
+            .event_store()
+            .append(RuntimeEventInput {
+                stream_id: "session:directory-session".into(),
+                scope: RuntimeEventScope::Session,
+                kind: "session.task_authorized_probe".into(),
+                status: None,
+                actor: None,
+                refs: vec![
+                    crate::RuntimeEventRef {
+                        kind: "session".into(),
+                        id: "directory-session".into(),
+                    },
+                    crate::RuntimeEventRef {
+                        kind: "task".into(),
+                        id: "directory-task".into(),
+                    },
+                ],
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        let ambiguous = port
+            .control_summary_projection(Vec::new(), None, Some(mission.mission_id))
+            .unwrap();
+        assert!(!ambiguous
+            .event_digest
+            .latest
+            .iter()
+            .any(|line| line.event_id == session_only.event_id));
+        assert!(ambiguous
+            .event_digest
+            .latest
+            .iter()
+            .any(|line| line.event_id == task_authorized.event_id));
+    }
+
+    #[test]
+    fn r1_bounded_history_mission_digest_is_recent_scoped_and_fail_closed() {
+        let services = RuntimeServices::in_memory().expect("services");
+        let mission = services
+            .mission_runtime()
+            .ensure_default_mission()
+            .expect("mission");
+        let empty = std::collections::BTreeSet::new();
+        let read = |through, limit| {
+            event_digest_for_mission(
+                limit,
+                &services,
+                &mission.mission_id,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                through,
+            )
+        };
+        assert_eq!(read(0, 50).unwrap().total_recent_events, 0);
+        assert_eq!(read(0, 0).unwrap().total_recent_events, 0);
+        let mut expected = Vec::new();
+        for cohort in 0..60 {
+            let receipt = services.event_store().append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!("recent-mission-{cohort}"),
+                expected_streams: (0..2).map(|index| crate::ExpectedStreamRevision {
+                    stream_id: format!("typed-only:{cohort}:{index}"), expected_revision: 0,
+                }).collect(),
+                events: (0..2).map(|index| crate::RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: format!("typed-only:{cohort}:{index}"), scope: RuntimeEventScope::Session,
+                        kind: if index == 0 { "session.failed" } else { "session.recovery_required" }.into(),
+                        status: Some(if index == 0 { "failed" } else { "recovery_required" }.into()),
+                        actor: Some(format!("actor-{cohort}-{index}")),
+                        refs: vec![crate::RuntimeEventRef { kind: "mission".into(), id: mission.mission_id.clone() },
+                            crate::RuntimeEventRef { kind: "task".into(), id: "overlap-task".into() }],
+                        payload: serde_json::json!({"old_payload": if cohort == 0 { "x".repeat(2 * 1024 * 1024) } else { String::new() }}),
+                    }, schema_version: 1, idempotency_key: Some(format!("recent-{cohort}-{index}")),
+                }).collect(),
+            }).expect("real transaction producer");
+            for index in 0..2 {
+                let event = services
+                    .event_store()
+                    .list_stream(&format!("typed-only:{cohort}:{index}"))
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                assert_eq!(event.commit_cursor, receipt.commit_cursor);
+                expected.push(MissionControlEventLine {
+                    event_id: event.event_id,
+                    stream_id: event.stream_id,
+                    cursor: event.commit_cursor,
+                    transaction_index: event.transaction_index,
+                    scope: "session".into(),
+                    kind: event.kind,
+                    status: event.status,
+                    actor: event.actor,
+                    created_at_ms: event.created_at_ms,
+                });
+            }
+            if cohort == 0 {
+                let short =
+                    read(services.event_store().durable_commit_cursor().unwrap(), 50).unwrap();
+                assert!(short.total_recent_events >= 2 && short.total_recent_events < 50);
+            }
+        }
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        for sequence in 0..60 {
+            services
+                .event_store()
+                .append(RuntimeEventInput {
+                    stream_id: format!("foreign:{sequence}"),
+                    scope: RuntimeEventScope::Session,
+                    kind: "session.foreign".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![crate::RuntimeEventRef {
+                        kind: "session".into(),
+                        id: "ambiguous-session".into(),
+                    }],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+        expected.reverse();
+        expected.truncate(50);
+        let digest = read(through, 50).unwrap();
+        assert_eq!(digest.total_recent_events, 50);
+        assert_eq!(digest.latest, expected[..20]);
+        assert_eq!(
+            digest.latest_errors,
+            expected
+                .iter()
+                .filter(|line| line.status.as_deref() == Some("failed"))
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            digest.recovery_required,
+            expected
+                .iter()
+                .filter(|line| line.status.as_deref() == Some("recovery_required"))
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            digest.scope_counts,
+            BTreeMap::from([("session".into(), 50)])
+        );
+        let projection = MissionControlRuntime::summary_projection(
+            &services,
+            Vec::new(),
+            None,
+            Some(mission.mission_id.clone()),
+        )
+        .unwrap();
+        assert_eq!(projection.event_digest, digest);
+        let selected_tasks = std::collections::BTreeSet::from(["selected-task".to_string()]);
+        let selected_graphs = std::collections::BTreeSet::from(["selected-graph".to_string()]);
+        let selected_teams = std::collections::BTreeSet::from(["selected-team".to_string()]);
+        let selected_agents = std::collections::BTreeSet::from(["selected-agent".to_string()]);
+        let selected_sessions = std::collections::BTreeSet::from(["unique-session".to_string()]);
+        let mut typed_ids = Vec::new();
+        for (kind, identity) in [
+            ("task", "selected-task"),
+            ("execution", "selected-graph"),
+            ("execution_graph", "selected-graph"),
+            ("team", "selected-team"),
+            ("team_run", "selected-team"),
+            ("agent", "selected-agent"),
+            ("agent_instance", "selected-agent"),
+            ("agent_run", "selected-agent"),
+            ("session", "unique-session"),
+        ] {
+            typed_ids.push(
+                services
+                    .event_store()
+                    .append(RuntimeEventInput {
+                        stream_id: format!("typed-only:{kind}"),
+                        scope: RuntimeEventScope::Session,
+                        kind: "session.typed_membership".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![crate::RuntimeEventRef {
+                            kind: kind.into(),
+                            id: identity.into(),
+                        }],
+                        payload: serde_json::json!({}),
+                    })
+                    .unwrap()
+                    .event_id,
+            );
+        }
+        let typed_through = services.event_store().durable_commit_cursor().unwrap();
+        let typed_digest = event_digest_for_mission(
+            50,
+            &services,
+            &mission.mission_id,
+            &selected_tasks,
+            &selected_graphs,
+            &selected_teams,
+            &selected_agents,
+            &selected_sessions,
+            typed_through,
+        )
+        .unwrap();
+        typed_ids.reverse();
+        assert_eq!(
+            typed_digest
+                .latest
+                .iter()
+                .take(9)
+                .map(|line| line.event_id.clone())
+                .collect::<Vec<_>>(),
+            typed_ids
+        );
+        assert!(!typed_digest
+            .latest
+            .iter()
+            .any(|line| line.stream_id.starts_with("foreign:")));
+        assert!(MissionControlRuntime::projection_through(
+            &services,
+            Vec::new(),
+            None,
+            Some(mission.mission_id.clone()),
+            false,
+            through
+        )
+        .unwrap_err()
+        .contains("resync required"));
+        let oversized = services
+            .event_store()
+            .append(RuntimeEventInput {
+                stream_id: format!("mission:{}", mission.mission_id),
+                scope: RuntimeEventScope::Session,
+                kind: "session.metadata_budget_probe".into(),
+                status: None,
+                actor: Some("x".repeat(1024 * 1024 + 1)),
+                refs: Vec::new(),
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        let error = read(oversized.commit_cursor, 50).unwrap_err();
+        assert!(
+            error.starts_with("HistoryBudgetExceeded:"),
+            "metadata budget fault-hit: {error}"
+        );
+        assert!(MissionControlRuntime::projection(
+            &services,
+            Vec::new(),
+            None,
+            Some(mission.mission_id.clone())
+        )
+        .is_err());
+        let port = crate::MissionRuntimePort::new(services.clone());
+        assert!(port
+            .control_projection(Vec::new(), None, Some(mission.mission_id.clone()))
+            .unwrap_err()
+            .starts_with("HistoryBudgetExceeded:"));
+        assert!(port
+            .control_summary_projection(Vec::new(), None, Some(mission.mission_id.clone()))
+            .unwrap_err()
+            .starts_with("HistoryBudgetExceeded:"));
+        assert!(port
+            .control_projection_through(
+                Vec::new(),
+                None,
+                Some(mission.mission_id.clone()),
+                false,
+                port.durable_commit_cursor().unwrap()
+            )
+            .unwrap_err()
+            .starts_with("HistoryBudgetExceeded:"));
+        let many = (0..4097).map(|index| format!("task-{index}")).collect();
+        assert!(event_digest_for_mission(
+            50,
+            &services,
+            &mission.mission_id,
+            &many,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            oversized.commit_cursor
+        )
+        .unwrap_err()
+        .starts_with("HistoryBudgetExceeded:"));
+        services
+            .event_store()
+            .append(RuntimeEventInput {
+                stream_id: "agentic-program:mission-directory-negative".into(),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.program_opened".into(),
+                status: None,
+                actor: Some("negative-fixture".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"negative": "missing required objective"}),
+            })
+            .unwrap();
+        let error = MissionControlRuntime::summary_projection(
+            &services,
+            Vec::new(),
+            None,
+            Some(mission.mission_id.clone()),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("program_opened_missing_objective"),
+            "real list_programs fault-hit: {error}"
+        );
+    }
 
     fn agentic_program_fixture() -> crate::AgenticProgramProjection {
         let mut program =
@@ -1676,12 +2318,10 @@ mod tests {
             researcher.display_provenance.as_deref(),
             Some("runtime.agentic_program_projection")
         );
-        assert!(
-            researcher
-                .display_digest
-                .as_deref()
-                .is_some_and(|digest| digest.starts_with("sha256:"))
-        );
+        assert!(researcher
+            .display_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
     }
 
     #[test]
@@ -1702,14 +2342,12 @@ mod tests {
     fn agentic_team_without_canonical_task_graph_binding_is_not_assigned_to_a_mission() {
         let programs = vec![agentic_program_fixture()];
         assert!(team_nodes(&programs, &BTreeMap::new()).is_empty());
-        assert!(
-            agent_nodes(
-                &serde_json::json!({ "agents": [] }),
-                &programs,
-                &BTreeMap::new(),
-            )
-            .is_empty()
-        );
+        assert!(agent_nodes(
+            &serde_json::json!({ "agents": [] }),
+            &programs,
+            &BTreeMap::new(),
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1776,7 +2414,8 @@ mod tests {
             vec![session],
             Some("session-a".into()),
             None,
-        );
+        )
+        .expect("canonical Mission projection");
         assert_eq!(projection.schema_version, MISSION_CONTROL_SCHEMA_VERSION);
         assert_eq!(projection.summary.session_count, 1);
         assert_eq!(
@@ -1796,13 +2435,11 @@ mod tests {
         assert!(team_create.available);
         assert_eq!(team_create.target_count, 1);
         assert!(!team_create.reason.is_empty());
-        assert!(
-            projection
-                .mission_graph
-                .nodes
-                .iter()
-                .any(|node| node.node_id == "session:session-a")
-        );
+        assert!(projection
+            .mission_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_id == "session:session-a"));
     }
 
     #[test]
@@ -1858,24 +2495,18 @@ mod tests {
             &digest,
             true,
         );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.node_id == "schedule:schedule-1")
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == "conflict" && node.status == "attention")
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == "recovery" && node.status == "attention")
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.node_id == "schedule:schedule-1"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == "conflict" && node.status == "attention"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == "recovery" && node.status == "attention"));
     }
 
     #[test]

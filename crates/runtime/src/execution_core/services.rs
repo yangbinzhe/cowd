@@ -25,24 +25,24 @@ use thiserror::Error;
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 use super::goal::{GoalStore, ObjectiveSupervisor};
 use super::graph::{
+    executors::{
+        AgentTaskExecutor, AgenticProgramWaitExecutor, ApprovalNodeExecutor,
+        CompileTargetGuardExecutor, MaterializeNodeExecutor, ScopedNodeExecutor,
+        SynthesizeNodeExecutor, VerifyNodeExecutor,
+    },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError, ExecutionServiceClass,
     ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
     ResourceAdmissionDecision, ResourceAdmissionRequest, ResourceObservation, ResourceQuota,
     ResourceResultClass, ScopeLockError, ScopeLockManager, WorktreeLeaseError,
     WorktreeLeaseManager,
-    executors::{
-        AgentTaskExecutor, AgenticProgramWaitExecutor, ApprovalNodeExecutor,
-        CompileTargetGuardExecutor, MaterializeNodeExecutor, ScopedNodeExecutor,
-        SynthesizeNodeExecutor, VerifyNodeExecutor,
-    },
 };
-#[cfg(feature = "test-fixtures")]
-use crate::RuntimeEventInput;
 use crate::agent::binding::request_for_intent;
 use crate::agent::definition::ExplicitTomlAgentImport;
 use crate::managed_agent::ManagedAgentRestartDisposition;
 use crate::runtime_event_store::RuntimeEventStoreError;
+#[cfg(feature = "test-fixtures")]
+use crate::RuntimeEventInput;
 use crate::{
     AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
     AgentRuntimeResolver, ApprovalConfig, ApprovalCoordinator, ApprovalQueue, CompiledAgentBinding,
@@ -556,25 +556,39 @@ impl RuntimeEventReader {
         after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
-        let mut events = self
+        let head = self
             .store
-            .list_stream(session_id)?
-            .into_iter()
-            .filter(|event| {
-                after_position.is_none_or(|position| {
-                    (event.commit_cursor, event.transaction_index) > position
-                })
-            })
-            .collect::<Vec<_>>();
-        events.extend(self.store.execution_events_for_session(
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
+        let events = self.store.position_page(
+            RuntimeEventScope::Session,
             session_id,
+            None,
             after_position,
-            limit,
-        )?);
-        events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
-        events.dedup_by(|left, right| left.event_id == right.event_id);
-        events.truncate(limit);
-        Ok(events)
+            head,
+            limit.min(100),
+            1024 * 1024,
+        )?;
+        let mut total = 0usize;
+        events
+            .into_iter()
+            .map(|event| {
+                let event = self.store.resolve_read_record(event)?;
+                let bytes = serde_json::to_vec(&event)
+                    .map_err(|error| error.to_string())?
+                    .len();
+                total = total
+                    .checked_add(bytes)
+                    .ok_or("timeline byte budget overflow")?;
+                if total > 1024 * 1024 {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                        "timeline resolved content".into(),
+                    )
+                    .to_string());
+                }
+                Ok(event)
+            })
+            .collect()
     }
 }
 
@@ -631,6 +645,16 @@ impl SessionTerminalDeliveryPort {
         terminal_id: &str,
     ) -> Result<Option<RuntimeSessionOutboxRecord>, RuntimeEventStoreError> {
         self.store.session_terminal(terminal_id)
+    }
+
+    pub fn for_execution(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<RuntimeSessionOutboxRecord>, RuntimeEventStoreError> {
+        self.store
+            .session_terminal_for_execution(session_id, execution_id, turn_id)
     }
 
     pub fn claim(
@@ -813,7 +837,7 @@ pub struct RuntimeServices {
     knowledge_activation: crate::knowledge_activation::KnowledgeActivationRuntime,
     session_dispatch_executor: Arc<crate::session_execution::SessionDispatchNodeExecutor>,
     session_input_router: OnceLock<Arc<SessionInputRouter>>,
-    session_query_port: OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>,
+    session_query_port: Arc<OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>>,
     session_ingress_port: OnceLock<Arc<dyn crate::SessionRuntimeIngressPort>>,
     session_journal_port: OnceLock<Arc<dyn crate::SessionRuntimeJournalPort>>,
     session_application_port: OnceLock<Arc<dyn crate::SessionRuntimeApplicationPort>>,
@@ -1002,7 +1026,9 @@ impl RuntimeServices {
             Arc::new(WorktreeLeaseManager::open(
                 ephemeral_root.path().join("worktree-leases.json"),
             )?),
-            Arc::new(ScopeLockManager::new()),
+            Arc::new(ScopeLockManager::persistent(
+                ephemeral_root.path().join("scope-locks"),
+            )?),
             default_resource_quotas(),
             crate::ProviderResourceConfig::default(),
             Arc::new(crate::ProviderRegistry::empty()),
@@ -1093,6 +1119,9 @@ impl RuntimeServices {
         defer_graph_producers: bool,
     ) -> Result<Self, RuntimeServicesError> {
         let assembly_started_at = Instant::now();
+        event_store
+            .bind_artifact_store(Arc::clone(&artifact_store))
+            .map_err(RuntimeServicesError::Invariant)?;
         let path_identity_resolver = Arc::new(
             crate::path_identity::WorkspacePathIdentityResolver::discover(&workspace_root)
                 .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?,
@@ -1203,10 +1232,17 @@ impl RuntimeServices {
                 Arc::clone(&session_dispatch_executor) as Arc<dyn NodeExecutor>,
             ],
         )?;
+        executor_registry.install_builtin_tool_batch(&tool_batch_executor)?;
+        let process_input_verifier =
+            crate::agentic::review_evidence::ProcessInputVerifier::new(Arc::clone(&scope_locks));
+        let session_query_port = Arc::new(OnceLock::new());
         let commit_service = ExecutionCommitService::with_hot_state(
             Arc::clone(&event_store),
             Arc::clone(&hot_state),
-        );
+        )
+        .with_process_input_verifier(process_input_verifier.clone())
+        .with_artifact_store(Arc::clone(&artifact_store))
+        .with_session_query_slot(Arc::clone(&session_query_port));
         let provider_generation = provider_resource_config.materialize(&provider_registry.pin());
         resource_quotas.retain(|(kind, _)| {
             !matches!(
@@ -1270,9 +1306,13 @@ impl RuntimeServices {
                 &execution_capacity_profile,
                 defer_graph_producers,
             ));
+        execution_supervisor.install_session_recovery_owner(Arc::clone(&event_store))?;
         executor_registry.register(Arc::new(AgenticProgramWaitExecutor::new(
             crate::AgentActionService::new(Arc::clone(&event_store))
-                .with_read_model(Arc::clone(&agentic_read_model)),
+                .with_read_model(Arc::clone(&agentic_read_model))
+                .with_process_input_verifier(process_input_verifier.clone())
+                .with_artifact_store(Arc::clone(&artifact_store))
+                .with_session_query_slot(Arc::clone(&session_query_port)),
             graph_state_store.clone(),
             Arc::downgrade(&execution_supervisor),
         )))?;
@@ -1363,18 +1403,26 @@ impl RuntimeServices {
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
             Arc::clone(&agentic_read_model),
+            Arc::clone(&agent_runtime),
         )?);
         projection_lanes.push(agentic_program_wait_resolution_lane(
             Arc::clone(&event_store),
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
             Arc::clone(&agentic_read_model),
+            Arc::clone(&artifact_store),
+            Arc::clone(&session_query_port),
         )?);
         let event_reactor = Arc::new(
             crate::RuntimeEventReactor::sealed(Arc::clone(&event_store), projection_lanes)
                 .map_err(RuntimeServicesError::Invariant)?,
         );
-        let goal_store = Arc::new(GoalStore::new(Arc::clone(&event_store)));
+        let goal_store = Arc::new(
+            GoalStore::new(Arc::clone(&event_store))
+                .with_process_input_verifier(process_input_verifier.clone())
+                .with_artifact_store(Arc::clone(&artifact_store))
+                .with_session_query_slot(Arc::clone(&session_query_port)),
+        );
         let objective_supervisor = Arc::new(ObjectiveSupervisor::new(Arc::clone(&goal_store)));
         let conflict_resolver = Arc::new(ConflictArbiter::new(
             Arc::clone(&mission_evidence),
@@ -1485,7 +1533,7 @@ impl RuntimeServices {
                 .unwrap_or_else(crate::knowledge_activation::KnowledgeActivationRuntime::new),
             session_dispatch_executor,
             session_input_router: OnceLock::new(),
-            session_query_port: OnceLock::new(),
+            session_query_port,
             session_ingress_port: OnceLock::new(),
             session_journal_port: OnceLock::new(),
             session_application_port: OnceLock::new(),
@@ -1515,6 +1563,7 @@ impl RuntimeServices {
         // after shutdown and after RuntimeServices itself has been dropped.
         let settled_lineage_supervisor = Arc::downgrade(&self.execution_supervisor);
         let settled_agentic_actions = self.agent_action_service();
+        let settled_services = Arc::downgrade(self);
         self.execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
@@ -1524,7 +1573,13 @@ impl RuntimeServices {
                     return;
                 };
                 let agentic_actions = settled_agentic_actions.clone();
+                let services = settled_services.clone();
                 tokio::spawn(async move {
+                    if let Some(services) = services.upgrade() {
+                        if let Err(error) = services.retry_agentic_run_exit(&graph_id).await {
+                            tracing::warn!(graph_id, %error, "Agent exit settlement awaits original durable lane retry");
+                        }
+                    }
                     if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                         &graph_id,
                         &agentic_actions,
@@ -1588,30 +1643,68 @@ impl RuntimeServices {
             .map_err(RuntimeServicesError::Invariant)
     }
 
+    pub fn session_recovery_exclusions(&self) -> Vec<String> {
+        self.event_store.session_recovery_exclusions()
+    }
+
+    pub fn ensure_session_recovery_admitted(
+        &self,
+        session_id: &str,
+    ) -> Result<(), RuntimeServicesError> {
+        self.event_store
+            .ensure_session_recovery_admitted(session_id)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn install_startup_recovery_exclusions(
+        &self,
+        excluded: BTreeSet<String>,
+    ) -> Result<(), RuntimeServicesError> {
+        if excluded.iter().any(|session| session.trim().is_empty()) {
+            return Err(RuntimeServicesError::Invariant(
+                "startup_recovery_session_id_empty".into(),
+            ));
+        }
+        self.execution_supervisor
+            .install_startup_recovery_exclusions(&self.event_store, excluded)?;
+        Ok(())
+    }
+
     pub async fn release_recovered_producers(
         self: &Arc<Self>,
     ) -> Result<usize, RuntimeServicesError> {
-        let deferred = self.execution_supervisor.take_deferred_recovered_graphs();
-        self.start_background_reactors()?;
-        let mut released = 0usize;
-        for graph_id in deferred {
+        let Some(deferred) = self.execution_supervisor.deferred_recovered_graphs() else {
+            return Ok(0);
+        };
+        self.execution_supervisor.prepare_recovered_producers()?;
+        let mut prepared = Vec::new();
+        for graph_id in &deferred {
             // Wake only a recovered graph whose turn-scoped executors are bound.
             // A conversation-owned graph (inline_model/tool_batch/synthesize) is
             // bound by the Session host after it restores the turn context;
             // waking it here races that binding and fails the node as
             // `executor ... is unavailable`. Unbound graphs stay deferred and are
             // driven by the Session host itself once it restores the context.
-            let bound = match self.graph_state_store().load_async(&graph_id).await {
-                Ok(graph) => self.graph_executors_are_bound(&graph),
-                Err(_) => false,
-            };
-            if !bound {
+            let graph = self.graph_state_store().load_async(graph_id).await?;
+            if graph.lineage.as_ref().is_some_and(|lineage| {
+                self.event_store
+                    .is_session_recovery_excluded(&lineage.session_id)
+            }) {
                 continue;
             }
-            if let Err(error) = self.execution_supervisor.notify_graph(&graph_id).await {
-                tracing::warn!(graph_id, %error, "bound recovered graph could not be woken");
+            self.execution_supervisor
+                .ensure_graph_session_recovery_admitted(&graph)?;
+            if !self.graph_executors_are_bound(&graph)? {
                 continue;
             }
+            prepared.push(graph_id.clone());
+        }
+        self.start_background_reactors()?;
+        self.execution_supervisor
+            .release_prepared_recovered_graphs(&deferred)?;
+        let mut released = 0usize;
+        for graph_id in prepared {
+            self.execution_supervisor.notify_graph(&graph_id).await?;
             released += 1;
         }
         tracing::info!(
@@ -1770,7 +1863,12 @@ impl RuntimeServices {
     /// Stop the one Runtime execution owner and return auditable per-owner
     /// queue/abort/error evidence to the process host.
     pub async fn shutdown_execution(&self) -> crate::RuntimeExecutionShutdownReport {
-        self.execution_supervisor.shutdown().await
+        self.agent_runtime.fence_run_admission();
+        let mut report = self.execution_supervisor.shutdown().await;
+        if let Err(error) = self.agent_runtime.drain_retained_runs().await {
+            report.errors.push(error);
+        }
+        report
     }
 
     #[must_use]
@@ -2188,9 +2286,15 @@ impl RuntimeServices {
     #[must_use]
     pub fn agent_action_service(&self) -> crate::AgentActionService {
         crate::AgentActionService::new(Arc::clone(&self.event_store))
+            .with_process_input_verifier(
+                crate::agentic::review_evidence::ProcessInputVerifier::new(Arc::clone(
+                    &self.scope_locks,
+                )),
+            )
             .with_graph_store(self.graph_state_store.clone())
             .with_read_model(Arc::clone(&self.agentic_read_model))
             .with_artifact_store(Arc::clone(&self.artifact_store))
+            .with_session_query_slot(Arc::clone(&self.session_query_port))
     }
 
     /// Ask the sole ObjectiveSupervisor to reduce one durable Agentic
@@ -2992,28 +3096,37 @@ impl RuntimeServices {
         execution_id: &str,
         turn_id: &str,
     ) -> Result<Option<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
-        const PAGE_SIZE: usize = 256;
+        let head = self.event_store.durable_commit_cursor()?;
         let mut after = None;
         let mut found = None;
         loop {
             let page = self
                 .event_store
-                .list_scope_kind_page_asc(
-                    crate::RuntimeEventScope::Session,
-                    "session.cancellation_committed",
+                .position_page(
+                    RuntimeEventScope::Session,
+                    session_id,
+                    Some("session.cancellation_committed"),
                     after,
-                    PAGE_SIZE,
+                    head,
+                    100,
+                    1024 * 1024,
                 )
                 .map_err(RuntimeServicesError::Invariant)?;
             if page.is_empty() {
                 break;
             }
-            for event in &page {
-                let Ok(mut receipt) = serde_json::from_value::<
-                    harness_contract::turn::CancellationReceipt,
-                >(event.payload.clone()) else {
-                    continue;
-                };
+            for event in page {
+                let position = (event.commit_cursor, event.transaction_index);
+                if after.is_some_and(|after| position <= after) {
+                    return Err(RuntimeServicesError::Invariant(
+                        "cancellation page did not advance".into(),
+                    ));
+                }
+                after = Some(position);
+                let mut receipt: harness_contract::turn::CancellationReceipt =
+                    serde_json::from_value(event.payload).map_err(|_| {
+                        RuntimeServicesError::Invariant("invalid current cancellation fact".into())
+                    })?;
                 if receipt.session_id == session_id
                     && receipt.execution_id == execution_id
                     && receipt.turn_id == turn_id
@@ -3022,12 +3135,6 @@ impl RuntimeServices {
                     receipt.projection_revision = event.sequence;
                     found = Some(receipt);
                 }
-            }
-            after = page
-                .last()
-                .map(|event| (event.commit_cursor, event.transaction_index));
-            if page.len() < PAGE_SIZE {
-                break;
             }
         }
         Ok(found)
@@ -3513,11 +3620,12 @@ impl RuntimeServices {
                     Err(ExecutionStateStoreError::NotFound { .. }) => break,
                     Err(error) => return Err(error.into()),
                 };
-                if graph
-                    .node_statuses
-                    .values()
-                    .all(|status| status.is_terminal())
-                {
+                if graph.nodes.iter().all(|node| {
+                    graph
+                        .node_statuses
+                        .get(&node.id)
+                        .is_some_and(|status| status.is_terminal())
+                }) {
                     break;
                 }
                 match self
@@ -4252,7 +4360,7 @@ impl RuntimeServices {
         self.session_query_port.get().cloned()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[must_use]
     pub(crate) fn session_ingress_port(&self) -> Option<Arc<dyn crate::SessionRuntimeIngressPort>> {
         self.session_ingress_port.get().cloned()
@@ -4263,7 +4371,7 @@ impl RuntimeServices {
         self.session_journal_port.get().cloned()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[must_use]
     pub(crate) fn session_application_port(
         &self,
@@ -4317,21 +4425,49 @@ fn validate_evolution_scenario_isolation(
             missing_skills.join(", ")
         )));
     }
+    let lease = tool_host.and_then(crate::RuntimeExecutionHost::pin_step_catalog);
+    let metadata = lease.as_ref().map(tools::ToolHostLease::catalog_receipt);
+    let requested = scenario
+        .allowed_tools
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let definitions = tool_host
+        .map(|host| host.delegated_tool_definitions(&scenario.allowed_tools))
+        .unwrap_or_default();
+    let projection = lease
+        .as_ref()
+        .zip(metadata.as_ref())
+        .map(|(lease, metadata)| {
+            crate::tool_host::DelegatedCatalogProjection::new(lease, metadata, &requested)
+        });
+    let registered = |tool: &str| {
+        metadata
+            .as_ref()
+            .zip(projection.as_ref())
+            .is_some_and(|(metadata, projection)| {
+                metadata.descriptors.iter().any(|descriptor| {
+                    descriptor.canonical_id == tool
+                        && descriptor.health
+                            == harness_contract::tool::ToolDescriptorHealth::Healthy
+                        && scenario
+                            .permission_ceiling
+                            .permits(descriptor.required_permission)
+                        && definitions.iter().any(|definition| {
+                            definition.name == tool && projection.registered(definition)
+                        })
+                })
+            })
+    };
     let unknown_tools = scenario
         .allowed_tools
         .iter()
-        .filter(|tool| {
-            tool_host
-                .and_then(|host| {
-                    host.delegated_tool_effect_descriptor(tool, &serde_json::json!({}))
-                })
-                .is_none()
-        })
+        .filter(|tool| !registered(tool))
         .cloned()
         .collect::<Vec<_>>();
     if !unknown_tools.is_empty() {
         return Err(RuntimeServicesError::Invariant(format!(
-            "paired evolution evaluation has tools without an enforceable effect descriptor: {}",
+            "paired evolution evaluation has tools without healthy pinned catalog metadata: {}",
             unknown_tools.join(", ")
         )));
     }
@@ -4343,15 +4479,44 @@ fn validate_evolution_scenario_isolation(
             EvaluationAcceptanceCheck::Output { .. } => continue,
         };
         let available = scenario.allowed_tools.iter().any(|tool| {
-            tool_host
-                .and_then(|host| {
-                    host.delegated_tool_effect_descriptor(tool, &serde_json::json!({}))
+            let Some((lease, metadata)) = lease.as_ref().zip(metadata.as_ref()) else {
+                return false;
+            };
+            let resolver = lease.snapshot().catalog.effect_resolver(tool);
+            if resolver.resolver_id == "builtin.orchestrate" || !registered(tool) {
+                return false;
+            }
+            if effect == ToolEffectKind::Write {
+                return tool == "edit"
+                    && resolver == tools::builtin_effect_resolver_spec(tool)
+                    && metadata.descriptors.iter().any(|descriptor| {
+                        descriptor.canonical_id == *tool && descriptor.source == "builtin"
+                    })
+                    && scenario
+                        .permission_ceiling
+                        .permits(harness_contract::policy::PermissionMode::WorkspaceWrite);
+            }
+            definitions
+                .iter()
+                .find(|definition| definition.name == *tool)
+                .and_then(|definition| {
+                    projection.as_ref()?.discover(
+                        definition,
+                        &requested,
+                        scenario.permission_ceiling,
+                        Some(&scenario.resource_scopes),
+                    )
                 })
-                .is_some_and(|descriptor| {
-                    descriptor.effect_kind == effect
-                        && descriptor.scopes.iter().any(|scope| {
-                            scope.resource == harness_contract::policy::PermissionResource::File
-                        })
+                .is_some_and(|_| {
+                    (tool == "read_file" && resolver == tools::builtin_effect_resolver_spec(tool))
+                        || {
+                            let probe = lease.describe_effect(tool, &serde_json::json!({}));
+                            probe.effect_kind == effect
+                                && probe.scopes.iter().any(|scope| {
+                                    scope.resource
+                                        == harness_contract::policy::PermissionResource::File
+                                })
+                        }
                 })
         });
         if !available {
@@ -4362,6 +4527,95 @@ fn validate_evolution_scenario_isolation(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod discovery_inventory_tests {
+    use super::*;
+
+    struct CatalogHost(tools::ToolHostLease);
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for CatalogHost {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            Some(self.0.clone())
+        }
+
+        fn delegated_tool_definitions(
+            &self,
+            names: &[String],
+        ) -> Vec<crate::ProviderToolDefinition> {
+            self.0
+                .snapshot()
+                .catalog
+                .definitions(None)
+                .into_iter()
+                .filter(|definition| names.contains(&definition.name))
+                .map(|definition| crate::ProviderToolDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    input_schema: definition.input_schema,
+                })
+                .collect()
+        }
+
+        async fn execute_runtime_tool(
+            &self,
+            _: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            panic!("inventory must not execute a producer")
+        }
+    }
+
+    #[test]
+    fn r1_discovery_evolution_inventory_requires_real_leaf_producers() {
+        use harness_contract::evaluation::{
+            EvaluationAcceptanceCheck, EvaluationAcceptanceRequirement,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let host = CatalogHost(
+            tools::ToolHost::builtin("evolution-discovery", root.path()).pin_snapshot(),
+        );
+        let skills = crate::RuntimeSkillCatalog::default();
+        let mut scenario = EvaluationScenarioSpec {
+            scenario_ref: "discovery/read".into(),
+            objective: "read narrow input".into(),
+            acceptance: vec!["read proof".into()],
+            acceptance_checks: vec![EvaluationAcceptanceRequirement {
+                criterion: "read proof".into(),
+                check: EvaluationAcceptanceCheck::IsolatedWorkspaceRead,
+            }],
+            allowed_tools: vec!["read_file".into(), "tool_orchestrate".into()],
+            allowed_skills: Vec::new(),
+            resource_scopes: vec!["read:src/a.rs".into()],
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            model_lease: "local".into(),
+            replay_manifest: None,
+        };
+        assert!(validate_evolution_scenario_isolation(&scenario, Some(&host), &skills).is_ok());
+        for scopes in [
+            vec![],
+            vec!["network:*".into()],
+            vec!["read:src/../secret".into()],
+            vec!["write:shared".into()],
+        ] {
+            let mut denied = scenario.clone();
+            denied.resource_scopes = scopes;
+            assert!(validate_evolution_scenario_isolation(&denied, Some(&host), &skills).is_err());
+        }
+        scenario.allowed_tools = vec!["tool_orchestrate".into()];
+        assert!(validate_evolution_scenario_isolation(&scenario, Some(&host), &skills).is_err());
+        scenario.acceptance_checks[0].check = EvaluationAcceptanceCheck::IsolatedWorkspaceChange {
+            field: harness_contract::agent::StructuredOutputField::Implementation,
+        };
+        scenario.permission_ceiling = harness_contract::policy::PermissionMode::WorkspaceWrite;
+        assert!(validate_evolution_scenario_isolation(&scenario, Some(&host), &skills).is_err());
+        scenario.allowed_tools.push("edit".into());
+        assert!(validate_evolution_scenario_isolation(&scenario, Some(&host), &skills).is_ok());
+        scenario.allowed_tools.push("mcp_tool".into());
+        assert!(validate_evolution_scenario_isolation(&scenario, Some(&host), &skills).is_err());
+        assert!(validate_evolution_scenario_isolation(&scenario, None, &skills).is_err());
+    }
 }
 
 fn now_ms() -> u64 {
@@ -4382,6 +4636,8 @@ fn agentic_program_wait_resolution_lane(
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
     read_model: Arc<crate::agentic::AgenticReadModel>,
+    artifacts: Arc<crate::ArtifactStore>,
+    session_queries: Arc<OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>>,
 ) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
         AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID,
@@ -4406,6 +4662,8 @@ fn agentic_program_wait_resolution_lane(
             let graph_store = graph_store.clone();
             let supervisor = Arc::clone(&supervisor);
             let read_model = Arc::clone(&read_model);
+            let artifacts = Arc::clone(&artifacts);
+            let session_queries = Arc::clone(&session_queries);
             Box::pin(async move {
                 let checkpoint = event_store
                     .projection_checkpoint(AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID)
@@ -4457,13 +4715,20 @@ fn agentic_program_wait_resolution_lane(
                     }
                 }
                 let actions = crate::AgentActionService::new(Arc::clone(&event_store))
-                    .with_read_model(read_model);
+                    .with_read_model(read_model)
+                    .with_artifact_store(Arc::clone(&artifacts))
+                    .with_session_query_slot(Arc::clone(&session_queries));
                 let objective_supervisor =
                     crate::execution_core::goal::ObjectiveSupervisor::new(Arc::new(
-                        crate::execution_core::goal::GoalStore::new(Arc::clone(&event_store)),
+                        crate::execution_core::goal::GoalStore::new(Arc::clone(&event_store))
+                            .with_artifact_store(artifacts)
+                            .with_session_query_slot(session_queries),
                     ));
                 let mut resolved = 0usize;
                 for program_id in &program_ids {
+                    if actions.program_recovery_is_excluded(program_id)? {
+                        continue;
+                    }
                     crate::agentic::supervision::reconcile_completion_request(
                         &actions,
                         &objective_supervisor,
@@ -4501,18 +4766,30 @@ fn agentic_program_wait_resolution_lane(
     ))
 }
 
+fn agentic_settled_graph_resolution_interest() -> crate::RuntimeProjectionInterest {
+    crate::RuntimeProjectionInterest::new([
+        crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::ExecutionNode,
+            "execution_node.transitioned",
+        ),
+        crate::RuntimeProjectionEventInterest::new(RuntimeEventScope::Agent, "agent.local_exit"),
+        crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::ExecutionNode,
+            "execution.effect.receipt",
+        ),
+    ])
+}
+
 fn agentic_settled_graph_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
     read_model: Arc<crate::agentic::AgenticReadModel>,
+    agent_runtime: Arc<AgentRuntime>,
 ) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
         AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID,
-        crate::RuntimeProjectionInterest::new([crate::RuntimeProjectionEventInterest::new(
-            RuntimeEventScope::ExecutionNode,
-            "execution_node.transitioned",
-        )]),
+        agentic_settled_graph_resolution_interest(),
         256,
         Duration::from_secs(5),
     )
@@ -4524,6 +4801,7 @@ fn agentic_settled_graph_resolution_lane(
             let graph_store = graph_store.clone();
             let supervisor = Arc::clone(&supervisor);
             let read_model = Arc::clone(&read_model);
+            let agent_runtime = Arc::clone(&agent_runtime);
             Box::pin(async move {
                 let checkpoint = event_store
                     .projection_checkpoint(AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID)
@@ -4531,12 +4809,7 @@ fn agentic_settled_graph_resolution_lane(
                 let source_cursor = checkpoint
                     .as_ref()
                     .map_or(0, |checkpoint| checkpoint.source_cursor);
-                let interest = crate::RuntimeProjectionInterest::new([
-                    crate::RuntimeProjectionEventInterest::new(
-                        RuntimeEventScope::ExecutionNode,
-                        "execution_node.transitioned",
-                    ),
-                ]);
+                let interest = agentic_settled_graph_resolution_interest();
                 let page = event_store
                     .projection_scan_page(
                         source_cursor,
@@ -4546,10 +4819,15 @@ fn agentic_settled_graph_resolution_lane(
                         16 * 1024 * 1024,
                     )
                     .map_err(|error| error.to_string())?;
+                let services = agent_runtime
+                    .services()
+                    .ok_or("Agent exit reconciliation lane has no bound RuntimeServices")?;
                 if page.scanned_commits == 0 {
+                    services.retry_pending_agentic_run_exits().await?;
                     return Ok(crate::RuntimeProjectionPass::default());
                 }
                 let mut touched_graphs = BTreeSet::new();
+                let mut unscoped_effect_receipt = false;
                 for batch in &page.batches {
                     for event in &batch.events {
                         if let Some(graph_id) = event
@@ -4558,6 +4836,8 @@ fn agentic_settled_graph_resolution_lane(
                             .and_then(serde_json::Value::as_str)
                         {
                             touched_graphs.insert(graph_id.to_string());
+                        } else if event.kind == "execution.effect.receipt" {
+                            unscoped_effect_receipt = true;
                         }
                     }
                 }
@@ -4566,7 +4846,11 @@ fn agentic_settled_graph_resolution_lane(
                 // linked Agent children so either event order closes the barrier.
                 let actions = crate::AgentActionService::new(Arc::clone(&event_store))
                     .with_read_model(read_model);
+                let mut exit_errors = Vec::new();
                 for graph_id in &touched_graphs {
+                    if let Err(error) = services.retry_agentic_run_exit(graph_id).await {
+                        exit_errors.push(format!("{graph_id}:{error}"));
+                    }
                     crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                     graph_id,
                     &actions,
@@ -4578,6 +4862,12 @@ fn agentic_settled_graph_resolution_lane(
                         .child_links(graph_id)
                         .map_err(|error| error.to_string())?
                     {
+                        if let Err(error) = services
+                            .retry_agentic_run_exit(&link.child_execution_id)
+                            .await
+                        {
+                            exit_errors.push(format!("{}:{error}", link.child_execution_id));
+                        }
                         crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                         &link.child_execution_id,
                         &actions,
@@ -4586,6 +4876,28 @@ fn agentic_settled_graph_resolution_lane(
                     )
                     .await?;
                     }
+                }
+                let mut last_exit_retry_ms = checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .payload
+                            .get("last_exit_retry_ms")
+                            .and_then(serde_json::Value::as_u64)
+                    })
+                    .unwrap_or(0);
+                let retry_now_ms = now_ms();
+                if unscoped_effect_receipt
+                    || retry_now_ms < last_exit_retry_ms
+                    || retry_now_ms.saturating_sub(last_exit_retry_ms) >= 5_000
+                {
+                    if let Err(error) = services.retry_pending_agentic_run_exits().await {
+                        exit_errors.push(error);
+                    }
+                    last_exit_retry_ms = retry_now_ms;
+                }
+                if !exit_errors.is_empty() {
+                    return Err(exit_errors.join("; "));
                 }
                 // The checkpoint advances only after every matching join was
                 // either atomically resolved or proven inapplicable/terminal.
@@ -4596,6 +4908,7 @@ fn agentic_settled_graph_resolution_lane(
                         &serde_json::json!({
                             "source_cursor": page.scanned_through_cursor,
                             "resolved_graphs": touched_graphs.len(),
+                            "last_exit_retry_ms": last_exit_retry_ms,
                         }),
                         now_ms(),
                     )
@@ -4607,6 +4920,57 @@ fn agentic_settled_graph_resolution_lane(
             })
         },
     ))
+}
+
+#[cfg(test)]
+mod exact_exit_lane_tests {
+    use super::*;
+
+    #[test]
+    fn exact_exit_lane_declares_both_orders_and_excludes_command_ack() {
+        let interest = agentic_settled_graph_resolution_interest();
+        let exit = crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::Agent,
+            "agent.local_exit",
+        );
+        let graph = crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::ExecutionNode,
+            "execution_node.transitioned",
+        );
+        for order in [[exit.clone(), graph.clone()], [graph, exit]] {
+            assert!(order.iter().all(|event| interest.events.contains(event)));
+        }
+        assert!(!interest
+            .events
+            .contains(&crate::RuntimeProjectionEventInterest::new(
+                RuntimeEventScope::Agent,
+                "agent.command"
+            )));
+        assert!(!interest
+            .events
+            .contains(&crate::RuntimeProjectionEventInterest::new(
+                RuntimeEventScope::Agent,
+                "agent.terminal"
+            )));
+        assert!(interest
+            .events
+            .contains(&crate::RuntimeProjectionEventInterest::new(
+                RuntimeEventScope::ExecutionNode,
+                "execution.effect.receipt"
+            )));
+    }
+
+    #[tokio::test]
+    async fn exact_exit_original_services_shutdown_is_repeatable_without_runs() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let first = services.shutdown_execution().await;
+        let second = services.shutdown_execution().await;
+        assert!(first.errors.is_empty(), "{first:?}");
+        assert!(second.errors.is_empty(), "{second:?}");
+        assert_eq!(first.forced_aborts, 0);
+        assert_eq!(second.forced_aborts, 0);
+        services.shutdown_maintenance().await;
+    }
 }
 
 async fn project_managed_invocation_terminal(
@@ -4678,7 +5042,11 @@ async fn project_managed_invocation_terminal(
                 .into_iter()
                 .find(|current| current.invocation_id == invocation.invocation_id)
                 .is_some_and(|current| !current.status.is_active());
-            if already_terminal { Ok(()) } else { Err(error) }
+            if already_terminal {
+                Ok(())
+            } else {
+                Err(error)
+            }
         }
     }
 }

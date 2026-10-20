@@ -1473,6 +1473,10 @@ impl SessionService {
     ) -> Result<crate::runtime_service::SessionInputAdmission, String> {
         self.ensure_accepting()?;
         let runtime = self.runtime()?;
+        runtime
+            .runtime_services()
+            .ensure_session_recovery_admitted(&envelope.session_id)
+            .map_err(|error| error.to_string())?;
         let admission = self
             .kernel()
             .session_input_admission(&envelope.session_id)
@@ -1822,6 +1826,11 @@ impl SessionService {
         self.kernel().has_unified_store()
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_receipt_test_store(&self) -> Option<Arc<session::UnifiedSessionStore>> {
+        self.kernel().test_unified_store()
+    }
+
     pub(crate) fn list_active_session_ids(&self) -> Vec<String> {
         self.kernel().list_active_session_ids()
     }
@@ -1864,6 +1873,85 @@ impl SessionService {
                 "error": error,
             }),
         }
+    }
+
+    pub(crate) async fn resolve_frame_source(
+        &self,
+        session_id: &str,
+        transport_id: &str,
+    ) -> session::SessionResult<(
+        session::SessionReceiptAuthority,
+        session::SessionReceiptSource,
+    )> {
+        self.presence_ledger()
+            .resolve_frame_source(session_id, transport_id)
+            .await
+    }
+
+    pub(crate) async fn attach_session_with_receipt_value(
+        &self,
+        authority: session::SessionReceiptAuthority,
+        actor: SessionActor,
+    ) -> session::SessionResult<serde_json::Value> {
+        let result = self
+            .presence_ledger()
+            .attach_with_receipt_binding(authority, actor)
+            .await?;
+        let attachment = result.attachment.ok_or_else(|| {
+            session::SessionError::Store("committed receipt grant missing".into())
+        })?;
+        Ok(
+            serde_json::json!({"ok":true,"session_id":result.projection.session_id,
+            "presence_ttl_ms":self.presence_ledger().presence_ttl_ms(),
+            "receipt_attachment":{"client_id":attachment.client_id,"client_expires_at_ms":attachment.client_expires_at_ms,
+                "receipt_protocol":attachment.receipt_protocol,"presence_revision":result.projection.revision.to_string()}}),
+        )
+    }
+
+    pub(crate) async fn detach_session_with_receipt_value(
+        &self,
+        authority: session::SessionReceiptAuthority,
+    ) -> session::SessionResult<serde_json::Value> {
+        self.presence_ledger()
+            .detach_with_receipt_binding(authority)
+            .await?;
+        Ok(serde_json::json!({"ok":true}))
+    }
+
+    pub(crate) async fn receipt_selector_required(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> session::SessionResult<bool> {
+        self.presence_ledger()
+            .receipt_selector_required(session_id, actor_id)
+            .await
+    }
+
+    pub(crate) async fn revoke_receipt_actor(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> session::SessionResult<()> {
+        self.presence_ledger()
+            .revoke_receipt_actor(session_id, actor_id)
+            .await
+    }
+
+    pub(crate) async fn get_terminal_message_receipt_context(
+        &self,
+        query: session::SessionTerminalReceiptQuery,
+    ) -> session::SessionResult<session::SessionTerminalReceiptContext> {
+        self.kernel()
+            .get_terminal_message_receipt_context(query)
+            .await
+    }
+
+    pub(crate) async fn record_terminal_message_ack(
+        &self,
+        command: session::SessionTerminalAckCommand,
+    ) -> session::SessionResult<harness_contract::live::SessionMessageAck> {
+        self.kernel().record_terminal_message_ack(command).await
     }
 
     pub(crate) async fn detach_session_value(
@@ -2079,6 +2167,12 @@ impl SessionService {
     ) -> Result<SessionRuntimeOutboxRecord, SessionError> {
         self.ensure_accepting()
             .map_err(SessionError::InvalidArgument)?;
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime
+                .runtime_services()
+                .ensure_session_recovery_admitted(session_id)
+                .map_err(|error| SessionError::InvalidArgument(error.to_string()))?;
+        }
         self.kernel()
             .append_runtime_ingress(session_id, role, content_json, created_at_ms, request)
             .await
@@ -2408,8 +2502,19 @@ impl SessionService {
     ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
         self.ensure_accepting()
             .map_err(SessionError::InvalidArgument)?;
+        let excluded_session_ids = match self.runtime.as_ref() {
+            Some(runtime) => runtime.runtime_services().session_recovery_exclusions(),
+            #[cfg(test)]
+            None => Vec::new(),
+            #[cfg(not(test))]
+            None => {
+                return Err(SessionError::InvalidArgument(
+                    "Session Runtime owner is unavailable".into(),
+                ))
+            }
+        };
         self.kernel()
-            .claim_ingress_work(worker_id, now_ms, lease_ms, limit)
+            .claim_ingress_work(worker_id, now_ms, lease_ms, limit, &excluded_session_ids)
             .await
     }
 

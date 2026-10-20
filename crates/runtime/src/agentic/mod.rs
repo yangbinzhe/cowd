@@ -23,11 +23,14 @@ mod work_market;
 
 pub use action_service::{AgentActionService, AgentActionServiceError};
 pub(crate) use action_service::{
-    AgenticTopicObservationAck, AgenticWaitDisposition, TopicObservationKind,
+    validate_receipt_index_record, AgenticTopicObservationAck, AgenticWaitDisposition, TopicObservationKind,
 };
 pub(crate) use execution::start_agentic_claim_heartbeat;
 pub use execution::{AgenticDispatchContext, AgenticDispatchReceipt};
-pub(crate) use ingress::agentic_program_completion_gap;
+pub(crate) use ingress::{
+    agentic_program_completion_gap, current_reviews_satisfy_the_goal,
+    uncovered_delivered_result_refs,
+};
 pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,
     AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,

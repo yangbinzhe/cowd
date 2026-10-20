@@ -1128,18 +1128,87 @@ pub(super) async fn get_session_history_index(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SessionAttachRequest {
+pub(super) struct SessionAttachRequest {
     surface: String,
     #[serde(default)]
     role: Option<String>,
+    receipt_protocol: String,
 }
 
-#[derive(Deserialize)]
+#[cfg(test)]
+mod receipt_attach_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn r1_message_ack_requires_current_protocol_and_rejects_legacy_heartbeat() {
+        let fixture = super::super::message_routes::tests::ReceiptRouteFixture::new().await;
+        let attach = format!("/api/sessions/{}/attach", fixture.commit.session_id);
+        for role in ["reader", "writer"] {
+            for protocol in [
+                serde_json::Value::Null,
+                serde_json::json!("session-public-v0"),
+                serde_json::json!(4),
+            ] {
+                let (status,body,_) = fixture.call_selected("legacy-tab","","POST",&attach,
+                    Some(serde_json::json!({"surface":"legacy","role":role,"receipt_protocol":protocol}))).await;
+                assert!(
+                    status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY
+                );
+                assert!(body["receipt_attachment"].is_null());
+            }
+            let (status, body, _) = fixture
+                .call_selected(
+                    "legacy-tab",
+                    "",
+                    "POST",
+                    &attach,
+                    Some(serde_json::json!({"surface":"legacy","role":role})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(body["receipt_attachment"].is_null());
+        }
+        let (status,grant,_) = fixture.call_selected("legacy-tab","","POST",&attach,Some(serde_json::json!({"surface":"legacy","role":"reader","receipt_protocol":"session-public-v1"}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let client = grant["receipt_attachment"]["client_id"].as_str().unwrap();
+        assert_ne!(client, fixture.client_id);
+        let (status,_,_) = fixture.call_selected("legacy-tab","","POST",&attach,Some(serde_json::json!({"surface":"legacy","role":"reader","receipt_protocol":"session-public-v1"}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status,renewed,_) = fixture.call_selected("legacy-tab",client,"POST",&attach,Some(serde_json::json!({"surface":"legacy","role":"reader","receipt_protocol":"session-public-v1"}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renewed["receipt_attachment"]["client_id"], client);
+        let (status, body, _) = fixture
+            .call_selected(
+                "legacy-tab",
+                "",
+                "POST",
+                &attach,
+                Some(serde_json::json!({"surface":"legacy","role":"reader"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["receipt_attachment"].is_null());
+        let (_, snapshot, _) = fixture
+            .call(
+                "GET",
+                &format!("/api/sessions/{}/lifecycle", fixture.commit.session_id),
+                None,
+            )
+            .await;
+        assert!(!snapshot.to_string().contains(client));
+        assert!(!snapshot.to_string().contains(&fixture.client_id));
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SessionDetachRequest {
+pub(super) struct SessionDetachRequest {
     surface: String,
+    #[serde(default)]
+    receipt_protocol: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1195,13 +1264,22 @@ async fn attach_session_handler(
     )
     .await?;
     let actor_id = surface_actor_id(&principal, observer_id);
-    Ok(Json(
-        state
-            .services
-            .session
-            .attach_session_value(&id, &actor_id, &body.surface, Some(role))
-            .await,
-    ))
+    if body.receipt_protocol != session::SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1 {
+        return Err(super::message_routes::receipt_store_error(
+            session::SessionError::InvalidArgument("unsupported receipt protocol".into()),
+        ));
+    }
+    let authority =
+        super::message_routes::receipt_authority(&state, &principal, &id, &headers, false)?;
+    let mut actor = session::SessionActor::new(&actor_id, &body.surface);
+    actor.role = Some(role.into());
+    state
+        .services
+        .session
+        .attach_session_with_receipt_value(authority, actor)
+        .await
+        .map(Json)
+        .map_err(super::message_routes::receipt_store_error)
 }
 
 async fn detach_session_handler(
@@ -1209,7 +1287,7 @@ async fn detach_session_handler(
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
-    Json(_body): Json<SessionDetachRequest>,
+    Json(body): Json<SessionDetachRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // Detach only removes the exact authenticated observer attachment derived
     // below. A reader must be able to leave without gaining conversation write
@@ -1228,6 +1306,49 @@ async fn detach_session_handler(
             )
         })?;
     let actor_id = surface_actor_id(&principal, observer_id);
+    if let Some(protocol) = body.receipt_protocol.as_deref() {
+        if protocol != session::SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1 {
+            return Err(super::message_routes::receipt_store_error(
+                session::SessionError::InvalidArgument("unsupported receipt protocol".into()),
+            ));
+        }
+        let authority =
+            super::message_routes::receipt_authority(&state, &principal, &id, &headers, true)?;
+        let was_writer = state
+            .services
+            .session
+            .lifecycle_attachment_role(&id, &actor_id)
+            .await
+            .as_deref()
+            == Some("writer");
+        let value = state
+            .services
+            .session
+            .detach_session_with_receipt_value(authority)
+            .await
+            .map_err(super::message_routes::receipt_store_error)?;
+        if was_writer {
+            if let Some(registry) = &state.session_lease_registry {
+                registry
+                    .release(&id, &super::session_lease_owner(&principal, observer_id))
+                    .await;
+            }
+        }
+        return Ok(Json(value));
+    }
+    if state
+        .services
+        .session
+        .receipt_selector_required(&id, &actor_id)
+        .await
+        .map_err(super::message_routes::receipt_store_error)?
+    {
+        return Err(super::message_routes::receipt_store_error(
+            session::SessionError::StaleExecutionFence(
+                "tagged detach requires exact selector".into(),
+            ),
+        ));
+    }
     if state
         .services
         .session

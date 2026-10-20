@@ -1,4 +1,839 @@
 use super::*;
+
+#[derive(Clone)]
+pub(crate) struct RealReceiptScenario {
+    config: serde_json::Value,
+    pub(crate) fixture: serde_json::Value,
+    progress: Arc<tokio::sync::Mutex<(Option<String>, String)>>,
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) mode: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) acknowledgements: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) attempted_acks: Arc<std::sync::atomic::AtomicUsize>,
+    reads: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    pub(crate) attach_started: Arc<tokio::sync::Notify>,
+    pub(crate) attach_release: Arc<tokio::sync::Notify>,
+    pub(crate) old_receipt: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub(crate) selected: Arc<tokio::sync::Mutex<Option<(String, String)>>>,
+}
+
+impl RealReceiptScenario {
+    pub(crate) async fn load(expected_case: &str) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::path::PathBuf::from(
+            std::env::var_os("COWD_R1_RECEIPT_TUI_CONFIG")
+                .expect("explicit TUI integration config required"),
+        );
+        assert!(path.is_absolute());
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o077, 0);
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let required = [
+            "case_id",
+            "mutation_id",
+            "run_id",
+            "gateway_url",
+            "gateway_token_file",
+            "provisioning_file",
+            "allocation_file",
+            "producer_evidence_file",
+            "frame_fixture_file",
+            "step_template_file",
+            "step_binary",
+            "output_directory",
+            "initial_state_sha256",
+            "state_directory",
+        ];
+        let optional = [
+            "binary",
+            "config_home",
+            "home_directory",
+            "workspace",
+            "model",
+            "terminal_preflight_config",
+            "initial_witness_file",
+        ];
+        assert!(config
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str())));
+        assert!(required
+            .iter()
+            .all(|key| config[*key].as_str().is_some_and(|value| !value.is_empty())));
+        assert_eq!(config["case_id"], expected_case);
+        let provisioning: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(config["provisioning_file"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let run_directory = std::path::Path::new(provisioning["run_directory"].as_str().unwrap());
+        for key in ["output_directory", "state_directory"] {
+            let path = std::path::Path::new(config[key].as_str().unwrap());
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert!(
+                path.is_absolute()
+                    && path.starts_with(run_directory)
+                    && std::fs::canonicalize(path).unwrap() == path
+                    && metadata.is_dir()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o077 == 0
+            );
+        }
+        use sha2::{Digest, Sha256};
+        let hashes = provisioning["hashes"].as_object().unwrap();
+        for (path, expected) in hashes {
+            assert_eq!(
+                format!("{:x}", Sha256::digest(std::fs::read(path).unwrap())),
+                expected.as_str().unwrap()
+            );
+        }
+        assert!(hashes.contains_key(std::env::current_exe().unwrap().to_str().unwrap()));
+        assert!(hashes.contains_key(config["step_binary"].as_str().unwrap()));
+        for key in [
+            "gateway_token_file",
+            "provisioning_file",
+            "allocation_file",
+            "producer_evidence_file",
+            "frame_fixture_file",
+            "step_template_file",
+        ] {
+            let path = std::path::Path::new(config[key].as_str().unwrap());
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert!(
+                path.is_absolute()
+                    && path.starts_with(run_directory)
+                    && std::fs::canonicalize(path).unwrap() == path
+                    && metadata.is_file()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o077 == 0
+            );
+        }
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(config["frame_fixture_file"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fixture["base_url"], config["gateway_url"]);
+        let gateway = reqwest::Url::parse(config["gateway_url"].as_str().unwrap()).unwrap();
+        assert!(
+            gateway.scheme() == "http"
+                && gateway.host_str() == Some("127.0.0.1")
+                && gateway.port().is_some()
+        );
+        let root = std::path::PathBuf::from(config["state_directory"].as_str().unwrap())
+            .join("cowd/tui/terminal-receipts");
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        assert!(
+            root.is_absolute()
+                && root.starts_with(run_directory)
+                && metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0
+                && std::fs::canonicalize(&root).unwrap() == root
+        );
+        let initial = config["initial_witness_file"].as_str().map(str::to_string);
+        if let Some(path) = initial.as_ref() {
+            let path_value = std::path::Path::new(path);
+            let metadata = std::fs::symlink_metadata(path_value).unwrap();
+            assert!(
+                path_value.is_absolute()
+                    && path_value.starts_with(run_directory)
+                    && std::fs::canonicalize(path_value).unwrap() == path_value
+                    && metadata.is_file()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o077 == 0
+            );
+            let witness: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(witness["status"], "done");
+            assert_eq!(witness["phase"], "captured");
+            for key in ["case_id", "run_id", "mutation_id"] {
+                assert_eq!(witness[key], config[key]);
+            }
+            assert_eq!(witness["after_sha256"], config["initial_state_sha256"]);
+            assert!(!witness["state"]["message"]["terminal_runtime_commit_cursor"].is_null());
+        }
+        let reused_capture = initial.is_some();
+        let scenario = Self {
+            progress: Arc::new(tokio::sync::Mutex::new((
+                initial,
+                config["initial_state_sha256"].as_str().unwrap().into(),
+            ))),
+            config,
+            fixture,
+            root,
+            mode: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            acknowledgements: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            attempted_acks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            attach_started: Arc::new(tokio::sync::Notify::new()),
+            attach_release: Arc::new(tokio::sync::Notify::new()),
+            old_receipt: Arc::new(tokio::sync::Mutex::new(None)),
+            selected: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        scenario
+            .step(if reused_capture { "observe" } else { "capture" }, false)
+            .await;
+        scenario.foreign_controls().await;
+        scenario
+    }
+
+    pub(crate) fn session(&self) -> &str {
+        self.fixture["source_a"]["session_id"].as_str().unwrap()
+    }
+    pub(crate) fn message(&self) -> &str {
+        self.fixture["message_a"].as_str().unwrap()
+    }
+
+    pub(crate) async fn step(&self, action: &str, selected: bool) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut progress = self.progress.lock().await;
+        let mut request: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(self.config["step_template_file"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        for key in [
+            "case_id",
+            "run_id",
+            "mutation_id",
+            "provisioning_file",
+            "allocation_file",
+            "frame_fixture_file",
+            "producer_evidence_file",
+        ] {
+            assert_eq!(request[key], self.config[key], "foreign step template");
+        }
+        assert_eq!(request["arm"], "a");
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = std::path::Path::new(self.config["output_directory"].as_str().unwrap());
+        let input = directory.join(format!("{id}.request.json"));
+        let output = directory.join(format!("{id}.done.json"));
+        request["action"] = action.into();
+        request["action_id"] = id.clone().into();
+        request["output_file"] = output.to_str().unwrap().into();
+        request["previous_witness_file"] = serde_json::to_value(&progress.0).unwrap();
+        request["expected_before_sha256"] = progress.1.clone().into();
+        let identity = if selected {
+            self.selected.lock().await.clone()
+        } else {
+            None
+        };
+        request["selected_actor_id"] =
+            serde_json::to_value(identity.as_ref().map(|value| &value.0)).unwrap();
+        request["selected_client_id"] =
+            serde_json::to_value(identity.as_ref().map(|value| &value.1)).unwrap();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&input)
+            .unwrap();
+        std::io::Write::write_all(&mut file, &bytes).unwrap();
+        file.sync_all().unwrap();
+        let binary = self.config["step_binary"].as_str().unwrap().to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut child = std::process::Command::new(binary)
+                .args([
+                    "--exact",
+                    "tests::r1_real_client_receipt_scenario_step",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(
+                    "HOME",
+                    std::env::var_os("HOME").unwrap_or_else(|| "/home/yi".into()),
+                )
+                .env("COWD_R1_RECEIPT_STEP_CONFIG", input)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "PG step failed");
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(15) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("PG step timed out; case spent");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .await
+        .unwrap();
+        let witness: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(witness["status"], "done");
+        assert_eq!(witness["action_id"], id);
+        assert_eq!(witness["case_id"], self.config["case_id"]);
+        assert_eq!(witness["run_id"], self.config["run_id"]);
+        assert_eq!(
+            witness["input_sha256"],
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        *progress = (
+            Some(output.to_str().unwrap().into()),
+            witness["after_sha256"].as_str().unwrap().into(),
+        );
+        witness
+    }
+
+    async fn foreign_controls(&self) {
+        let token =
+            std::fs::read_to_string(self.config["gateway_token_file"].as_str().unwrap()).unwrap();
+        let http = reqwest::Client::new();
+        let base = self.fixture["base_url"].as_str().unwrap();
+        let app_id = self.fixture["app_id"]
+            .as_str()
+            .expect("explicit fixture APP identity");
+        cowd_app_protocol::AppId(app_id.to_string())
+            .validate_value()
+            .unwrap();
+        for (arm, other) in [("a", "b"), ("b", "a")] {
+            let mut source = self.fixture[format!("source_{arm}")].clone();
+            source["frame_nonce"] = uuid::Uuid::new_v4().to_string().into();
+            let grant = http
+                .post(format!("{base}/api/apps/{app_id}/frame-source-bindings"))
+                .bearer_auth(token.trim())
+                .header("origin", base)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-cowd-surface-id", "webui")
+                .json(&source)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap();
+            for (selection, available) in [
+                (
+                    serde_json::json!({"selection":"bound_source_terminal"}),
+                    true,
+                ),
+                (
+                    serde_json::json!({"selection":"message","message_id":self.fixture[format!("message_{other}")]}),
+                    false,
+                ),
+            ] {
+                let response = http.post(format!("{base}/api/apps/{app_id}/operations/{app_id}.session.terminal_receipt.read/invoke"))
+                    .bearer_auth(token.trim()).header("x-cowd-surface-id","webui")
+                    .header("x-cowd-frame-binding",grant["frame_binding_ref"].as_str().unwrap())
+                    .json(&serde_json::json!({"payload":selection})).send().await.unwrap();
+                if available {
+                    assert!(response.status().is_success());
+                    assert_eq!(
+                        response.json::<serde_json::Value>().await.unwrap()["payload"]["status"],
+                        "available"
+                    );
+                } else if response.status().is_success() {
+                    assert_eq!(
+                        response.json::<serde_json::Value>().await.unwrap()["payload"]["status"],
+                        "unavailable"
+                    );
+                } else {
+                    assert!([403, 404, 409].contains(&response.status().as_u16()));
+                }
+            }
+            source["frame_binding_ref"] = grant["frame_binding_ref"].clone();
+            assert!(http
+                .delete(format!("{base}/api/apps/{app_id}/frame-source-bindings"))
+                .bearer_auth(token.trim())
+                .header("origin", base)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-cowd-surface-id", "webui")
+                .json(&source)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success());
+        }
+    }
+
+    pub(crate) async fn fixture(
+        &self,
+        lose_first_ack: bool,
+    ) -> (GatewayApiClient, tokio::task::JoinHandle<()>) {
+        assert!(
+            std::env::var_os("COWD_TUI_OBSERVER_ID").is_none(),
+            "integration clients must use normal fresh observer identities"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let owner = self.clone();
+        let server = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut socket,_) = accepted.unwrap();
+                        let scenario = owner.clone();
+                        children.spawn(async move {
+                            let mut bytes = Vec::new();
+                            let header_end = loop {
+                                let mut chunk = [0u8;4096]; let count = socket.read(&mut chunk).await.unwrap();
+                                if count == 0 { return; } bytes.extend_from_slice(&chunk[..count]);
+                                assert!(bytes.len() < 1024*1024);
+                                if let Some(index) = bytes.windows(4).position(|value| value == b"\r\n\r\n") { break index+4; }
+                            };
+                            let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                            let first = headers.lines().next().unwrap().split_whitespace().collect::<Vec<_>>();
+                            let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value|value.trim().parse::<usize>().ok())).unwrap_or(0);
+                            while bytes.len() < header_end+length {
+                                let mut chunk = [0u8;4096]; let count = socket.read(&mut chunk).await.unwrap();
+                                if count == 0 { return; } bytes.extend_from_slice(&chunk[..count]);
+                            }
+                            if first[1].ends_with("/attach") {
+                                match scenario.mode.load(Ordering::SeqCst) {
+                                    403 | 409 => {
+                                        let code = scenario.mode.load(Ordering::SeqCst);
+                                        socket.write_all(format!("HTTP/1.1 {code} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap(); return;
+                                    }
+                                    1 => return,
+                                    2 => { scenario.attach_started.notify_one(); scenario.attach_release.notified().await; }
+                                    _ => {}
+                                }
+                            }
+                            let upstream = reqwest::Client::new();
+                            let mut request = upstream.request(first[0].parse().unwrap(),format!("{}{}",scenario.fixture["base_url"].as_str().unwrap(),first[1]));
+                            for line in headers.lines().skip(1) {
+                                if let Some((name,value)) = line.split_once(':') {
+                                    if !["host","connection","content-length"].contains(&name.to_ascii_lowercase().as_str()) { request = request.header(name,value.trim()); }
+                                }
+                            }
+                            if length > 0 { request = request.body(bytes[header_end..header_end+length].to_vec()); }
+                            let ack = first[1].ends_with("/ack");
+                            if ack {
+                                scenario.attempted_acks.fetch_add(1,Ordering::SeqCst);
+                                let identities = std::fs::read_dir(&scenario.root).unwrap().filter_map(Result::ok)
+                                    .filter(|entry|entry.path().extension().is_some_and(|extension|extension == "identity")).collect::<Vec<_>>();
+                                let command: serde_json::Value = serde_json::from_slice(&bytes[header_end..header_end+length]).unwrap();
+                                let client_id = headers.lines().find_map(|line|line.split_once(':').filter(|(name,_)|name.eq_ignore_ascii_case("x-cowd-client-id")).map(|(_,value)|value.trim())).unwrap();
+                                let mut matches = 0;
+                                for identity in identities {
+                                    let tuple: serde_json::Value = serde_json::from_slice(&std::fs::read(identity.path()).unwrap()).unwrap();
+                                    if tuple["client_id"] != client_id || tuple["session_id"] != scenario.session()
+                                        || tuple["message_id"] != scenario.message() || tuple["runtime_commit_cursor"] != command["runtime_commit_cursor"]
+                                        || tuple["content_digest"] != command["content_digest"] { continue; }
+                                    matches += 1;
+                                    let payload = std::fs::read(identity.path().with_extension("public")).unwrap();
+                                    use sha2::{Digest,Sha256};
+                                    assert_eq!(tuple["content_digest"],format!("session-public-v1:sha256:{:x}",Sha256::digest(&payload)));
+                                    let reads = scenario.reads.lock().await;
+                                    let context = reads.iter().rev().find(|context|context["client_id"] == client_id
+                                        && context["status"] == "available" && context["message_id"] == scenario.message()).unwrap();
+                                    assert_eq!(payload,context["payload_json"].as_str().unwrap().as_bytes());
+                                    assert_eq!(tuple["message_sequence"],context["message_sequence"]);
+                                }
+                                assert_eq!(matches,1,"first ACK requires this exact client's completed durable save");
+                            }
+                            if ack && scenario.mode.load(Ordering::SeqCst) == 4 { return; }
+                            let response = request.send().await.unwrap();
+                            let status = response.status();
+                            let body = response.bytes().await.unwrap();
+                            if first[1].ends_with("/receipt-context") && first[1].contains(&url_encode(scenario.message())) && status.is_success() {
+                                scenario.reads.lock().await.push(serde_json::from_slice(&body).unwrap());
+                            }
+                            if ack && status.is_success() {
+                                let observed = scenario.step("observe",false).await;
+                                let incoming_client = headers.lines().find_map(|line|line.split_once(':').filter(|(name,_)|name.eq_ignore_ascii_case("x-cowd-client-id")).map(|(_,value)|value.trim())).unwrap();
+                                let attachments = observed["presence"]["attachments_json"].as_array().unwrap();
+                                let attachment = attachments.iter().find(|attachment|attachment["client_id"] == incoming_client).unwrap();
+                                *scenario.selected.lock().await = Some((attachment["actor"]["id"].as_str().unwrap().into(),incoming_client.into()));
+                                let rows = observed["receipts"].as_array().unwrap().iter().filter(|receipt|receipt["client_id"] == incoming_client).collect::<Vec<_>>();
+                                assert_eq!(rows.len(),1);
+                                let mut old = scenario.old_receipt.lock().await;
+                                if let Some(old) = old.as_ref() {
+                                    if old["client_id"] == incoming_client { assert_eq!(rows[0],old); }
+                                } else { *old = Some(rows[0].clone()); }
+                                let index = scenario.acknowledgements.fetch_add(1,Ordering::SeqCst);
+                                if scenario.mode.load(Ordering::SeqCst) == 3 {
+                                    scenario.attach_started.notify_one();
+                                    scenario.attach_release.notified().await;
+                                }
+                                if lose_first_ack && index == 0 { return; }
+                            }
+                            socket.write_all(format!("HTTP/1.1 {} Upstream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",status.as_u16(),body.len()).as_bytes()).await.unwrap();
+                            socket.write_all(&body).await.unwrap();
+                        });
+                    }
+                    completed = children.join_next(), if !children.is_empty() => { completed.unwrap().unwrap(); }
+                }
+            }
+        });
+        let token =
+            std::fs::read_to_string(self.config["gateway_token_file"].as_str().unwrap()).unwrap();
+        let client =
+            GatewayApiClient::new(format!("http://{address}"), Some(token.trim().into())).unwrap();
+        *client.terminal_receipts.root.lock().unwrap() = Some(self.root.clone());
+        (client, server)
+    }
+
+    pub(crate) async fn publish(&self, client: &GatewayApiClient, tx: &CowdEventSender) {
+        client
+            .publish_terminal_receipts(self.session(), tx, 1)
+            .await;
+    }
+
+    pub(crate) async fn recover(
+        &self,
+        client: &GatewayApiClient,
+    ) -> Result<crate::protocol::TerminalReceiptOverlay, GatewayApiError> {
+        client
+            .recover_terminal_receipt(self.session(), self.message())
+            .await
+    }
+
+    pub(crate) async fn assert_old(&self) {
+        let observed = self.step("observe", true).await;
+        let old = self.old_receipt.lock().await.clone().unwrap();
+        let rows = observed["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|receipt| {
+                receipt["client_id"] == old["client_id"]
+                    && receipt["runtime_commit_cursor"] == old["runtime_commit_cursor"]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![&old]);
+    }
+
+    pub(crate) async fn expire_locally(&self, client: &GatewayApiClient) {
+        let lane = client.terminal_receipts.lane(self.session());
+        lane.lock().await.grant.as_mut().unwrap().expires_at_ms = 0;
+        crate::runner::receipt_expiry_tick(client).await;
+    }
+
+    pub(crate) fn save_barrier(
+        &self,
+        client: &GatewayApiClient,
+    ) -> (Arc<tokio::sync::Notify>, std::sync::mpsc::SyncSender<()>) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release, receiver) = std::sync::mpsc::sync_channel(1);
+        *client.terminal_receipts.save_gate.lock().unwrap() = Some((started.clone(), receiver));
+        (started, release)
+    }
+
+    pub(crate) async fn fresh_transport_unknown(&self) {
+        self.mode.store(4, Ordering::SeqCst);
+        self.reads.lock().await.clear();
+        let previous = self.progress.lock().await.0.clone().unwrap();
+        let witness: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(previous).unwrap()).unwrap();
+        let unavailable = witness["state"]["message"]["terminal_runtime_commit_cursor"].is_null();
+        let (client, server) = self.fixture(false).await;
+        client
+            .attach_session(self.session(), "tui", Some("reader"))
+            .await
+            .unwrap();
+        let grant = client
+            .terminal_receipts
+            .lane(self.session())
+            .lock()
+            .await
+            .grant
+            .clone()
+            .unwrap();
+        assert_ne!(
+            grant.client_id,
+            self.old_receipt.lock().await.as_ref().unwrap()["client_id"]
+                .as_str()
+                .unwrap()
+        );
+        let (tx, mut receiver) = crate::cowd_event_channel();
+        let before = self.acknowledgements.load(Ordering::SeqCst);
+        let attempted_before = self.attempted_acks.load(Ordering::SeqCst);
+        client
+            .hydrate_session_history(self.session(), tx, Arc::new(AtomicUsize::new(0)), 1)
+            .await;
+        let mut app = crate::app::App::new("integration", self.session());
+        while let Ok(event) = receiver.try_recv() {
+            app.apply_event(event);
+        }
+        assert!(real_receipt_panel(&app).contains("This client unknown"));
+        let reads = self.reads.lock().await;
+        assert!(
+            !reads.is_empty(),
+            "actual history hydration must read the target receipt"
+        );
+        for context in reads.iter() {
+            if unavailable {
+                assert_eq!(context["status"], "unavailable");
+            } else {
+                assert_eq!(context["status"], "available");
+                assert_eq!(context["client_id"], grant.client_id);
+                assert!(context["receipt"].is_null());
+            }
+        }
+        assert_eq!(self.acknowledgements.load(Ordering::SeqCst), before);
+        if unavailable {
+            assert_eq!(self.attempted_acks.load(Ordering::SeqCst), attempted_before);
+        } else {
+            assert!(self.attempted_acks.load(Ordering::SeqCst) > attempted_before);
+        }
+        self.mode.store(0, Ordering::SeqCst);
+        server.abort();
+    }
+
+    pub(crate) async fn reject_old(&self, client: &GatewayApiClient) {
+        let old = self.old_receipt.lock().await.clone().unwrap();
+        assert!(
+            client
+                .reject_old_receipt_for_test(self.session(), self.message(), &old)
+                .await
+        );
+    }
+
+    pub(crate) fn saved_files(&self) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        std::fs::read_dir(&self.root)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    pub(crate) async fn finish(&self, app: &crate::app::App) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let output = std::path::Path::new(self.config["output_directory"].as_str().unwrap());
+        let value = serde_json::json!({"status":"done","case_id":self.config["case_id"],"run_id":self.config["run_id"],
+            "mutation_id":self.config["mutation_id"],"previous_witness_file":self.progress.lock().await.0,
+            "old_receipt":self.old_receipt.lock().await.clone(),"panel":real_receipt_panel(app),
+            "ack_posts":self.attempted_acks.load(Ordering::SeqCst),"ack_commits":self.acknowledgements.load(Ordering::SeqCst)});
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(output.join("tui-done.json"))
+            .unwrap();
+        std::io::Write::write_all(&mut file, &serde_json::to_vec(&value).unwrap()).unwrap();
+        file.sync_all().unwrap();
+        std::fs::File::open(output).unwrap().sync_all().unwrap();
+    }
+}
+
+pub(crate) fn real_receipt_panel(app: &crate::app::App) -> String {
+    use crate::components::{Component, RenderContext};
+    let mut panel = crate::components::runtime_activity_panel::RuntimeActivityPanel::new();
+    panel.sync_from_app(app);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 80)).unwrap();
+    let skin = crate::skin::SkinConfig::default();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            panel.render(&mut RenderContext::new(frame, &skin), area);
+        })
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+}
+
+pub(super) fn receipt_private_test_root() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("COWD_R1_TEST_PRIVATE_ROOT").expect("set private plan scratch root"),
+    );
+    assert!(root.is_absolute());
+    let root = root.join(format!("tui-receipt-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("private fixture directory");
+    root
+}
+
+pub(super) async fn receipt_http_fixture(
+    root: std::path::PathBuf,
+    lose_first_ack: bool,
+) -> (
+    GatewayApiClient,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use sha2::{Digest, Sha256};
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind receipt HTTP fixture");
+    let address = listener.local_addr().unwrap();
+    let acknowledgements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = acknowledgements.clone();
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let server_client_id = client_id.clone();
+    let save_root = root.clone();
+    let server = tokio::spawn(async move {
+        let payload = "{ \"blocks\" : [{\"type\":\"text\",\"text\":\"exact public bytes\"}] }";
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let mut chunk = [0u8; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first = headers.lines().next().unwrap();
+            let value = if first.contains("/attach ") {
+                serde_json::json!({"ok":true,"session_id":"receipt-session","receipt_attachment":{
+                    "client_id":server_client_id,"client_expires_at_ms":4_000_000_000_000u64,
+                    "receipt_protocol":"session-public-v1","presence_revision":"1"}})
+            } else if first.contains("/messages?") {
+                assert!(!headers.to_ascii_lowercase().contains("x-cowd-client-id:"));
+                serde_json::json!({"session_id":"receipt-session","messages":[{
+                    "id":"assistant:receipt","session_id":"receipt-session","role":"assistant","sequence":1,"blocks":[],"created_at_ms":1
+                }],"total":1,"offset":0,"next_seq":2,"limit":500,"has_more":false})
+            } else {
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("x-cowd-client-id: {server_client_id}")));
+                if first.contains("/ack ") {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+                    assert_eq!(body["runtime_commit_cursor"], "9007199254740993");
+                    assert_eq!(body.as_object().unwrap().len(), 2);
+                    let saved = std::fs::read_dir(&save_root)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .find(|entry| {
+                            entry
+                                .path()
+                                .extension()
+                                .is_some_and(|extension| extension == "public")
+                        })
+                        .expect("sync/rename must precede ACK");
+                    assert_eq!(std::fs::read(saved.path()).unwrap(), payload.as_bytes());
+                    let previous = observed.fetch_add(1, Ordering::SeqCst);
+                    if lose_first_ack && previous == 0 {
+                        continue;
+                    }
+                    serde_json::json!({"client_id":server_client_id,"received_at_ms":1})
+                } else {
+                    serde_json::json!({"status":"available","payload_kind":"session-public-v1","payload_json":payload,
+                        "session_id":"receipt-session","message_id":"assistant:receipt","client_id":server_client_id,
+                        "message_sequence":"9223372036854775807","runtime_commit_cursor":"9007199254740993",
+                        "session_source":{"source":"session_snapshot","turn_id":"receipt-turn"},
+                        "content_digest":format!("session-public-v1:sha256:{:x}", Sha256::digest(payload.as_bytes())),
+"receipt":if observed.load(Ordering::SeqCst)>0 { serde_json::json!({
+                            "session_id":"receipt-session","message_id":"assistant:receipt","client_id":server_client_id,
+                            "runtime_commit_cursor":"9007199254740993",
+                            "content_digest":format!("session-public-v1:sha256:{:x}", Sha256::digest(payload.as_bytes())),
+                            "received_at_ms":1
+                        }) } else { serde_json::Value::Null }})
+                }
+            };
+            let body = serde_json::to_vec(&value).unwrap();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        }
+    });
+    let client = GatewayApiClient::new(format!("http://{address}"), None).unwrap();
+    *client.terminal_receipts.root.lock().unwrap() = Some(root);
+    (client, acknowledgements, server)
+}
+
+#[tokio::test]
+async fn r1_client_receipt_tui_save_failure_never_posts_ack() {
+    let root = receipt_private_test_root().join("blocked");
+    std::fs::write(&root, b"not a directory").unwrap();
+    let (client, acknowledgements, server) = receipt_http_fixture(root, false).await;
+    client
+        .attach_session("receipt-session", "tui", Some("reader"))
+        .await
+        .unwrap();
+    assert!(client
+        .recover_terminal_receipt("receipt-session", "assistant:receipt")
+        .await
+        .is_err());
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn r1_client_receipt_reconnect_recovers_without_terminal_notify() {
+    let root = receipt_private_test_root();
+    let (client, acknowledgements, server) = receipt_http_fixture(root, false).await;
+    client
+        .attach_session("receipt-session", "tui", Some("reader"))
+        .await
+        .unwrap();
+    let page = client
+        .session_messages("receipt-session", 0, 500)
+        .await
+        .unwrap();
+    assert_eq!(page.messages[0].id, "assistant:receipt");
+    let overlay = client
+        .recover_terminal_receipt("receipt-session", &page.messages[0].id)
+        .await
+        .unwrap();
+    assert!(overlay.received);
+    assert_eq!(overlay.runtime_commit_cursor, "9007199254740993");
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn r1_client_receipt_context_cursor_never_rounds() {
+    let (client, _, server) = receipt_http_fixture(receipt_private_test_root(), false).await;
+    client
+        .attach_session("receipt-session", "tui", Some("reader"))
+        .await
+        .unwrap();
+    let overlay = client
+        .recover_terminal_receipt("receipt-session", "assistant:receipt")
+        .await
+        .unwrap();
+    assert_eq!(overlay.runtime_commit_cursor, "9007199254740993");
+    server.abort();
+}
+
+#[test]
+fn r1_client_receipt_subscription_progress_never_acknowledges_message() {
+    assert!(
+        live::terminal_receipt_refresh_hint(&CowdEvent::SessionStreamConnection {
+            session_id: "receipt-session".into(),
+            state: SessionStreamConnectionState::Connected,
+        })
+        .is_none()
+    );
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

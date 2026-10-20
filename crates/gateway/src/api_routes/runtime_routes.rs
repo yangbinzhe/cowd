@@ -543,6 +543,13 @@ pub(super) fn execution_runtime(
 fn projection_error(error: runtime::RuntimeServicesError) -> (StatusCode, Json<ErrorResponse>) {
     let status = if matches!(error, runtime::RuntimeServicesError::ProjectionAccessDenied) {
         StatusCode::FORBIDDEN
+    } else if matches!(
+        error,
+        runtime::RuntimeServicesError::EventStore(
+            runtime::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+        )
+    ) {
+        StatusCode::PAYLOAD_TOO_LARGE
     } else {
         StatusCode::NOT_FOUND
     };
@@ -874,6 +881,176 @@ impl RuntimeTimelineCursor {
 #[cfg(test)]
 mod timeline_cursor_tests {
     use super::{RuntimeTimelineCursor, RuntimeTimelineRuntimePosition};
+
+    #[tokio::test]
+    async fn r1_event_replay_runtime_to_surface_preserves_terminal_and_evidence() {
+        use runtime::ArtifactGcPort;
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
+                .expect("explicit private plan fixture root"),
+        )
+        .join(format!("gateway-ref-{}", uuid::Uuid::new_v4()));
+        assert!(
+            root.is_absolute()
+                && root
+                    .starts_with("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel")
+        );
+        std::fs::create_dir_all(&root).unwrap();
+        let events = std::sync::Arc::new(runtime::RuntimeEventStore::for_test());
+        let artifacts = std::sync::Arc::new(runtime::ArtifactStore::for_test_default(
+            root.join("artifacts"),
+        ));
+        let services = runtime::RuntimeServices::builder(root.join("home"), &root)
+            .runtime_event_store(events.clone())
+            .artifact_store(artifacts.clone())
+            .task_aggregate_service(std::sync::Arc::new(
+                runtime::TaskAggregateService::for_test(),
+            ))
+            .build()
+            .unwrap();
+        let graph = harness_contract::execution_graph::ExecutionGraph::new(
+            "real current ref graph ".repeat(4096),
+        )
+        .with_lineage(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "surface-session".into(),
+            turn_id: "surface-turn".into(),
+            root_task_id: "surface-task".into(),
+            task_id: "surface-task".into(),
+            generation: 1,
+        });
+        let graph = runtime::ExecutionCommitService::new(events.clone())
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        let artifact = artifacts
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/json".into(),
+                    visibility_scope: "session:surface-session".into(),
+                    expected_bytes: None,
+                    original_name: None,
+                },
+                b"current exact evidence bytes",
+            )
+            .await
+            .unwrap();
+        artifacts
+            .pin_artifact(&artifact, "before-B", i64::MAX as u64)
+            .unwrap();
+        let mut terminal = runtime::SessionTerminalInput {
+            terminal_id: "surface-terminal".into(),
+            message_id: "surface-message".into(),
+            session_id: "surface-session".into(),
+            execution_id: Some(graph.id.clone()),
+            turn_id: Some("surface-turn".into()),
+            request_id: Some("surface-request".into()),
+            session_generation: Some(1),
+            input_sequence: Some(1),
+            input_claim_owner: Some("surface-worker".into()),
+            input_claim_token: Some("surface-token".into()),
+            input_claim_revision: Some(1),
+            controlled_recovery_claim_fingerprints: Vec::new(),
+            payload_ref: String::new(),
+        };
+        let mut payload = crate::current_terminal_fixture::current_payload(
+            "surface-terminal",
+            "surface-ingress",
+            1,
+            "surface answer",
+        );
+        payload["goal_completion"] = serde_json::json!("satisfied");
+        crate::current_terminal_fixture::publish(&events, &artifacts, &mut terminal, &payload)
+            .await;
+        let terminal_payload_ref = terminal.payload_ref.clone();
+        events
+            .append_transaction_with_terminal(
+                runtime::AppendTransactionRequest {
+                    transaction_id: "surface-B".into(),
+                    expected_streams: vec![runtime::ExpectedStreamRevision {
+                        stream_id: "surface-input".into(),
+                        expected_revision: 0,
+                    }],
+                    events: vec![runtime::RuntimeTransactionEventInput {
+                        event: runtime::RuntimeEventInput {
+                            stream_id: "surface-input".into(),
+                            scope: runtime::RuntimeEventScope::SessionInput,
+                            kind: "runtime.session.terminal_requested".into(),
+                            status: Some("pending".into()),
+                            actor: None,
+                            refs: vec![
+                                runtime::RuntimeEventRef {
+                                    kind: "session".into(),
+                                    id: "surface-session".into(),
+                                },
+                                runtime::RuntimeEventRef {
+                                    kind: "evidence".into(),
+                                    id: artifact.selector.clone(),
+                                },
+                            ],
+                            payload: serde_json::to_value(&terminal).unwrap(),
+                        },
+                        idempotency_key: Some("surface-B".into()),
+                        schema_version: 1,
+                    }],
+                },
+                terminal,
+            )
+            .unwrap();
+        let page = services
+            .event_reader()
+            .session_timeline_events("surface-session", None, 100)
+            .unwrap();
+        let surface = page
+            .into_iter()
+            .map(super::RuntimeEvent::from)
+            .collect::<Vec<_>>();
+        let planned = surface
+            .iter()
+            .find(|event| event.kind == "execution_graph.planned")
+            .unwrap();
+        assert_eq!(planned.payload["graph"]["objective"], graph.objective);
+        assert!(planned.payload.get("content_schema").is_none());
+        let terminal = surface
+            .iter()
+            .find(|event| event.kind == "runtime.session.terminal_requested")
+            .unwrap();
+        assert_eq!(terminal.payload["message_id"], "surface-message");
+        assert!(
+            terminal
+                .refs
+                .iter()
+                .any(|reference| reference.ref_type == "evidence"
+                    && reference.id == artifact.selector)
+        );
+        let original = services
+            .session_terminal_delivery()
+            .for_execution("surface-session", &graph.id, "surface-turn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.status, "pending");
+        assert!(original.materialized_at_ms.is_none());
+        assert_eq!(original.payload_ref, terminal_payload_ref);
+        assert_eq!(
+            artifacts
+                .read(&artifact, "session:surface-session", None)
+                .await
+                .unwrap(),
+            b"current exact evidence bytes"
+        );
+        assert!(services
+            .event_reader()
+            .session_timeline_events("foreign-session", None, 100)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            super::runtime_event_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "HistoryBudgetExceeded: payload"
+            )
+            .0,
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
 
     #[test]
     fn cursor_roundtrips_runtime_transaction_position() {
@@ -1524,12 +1701,13 @@ fn runtime_event_error(
     status: StatusCode,
     error: impl ToString,
 ) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        status,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
+    let error = error.to_string();
+    let status = if error.starts_with("HistoryBudgetExceeded:") {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        status
+    };
+    (status, Json(ErrorResponse { error }))
 }
 
 fn parse_runtime_event_scope(scope: &str) -> Result<runtime::RuntimeEventScope, String> {
@@ -1683,7 +1861,8 @@ pub(super) async fn get_runtime_timeline(
             && left.kind == right.kind
     });
     let combined_total = domain_total + lifecycle_total;
-    let combined_has_more = domain_has_more || events.len() > limit;
+    let combined_has_more =
+        domain_has_more || lifecycle_total == source_limit.min(100) || events.len() > limit;
     events.truncate(limit);
     let mut next_cursor = cursor;
     for event in &events {

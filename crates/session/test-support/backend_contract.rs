@@ -120,7 +120,7 @@ fn running_input(
     let request = ingress(id, 1);
     append_input(backend, session_id, &request);
     let claimed = backend
-        .claim_session_runtime_outbox("contract-worker", now_ms, lease_ms, 1)
+        .claim_session_runtime_outbox("contract-worker", now_ms, lease_ms, 1, &[])
         .expect("claim durable Session input")
         .remove(0);
     let claim_token = claimed.claim_token.clone().expect("claim token");
@@ -224,7 +224,7 @@ pub fn input_generation_and_claim_fence(fixture: &mut impl BackendContractFixtur
 
     let reclaimed = fixture
         .backend()
-        .claim_session_runtime_outbox("replacement-worker", 200, 1_000, 1)
+        .claim_session_runtime_outbox("replacement-worker", 200, 1_000, 1, &[])
         .expect("reclaim expired input")
         .remove(0);
     assert_ne!(reclaimed.claim_token.as_deref(), Some(token.as_str()));

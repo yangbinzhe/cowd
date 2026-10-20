@@ -335,6 +335,11 @@ impl ExecutionProjectionReducer {
 pub fn validate_execution_projection_schema(
     projection: &ExecutionProjection,
 ) -> Result<(), String> {
+    if projection.agentic_collaboration.schema_version
+        != harness_contract::projection::AGENTIC_COLLABORATION_PROJECTION_SCHEMA_VERSION
+    {
+        return Err("unsupported Agentic collaboration schema".into());
+    }
     if projection.schema_version
         != harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION
     {
@@ -357,6 +362,11 @@ pub fn validate_execution_projection_schema(
 }
 
 pub fn validate_projection_delta_schema(delta: &ProjectionDelta) -> Result<(), String> {
+    if delta.operations.iter().any(|operation| matches!(operation,
+        harness_contract::projection::ProjectionOperation::ReplaceAgenticCollaboration { collaboration }
+        if collaboration.schema_version != harness_contract::projection::AGENTIC_COLLABORATION_PROJECTION_SCHEMA_VERSION)) {
+        return Err("unsupported Agentic collaboration delta schema".into());
+    }
     if delta.schema_version != harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION
         || delta.reducer_version
             != harness_contract::projection::EXECUTION_PROJECTION_REDUCER_VERSION
@@ -393,8 +403,29 @@ pub struct RuntimePolicyDecisionSummary {
     pub signal_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalReceiptOverlay {
+    pub expires_at_ms: u64,
+    pub turn_id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub client_id: String,
+    pub epoch: u64,
+    pub received: bool,
+    pub runtime_commit_cursor: String,
+    pub content_digest: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CowdEvent {
+    TerminalReceiptContext {
+        overlay: TerminalReceiptOverlay,
+    },
+    TerminalReceiptSelection {
+        session_id: String,
+        client_id: String,
+        epoch: u64,
+    },
     /// Event emitted by one session SSE observer whose payload does not always
     /// carry correlation itself (usage/context/telemetry/warnings). Runner
     /// unwraps this only after routing it to the matching presentation state.
@@ -678,6 +709,7 @@ mod tests {
             schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "graph-a".to_string(),
             agentic_collaboration: Default::default(),
+            terminal_axes: Default::default(),
             revision: 1,
             cursor: 10,
             detail_scope: ProjectionDetailScope::Summary,
@@ -714,6 +746,36 @@ mod tests {
             cancellation_receipt: None,
             available_commands: Vec::<ProjectionCommandAvailability>::new(),
         }
+    }
+
+    #[test]
+    fn r1_outcome_axes_versions_are_independent_and_fail_closed() {
+        let current = snapshot();
+        assert!(validate_execution_projection_schema(&current).is_ok());
+        for version in [4, 6] {
+            let mut wrong = current.clone();
+            wrong.schema_version = version;
+            assert!(validate_execution_projection_schema(&wrong).is_err());
+            wrong = current.clone();
+            wrong.agentic_collaboration.schema_version = version;
+            assert!(validate_execution_projection_schema(&wrong).is_err());
+            let mut reducer = ExecutionProjectionReducer::default();
+            assert_eq!(
+                reducer.install_snapshot(&wrong),
+                ProjectionDeltaApply::ResyncRequired
+            );
+        }
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
+        ))
+        .unwrap();
+        let mut delta: ProjectionDelta = serde_json::from_value(corpus["delta"].clone()).unwrap();
+        let mut collaboration = current.agentic_collaboration.clone();
+        collaboration.schema_version = 6;
+        delta
+            .operations
+            .push(ProjectionOperation::ReplaceAgenticCollaboration { collaboration });
+        assert!(validate_projection_delta_schema(&delta).is_err());
     }
 
     #[test]

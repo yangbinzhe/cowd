@@ -9,16 +9,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use harness_contract::core::MeasureProvenance;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::projection::{
-    AdmissionProjection, AdmissionProjectionStatus, ChildExecutionProjection,
-    EXECUTION_PROJECTION_REDUCER_VERSION, EXECUTION_PROJECTION_SCHEMA_VERSION, EvidenceProjection,
+    AdmissionProjection, AdmissionProjectionStatus, ChildExecutionProjection, EvidenceProjection,
     ExecutionCommandKind, ExecutionCommandReceipt, ExecutionCommandRequest,
     ExecutionConcurrencyCountsProjection, ExecutionConcurrencyProjection, ExecutionProjection,
     ExecutionResourceCapacityProjection, OutcomeProjection, OutcomeQualityProjection,
     ProjectionCommandAvailability, ProjectionDelta, ProjectionDetailScope, ProjectionEntity,
     ProjectionEntityCollection, ProjectionEntityPayload, ProjectionOperation,
     ProjectionQueryContext, ProjectionResyncReason, ProjectionSourceHealth,
-    STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION, StrategyActualProjection, StrategyActualStatus,
-    StrategyDecisionProjection, StrategyProofStatus, StrategyTransitionProjection,
+    StrategyActualProjection, StrategyActualStatus, StrategyDecisionProjection,
+    StrategyProofStatus, StrategyTransitionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
+    EXECUTION_PROJECTION_SCHEMA_VERSION, STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION,
 };
 use harness_contract::reality::{EvidenceCompleteness, EvidenceRef, RealityBoundary};
 use harness_contract::strategy::{
@@ -34,7 +34,11 @@ use crate::{ExecutionGraphHost, RuntimeEventScope, RuntimeServices, RuntimeServi
 
 mod activity;
 mod delta;
+mod history;
+#[cfg(test)]
+pub(crate) use history::own843_checkpoint_state;
 mod reducer_support;
+pub(crate) mod settlement;
 mod snapshot;
 
 pub use delta::delta;
@@ -174,37 +178,20 @@ pub async fn activity_detail(
 ) -> Result<harness_contract::projection::ExecutionActivityDetailProjection, RuntimeServicesError> {
     validate_context(services, context)?;
     let graph = services.graph_state_store().projection(execution_id)?;
-    let scope = ExecutionProjectionScope::load(services, execution_id, &graph, true)?;
-    validate_projection_scope(&scope, context)?;
-
-    const PAGE_SIZE: usize = 256;
-    let mut events = Vec::new();
-    let mut after = None;
-    loop {
-        let page = services
-            .event_store()
-            .events_for_activity(activity_id, after, PAGE_SIZE)
-            .map_err(RuntimeServicesError::Invariant)?;
-        if page.is_empty() {
-            break;
-        }
-        let next = page
-            .last()
-            .map(|event| (event.commit_cursor, event.transaction_index));
-        let page_len = page.len();
-        events.extend(page);
-        if page_len < PAGE_SIZE || next == after {
-            break;
-        }
-        after = next;
-    }
-    let (activities, activity_relations) = activity::project_execution_activities_from_events(
+    let through = services.event_store().durable_commit_cursor()?;
+    let mut budget = history::RequestBudget::default();
+    let scope = ExecutionProjectionScope::load_budgeted(
         services,
-        &scope,
+        execution_id,
         &graph,
-        events.clone(),
         true,
-    );
+        through,
+        &mut budget,
+    )?;
+    validate_projection_scope(&scope, context)?;
+    let facts = history::load_scope_budgeted(services, &scope, through, false, &mut budget)?;
+    let (activities, activity_relations) =
+        activity::project_execution_activities_from_history(services, &scope, &graph, &facts, true);
     let activity = activities
         .iter()
         .find(|activity| activity.activity_id == activity_id)
@@ -221,39 +208,18 @@ pub async fn activity_detail(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let input = activity_content_projection(
-        &events,
-        &[
-            "input",
-            "input_preview",
-            "request",
-            "objective",
-            "payload_ref",
-            "constraints",
-            "depends_on",
-            "input_refs",
-        ],
-        false,
-        activity.public_summary.as_deref(),
-    );
-    let output = activity_content_projection(
-        &events,
-        &[
-            "output",
-            "output_preview",
-            "result",
-            "result_summary",
-            "summary",
-            "outcome",
-            "returned",
-            "error",
-            "failure",
-            "full_output_ref",
-            "output_ref",
-        ],
-        true,
-        activity.result_summary.as_deref(),
-    );
+    let input = facts
+        .values()
+        .find_map(|state| state.detail_inputs.get(activity_id).cloned())
+        .or_else(|| {
+            activity_content_projection(&[], &[], false, activity.public_summary.as_deref())
+        });
+    let output = facts
+        .values()
+        .find_map(|state| state.detail_outputs.get(activity_id).cloned())
+        .or_else(|| {
+            activity_content_projection(&[], &[], true, activity.result_summary.as_deref())
+        });
     let refs = activity
         .evidence_refs
         .iter()
@@ -261,9 +227,10 @@ pub async fn activity_detail(
         .chain(activity.definition_refs.iter())
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut related_entities = events
-        .into_iter()
-        .map(|event| snapshot::entity_from_runtime_event("evidence", event, true))
+    let mut related_entities = facts
+        .values()
+        .filter_map(|state| state.detail_entities.get(activity_id))
+        .flat_map(|entities| entities.values())
         .filter(|entity| {
             refs.is_empty()
                 || refs.contains(&entity.id)
@@ -272,6 +239,7 @@ pub async fn activity_detail(
                     .iter()
                     .any(|reference| refs.contains(reference))
         })
+        .cloned()
         .map(|entity| (entity.id.clone(), entity))
         .collect::<BTreeMap<_, _>>();
     for entity in scope
@@ -306,17 +274,27 @@ pub async fn activity_detail(
     for entity in activity_identity_entities(&activity) {
         related_entities.insert(entity.id.clone(), entity);
     }
-    Ok(
-        harness_contract::projection::ExecutionActivityDetailProjection {
-            schema_version: harness_contract::projection::EXECUTION_ACTIVITY_SCHEMA_VERSION,
-            execution_id: activity.scope.execution_id.clone(),
-            activity,
-            input,
-            output,
-            relations,
-            related_entities: related_entities.into_values().collect(),
-        },
-    )
+    for content in input.iter().chain(output.iter()) {
+        if content.truncated && content.content_ref.is_none() {
+            return Err(crate::RuntimeEventStoreError::HistoryBudgetExceeded(
+                "activity content has no authorized durable reference".into(),
+            )
+            .into());
+        }
+    }
+    let detail = harness_contract::projection::ExecutionActivityDetailProjection {
+        schema_version: harness_contract::projection::EXECUTION_ACTIVITY_SCHEMA_VERSION,
+        execution_id: activity.scope.execution_id.clone(),
+        activity,
+        input,
+        output,
+        relations,
+        related_entities: related_entities.into_values().collect(),
+    };
+    validate_context(services, context)?;
+    validate_projection_scope(&scope, context)?;
+    history::check_bytes(&detail)?;
+    Ok(detail)
 }
 
 fn activity_content_projection(
@@ -714,9 +692,9 @@ mod tests {
     use super::*;
     use harness_contract::{
         execution_graph::{
-            ExecutionFailure, ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind,
-            ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionParentBinding,
-            ExecutionUsage, project_execution_graph,
+            project_execution_graph, ExecutionFailure, ExecutionGraph, ExecutionGraphLineage,
+            ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
+            ExecutionParentBinding, ExecutionUsage,
         },
         goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract},
         task::{TaskCreateCommand, TaskSpec},
@@ -735,6 +713,1975 @@ mod tests {
             detail_scope: ProjectionDetailScope::Full,
             authorization_revision: 1,
         }
+    }
+
+    fn r1_history_fixture() -> (
+        std::sync::Arc<RuntimeServices>,
+        std::sync::Arc<crate::content_publication::tests::JournalFault>,
+        String,
+    ) {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
+                .expect("explicit private plan fixture root"),
+        )
+        .join(format!("projection-history-{}", uuid::Uuid::new_v4()));
+        assert!(
+            root.is_absolute()
+                && root
+                    .starts_with("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel")
+        );
+        std::fs::create_dir_all(&root).unwrap();
+        let (events, backend) = crate::content_publication::tests::JournalFault::new_journal();
+        let services = RuntimeServices::builder(root.join("home"), &root)
+            .runtime_event_store(events.clone())
+            .artifact_store(std::sync::Arc::new(crate::ArtifactStore::for_test_default(
+                root.join("artifacts"),
+            )))
+            .task_aggregate_service(std::sync::Arc::new(crate::TaskAggregateService::for_test()))
+            .build()
+            .unwrap();
+        let graph = graph_with_lineage(
+            "bounded history request",
+            "history-session",
+            "history-turn",
+            "history-task",
+        );
+        let graph_id = graph.id.clone();
+        crate::ExecutionCommitService::new(events)
+            .register_graph(graph)
+            .unwrap();
+        (services, backend, graph_id)
+    }
+
+    #[tokio::test]
+    async fn r1_projection_395_race_returns_complete_cut_without_replaying_full_history() {
+        for detail_scope in [ProjectionDetailScope::Full, ProjectionDetailScope::Summary] {
+            let (services, backend, graph_id) = r1_history_fixture();
+            let body = "public projection body ".repeat(30_000);
+            services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: format!("history:{graph_id}"),
+                    scope: RuntimeEventScope::Session,
+                    kind: "model.item_completed".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![crate::RuntimeEventRef {
+                        kind: "execution_graph".into(),
+                        id: graph_id.clone(),
+                    }],
+                    payload: serde_json::json!({"text": body.clone()}),
+                })
+                .unwrap();
+            let source_graph = services.graph_state_store().load(&graph_id).unwrap();
+            let source_cut = services.event_store().durable_commit_cursor().unwrap();
+            let mut query = context(&services);
+            query.detail_scope = detail_scope;
+            backend.reset_history_reads();
+            backend.advance_cursor_after_projection_page();
+            let projection = snapshot(&services, &graph_id, &query).await.unwrap();
+            assert_eq!(projection.cursor, source_cut);
+            assert_eq!(projection.graph.graph_id, graph_id);
+            assert_eq!(projection.graph.revision, source_graph.revision);
+            assert_eq!(projection.detail_scope, detail_scope);
+            assert!(projection.terminal_axes.source_race);
+            assert!(projection.terminal_axes.source_cursor > source_cut);
+            assert_eq!(projection.terminal_axes.outcome.outcome, None);
+            assert_eq!(
+                projection.terminal_axes.execution.phase,
+                harness_contract::projection::TerminalExecutionPhase::Unknown
+            );
+            assert_eq!(
+                projection.terminal_axes.execution.settlement,
+                harness_contract::projection::TerminalEffectSettlement::Unknown
+            );
+            let evidence = projection
+                .evidence
+                .iter()
+                .find(|entity| entity.summary.as_deref() == Some("model.item_completed"))
+                .unwrap();
+            if detail_scope == ProjectionDetailScope::Full {
+                assert_eq!(
+                    evidence.detail.as_ref().unwrap()["text"].as_str(),
+                    Some(body.as_str())
+                );
+            } else {
+                assert!(evidence.detail.is_none());
+            }
+            assert!(serde_json::to_vec(&projection).unwrap().len() < 1024 * 1024);
+            let (hydrated, full_scans) = backend.history_reads();
+            assert_eq!(hydrated, 2);
+            assert_eq!(full_scans, 1);
+            let checkpoint_id = format!("projection-history:{graph_id}");
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .is_none());
+            assert_eq!(services.execution_projection_cache_stats().2, 0);
+            assert_eq!(
+                services.graph_state_store().load(&graph_id).unwrap(),
+                source_graph
+            );
+            let stable = snapshot(&services, &graph_id, &query).await.unwrap();
+            assert!(!stable.terminal_axes.source_race);
+            assert!(stable.cursor > source_cut);
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .is_some());
+            let mut denied = query.clone();
+            denied.workspace_id = "foreign-workspace-395".into();
+            assert!(matches!(
+                snapshot(&services, &graph_id, &denied).await,
+                Err(RuntimeServicesError::ProjectionAccessDenied)
+            ));
+            services.shutdown_execution().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_projection_395_real_oversize_still_rejects_without_checkpoint() {
+        let (services, backend, graph_id) = r1_history_fixture();
+        for sequence in 0..2 {
+            services.event_store().append(crate::RuntimeEventInput {
+                stream_id: format!("history:{graph_id}"), scope: RuntimeEventScope::Session,
+                kind: "model.item_completed".into(), status: None, actor: None,
+                refs: vec![crate::RuntimeEventRef { kind: "execution_graph".into(), id: graph_id.clone() }],
+                payload: serde_json::json!({"sequence": sequence, "text": "public projection body ".repeat(30_000)}),
+            }).unwrap();
+        }
+        backend.reset_history_reads();
+        assert!(matches!(
+            snapshot(&services, &graph_id, &context(&services)).await,
+            Err(RuntimeServicesError::EventStore(
+                crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+            ))
+        ));
+        assert!(backend.history_reads().0 <= 2);
+        assert!(services
+            .event_store()
+            .projection_checkpoint(&format!("projection-history:{graph_id}"))
+            .unwrap()
+            .is_none());
+        assert_eq!(services.execution_projection_cache_stats().2, 0);
+        services.shutdown_execution().await;
+    }
+
+    pub(super) struct Projection412Executor;
+
+    #[async_trait::async_trait]
+    impl crate::execution_core::graph::ScopedNodeBackend for Projection412Executor {
+        async fn execute(
+            &self,
+            _ticket: &crate::execution_core::graph::NodeExecutionTicket,
+        ) -> Result<
+            crate::execution_core::graph::NodeExecutionOutcome,
+            crate::execution_core::graph::NodeExecutorError,
+        > {
+            Ok(crate::execution_core::graph::NodeExecutionOutcome::new(
+                ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Completed,
+                    result_ref: None,
+                    wait_class: None,
+                    summary: Some("deterministic no-effect model transport fixture".into()),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                },
+            ))
+        }
+    }
+
+    pub(super) struct Projection412Resolver {
+        pub(super) ticket: crate::execution_core::graph::NodeExecutionTicket,
+        pub(super) backend: std::sync::Arc<Projection412Executor>,
+    }
+
+    impl crate::execution_core::graph::executors::ScopedNodeBackendResolver for Projection412Resolver {
+        fn resolve(
+            &self,
+            ticket: &crate::execution_core::graph::NodeExecutionTicket,
+        ) -> Option<std::sync::Arc<dyn crate::execution_core::graph::ScopedNodeBackend>> {
+            if ticket != &self.ticket {
+                return None;
+            }
+            Some(self.backend.clone())
+        }
+    }
+
+    fn projection_412_goal(
+        services: &RuntimeServices,
+        graph_id: &str,
+        session_id: &str,
+        turn_id: &str,
+        kind: &str,
+    ) {
+        let goal: GoalContract = serde_json::from_value(serde_json::json!({
+            "id":format!("goal:{graph_id}"),"session_id":session_id,"objective":"412 read-axis authority fixture",
+            "criteria":[{"id":"criterion","statement":"source owner test","status":"satisfied"}],
+            "phase":"terminal","scope":"internal","completion":kind,"revision":1,"user_sequence":1,
+            "spec_revision":1,"spec_digest":"projection-412-goal",
+            "execution_binding":{"objective_id":format!("goal:{graph_id}"),"session_id":session_id,"turn_id":turn_id,
+                "root_execution_id":graph_id,"agentic_program_id":format!("program:{graph_id}")},
+            "terminal":{"kind":kind,"terminal_fence":format!("412-goal:{graph_id}"),"authority_revision":1,
+                "reason":"read derivation fixture; not a model acceptance","committed_at_ms":1}
+        })).unwrap();
+        services.goal_store().create(goal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn r1_execution_axes_412_no_effect_terminal_is_settled_full_summary_and_delta() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let mut graph =
+            graph_with_lineage("412 pure no-effect", "412-session", "412-turn", "412-task");
+        let node = ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "{}");
+        let expected = crate::execution_core::graph::NodeExecutionTicket {
+            graph_id: graph.id.clone(),
+            node_id: node.id.clone(),
+            executor_kind: node.executor_kind.clone(),
+            service_class: graph.service_class,
+            attempt: 1,
+            idempotency_key: node.idempotency_key.clone(),
+            payload_ref: node.payload_ref.clone(),
+        };
+        let resolver = std::sync::Arc::new(Projection412Resolver {
+            ticket: expected.clone(),
+            backend: std::sync::Arc::new(Projection412Executor),
+        });
+        let mut foreign = expected.clone();
+        foreign.graph_id.push_str(":foreign");
+        assert!(crate::execution_core::graph::executors::ScopedNodeBackendResolver::resolve(
+            resolver.as_ref(),
+            &foreign,
+        )
+        .is_none());
+        services.model_step_executor().install_resolver(resolver);
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        graph.nodes.push(node);
+        let graph_id = graph.id.clone();
+        services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        projection_412_goal(&services, &graph_id, "412-session", "412-turn", "satisfied");
+        let mut query = context(&services);
+        let full = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(
+            full.terminal_axes.execution.phase,
+            harness_contract::projection::TerminalExecutionPhase::Terminal
+        );
+        assert_eq!(
+            full.terminal_axes.execution.settlement,
+            harness_contract::projection::TerminalEffectSettlement::ProvenSettled
+        );
+        assert!(full.terminal_axes.execution.coverage_complete);
+        assert_eq!(
+            full.terminal_axes.outcome.outcome,
+            Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied)
+        );
+        assert_eq!(
+            full.terminal_axes.delivery.session_client_evidence,
+            harness_contract::projection::SessionClientEvidence::RequiresFreshContext
+        );
+        query.detail_scope = ProjectionDetailScope::Summary;
+        let summary = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(full.terminal_axes, summary.terminal_axes);
+        let unchanged = delta(
+            &services,
+            &graph_id,
+            summary.revision,
+            summary.cursor,
+            &query,
+        )
+        .unwrap();
+        assert!(unchanged.operations.is_empty());
+        assert!(unchanged.resync_reason.is_none());
+        let projection = services.graph_state_store().projection(&graph_id).unwrap();
+        let scope =
+            ExecutionProjectionScope::load(&services, &graph_id, &projection, true).unwrap();
+        let mut facts = history::load_scope(&services, &scope, summary.cursor).unwrap();
+        facts.get_mut(&graph_id).unwrap().effect_missing_receipt = true;
+        let blocked = execution_terminal_axes(
+            &services,
+            &projection,
+            &scope,
+            &facts,
+            summary.cursor,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(blocked.outcome.outcome, full.terminal_axes.outcome.outcome);
+        assert_ne!(
+            blocked.execution.phase,
+            harness_contract::projection::TerminalExecutionPhase::Terminal
+        );
+        assert_eq!(
+            blocked.execution.settlement,
+            harness_contract::projection::TerminalEffectSettlement::Unsettled
+        );
+        assert!(!blocked.execution.coverage_complete);
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_execution_axes_412_original_lease_generation_and_drop_are_not_absence_guesses() {
+        use crate::execution_core::graph::{
+            ExecutionResourceKind, ExecutionResourceManager, ResourceQuota, ScopeLockManager,
+            ScopeLockMode, ScopeLockRequest, ScopedResource,
+        };
+        let kind = ExecutionResourceKind::Custom("412-owned".into());
+        let manager =
+            ExecutionResourceManager::new([(kind.clone(), ResourceQuota::new(1, 1, 1).unwrap())]);
+        let lease = manager.acquire(kind.clone(), None).await.unwrap();
+        let reference = lease.projection_reference();
+        assert_eq!(manager.lease_is_active(&reference).unwrap(), Some(true));
+        let replacement =
+            ExecutionResourceManager::new([(kind, ResourceQuota::new(1, 1, 1).unwrap())]);
+        assert_eq!(replacement.lease_is_active(&reference).unwrap(), None);
+        assert_eq!(
+            manager.lease_is_active(&lease.id().to_string()).unwrap(),
+            None
+        );
+        drop(lease);
+        assert_eq!(manager.lease_is_active(&reference).unwrap(), Some(false));
+        let locks = ScopeLockManager::new();
+        let lease = locks
+            .acquire(
+                vec![ScopeLockRequest {
+                    scope: ScopedResource::workspace("412-workspace").unwrap(),
+                    mode: ScopeLockMode::Write,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let reference = lease.projection_reference();
+        assert_eq!(locks.lease_is_active(&reference).unwrap(), Some(true));
+        assert_eq!(
+            ScopeLockManager::new().lease_is_active(&reference).unwrap(),
+            None
+        );
+        drop(lease);
+        assert_eq!(locks.lease_is_active(&reference).unwrap(), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r1_execution_axes_412_real_process_wait_unknown_exit_and_withdrawal() {
+        use crate::agentic::execution::reviewed_goal_fixture::PhysicalProcessFixture;
+        for unknown in [false, true] {
+            let fixture = PhysicalProcessFixture::new(
+                crate::config::AgentExecutorSandboxProfile::WorkspaceReadOnly,
+                if unknown {
+                    "projection-412-unknown"
+                } else {
+                    "projection-412-reaped"
+                },
+            )
+            .await;
+            let gate = fixture
+                .services
+                .agent_runtime()
+                .process_fixture_exit_gate(unknown);
+            let worker = fixture
+                .dispatch(
+                    "projection-412-worker",
+                    vec!["read:.".into()],
+                    false,
+                    false,
+                    true,
+                )
+                .await;
+            let graph_id = worker.packet.graph_id().to_string();
+            let before = snapshot(&fixture.services, &graph_id, &context(&fixture.services))
+                .await
+                .unwrap();
+            assert_ne!(
+                before.terminal_axes.execution.phase,
+                harness_contract::projection::TerminalExecutionPhase::Terminal
+            );
+            worker.withdraw().await;
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !gate.entered.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(crate::agent_runtime::confirmed_run_exit(
+                fixture.services.event_store(),
+                &worker.packet
+            )
+            .unwrap()
+            .is_none());
+            let pending_program = fixture
+                .services
+                .agent_action_service()
+                .project(&worker.packet.agentic_binding.as_ref().unwrap().program_id)
+                .unwrap();
+            assert_eq!(
+                pending_program.tasks[&worker.task_ref].status,
+                crate::AgenticTaskStatus::CancelRequested
+            );
+            assert!(pending_program.tasks[&worker.task_ref]
+                .pending_retirement
+                .is_some());
+            assert!(!pending_program.tasks[&worker.task_ref]
+                .active_attempts
+                .is_empty());
+            let pending = snapshot(&fixture.services, &graph_id, &context(&fixture.services))
+                .await
+                .unwrap();
+            assert_ne!(
+                pending.terminal_axes.execution.phase,
+                harness_contract::projection::TerminalExecutionPhase::Terminal
+            );
+            gate.release();
+            worker.wait_terminal().await;
+            let turn_id = fixture
+                .services
+                .graph_state_store()
+                .load(&graph_id)
+                .unwrap()
+                .lineage
+                .unwrap()
+                .turn_id;
+            projection_412_goal(
+                &fixture.services,
+                &graph_id,
+                worker.packet.session_id(),
+                &turn_id,
+                "cancelled",
+            );
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let projection =
+                        snapshot(&fixture.services, &graph_id, &context(&fixture.services))
+                            .await
+                            .unwrap();
+                    if unknown
+                        || projection.terminal_axes.execution.phase
+                            == harness_contract::projection::TerminalExecutionPhase::Terminal
+                    {
+                        break projection;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                settled.terminal_axes.outcome.outcome,
+                Some(harness_contract::goal::ObjectiveTerminalKind::Cancelled)
+            );
+            if unknown {
+                assert_ne!(
+                    settled.terminal_axes.execution.phase,
+                    harness_contract::projection::TerminalExecutionPhase::Terminal
+                );
+                assert_ne!(
+                    settled.terminal_axes.execution.settlement,
+                    harness_contract::projection::TerminalEffectSettlement::ProvenSettled
+                );
+            } else {
+                assert_eq!(
+                    settled.terminal_axes.execution.settlement,
+                    harness_contract::projection::TerminalEffectSettlement::ProvenSettled
+                );
+                assert!(settled.terminal_axes.execution.coverage_complete);
+                let binding = worker.packet.agentic_binding.as_ref().unwrap();
+                let program = fixture
+                    .services
+                    .agent_action_service()
+                    .project(&binding.program_id)
+                    .unwrap();
+                assert_eq!(
+                    program.tasks[&worker.task_ref].status,
+                    crate::AgenticTaskStatus::Withdrawn
+                );
+                assert_ne!(
+                    program.tasks[&worker.task_ref].status,
+                    crate::AgenticTaskStatus::Accepted
+                );
+                assert!(program.tasks[&worker.task_ref].pending_retirement.is_none());
+                assert!(program.tasks[&worker.task_ref].active_attempts.is_empty());
+                let diff = delta(
+                    &fixture.services,
+                    &graph_id,
+                    settled.revision,
+                    settled.cursor,
+                    &context(&fixture.services),
+                )
+                .unwrap();
+                assert!(diff.resync_reason.is_some());
+            }
+            fixture.services.shutdown_execution().await;
+        }
+    }
+
+    struct BindingHistoryExecutor {
+        polls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::execution_core::graph::NodeExecutor for BindingHistoryExecutor {
+        fn kind(&self) -> &str {
+            "binding_history_oracle"
+        }
+
+        fn validate(
+            &self,
+            _node: &ExecutionNodeSpec,
+        ) -> Result<(), crate::execution_core::graph::NodeExecutorError> {
+            Ok(())
+        }
+
+        async fn start(
+            &self,
+            context: crate::execution_core::graph::NodeExecutionContext,
+        ) -> Result<
+            crate::execution_core::graph::NodeExecutionTicket,
+            crate::execution_core::graph::NodeExecutorError,
+        > {
+            Ok(crate::execution_core::graph::NodeExecutionTicket {
+                graph_id: context.graph.id.clone(),
+                node_id: context.node.id,
+                executor_kind: "binding_history_oracle".into(),
+                service_class: context.graph.service_class,
+                attempt: context.attempt,
+                idempotency_key: context.node.idempotency_key,
+                payload_ref: context.node.payload_ref,
+            })
+        }
+
+        async fn poll_or_await(
+            &self,
+            _ticket: &crate::execution_core::graph::NodeExecutionTicket,
+        ) -> Result<
+            crate::execution_core::graph::NodeExecutionOutcome,
+            crate::execution_core::graph::NodeExecutorError,
+        > {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::execution_core::graph::NodeExecutionOutcome::new(
+                ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Completed,
+                    result_ref: None,
+                    wait_class: None,
+                    summary: Some("real deterministic poll".into()),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                },
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_bounded_history_unique_binding_cannot_hide_effect_debt() {
+        use crate::execution_core::graph::{ExecutionGraphEvent, ExecutionNodeBinding};
+        let services = RuntimeServices::in_memory().unwrap();
+        let executor = std::sync::Arc::new(BindingHistoryExecutor {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        services
+            .executor_registry()
+            .register(executor.clone())
+            .unwrap();
+        let mut original = graph_with_lineage(
+            "unique historical start",
+            "binding-session",
+            "binding-turn",
+            "binding-task",
+        );
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "binding_history_oracle",
+            "history-payload",
+        );
+        original
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        original.nodes.push(node.clone());
+        let graph_id = original.id.clone();
+        services
+            .execution_supervisor()
+            .submit_and_wait(
+                original,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(executor.polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let graph = services.graph_state_store().projection(&graph_id).unwrap();
+        let scope = ExecutionProjectionScope::load(&services, &graph_id, &graph, true).unwrap();
+        let root_scope = activity::execution_scope(&services, &scope, &graph);
+        let records = services.event_store().list_stream(&graph_id).unwrap();
+        let mut prefix = history::HistoryState::default();
+        let mut unique = None;
+        for record in &records {
+            let event = services
+                .event_store()
+                .resolve_read_record(record.clone())
+                .unwrap();
+            let value: ExecutionGraphEvent = serde_json::from_value(event.payload.clone()).unwrap();
+            let bindings = match &value {
+                ExecutionGraphEvent::Checkpoint { bindings, .. }
+                | ExecutionGraphEvent::NodesStarted { bindings, .. } => bindings.clone(),
+                ExecutionGraphEvent::NodeTransitioned {
+                    node_id,
+                    binding: Some(binding),
+                    ..
+                } => BTreeMap::from([(node_id.clone(), binding.clone())]),
+                _ => BTreeMap::new(),
+            };
+            if let Some(binding) = bindings.get(&node.id) {
+                assert!(
+                    unique.is_none(),
+                    "only one canonical start, not a duplicate-conflict oracle"
+                );
+                unique = Some((
+                    prefix.clone(),
+                    record.clone(),
+                    value.clone(),
+                    binding.clone(),
+                ));
+            }
+            prefix.fold(&event, &graph, &root_scope).unwrap();
+        }
+        let (before, record, value, binding) = unique.expect("Runner produced a start");
+        let slot = format!(
+            "{}:{}:{}",
+            node.id, binding.attempt, binding.ticket_idempotency_key
+        );
+        let ticket = prefix.start_tickets.get(&slot).unwrap().clone();
+        let effect_stream = ExecutionNodeBinding::effect_stream_id(&ticket);
+        let intent = services
+            .event_store()
+            .event_by_idempotency_key(
+                &effect_stream,
+                &format!("{}:intent", binding.ticket_idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        let receipt = services
+            .event_store()
+            .event_by_idempotency_key(
+                &effect_stream,
+                &format!("{}:receipt", binding.ticket_idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        let stored_ticket: crate::execution_core::graph::NodeExecutionTicket =
+            serde_json::from_value(intent.payload.clone()).unwrap();
+        assert_eq!(stored_ticket, ticket);
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        assert!(ExecutionNodeBinding::validate_effect_records(
+            &ticket,
+            Some(&intent),
+            Some(&receipt),
+            through
+        )
+        .unwrap()
+        .is_some());
+        let mut retry = ticket.clone();
+        retry.attempt = retry.attempt.checked_add(1).unwrap();
+        assert_ne!(
+            ExecutionNodeBinding::effect_stream_id(&retry),
+            effect_stream
+        );
+        assert!(ExecutionNodeBinding::validate_effect_records(
+            &retry,
+            Some(&intent),
+            Some(&receipt),
+            through
+        )
+        .is_err());
+        assert!(ExecutionNodeBinding::validate_effect_records(
+            &ticket,
+            Some(&intent),
+            None,
+            through
+        )
+        .unwrap()
+        .is_none());
+        assert!(ExecutionNodeBinding::validate_effect_records(
+            &ticket,
+            None,
+            Some(&receipt),
+            through
+        )
+        .is_err());
+        let mut effect_fault_hits = 0;
+        for field in [
+            "graph_id",
+            "node_id",
+            "payload_ref",
+            "service_class",
+            "idempotency_key",
+            "attempt",
+        ] {
+            let mut bad = intent.clone();
+            bad.payload[field] = if field == "attempt" {
+                serde_json::json!(0)
+            } else if field == "service_class" {
+                serde_json::json!("background")
+            } else {
+                serde_json::json!("foreign")
+            };
+            assert!(
+                ExecutionNodeBinding::validate_effect_records(
+                    &ticket,
+                    Some(&bad),
+                    Some(&receipt),
+                    through
+                )
+                .is_err(),
+                "intent identity fault-hit {field}"
+            );
+            effect_fault_hits += 1;
+        }
+        for field in [
+            "schema", "kind", "scope", "actor", "refs", "key", "payload", "order",
+        ] {
+            let mut bad = receipt.clone();
+            match field {
+                "schema" => bad.schema_version += 1,
+                "kind" => bad.kind = "execution.effect.intent".into(),
+                "scope" => bad.scope = RuntimeEventScope::Session,
+                "actor" => bad.actor = Some("foreign".into()),
+                "refs" => bad.refs[0].id = "foreign-node".into(),
+                "key" => bad.idempotency_key = Some("foreign:receipt".into()),
+                "payload" => bad.payload = serde_json::json!({"result": "bad-result"}),
+                _ => {
+                    bad.commit_cursor = intent.commit_cursor;
+                    bad.transaction_index = intent.transaction_index;
+                }
+            }
+            assert!(
+                ExecutionNodeBinding::validate_effect_records(
+                    &ticket,
+                    Some(&intent),
+                    Some(&bad),
+                    through
+                )
+                .is_err(),
+                "receipt source fault-hit {field}"
+            );
+            effect_fault_hits += 1;
+        }
+        assert_eq!(effect_fault_hits, 14);
+        let mut missing_class = intent.clone();
+        missing_class
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("service_class");
+        assert!(
+            ExecutionNodeBinding::validate_effect_records(
+                &ticket,
+                Some(&missing_class),
+                Some(&receipt),
+                through
+            )
+            .unwrap_err()
+            .contains("field missing"),
+            "required service_class field fault-hit"
+        );
+        assert!(binding.resource_lease_refs.is_empty());
+        assert!(binding.scope_lease_ref.is_none() && binding.worktree_lease_ref.is_none());
+        let mut fault_hits = 0;
+        for field in ["attempt", "ticket_idempotency_key", "executor_kind"] {
+            let mut changed = serde_json::to_value(&value).unwrap();
+            let replacement = match field {
+                "attempt" => serde_json::json!(0),
+                "ticket_idempotency_key" => serde_json::json!(""),
+                _ => serde_json::json!("foreign-executor"),
+            };
+            if changed["binding"].is_object() {
+                changed["binding"][field] = replacement;
+            } else {
+                changed["bindings"][&node.id][field] = replacement;
+            }
+            let mut corrupted = record.clone();
+            corrupted.payload = services
+                .event_store()
+                .prepare_content(
+                    "session:binding-session",
+                    "unique-binding-negative",
+                    &changed,
+                    &crate::PreparedArtifactOrigin::EventBody {
+                        stream_id: record.stream_id.clone(),
+                        idempotency_key: record.idempotency_key.clone().unwrap(),
+                        kind: record.kind.clone(),
+                    },
+                )
+                .unwrap();
+            corrupted.payload["_runtime_activity_binding"] =
+                record.payload["_runtime_activity_binding"].clone();
+            let resolved = services
+                .event_store()
+                .resolve_read_record(corrupted)
+                .unwrap();
+            let mut candidate = before.clone();
+            assert!(
+                candidate.fold(&resolved, &graph, &root_scope).is_err(),
+                "first-binding fault-hit {field}"
+            );
+            fault_hits += 1;
+        }
+        assert_eq!(fault_hits, 3);
+        let query = context(&services);
+        let cold = snapshot(&services, &graph_id, &query).await.unwrap();
+        let hot = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(cold, hot);
+        let checkpoint_id = format!("projection-history:{graph_id}");
+        let saved = services
+            .event_store()
+            .projection_checkpoint(&checkpoint_id)
+            .unwrap()
+            .unwrap();
+        let mut old_cache = saved.payload.clone();
+        old_cache["schema"] = serde_json::json!(2);
+        assert!(services
+            .event_store()
+            .compare_and_repair_projection_checkpoint(
+                &checkpoint_id,
+                saved.source_cursor,
+                saved.revision,
+                &old_cache,
+                0
+            )
+            .is_err());
+        services
+            .event_store()
+            .inject_content_checkpoint_fault(
+                &checkpoint_id,
+                saved.source_cursor,
+                saved.revision,
+                &old_cache,
+            )
+            .unwrap();
+        let after_old_cache =
+            history::load(&services, &scope, &graph, saved.source_cursor).unwrap();
+        assert_eq!(after_old_cache.bindings.len(), prefix.bindings.len());
+        assert_eq!(
+            services
+                .event_store()
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .unwrap()
+                .payload["schema"],
+            6
+        );
+        services
+            .event_store()
+            .delete_projection_checkpoint(&format!("projection-history:{graph_id}"))
+            .unwrap();
+        let rebuilt = history::load(
+            &services,
+            &scope,
+            &graph,
+            services.event_store().durable_commit_cursor().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(prefix.bindings).unwrap(),
+            serde_json::to_value(rebuilt.bindings).unwrap()
+        );
+        for bad_source in ["missing", "foreign"] {
+            let mut pending = graph_with_lineage(
+                "required intent debt",
+                "binding-session",
+                "binding-turn",
+                "binding-task",
+            );
+            let pending_node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::InlineModel,
+                "binding_history_oracle",
+                "pending-payload",
+            );
+            pending
+                .node_statuses
+                .insert(pending_node.id.clone(), ExecutionNodeStatus::Planned);
+            pending.nodes.push(pending_node.clone());
+            let registered = services
+                .commit_service()
+                .register_graph(pending)
+                .unwrap()
+                .graph;
+            let ready = services
+                .commit_service()
+                .transition_node(
+                    &registered,
+                    &pending_node.id,
+                    ExecutionNodeStatus::Ready,
+                    None,
+                    Vec::new(),
+                )
+                .unwrap()
+                .graph;
+            let start = ExecutionNodeBinding {
+                executor_kind: pending_node.executor_kind.clone(),
+                attempt: 1,
+                ticket_idempotency_key: if bad_source == "foreign" {
+                    binding.ticket_idempotency_key.clone()
+                } else {
+                    format!("missing:{}", pending_node.id)
+                },
+                resource_lease_refs: Vec::new(),
+                scope_lease_ref: None,
+                worktree_lease_ref: None,
+            };
+            let running = services
+                .commit_service()
+                .bind_and_start_node(&ready, &pending_node.id, start)
+                .unwrap()
+                .graph;
+            let error = snapshot(&services, &running.id, &query).await.unwrap_err();
+            assert!(
+                error.to_string().contains("effect"),
+                "required-intent fault-hit {bad_source}: {error}"
+            );
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&format!("projection-history:{}", running.id))
+                .unwrap()
+                .is_none());
+        }
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_bounded_history_checkpoint_start_is_validated_before_empty_successor() {
+        use crate::execution_core::graph::{
+            ExecutionGraphEvent, ExecutionNodeBinding, NodeExecutor,
+        };
+        let services = RuntimeServices::in_memory().unwrap();
+        let executor = BindingHistoryExecutor {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut graph = graph_with_lineage(
+            "checkpoint-only start",
+            "checkpoint-session",
+            "checkpoint-turn",
+            "checkpoint-task",
+        );
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "binding_history_oracle",
+            "checkpoint-payload",
+        );
+        graph.nodes.push(node.clone());
+        graph = services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                &node.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        while graph.revision < 63 {
+            graph = services
+                .commit_service()
+                .apply_command(
+                    &graph,
+                    &ExecutionGraphCommand::Start {
+                        expected_revision: graph.revision,
+                    },
+                )
+                .unwrap()
+                .graph;
+        }
+        let ticket = executor
+            .start(crate::execution_core::graph::NodeExecutionContext {
+                graph: std::sync::Arc::new(graph.clone()),
+                node: node.clone(),
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        let binding = ExecutionNodeBinding {
+            executor_kind: ticket.executor_kind.clone(),
+            ticket_idempotency_key: ticket.idempotency_key.clone(),
+            attempt: ticket.attempt,
+            resource_lease_refs: Vec::new(),
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        graph = services
+            .commit_service()
+            .bind_and_start_nodes(
+                &graph,
+                BTreeMap::from([(node.id.clone(), binding.clone())]),
+                vec![ticket],
+            )
+            .unwrap()
+            .graph;
+        let start_record = services
+            .event_store()
+            .latest_for_stream(&graph.id)
+            .unwrap()
+            .unwrap();
+        let start_event = services
+            .event_store()
+            .resolve_read_record(start_record.clone())
+            .unwrap();
+        let start_value: ExecutionGraphEvent =
+            serde_json::from_value(start_event.payload.clone()).unwrap();
+        assert!(
+            matches!(&start_value, ExecutionGraphEvent::Checkpoint { bindings, .. } if bindings.get(&node.id) == Some(&binding))
+        );
+        let projection = services.graph_state_store().projection(&graph.id).unwrap();
+        let scope =
+            ExecutionProjectionScope::load(&services, &graph.id, &projection, true).unwrap();
+        let root_scope = activity::execution_scope(&services, &scope, &projection);
+        let mut state = history::HistoryState::default();
+        for record in services.event_store().list_stream(&graph.id).unwrap() {
+            if record.sequence == start_record.sequence {
+                break;
+            }
+            let resolved = services.event_store().resolve_read_record(record).unwrap();
+            state.fold(&resolved, &projection, &root_scope).unwrap();
+        }
+        let mut hits = 0;
+        for field in ["attempt", "ticket_idempotency_key", "executor_kind"] {
+            let mut altered = serde_json::to_value(&start_value).unwrap();
+            altered["bindings"][&node.id][field] = match field {
+                "attempt" => serde_json::json!(0),
+                "ticket_idempotency_key" => serde_json::json!(""),
+                _ => serde_json::json!("foreign"),
+            };
+            let mut record = start_record.clone();
+            record.payload = services
+                .event_store()
+                .prepare_content(
+                    "session:checkpoint-session",
+                    "checkpoint-binding-negative",
+                    &altered,
+                    &crate::PreparedArtifactOrigin::EventBody {
+                        stream_id: record.stream_id.clone(),
+                        idempotency_key: record.idempotency_key.clone().unwrap(),
+                        kind: record.kind.clone(),
+                    },
+                )
+                .unwrap();
+            record.payload["_runtime_activity_binding"] =
+                start_record.payload["_runtime_activity_binding"].clone();
+            let resolved = services.event_store().resolve_read_record(record).unwrap();
+            assert!(
+                state
+                    .clone()
+                    .fold(&resolved, &projection, &root_scope)
+                    .is_err(),
+                "checkpoint first-start fault-hit {field}"
+            );
+            hits += 1;
+        }
+        assert_eq!(hits, 3);
+        state.fold(&start_event, &projection, &root_scope).unwrap();
+        for _ in 0..64 {
+            graph = services
+                .commit_service()
+                .apply_command(
+                    &graph,
+                    &ExecutionGraphCommand::Start {
+                        expected_revision: graph.revision,
+                    },
+                )
+                .unwrap()
+                .graph;
+            let record = services
+                .event_store()
+                .latest_for_stream(&graph.id)
+                .unwrap()
+                .unwrap();
+            let resolved = services.event_store().resolve_read_record(record).unwrap();
+            if let ExecutionGraphEvent::Checkpoint { bindings, .. } =
+                serde_json::from_value::<ExecutionGraphEvent>(resolved.payload.clone()).unwrap()
+            {
+                assert!(bindings.is_empty());
+            }
+            state.fold(&resolved, &projection, &root_scope).unwrap();
+        }
+        assert_eq!(state.bindings.len(), 1);
+        assert_eq!(executor.polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let snapshot = snapshot(&services, &graph.id, &context(&services))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.terminal_axes.execution.settlement,
+            harness_contract::projection::TerminalEffectSettlement::Unknown
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_bounded_history_projection_request_does_not_accumulate_all_pages() {
+        let (services, backend, graph_id) = r1_history_fixture();
+        let original_plan = services.graph_state_store().load(&graph_id).unwrap();
+        for sequence in 0..1000 {
+            services.event_store().append(crate::RuntimeEventInput {stream_id:format!("history:{graph_id}"),scope:RuntimeEventScope::Session,kind:"model.item_completed".into(),status:None,actor:None,
+                refs:vec![crate::RuntimeEventRef {kind:"execution_graph".into(),id:graph_id.clone()}],payload:serde_json::json!({"sequence":sequence,"text":"public observable text ".repeat(2048)})}).unwrap();
+        }
+        backend.reset_history_reads();
+        match snapshot(&services, &graph_id, &context(&services)).await {
+            Err(error) => assert!(matches!(
+                error,
+                RuntimeServicesError::EventStore(
+                    crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+                )
+            )),
+            Ok(projection) => {
+                assert_eq!(projection.graph.graph_id, original_plan.id);
+                assert_eq!(projection.graph.revision, original_plan.revision);
+                assert_eq!(
+                    projection.terminal_axes.execution.settlement,
+                    harness_contract::projection::TerminalEffectSettlement::Unknown
+                );
+                assert_ne!(
+                    projection.terminal_axes.outcome.outcome,
+                    Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied)
+                );
+            }
+        }
+        let (hydrated, full_scans) = backend.history_reads();
+        assert!(
+            hydrated > 0 && hydrated < 200,
+            "bounded failure before all 1000 pages/events: {hydrated}"
+        );
+        assert_eq!(
+            full_scans, 1,
+            "only the current scope lookup, not a full history scan"
+        );
+        assert_eq!(
+            services.graph_state_store().load(&graph_id).unwrap(),
+            original_plan
+        );
+        assert!(services
+            .event_store()
+            .projection_checkpoint(&format!("projection-history:{graph_id}"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn r1_703_long_history_full_hot_and_durable_reload_preserve_axes_and_bounds() {
+        let (services, backend, graph_id) = r1_history_fixture();
+        let query = context(&services);
+        let mut latest = snapshot(&services, &graph_id, &query).await.unwrap();
+        for batch in 0..3 {
+            for sequence in 0..100 {
+                services.event_store().append(crate::RuntimeEventInput {
+                    stream_id: format!("history:{graph_id}"),
+                    scope: RuntimeEventScope::Session,
+                    kind: "model.item_completed".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![crate::RuntimeEventRef { kind: "execution_graph".into(), id: graph_id.clone() }],
+                    payload: serde_json::json!({"sequence":batch * 100 + sequence,"text":"public current state ".repeat(6)}),
+                }).unwrap();
+            }
+            latest = snapshot(&services, &graph_id, &query).await.unwrap();
+        }
+        assert_eq!(snapshot(&services, &graph_id, &query).await.unwrap(), latest);
+        let graph = services.graph_state_store().projection(&graph_id).unwrap();
+        let scope = ExecutionProjectionScope::load(&services, &graph_id, &graph, true).unwrap();
+        backend.reset_history_reads();
+        let facts = history::load_scope(&services, &scope, latest.cursor).unwrap();
+        assert_eq!(backend.history_reads().0, 0);
+        let mut budget = history::RequestBudget::default();
+        let axes = execution_terminal_axes(&services, &graph, &scope, &facts, latest.cursor, &mut budget).unwrap();
+        assert_eq!(axes, latest.terminal_axes);
+        let saved = services.event_store().projection_checkpoint(&format!("projection-history:{graph_id}")).unwrap().unwrap();
+        assert_eq!(saved.payload["schema"], 6);
+        assert!(serde_json::to_vec(&latest).unwrap().len() <= 1024 * 1024);
+        services.event_store().delete_projection_checkpoint(&format!("projection-history:{graph_id}")).unwrap();
+        assert!(matches!(history::load(&services, &scope, &graph, latest.cursor), Err(RuntimeServicesError::EventStore(crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)))));
+        assert!(services.event_store().projection_checkpoint(&format!("projection-history:{graph_id}")).unwrap().is_none());
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_bounded_history_projection_cursor_scope_and_oversize_are_honest() {
+        let (services, backend, graph_id) = r1_history_fixture();
+        let query = context(&services);
+        let initial = snapshot(&services, &graph_id, &query).await.unwrap();
+        backend.reset_history_reads();
+        let repeated = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(initial.cursor, repeated.cursor);
+        assert_eq!(backend.history_reads(), (0, 1));
+        let future = delta(
+            &services,
+            &graph_id,
+            initial.revision,
+            initial.cursor + 100,
+            &query,
+        )
+        .unwrap();
+        assert!(future.resync_reason.is_some());
+        assert!(future.operations.is_empty());
+        let mut foreign = query.clone();
+        foreign.workspace_id = "foreign-workspace".into();
+        assert!(snapshot(&services, &graph_id, &foreign).await.is_err());
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: format!("history:{graph_id}"),
+                scope: RuntimeEventScope::Session,
+                kind: "model.item_completed".into(),
+                status: None,
+                actor: None,
+                refs: vec![crate::RuntimeEventRef {
+                    kind: "execution_graph".into(),
+                    id: graph_id.clone(),
+                }],
+                payload: serde_json::json!({"text":"x".repeat(2*1024*1024)}),
+            })
+            .unwrap();
+        backend.reset_history_reads();
+        assert!(matches!(
+            snapshot(&services, &graph_id, &query).await,
+            Err(RuntimeServicesError::EventStore(
+                crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+            ))
+        ));
+        let (hydrated, full_scans) = backend.history_reads();
+        assert!(
+            hydrated <= 1,
+            "oversized external content must fail on its first bounded record"
+        );
+        assert_eq!(
+            full_scans, 1,
+            "only the current scope lookup may use list_stream"
+        );
+    }
+
+    mod budget_adversarial_173 {
+        use super::*;
+
+        fn assert_budget_error<ResultValue>(result: Result<ResultValue, RuntimeServicesError>) {
+            assert!(matches!(
+                result,
+                Err(RuntimeServicesError::EventStore(
+                    crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+                ))
+            ));
+        }
+
+        fn register_history(
+            services: &RuntimeServices,
+            graph_id: &str,
+            parent: Option<ExecutionParentBinding>,
+            revision: u64,
+        ) -> ExecutionGraph {
+            let mut graph = graph_with_lineage(
+                "budget adversarial 173",
+                "budget173-session",
+                "budget173-turn",
+                "budget173-task",
+            );
+            graph.id = graph_id.into();
+            graph.parent_execution = parent;
+            graph = services
+                .commit_service()
+                .register_graph(graph)
+                .unwrap()
+                .graph;
+            while graph.revision < revision {
+                graph = services
+                    .commit_service()
+                    .apply_command(
+                        &graph,
+                        &ExecutionGraphCommand::Start {
+                            expected_revision: graph.revision,
+                        },
+                    )
+                    .unwrap()
+                    .graph;
+            }
+            graph
+        }
+
+        fn reserved_budget(records: usize) -> history::RequestBudget {
+            let mut budget = history::RequestBudget::default();
+            budget.charge(MAX_DELTA_BATCHES - records, 0).unwrap();
+            budget
+        }
+
+        #[tokio::test]
+        async fn root_fits_child_fits_shared_request_fails_without_checkpoints() {
+            let services = RuntimeServices::in_memory().unwrap();
+            let root = register_history(&services, "budget173-root", None, 140);
+            let child = register_history(
+                &services,
+                "budget173-zchild",
+                Some(ExecutionParentBinding {
+                    execution_id: root.id.clone(),
+                    node_id: "budget173-parent".into(),
+                }),
+                140,
+            );
+            let root_graph = services.graph_state_store().projection(&root.id).unwrap();
+            let child_graph = services.graph_state_store().projection(&child.id).unwrap();
+            let through = services.event_store().durable_commit_cursor().unwrap();
+            let mut root_only =
+                ExecutionProjectionScope::load(&services, &root.id, &root_graph, true).unwrap();
+            assert_eq!(
+                root_only.execution_ids,
+                BTreeSet::from([root.id.clone(), child.id.clone()])
+            );
+            assert_eq!(root_only.execution_ids.first(), Some(&root.id));
+            root_only
+                .execution_ids
+                .retain(|execution| execution == &root.id);
+            let child_only =
+                ExecutionProjectionScope::load(&services, &child.id, &child_graph, true).unwrap();
+            assert_eq!(child_only.execution_ids, BTreeSet::from([child.id.clone()]));
+            for scope in [&root_only, &child_only] {
+                let mut independent = history::RequestBudget::default();
+                let facts = history::load_scope_budgeted(
+                    &services,
+                    scope,
+                    through,
+                    false,
+                    &mut independent,
+                )
+                .unwrap();
+                assert_eq!(facts.len(), 1);
+                assert_eq!(
+                    facts.values().next().unwrap().effects_checked_through,
+                    Some(through)
+                );
+            }
+            let combined =
+                ExecutionProjectionScope::load(&services, &root.id, &root_graph, true).unwrap();
+            let mut shared = history::RequestBudget::default();
+            assert_budget_error(history::load_scope_budgeted(
+                &services,
+                &combined,
+                through,
+                false,
+                &mut shared,
+            ));
+            assert_budget_error(shared.publish(&services));
+            for graph in [&root, &child] {
+                assert!(services
+                    .event_store()
+                    .projection_checkpoint(&format!("projection-history:{}", graph.id),)
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    services.graph_state_store().load(&graph.id).unwrap(),
+                    *graph
+                );
+            }
+            assert_budget_error(history::load_scope(&services, &combined, through));
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&format!("projection-history:{}", root.id),)
+                .unwrap()
+                .is_none());
+            services.shutdown_execution().await;
+        }
+
+        #[tokio::test]
+        async fn repeated_scope_attempt_spends_same_budget_and_exhaustion_is_sticky() {
+            let services = RuntimeServices::in_memory().unwrap();
+            let graph = register_history(&services, "budget173-retry", None, 140);
+            let projection = services.graph_state_store().projection(&graph.id).unwrap();
+            let scope =
+                ExecutionProjectionScope::load(&services, &graph.id, &projection, true).unwrap();
+            let through = services.event_store().durable_commit_cursor().unwrap();
+            let mut shared = history::RequestBudget::default();
+            let first =
+                history::load_scope_budgeted(&services, &scope, through, false, &mut shared)
+                    .unwrap();
+            assert_eq!(first[&graph.id].graph_state.as_ref().unwrap().revision, 140);
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&format!("projection-history:{}", graph.id),)
+                .unwrap()
+                .is_none());
+            assert_budget_error(history::load_scope_budgeted(
+                &services,
+                &scope,
+                through,
+                false,
+                &mut shared,
+            ));
+            assert_budget_error(shared.charge(0, 0));
+            assert_budget_error(history::load_scope_budgeted(
+                &services,
+                &scope,
+                through,
+                false,
+                &mut shared,
+            ));
+            assert_budget_error(shared.publish(&services));
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&format!("projection-history:{}", graph.id),)
+                .unwrap()
+                .is_none());
+            let mut independent = history::RequestBudget::default();
+            let retried =
+                history::load_scope_budgeted(&services, &scope, through, false, &mut independent)
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&first[&graph.id]).unwrap(),
+                serde_json::to_value(&retried[&graph.id]).unwrap(),
+            );
+            independent.publish(&services).unwrap();
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&format!("projection-history:{}", graph.id),)
+                .unwrap()
+                .is_some());
+            assert_budget_error(shared.publish(&services));
+            services.shutdown_execution().await;
+        }
+
+        #[tokio::test]
+        async fn checkpoint_restore_and_tail_share_allowance_and_preserve_old_checkpoint() {
+            let services = RuntimeServices::in_memory().unwrap();
+            let mut graph = register_history(&services, "budget173-tail", None, 1);
+            let projection = services.graph_state_store().projection(&graph.id).unwrap();
+            let scope =
+                ExecutionProjectionScope::load(&services, &graph.id, &projection, true).unwrap();
+            let old_cut = services.event_store().durable_commit_cursor().unwrap();
+            history::load(&services, &scope, &projection, old_cut).unwrap();
+            let checkpoint_id = format!("projection-history:{}", graph.id);
+            let saved = services
+                .event_store()
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .unwrap();
+            let mut restore_only = reserved_budget(8);
+            let restored =
+                history::load_scope_budgeted(&services, &scope, old_cut, false, &mut restore_only)
+                    .unwrap();
+            assert_eq!(restored[&graph.id].through, saved.source_cursor);
+            for _ in 0..6 {
+                graph = services
+                    .commit_service()
+                    .apply_command(
+                        &graph,
+                        &ExecutionGraphCommand::Start {
+                            expected_revision: graph.revision,
+                        },
+                    )
+                    .unwrap()
+                    .graph;
+            }
+            let through = services.event_store().durable_commit_cursor().unwrap();
+            let projection = services.graph_state_store().projection(&graph.id).unwrap();
+            let scope =
+                ExecutionProjectionScope::load(&services, &graph.id, &projection, true).unwrap();
+            let tail = services
+                .event_store()
+                .list_stream(&graph.id)
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.commit_cursor > old_cut)
+                .collect::<Vec<_>>();
+            assert_eq!(tail.len(), 6);
+            let mut tail_only = reserved_budget(8);
+            for record in tail {
+                tail_only.resolve_record(&services, record).unwrap();
+            }
+            let mut shared = reserved_budget(8);
+            assert_budget_error(history::load_scope_budgeted(
+                &services,
+                &scope,
+                through,
+                false,
+                &mut shared,
+            ));
+            assert_budget_error(shared.publish(&services));
+            let unchanged = services
+                .event_store()
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&unchanged).unwrap(),
+                serde_json::to_value(&saved).unwrap()
+            );
+            let mut sufficient = history::RequestBudget::default();
+            let complete =
+                history::load_scope_budgeted(&services, &scope, through, false, &mut sufficient)
+                    .unwrap();
+            assert_eq!(
+                complete[&graph.id].graph_state.as_ref().unwrap().revision,
+                graph.revision
+            );
+            sufficient.publish(&services).unwrap();
+            let advanced = services
+                .event_store()
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(advanced.source_cursor, through);
+            assert!(advanced.revision > saved.revision);
+            services.shutdown_execution().await;
+        }
+
+        #[tokio::test]
+        async fn declared_graph_body_oversize_is_typed_before_resolver_and_stays_exhausted() {
+            let services = RuntimeServices::in_memory().unwrap();
+            let graph = register_history(&services, "budget173-declared", None, 1);
+            let mut record = services
+                .event_store()
+                .latest_for_stream(&graph.id)
+                .unwrap()
+                .unwrap();
+            let mut body = services
+                .event_store()
+                .resolve_read_record(record.clone())
+                .unwrap()
+                .payload;
+            body.as_object_mut()
+                .unwrap()
+                .remove("_runtime_activity_binding");
+            body["budget173_padding"] = serde_json::json!("public content ".repeat(4096));
+            let binding = record.payload["_runtime_activity_binding"].clone();
+            record.payload = services
+                .event_store()
+                .prepare_content(
+                    "session:budget173-session",
+                    "budget173-declared-content",
+                    &body,
+                    &crate::PreparedArtifactOrigin::EventBody {
+                        stream_id: record.stream_id.clone(),
+                        idempotency_key: record.idempotency_key.clone().unwrap(),
+                        kind: record.kind.clone(),
+                    },
+                )
+                .unwrap();
+            record.payload["_runtime_activity_binding"] = binding;
+            assert_eq!(record.payload["body"]["kind"], "artifact_ref");
+            let mut control = history::RequestBudget::default();
+            control.resolve_record(&services, record.clone()).unwrap();
+            let mut oversized = record.clone();
+            oversized.payload["bytes"] = serde_json::json!(2 * 1024 * 1024);
+            let mut budget = history::RequestBudget::default();
+            assert_budget_error(budget.resolve_record(&services, oversized));
+            assert_budget_error(budget.resolve_record(&services, record.clone()));
+            assert_budget_error(budget.publish(&services));
+            let mut independent = history::RequestBudget::default();
+            independent.resolve_record(&services, record).unwrap();
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&format!("projection-history:{}", graph.id),)
+                .unwrap()
+                .is_none());
+            services.shutdown_execution().await;
+        }
+
+        #[tokio::test]
+        async fn legitimate_128_revision_start_and_completed_effect_survive_cold_and_restore() {
+            let services = RuntimeServices::in_memory().unwrap();
+            let executor = std::sync::Arc::new(BindingHistoryExecutor {
+                polls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            services
+                .executor_registry()
+                .register(executor.clone())
+                .unwrap();
+            let mut graph = graph_with_lineage(
+                "budget173 legitimate effect",
+                "binding-session",
+                "binding-turn",
+                "binding-task",
+            );
+            let node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::InlineModel,
+                "binding_history_oracle",
+                "budget173-payload",
+            );
+            graph
+                .node_statuses
+                .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+            graph.nodes.push(node);
+            let graph_id = graph.id.clone();
+            services
+                .execution_supervisor()
+                .submit_and_wait(
+                    graph,
+                    ExecutionGraphCommand::Start {
+                        expected_revision: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            graph = services.graph_state_store().load(&graph_id).unwrap();
+            while graph.revision < 128 {
+                graph = services
+                    .commit_service()
+                    .apply_command(
+                        &graph,
+                        &ExecutionGraphCommand::Start {
+                            expected_revision: graph.revision,
+                        },
+                    )
+                    .unwrap()
+                    .graph;
+            }
+            assert_eq!(graph.revision, 128);
+            let projection = services.graph_state_store().projection(&graph_id).unwrap();
+            let scope =
+                ExecutionProjectionScope::load(&services, &graph_id, &projection, true).unwrap();
+            let through = services.event_store().durable_commit_cursor().unwrap();
+            let cold = history::load(&services, &scope, &projection, through).unwrap();
+            assert_eq!(cold.bindings.len(), 1);
+            assert_eq!(cold.start_tickets.len(), 1);
+            assert_eq!(cold.start_specs.len(), 1);
+            assert_eq!(cold.start_positions.len(), 1);
+            assert!(!cold.effect_missing_receipt);
+            assert!(!cold.effect_evidence_refs.is_empty());
+            assert_eq!(cold.effects_checked_through, Some(through));
+            let restored = history::load(&services, &scope, &projection, through).unwrap();
+            assert_eq!(
+                serde_json::to_value(&cold).unwrap(),
+                serde_json::to_value(&restored).unwrap()
+            );
+            assert_eq!(restored.effect_evidence_refs, cold.effect_evidence_refs);
+            assert!(!restored.effect_missing_receipt);
+            assert_eq!(restored.effects_checked_through, Some(through));
+            assert_eq!(executor.polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            services.shutdown_execution().await;
+        }
+    }
+
+    async fn terminal_axes_goal_fixture() -> (std::sync::Arc<RuntimeServices>, String) {
+        let services = RuntimeServices::in_memory().unwrap();
+        let graph = graph_with_lineage(
+            "terminal axes fixture",
+            "projection-session",
+            "projection-turn",
+            "projection-task",
+        );
+        let graph_id = graph.id.clone();
+        services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let goal: GoalContract = serde_json::from_value(serde_json::json!({
+            "id":format!("goal:{graph_id}"),"session_id":"projection-session","objective":"axes current Goal fixture",
+            "criteria":[{"id":"criterion","statement":"fixture satisfied","status":"satisfied"}],
+            "phase":"terminal","scope":"internal","completion":"satisfied","revision":1,"user_sequence":1,
+            "spec_revision":1,"spec_digest":"axes-fixture-v1",
+            "execution_binding":{"objective_id":format!("goal:{graph_id}"),"session_id":"projection-session","turn_id":"projection-turn","root_execution_id":graph_id,"agentic_program_id":format!("program:{graph_id}")},
+            "terminal":{"kind":"satisfied","terminal_fence":"axes-fixture-terminal","authority_revision":1,"reason":"fixture","committed_at_ms":1}
+        })).unwrap();
+        services.goal_store().create(goal).unwrap();
+        (services, graph_id)
+    }
+
+    #[tokio::test]
+    async fn r1_outcome_axes_non_program_summary_and_full_use_current_goal() {
+        let (services, graph_id) = terminal_axes_goal_fixture().await;
+        let mut query = context(&services);
+        let full = snapshot(&services, &graph_id, &query).await.unwrap();
+        query.detail_scope = ProjectionDetailScope::Summary;
+        let summary = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(full.terminal_axes, summary.terminal_axes);
+        assert!(full.agentic_collaboration.programs.is_empty());
+        assert_eq!(
+            full.terminal_axes.outcome.outcome,
+            Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied)
+        );
+        assert_eq!(
+            full.terminal_axes.outcome.goal_id,
+            Some(format!("goal:{graph_id}"))
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_outcome_axes_satisfied_goal_does_not_finish_draining_execution() {
+        let (services, graph_id) = terminal_axes_goal_fixture().await;
+        let mut program = crate::AgenticProgramProjection::empty(
+            format!("program:{graph_id}"),
+            format!("goal:{graph_id}"),
+        );
+        program.session_id = "projection-session".into();
+        program.turn_id = "projection-turn".into();
+        program.root_execution_id = Some(graph_id.clone());
+        program.status = crate::AgenticProgramStatus::Draining;
+        program.continuation = Some(serde_json::from_value(serde_json::json!({"source_program_id":"source","source_objective_id":"source-goal","source_root_id":"source-root","source_revision":1,"source_status":"verified","authorization_generation":1,"authorization_revision":1,"binding_digest":"fixture-digest"})).unwrap());
+        services.event_store().append(crate::RuntimeEventInput {
+            stream_id:format!("agentic-program:{}",program.program_id),scope:RuntimeEventScope::Program,kind:"agentic.program_opened".into(),
+            status:Some("draining".into()),actor:Some("projection-fixture".into()),refs:vec![crate::RuntimeEventRef { kind:"execution_graph".into(), id:graph_id.clone() }],
+            payload:serde_json::json!({"objective_id":program.objective_id,"session_id":program.session_id,"turn_id":program.turn_id,"root_execution_id":graph_id,"continuation_seed":program}),
+        }).unwrap();
+        let projection = snapshot(&services, &graph_id, &context(&services))
+            .await
+            .unwrap();
+        assert_eq!(
+            projection.terminal_axes.outcome.outcome,
+            Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied)
+        );
+        assert_eq!(
+            projection.terminal_axes.execution.phase,
+            harness_contract::projection::TerminalExecutionPhase::Draining
+        );
+        assert_ne!(
+            projection.terminal_axes.execution.settlement,
+            harness_contract::projection::TerminalEffectSettlement::ProvenSettled
+        );
+        assert_eq!(
+            projection.terminal_axes.delivery.session_client_evidence,
+            harness_contract::projection::SessionClientEvidence::RequiresFreshContext
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_outcome_axes_goal_program_effect_and_descendant_deltas_match_snapshot() {
+        let (services, graph_id) = terminal_axes_goal_fixture().await;
+        let query = context(&services);
+        let initial = snapshot(&services, &graph_id, &query).await.unwrap();
+        let executor = BindingHistoryExecutor {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "binding_history_oracle",
+            "fixture://effect",
+        );
+        let current = services.graph_state_store().load(&graph_id).unwrap();
+        let planned = services
+            .commit_service()
+            .replan(
+                &current,
+                vec![node.clone()],
+                Vec::new(),
+                "real effect start provenance".into(),
+            )
+            .unwrap()
+            .graph;
+        let ready = services
+            .commit_service()
+            .transition_node(
+                &planned,
+                &node.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let ticket = crate::execution_core::graph::NodeExecutor::start(
+            &executor,
+            crate::execution_core::graph::NodeExecutionContext {
+                graph: std::sync::Arc::new(ready.clone()),
+                node: node.clone(),
+                attempt: 1,
+            },
+        )
+        .await
+        .unwrap();
+        services
+            .commit_service()
+            .bind_and_start_nodes(
+                &ready,
+                BTreeMap::from([(
+                    node.id.clone(),
+                    crate::execution_core::graph::ExecutionNodeBinding {
+                        executor_kind: ticket.executor_kind.clone(),
+                        ticket_idempotency_key: ticket.idempotency_key.clone(),
+                        attempt: ticket.attempt,
+                        resource_lease_refs: Vec::new(),
+                        scope_lease_ref: None,
+                        worktree_lease_ref: None,
+                    },
+                )]),
+                vec![ticket],
+            )
+            .unwrap();
+        let update = delta(
+            &services,
+            &graph_id,
+            initial.revision,
+            initial.cursor,
+            &query,
+        )
+        .unwrap();
+        assert!(update
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, ProjectionOperation::ReplaceTerminalAxes { .. })));
+        let reduced =
+            harness_contract::projection::reduce_projection_delta(&initial, &update).unwrap();
+        let fresh = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(reduced, fresh);
+        assert_eq!(
+            fresh.terminal_axes.execution.settlement,
+            harness_contract::projection::TerminalEffectSettlement::Unsettled
+        );
+        let mut previous = fresh;
+        let goal_id = format!("goal:{graph_id}");
+        services
+            .goal_store()
+            .revise(&goal_id, 1, 2, "changed current goal", |goal| {
+                goal.terminal = None;
+                goal.completion = GoalCompletion::Open;
+                goal.phase = "execution".into();
+                vec!["completion".into()]
+            })
+            .unwrap();
+        let update = delta(
+            &services,
+            &graph_id,
+            previous.revision,
+            previous.cursor,
+            &query,
+        )
+        .unwrap();
+        let fresh = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(
+            harness_contract::projection::reduce_projection_delta(&previous, &update).unwrap(),
+            fresh
+        );
+        assert!(fresh.terminal_axes.outcome.outcome.is_none());
+        previous = fresh;
+        services.event_store().append(crate::RuntimeEventInput {
+            stream_id:format!("agentic-program:program:{graph_id}"),scope:RuntimeEventScope::Program,kind:"agentic.program_opened".into(),
+            status:Some("open".into()),actor:Some("projection-fixture".into()),refs:vec![crate::RuntimeEventRef { kind:"execution_graph".into(), id:graph_id.clone() }],
+            payload:serde_json::json!({"objective_id":goal_id,"session_id":"projection-session","turn_id":"projection-turn","root_execution_id":graph_id}),
+        }).unwrap();
+        let update = delta(
+            &services,
+            &graph_id,
+            previous.revision,
+            previous.cursor,
+            &query,
+        )
+        .unwrap();
+        let fresh = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(
+            harness_contract::projection::reduce_projection_delta(&previous, &update).unwrap(),
+            fresh
+        );
+        previous = fresh;
+        let mut child = graph_with_lineage(
+            "axes descendant",
+            "projection-session",
+            "projection-turn",
+            "projection-task",
+        );
+        child.parent_execution = Some(ExecutionParentBinding {
+            execution_id: graph_id.clone(),
+            node_id: "axes-parent".into(),
+        });
+        services
+            .execution_supervisor()
+            .submit_and_wait(
+                child,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let update = delta(
+            &services,
+            &graph_id,
+            previous.revision,
+            previous.cursor,
+            &query,
+        )
+        .unwrap();
+        let fresh = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert!(update
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, ProjectionOperation::ReplaceTerminalAxes { .. })));
+        assert_eq!(
+            harness_contract::projection::reduce_projection_delta(&previous, &update).unwrap(),
+            fresh
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_outcome_axes_runtime_cache_contains_no_mutable_delivery() {
+        let (services, graph_id) = terminal_axes_goal_fixture().await;
+        let query = context(&services);
+        let initial = snapshot(&services, &graph_id, &query).await.unwrap();
+        let terminal = services
+            .session_terminal_delivery()
+            .enqueue(
+                "axes-unfenced-test-terminal",
+                "axes-message",
+                "projection-session",
+                initial.cursor,
+                "fixture://axes",
+            )
+            .unwrap();
+        let before = services.event_store().durable_commit_cursor().unwrap();
+        let claimed = services
+            .session_terminal_delivery()
+            .claim("axes-worker", 1, 1000, 10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.terminal_id == terminal.terminal_id)
+            .unwrap();
+        services
+            .session_terminal_delivery()
+            .acknowledge(&claimed.terminal_id, "axes-worker", claimed.revision, 2)
+            .unwrap();
+        let cached = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(initial.terminal_axes, cached.terminal_axes);
+        assert_eq!(
+            services.event_store().durable_commit_cursor().unwrap(),
+            before
+        );
+        let wire = serde_json::to_string(&cached.terminal_axes).unwrap();
+        for forbidden in [
+            "materialized_at_ms",
+            "outbox_revision",
+            "received_at_ms",
+            "client_id",
+        ] {
+            assert!(!wire.contains(forbidden));
+        }
+        assert!(
+            delta(&services, &graph_id, cached.revision, cached.cursor, &query)
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+        services.shutdown_execution().await;
     }
 
     fn bound_task_spec(services: &RuntimeServices, session_id: &str, objective: &str) -> TaskSpec {
@@ -846,16 +2793,14 @@ mod tests {
         assert!(node.usage.required_acceptance.is_empty());
         assert!(node.usage.observed_acceptance.is_empty());
         assert!(node.usage.runtime_write_attempt_paths.is_empty());
-        assert!(
-            node.summary
-                .as_ref()
-                .is_some_and(|value| value.chars().count() <= 1_025)
-        );
-        assert!(
-            node.failure
-                .as_ref()
-                .is_some_and(|failure| failure.message.chars().count() <= 513)
-        );
+        assert!(node
+            .summary
+            .as_ref()
+            .is_some_and(|value| value.chars().count() <= 1_025));
+        assert!(node
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.message.chars().count() <= 513));
         assert_eq!(node.resource_scopes.len(), SUMMARY_EVIDENCE_REFS);
         assert!(
             serde_json::to_vec(&summary)
@@ -904,6 +2849,7 @@ mod tests {
         }
         let projection = project_execution_graph(&graph);
         let scope = ExecutionProjectionScope {
+            programs: Vec::new(),
             session_id: None,
             mission_id: None,
             task_id: None,
@@ -1052,19 +2998,49 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let backend = std::sync::Arc::new(crate::runtime_event_store::EphemeralRuntimeEventStore::new());
+        let backend =
+            std::sync::Arc::new(crate::runtime_event_store::EphemeralRuntimeEventStore::new());
         let reader = std::sync::Arc::new(crate::RuntimeEventStore::from_backend(backend.clone()));
         let writer = std::sync::Arc::new(crate::RuntimeEventStore::from_backend(backend));
         let services = RuntimeServices::test_builder(temporary.path().join("home"), &workspace)
-            .runtime_event_store(reader.clone()).build().unwrap();
-        let graph = graph_with_lineage("external Goal recovery", "external-session", "external-turn", "external-task");
+            .runtime_event_store(reader.clone())
+            .build()
+            .unwrap();
+        let graph = graph_with_lineage(
+            "external Goal recovery",
+            "external-session",
+            "external-turn",
+            "external-task",
+        );
         let graph_id = graph.id.clone();
-        services.execution_supervisor().submit_and_wait(graph, ExecutionGraphCommand::Start {
-            expected_revision: 0,
-        }).await.unwrap();
+        services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
         let query = context(&services);
         let initial = snapshot(&services, &graph_id, &query).await.unwrap();
         assert!(initial.goals.is_empty());
+        // The independent recovery client runs under its own principal, so it
+        // owns a different redaction revision and therefore a different
+        // projection cache family. Its recovery snapshot can never be served
+        // by the delta that the original client family asks for, and it must
+        // never evict the base that family still holds.
+        let mut recovery_query = query.clone();
+        recovery_query.principal = "test-external-goal-recovery".to_string();
+        let recovery_initial = snapshot(&services, &graph_id, &recovery_query)
+            .await
+            .unwrap();
+        assert!(recovery_initial.goals.is_empty());
+        assert_ne!(
+            initial.redaction_revision, recovery_initial.redaction_revision,
+            "the independent recovery client must not share the delta client cache family"
+        );
         services.shutdown_maintenance().await;
         let hint = reader.current_commit_cursor();
         let goal_id = format!("goal:{graph_id}");
@@ -1074,18 +3050,49 @@ mod tests {
             "phase":"execution", "scope":"internal", "completion":"open", "revision":1, "user_sequence":1,
             "spec_revision":1,"spec_digest":"kernel-external-goal-fixture-v1",
         })).unwrap();
-        crate::execution_core::GoalStore::new(writer).create(goal).unwrap();
+        crate::execution_core::GoalStore::new(writer)
+            .create(goal)
+            .unwrap();
         assert_eq!(reader.current_commit_cursor(), hint);
         let durable = reader.durable_commit_cursor().unwrap();
         assert!(durable > initial.cursor);
-        let recovered = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert!(durable > recovery_initial.cursor);
+        // Independent recovery first, in the other cache family. It proves the
+        // external Goal is durable and visible without refreshing the family
+        // that still holds the delta client base.
+        let recovered = snapshot(&services, &graph_id, &recovery_query)
+            .await
+            .unwrap();
         assert_eq!(recovered.cursor, durable);
         assert!(recovered.goals.iter().any(|goal| goal.id == goal_id));
-        let update = delta(&services, &graph_id, initial.revision, initial.cursor, &query).unwrap();
+        // Then the real delta from the base the original client still holds.
+        let update = delta(
+            &services,
+            &graph_id,
+            initial.revision,
+            initial.cursor,
+            &query,
+        )
+        .unwrap();
+        assert_eq!(update.base_cursor, initial.cursor);
+        assert_eq!(update.from_revision, initial.revision);
         assert_eq!(update.target_cursor, durable);
+        assert!(
+            update.resync_reason.is_none(),
+            "a resync must never stand in for the external Goal upsert"
+        );
         assert!(update.operations.iter().any(|operation| matches!(operation,
             ProjectionOperation::UpsertEntity { collection: ProjectionEntityCollection::Goals, entity }
                 if entity.id == goal_id)));
+        let reduced = harness_contract::projection::reduce_projection_delta(&initial, &update)
+            .expect("external goal delta reduces onto the held base");
+        assert!(reduced.goals.iter().any(|goal| goal.id == goal_id));
+        let current = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(current.cursor, durable);
+        assert!(current.goals.iter().any(|goal| goal.id == goal_id));
+        assert_eq!(reduced.cursor, current.cursor);
+        assert_eq!(reduced.goals, current.goals);
+        assert_eq!(recovered.goals, current.goals);
         services.shutdown_execution().await;
     }
 
@@ -1207,8 +3214,41 @@ mod tests {
         .expect("activity detail");
         assert_eq!(detail.activity.activity_id, root_activity_id);
         assert_eq!(detail.execution_id, initial_snapshot.execution_id);
-        let initial_delta =
-            delta(&services, &initial_snapshot.execution_id, 0, 0, &query).expect("delta");
+        // A commit that does not move the graph revision must still advance
+        // the projection consumption cursor, so the delta carries a real
+        // cursor advance instead of replaying the whole projection.
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: "evolution:projection-graph-revision".to_string(),
+                scope: RuntimeEventScope::Evolution,
+                kind: "evolution.unrelated.recorded".to_string(),
+                status: Some("recorded".to_string()),
+                actor: Some("projection-test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"unrelated": true}),
+            })
+            .expect("unrelated event commits");
+        // The delta contract diffs the base a client actually holds against a
+        // freshly materialized target. A base that is not cached is an honest
+        // resync, never a guessed full delta, so the delta starts from the
+        // snapshot this client holds.
+        let initial_delta = delta(
+            &services,
+            &initial_snapshot.execution_id,
+            initial_snapshot.revision,
+            initial_snapshot.cursor,
+            &query,
+        )
+        .expect("delta");
+        assert!(
+            initial_delta.resync_reason.is_none(),
+            "a held snapshot base must produce a delta, not a resync"
+        );
+        assert_eq!(
+            initial_delta.target_revision, initial_snapshot.revision,
+            "the snapshot and the delta must report one graph revision"
+        );
         assert!(initial_delta.target_cursor >= initial_snapshot.cursor);
         assert!(initial_delta.operations.iter().any(|operation| {
             matches!(
@@ -1376,6 +3416,13 @@ mod tests {
             )
             .await
             .expect("parent graph starts");
+        // The delta base is the parent projection this client holds before the
+        // child execution is registered. A base that is not cached is an
+        // honest resync, never a guessed full delta.
+        let base = snapshot(&services, &parent_id, &context(&services))
+            .await
+            .expect("parent base projection");
+        assert!(base.child_executions.is_empty());
 
         let mut child = graph_with_lineage(
             "nested team protocol",
@@ -1425,6 +3472,28 @@ mod tests {
         assert_eq!(links[0].child_execution_id, child_id);
         assert_eq!(links[0].parent_node_id, "root-tool-batch");
 
+        // The delta is requested while the base is still the cached family
+        // member; a later same-family snapshot would evict it.
+        let lineage_delta = delta(
+            &services,
+            &parent_id,
+            base.revision,
+            base.cursor,
+            &context(&services),
+        )
+        .expect("lineage delta");
+        assert!(
+            lineage_delta.resync_reason.is_none(),
+            "a held base must produce a delta, not a resync"
+        );
+        assert!(lineage_delta.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                ProjectionOperation::UpsertChildExecution { child }
+                    if child.execution_id == child_id
+            )
+        }));
+
         let projection = snapshot(&services, &parent_id, &context(&services))
             .await
             .expect("parent projection");
@@ -1434,32 +3503,19 @@ mod tests {
             projection.child_executions[0].parent_node_id,
             "root-tool-batch"
         );
-        assert!(
-            projection
-                .child_executions
-                .iter()
-                .all(|child| child.execution_id != sibling_id)
-        );
+        assert!(projection
+            .child_executions
+            .iter()
+            .all(|child| child.execution_id != sibling_id));
         assert!(projection.activities.iter().any(|activity| {
             activity.kind == harness_contract::projection::ExecutionActivityKind::Execution
                 && activity.scope.execution_id == child_id
         }));
-        assert!(
-            !projection
-                .activities
-                .iter()
-                .any(|activity| { activity.scope.execution_id == sibling_id })
-        );
+        assert!(!projection
+            .activities
+            .iter()
+            .any(|activity| { activity.scope.execution_id == sibling_id }));
 
-        let lineage_delta =
-            delta(&services, &parent_id, 0, 0, &context(&services)).expect("lineage delta");
-        assert!(lineage_delta.operations.iter().any(|operation| {
-            matches!(
-                operation,
-                ProjectionOperation::UpsertChildExecution { child }
-                    if child.execution_id == child_id
-            )
-        }));
     }
     #[tokio::test]
     async fn agentic_program_reducer_exports_canonical_typed_collaboration() {
@@ -1822,6 +3878,7 @@ mod tests {
                     reason_ref: "tool://decision-review".into(),
                     // Pure projection fixture: physical receipt ingress has separate tests.
                     verification: Some(harness_contract::goal::ObjectiveReviewVerification {
+                        input_set: None,
                         result_source_revisions: Default::default(),
                         independence_required: true,
                         review_policy_digest: None,
@@ -1850,12 +3907,10 @@ mod tests {
         let before_completion = snapshot(&services, execution_id, &context(&services))
             .await
             .expect("project open Program");
-        assert!(
-            before_completion.agentic_collaboration.programs[0]
-                .completion
-                .wait
-                .is_none()
-        );
+        assert!(before_completion.agentic_collaboration.programs[0]
+            .completion
+            .wait
+            .is_none());
         actions
             .apply(&root(
                 "request-program-completion",
@@ -1885,18 +3940,14 @@ mod tests {
         assert_eq!(program.teams.len(), 2);
         assert_eq!(program.agents.len(), 2);
         assert_eq!(program.tasks.len(), 2);
-        assert!(
-            program
-                .teams
-                .iter()
-                .any(|team| team.name == "Evidence Research Team")
-        );
-        assert!(
-            program
-                .agents
-                .iter()
-                .any(|agent| agent.role == "Decision Reviewer")
-        );
+        assert!(program
+            .teams
+            .iter()
+            .any(|team| team.name == "Evidence Research Team"));
+        assert!(program
+            .agents
+            .iter()
+            .any(|agent| agent.role == "Decision Reviewer"));
         assert!(program.tasks.iter().any(|task| {
             task.task_id == synthesis_task_id && task.depends_on == vec![research_task_id.clone()]
         }));
@@ -2022,6 +4073,7 @@ mod tests {
         let team_id = "runtime-team:live".to_string();
         let team_graph_id = "team-graph:runtime-team:live".to_string();
         let scope = ExecutionProjectionScope {
+            programs: Vec::new(),
             session_id: Some("session-live-team".to_string()),
             mission_id: None,
             task_id: None,
@@ -2360,40 +4412,39 @@ mod tests {
         assert_eq!(strategy.confidence, Some(90));
         assert_eq!(strategy.downgrades.len(), 1);
         assert_eq!(strategy.early_stops.len(), 1);
-        assert!(
-            !serde_json::to_string(&strategy)
-                .expect("strategy wire")
-                .contains("/home/private/secret.txt")
-        );
+        assert!(!serde_json::to_string(&strategy)
+            .expect("strategy wire")
+            .contains("/home/private/secret.txt"));
     }
 
     #[test]
     fn strategy_projection_redacts_private_calibration() {
-        let mut estimates = vec![
-            serde_json::from_value::<ExecutionCandidateEstimate>(serde_json::json!({
-                "candidate": "team",
-                "eligible": true,
-                "estimated_serial_ms": 100,
-                "estimated_critical_path_ms": 50,
-                "startup_overhead_ms": 5,
-                "context_duplication_tokens": 10,
-                "merge_cost_ms": 5,
-                "evidence_overlap_penalty_bp": 0,
-                "provider_concurrency_penalty_bp": 0,
-                "risk_approval_penalty_bp": 0,
-                "expected_quality_lift_bp": 0,
-                "duration_calibration_source": "file:///home/private/strategy.json",
-                "duration_sample_count": 1,
-                "quality_calibration_source": "file:///home/private/quality.json",
-                "quality_sample_count": 0,
-                "duration_provenance": "observed",
-                "token_provenance": "assumed",
-                "quality_provenance": "unknown",
-                "risk_provenance": "assumed",
-                "reasons": ["copy the hidden prompt from C:\\private\\prompt.txt"]
-            }))
-            .expect("candidate estimate"),
-        ];
+        let mut estimates =
+            vec![
+                serde_json::from_value::<ExecutionCandidateEstimate>(serde_json::json!({
+                    "candidate": "team",
+                    "eligible": true,
+                    "estimated_serial_ms": 100,
+                    "estimated_critical_path_ms": 50,
+                    "startup_overhead_ms": 5,
+                    "context_duplication_tokens": 10,
+                    "merge_cost_ms": 5,
+                    "evidence_overlap_penalty_bp": 0,
+                    "provider_concurrency_penalty_bp": 0,
+                    "risk_approval_penalty_bp": 0,
+                    "expected_quality_lift_bp": 0,
+                    "duration_calibration_source": "file:///home/private/strategy.json",
+                    "duration_sample_count": 1,
+                    "quality_calibration_source": "file:///home/private/quality.json",
+                    "quality_sample_count": 0,
+                    "duration_provenance": "observed",
+                    "token_provenance": "assumed",
+                    "quality_provenance": "unknown",
+                    "risk_provenance": "assumed",
+                    "reasons": ["copy the hidden prompt from C:\\private\\prompt.txt"]
+                }))
+                .expect("candidate estimate"),
+            ];
         sanitize_candidate_estimates(&mut estimates);
         assert_eq!(
             estimates[0].duration_calibration_source,

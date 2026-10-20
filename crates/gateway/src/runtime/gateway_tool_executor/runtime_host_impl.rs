@@ -1,5 +1,28 @@
 #[async_trait::async_trait]
 impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
+    fn bounded_process_authority(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> Result<runtime::tool_host::BoundedProcessAuthority, ToolError> {
+        self.validated_bounded_process_lease(request)?;
+        runtime::tool_host::BoundedProcessAuthority::bind(
+            self.upgrade_runtime_services()
+                .ok_or_else(|| ToolError::new("bounded process Runtime unavailable"))?,
+            request.clone(),
+        )
+    }
+    fn bounded_process_lease(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> Result<tools::ToolHostLease, ToolError> {
+        self.validated_bounded_process_lease(request)
+    }
+
+    fn bounded_process_plane(&self) -> Option<Arc<runtime::ToolExecutionPlane>> {
+        self.upgrade_runtime_services()
+            .map(|services| Arc::clone(services.tool_execution_plane()))
+    }
+
     fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
         Some(self.tool_host.pin_snapshot())
     }
@@ -61,8 +84,10 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 }
             }
         };
-        let Some(canonical_tool_name) =
-            step_lease.snapshot().catalog.canonical_name(&request.tool_name)
+        let Some(canonical_tool_name) = step_lease
+            .snapshot()
+            .catalog
+            .canonical_name(&request.tool_name)
         else {
             return runtime::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
@@ -293,6 +318,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         } else {
             None
         };
+        let mut typed_observations = Vec::new();
         let result = if request.tool_name == "tool_search" {
             self.execute_search_tool(value)
         } else if is_gateway_runtime_control_tool(&request.tool_name)
@@ -332,15 +358,39 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             } else {
                 request.input.clone()
             };
-            self.execute_authorized_output_with_progress(
-                authorization,
-                &request.tool_name,
-                &effective_input,
-                request.tool_progress.0.as_ref(),
-                Some(step_lease),
-            )
-            .await
-            .map(|output| output.model_text().to_string())
+            if request.compiled_invocation.as_ref().is_some_and(|invocation| {
+                invocation.effect.uses_network && !invocation.effect.spawns_process
+            }) {
+                async {
+                    let input = harness_contract::step::parse_strict_json(&effective_input)
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    self.reject_orchestrated_tools_outside_allow_list(&request.tool_name, &input)?;
+                    let binding = runtime::ExecutionCommitService::local_network_binding(request)
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    let (output, fact) = step_lease.execute_joined_local_network(
+                        authorization, &request.tool_name, &effective_input, binding,
+                        request.session_id.as_deref().ok_or_else(|| ToolError::new("local network Session missing"))?,
+                        &request.step_binding.as_ref().ok_or_else(|| ToolError::new("local network Step missing"))?.origin,
+                    ).await.map_err(|error| ToolError::new(error.to_string()))?;
+                    typed_observations.push(fact.into_observation(
+                        request.tool_name.clone(), request.observation_wave_sequence,
+                    ));
+                    Ok(output)
+                }.await
+            } else {
+                self.execute_authorized_output_with_progress(
+                    authorization,
+                    &request.tool_name,
+                    &effective_input,
+                    request.tool_progress.0.as_ref(),
+                    Some(step_lease),
+                )
+                .await
+                .map(|output| {
+                    typed_observations = output.observations().to_vec();
+                    output.model_text().to_string()
+                })
+            }
         } else {
             Err(ToolError::new(format!(
                 "ordinary tool `{}` requires Runtime authorization",
@@ -376,8 +426,13 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                         };
                     }
                 }
-                let observed_evidence =
-                    gateway_observed_evidence(self, request, &output, &evidence_ref);
+                let mut observed_evidence = typed_observations;
+                observed_evidence.extend(gateway_observed_evidence(
+                    self,
+                    request,
+                    &output,
+                    &evidence_ref,
+                ));
                 runtime::RuntimeToolExecutionOutcome {
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),

@@ -314,8 +314,9 @@ impl RuntimeServices {
                             )?,
                             None => {
                                 return Err(format!(
-                                    "{} evidence {evidence_ref} points to missing durable content: {store_error}",
-                                    action.kind()
+                                    "{} evidence {evidence_ref} points to missing durable content: {store_error}. {}",
+                                    action.kind(),
+                                    super::order_contract::ARTIFACT_CONTENT_REF_CONTRACT
                                 ))
                             }
                         }
@@ -391,6 +392,8 @@ impl RuntimeServices {
         envelope: &AgentActionEnvelope,
     ) -> Result<AgentActionObservation, String> {
         envelope.validate().map_err(|error| error.to_string())?;
+        self.ensure_session_recovery_admitted(&envelope.actor.session_id)
+            .map_err(|error| error.to_string())?;
         let actions = self.agent_action_service();
         if let Some(replay) = actions
             .replay_if_applied(envelope)
@@ -433,7 +436,7 @@ impl RuntimeServices {
             }
             let key = review_attempt_key(envelope);
             match self
-                .independent_result_review(
+                .independent_result_review_with_evidence(
                     &envelope.actor,
                     &program,
                     results,
@@ -441,15 +444,17 @@ impl RuntimeServices {
                         AgentAction::ObjectiveReview(input) => Some(input.criterion_ref.as_str()),
                         _ => None,
                     },
+                    match &envelope.action {
+                        AgentAction::TaskReview(input) => &input.evidence_refs,
+                        AgentAction::ObjectiveReview(input) => &input.evidence_refs,
+                        _ => unreachable!("review classification"),
+                    },
                 )
                 .await
             {
                 Ok(review) => {
                     clear_review_streak(&key);
-                    // Only a positive verdict carries the verification forward;
-                    // a negative verdict already satisfied the physical-read
-                    // guard above and applies as before.
-                    positive_review.then_some(review)
+                    Some(review)
                 }
                 Err(error) => {
                     if is_review_source_changed_retry(&error) {
@@ -1165,11 +1170,9 @@ mod tests {
         assert!(is_review_content_refusal(
             "review physical attempt is stale or owns different results"
         ));
-        assert!(
-            !is_review_precondition_refusal(
-                "review physical attempt is stale or owns different results"
-            )
-        );
+        assert!(!is_review_precondition_refusal(
+            "review physical attempt is stale or owns different results"
+        ));
         assert!(is_review_source_changed_retry(
             "review_requires_current_physical_reads:artifact:a"
         ));

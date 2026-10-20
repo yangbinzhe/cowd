@@ -107,6 +107,12 @@ pub struct WorkspaceScopeIdentity {
 )]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceTargetIdentity {
+    LocalNetwork {
+        operation: LocalNetworkFact,
+    },
+    ToolExecution {
+        execution: ToolExecutionFact,
+    },
     Workspace {
         scope: WorkspaceScopeIdentity,
     },
@@ -213,6 +219,267 @@ pub struct ObservedEvidence {
     pub workspace_prior_state: Option<WorkspacePriorState>,
 }
 
+pub const TOOL_EXECUTION_DESCRIPTOR_DOMAIN: &str = "cowd.bounded_process.descriptor/v1";
+pub const TOOL_EXECUTION_INPUT_DOMAIN: &str = "cowd.bounded_process.input/v1";
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExecutionBinding {
+    pub call_key: String,
+    pub tool_use_id: String,
+    #[serde(deserialize_with = "deserialize_tool_execution_sha256")]
+    pub input_sha256: String,
+    #[serde(deserialize_with = "deserialize_tool_execution_sha256")]
+    pub descriptor_sha256: String,
+    #[serde(deserialize_with = "deserialize_tool_execution_sha256")]
+    pub authority_sha256: String,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExecutionInput {
+    #[serde(deserialize_with = "deserialize_tool_execution_path")]
+    pub relative_path: String,
+    #[serde(deserialize_with = "deserialize_tool_execution_sha256")]
+    pub sha256: String,
+    pub bytes: u64,
+    #[serde(with = "tool_execution_unsigned_identity")]
+    #[schemars(with = "String")]
+    pub device: u64,
+    #[serde(with = "tool_execution_unsigned_identity")]
+    #[schemars(with = "String")]
+    pub inode: u64,
+    #[serde(with = "tool_execution_signed_identity")]
+    #[schemars(with = "String")]
+    pub mtime_ns: i64,
+    #[serde(with = "tool_execution_signed_identity")]
+    #[schemars(with = "String")]
+    pub ctime_ns: i64,
+}
+
+mod tool_execution_unsigned_identity {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<Encoder: Serializer>(value: &u64, encoder: Encoder) -> Result<Encoder::Ok, Encoder::Error> {
+        encoder.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, Decoder: Deserializer<'de>>(decoder: Decoder) -> Result<u64, Decoder::Error> {
+        let text = String::deserialize(decoder)?;
+        let value = text.parse::<u64>().map_err(serde::de::Error::custom)?;
+        if value.to_string() != text {
+            return Err(serde::de::Error::custom("noncanonical unsigned filesystem identity"));
+        }
+        Ok(value)
+    }
+}
+
+mod tool_execution_signed_identity {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<Encoder: Serializer>(value: &i64, encoder: Encoder) -> Result<Encoder::Ok, Encoder::Error> {
+        encoder.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, Decoder: Deserializer<'de>>(decoder: Decoder) -> Result<i64, Decoder::Error> {
+        let text = String::deserialize(decoder)?;
+        let value = text.parse::<i64>().map_err(serde::de::Error::custom)?;
+        if value.to_string() != text {
+            return Err(serde::de::Error::custom("noncanonical signed filesystem identity"));
+        }
+        Ok(value)
+    }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExecutionAdmission {
+    #[serde(deserialize_with = "deserialize_tool_execution_version")]
+    pub version: u32,
+    pub binding: ToolExecutionBinding,
+    #[serde(deserialize_with = "deserialize_tool_execution_sha256")]
+    pub code_sha256: String,
+    #[serde(deserialize_with = "deserialize_tool_execution_inputs")]
+    pub inputs: Vec<ToolExecutionInput>,
+    pub source_bundle: ArtifactRef,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ToolProcessClosure {
+    pub backend: String,
+    pub namespace_inode: u64,
+    pub init_host_pid: u32,
+    pub init_start_ticks: u64,
+    pub all_children_reaped: bool,
+    pub init_reaped: bool,
+    pub kernel_hardening_applied: bool,
+    pub network_disabled: bool,
+    pub project_read_only: bool,
+    pub status_channel_protected: bool,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolExecutionStopReason {
+    CommandExit,
+    Timeout,
+    Cancelled,
+    CaptureLimit,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolExecutionTerminal {
+    NotStarted {
+        #[serde(deserialize_with = "deserialize_tool_execution_reason")]
+        reason_code: String,
+    },
+    Settled {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        closure: ToolProcessClosure,
+        stop_reason: ToolExecutionStopReason,
+    },
+    Unknown {
+        #[serde(deserialize_with = "deserialize_tool_execution_reason")]
+        reason_code: String,
+    },
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExecutionFact {
+    #[serde(deserialize_with = "deserialize_tool_execution_version")]
+    pub version: u32,
+    pub admission: ToolExecutionAdmission,
+    pub terminal: ToolExecutionTerminal,
+    pub body: ArtifactRef,
+    #[serde(deserialize_with = "deserialize_tool_execution_sha256")]
+    pub stdout_sha256: String,
+    #[serde(deserialize_with = "deserialize_tool_execution_sha256")]
+    pub stderr_sha256: String,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub capture_complete: bool,
+}
+
+fn deserialize_tool_execution_version<'de, Decoder>(decoder: Decoder) -> Result<u32, Decoder::Error>
+where
+    Decoder: serde::Deserializer<'de>,
+{
+    let version = u32::deserialize(decoder)?;
+    if version != 1 {
+        return Err(serde::de::Error::custom(
+            "unsupported bounded process version",
+        ));
+    }
+    Ok(version)
+}
+
+fn deserialize_tool_execution_sha256<'de, Decoder: serde::Deserializer<'de>>(
+    decoder: Decoder,
+) -> Result<String, Decoder::Error> {
+    let digest = String::deserialize(decoder)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(serde::de::Error::custom("invalid bounded process SHA256"));
+    }
+    Ok(digest)
+}
+
+fn deserialize_tool_execution_path<'de, Decoder: serde::Deserializer<'de>>(
+    decoder: Decoder,
+) -> Result<String, Decoder::Error> {
+    let path = String::deserialize(decoder)?;
+    if path.is_empty()
+        || path.len() > 1024
+        || path.contains('\\')
+        || path.contains('\0')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(serde::de::Error::custom(
+            "invalid bounded process input path",
+        ));
+    }
+    Ok(path)
+}
+
+fn deserialize_tool_execution_reason<'de, Decoder: serde::Deserializer<'de>>(
+    decoder: Decoder,
+) -> Result<String, Decoder::Error> {
+    let reason = String::deserialize(decoder)?;
+    if reason.len() > 128 {
+        return Err(serde::de::Error::custom(
+            "bounded process reason exceeds budget",
+        ));
+    }
+    Ok(reason)
+}
+
+fn deserialize_tool_execution_inputs<'de, Decoder: serde::Deserializer<'de>>(
+    decoder: Decoder,
+) -> Result<Vec<ToolExecutionInput>, Decoder::Error> {
+    struct InputsVisitor;
+    impl<'de> serde::de::Visitor<'de> for InputsVisitor {
+        type Value = Vec<ToolExecutionInput>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("at most64 sorted bounded process file inputs")
+        }
+        fn visit_seq<Sequence: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: Sequence,
+        ) -> Result<Self::Value, Sequence::Error> {
+            let mut inputs: Vec<ToolExecutionInput> =
+                Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(64));
+            let mut total = 0_u64;
+            while inputs.len() < 64 {
+                let Some(input) = sequence.next_element::<ToolExecutionInput>()? else {
+                    return Ok(inputs);
+                };
+                total = total.saturating_add(input.bytes);
+                if input.bytes > 2097152
+                    || total > 16777216
+                    || inputs
+                        .last()
+                        .is_some_and(|last| last.relative_path >= input.relative_path)
+                {
+                    return Err(serde::de::Error::custom(
+                        "bounded process input ordering or byte limit",
+                    ));
+                }
+                inputs.push(input);
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(
+                    "bounded process input count limit",
+                ));
+            }
+            Ok(inputs)
+        }
+    }
+    decoder.deserialize_seq(InputsVisitor)
+}
+
 /// Invocation-level proof of semantic delivery to a Provider model.
 ///
 /// The Provider invocation id is the correlation key. Digests are integrity
@@ -291,7 +558,19 @@ impl ObservedAcceptance {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceDurability {
     Pending,
@@ -304,7 +583,9 @@ pub enum EvidenceDurability {
 /// The selector is the only public locator. Physical paths, database keys, and
 /// compact/blob tier choices are adapter-private and must never cross a
 /// Runtime or Gateway contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct ArtifactRef {
     pub selector: String,
     pub sha256: String,
@@ -359,6 +640,11 @@ pub struct ArtifactWriteDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutputDraft {
+    ObservedArtifact {
+        summary: String,
+        artifact_ref: ArtifactRef,
+        observations: Vec<ObservedEvidence>,
+    },
     BoundedInline {
         content: String,
     },
@@ -368,7 +654,57 @@ pub enum ToolOutputDraft {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalNetworkFact {
+    pub version: u32,
+    pub binding: ToolExecutionBinding,
+    pub host_joined: bool,
+    pub coverage_complete: bool,
+    pub operations: Vec<LocalNetworkOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalNetworkOperation {
+    pub ordinal: u32,
+    pub input_sha256: String,
+    pub endpoint: String,
+    pub terminal: LocalNetworkTerminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocalNetworkTerminal {
+    BodyDone { status: u16, body_bytes: u64, body_sha256: String },
+    NotStarted { reason_code: String },
+    Unknown { reason_code: String },
+}
+
+impl LocalNetworkFact {
+    pub fn into_observation(self, tool_name: String, sequence: u64) -> ObservedEvidence {
+        ObservedEvidence {
+            obligation_id: String::new(),
+            target: EvidenceTargetIdentity::LocalNetwork { operation: self },
+            observed_at_sequence: sequence,
+            tool_name,
+            provenance: ObservedEvidenceProvenance::FreshExecution,
+            evidence_ref: None,
+            model_observation: None,
+            workspace_prior_state: None,
+        }
+    }
+}
+
 impl ToolOutputDraft {
+    #[must_use]
+    pub fn observations(&self) -> &[ObservedEvidence] {
+        match self {
+            Self::ObservedArtifact { observations, .. } => observations,
+            _ => &[],
+        }
+    }
+
     #[must_use]
     pub fn bounded_inline(content: impl Into<String>) -> Self {
         Self::BoundedInline {
@@ -388,7 +724,9 @@ impl ToolOutputDraft {
     pub fn model_text(&self) -> &str {
         match self {
             Self::BoundedInline { content } => content,
-            Self::StagedArtifact { summary, .. } => summary,
+            Self::StagedArtifact { summary, .. } | Self::ObservedArtifact { summary, .. } => {
+                summary
+            }
         }
     }
 
@@ -396,7 +734,8 @@ impl ToolOutputDraft {
     pub const fn artifact_ref(&self) -> Option<&ArtifactRef> {
         match self {
             Self::BoundedInline { .. } => None,
-            Self::StagedArtifact { artifact_ref, .. } => Some(artifact_ref),
+            Self::StagedArtifact { artifact_ref, .. }
+            | Self::ObservedArtifact { artifact_ref, .. } => Some(artifact_ref),
         }
     }
 }
@@ -1641,6 +1980,202 @@ fn estimate_tokens(content: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_process_os_identity_uses_exact_canonical_decimal_strings() {
+        for (modified, changed) in [
+            (1_792_378_000_123_456_789, 1_792_378_001_987_654_321),
+            (i64::MIN, i64::MAX),
+            (0, -1),
+        ] {
+            let input = ToolExecutionInput {
+                relative_path: "source.py".into(),
+                sha256: "a".repeat(64),
+                bytes: 1,
+                device: u64::MAX,
+                inode: u64::MAX - 1,
+                mtime_ns: modified,
+                ctime_ns: changed,
+            };
+            let encoded = serde_json::to_value(&input).unwrap();
+            assert_eq!(encoded["device"], u64::MAX.to_string());
+            assert_eq!(encoded["inode"], (u64::MAX - 1).to_string());
+            assert_eq!(encoded["mtime_ns"], modified.to_string());
+            assert_eq!(encoded["ctime_ns"], changed.to_string());
+            crate::step::canonical_json_bytes(&encoded).unwrap();
+            assert_eq!(serde_json::from_value::<ToolExecutionInput>(encoded.clone()).unwrap(), input);
+            for field in ["device", "inode", "mtime_ns", "ctime_ns"] {
+                for invalid in [
+                    serde_json::json!(1),
+                    serde_json::json!(1.5),
+                    serde_json::Value::Null,
+                    serde_json::json!("01"),
+                    serde_json::json!("+1"),
+                    serde_json::json!("-0"),
+                    serde_json::json!(" 1"),
+                    serde_json::json!("18446744073709551616"),
+                ] {
+                    let mut changed_input = encoded.clone();
+                    changed_input[field] = invalid;
+                    assert!(serde_json::from_value::<ToolExecutionInput>(changed_input).is_err(), "{field}");
+                }
+            }
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(ToolExecutionInput)).unwrap();
+        for field in ["device", "inode", "mtime_ns", "ctime_ns"] {
+            assert_eq!(schema["properties"][field]["type"], "string");
+        }
+    }
+
+    #[test]
+    fn bounded_process_dto_versions_limits_and_observed_artifact_accessors() {
+        let archive = ArtifactRef::durable(
+            "artifact://original",
+            format!("sha256:{}", "a".repeat(64)),
+            12,
+            "application/octet-stream",
+            "session:test",
+        );
+        let admission = ToolExecutionAdmission {
+            version: 1,
+            binding: ToolExecutionBinding {
+                call_key: "original-call".into(),
+                tool_use_id: "original-tool".into(),
+                input_sha256: "a".repeat(64),
+                descriptor_sha256: "c".repeat(64),
+                authority_sha256: "b".repeat(64),
+            },
+            code_sha256: "c".repeat(64),
+            inputs: Vec::new(),
+            source_bundle: archive.clone(),
+        };
+        let fact = ToolExecutionFact {
+            version: 1,
+            admission,
+            terminal: ToolExecutionTerminal::NotStarted {
+                reason_code: "cancelled_before_spawn".into(),
+            },
+            body: ArtifactRef::durable(
+                "artifact://body",
+                format!("sha256:{}", "d".repeat(64)),
+                32,
+                "application/json",
+                "session:test",
+            ),
+            stdout_sha256: "e".repeat(64),
+            stderr_sha256: "f".repeat(64),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            capture_complete: false,
+        };
+        let value = serde_json::to_value(&fact).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ToolExecutionFact>(value.clone()).unwrap(),
+            fact
+        );
+        assert_eq!(fact.admission.source_bundle.sha256.len(), 71);
+        let mut maximum_inputs = value.clone();
+        maximum_inputs["admission"]["inputs"] = serde_json::Value::Array((0..64).map(|index| {
+            serde_json::json!({"relative_path":format!("file-{index:03}"),
+                "sha256":"a".repeat(64),"bytes":1,"device":"1","inode":"2","mtime_ns":"3","ctime_ns":"4"})
+        }).collect());
+        assert_eq!(serde_json::from_value::<ToolExecutionFact>(maximum_inputs).unwrap().admission.inputs.len(), 64);
+        for mutation in [
+            "version",
+            "admission-version",
+            "extra",
+            "missing",
+            "prefix",
+            "uppercase",
+            "descriptor16",
+            "descriptor-prefix",
+            "descriptor-uppercase",
+            "reason",
+            "path",
+            "inputs",
+        ] {
+            let mut invalid = value.clone();
+            match mutation {
+                "version" => invalid["version"] = serde_json::json!(2),
+                "admission-version" => invalid["admission"]["version"] = serde_json::json!(2),
+                "extra" => invalid["attestation"] = serde_json::json!(true),
+                "missing" => {
+                    invalid.as_object_mut().unwrap().remove("terminal");
+                }
+                "prefix" => {
+                    invalid["stdout_sha256"] =
+                        serde_json::json!(format!("sha256:{}", "a".repeat(64)))
+                }
+                "uppercase" => invalid["stdout_sha256"] = serde_json::json!("A".repeat(64)),
+                "descriptor16" => {
+                    invalid["admission"]["binding"]["descriptor_sha256"] =
+                        serde_json::json!("a".repeat(16))
+                }
+                "descriptor-prefix" => {
+                    invalid["admission"]["binding"]["descriptor_sha256"] =
+                        serde_json::json!(format!("sha256:{}", "a".repeat(64)))
+                }
+                "descriptor-uppercase" => {
+                    invalid["admission"]["binding"]["descriptor_sha256"] =
+                        serde_json::json!("A".repeat(64))
+                }
+                "reason" => invalid["terminal"]["reason_code"] = serde_json::json!("x".repeat(129)),
+                "path" | "inputs" => {
+                    let entry = serde_json::json!({"relative_path":if mutation == "path" {"../escape"} else {"file"},
+                        "sha256":"a".repeat(64),"bytes":1,"device":"1","inode":"2","mtime_ns":"3","ctime_ns":"4"});
+                    invalid["admission"]["inputs"] = if mutation == "inputs" {
+                        serde_json::Value::Array((0..65).map(|index| {
+                            let mut sorted_entry = entry.clone();
+                            sorted_entry["relative_path"] = serde_json::json!(format!("file-{index:03}"));
+                            sorted_entry
+                        }).collect())
+                    } else {
+                        serde_json::json!([entry])
+                    };
+                }
+                _ => unreachable!(),
+            }
+            let error = serde_json::from_value::<ToolExecutionFact>(invalid).unwrap_err();
+            if mutation == "inputs" {
+                assert!(error.to_string().contains("bounded process input count limit"), "{error}");
+            }
+        }
+        let observation = ObservedEvidence {
+            obligation_id: String::new(),
+            target: EvidenceTargetIdentity::ToolExecution { execution: fact },
+            observed_at_sequence: 0,
+            tool_name: "execute_code".into(),
+            provenance: ObservedEvidenceProvenance::FreshExecution,
+            evidence_ref: None,
+            model_observation: None,
+            workspace_prior_state: None,
+        };
+        let output = ToolOutputDraft::ObservedArtifact {
+            summary: "bounded summary".into(),
+            artifact_ref: archive.clone(),
+            observations: vec![observation.clone()],
+        };
+        assert_eq!(output.model_text(), "bounded summary");
+        assert_eq!(output.artifact_ref(), Some(&archive));
+        assert_eq!(output.observations(), &[observation.clone()]);
+        assert!(ToolOutputDraft::bounded_inline("ordinary")
+            .observations()
+            .is_empty());
+        assert!(ToolOutputDraft::staged_artifact("ordinary", archive)
+            .observations()
+            .is_empty());
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(observation.target.clone());
+        let mut hashes = std::collections::HashSet::new();
+        hashes.insert(observation.target);
+        assert_eq!(set.len(), 1);
+        assert_eq!(hashes.len(), 1);
+        assert!(
+            serde_json::to_value(schemars::schema_for!(EvidenceTargetIdentity))
+                .unwrap()
+                .is_object()
+        );
+    }
 
     fn item(source: ContextSourceKind, content: &str, score: f32) -> ContextItem {
         ContextItem::new(

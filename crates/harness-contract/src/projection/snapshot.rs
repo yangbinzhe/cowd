@@ -18,11 +18,9 @@ use crate::strategy::{
 };
 use crate::turn::CancellationReceipt;
 
-// The collaboration projection now carries Runtime-owned dependency
-// resolution, so an outer projection reader must not silently combine a
-// schema-3 envelope with schema-4 collaboration semantics.
-pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 4;
-pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 4;
+pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 5;
+pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 5;
+pub const AGENTIC_COLLABORATION_PROJECTION_SCHEMA_VERSION: u32 = 5;
 pub const STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(
@@ -1058,6 +1056,8 @@ pub struct AgenticCollaborationSemanticRefsV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionProjection {
+    #[serde(default)]
+    pub terminal_axes: ExecutionTerminalAxes,
     pub schema_version: u32,
     pub execution_id: String,
     pub revision: u64,
@@ -1126,6 +1126,73 @@ pub struct ExecutionProjection {
     pub cancellation_receipt: Option<CancellationReceipt>,
     #[serde(default)]
     pub available_commands: Vec<ProjectionCommandAvailability>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalExecutionPhase {
+    #[default]
+    Unknown,
+    Running,
+    Draining,
+    Terminal,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalEffectSettlement {
+    #[default]
+    Unknown,
+    Unsettled,
+    ProvenSettled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionClientEvidence {
+    RequiresFreshContext,
+}
+
+impl Default for SessionClientEvidence {
+    fn default() -> Self {
+        Self::RequiresFreshContext
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalOutcomeAxis {
+    pub goal_id: Option<String>,
+    pub goal_revision: Option<u64>,
+    pub outcome: Option<crate::goal::ObjectiveTerminalKind>,
+    pub terminal_fence: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalExecutionAxis {
+    pub phase: TerminalExecutionPhase,
+    pub settlement: TerminalEffectSettlement,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub coverage_complete: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalDeliveryAxis {
+    pub runtime_terminal_ref: Option<String>,
+    pub session_client_evidence: SessionClientEvidence,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionTerminalAxes {
+    pub outcome: TerminalOutcomeAxis,
+    pub execution: TerminalExecutionAxis,
+    pub delivery: TerminalDeliveryAxis,
+    pub source_cursor: u64,
+    pub source_race: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

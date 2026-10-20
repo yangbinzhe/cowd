@@ -407,6 +407,61 @@ fn gateway_openapi_document_from_contract(
 }
 
 fn insert_runtime_contract_schemas(schemas: &mut Map<String, Value>) {
+    insert_canonical_schema::<cowd_app_protocol::AppFrameSourceBindingRequestV1>(
+        schemas,
+        "AppFrameSourceBindingRequestV1",
+    );
+    insert_canonical_schema::<cowd_app_protocol::AppFrameSourceBindingV1>(
+        schemas,
+        "AppFrameSourceBindingV1",
+    );
+    insert_canonical_schema::<super::session_routes::SessionAttachRequest>(
+        schemas,
+        "SessionAttachRequest",
+    );
+    insert_canonical_schema::<super::session_routes::SessionDetachRequest>(
+        schemas,
+        "SessionDetachRequest",
+    );
+    schemas.insert("SessionAttachReceipt".into(),json!({"type":"object","properties":{
+        "ok":{"type":"boolean"},"session_id":{"type":"string"},"presence_ttl_ms":{"type":"integer","minimum":1},
+        "receipt_attachment":{"type":"object","additionalProperties":false,"required":["client_id","client_expires_at_ms","receipt_protocol","presence_revision"],
+            "properties":{"client_id":{"type":"string","format":"uuid"},"client_expires_at_ms":{"type":"integer","minimum":1},
+                "receipt_protocol":{"type":"string","const":"session-public-v1"},"presence_revision":{"type":"string","pattern":"^[1-9][0-9]*$"}}}
+    }}));
+    insert_canonical_schema::<harness_contract::live::SessionMessageAckRequest>(
+        schemas,
+        "SessionMessageAckRequest",
+    );
+    insert_canonical_schema::<harness_contract::live::SessionMessageAck>(
+        schemas,
+        "SessionMessageAck",
+    );
+    insert_canonical_schema::<harness_contract::live::SessionMessageReceiptContext>(
+        schemas,
+        "SessionMessageReceiptContext",
+    );
+    schemas.insert("ReceiptCursor".into(),json!({"type":"string","pattern":"^[1-9][0-9]*$","maxLength":19,
+        "description":"Positive decimal identity; checked range 1..9223372036854775807, never a JSON number"}));
+    if let Some(properties) = schemas
+        .get_mut("SessionMessageAckRequest")
+        .and_then(|schema| schema.get_mut("properties"))
+    {
+        properties["content_digest"] =
+            json!({"type":"string","pattern":"^session-public-v1:sha256:[0-9a-f]{64}$"});
+    }
+    for name in ["SessionAttachRequest", "SessionDetachRequest"] {
+        if let Some(properties) = schemas
+            .get_mut(name)
+            .and_then(|schema| schema.get_mut("properties"))
+        {
+            properties["receipt_protocol"] = if name == "SessionAttachRequest" {
+                json!({"type":"string","const":"session-public-v1"})
+            } else {
+                json!({"type":["string","null"],"enum":["session-public-v1",null]})
+            };
+        }
+    }
     insert_canonical_schema::<super::session_routes::BranchSessionRequest>(
         schemas,
         "BranchSessionRequest",
@@ -1104,7 +1159,7 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         .map_or(SessionWriterPolicy::None, |metadata| {
             metadata.session_writer
         });
-    let responses = if let Some(metadata) = app_metadata {
+    let mut responses = if let Some(metadata) = app_metadata {
         json!({
             "200": {
                 "description": "Successful Gateway response",
@@ -1138,6 +1193,26 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         }
         responses
     };
+    if (capability.http.path.contains("/messages/")
+        && (capability.http.path.ends_with("/receipt-context")
+            || capability.http.path.ends_with("/ack")))
+        || capability.http.path.ends_with("/frame-source-bindings")
+    {
+        for (code, description) in [
+            ("403", "SessionRead denied"),
+            ("404", "Resource outside verified scope"),
+            ("409", "Receipt tuple or attachment expired"),
+            ("503", "Receipt authority unavailable"),
+        ] {
+            responses[code] = json!({"description":description});
+        }
+        if let Some(codes) = responses.as_object_mut() {
+            for response in codes.values_mut() {
+                response["headers"] =
+                    json!({"Cache-Control":{"schema":{"type":"string","const":"no-store"}}});
+            }
+        }
+    }
     operation.insert("responses".to_string(), responses);
     operation.insert(
         "x-cowd".to_string(),
@@ -2500,6 +2575,20 @@ fn openapi_parameters(
     stable_metadata: Option<&StableRouteMetadata>,
 ) -> Vec<Value> {
     let mut params = Vec::new();
+    if path.ends_with("/frame-source-bindings") {
+        params.push(json!({"name":"Origin","in":"header","required":true,"description":"Trusted Host origin; opaque/null origins are rejected","schema":{"type":"string"}}));
+        params.push(json!({"name":"Sec-Fetch-Site","in":"header","required":true,"schema":{"type":"string","const":"same-origin"}}));
+    }
+    if path == "/api/sessions/:id/attach" || path == "/api/sessions/:id/detach" {
+        params.push(json!({"name":"x-cowd-observer-id","in":"header","required":true,"schema":{"type":"string","minLength":1,"maxLength":128}}));
+        params.push(json!({"name":"x-cowd-client-id","in":"header","required":false,"description":"Exact committed selector required for receipt renewal or tagged detach","schema":{"type":"string","format":"uuid"}}));
+    }
+    if path.contains("/messages/") && (path.ends_with("/receipt-context") || path.ends_with("/ack"))
+    {
+        for name in ["x-cowd-observer-id", "x-cowd-client-id"] {
+            params.push(json!({"name":name,"in":"header","required":true,"schema":{"type":"string","minLength":1,"maxLength":128}}));
+        }
+    }
     for segment in path.split('/') {
         if let Some(name) = segment.strip_prefix(':') {
             params.push(json!({

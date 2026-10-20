@@ -1,5 +1,28 @@
 #[async_trait::async_trait]
 impl ToolExecutor for GatewayToolExecutor {
+    fn bounded_process_authority(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> Result<runtime::tool_host::BoundedProcessAuthority, ToolError> {
+        self.validated_bounded_process_lease(request)?;
+        runtime::tool_host::BoundedProcessAuthority::bind(
+            self.upgrade_runtime_services()
+                .ok_or_else(|| ToolError::new("bounded process Runtime unavailable"))?,
+            request.clone(),
+        )
+    }
+    fn bounded_process_lease(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> Result<tools::ToolHostLease, ToolError> {
+        self.validated_bounded_process_lease(request)
+    }
+
+    fn bounded_process_plane(&self) -> Option<Arc<runtime::ToolExecutionPlane>> {
+        self.upgrade_runtime_services()
+            .map(|services| Arc::clone(services.tool_execution_plane()))
+    }
+
     fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
         Some(self.tool_host.pin_snapshot())
     }
@@ -126,7 +149,8 @@ impl ToolExecutor for GatewayToolExecutor {
         // objective to exactly that: two identical frames refused, the single
         // frame-repair budget spent, three Teams and zero Tasks, verdict
         // `partial`.
-        let repaired_fields = self.coerce_string_typed_structured_fields(&canonical_name, &mut value);
+        let repaired_fields =
+            self.coerce_string_typed_structured_fields(&canonical_name, &mut value);
         if !repaired_fields.is_empty() {
             tracing::info!(
                 tool_name,
@@ -151,12 +175,12 @@ impl ToolExecutor for GatewayToolExecutor {
                 };
                 self.input_contract_error(&canonical_name, message)
             })
-        // Hand back the bytes Runtime will actually dispatch so the
-        // transcript, the governed plan and the execution cannot disagree.
-        // `Value` re-serializes deterministically, so a model that repeats the
-        // same frame still hashes the same and the repetition guard still sees
-        // it.
-        .map(|()| serde_json::to_string(&value).unwrap_or_else(|_| input.to_string()))
+            // Hand back the bytes Runtime will actually dispatch so the
+            // transcript, the governed plan and the execution cannot disagree.
+            // `Value` re-serializes deterministically, so a model that repeats the
+            // same frame still hashes the same and the repetition guard still sees
+            // it.
+            .map(|()| serde_json::to_string(&value).unwrap_or_else(|_| input.to_string()))
     }
 
     fn tool_input_coercions(

@@ -11,6 +11,8 @@ use std::time::Instant;
 mod domain;
 #[path = "client/live.rs"]
 mod live;
+#[path = "client/terminal_receipts.rs"]
+mod terminal_receipts;
 #[cfg(test)]
 use live::{deliver_tui_live_envelope, deliver_tui_live_resync, refresh_tui_live_source_selector};
 
@@ -71,6 +73,7 @@ pub struct GatewayApiClient {
     sse_client: reqwest::Client,
     live: Arc<TuiLiveMultiplexer>,
     pending_cancellations: Arc<Mutex<BTreeMap<String, (String, u64)>>>,
+    terminal_receipts: Arc<terminal_receipts::TerminalReceipts>,
 }
 
 #[derive(Debug)]
@@ -345,6 +348,7 @@ impl GatewayApiClient {
             sse_client,
             live,
             pending_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+            terminal_receipts: Arc::new(terminal_receipts::TerminalReceipts::default()),
         })
     }
 
@@ -711,6 +715,22 @@ impl GatewayApiClient {
             GatewayApiError::Contract(format!("invalid session message page: {error}"))
         })?;
         validate_session_messages_identity(session_id, &page)?;
+        {
+            let lane = self.terminal_receipts.lane(session_id);
+            let mut state = lane.lock().await;
+            for message in page
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+            {
+                if !state.messages.contains(&message.id) {
+                    if state.messages.len() >= 128 {
+                        state.messages.remove(0);
+                    }
+                    state.messages.push(message.id.clone());
+                }
+            }
+        }
         Ok(page)
     }
 
@@ -731,6 +751,22 @@ impl GatewayApiClient {
             GatewayApiError::Contract(format!("invalid session message page: {error}"))
         })?;
         validate_session_messages_identity(session_id, &page)?;
+        {
+            let lane = self.terminal_receipts.lane(session_id);
+            let mut state = lane.lock().await;
+            for message in page
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+            {
+                if !state.messages.contains(&message.id) {
+                    if state.messages.len() >= 128 {
+                        state.messages.remove(0);
+                    }
+                    state.messages.push(message.id.clone());
+                }
+            }
+        }
         Ok(page)
     }
 
@@ -1253,6 +1289,7 @@ impl GatewayApiClient {
             }
             let candidate_cursor = envelope.source_cursor;
             if envelope.event == "source.authorization_revoked" {
+                self.invalidate_terminal_receipt_lane(session_id).await;
                 let reason = envelope
                     .payload
                     .get("reason")
@@ -1305,6 +1342,68 @@ impl GatewayApiClient {
             };
             match strict_gateway_sse_frame_to_cowd_event_for_session(&frame, session_id) {
                 Ok(Some(event)) => {
+                    if let CowdEvent::GatewaySession {
+                        event: GatewaySessionEvent::UserMessageCommitted { correlation, .. },
+                    } = &event
+                    {
+                        if !correlation.replayed {
+                            if let Some(turn_id) = correlation.turn_id.as_ref() {
+                                let lane = self.terminal_receipts.lane(session_id);
+                                let mut state = lane.lock().await;
+                                if state.latest_turn.as_ref() != Some(turn_id) {
+                                    state.latest_turn = Some(turn_id.clone());
+                                    match state.epoch.checked_add(1) {
+                                        Some(epoch) => state.epoch = epoch,
+                                        None => {
+                                            state.exhausted = true;
+                                            state.grant = None;
+                                        }
+                                    }
+                                    let epoch = state.epoch;
+                                    if let Some(grant) = state.grant.as_mut() {
+                                        grant.epoch = epoch;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(message_id) = live::terminal_receipt_refresh_hint(&event) {
+                        let lane = self.terminal_receipts.lane(session_id);
+                        {
+                            let mut state = lane.lock().await;
+                            if !state.messages.iter().any(|message| message == message_id) {
+                                if state.messages.len() >= 128 {
+                                    state.messages.remove(0);
+                                }
+                                state.messages.push(message_id.to_string());
+                            }
+                        }
+                        let client = self.clone();
+                        let session_id = session_id.to_string();
+                        let message_id = message_id.to_string();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(overlay) = client
+                                .recover_terminal_receipt(&session_id, &message_id)
+                                .await
+                            {
+                                let _ = tx.send(session_scoped_event(
+                                    &session_id,
+                                    authority_generation,
+                                    CowdEvent::TerminalReceiptSelection {
+                                        session_id: session_id.clone(),
+                                        client_id: overlay.client_id.clone(),
+                                        epoch: overlay.epoch,
+                                    },
+                                ));
+                                let _ = tx.send(session_scoped_event(
+                                    &session_id,
+                                    authority_generation,
+                                    CowdEvent::TerminalReceiptContext { overlay },
+                                ));
+                            }
+                        });
+                    }
                     deliver_session_stream_event_with_catchup(
                         self,
                         &tx,
@@ -1336,18 +1435,136 @@ impl GatewayApiClient {
         surface: &str,
         role: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        require_gateway_session_operation_ok(
-            self.post_json(
-                &crate::gateway_client_routes::render_route(
-                    surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACH,
-                    &[(url_encode(session_id)).to_string()],
-                ),
-                serde_json::json!({ "surface": surface, "role": role }),
+        let lane = self.terminal_receipts.lane(session_id);
+        let serial = lane.lock().await.attach.clone();
+        let _serial = serial.lock().await;
+        let requested_role = role.unwrap_or("reader");
+        let (previous, role_changed) = {
+            let state = lane.lock().await;
+            (
+                state.grant.clone(),
+                state
+                    .role
+                    .as_deref()
+                    .is_some_and(|previous| previous != requested_role),
             )
-            .await?,
-            "attach session",
-            session_id,
-        )
+        };
+        if role_changed {
+            self.invalidate_terminal_receipt_lane(session_id).await;
+            if let Some(grant) = previous.as_ref() {
+                let url = format!(
+                    "{}/api/sessions/{}/detach",
+                    self.base_url,
+                    url_encode(session_id)
+                );
+                let response = self
+                    .authorize(self.client.post(url).json(&serde_json::json!({
+                        "surface": surface, "receipt_protocol": "session-public-v1"
+                    })))
+                    .header("x-cowd-client-id", &grant.client_id)
+                    .send()
+                    .await
+                    .map_err(GatewayApiError::Http)?;
+                if !response.status().is_success() {
+                    return Err(gateway_status_error(
+                        response.status(),
+                        response.text().await.unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(u64::MAX, |time| time.as_millis() as u64);
+        if lane
+            .lock()
+            .await
+            .grant
+            .as_ref()
+            .is_some_and(|grant| now >= grant.expires_at_ms)
+        {
+            self.invalidate_terminal_receipt_lane(session_id).await;
+        }
+        let (attempt_epoch, active) = {
+            let mut state = lane.lock().await;
+            if state.exhausted {
+                return Err(GatewayApiError::Contract("receipt epoch exhausted".into()));
+            }
+            state.role = Some(requested_role.into());
+            (state.epoch, state.grant.clone())
+        };
+        let result = async {
+            let url = format!(
+                "{}/api/sessions/{}/attach",
+                self.base_url,
+                url_encode(session_id)
+            );
+            let mut request = self.authorize(self.client.post(url).json(&serde_json::json!({
+                "surface": surface, "role": role, "receipt_protocol": "session-public-v1"
+            })));
+            if let Some(grant) = active.as_ref() {
+                request = request.header("x-cowd-client-id", &grant.client_id);
+            }
+            let response = request.send().await.map_err(GatewayApiError::Http)?;
+            if !response.status().is_success() {
+                return Err(gateway_status_error(
+                    response.status(),
+                    response.text().await.unwrap_or_default(),
+                ));
+            }
+            let value: serde_json::Value = response.json().await.map_err(GatewayApiError::Http)?;
+            let value = require_gateway_session_operation_ok(value, "attach session", session_id)?;
+            let grant = &value["receipt_attachment"];
+            let client_id = grant["client_id"]
+                .as_str()
+                .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+                .ok_or_else(|| {
+                    GatewayApiError::Contract("committed receipt client missing".into())
+                })?
+                .to_string();
+            if grant["receipt_protocol"] != "session-public-v1" {
+                return Err(GatewayApiError::Contract(
+                    "receipt protocol mismatch".into(),
+                ));
+            }
+            let expires_at_ms = grant["client_expires_at_ms"]
+                .as_u64()
+                .filter(|expiry| {
+                    *expiry
+                        > std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(u64::MAX, |time| time.as_millis() as u64)
+                })
+                .ok_or_else(|| GatewayApiError::Contract("receipt expiry invalid".into()))?;
+            let mut state = lane.lock().await;
+            if state.exhausted || state.epoch != attempt_epoch {
+                return Err(GatewayApiError::Contract(
+                    "late receipt attach result".into(),
+                ));
+            }
+            if state
+                .grant
+                .as_ref()
+                .is_none_or(|active| active.client_id != client_id)
+            {
+                state.epoch = state
+                    .epoch
+                    .checked_add(1)
+                    .ok_or_else(|| GatewayApiError::Contract("receipt epoch overflow".into()))?;
+            }
+            state.role = Some(requested_role.into());
+            state.grant = Some(terminal_receipts::ReceiptGrant {
+                client_id,
+                expires_at_ms,
+                epoch: state.epoch,
+            });
+            Ok(value)
+        }
+        .await;
+        if result.is_err() {
+            self.invalidate_terminal_receipt_lane(session_id).await;
+        }
+        result
     }
 
     pub async fn detach_session(
@@ -1355,18 +1572,32 @@ impl GatewayApiClient {
         session_id: &str,
         surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        require_gateway_session_operation_ok(
-            self.post_json(
-                &crate::gateway_client_routes::render_route(
-                    surface::gateway_api::paths::API_SESSIONS_BY_ID_DETACH,
-                    &[(url_encode(session_id)).to_string()],
-                ),
-                serde_json::json!({ "surface": surface }),
-            )
-            .await?,
-            "detach session",
-            session_id,
-        )
+        let lane = self.terminal_receipts.lane(session_id);
+        let serial = lane.lock().await.attach.clone();
+        let _serial = serial.lock().await;
+        let grant = lane.lock().await.grant.clone();
+        self.invalidate_terminal_receipt_lane(session_id).await;
+        let url = format!(
+            "{}/api/sessions/{}/detach",
+            self.base_url,
+            url_encode(session_id)
+        );
+        let mut request = self.authorize(self.client.post(url).json(&serde_json::json!({
+            "surface": surface, "receipt_protocol": "session-public-v1"
+        })));
+        if let Some(grant) = grant {
+            request = request.header("x-cowd-client-id", grant.client_id);
+        }
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        if !response.status().is_success() {
+            return Err(gateway_status_error(
+                response.status(),
+                response.text().await.unwrap_or_default(),
+            ));
+        }
+        let value = response.json().await.map_err(GatewayApiError::Http)?;
+        let value = require_gateway_session_operation_ok(value, "detach session", session_id)?;
+        Ok(value)
     }
 
     pub async fn lifecycle_snapshot(
@@ -3829,6 +4060,9 @@ async fn hydrate_session_history_once(
             let page = client
                 .session_messages_offset(session_id, offset, 500)
                 .await?;
+            client
+                .publish_terminal_receipts(session_id, &tx, authority_generation)
+                .await;
             let loaded = page.messages.len();
             let next_sequence = page.next_seq;
             let page_has_more = page.has_more;
@@ -3863,6 +4097,9 @@ async fn hydrate_session_history_once(
             let page = client
                 .session_messages(session_id, from_sequence, 500)
                 .await?;
+            client
+                .publish_terminal_receipts(session_id, &tx, authority_generation)
+                .await;
             let next_sequence = page.next_seq;
             let has_more = page.has_more;
             total_messages = total_messages.max(page.total);
@@ -4930,3 +5167,6 @@ fn gateway_sse_frame_projection_authorization_revoked(frame: &str) -> bool {
 #[cfg(test)]
 #[path = "client/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::RealReceiptScenario;

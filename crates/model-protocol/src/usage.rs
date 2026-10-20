@@ -3,7 +3,7 @@
 /// These values are technical telemetry: context packing, output clipping,
 /// rate-limit observation, and performance diagnostics. They must never be
 /// converted into money, authorization, approval, or execution outcome.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -61,6 +61,55 @@ impl TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::TokenUsage;
+
+    #[test]
+    fn r1_477_raw_usage_roundtrip_preserves_counters_and_unknown_distinction() {
+        let usage = TokenUsage {
+            input_tokens: 7,
+            output_tokens: 11,
+            cache_creation_input_tokens: 13,
+            cache_read_input_tokens: 17,
+        };
+        let value = serde_json::to_value(usage).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "input_tokens": 7, "output_tokens": 11,
+                "cache_creation_input_tokens": 13, "cache_read_input_tokens": 17,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<TokenUsage>(value.clone()).unwrap(),
+            usage
+        );
+        assert_eq!(
+            serde_json::to_value(None::<TokenUsage>).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_ne!(
+            serde_json::to_value(Some(TokenUsage::default())).unwrap(),
+            serde_json::Value::Null
+        );
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(4294967296u64),
+                serde_json::json!("unknown"),
+            ] {
+                let mut malformed = value.clone();
+                malformed[field] = invalid;
+                assert!(serde_json::from_value::<TokenUsage>(malformed).is_err());
+            }
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<TokenUsage>(missing).is_err());
+        }
+    }
 
     #[test]
     fn summarizes_technical_token_usage_without_money() {

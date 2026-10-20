@@ -1,7 +1,9 @@
 mod policy;
 mod results;
 pub(crate) use policy::{
-    RootReviewPolicySnapshot, effect_review_snapshot, root_self_review_policy,
+    committed_proof_sources, completion_admission_context, effect_review_snapshot,
+    proof_input_snapshot, root_self_review_policy, validate_proof_inputs,
+    CompletionAdmissionContext, ProofInputSnapshot,
 };
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,6 +15,411 @@ use sha2::{Digest, Sha256};
 
 use super::program::AgenticProgramProjection;
 use crate::RuntimeServices;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ResultContentReaders<'reader> {
+    pub artifacts: Option<&'reader crate::ArtifactStore>,
+    pub history: Option<&'reader session::SessionHistoryReader>,
+    pub process_inputs: Option<&'reader ProcessInputFrame>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessInputVerifier {
+    scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>,
+}
+
+pub(crate) struct ProcessInputFrame {
+    verifier: ProcessInputVerifier,
+    retained: std::sync::Mutex<BTreeMap<String, ProcessInputGuard>>,
+}
+
+struct ProcessInputGuard {
+    _lease: crate::execution_core::graph::resources::ScopeLockLease,
+    _descriptors: Vec<std::fs::File>,
+    checked_runs: BTreeSet<String>,
+}
+
+impl ProcessInputVerifier {
+    pub(crate) fn new(
+        scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>,
+    ) -> Self {
+        Self { scope_locks }
+    }
+
+    pub(crate) fn frame(&self) -> ProcessInputFrame {
+        ProcessInputFrame {
+            verifier: self.clone(),
+            retained: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl ProcessInputFrame {
+    fn validate(
+        &self,
+        store: &std::sync::Arc<crate::RuntimeEventStore>,
+        run: &results::AuthenticatedProcessExecution,
+    ) -> Result<(), String> {
+        use crate::execution_core::graph::resources::{
+            ScopeLockMode, ScopeLockRequest, ScopedResource,
+        };
+        let mut cuts = BTreeMap::new();
+        let admitted = policy::verify_material_event(store, &run.admission, &mut cuts)?;
+        let primary = policy::verify_material_event(store, &run.primary, &mut cuts)?;
+        let root = admitted.payload["source_workspace_root"]
+            .as_str()
+            .filter(|root| !root.is_empty())
+            .ok_or("bounded process protected source workspace missing")?;
+        let workspace = std::path::Path::new(root);
+        if !workspace.is_absolute()
+            || workspace
+                .canonicalize()
+                .map_err(|error| error.to_string())?
+                != workspace
+        {
+            return Err(
+                "bounded process protected source workspace changed or is not canonical".into(),
+            );
+        }
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(workspace)
+            .map_err(|error| error.to_string())?;
+        let descriptor = results::receipt_effect_descriptor(&primary)?;
+        let scope = results::require_original_effect_scope(
+            &primary.payload["resolved_effect_scope"],
+            &descriptor,
+        )?;
+        if scope
+            .targets
+            .iter()
+            .any(|target| target.path.workspace_id != resolver.workspace_id())
+        {
+            return Err(
+                "bounded process protected source workspace/scope namespace mismatch".into(),
+            );
+        }
+        let mut retained = self
+            .retained
+            .lock()
+            .map_err(|_| "bounded process input frame poisoned")?;
+        let key = resolver.workspace_id().to_string();
+        if let Some(guard) = retained.get_mut(&key) {
+            let descriptors = policy::validate_current_process_inputs(workspace, run)?;
+            if guard
+                .checked_runs
+                .insert(run.fact.admission.binding.call_key.clone())
+            {
+                guard._descriptors.extend(descriptors);
+            }
+            return Ok(());
+        }
+        let request = ScopeLockRequest {
+            scope: ScopedResource::workspace(resolver.workspace_id())
+                .map_err(|error| error.to_string())?,
+            mode: ScopeLockMode::Read,
+        };
+        let lease = self
+            .verifier
+            .scope_locks
+            .try_acquire([request])
+            .map_err(|error| error.to_string())?
+            .ok_or("effect_review_pending: bounded process input scope busy; retry")?;
+        let descriptors = policy::validate_current_process_inputs(workspace, run)?;
+        retained.insert(
+            key,
+            ProcessInputGuard {
+                _lease: lease,
+                _descriptors: descriptors,
+                checked_runs: BTreeSet::from([run.fact.admission.binding.call_key.clone()]),
+            },
+        );
+        Ok(())
+    }
+}
+
+fn validate_selected_process_inputs(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    run: &results::AuthenticatedProcessExecution,
+    readers: ResultContentReaders<'_>,
+) -> Result<(), String> {
+    readers
+        .process_inputs
+        .ok_or("bounded process selected input verifier context missing")?
+        .validate(store, run)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PROOF_MATERIAL_CUT_BARRIER: std::cell::RefCell<Option<(
+        String,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )>>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_proof_material_cut_barrier<ReviewOutput>(
+    source: String,
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    review: impl std::future::Future<Output = ReviewOutput>,
+) -> ReviewOutput {
+    PROOF_MATERIAL_CUT_BARRIER
+        .scope(
+            std::cell::RefCell::new(Some((source, entered, release))),
+            review,
+        )
+        .await
+}
+
+pub(crate) fn validate_original_effect_scope(
+    value: &serde_json::Value,
+    descriptor: &harness_contract::tool::ToolEffectDescriptor,
+) -> Result<harness_contract::goal::ProofEffectScope, String> {
+    results::require_original_effect_scope(value, descriptor)
+}
+
+pub(crate) fn proof_value_digest(value: &impl serde::Serialize) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).expect("serializable proof input"))
+    )
+}
+
+pub(crate) fn required_review_conditions(
+    goal: &harness_contract::goal::GoalContract,
+) -> BTreeSet<String> {
+    goal.user_intent_criterion_id
+        .iter()
+        .cloned()
+        .chain(
+            goal.obligations
+                .iter()
+                .filter(|obligation| obligation.required)
+                .map(|obligation| obligation.obligation_id.clone()),
+        )
+        .chain(
+            goal.criteria
+                .iter()
+                .filter(|criterion| {
+                    criterion.status == harness_contract::goal::AcceptanceStatus::Satisfied
+                })
+                .map(|criterion| criterion.id.clone()),
+        )
+        .collect()
+}
+
+pub(crate) fn review_snapshot_key(
+    proof: &ObjectiveReviewVerification,
+) -> (Vec<String>, Option<String>) {
+    (
+        proof.effect_source_refs.clone(),
+        proof
+            .input_set
+            .as_ref()
+            .map(|inputs| inputs.semantic_digest.clone()),
+    )
+}
+
+pub(crate) fn review_result_identity(
+    program: &AgenticProgramProjection,
+    reference: &str,
+) -> Result<String, String> {
+    let matches = program
+        .artifacts
+        .values()
+        .filter(|artifact| {
+            artifact.artifact_ref == reference
+                || artifact.content_ref == reference
+                || same_reference_spelling(&artifact.artifact_ref, reference)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(reference.to_string()),
+        [artifact] => Ok(artifact.artifact_ref.clone()),
+        _ => Err("proof artifact identity is ambiguous".into()),
+    }
+}
+
+fn canonical_review_result_refs(
+    program: &AgenticProgramProjection,
+    references: &[String],
+) -> Result<BTreeSet<String>, String> {
+    references
+        .iter()
+        .map(|reference| review_result_identity(program, reference))
+        .collect()
+}
+
+fn selected_work(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    goal: Option<&harness_contract::goal::GoalContract>,
+    references: &[String],
+    publication_sources: &mut BTreeMap<String, u64>,
+) -> Result<(Vec<String>, Vec<String>, String), String> {
+    let required = goal
+        .into_iter()
+        .flat_map(|goal| &goal.obligations)
+        .filter(|obligation| obligation.required)
+        .map(|obligation| obligation.obligation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let normalize = |reference: &str| review_result_identity(program, reference);
+    let mut artifacts = references
+        .iter()
+        .map(|reference| normalize(reference))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut task_artifacts = BTreeMap::new();
+    for task in program.tasks.values() {
+        task_artifacts.insert(
+            task.task_id.clone(),
+            task.artifact_refs.iter().cloned().collect::<BTreeSet<_>>(),
+        );
+    }
+    let mut pending = program
+        .tasks
+        .values()
+        .filter(|task| {
+            artifacts.contains(&task.task_id)
+                || task_artifacts[&task.task_id]
+                    .iter()
+                    .any(|reference| artifacts.contains(reference))
+                || task
+                    .obligation_refs
+                    .iter()
+                    .any(|reference| required.contains(reference.as_str()))
+        })
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    let mut tasks = BTreeMap::new();
+    let mut selected = BTreeMap::new();
+    loop {
+        while let Some(reference) = pending.pop() {
+            if tasks.contains_key(&reference) {
+                continue;
+            }
+            let task = program
+                .tasks
+                .get(&reference)
+                .ok_or("proof dependency Task missing")?;
+            pending.extend(task.depends_on.iter().cloned());
+            if !task.replacement_task_refs.is_empty()
+                || task.status == super::program::AgenticTaskStatus::Superseded
+                || task.pending_retirement
+                    == Some(super::program::AgenticTaskRetirement::Superseded)
+            {
+                if task.replacement_task_refs.is_empty()
+                    || (task.status == super::program::AgenticTaskStatus::Superseded
+                        && !super::work_market::task_dependency_satisfied(program, &reference))
+                {
+                    return Err("proof replacement dependency is not satisfied".into());
+                }
+                pending.extend(task.replacement_task_refs.iter().cloned());
+            }
+            artifacts.extend(task_artifacts[&task.task_id].iter().cloned());
+            tasks.insert(reference, serde_json::json!({
+            "team":task.team_id,"objective":task.objective,"acceptance":task.acceptance,
+            "acceptance_checks":task.acceptance_checks,"criterion_source":task.criterion_source,
+            "obligations":task.obligation_refs,"capabilities":task.required_capabilities,
+            "execution_requirements":task.execution_requirements,"purpose":task.purpose,
+            "dependencies":task.depends_on,"status":task.status,"claimant":task.claimant,
+            "claim_generation":task.claim_generation,"execution":task.claim_execution_id,
+            "artifacts":task.artifact_refs,"reviewer":task.reviewed_by,"unresolved":task.unresolved,
+            "replacements":task.replacement_task_refs,"pending_retirement":task.pending_retirement,
+        }));
+        }
+        let mut pending_artifacts = std::mem::take(&mut artifacts)
+            .into_iter()
+            .collect::<Vec<_>>();
+        while let Some(reference) = pending_artifacts.pop() {
+            if selected.contains_key(&reference) {
+                continue;
+            }
+            if let Some(artifact) = program.artifacts.get(&reference) {
+                for dependency in &artifact.relates_to {
+                    let normalized = normalize(dependency)?;
+                    if program.artifacts.contains_key(&normalized) {
+                        pending_artifacts.push(normalized);
+                    }
+                    if program.tasks.contains_key(dependency) {
+                        if !task_artifacts[dependency].contains(&artifact.artifact_ref) {
+                            results::authenticate_publication_task_link(
+                                store,
+                                program,
+                                artifact,
+                                dependency,
+                                publication_sources,
+                            )?;
+                        }
+                        if !tasks.contains_key(dependency) {
+                            pending.push(dependency.clone());
+                        }
+                    }
+                }
+                selected.insert(
+                    artifact.artifact_ref.clone(),
+                    serde_json::to_value(artifact).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+    }
+    let mut dependency_counts = BTreeMap::new();
+    let mut dependents = BTreeMap::<String, Vec<String>>::new();
+    for reference in tasks.keys() {
+        let task = &program.tasks[reference];
+        let dependencies = task
+            .depends_on
+            .iter()
+            .chain(&task.replacement_task_refs)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        dependency_counts.insert(reference.clone(), dependencies.len());
+        for dependency in dependencies {
+            if !tasks.contains_key(&dependency) {
+                return Err("proof dependency closure is incomplete".into());
+            }
+            dependents
+                .entry(dependency)
+                .or_default()
+                .push(reference.clone());
+        }
+    }
+    let mut ready = dependency_counts
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(reference, _)| reference.clone())
+        .collect::<Vec<_>>();
+    let mut resolved_tasks = 0usize;
+    while let Some(reference) = ready.pop() {
+        resolved_tasks += 1;
+        if let Some(references) = dependents.get(&reference) {
+            for dependent in references {
+                let count = dependency_counts
+                    .get_mut(dependent)
+                    .ok_or("proof dependency disappeared")?;
+                *count -= 1;
+                if *count == 0 {
+                    ready.push(dependent.clone());
+                }
+            }
+        }
+    }
+    if resolved_tasks != tasks.len() {
+        return Err("proof dependency or replacement cycle".into());
+    }
+    let digest = proof_value_digest(&serde_json::json!({
+        "domain":"cowd.proof.work.v2","program":program.program_id,"objective":program.objective_id,
+        "continuation":program.continuation,"tasks":tasks,"artifacts":selected,
+        "required_teams":program.required_team_count,"exact_teams":program.exact_team_count,
+    }));
+    Ok((
+        tasks.into_keys().collect(),
+        selected.into_keys().collect(),
+        digest,
+    ))
+}
 
 pub(crate) fn work_manifest_digest(program: &AgenticProgramProjection) -> String {
     // Hash semantic work, not lease renewal or retirement of its workers.
@@ -179,8 +586,6 @@ struct ReadCoverage {
     proof: ObjectiveResultReadProof,
     total: Option<usize>,
     chunks: BTreeSet<usize>,
-    effect_scopes_remaining: BTreeSet<usize>,
-    unscoped_effect: bool,
 }
 
 /// Whether a tool result counts as a physical read of a delivered result.
@@ -218,7 +623,67 @@ fn same_reference_spelling(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
+#[cfg(test)]
+fn read_digest_208(value: &str) -> Option<String> {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| digest.to_ascii_lowercase())
+}
+
 impl ReadCoverage {
+    fn observe_delivered(&mut self, read: &policy::VerifiedReadDelivery) -> Result<(), String> {
+        if !read.body_delivered() {
+            return Ok(());
+        }
+        let body = &read.material.acquisition.body;
+        #[cfg(test)]
+        eprintln!(
+            "R1_READ_208_BODY {}",
+            serde_json::json!({
+                "receipt": read.receipt_reference(),
+                "result": self.proof.result_ref,
+                "source_ref": body.source_ref,
+                "content_ref": self.proof.content_ref,
+                "source_digest": body.source_sha256,
+                "proof_digest": self.proof.sha256,
+                "source_digest_canonical": read_digest_208(&body.source_sha256),
+                "proof_digest_canonical": read_digest_208(&self.proof.sha256),
+                "literal_digest_matches": body.source_sha256 == self.proof.sha256,
+                "source_bytes": body.source_bytes,
+                "proof_bytes": self.proof.bytes,
+                "extent": body.extent,
+            })
+        );
+        if body.source_sha256 != self.proof.sha256
+            || body.source_bytes != self.proof.bytes
+            || !(same_reference_spelling(&body.source_ref, &self.proof.content_ref)
+                || same_reference_spelling(&body.source_ref, &self.proof.result_ref))
+        {
+            return Ok(());
+        }
+        let crate::context_evidence::ReadExtent::ArtifactChunks {
+            total_chunks,
+            chunks,
+        } = &body.extent
+        else {
+            return Ok(());
+        };
+        let total =
+            usize::try_from(*total_chunks).map_err(|_| "delivered result extent overflow")?;
+        if self.total.is_some_and(|expected| expected != total)
+            || (*total_chunks == 0 && self.proof.bytes != 0)
+            || chunks.iter().any(|chunk| chunk.index >= *total_chunks)
+        {
+            return Err("delivered result pages disagree about the actual source extent".into());
+        }
+        self.total = Some(total);
+        self.chunks
+            .extend(chunks.iter().map(|chunk| chunk.index as usize));
+        self.proof.receipt_refs.push(read.receipt_reference());
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn observe(&mut self, output: &str, receipt_ref: &str) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
             return;
@@ -282,32 +747,460 @@ impl ReadCoverage {
     }
 }
 
-fn record_effect_observation(
-    results: &[results::ResolvedReviewResult],
-    coverage: &mut BTreeMap<String, ReadCoverage>,
-    cursor: u64,
-    scopes: &[harness_contract::policy::PermissionScope],
-    reference: &str,
-) {
-    for result in results {
-        if !result.effect_cursor.is_some_and(|effect| cursor > effect) {
+pub(crate) fn validate_explicit_process_evidence(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    verification: &harness_contract::goal::ObjectiveReviewVerification,
+    explicit_evidence_refs: &[String],
+) -> Result<(), String> {
+    let claims = verification
+        .reads
+        .iter()
+        .flat_map(|read| &read.effect_observation_refs)
+        .filter(|reference| is_process_body_receipt(reference))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if explicit_evidence_refs
+        .iter()
+        .filter(|reference| is_process_body_receipt(reference))
+        .any(|reference| !claims.contains(reference))
+    {
+        return Err(
+            "bounded process explicit receipt selection was omitted from this proof".into(),
+        );
+    }
+    let Some(inputs) = verification.input_set.as_ref() else {
+        return if claims.is_empty() {
+            Ok(())
+        } else {
+            Err("bounded process selection inputs missing".into())
+        };
+    };
+    let mut cuts = BTreeMap::new();
+    let mut originals = Vec::new();
+    let mut known_bodies = BTreeSet::new();
+    for material in &inputs.material_events {
+        let event = policy::verify_material_event(store, material, &mut cuts)?;
+        if event.kind == "execution.effect.receipt" && results::has_process_fact(&event) {
+            let run = results::authenticate_bounded_process(store, &event)?;
+            known_bodies.insert(run.fact.body.selector);
+        }
+        originals.push(event);
+    }
+    let mut expected_bodies = known_bodies
+        .iter()
+        .filter(|body| {
+            explicit_evidence_refs
+                .iter()
+                .any(|explicit| same_reference_spelling(explicit, body))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut read_bodies = BTreeSet::new();
+    let mut recovered = BTreeSet::new();
+    for event in originals {
+        if !matches!(
+            event.kind.as_str(),
+            crate::context_evidence::NATIVE_DELIVERY_KIND
+                | crate::context_evidence::PROCESS_DELIVERY_KIND
+        ) {
             continue;
         }
-        if let Some(state) = coverage.get_mut(&result.reference) {
-            let before = state.effect_scopes_remaining.len();
-            state.effect_scopes_remaining.retain(|index| {
-                let effect = &result.effect_scopes[*index];
-                !scopes.iter().any(|read| {
-                    read.resource == effect.resource
-                        && effect.target.is_some()
-                        && read.target == effect.target
-                })
-            });
-            if state.effect_scopes_remaining.len() != before {
-                state.proof.effect_observation_refs.push(reference.into());
+        let delivery = crate::context_evidence::decode_read_delivery(&event.payload)
+            .map_err(str::to_string)?;
+        let recipient = match &delivery.recipient {
+            crate::context_evidence::ReadDeliveryRecipient::Root { owner, .. } => {
+                format!("root-execution:{}", owner.binding.root_execution_id)
+            }
+            crate::context_evidence::ReadDeliveryRecipient::AgentTask { identity } => format!(
+                "agent-run:{}",
+                identity
+                    .agent_run_id()
+                    .ok_or("bounded body recipient run missing")?
+            ),
+        };
+        if recipient != verification.reviewer_execution_id {
+            continue;
+        }
+        let reference = match &delivery.recipient {
+            crate::context_evidence::ReadDeliveryRecipient::Root { owner, .. } => {
+                format!("tool://runtime-event:{}", owner.event_id)
+            }
+            crate::context_evidence::ReadDeliveryRecipient::AgentTask { .. } => {
+                let index = store
+                    .event_by_idempotency_key(
+                        &delivery.acquisition.index_stream,
+                        &delivery.acquisition.index_key,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or("bounded body original index missing")?;
+                format!(
+                    "tool://{}#{}",
+                    index.stream_id,
+                    index.payload["sequence"]
+                        .as_u64()
+                        .ok_or("bounded body original index sequence missing")?
+                )
+            }
+        };
+        let body = known_bodies
+            .iter()
+            .find(|body| same_reference_spelling(body, &delivery.acquisition.body.source_ref));
+        if let Some(body) = body {
+            if explicit_evidence_refs.contains(&reference) {
+                expected_bodies.insert(body.clone());
+            }
+            if expected_bodies.contains(body) && claims.contains(&reference) {
+                read_bodies.insert(body.clone());
             }
         }
+        if !claims.contains(&reference) {
+            continue;
+        }
+        if !explicit_evidence_refs.iter().any(|explicit| {
+            explicit == &reference
+                || same_reference_spelling(explicit, &delivery.acquisition.body.source_ref)
+        }) {
+            return Err(
+                "bounded process selected body was not explicitly proposed by this review action"
+                    .into(),
+            );
+        }
+        recovered.insert(reference);
     }
+    if recovered != claims || !expected_bodies.is_subset(&read_bodies) {
+        return Err(
+            "bounded process action selection lacks original body delivery materials".into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_bounded_process_retirement(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    primary: &crate::DurableRuntimeEvent,
+    artifacts: Option<&crate::ArtifactStore>,
+) -> Result<Vec<crate::ExpectedStreamRevision>, String> {
+    let run = results::authenticate_bounded_process(store, primary)?;
+    results::process_has_no_external_effects(&run)?;
+    results::validate_process_archives(
+        &run,
+        ResultContentReaders {
+            artifacts,
+            history: None,
+            process_inputs: None,
+        },
+    )?;
+    let mut cuts = BTreeMap::new();
+    results::retain_process_execution(store, &run, &mut cuts)?;
+    Ok(cuts
+        .into_iter()
+        .map(
+            |(stream_id, expected_revision)| crate::ExpectedStreamRevision {
+                stream_id,
+                expected_revision,
+            },
+        )
+        .collect())
+}
+
+fn process_body_receipt(read: &policy::VerifiedReadDelivery) -> String {
+    format!("tool://{}", read.receipt_reference())
+}
+
+fn complete_process_body_refs(
+    run: &results::AuthenticatedProcessExecution,
+    deliveries: &policy::ReviewDeliverySnapshot,
+) -> Result<Vec<String>, String> {
+    let mut total = None;
+    let mut chunks = BTreeMap::new();
+    let mut references = BTreeSet::new();
+    for read in &deliveries.reads {
+        let body = &read.material.acquisition.body;
+        if !read.body_delivered()
+            || read.material.acquisition_cursor == 0
+            || !same_reference_spelling(&body.source_ref, &run.fact.body.selector)
+            || body.source_sha256 != run.fact.body.sha256
+            || body.source_bytes != run.fact.body.bytes
+        {
+            continue;
+        }
+        let crate::context_evidence::ReadExtent::ArtifactChunks {
+            total_chunks,
+            chunks: pages,
+        } = &body.extent
+        else {
+            continue;
+        };
+        if total.is_some_and(|old| old != *total_chunks) {
+            return Err("bounded process body delivery extent conflict".into());
+        }
+        total = Some(*total_chunks);
+        for chunk in pages {
+            if chunk.index >= *total_chunks
+                || chunks
+                    .insert(chunk.index, (chunk.body_sha256.clone(), chunk.body_bytes))
+                    .is_some_and(|previous| {
+                        previous != (chunk.body_sha256.clone(), chunk.body_bytes)
+                    })
+            {
+                return Err("bounded process body delivery chunk conflict".into());
+            }
+        }
+        references.insert(process_body_receipt(read));
+    }
+    if !run.fact.capture_complete
+        || total.is_none_or(|total| {
+            (total == 0 && run.fact.body.bytes != 0)
+                || chunks.len() as u64 != total
+                || !chunks.keys().copied().eq(0..total)
+        })
+    {
+        return Err(
+            "review_requires_complete_process_body: independently read every original body chunk"
+                .into(),
+        );
+    }
+    Ok(references.into_iter().collect())
+}
+
+fn is_process_body_receipt(reference: &str) -> bool {
+    reference.starts_with("tool://runtime-event:")
+        || reference.starts_with("tool://execution-agent-receipts:")
+}
+
+fn validate_process_claims(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    runs: &[results::AuthenticatedProcessExecution],
+    claimed: &[String],
+    deliveries: &policy::ReviewDeliverySnapshot,
+) -> Result<Vec<results::AuthenticatedProcessExecution>, String> {
+    let claims = claimed
+        .iter()
+        .filter(|reference| is_process_body_receipt(reference))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if claims.len()
+        != claimed
+            .iter()
+            .filter(|reference| is_process_body_receipt(reference))
+            .count()
+    {
+        return Err("bounded process selection repeats a body receipt".into());
+    }
+    let mut selected = Vec::new();
+    let mut recovered = BTreeSet::new();
+    for run in runs {
+        let candidates = deliveries
+            .reads
+            .iter()
+            .filter(|read| {
+                same_reference_spelling(
+                    &read.material.acquisition.body.source_ref,
+                    &run.fact.body.selector,
+                )
+            })
+            .map(process_body_receipt)
+            .collect::<BTreeSet<_>>();
+        if claims.is_disjoint(&candidates) {
+            continue;
+        }
+        let primary = store
+            .event_by_idempotency_key(
+                &run.primary.stream_id,
+                &format!("{}:receipt", run.fact.admission.binding.call_key),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or("bounded process selected original terminal missing")?;
+        let original = results::authenticate_bounded_process(store, &primary)?;
+        results::process_has_no_external_effects(&original)?;
+        if !matches!(
+            original.fact.terminal,
+            harness_contract::context::ToolExecutionTerminal::Settled { .. }
+        ) {
+            return Err("bounded process selected witness was not executed".into());
+        }
+        let complete = complete_process_body_refs(&original, deliveries)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if !complete.is_subset(&claims) {
+            return Err("bounded process selected body omits an original chunk receipt".into());
+        }
+        recovered.extend(complete);
+        selected.push(original);
+    }
+    if recovered != claims {
+        return Err(
+            "bounded process selected receipt is not in this result's authentic producer closure"
+                .into(),
+        );
+    }
+    Ok(selected)
+}
+
+fn select_process_witnesses(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    actor: &harness_contract::agent_action::AgentActorBinding,
+    runs_by_result: &std::collections::BTreeMap<
+        String,
+        Vec<results::AuthenticatedProcessExecution>,
+    >,
+    explicit_evidence_refs: &[String],
+    deliveries: &policy::ReviewDeliverySnapshot,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let mut selected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (result, runs) in runs_by_result {
+        let mut refs = BTreeSet::new();
+        for run in runs {
+            let requested = explicit_evidence_refs.iter().any(|reference| {
+                same_reference_spelling(reference, &run.fact.body.selector)
+                    || deliveries.reads.iter().any(|read| {
+                        process_body_receipt(read) == *reference
+                            && same_reference_spelling(
+                                &read.material.acquisition.body.source_ref,
+                                &run.fact.body.selector,
+                            )
+                    })
+            });
+            if !requested {
+                continue;
+            }
+            let primary = store
+                .event_by_idempotency_key(
+                    &run.primary.stream_id,
+                    &format!("{}:receipt", run.fact.admission.binding.call_key),
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or("selected bounded process original receipt missing")?;
+            let original = results::authenticate_bounded_process(store, &primary)?;
+            results::process_has_no_external_effects(&original)?;
+            if !matches!(
+                original.fact.terminal,
+                harness_contract::context::ToolExecutionTerminal::Settled { .. }
+            ) {
+                return Err(
+                    "review_requires_process_execution: NotStarted is not an executed witness"
+                        .into(),
+                );
+            }
+            if primary.payload["replay"]["session_id"] != actor.session_id {
+                return Err("bounded process witness belongs to a foreign Session".into());
+            }
+            refs.extend(complete_process_body_refs(run, deliveries)?);
+        }
+        selected.insert(result.clone(), refs.into_iter().collect());
+    }
+    for reference in explicit_evidence_refs.iter().filter(|reference| {
+        reference.starts_with("tool://runtime-event:")
+            || reference.starts_with("tool://execution-agent-receipts:")
+    }) {
+        if !selected.values().any(|refs| refs.contains(reference)) {
+            return Err(
+                "explicit bounded body receipt is outside the original result producer closure"
+                    .into(),
+            );
+        }
+    }
+    Ok(selected)
+}
+
+fn effect_observation_groups<'reads>(
+    result: &results::ResolvedReviewResult,
+    reads: &'reads [policy::DeliveredFileRead],
+    claimed: Option<&BTreeSet<String>>,
+) -> Result<Vec<&'reads policy::DeliveredFileRead>, String> {
+    use harness_contract::context::WorkspaceObjectKind;
+    use harness_contract::policy::{PermissionOperation, PermissionResource};
+    if result.kind != harness_contract::goal::GoalResultKind::ToolEffect {
+        if claimed.is_some_and(|references| !references.is_empty()) {
+            return Err("non-effect result cannot borrow effect observation references".into());
+        }
+        return Ok(Vec::new());
+    }
+    let cursor = result
+        .effect_cursor
+        .ok_or("effect result has no authenticated effect cursor")?;
+    if result.unscoped_effect || result.effect_scopes.is_empty() {
+        return Err(format!(
+            "review_requires_effect_observation:{}; original effect targets are unscoped",
+            result.reference
+        ));
+    }
+    let mut selected = Vec::new();
+    let mut targets = Vec::new();
+    for scope in &result.effect_scopes {
+        let matches = result
+            .effect_targets
+            .iter()
+            .filter(|target| &target.declared_scope == scope)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err("effect observation lacks its original canonical target identity".into());
+        }
+        targets.extend(matches);
+    }
+    for target in targets {
+        let scope = &target.declared_scope;
+        let matches = |read: &&policy::DeliveredFileRead| {
+            read.cursor > cursor
+                && scope.resource == PermissionResource::File
+                && read.scope.resource == scope.resource
+                && read.scope.operation == PermissionOperation::Read
+                && scope.target.is_some()
+                && read.scope.target == scope.target
+                && read.path.object_kind == WorkspaceObjectKind::File
+                && target.path.object_kind == WorkspaceObjectKind::File
+                && read.path.workspace_id == target.path.workspace_id
+                && read.path.repository_id == target.path.repository_id
+                && read.path.workspace_relative_path == target.path.workspace_relative_path
+                && read.path.repository_relative_path == target.path.repository_relative_path
+                && !read.receipt_refs.is_empty()
+                && claimed.is_none_or(|references| read.receipt_refs.is_subset(references))
+        };
+        let mut matching = reads.iter().filter(matches);
+        if let Some(references) = claimed {
+            let groups = matching.collect::<Vec<_>>();
+            if groups.is_empty() {
+                return Err(format!(
+                    "review_requires_effect_observation:{}; no complete strictly later reviewer witness for {:?}",
+                    result.reference, scope.target
+                ));
+            }
+            selected.extend(
+                groups
+                    .into_iter()
+                    .filter(|read| !read.receipt_refs.is_disjoint(references)),
+            );
+        } else {
+            selected.push(matching.next().ok_or_else(|| format!(
+                "review_requires_effect_observation:{}; independently read every affected target after the original effect", result.reference
+            ))?);
+        }
+    }
+    Ok(selected)
+}
+
+fn effect_observation_refs(
+    result: &results::ResolvedReviewResult,
+    reads: &[policy::DeliveredFileRead],
+    claimed: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    let claimed_set = claimed.map(|references| references.iter().cloned().collect::<BTreeSet<_>>());
+    let groups = effect_observation_groups(result, reads, claimed_set.as_ref())?;
+    let actual = groups
+        .into_iter()
+        .flat_map(|read| read.receipt_refs.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if claimed_set
+        .as_ref()
+        .is_some_and(|references| references != &actual)
+        || claimed.is_some_and(|references| references.len() != actual.len())
+    {
+        return Err(format!(
+            "review_requires_effect_observation:{}; references do not form exact complete target witnesses",
+            result.reference
+        ));
+    }
+    Ok(actual.into_iter().collect())
 }
 
 /// The review path reads through the durable-verified store, not the hot cache.
@@ -463,6 +1356,45 @@ fn binding_is_owned_by_root(
 }
 
 impl RuntimeServices {
+    async fn actual_review_material_output(
+        &self,
+        session: &str,
+        event: &crate::DurableRuntimeEvent,
+    ) -> Result<Option<String>, String> {
+        if let Some(output) = event.payload["outcome"]["output"]
+            .as_str()
+            .or_else(|| event.payload["output"].as_str())
+        {
+            return Ok(Some(output.to_string()));
+        }
+        let Some(reference) = event.payload["full_output_ref"]
+            .as_str()
+            .and_then(|reference| reference.strip_prefix("tool://"))
+        else {
+            return Ok(None);
+        };
+        let access = self
+            .session_evidence_access(session, reference)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("actual read material access missing")?;
+        let artifact = self
+            .artifact_store()
+            .resolve(&access.retrieval_selector)
+            .map_err(|error| error.to_string())?;
+        if artifact.sha256 != access.sha256 || artifact.bytes != access.bytes {
+            return Err("actual read material identity changed".into());
+        }
+        let bytes = self
+            .artifact_store()
+            .read(&artifact, &access.visibility_scope, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Some(
+            String::from_utf8(bytes).map_err(|error| error.to_string())?,
+        ))
+    }
+
     pub(crate) async fn independent_result_review(
         &self,
         actor: &AgentActorBinding,
@@ -470,6 +1402,26 @@ impl RuntimeServices {
         result_refs: &[String],
         condition_ref: Option<&str>,
     ) -> Result<IndependentReview, String> {
+        self.independent_result_review_with_evidence(
+            actor,
+            program,
+            result_refs,
+            condition_ref,
+            &[],
+        )
+        .await
+    }
+
+    pub(crate) async fn independent_result_review_with_evidence(
+        &self,
+        actor: &AgentActorBinding,
+        program: &AgenticProgramProjection,
+        result_refs: &[String],
+        condition_ref: Option<&str>,
+        explicit_evidence_refs: &[String],
+    ) -> Result<IndependentReview, String> {
+        let process_verifier = ProcessInputVerifier::new(std::sync::Arc::clone(self.scope_locks()));
+        let process_frame = process_verifier.frame();
         // A review names the delivered results it covers, and a model routinely
         // names the Task that produced them instead: `task:<id>` is work, not a
         // result, so the coverage map came back empty and the review was refused
@@ -553,8 +1505,8 @@ impl RuntimeServices {
         let mut producer_packets = Vec::new();
         let mut result_kinds = BTreeSet::new();
         let mut resolved = Vec::new();
-        for reference in result_refs {
-            resolved.push(results::resolve_result(self, actor, program, reference).await?);
+        for reference in canonical_review_result_refs(program, result_refs)? {
+            resolved.push(results::resolve_result(self, actor, program, &reference).await?);
         }
         let policy = if actor.kind == AgentActorKind::Root && condition_ref.is_some() {
             match goal.as_ref() {
@@ -569,13 +1521,15 @@ impl RuntimeServices {
             .iter()
             .flat_map(|result| &result.producers)
             .filter_map(|producer| producer.packet.as_ref())
-            .map(|packet| {
-                format!(
-                    "execution-agent-receipts:{}:{}:{}",
-                    packet.graph_id(),
-                    packet.node_id(),
-                    packet.attempt
-                )
+            .flat_map(|packet| {
+                (1..=packet.attempt.max(1)).map(move |attempt| {
+                    format!(
+                        "execution-agent-receipts:{}:{}:{}",
+                        packet.graph_id(),
+                        packet.node_id(),
+                        attempt
+                    )
+                })
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -596,28 +1550,17 @@ impl RuntimeServices {
             None
         };
 
-        if let Some(effects) = &effects {
-            if resolved
-                .iter()
-                .flat_map(|result| &result.effect_sources)
-                .any(|source| {
-                    !std::iter::once(&effects.source)
-                        .chain(&effects.additional_sources)
-                        .any(|current| {
-                            current.stream_id == source.stream_id
-                                && current.expected_revision == source.expected_revision
-                        })
-                })
+        for source in resolved.iter().flat_map(|result| &result.effect_sources) {
+            if self
+                .event_store()
+                .stream_revision(&source.stream_id)
+                .map_err(|error| error.to_string())?
+                != source.expected_revision
             {
                 return Err(
-                    "producer effects changed during result resolution; retry current results"
+                    "producer metadata changed during result resolution; retry current results"
                         .into(),
                 );
-            }
-            for result in &mut resolved {
-                if let Some(cursor) = result.effect_cursor.as_mut() {
-                    *cursor = (*cursor).max(effects.last_effect_cursor);
-                }
             }
         }
         for result in &resolved {
@@ -651,8 +1594,6 @@ impl RuntimeServices {
                     },
                     total: None,
                     chunks: BTreeSet::new(),
-                    effect_scopes_remaining: (0..result.effect_scopes.len()).collect(),
-                    unscoped_effect: result.unscoped_effect,
                 },
             );
         }
@@ -775,219 +1716,88 @@ impl RuntimeServices {
                 crate::agentic::supervision::completion_ready_result_artifact_refs(program);
             return Err(no_current_results_error(&current));
         }
-        if let Some(packet) = packet {
-            // A read is a fact about this Agent node, not about one dispatch of it.
-            // The per-attempt stream made a re-dispatched reviewer start from zero
-            // reads, so it was refused for "not having read" bodies it had already
-            // read, and each refusal burned the retry budget until the attempt
-            // settled. Union the node attempts; observe still verifies every payload
-            // sha256 and bytes, so a stale body cannot pass, and receipts from any
-            // other Agent node are still excluded.
-            for receipt in self
-                .commit_service()
-                .load_delegated_agent_tool_receipts_all_attempts(
-                    packet.graph_id(),
-                    packet.node_id(),
-                    packet.attempt,
-                )
-                .map_err(|error| error.to_string())?
-            {
-                if receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed
-                    && receipt.effect_kind == harness_contract::tool::ToolEffectKind::Read
-                    && receipt.outcome.tool_name != "evidence_retrieve"
-                {
-                    if let Some(scope) = receipt.effect_scope.as_ref() {
-                        record_effect_observation(
-                            &resolved,
-                            &mut coverage,
-                            receipt.committed_cursor,
-                            std::slice::from_ref(scope),
-                            &format!(
-                                "execution-agent-receipts:{}:{}:{}#{}",
-                                packet.graph_id(),
-                                packet.node_id(),
-                                packet.attempt,
-                                receipt.sequence
-                            ),
-                        );
-                    }
-                }
-                // `read_ref` is the unified facade the primer names as THE
-                // canonical reader, and it resolves the same durable receipt as
-                // `evidence_retrieve` with the same payload shape. Refusing it
-                // here told a reviewer to read the delivered results and then
-                // refused the review that followed those reads: one live run
-                // cycled `read_ref` -> `objective_review` ->
-                // `review_requires_current_physical_reads` until the window
-                // expired, while the identical read through `evidence_retrieve`
-                // would have closed the coverage.
-                if !counts_as_physical_read(&receipt.outcome.tool_name)
-                    || receipt.outcome.status != crate::RuntimeToolExecutionStatus::Executed
-                {
-                    continue;
-                }
-                if let Some(output) = receipt.outcome.output.as_deref() {
-                    let reference = format!(
-                        "execution-agent-receipts:{}:{}:{}#{}",
-                        packet.graph_id(),
-                        packet.node_id(),
-                        packet.attempt,
-                        receipt.sequence
-                    );
-                    for state in coverage.values_mut() {
-                        state.observe(output, &reference);
-                    }
-                }
-            }
-        } else {
-            let mut position = None;
-            loop {
-                let events = self.event_store().events_for_root_execution_kind(
-                    root,
-                    "tool.invocation.completed",
-                    position,
-                    64,
-                )?;
-                if events.is_empty() {
-                    break;
-                }
-                for event in events {
-                    position = Some((event.commit_cursor, event.transaction_index));
-                    let Some(binding) = event.activity_binding() else {
-                        continue;
-                    };
-                    if binding.session_id != actor.session_id
-                        || binding.turn_id != actor.turn_id
-                        || event.payload["status"] != "completed"
-                    {
-                        continue;
-                    }
-                    // The root's own reads are owned by the root execution, and
-                    // Runtime carries them under whichever agentic-graph run is
-                    // executing the root's step at that moment. One live run's
-                    // 125 root tool calls were attributed to eight different
-                    // graphs, interleaved in time, so the old blanket skip for
-                    // "any agent_run_id" discarded every one of them and the
-                    // root could never satisfy its own read coverage.
-                    //
-                    // What must still be excluded is another Agent's read. Those
-                    // are not owned by the root execution, so ownership is the
-                    // discriminator - not the presence of a run id.
-                    if !binding_is_owned_by_root(&binding, actor.root_execution_id.as_deref()) {
-                        continue;
-                    }
-                    // `read_ref` is the unified facade; a tool:// or artifact:// read
-                    // through it resolves the same durable receipt as
-                    // `evidence_retrieve`, so it must count as a physical read.
-                    // Non-evidence `read_ref` calls simply have no full_output_ref
-                    // and are skipped below.
-                    // `read_ref` is the unified facade; a tool:// or artifact:// read
-                    // through it resolves the same durable receipt as
-                    // `evidence_retrieve`, so it must count as a physical read.
-                    // Non-evidence `read_ref` calls simply have no full_output_ref
-                    // and are skipped below. (`"read"` was never a tool name; the
-                    // facade is `read_ref`, so that arm could not match anything.)
-                    if !event.payload["tool_name"]
-                        .as_str()
-                        .is_some_and(counts_as_physical_read)
-                    {
-                        if let Some(effect) = results::tool_effect(self, &event)? {
-                            if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                                record_effect_observation(
-                                    &resolved,
-                                    &mut coverage,
-                                    event.commit_cursor,
-                                    &effect.scopes,
-                                    &format!("runtime-event:{}", event.event_id),
-                                );
-                            }
-                        }
-                        continue;
-                    }
-                    let Some(reference) = event.payload["full_output_ref"]
-                        .as_str()
-                        .and_then(|reference| reference.strip_prefix("tool://"))
-                    else {
-                        continue;
-                    };
-                    let Some(access) = self
-                        .session_evidence_access(&actor.session_id, reference)
-                        .await
-                        .map_err(|error| error.to_string())?
-                    else {
-                        continue;
-                    };
-                    if access.bytes > 256 * 1024 {
-                        continue;
-                    }
-                    let raw = self
-                        .artifact_store()
-                        .resolve(&access.retrieval_selector)
-                        .map_err(|error| {
-                            // Name the receipt and the selector. This is the exact
-                            // shape that cost run one30 its whole window: the model
-                            // cited a real receipt, the selector did not resolve,
-                            // and it was told "artifact does not exist" with nothing
-                            // it could act on.
-                            results::unresolvable_receipt_error(
-                                "review evidence receipt tool://",
-                                reference,
-                                &access.retrieval_selector,
-                                &error.to_string(),
-                                "re-read it with evidence_retrieve and cite the reference that call \
-                                 returns",
-                            )
-                        })?;
-                    if raw.sha256 != access.sha256 || raw.bytes != access.bytes {
-                        return Err("review raw receipt integrity mismatch".into());
-                    }
-                    let bytes = self
-                        .artifact_store()
-                        .read(&raw, &raw.visibility_scope, None)
-                        .await
-                        .map_err(|error| {
-                            results::unreadable_receipt_error(
-                                "review evidence receipt tool://",
-                                reference,
-                                &raw.selector,
-                                &error.to_string(),
-                                "re-read it with evidence_retrieve and cite the reference that call \
-                                 returns",
-                            )
-                        })?;
-                    let Ok(output) = std::str::from_utf8(&bytes) else {
-                        continue;
-                    };
-                    for state in coverage.values_mut() {
-                        state.observe(output, &format!("runtime-event:{}", event.event_id));
-                    }
-                }
-                if coverage.values().all(|state| {
-                    state.complete()
-                        && (state.proof.result_kind
-                            != harness_contract::goal::GoalResultKind::ToolEffect
-                            || (!state.proof.effect_observation_refs.is_empty()
-                                && state.effect_scopes_remaining.is_empty()
-                                && !state.unscoped_effect))
-                }) {
-                    break;
-                }
+        let reviewer_packet = packet.clone();
+        let delivery_snapshot = policy::review_delivery_snapshot(
+            self.event_store(),
+            program,
+            reviewer_packet.as_ref(),
+            None,
+        )?;
+        for read in &delivery_snapshot.reads {
+            for state in coverage.values_mut() {
+                state.observe_delivered(read)?;
             }
         }
-        // If the runtime already handed this reviewer the submitted bodies (a
-        // durable `agentic.review_body_prefetched` attestation for the same
-        // reviewer execution), the physical-read coverage is satisfied without a
-        // separate tool read.
-        let body_prefetched = self.review_body_prefetched(&actor, program);
-        let missing = if body_prefetched {
-            Vec::new()
-        } else {
+        let complete_file_reads = delivery_snapshot.complete_file_reads()?;
+        #[cfg(test)]
+        eprintln!(
+            "R1_READ_208_COVERAGE {}",
+            serde_json::json!({
+                "verified_reads": delivery_snapshot.reads.len(),
+                "reads": delivery_snapshot.reads.iter().map(|read| serde_json::json!({
+                    "receipt": read.receipt_reference(),
+                    "tool": read.material.acquisition.tool_name,
+                    "grade": read.material.grade,
+                    "requires_model": read.requires_model,
+                    "body_delivered": read.body_delivered(),
+                    "body_omitted": read.material.body_omitted,
+                    "extent": read.material.acquisition.body.extent,
+                    "source_digest": read.material.acquisition.body.source_sha256,
+                    "resolved_effect_scope": read.receipt.payload["resolved_effect_scope"],
+                    "observed_evidence": read.receipt.payload["outcome"]["observed_evidence"],
+                    "sequence": read.receipt.payload["sequence"],
+                    "cursor": read.material.acquisition_cursor,
+                })).collect::<Vec<_>>(),
+                "complete_files": complete_file_reads.iter().map(|read| serde_json::json!({
+                    "scope": read.scope, "path": read.path,
+                    "cursor": read.cursor, "receipts": read.receipt_refs,
+                })).collect::<Vec<_>>(),
+                "results": coverage.values().map(|state| serde_json::json!({
+                    "proof": state.proof, "total": state.total,
+                    "chunks": state.chunks, "complete": state.complete(),
+                })).collect::<Vec<_>>(),
+                "effects": resolved.iter().map(|result| serde_json::json!({
+                    "reference": result.reference,
+                    "cursor": result.effect_cursor,
+                    "unscoped": result.unscoped_effect,
+                    "scopes": result.effect_scopes,
+                    "targets": result.effect_targets,
+                })).collect::<Vec<_>>(),
+            })
+        );
+        let runs_by_result = resolved
+            .iter()
+            .map(|result| (result.reference.clone(), result.process_runs.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let process_selection = select_process_witnesses(
+            self.event_store(),
+            actor,
+            &runs_by_result,
+            explicit_evidence_refs,
+            &delivery_snapshot,
+        )?;
+        for result in &resolved {
+            let references = effect_observation_refs(result, &complete_file_reads, None)?;
             coverage
-                .values()
-                .filter(|state| !state.complete())
-                .map(|state| state.proof.result_ref.clone())
-                .collect::<Vec<_>>()
-        };
+                .get_mut(&result.reference)
+                .ok_or("review result coverage disappeared")?
+                .proof
+                .effect_observation_refs = references
+                .into_iter()
+                .chain(
+                    process_selection
+                        .get(&result.reference)
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                )
+                .collect();
+        }
+        let missing = coverage
+            .values()
+            .filter(|state| !state.complete())
+            .map(|state| state.proof.result_ref.clone())
+            .collect::<Vec<_>>();
         if !missing.is_empty() {
             // Name WHO must read. The old text said only "use evidence_retrieve",
             // which a model satisfied by having some other Agent - or itself in an
@@ -999,53 +1809,1137 @@ impl RuntimeServices {
                 "review_requires_current_physical_reads:{}; the Agent that submits this \
                  objective_review must itself read each of these results in THIS execution \
                  (evidence_retrieve or read_ref, following every next_request to the end). \
-                 A read by another Agent, by the root, or by an earlier attempt of this \
-                 Agent does not count.",
+                 A read by another Agent or by the root does not count for a delegated reviewer.",
                 missing.join(",")
             ));
         }
-        let unobserved = coverage
-            .values()
-            .filter(|state| {
-                state.proof.result_kind == harness_contract::goal::GoalResultKind::ToolEffect
-                    && (state.proof.effect_observation_refs.is_empty()
-                        || !state.effect_scopes_remaining.is_empty()
-                        || state.unscoped_effect)
+        let mut verification = ObjectiveReviewVerification {
+            input_set: None,
+            result_source_revisions: resolved
+                .iter()
+                .flat_map(|result| &result.result_sources)
+                .map(|source| (source.stream_id.clone(), source.expected_revision))
+                .collect(),
+            independence_required,
+            review_policy_digest: policy.map(|policy| policy.digest),
+            effect_manifest_digest: effects.map(|effects| effects.digest),
+            effect_source_refs,
+            goal_spec_revision: goal.as_ref().map(|goal| goal.spec_revision),
+            goal_spec_digest: goal.as_ref().map(|goal| goal.spec_digest.clone()),
+            work_manifest_digest: String::new(),
+            reviewer_execution_id,
+            producer_execution_ids: producer_execution_ids.into_iter().collect(),
+            reads: coverage
+                .into_values()
+                .map(|mut state| {
+                    state.proof.receipt_refs.sort();
+                    state.proof.receipt_refs.dedup();
+                    state.proof
+                })
+                .collect(),
+        };
+        let mut root_materials = resolved
+            .iter()
+            .flat_map(|result| &result.producers)
+            .filter(|producer| producer.packet.is_none())
+            .filter_map(|producer| {
+                producer
+                    .execution
+                    .strip_prefix("root-execution:")
+                    .map(str::to_string)
             })
-            .map(|state| state.proof.result_ref.as_str())
-            .collect::<Vec<_>>();
-        if !unobserved.is_empty() {
-            return Err(format!(
-                "review_requires_effect_observation:{}; independently read the actual affected target after the effect",
-                unobserved.join(",")
-            ));
+            .collect::<BTreeSet<_>>();
+        let mut primary_roots = root_materials.clone();
+        if reviewer_packet.is_none() {
+            root_materials.insert(root.to_string());
         }
+        let mut packets = producer_packets;
+        let mut primary_packets = packets
+            .iter()
+            .map(|packet| packet.graph_id().to_string())
+            .collect::<BTreeSet<_>>();
+        packets.extend(reviewer_packet);
+        let initial_material_packets = packets
+            .iter()
+            .map(|packet| packet.graph_id().to_string())
+            .collect::<BTreeSet<_>>();
+        let initial_root_materials = root_materials.clone();
+        let mut auxiliary_refs = packets
+            .iter()
+            .flat_map(|packet| packet.evidence_refs.iter())
+            .flat_map(|evidence| {
+                [
+                    evidence.evidence_ref.id.clone(),
+                    evidence.retrieval_selector.clone(),
+                ]
+            })
+            .filter(|reference| !reference.is_empty())
+            .collect::<BTreeSet<_>>();
+        let mut packet_digests = BTreeMap::new();
+        let mut material_contents = resolved
+            .iter()
+            .map(|material| (material.reference.clone(), material.content.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut resolved_materials = material_contents.keys().cloned().collect::<BTreeSet<_>>();
+        let mut dependency_results = resolved;
+        let mut actual_boundaries = Vec::new();
+        let mut business_effect_targets = Vec::new();
+        let mut primary_seed_refs = result_refs.to_vec();
+        primary_seed_refs.extend(packets.iter().filter_map(|packet| {
+            if !primary_packets.contains(packet.graph_id()) {
+                return None;
+            }
+            let binding = packet.agentic_binding.as_ref()?;
+            match &binding.focus {
+                harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref }
+                | harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref }
+                    if binding.program_id == program.program_id =>
+                {
+                    Some(task_ref.clone())
+                }
+                _ => None,
+            }
+        }));
+        let mut publication_sources = BTreeMap::new();
+        let (initial_primary_tasks, initial_primary_artifacts, _) = selected_work(
+            self.event_store(),
+            program,
+            goal.as_ref(),
+            &primary_seed_refs,
+            &mut publication_sources,
+        )?;
+        let mut primary_refs = result_refs
+            .iter()
+            .map(|reference| review_result_identity(program, reference))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        primary_refs.extend(initial_primary_artifacts);
+        let mut primary_tasks = initial_primary_tasks.into_iter().collect::<BTreeSet<_>>();
+        let mut expanded_primary_tasks = BTreeSet::new();
+        let mut expanded_primary_materials = BTreeSet::new();
+        let mut expanded_packet_roles = BTreeMap::new();
+        let mut pending_references = BTreeSet::new();
+        let mut pending_metadata = BTreeSet::new();
+        let mut inspected_metadata = BTreeMap::new();
+        let material_discovery_cursor = self
+            .event_store()
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
+        let selected_receipts = verification
+            .reads
+            .iter()
+            .flat_map(|read| {
+                read.receipt_refs
+                    .iter()
+                    .chain(&read.effect_observation_refs)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let selected_receipts = selected_receipts
+            .into_iter()
+            .map(|reference| {
+                reference
+                    .strip_prefix("tool://")
+                    .filter(|_| {
+                        reference.starts_with("tool://runtime-event:")
+                            || reference.starts_with("tool://execution-agent-receipts:")
+                    })
+                    .map(str::to_string)
+                    .unwrap_or(reference)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut matched_receipts = BTreeSet::new();
+        let mut material_events = delivery_snapshot
+            .reads
+            .iter()
+            .map(|read| harness_contract::goal::ProofInputEvent {
+                stream_id: read.event.stream_id.clone(),
+                sequence: read.event.sequence,
+                event_id: read.event.event_id.clone(),
+                payload_digest: proof_value_digest(&read.event.payload),
+            })
+            .collect::<Vec<_>>();
+        let mut required_scopes = Vec::new();
+        let required_scope_complete = true;
+        let mut material_revisions = delivery_snapshot.sources;
+        for (source, revision) in publication_sources {
+            if material_revisions
+                .insert(source, revision)
+                .is_some_and(|previous| previous != revision)
+            {
+                return Err("publication source changed during original review discovery".into());
+            }
+        }
+        let mut pending_sources = BTreeSet::from([format!("session:{}", actor.session_id)]);
+        let mut selected_roots = BTreeMap::new();
+        let mut selected_events = BTreeMap::new();
+        let mut start_cursor = self
+            .event_store()
+            .list_stream_after(root, 0, 1, 1, 4 * 1024 * 1024)?
+            .first()
+            .map_or(0, |event| event.commit_cursor);
+        loop {
+            let previous_start_cursor = start_cursor;
+            for mut material in std::mem::take(&mut dependency_results) {
+                let identity = review_result_identity(program, &material.reference)?;
+                let primary = primary_refs.contains(&identity);
+                if primary {
+                    actual_boundaries.extend(material.input_boundaries.iter().cloned());
+                    if let Some(cursor) = material.effect_cursor {
+                        business_effect_targets.extend(
+                            material
+                                .effect_targets
+                                .iter()
+                                .cloned()
+                                .map(|target| (target, cursor)),
+                        );
+                    }
+                    expanded_primary_materials.insert(identity);
+                }
+                if primary {
+                    let history = self.session_history_reader();
+                    let acquired = policy::primary_producer_immutable_inputs(
+                        self.event_store(),
+                        program,
+                        &material.producers,
+                        ResultContentReaders {
+                            artifacts: Some(self.artifact_store().as_ref()),
+                            history: history.as_deref(),
+                            process_inputs: Some(&process_frame),
+                        },
+                        None,
+                    )?;
+                    for (source, revision) in acquired.sources {
+                        if material_revisions
+                            .insert(source, revision)
+                            .is_some_and(|previous| previous != revision)
+                        {
+                            return Err(
+                                "primary acquisition source changed during discovery".into()
+                            );
+                        }
+                    }
+                    for event in acquired.material_events {
+                        if !material_events.contains(&event) {
+                            material_events.push(event);
+                        }
+                    }
+                    for content in acquired.immutable_inputs {
+                        if !material.primary_inputs.contains(&content) {
+                            material.primary_inputs.push(content);
+                        }
+                    }
+                    for input in &material.primary_inputs {
+                        let identity = review_result_identity(program, &input.selector)?;
+                        if input.selector.starts_with("artifact://")
+                            && !program.artifacts.contains_key(&identity)
+                        {
+                            match results::resolve_result_metadata(
+                                self.event_store(),
+                                program,
+                                &input.selector,
+                                input,
+                                None,
+                                ResultContentReaders {
+                                    artifacts: Some(self.artifact_store().as_ref()),
+                                    history: self.session_history_reader().as_deref(),
+                                    process_inputs: Some(&process_frame),
+                                },
+                            ) {
+                                Ok(metadata) => {
+                                    for source in metadata
+                                        .effect_sources
+                                        .iter()
+                                        .chain(&metadata.result_sources)
+                                    {
+                                        if material_revisions
+                                            .insert(
+                                                source.stream_id.clone(),
+                                                source.expected_revision,
+                                            )
+                                            .is_some_and(|previous| {
+                                                previous != source.expected_revision
+                                            })
+                                        {
+                                            return Err("primary immutable input source changed during provenance discovery".into());
+                                        }
+                                    }
+                                    primary_refs.insert(identity.clone());
+                                    auxiliary_refs.insert(input.selector.clone());
+                                    pending_references.insert(identity);
+                                }
+                                Err(error)
+                                    if error.starts_with(
+                                        "review result has no Runtime-resolved producer:",
+                                    ) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                }
+                if material.unscoped_effect {
+                    return Err("recursive material has an unmodelled effect dependency".into());
+                }
+                pending_metadata.insert(material.reference.clone());
+                for source in material
+                    .result_sources
+                    .iter()
+                    .chain(&material.effect_sources)
+                {
+                    if material_revisions
+                        .insert(source.stream_id.clone(), source.expected_revision)
+                        .is_some_and(|revision| revision != source.expected_revision)
+                    {
+                        return Err("recursive proof material sources have different enumeration cuts; rebuild the whole review".into());
+                    }
+                }
+                for source in &material.result_sources {
+                    if verification
+                        .result_source_revisions
+                        .insert(source.stream_id.clone(), source.expected_revision)
+                        .is_some_and(|revision| revision != source.expected_revision)
+                    {
+                        return Err(
+                            "recursive approval material source changed; rebuild the whole review"
+                                .into(),
+                        );
+                    }
+                }
+                for source in material.effect_sources {
+                    if source.stream_id.starts_with("execution-agent-receipts:") {
+                        verification.effect_source_refs.push(source.stream_id);
+                    }
+                }
+                for producer in material.producers {
+                    if primary
+                        && independence_required
+                        && (producer.execution == verification.reviewer_execution_id
+                            || producer.actor == actor.actor_id)
+                    {
+                        return Err("derived material producer and reviewer must be different physical executions".into());
+                    }
+                    if primary {
+                        producers.insert(producer.actor);
+                        verification
+                            .producer_execution_ids
+                            .push(producer.execution.clone());
+                    }
+                    if let Some(packet) = producer.packet {
+                        if primary {
+                            primary_packets.insert(packet.graph_id().to_string());
+                        }
+                        let scope = packet
+                            .agentic_binding
+                            .as_ref()
+                            .ok_or("recursive material producer has no Program Task binding")?;
+                        match &scope.focus {
+                            harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                                task_ref,
+                            }
+                            | harness_contract::agent::AgenticExecutionFocus::TaskReview {
+                                task_ref,
+                            } if scope.program_id == program.program_id => {
+                                auxiliary_refs.insert(task_ref.clone());
+                                if primary {
+                                    primary_tasks.insert(task_ref.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                        if let Some(previous) = packets
+                            .iter()
+                            .find(|previous| previous.graph_id() == packet.graph_id())
+                        {
+                            if proof_value_digest(previous) != proof_value_digest(&packet) {
+                                return Err(
+                                    "recursive material producer packet identity is ambiguous"
+                                        .into(),
+                                );
+                            }
+                        } else {
+                            packets.push(packet);
+                        }
+                    } else if let Some(root) = producer.execution.strip_prefix("root-execution:") {
+                        root_materials.insert(root.to_string());
+                        if primary {
+                            primary_roots.insert(root.to_string());
+                        }
+                    } else if !producer.execution.starts_with("approval-decision:") {
+                        return Err(
+                            "recursive material producer has no authenticated physical origin"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            let mut pending_primary_tasks = primary_tasks
+                .difference(&expanded_primary_tasks)
+                .cloned()
+                .collect::<Vec<_>>();
+            while let Some(task_ref) = pending_primary_tasks.pop() {
+                if !expanded_primary_tasks.insert(task_ref.clone()) {
+                    continue;
+                }
+                let task = program
+                    .tasks
+                    .get(&task_ref)
+                    .ok_or("primary influence Task missing")?;
+                auxiliary_refs.insert(task_ref);
+                for dependency in task.depends_on.iter().chain(&task.replacement_task_refs) {
+                    primary_tasks.insert(dependency.clone());
+                    pending_primary_tasks.push(dependency.clone());
+                }
+                for reference in &task.artifact_refs {
+                    let identity = review_result_identity(program, reference)?;
+                    primary_refs.insert(identity.clone());
+                    pending_references.insert(identity);
+                }
+            }
+            for packet in &packets {
+                let digest = proof_value_digest(packet);
+                let primary = primary_packets.contains(packet.graph_id());
+                if let Some(previous) = packet_digests.get(packet.graph_id()) {
+                    if previous != &digest {
+                        return Err("recursive material packet changed".into());
+                    }
+                    if expanded_packet_roles.get(packet.graph_id()) == Some(&primary)
+                        || expanded_packet_roles.get(packet.graph_id()) == Some(&true)
+                    {
+                        continue;
+                    }
+                }
+                let graph = self
+                    .graph_state_store()
+                    .load(packet.graph_id())
+                    .map_err(|error| error.to_string())?;
+                if packet.session_id() != actor.session_id
+                    || packet.binding.as_ref().is_none_or(|binding| {
+                        !crate::agent::binding::recompute_binding_digest(binding)
+                            .is_ok_and(|digest| digest == binding.binding_digest)
+                    })
+                    || graph
+                        .lineage
+                        .as_ref()
+                        .is_none_or(|lineage| lineage.session_id != actor.session_id)
+                    || !graph.nodes.iter().any(|node| {
+                        node.id == packet.node_id()
+                            && serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                                .is_ok_and(|stored| proof_value_digest(&stored) == digest)
+                    })
+                    || material_revisions
+                        .insert(graph.id.clone(), graph.revision)
+                        .is_some_and(|revision| revision != graph.revision)
+                {
+                    return Err(
+                        "recursive material packet has no matching immutable graph origin".into(),
+                    );
+                }
+                let genesis = self
+                    .event_store()
+                    .list_stream_after(packet.graph_id(), 0, 1, 1, 4 * 1024 * 1024)?
+                    .into_iter()
+                    .next()
+                    .ok_or("recursive material graph genesis missing")?;
+                if genesis.commit_cursor > material_discovery_cursor {
+                    return Err("recursive material graph crosses the review discovery cut; rebuild the whole review".into());
+                }
+                start_cursor = start_cursor.min(genesis.commit_cursor);
+                for attempt in 1..=packet.attempt.max(1).max(
+                    graph
+                        .recovery_cursor
+                        .node_attempts
+                        .get(packet.node_id())
+                        .copied()
+                        .unwrap_or_default(),
+                ) {
+                    pending_sources.insert(format!(
+                        "execution-agent-receipts:{}:{}:{attempt}",
+                        packet.graph_id(),
+                        packet.node_id()
+                    ));
+                }
+                for evidence in &packet.evidence_refs {
+                    if evidence.evidence_ref.ref_type == "agent"
+                        && !program.artifacts.contains_key(&review_result_identity(
+                            program,
+                            &evidence.retrieval_selector,
+                        )?)
+                    {
+                        return Err(
+                            "recursive Agent material has no authenticated publication producer"
+                                .into(),
+                        );
+                    }
+                    let content = self
+                        .artifact_store()
+                        .resolve(&evidence.retrieval_selector)
+                        .map_err(|error| error.to_string())?;
+                    if content.sha256 != evidence.sha256
+                        || content.bytes != evidence.bytes
+                        || content.media_type != evidence.media_type
+                        || content.visibility_scope != evidence.visibility_scope
+                        || (content.visibility_scope != "public"
+                            && content.visibility_scope != format!("session:{}", actor.session_id)
+                            && !packet.resource_scopes.contains(&content.visibility_scope))
+                    {
+                        return Err(
+                            "recursive packet material does not match its immutable read grant"
+                                .into(),
+                        );
+                    }
+                    self.artifact_store()
+                        .read(&content, &evidence.visibility_scope, None)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    for reference in [&evidence.evidence_ref.id, &evidence.retrieval_selector] {
+                        auxiliary_refs.insert(reference.clone());
+                        let identity = review_result_identity(program, reference)?;
+                        if program.artifacts.contains_key(&identity)
+                            || reference.starts_with("tool://")
+                            || reference.starts_with("approval:v1:")
+                        {
+                            if primary {
+                                primary_refs.insert(identity.clone());
+                            }
+                            pending_references.insert(identity);
+                        }
+                    }
+                    if evidence.evidence_ref.ref_type == "tool" {
+                        let reference = if evidence.evidence_ref.id.starts_with("tool://") {
+                            evidence.evidence_ref.id.clone()
+                        } else {
+                            format!("tool://{}", evidence.evidence_ref.id)
+                        };
+                        auxiliary_refs.insert(reference.clone());
+                        if primary {
+                            primary_refs.insert(reference.clone());
+                        }
+                        pending_references.insert(reference);
+                    }
+                    material_contents.insert(evidence.retrieval_selector.clone(), content);
+                }
+                packet_digests.insert(packet.graph_id().to_string(), digest);
+                expanded_packet_roles.insert(packet.graph_id().to_string(), primary);
+            }
+            for material_root in &root_materials {
+                let primary = primary_roots.contains(material_root);
+                if selected_roots.get(material_root) != Some(&primary) {
+                    selected_roots.insert(material_root.clone(), primary);
+                    let genesis = self
+                        .event_store()
+                        .list_stream_after(material_root, 0, 1, 1, 4 * 1024 * 1024)?
+                        .into_iter()
+                        .next()
+                        .ok_or("recursive root material graph genesis missing")?;
+                    if genesis.commit_cursor > material_discovery_cursor {
+                        return Err("recursive root material crosses the review discovery cut; rebuild the whole review".into());
+                    }
+                    start_cursor = start_cursor.min(genesis.commit_cursor);
+                    pending_sources.insert(format!("session:{}", actor.session_id));
+                }
+            }
+            if start_cursor < previous_start_cursor {
+                pending_sources.extend(
+                    material_revisions
+                        .keys()
+                        .filter(|source| {
+                            source.starts_with("session:")
+                                || source.starts_with("execution-agent-receipts:")
+                        })
+                        .cloned(),
+                );
+            }
+            let dependencies = result_refs
+                .iter()
+                .chain(&auxiliary_refs)
+                .cloned()
+                .collect::<Vec<_>>();
+            pending_metadata.extend(
+                dependencies
+                    .iter()
+                    .map(|reference| review_result_identity(program, reference))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            while let Some(reference) = pending_metadata.pop_first() {
+                let primary = primary_refs.contains(&reference);
+                if inspected_metadata.get(&reference) == Some(&primary)
+                    || inspected_metadata.get(&reference) == Some(&true)
+                {
+                    continue;
+                }
+                inspected_metadata.insert(reference.clone(), primary);
+                let Some(artifact) = program.artifacts.get(&reference) else {
+                    continue;
+                };
+                pending_references.insert(reference);
+                for dependency in &artifact.relates_to {
+                    let identity = review_result_identity(program, dependency)?;
+                    if primary {
+                        primary_refs.insert(identity.clone());
+                    }
+                    if program.artifacts.contains_key(&identity) {
+                        pending_metadata.insert(identity);
+                    } else if program.tasks.contains_key(dependency) {
+                        if primary {
+                            primary_tasks.insert(dependency.clone());
+                        }
+                    } else if !program.tasks.contains_key(dependency) {
+                        if dependency.starts_with("tool://")
+                            || dependency.starts_with("approval:v1:")
+                            || dependency.starts_with("artifact://")
+                        {
+                            pending_references.insert(identity);
+                        } else {
+                            return Err("recursive artifact dependency has no authenticated material identity".into());
+                        }
+                    }
+                }
+            }
+            while let Some(reference) = pending_references.pop_first() {
+                let identity = review_result_identity(program, &reference)?;
+                if !resolved_materials.insert(identity.clone())
+                    && (!primary_refs.contains(&identity)
+                        || expanded_primary_materials.contains(&identity))
+                {
+                    continue;
+                }
+                let material = results::resolve_result(self, actor, program, &identity).await?;
+                material_contents.insert(identity, material.content.clone());
+                dependency_results.push(material);
+            }
+            if !dependency_results.is_empty() {
+                continue;
+            }
+            if !primary_tasks.is_subset(&expanded_primary_tasks) {
+                continue;
+            }
+            let (_, artifacts, _) = selected_work(
+                self.event_store(),
+                program,
+                goal.as_ref(),
+                &dependencies,
+                &mut material_revisions,
+            )?;
+            if artifacts
+                .iter()
+                .any(|reference| !resolved_materials.contains(reference))
+            {
+                pending_references.extend(artifacts);
+                continue;
+            }
+            let Some(source) = pending_sources.pop_first() else {
+                break;
+            };
+            let current_revision = self
+                .event_store()
+                .stream_revision(&source)
+                .map_err(|error| error.to_string())?;
+            let material_revision = *material_revisions
+                .entry(source.clone())
+                .or_insert(current_revision);
+            if material_revision != current_revision {
+                return Err(
+                    "recursive material enumeration cut changed; rebuild the whole review".into(),
+                );
+            }
+            let mut offset = 0;
+            loop {
+                let events = self
+                    .event_store()
+                    .list_stream_page_desc(&source, 64, offset)?;
+                if self
+                    .event_store()
+                    .stream_revision(&source)
+                    .map_err(|error| error.to_string())?
+                    != material_revision
+                {
+                    return Err(
+                        "actual read material source changed while paging; retry current inputs"
+                            .into(),
+                    );
+                }
+                if events.is_empty() {
+                    break;
+                }
+                offset += events.len();
+                let before_start = events
+                    .iter()
+                    .any(|event| event.commit_cursor < start_cursor);
+                for event in events {
+                    if event.commit_cursor < start_cursor {
+                        continue;
+                    }
+                    let reference = if source.starts_with("execution-agent-receipts:") {
+                        format!(
+                            "{}#{}",
+                            source,
+                            event.payload["sequence"].as_u64().unwrap_or_default()
+                        )
+                    } else {
+                        format!("runtime-event:{}", event.event_id)
+                    };
+                    let packet_read = source.starts_with("execution-agent-receipts:")
+                        && event.kind == "execution.agent_tool.receipt"
+                        && event.payload["effect_kind"] == "read"
+                        && event.payload["outcome"]["status"] == "executed";
+                    let root_read = event.kind == "tool.invocation.completed"
+                        && event.payload["status"] == "completed"
+                        && event.activity_binding().is_some_and(|binding| {
+                            binding.session_id == actor.session_id
+                                && root_materials.contains(&binding.root_execution_id)
+                                && binding_is_owned_by_root(
+                                    &binding,
+                                    Some(&binding.root_execution_id),
+                                )
+                        })
+                        && (event.payload["tool_name"]
+                            .as_str()
+                            .is_some_and(counts_as_physical_read)
+                            || results::tool_effect_from_store(self.event_store(), &event)?
+                                .is_some_and(|effect| {
+                                    effect.effect_kind
+                                        == harness_contract::tool::ToolEffectKind::Read
+                                }));
+                    if !packet_read && !root_read && !selected_receipts.contains(&reference) {
+                        continue;
+                    }
+                    if event.commit_cursor > material_discovery_cursor {
+                        return Err("actual material crosses the review discovery cut; rebuild the whole review".into());
+                    }
+                    if selected_receipts.contains(&reference) {
+                        let actual_read = if source.starts_with("execution-agent-receipts:") {
+                            event.kind == "execution.agent_tool.receipt"
+                                && event.payload["outcome"]["status"] == "executed"
+                                && event.payload["effect_kind"] == "read"
+                        } else {
+                            event.kind == "tool.invocation.completed"
+                                && event.payload["status"] == "completed"
+                        };
+                        if !actual_read {
+                            return Err("v2 selected read is not an actual material receipt".into());
+                        }
+                        matched_receipts.insert(reference);
+                    }
+                    let primary = packets.iter().any(|packet| {
+                        primary_packets.contains(packet.graph_id())
+                            && source.starts_with(&format!(
+                                "execution-agent-receipts:{}:{}:",
+                                packet.graph_id(),
+                                packet.node_id()
+                            ))
+                    }) || event.activity_binding().is_some_and(|binding| {
+                        primary_roots.contains(&binding.root_execution_id)
+                            && binding_is_owned_by_root(&binding, Some(&binding.root_execution_id))
+                    });
+                    let event_key = (source.clone(), event.event_id.clone());
+                    if selected_events.get(&event_key) == Some(&primary)
+                        || selected_events.get(&event_key) == Some(&true)
+                    {
+                        continue;
+                    }
+                    if selected_events.insert(event_key, primary).is_none() {
+                        material_events.push(harness_contract::goal::ProofInputEvent {
+                            stream_id: source.clone(),
+                            sequence: event.sequence,
+                            event_id: event.event_id.clone(),
+                            payload_digest: proof_value_digest(&event.payload),
+                        });
+                    }
+                    let name = event.payload["tool_name"]
+                        .as_str()
+                        .or_else(|| event.payload["outcome"]["tool_name"].as_str())
+                        .unwrap_or_default();
+                    if root_read && name == "read_file" {
+                        let (acquisition, index) = policy::root_file_acquisition(
+                            self.event_store(),
+                            &event,
+                            &mut material_revisions,
+                        )?;
+                        for original in [&acquisition, &index] {
+                            if original.commit_cursor > material_discovery_cursor {
+                                return Err(
+                                    "Root original acquisition crosses the material discovery cut"
+                                        .into(),
+                                );
+                            }
+                            let key = (original.stream_id.clone(), original.event_id.clone());
+                            let previous = selected_events.get(&key).copied();
+                            selected_events.insert(key, primary || previous.unwrap_or(false));
+                            if previous.is_none() {
+                                material_events.push(harness_contract::goal::ProofInputEvent {
+                                    stream_id: original.stream_id.clone(),
+                                    sequence: original.sequence,
+                                    event_id: original.event_id.clone(),
+                                    payload_digest: proof_value_digest(&original.payload),
+                                });
+                            }
+                        }
+                    }
+                    let scope = if policy::goal_metadata_tool(name) {
+                        None
+                    } else {
+                        policy::original_material_scope(
+                            self.event_store(),
+                            &event,
+                            &mut material_revisions,
+                        )?
+                    };
+                    if root_read
+                        && name == "read_file"
+                        && scope
+                            .as_ref()
+                            .is_none_or(|scope| !scope.complete || scope.targets.is_empty())
+                    {
+                        return Err(
+                            "Root file dependency lacks its original complete physical scope"
+                                .into(),
+                        );
+                    }
+                    let mut immutable_material = scope.is_none()
+                        && !counts_as_physical_read(name)
+                        && !policy::goal_metadata_tool(name);
+                    if counts_as_physical_read(name) {
+                        let output = self
+                            .actual_review_material_output(&actor.session_id, &event)
+                            .await?;
+                        if let Some(output) = output.and_then(|output| {
+                            serde_json::from_str::<serde_json::Value>(&output).ok()
+                        }) {
+                            if output["kind"] == "evidence_retrieve" && output["available"] == true
+                            {
+                                if let Some(selector) = output["evidence_ref"].as_str() {
+                                    let identity = review_result_identity(program, selector)?;
+                                    if primary {
+                                        primary_refs.insert(identity.clone());
+                                    }
+                                    let material = if (program.artifacts.contains_key(&identity)
+                                        || selector.starts_with("tool://")
+                                        || selector.starts_with("approval:v1:"))
+                                        && (!resolved_materials.contains(&identity)
+                                            || (primary_refs.contains(&identity)
+                                                && !expanded_primary_materials.contains(&identity)))
+                                    {
+                                        Some(
+                                            results::resolve_result(
+                                                self, actor, program, &identity,
+                                            )
+                                            .await?,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    let content = if let Some(material) = &material {
+                                        material.content.clone()
+                                    } else if let Some(content) = material_contents.get(&identity) {
+                                        content.clone()
+                                    } else if selector.starts_with("artifact://") {
+                                        let content = self
+                                            .artifact_store()
+                                            .resolve(selector)
+                                            .map_err(|error| error.to_string())?;
+                                        let session_scope = format!("session:{}", actor.session_id);
+                                        let authorized_scope = if content.visibility_scope
+                                            == session_scope
+                                            || content.visibility_scope == "public"
+                                        {
+                                            session_scope.as_str()
+                                        } else if packets.iter().any(|packet| {
+                                            source.starts_with(&format!(
+                                                "execution-agent-receipts:{}:{}:",
+                                                packet.graph_id(),
+                                                packet.node_id(),
+                                            )) && packet
+                                                .resource_scopes
+                                                .contains(&content.visibility_scope)
+                                        }) {
+                                            content.visibility_scope.as_str()
+                                        } else {
+                                            return Err("actual immutable material is outside its original read grant".into());
+                                        };
+                                        self.artifact_store()
+                                            .read(&content, authorized_scope, None)
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                        content
+                                    } else {
+                                        return Err("actual immutable material has no authenticated content identity".into());
+                                    };
+                                    if output["sha256"].as_str() != Some(content.sha256.as_str())
+                                        || output["bytes"].as_u64() != Some(content.bytes)
+                                    {
+                                        return Err("immutable review material does not match its original source identity".into());
+                                    }
+                                    immutable_material =
+                                        scope.as_ref().is_none_or(|scope| scope.targets.is_empty());
+                                    for source in material
+                                        .iter()
+                                        .flat_map(|material| &material.result_sources)
+                                    {
+                                        if verification
+                                            .result_source_revisions
+                                            .insert(
+                                                source.stream_id.clone(),
+                                                source.expected_revision,
+                                            )
+                                            .is_some_and(|revision| {
+                                                revision != source.expected_revision
+                                            })
+                                        {
+                                            return Err("immutable approval material source changed during enumeration".into());
+                                        }
+                                    }
+                                    material_contents.insert(identity.clone(), content);
+                                    if let Some(material) = material {
+                                        resolved_materials.insert(identity);
+                                        dependency_results.push(material);
+                                    }
+                                    auxiliary_refs.insert(selector.to_string());
+                                }
+                            }
+                        }
+                    }
+                    if !immutable_material
+                        && !policy::goal_metadata_tool(name)
+                        && (packets.iter().any(|packet| {
+                            !initial_material_packets.contains(packet.graph_id())
+                                && source.starts_with(&format!(
+                                    "execution-agent-receipts:{}:{}:",
+                                    packet.graph_id(),
+                                    packet.node_id()
+                                ))
+                        }) || event.activity_binding().is_some_and(|binding| {
+                            root_materials.contains(&binding.root_execution_id)
+                                && !initial_root_materials.contains(&binding.root_execution_id)
+                        }))
+                        && scope
+                            .as_ref()
+                            .is_none_or(|scope| !scope.complete || scope.targets.is_empty())
+                    {
+                        return Err(
+                            "recursive physical material has no authenticated admission coverage"
+                                .into(),
+                        );
+                    }
+                    if !immutable_material
+                        && counts_as_physical_read(name)
+                        && scope
+                            .as_ref()
+                            .is_none_or(|scope| !scope.complete || scope.targets.is_empty())
+                    {
+                        return Err("proof auxiliary read has no authenticated immutable or physical material".into());
+                    }
+                }
+                if before_start {
+                    break;
+                }
+            }
+            #[cfg(test)]
+            if let Some((_, entered, release)) = PROOF_MATERIAL_CUT_BARRIER
+                .try_with(|stored| {
+                    let mut stored = stored.borrow_mut();
+                    if stored
+                        .as_ref()
+                        .is_some_and(|(expected, _, _)| expected == &source)
+                    {
+                        stored.take()
+                    } else {
+                        None
+                    }
+                })
+                .ok()
+                .flatten()
+            {
+                entered.notify_one();
+                release.notified().await;
+            }
+            if self
+                .event_store()
+                .stream_revision(&source)
+                .map_err(|error| error.to_string())?
+                != material_revision
+            {
+                return Err(
+                    "actual read material enumeration cut changed; rebuild the whole review".into(),
+                );
+            }
+        }
+        verification.producer_execution_ids.sort();
+        verification.producer_execution_ids.dedup();
+        verification.effect_source_refs.sort();
+        verification.effect_source_refs.dedup();
+        if selected_receipts != matched_receipts {
+            return Err("v2 selected physical read has no matching origin material event".into());
+        }
+        if verification
+            .reads
+            .iter()
+            .any(|read| read.receipt_refs.is_empty())
+        {
+            return Err("v2 proof requires complete physical read receipts".into());
+        }
+        material_events.sort_by(|left, right| {
+            (&left.stream_id, &left.event_id).cmp(&(&right.stream_id, &right.event_id))
+        });
+        material_events.dedup();
+        let actual_history = self.session_history_reader();
+        let actual = policy::actual_input_snapshot(
+            self.event_store(),
+            program,
+            &actual_boundaries,
+            ResultContentReaders {
+                artifacts: Some(self.artifact_store().as_ref()),
+                history: actual_history.as_deref(),
+                process_inputs: Some(&process_frame),
+            },
+            None,
+        )?;
+        required_scopes = actual.required_scopes();
+        for material in actual.material_events {
+            if !material_events.contains(&material) {
+                material_events.push(material);
+            }
+        }
+        for (source, revision) in actual.sources {
+            if material_revisions
+                .insert(source, revision)
+                .is_some_and(|previous| previous != revision)
+            {
+                return Err("actual input source moved after material discovery".into());
+            }
+        }
+        required_scopes.sort_by_key(proof_value_digest);
+        if !packets.iter().all(|packet| {
+            packet
+                .required_acceptance
+                .evidence_obligations
+                .iter()
+                .all(|obligation| match &obligation.target {
+                    harness_contract::context::EvidenceTargetIdentity::Workspace { scope } => {
+                        use harness_contract::context::{
+                            EvidenceObligationKind, WorkspaceObjectKind,
+                        };
+                        let same_path =
+                            |path: &harness_contract::context::WorkspacePathIdentity| {
+                                path.workspace_id == scope.path.workspace_id
+                                    && path.repository_id == scope.path.repository_id
+                                    && path.workspace_relative_path
+                                        == scope.path.workspace_relative_path
+                                    && path.repository_relative_path
+                                        == scope.path.repository_relative_path
+                            };
+                        scope.path.object_kind == WorkspaceObjectKind::File
+                            && match obligation.kind {
+                                EvidenceObligationKind::ContentRead
+                                | EvidenceObligationKind::VerifyUpstreamChange => {
+                                    required_scopes.iter().any(|target| same_path(&target.path))
+                                        || complete_file_reads
+                                            .iter()
+                                            .any(|read| same_path(&read.path))
+                                }
+                                EvidenceObligationKind::WriteEffect => business_effect_targets
+                                    .iter()
+                                    .any(|(target, _)| same_path(&target.path)),
+                                EvidenceObligationKind::VerifyAfterWrite => {
+                                    business_effect_targets.iter().any(|(target, cursor)| {
+                                        same_path(&target.path)
+                                            && complete_file_reads.iter().any(|read| {
+                                                same_path(&read.path) && read.cursor > *cursor
+                                            })
+                                    })
+                                }
+                                _ => false,
+                            }
+                    }
+                    _ => false,
+                })
+        }) {
+            return Err(
+                "proof packet evidence obligation has no authenticated physical material coverage"
+                    .into(),
+            );
+        }
+        for reference in &auxiliary_refs {
+            if reference.starts_with("approval:v1:") {
+                let decision = results::resolve_result(self, actor, program, reference).await?;
+                for source in decision.result_sources {
+                    if verification
+                        .result_source_revisions
+                        .insert(source.stream_id, source.expected_revision)
+                        .is_some_and(|previous| previous != source.expected_revision)
+                    {
+                        return Err(
+                            "approval source changed during actual material collection".into()
+                        );
+                    }
+                }
+            }
+        }
+        let dependencies = result_refs
+            .iter()
+            .chain(&auxiliary_refs)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (task_refs, artifact_refs, _) = selected_work(
+            self.event_store(),
+            program,
+            goal.as_ref(),
+            &dependencies,
+            &mut material_revisions,
+        )?;
+        verification.input_set = Some(harness_contract::goal::ProofInputSet {
+            version: 2,
+            condition_ref: condition_ref.map(str::to_string),
+            result_refs: result_refs.to_vec(),
+            auxiliary_refs: auxiliary_refs.into_iter().collect(),
+            required_obligation_refs: goal
+                .iter()
+                .flat_map(|goal| &goal.obligations)
+                .filter(|obligation| obligation.required)
+                .map(|obligation| obligation.obligation_id.clone())
+                .collect(),
+            task_refs,
+            artifact_refs,
+            packet_digests,
+            material_events,
+            source_revisions: material_revisions,
+            required_scopes,
+            required_scope_complete,
+            acceptance_policy_digest: String::new(),
+            semantic_digest: String::new(),
+        });
+        let history = self.session_history_reader();
+        let readers = ResultContentReaders {
+            artifacts: Some(self.artifact_store().as_ref()),
+            history: history.as_deref(),
+            process_inputs: Some(&process_frame),
+        };
+        let snapshot = proof_input_snapshot(
+            self.event_store(),
+            program,
+            goal.as_ref(),
+            &verification,
+            readers,
+        )?;
+        verification.work_manifest_digest = snapshot.work_digest;
+        verification.effect_manifest_digest = Some(snapshot.effects.digest);
+        if !verification.independence_required {
+            verification.review_policy_digest = Some(snapshot.policy_digest.clone());
+        }
+        let inputs = verification
+            .input_set
+            .as_mut()
+            .expect("v2 inputs were constructed");
+        inputs.semantic_digest = snapshot.semantic_digest;
+        inputs.acceptance_policy_digest = snapshot.policy_digest;
+        inputs.task_refs = snapshot.task_refs;
+        inputs.artifact_refs = snapshot.artifact_refs;
+        inputs.source_revisions = snapshot
+            .sources
+            .into_iter()
+            .map(|source| (source.stream_id, source.expected_revision))
+            .collect();
         Ok(IndependentReview {
             producers: producers.into_iter().collect(),
-            verification: ObjectiveReviewVerification {
-                result_source_revisions: resolved
-                    .iter()
-                    .flat_map(|result| &result.result_sources)
-                    .map(|source| (source.stream_id.clone(), source.expected_revision))
-                    .collect(),
-                independence_required,
-                review_policy_digest: policy.map(|policy| policy.digest),
-                effect_manifest_digest: effects.map(|effects| effects.digest),
-                effect_source_refs,
-                goal_spec_revision: goal.as_ref().map(|goal| goal.spec_revision),
-                goal_spec_digest: goal.as_ref().map(|goal| goal.spec_digest.clone()),
-                work_manifest_digest: work_manifest_digest(program),
-                reviewer_execution_id,
-                producer_execution_ids: producer_execution_ids.into_iter().collect(),
-                reads: coverage
-                    .into_values()
-                    .map(|mut state| {
-                        state.proof.receipt_refs.sort();
-                        state.proof.receipt_refs.dedup();
-                        state.proof
-                    })
-                    .collect(),
-            },
+            verification,
         })
     }
 
@@ -1137,8 +3031,6 @@ mod tests {
             },
             total: None,
             chunks: BTreeSet::new(),
-            effect_scopes_remaining: BTreeSet::new(),
-            unscoped_effect: false,
         }
     }
 
@@ -1152,45 +3044,44 @@ mod tests {
     /// generation 1 bound to `graph` / `agent:1` / `membership:1`.
     fn reviewed_task() -> crate::agentic::program::AgenticTaskProjection {
         let mut task = crate::agentic::program::AgenticTaskProjection {
-
-                task_id: "task".to_string(),
-                team_id: "team".to_string(),
-                title: "long task".to_string(),
-                objective: "finish without an arbitrary wall timeout".to_string(),
-                acceptance: "durable evidence".to_string(),
-                acceptance_checks: Vec::new(),
-                criterion_source: Default::default(),
-                required_capabilities: Vec::new(),
-                depends_on: Vec::new(),
-                status: crate::agentic::program::AgenticTaskStatus::Published,
-                claimant: None,
-                claim_generation: 0,
-                claim_execution_id: None,
-                claimed_at_ms: None,
-                lease_expires_at_ms: None,
-                claim_renewal_streak: 0,
-                active_attempts: Default::default(),
-                artifact_refs: Vec::new(),
-                evidence_refs: Vec::new(),
-                unresolved: Vec::new(),
-                review_reason: None,
-                reviewed_by: None,
-                failed_attempts: 0,
-                review_generation: 0,
-                failed_review_attempts: 0,
-                last_failure: None,
-                replacement_task_refs: Vec::new(),
-                supersede_evidence_refs: Vec::new(),
-                superseded_reason: None,
-                superseded_by: None,
-                obligation_refs: Vec::new(),
-                purpose: Default::default(),
-                execution_requirements: Vec::new(),
-                expertise_hints: Vec::new(),
-                cancel_requested_by: None,
-                cancel_reason_ref: None,
-                cancel_evidence_refs: Vec::new(),
-                pending_retirement: None,
+            task_id: "task".to_string(),
+            team_id: "team".to_string(),
+            title: "long task".to_string(),
+            objective: "finish without an arbitrary wall timeout".to_string(),
+            acceptance: "durable evidence".to_string(),
+            acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
+            required_capabilities: Vec::new(),
+            depends_on: Vec::new(),
+            status: crate::agentic::program::AgenticTaskStatus::Published,
+            claimant: None,
+            claim_generation: 0,
+            claim_execution_id: None,
+            claimed_at_ms: None,
+            lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
+            active_attempts: Default::default(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            review_reason: None,
+            reviewed_by: None,
+            failed_attempts: 0,
+            review_generation: 0,
+            failed_review_attempts: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
         };
         task.review_generation = 1;
         task.artifact_refs = vec!["artifact:a".to_string(), "artifact:b".to_string()];
@@ -1372,7 +3263,9 @@ mod tests {
         for graph in ["aaa", "bbb", "ccc"] {
             assert!(
                 binding_is_owned_by_root(
-                    &binding(&format!("activity:execution:{root}:owner:run:agentic-graph:{graph}:tool:x")),
+                    &binding(&format!(
+                        "activity:execution:{root}:owner:run:agentic-graph:{graph}:tool:x"
+                    )),
                     Some(root)
                 ),
                 "the root's own read counts under any graph: {graph}"
@@ -1389,7 +3282,9 @@ mod tests {
         );
         // An actor with no root execution has nothing to match against.
         assert!(!binding_is_owned_by_root(
-            &binding(&format!("activity:execution:{root}:owner:run:agentic-graph:aaa")),
+            &binding(&format!(
+                "activity:execution:{root}:owner:run:agentic-graph:aaa"
+            )),
             None
         ));
     }
@@ -1437,10 +3332,8 @@ mod tests {
             scope.target = Some(target.into());
             scope
         };
-        let mut state = coverage();
-        state.effect_scopes_remaining = BTreeSet::from([0, 1]);
-        let mut coverage = BTreeMap::from([("result:1".into(), state)]);
         let results = vec![results::ResolvedReviewResult {
+            origin: results::ResultOrigin::Strong,
             result_sources: vec![],
             reference: "result:1".into(),
             content: harness_contract::context::ArtifactRef::durable(
@@ -1456,33 +3349,87 @@ mod tests {
             effect_cursor: Some(10),
             effect_sources: Vec::new(),
             effect_scopes: vec![scope("a"), scope("b")],
+            effect_targets: ["a", "b"]
+                .into_iter()
+                .map(|target| harness_contract::goal::ProofEffectTarget {
+                    path: serde_json::from_value(serde_json::json!({
+                        "workspace_id":"workspace", "repository_id":"repository",
+                        "workspace_relative_path":target, "repository_relative_path":target,
+                        "object_kind":"file"
+                    }))
+                    .unwrap(),
+                    declared_scope: scope(target),
+                    access_mode: harness_contract::context::WorkspaceAccessMode::Write,
+                    coverage: harness_contract::context::EvidenceCoverageKind::WriteEffect,
+                    exact: true,
+                    physical_identity: Some(format!("test:{target}")),
+                    alias_checked: true,
+                })
+                .collect(),
             unscoped_effect: false,
+            primary_inputs: Vec::new(),
+            input_boundaries: Vec::new(),
+            process_runs: Vec::new(),
         }];
-        record_effect_observation(&results, &mut coverage, 10, &[scope("a")], "same-commit");
-        record_effect_observation(
-            &results,
-            &mut coverage,
-            11,
-            &[scope("other")],
-            "wrong-target",
-        );
-        assert!(
-            coverage["result:1"]
-                .proof
-                .effect_observation_refs
-                .is_empty()
-        );
-        record_effect_observation(&results, &mut coverage, 12, &[scope("a")], "read-a");
+        let file = |target: &str, cursor, references: &[&str]| policy::DeliveredFileRead {
+            path: serde_json::from_value(serde_json::json!({
+                "workspace_id":"workspace", "repository_id":"repository",
+                "workspace_relative_path":target, "repository_relative_path":target,
+                "object_kind":"file"
+            }))
+            .unwrap(),
+            scope: scope(target),
+            cursor,
+            receipt_refs: references
+                .iter()
+                .map(|reference| reference.to_string())
+                .collect(),
+        };
+        let result = &results[0];
+        let mut files = vec![
+            file("a", 10, &["same-commit"]),
+            file("other", 11, &["wrong-target"]),
+        ];
+        assert!(effect_observation_refs(result, &files, None).is_err());
+        let mut foreign = file("a", 12, &["foreign-workspace"]);
+        foreign.path.workspace_id = "another-workspace".into();
+        files.push(foreign);
+        assert!(effect_observation_refs(result, &files, None).is_err());
+        files.push(file("a", 12, &["read-a"]));
+        assert!(effect_observation_refs(result, &files, None).is_err());
+        files.push(file("b", 13, &["read-b-page-0", "read-b-page-1"]));
+        let expected = vec![
+            "read-a".into(),
+            "read-b-page-0".into(),
+            "read-b-page-1".into(),
+        ];
         assert_eq!(
-            coverage["result:1"].effect_scopes_remaining,
-            BTreeSet::from([1])
+            effect_observation_refs(result, &files, None).unwrap(),
+            expected
         );
-        record_effect_observation(&results, &mut coverage, 13, &[scope("b")], "read-b");
-        assert!(coverage["result:1"].effect_scopes_remaining.is_empty());
-        assert_eq!(
-            coverage["result:1"].proof.effect_observation_refs,
-            ["read-a", "read-b"]
-        );
+        assert!(effect_observation_refs(result, &files, Some(&expected)).is_ok());
+        assert!(effect_observation_refs(
+            result,
+            &files,
+            Some(&["read-a".into(), "read-b-page-0".into()])
+        )
+        .is_err());
+        assert!(effect_observation_refs(
+            result,
+            &files,
+            Some(&["read-a".into(), "wrong-target".into()])
+        )
+        .is_err());
+        assert!(effect_observation_refs(
+            result,
+            &files,
+            Some(&[
+                "same-commit".into(),
+                "read-b-page-0".into(),
+                "read-b-page-1".into()
+            ])
+        )
+        .is_err());
     }
 
     #[test]
@@ -1703,5 +3650,113 @@ mod tests {
             },
         );
         assert!(resolve_result_refs(&program, &["task:empty".to_string()]).is_empty());
+    }
+
+    fn canonical_alias_program_565() -> crate::AgenticProgramProjection {
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        program.artifacts.insert(
+            "artifact:one".into(),
+            crate::agentic::program::AgenticArtifactProjection {
+                artifact_ref: "artifact:one".into(),
+                content_ref: "artifact://content-one".into(),
+                kind: "report".into(),
+                title: "original".into(),
+                relates_to: Vec::new(),
+                committed_by: "producer".into(),
+                claim_execution_id: None,
+                claim_generation: None,
+            },
+        );
+        program
+    }
+
+    #[test]
+    fn r1_565_review_aliases_share_one_coverage_without_mutating_original_citations() {
+        let program = canonical_alias_program_565();
+        let references = vec![
+            "artifact:one".into(),
+            "artifact://one".into(),
+            "artifact://content-one".into(),
+            "artifact:one".into(),
+        ];
+        let original = references.clone();
+        assert_eq!(
+            canonical_review_result_refs(&program, &references).unwrap(),
+            BTreeSet::from(["artifact:one".into()])
+        );
+        assert_eq!(references, original);
+    }
+
+    #[test]
+    fn r1_565_review_identity_keeps_unrelated_tool_and_content_results() {
+        let program = canonical_alias_program_565();
+        let references = vec![
+            "artifact:one".into(),
+            "artifact://content-one".into(),
+            "tool://original-receipt".into(),
+            "artifact://other-content".into(),
+        ];
+        assert_eq!(
+            canonical_review_result_refs(&program, &references).unwrap(),
+            BTreeSet::from([
+                "artifact:one".into(),
+                "tool://original-receipt".into(),
+                "artifact://other-content".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn r1_565_review_identity_rejects_ambiguous_content_and_logical_spelling() {
+        let program = canonical_alias_program_565();
+        for (reference, artifact_ref) in [
+            ("artifact://content-one", "artifact:two"),
+            ("artifact://one", "artifact://one"),
+        ] {
+            let mut ambiguous = program.clone();
+            let mut artifact = ambiguous.artifacts["artifact:one"].clone();
+            artifact.artifact_ref = artifact_ref.into();
+            ambiguous.artifacts.insert(artifact_ref.into(), artifact);
+            assert!(
+                canonical_review_result_refs(&ambiguous, &[reference.into()])
+                    .unwrap_err()
+                    .contains("ambiguous")
+            );
+        }
+    }
+
+    #[test]
+    fn r1_566_unverified_task_relation_rejects_before_and_after_task_visit() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let mut program = canonical_alias_program_565();
+        let task: crate::AgenticTaskProjection = serde_json::from_value(serde_json::json!({
+            "task_id": "task:unproven", "team_id": "team:one", "title": "unproven",
+            "objective": "unproven", "acceptance": "original independent evidence",
+            "required_capabilities": [], "depends_on": [], "status": "published",
+            "claim_generation": 0, "artifact_refs": [], "evidence_refs": [],
+            "unresolved": [], "failed_attempts": 0, "review_generation": 1,
+            "failed_review_attempts": 0
+        }))
+        .unwrap();
+        program.tasks.insert(task.task_id.clone(), task);
+        program
+            .artifacts
+            .get_mut("artifact:one")
+            .unwrap()
+            .relates_to = vec!["task:unproven".into()];
+        let original = program.clone();
+        for references in [
+            vec!["artifact:one".into()],
+            vec!["task:unproven".into(), "artifact:one".into()],
+        ] {
+            let mut cuts = BTreeMap::new();
+            assert!(selected_work(&store, &program, None, &references, &mut cuts).is_err());
+            assert_eq!(program, original);
+            assert_eq!(
+                program.tasks["task:unproven"].status,
+                crate::AgenticTaskStatus::Published
+            );
+            assert!(program.tasks["task:unproven"].artifact_refs.is_empty());
+        }
     }
 }

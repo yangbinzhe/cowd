@@ -3,12 +3,1795 @@ use super::reviewed_goal_fixture::*;
 use super::*;
 use harness_contract::agent_action::{
     AgentActionStatus, AgentActorBinding, AgentActorKind, AgentInviteInput, ArtifactCommitInput,
-    TaskClaimInput, TaskOneShotDeliverable, TaskPublishInput, TaskReviewDecision, TaskReviewInput,
-    TaskSubmitInput, TeamCreateInput,
+    TaskClaimInput, TaskOneShotDeliverable, TaskPublishInput, TaskReviewDecision, TaskSubmitInput,
+    TeamCreateInput,
 };
 use harness_contract::skill::{
     SkillAdapterKind, SkillCapabilityProfile, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
 };
+
+#[tokio::test]
+async fn r1_native_backend_cancel_retains_physical_scope_and_rejects_old_owner() {
+    exercise_r1_backend_resource_lifetime_for_test(R1ResourceBackend::Native).await;
+}
+
+fn copy_prepared_conclusion(
+    prepared: &crate::execution_core::goal::PreparedProgramConclusion,
+) -> crate::execution_core::goal::PreparedProgramConclusion {
+    crate::execution_core::goal::PreparedProgramConclusion {
+        goal: prepared.goal.clone(),
+        expected_stream_revision: prepared.expected_stream_revision,
+        event: prepared.event.clone(),
+        gaps: prepared.gaps.clone(),
+        policy_sources: prepared.policy_sources.clone(),
+    }
+}
+
+fn set_review_input_case(review: &mut harness_contract::goal::ObjectiveReviewRecord, case: &str) {
+    match case {
+        "missing-review" => unreachable!(),
+        "missing-verification" => review.verification = None,
+        "missing-inputs" => review.verification.as_mut().unwrap().input_set = None,
+        "zero" | "legacy" | "unknown" => {
+            review
+                .verification
+                .as_mut()
+                .unwrap()
+                .input_set
+                .as_mut()
+                .unwrap()
+                .version = match case {
+                "zero" => 0,
+                "legacy" => 1,
+                _ => u32::MAX,
+            };
+        }
+        "gap" => review.decision = "gap".into(),
+        _ => unreachable!(),
+    }
+}
+
+fn assert_unsupported_review_inputs(
+    services: &Arc<RuntimeServices>,
+    original: &AgentActionEnvelope,
+    donor: &crate::agentic::review_evidence::IndependentReview,
+    action_kind: &str,
+) {
+    let actions = services.agent_action_service();
+    let store = services.event_store();
+    let program_stream = format!("agentic-program:{}", original.actor.program_id);
+    let goal_id = format!(
+        "goal:{}",
+        original.actor.root_execution_id.as_ref().unwrap()
+    );
+    let original_goal = services.goal_store().projection(&goal_id).unwrap().unwrap();
+    let session_stream = format!("session:{}", original.actor.session_id);
+    let host_calls = store
+        .list_stream(&session_stream)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool.invocation.completed")
+        .count();
+    for case in [
+        "missing-verification",
+        "missing-inputs",
+        "zero",
+        "legacy",
+        "unknown",
+    ] {
+        for entry in ["internal", "goal-event"] {
+            let mut envelope = original.clone();
+            envelope.action_id = format!("unsupported-{action_kind}-{case}-{entry}");
+            if let AgentAction::TaskReview(input) = &mut envelope.action {
+                let program = actions.project(&envelope.actor.program_id).unwrap();
+                assert_eq!(
+                    program.tasks[&input.task_ref].status,
+                    crate::AgenticTaskStatus::Submitted
+                );
+                if action_kind != "task-accept" {
+                    input.decision = if action_kind == "task-rework" {
+                        TaskReviewDecision::Rework
+                    } else {
+                        TaskReviewDecision::Challenge
+                    };
+                    input.operator_requirement = Some(original_goal.goal.objective.clone());
+                    input.reason = program.tasks[&input.task_ref].acceptance_checks.join("; ");
+                }
+            }
+            let mut proof = donor.verification.clone();
+            match case {
+                "missing-verification" => {}
+                "missing-inputs" => proof.input_set = None,
+                _ => {
+                    proof.input_set.as_mut().unwrap().version = match case {
+                        "zero" => 0,
+                        "legacy" => 1,
+                        _ => u32::MAX,
+                    }
+                }
+            }
+            let proof = (case != "missing-verification").then_some(&proof);
+            let before_cursor = store.durable_commit_cursor().unwrap();
+            let before_program = store.stream_revision(&program_stream).unwrap();
+            let rejected = if entry == "goal-event" {
+                let event = crate::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: format!("goal:{goal_id}"),
+                        scope: crate::RuntimeEventScope::Program,
+                        kind: "goal.revised".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({"goal":original_goal.goal}),
+                    },
+                    idempotency_key: Some(envelope.action_id.clone()),
+                    schema_version: 1,
+                };
+                actions
+                    .apply_with_goal_event(
+                        &envelope,
+                        event.event.stream_id.clone(),
+                        original_goal.stream_revision,
+                        event,
+                        proof,
+                    )
+                    .unwrap()
+            } else if let Some(proof) = proof {
+                actions.apply_verified_review(&envelope, proof).unwrap()
+            } else {
+                actions.apply(&envelope).unwrap()
+            };
+            assert_eq!(
+                rejected.status,
+                AgentActionStatus::Rejected,
+                "{action_kind}/{case}/{entry}"
+            );
+            assert_eq!(rejected.error.unwrap().code, "unsupported_review_inputs");
+            assert_eq!(store.durable_commit_cursor().unwrap(), before_cursor);
+            assert_eq!(
+                store.stream_revision(&program_stream).unwrap(),
+                before_program
+            );
+            assert_eq!(
+                services
+                    .goal_store()
+                    .projection(&goal_id)
+                    .unwrap()
+                    .unwrap()
+                    .goal,
+                original_goal.goal
+            );
+            let after_calls = store
+                .list_stream(&session_stream)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == "tool.invocation.completed")
+                .count();
+            assert_eq!(after_calls, host_calls);
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
+    with_native_review_before_apply(|services, original, donor| {
+        assert_unsupported_review_inputs(services, original, donor, "objective");
+        let actions = services.agent_action_service();
+        let mut positive = original.clone();
+        positive.action_id = "direct-v2-objective-positive".into();
+        let mutation = services
+            .goal_store()
+            .prepare_agentic_objective_action(
+                &positive,
+                &donor.producers,
+                Some(&donor.verification),
+            )
+            .unwrap();
+        let applied = actions
+            .apply_with_goal_event(
+                &positive,
+                mutation.stream_id,
+                mutation.expected_stream_revision,
+                mutation.event,
+                Some(&donor.verification),
+            )
+            .unwrap();
+        assert_eq!(applied.status, AgentActionStatus::Applied, "{applied:?}");
+        let mut no_proof_gap = original.clone();
+        no_proof_gap.action_id = "legitimate-gap-without-proof".into();
+        if let AgentAction::ObjectiveReview(input) = &mut no_proof_gap.action {
+            input.decision = harness_contract::agent_action::ObjectiveReviewDecision::Gap;
+            input.reason =
+                "gap: the reviewed delivery still lacks its named missing deliverable".into();
+        }
+        let gap = actions.apply(&no_proof_gap).unwrap();
+        assert_eq!(gap.status, AgentActionStatus::Applied, "{gap:?}");
+    })
+    .await;
+    for action_kind in ["task-accept", "task-rework", "task-challenge"] {
+        with_native_task_review_before_apply(move |services, original, donor| {
+            assert_unsupported_review_inputs(services, original, donor, action_kind);
+            let actions = services.agent_action_service();
+            let mut positive = original.clone();
+            positive.action_id = format!("direct-v2-{action_kind}-positive");
+            if let AgentAction::TaskReview(input) = &mut positive.action {
+                if action_kind != "task-accept" {
+                    input.decision = if action_kind == "task-rework" {
+                        TaskReviewDecision::Rework
+                    } else {
+                        TaskReviewDecision::Challenge
+                    };
+                    input.operator_requirement = Some(
+                        services
+                            .goal_store()
+                            .get(&format!(
+                                "goal:{}",
+                                original.actor.root_execution_id.as_ref().unwrap()
+                            ))
+                            .unwrap()
+                            .unwrap()
+                            .objective,
+                    );
+                    input.reason = actions.project(&original.actor.program_id).unwrap().tasks
+                        [&input.task_ref]
+                        .acceptance_checks
+                        .join("; ");
+                }
+            }
+            let applied = actions
+                .apply_verified_review(&positive, &donor.verification)
+                .unwrap();
+            assert_eq!(
+                applied.status,
+                AgentActionStatus::Applied,
+                "{action_kind}: {applied:?}"
+            );
+            let task_ref = match &positive.action {
+                AgentAction::TaskReview(input) => input.task_ref.clone(),
+                _ => unreachable!(),
+            };
+            let current = actions.project(&original.actor.program_id).unwrap();
+            if action_kind == "task-accept" {
+                assert_eq!(
+                    current.tasks[&task_ref].status,
+                    crate::AgenticTaskStatus::Accepted
+                );
+                positive.action_id.push_str(":rereview");
+                let cursor = services.event_store().durable_commit_cursor().unwrap();
+                let repeated = actions.apply(&positive).unwrap();
+                assert_eq!(repeated.error.unwrap().code, "task_already_accepted");
+                assert_eq!(
+                    services.event_store().durable_commit_cursor().unwrap(),
+                    cursor
+                );
+            } else {
+                assert_eq!(
+                    current.tasks[&task_ref].status,
+                    crate::AgenticTaskStatus::Rework
+                );
+                assert_eq!(current.tasks[&task_ref].review_generation, 1);
+            }
+        })
+        .await;
+    }
+
+    for decision in [
+        TaskReviewDecision::Accept,
+        TaskReviewDecision::Rework,
+        TaskReviewDecision::Challenge,
+    ] {
+        with_native_task_review_async(
+            NativeTaskReviewCase::default(),
+            move |services, mut envelope, _donor| {
+                Box::pin(async move {
+                    let actions = services.agent_action_service();
+                    let goal_id = format!(
+                        "goal:{}",
+                        envelope.actor.root_execution_id.as_ref().unwrap()
+                    );
+                    let goal = services.goal_store().get(&goal_id).unwrap().unwrap();
+                    let task_ref = match &mut envelope.action {
+                        AgentAction::TaskReview(input) => {
+                            input.decision = decision;
+                            if decision != TaskReviewDecision::Accept {
+                                input.operator_requirement = Some(goal.objective.clone());
+                                input.reason =
+                                    actions.project(&envelope.actor.program_id).unwrap().tasks
+                                        [&input.task_ref]
+                                        .acceptance_checks
+                                        .join("; ");
+                            }
+                            input.task_ref.clone()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let before = actions.project(&envelope.actor.program_id).unwrap();
+                    assert_eq!(
+                        before.tasks[&task_ref].status,
+                        crate::AgenticTaskStatus::Submitted
+                    );
+                    envelope.action_id = format!("public-task-{decision:?}");
+                    let applied = services.submit_agent_action(&envelope).await.unwrap();
+                    assert_eq!(applied.status, AgentActionStatus::Applied, "{applied:?}");
+                    let after = actions.project(&envelope.actor.program_id).unwrap();
+                    assert_eq!(
+                        after.tasks[&task_ref].status,
+                        if decision == TaskReviewDecision::Accept {
+                            crate::AgenticTaskStatus::Accepted
+                        } else {
+                            crate::AgenticTaskStatus::Rework
+                        }
+                    );
+                    assert_eq!(
+                        after.tasks[&task_ref].review_generation,
+                        before.tasks[&task_ref].review_generation
+                            + u64::from(decision != TaskReviewDecision::Accept)
+                    );
+                    assert_public_exact_replay(&services, &envelope, &applied).await;
+                    if decision == TaskReviewDecision::Accept {
+                        envelope.action_id.push_str(":new-action");
+                        let repeated = services.submit_agent_action(&envelope).await.unwrap_err();
+                        assert!(
+                            repeated.starts_with(
+                                "review attempt is not the active Review attempt for Task "
+                            ),
+                            "{repeated}"
+                        );
+                        assert!(repeated.contains(&task_ref), "{repeated}");
+                        let rejected = actions.apply(&envelope).unwrap();
+                        assert_eq!(rejected.status, AgentActionStatus::Rejected);
+                        assert_eq!(rejected.error.unwrap().code, "task_already_accepted");
+                    }
+                })
+            },
+        )
+        .await;
+    }
+    with_native_review_async(|services, mut envelope, _donor| {
+        Box::pin(async move {
+            envelope.action_id = "public-objective-gap-without-proof".into();
+            if let AgentAction::ObjectiveReview(input) = &mut envelope.action {
+                input.decision = harness_contract::agent_action::ObjectiveReviewDecision::Gap;
+            } else {
+                unreachable!()
+            }
+            let goal_id = format!(
+                "goal:{}",
+                envelope.actor.root_execution_id.as_ref().unwrap()
+            );
+            assert_eq!(
+                services
+                    .goal_store()
+                    .get(&goal_id)
+                    .unwrap()
+                    .unwrap()
+                    .completion,
+                harness_contract::goal::GoalCompletion::Open
+            );
+            let applied = services.submit_agent_action(&envelope).await.unwrap();
+            assert_eq!(applied.status, AgentActionStatus::Applied, "{applied:?}");
+            let goal = services.goal_store().get(&goal_id).unwrap().unwrap();
+            let review = goal.reviews.last().unwrap();
+            assert_eq!(review.decision, "gap");
+            assert!(review.verification.is_none());
+            assert_public_exact_replay(&services, &envelope, &applied).await;
+        })
+    })
+    .await;
+}
+
+async fn assert_public_exact_replay(
+    services: &Arc<RuntimeServices>,
+    envelope: &AgentActionEnvelope,
+    applied: &harness_contract::agent_action::AgentActionObservation,
+) {
+    let store = services.event_store();
+    let goal_id = format!(
+        "goal:{}",
+        envelope.actor.root_execution_id.as_ref().unwrap()
+    );
+    let cursor = store.durable_commit_cursor().unwrap();
+    let program = services
+        .agent_action_service()
+        .project(&envelope.actor.program_id)
+        .unwrap();
+    let goal = services.goal_store().projection(&goal_id).unwrap().unwrap();
+    let activity = native_review_activity(services, envelope);
+    let replay = services.submit_agent_action(envelope).await.unwrap();
+    assert_eq!(replay.status, AgentActionStatus::Applied);
+    assert!(replay.duplicate);
+    assert_eq!(replay.receipt_id, applied.receipt_id);
+    assert_eq!(replay.changed_refs, applied.changed_refs);
+    assert_eq!(replay.revision, applied.revision);
+    assert_eq!(store.durable_commit_cursor().unwrap(), cursor);
+    assert_eq!(
+        services
+            .agent_action_service()
+            .project(&envelope.actor.program_id)
+            .unwrap(),
+        program
+    );
+    let after = services.goal_store().projection(&goal_id).unwrap().unwrap();
+    assert_eq!(after.goal, goal.goal);
+    assert_eq!(after.stream_revision, goal.stream_revision);
+    assert_eq!(native_review_activity(services, envelope), activity);
+}
+
+fn append_historical_a_for_proof_negative(
+    services: &Arc<RuntimeServices>,
+    program: &crate::AgenticProgramProjection,
+    mut prepared: crate::execution_core::goal::PreparedProgramConclusion,
+    event_case: &str,
+) -> harness_contract::goal::GoalContract {
+    let terminal = prepared.goal.terminal.as_ref().unwrap();
+    let verdict = crate::agentic::program::AgenticObjectiveVerdictProjection {
+        goal_id: prepared.goal.id.clone(),
+        goal_revision: prepared.goal.revision,
+        terminal_fence: terminal.terminal_fence.clone(),
+        authority_revision: terminal.authority_revision,
+        kind: terminal.kind,
+    };
+    prepared.event.event.payload["goal"] = serde_json::to_value(&prepared.goal).unwrap();
+    let stream = format!("agentic-program:{}", program.program_id);
+    let mut payload = serde_json::json!({"program_id":program.program_id,"verdict":verdict});
+    if event_case == "payload" {
+        payload["verdict"]["goal_revision"] = serde_json::json!(u64::MAX);
+    }
+    if event_case == "fence" {
+        payload["verdict"]["terminal_fence"] = serde_json::json!("wrong-fence");
+    }
+    let event = crate::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput {
+            stream_id: stream.clone(),
+            scope: crate::RuntimeEventScope::Program,
+            kind: if event_case == "kind" {
+                "test.not_a_verdict"
+            } else {
+                "agentic.objective_verdict_bound"
+            }
+            .into(),
+            status: Some("verified".into()),
+            actor: Some("historical_fixture_only".into()),
+            refs: vec![],
+            payload,
+        },
+        idempotency_key: Some(if event_case == "missing-key" {
+            "historical-a-without-current-key".into()
+        } else {
+            format!("program-conclusion:{}", terminal.authority_revision)
+        }),
+        schema_version: 1,
+    };
+    let history = crate::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput {
+            stream_id: stream.clone(),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.objective_verdict_bound".into(),
+            status: Some("verified".into()),
+            actor: Some("historical_fixture_only".into()),
+            refs: vec![],
+            payload: serde_json::json!({"program_id":program.program_id,"verdict":verdict}),
+        },
+        idempotency_key: Some("historical-projection-verdict".into()),
+        schema_version: 1,
+    };
+    services
+        .event_store()
+        .append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("historical-a-fixture:{event_case}"),
+            expected_streams: vec![
+                crate::ExpectedStreamRevision {
+                    stream_id: stream,
+                    expected_revision: program.revision,
+                },
+                crate::ExpectedStreamRevision {
+                    stream_id: prepared.event.event.stream_id.clone(),
+                    expected_revision: prepared.expected_stream_revision,
+                },
+            ],
+            events: vec![prepared.event, event, history],
+        })
+        .unwrap();
+    prepared.goal
+}
+
+#[tokio::test]
+async fn r1_proof_current_a_and_b_reject_unsupported_required_reviews() {
+    for case in [
+        "missing-review",
+        "missing-verification",
+        "missing-inputs",
+        "zero",
+        "legacy",
+        "unknown",
+        "gap",
+    ] {
+        with_native_goal_before_a(move |services, program, prepared, _| {
+            let intent = prepared.goal.user_intent_criterion_id.clone().unwrap();
+            let selected = prepared
+                .goal
+                .reviews
+                .iter()
+                .rposition(|review| review.criterion_ref == intent)
+                .unwrap();
+            let mut bypass = copy_prepared_conclusion(&prepared);
+            if case == "missing-review" {
+                bypass
+                    .goal
+                    .reviews
+                    .retain(|review| review.criterion_ref != intent);
+            } else {
+                set_review_input_case(&mut bypass.goal.reviews[selected], case);
+            }
+            bypass.event.event.payload["goal"] = serde_json::to_value(&bypass.goal).unwrap();
+            let cursor = services.event_store().durable_commit_cursor().unwrap();
+            let error = services
+                .agent_action_service()
+                .commit_program_conclusion(program, bypass)
+                .err()
+                .expect("direct mutable prepared must not bypass final required review");
+            assert!(
+                error.to_string().contains("review") || error.to_string().contains("proof"),
+                "{error}"
+            );
+            assert_eq!(
+                services.event_store().durable_commit_cursor().unwrap(),
+                cursor
+            );
+            let current = services
+                .goal_store()
+                .get(&prepared.goal.id)
+                .unwrap()
+                .unwrap();
+            services
+                .goal_store()
+                .revise(
+                    &current.id,
+                    current.revision,
+                    current.user_sequence + 1,
+                    "latest review negative fixture",
+                    |goal| {
+                        if case == "missing-review" {
+                            goal.reviews.retain(|review| review.criterion_ref != intent);
+                        } else {
+                            let mut latest = goal
+                                .reviews
+                                .iter()
+                                .rev()
+                                .find(|review| review.criterion_ref == intent)
+                                .unwrap()
+                                .clone();
+                            latest.review_id.push_str(":latest-negative");
+                            set_review_input_case(&mut latest, case);
+                            goal.reviews.push(latest);
+                        }
+                        vec!["reviews".into()]
+                    },
+                )
+                .unwrap();
+            let current_program = services
+                .agent_action_service()
+                .project(&program.program_id)
+                .unwrap();
+            let rejected = services
+                .goal_store()
+                .prepare_program_conclusion(&current_program)
+                .unwrap();
+            assert!(rejected
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("original_intent_review_required:")));
+            assert!(rejected.goal.terminal.is_none());
+            assert!(services
+                .agent_action_service()
+                .project(&program.program_id)
+                .unwrap()
+                .objective_verdict
+                .is_none());
+        })
+        .await;
+        with_native_goal_before_a(move |services, program, mut prepared, _| {
+            let intent = prepared.goal.user_intent_criterion_id.clone().unwrap();
+            if case == "missing-review" {
+                prepared
+                    .goal
+                    .reviews
+                    .retain(|review| review.criterion_ref != intent);
+            } else {
+                let review = prepared
+                    .goal
+                    .reviews
+                    .iter_mut()
+                    .rev()
+                    .find(|review| review.criterion_ref == intent)
+                    .unwrap();
+                set_review_input_case(review, case);
+            }
+            let goal = append_historical_a_for_proof_negative(services, program, prepared, "proof");
+            assert_native_sources_b_rejected(services, &goal, "committed A");
+        })
+        .await;
+    }
+    for case in ["missing-verification", "missing-inputs", "unknown"] {
+        with_native_goal_before_a(move |services, program, mut prepared, _| {
+            let mut extra = prepared.goal.criteria[0].clone();
+            extra.id = "additional-accepted-condition".into();
+            extra.status = harness_contract::goal::AcceptanceStatus::Satisfied;
+            prepared.goal.criteria.push(extra);
+            let mut review = prepared.goal.reviews.last().unwrap().clone();
+            review.criterion_ref = "additional-accepted-condition".into();
+            review.review_id = "additional-accepted-review".into();
+            set_review_input_case(&mut review, case);
+            prepared.goal.reviews.push(review);
+            let goal = append_historical_a_for_proof_negative(services, program, prepared, "proof");
+            let history = services.session_history_reader();
+            let error = crate::agentic::review_evidence::committed_proof_sources(
+                services.event_store(),
+                &goal,
+                crate::agentic::review_evidence::ResultContentReaders {
+                    artifacts: Some(services.artifact_store().as_ref()),
+                    history: history.as_deref(),
+                    process_inputs: None,
+                },
+            )
+            .err()
+            .expect("all accepted criteria participate, not merely any-v2");
+            assert!(
+                error.contains("additional-accepted-condition") || error.contains("proof identity"),
+                "{error}"
+            );
+            assert_native_sources_b_rejected(services, &goal, "committed A");
+        })
+        .await;
+    }
+    with_native_extra_before_a(|services, program, prepared, _| {
+        for status in [
+            harness_contract::goal::AcceptanceStatus::Open,
+            harness_contract::goal::AcceptanceStatus::Waived,
+        ] {
+            let mut bypass = copy_prepared_conclusion(&prepared);
+            let criterion = bypass
+                .goal
+                .criteria
+                .iter_mut()
+                .find(|criterion| criterion.id == "additional-accepted-condition")
+                .unwrap();
+            criterion.status = status;
+            criterion.waiver = None;
+            bypass.event.event.payload["goal"] = serde_json::to_value(&bypass.goal).unwrap();
+            let cursor = services.event_store().durable_commit_cursor().unwrap();
+            let error = services
+                .agent_action_service()
+                .commit_program_conclusion(program, bypass)
+                .err()
+                .expect("mutable prepared cannot hide an accepted condition");
+            assert!(
+                error.to_string().contains("required review or waiver"),
+                "{error}"
+            );
+            assert_eq!(
+                services.event_store().durable_commit_cursor().unwrap(),
+                cursor
+            );
+        }
+        let selected = crate::agentic::review_evidence::required_review_conditions(&prepared.goal);
+        assert!(selected.contains("additional-accepted-condition"));
+        assert_eq!(selected.len(), 3);
+        let intent = prepared.goal.user_intent_criterion_id.as_ref().unwrap();
+        assert!(prepared
+            .goal
+            .obligations
+            .iter()
+            .any(|obligation| obligation.required && &obligation.obligation_id == intent));
+        assert!(prepared
+            .goal
+            .obligations
+            .iter()
+            .any(|obligation| !obligation.required
+                && obligation.obligation_id == "additional-accepted-condition"));
+        assert!(!selected.contains("unrelated-optional"));
+        assert!(!selected.contains("waived-additional"));
+        assert!(prepared.gaps.is_empty());
+        let after = services
+            .agent_action_service()
+            .commit_program_conclusion(program, prepared)
+            .unwrap();
+        let goal = services
+            .goal_store()
+            .get(&after.objective_verdict.as_ref().unwrap().goal_id)
+            .unwrap()
+            .unwrap();
+        assert_native_sources_final_b(services, services.commit_service(), &goal, false);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn r1_proof_exact_a_identity_survives_later_nonproof_events() {
+    for writer in ["conclusion", "bound"] {
+        with_native_goal_before_a(move |services, program, prepared, _| {
+            let actions = services.agent_action_service();
+            let after = if writer == "conclusion" {
+                actions
+                    .commit_program_conclusion(program, prepared)
+                    .unwrap()
+            } else {
+                let goal = prepared.goal.clone();
+                services
+                    .event_store()
+                    .append_batch_if_revision(
+                        prepared.event.event.stream_id.clone(),
+                        prepared.expected_stream_revision,
+                        "goal-half-for-current-bound-writer",
+                        vec![prepared.event],
+                    )
+                    .unwrap();
+                actions
+                    .bind_objective_verdict(&program.program_id, &goal)
+                    .unwrap()
+            };
+            let verdict = after.objective_verdict.as_ref().unwrap();
+            let goal = services
+                .goal_store()
+                .get(&verdict.goal_id)
+                .unwrap()
+                .unwrap();
+            let own = format!("agentic-program:{}", program.program_id);
+            let key = if writer == "conclusion" {
+                format!("program-conclusion:{}", verdict.authority_revision)
+            } else {
+                format!("agentic-objective-verdict:{}", verdict.terminal_fence)
+            };
+            let original = services
+                .event_store()
+                .event_by_idempotency_key(&own, &key)
+                .unwrap()
+                .unwrap();
+            for kind in ["agentic.task_lease_renewed", "test.unrelated_noise"] {
+                services
+                    .event_store()
+                    .append(crate::RuntimeEventInput {
+                        stream_id: own.clone(),
+                        scope: crate::RuntimeEventScope::Program,
+                        kind: kind.into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({}),
+                    })
+                    .unwrap();
+            }
+            let previous = services
+                .session_execution_policy("session-dispatch")
+                .unwrap();
+            let next = harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Cautious,
+                previous.revision + 1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+            );
+            services
+                .session_execution_policy_control("session-dispatch")
+                .unwrap()
+                .replace(next)
+                .unwrap();
+            assert_eq!(
+                services
+                    .event_store()
+                    .event_by_idempotency_key(&own, &key)
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+            assert_native_sources_final_b(services, services.commit_service(), &goal, false);
+            assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), goal);
+        })
+        .await;
+    }
+    for case in ["goal-revision", "goal-turn", "goal-program"] {
+        with_native_goal_before_a(move |services, program, prepared, _| {
+            let after = services
+                .agent_action_service()
+                .commit_program_conclusion(program, prepared)
+                .unwrap();
+            let goal = services
+                .goal_store()
+                .get(&after.objective_verdict.as_ref().unwrap().goal_id)
+                .unwrap()
+                .unwrap();
+            let mut changed = goal.clone();
+            if case == "goal-revision" {
+                changed.revision += 1;
+            } else if case == "goal-turn" {
+                changed.execution_binding.as_mut().unwrap().turn_id = "foreign-turn".into();
+            } else {
+                changed
+                    .execution_binding
+                    .as_mut()
+                    .unwrap()
+                    .agentic_program_id = "foreign-program".into();
+            }
+            services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: format!("goal:{}", goal.id),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "goal.revised".into(),
+                    status: None,
+                    actor: Some("historical_binding_negative".into()),
+                    refs: vec![],
+                    payload: serde_json::json!({"goal":changed}),
+                })
+                .unwrap();
+            assert_native_sources_b_rejected(
+                services,
+                &goal,
+                "Goal terminal disagrees with Program verdict",
+            );
+        })
+        .await;
+    }
+    for case in ["kind", "payload", "fence", "missing-key"] {
+        with_native_goal_before_a(move |services, program, prepared, _| {
+            let goal = append_historical_a_for_proof_negative(services, program, prepared, case);
+            assert_native_sources_b_rejected(
+                services,
+                &goal,
+                if case == "missing-key" {
+                    "identity is missing"
+                } else {
+                    "exact Program event"
+                },
+            );
+        })
+        .await;
+    }
+    with_native_goal_before_a(|services, program, prepared, _| {
+        let after = services
+            .agent_action_service()
+            .commit_program_conclusion(program, prepared)
+            .unwrap();
+        let verdict = after.objective_verdict.as_ref().unwrap();
+        let goal = services
+            .goal_store()
+            .get(&verdict.goal_id)
+            .unwrap()
+            .unwrap();
+        let stream = format!("agentic-program:{}", program.program_id);
+        let original = services
+            .event_store()
+            .event_by_idempotency_key(
+                &stream,
+                &format!("program-conclusion:{}", verdict.authority_revision),
+            )
+            .unwrap()
+            .unwrap();
+        services
+            .event_store()
+            .append_batch_if_revision(
+                &stream,
+                after.revision,
+                "distinct-second-current-a",
+                vec![crate::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: stream.clone(),
+                        scope: original.scope,
+                        kind: original.kind,
+                        status: original.status,
+                        actor: original.actor,
+                        refs: original.refs,
+                        payload: original.payload,
+                    },
+                    idempotency_key: Some(format!(
+                        "agentic-objective-verdict:{}",
+                        verdict.terminal_fence
+                    )),
+                    schema_version: 1,
+                }],
+            )
+            .unwrap();
+        assert_native_sources_b_rejected(services, &goal, "conflicting committed A");
+    })
+    .await;
+    for kind in [
+        harness_contract::goal::ObjectiveTerminalKind::PartiallySatisfied,
+        harness_contract::goal::ObjectiveTerminalKind::Blocked,
+        harness_contract::goal::ObjectiveTerminalKind::Failed,
+        harness_contract::goal::ObjectiveTerminalKind::Cancelled,
+    ] {
+        with_native_goal_before_a(move |services, program, mut prepared, _| {
+            prepared.goal.completion = match kind {
+                harness_contract::goal::ObjectiveTerminalKind::PartiallySatisfied => {
+                    harness_contract::goal::GoalCompletion::Partial
+                }
+                harness_contract::goal::ObjectiveTerminalKind::Blocked => {
+                    harness_contract::goal::GoalCompletion::Blocked
+                }
+                harness_contract::goal::ObjectiveTerminalKind::Failed => {
+                    harness_contract::goal::GoalCompletion::Failed
+                }
+                _ => harness_contract::goal::GoalCompletion::Cancelled,
+            };
+            prepared.goal.terminal.as_mut().unwrap().kind = kind;
+            let (event_kind, status) = match kind {
+                harness_contract::goal::ObjectiveTerminalKind::PartiallySatisfied => {
+                    ("goal.partial", "partial")
+                }
+                harness_contract::goal::ObjectiveTerminalKind::Blocked => {
+                    ("goal.blocked", "blocked")
+                }
+                harness_contract::goal::ObjectiveTerminalKind::Failed => ("goal.failed", "failed"),
+                _ => ("goal.cancelled", "cancelled"),
+            };
+            prepared.event.event.kind = event_kind.into();
+            prepared.event.event.status = Some(status.into());
+            prepared.goal.reviews.clear();
+            prepared.policy_sources.clear();
+            prepared.event.event.payload["goal"] = serde_json::to_value(&prepared.goal).unwrap();
+            let after = services
+                .agent_action_service()
+                .commit_program_conclusion(program, prepared)
+                .unwrap();
+            let goal = services
+                .goal_store()
+                .get(&after.objective_verdict.as_ref().unwrap().goal_id)
+                .unwrap()
+                .unwrap();
+            assert_native_sources_final_b(services, services.commit_service(), &goal, false);
+        })
+        .await;
+    }
+
+    with_native_goal_before_a(|services, program, prepared, _| {
+        let after = services
+            .agent_action_service()
+            .commit_program_conclusion(program, prepared)
+            .unwrap();
+        let goal = services
+            .goal_store()
+            .get(&after.objective_verdict.as_ref().unwrap().goal_id)
+            .unwrap()
+            .unwrap();
+        let (expected, release) = services
+            .commit_service()
+            .observe_terminal_append_for_test("turn-terminal:native-cold-b")
+            .unwrap();
+        let store = services.event_store().clone();
+        let source = format!("session:{}", program.session_id);
+        let writer = std::thread::spawn(move || {
+            let cut = expected
+                .blocking_recv()
+                .expect("actual B pre-append observer must fire");
+            let revision = cut
+                .iter()
+                .find(|cut| cut.stream_id == source)
+                .unwrap()
+                .expected_revision;
+            assert_eq!(store.stream_revision(&source).unwrap(), revision);
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: source.clone(),
+                    scope: crate::RuntimeEventScope::Session,
+                    kind: "test.after_b_material_cut".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+            assert_eq!(store.stream_revision(&source).unwrap(), revision + 1);
+            release.send(()).unwrap();
+            (source, revision)
+        });
+        assert_native_sources_b_rejected(services, &goal, "revision");
+        let (source, expected_revision) = writer.join().unwrap();
+        assert_eq!(
+            services.event_store().stream_revision(&source).unwrap(),
+            expected_revision + 1
+        );
+        assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), goal);
+    })
+    .await;
+    exercise_native_sources_with_changed_anchor_source().await;
+}
+
+#[tokio::test]
+async fn r1_process_backend_cancel_retains_physical_scope_and_rejects_old_owner() {
+    exercise_r1_backend_resource_lifetime_for_test(R1ResourceBackend::Process).await;
+}
+
+#[tokio::test]
+async fn r1_backend_effect_receipt_cannot_confirm_unknown_process_exit() {
+    exercise_r1_backend_unknown_exit_for_test().await;
+}
+
+#[tokio::test]
+async fn r1_process_envelope_rw_max_is_clamped_to_readonly_off() {
+    let fixture = PhysicalProcessFixture::new(
+        crate::config::AgentExecutorSandboxProfile::WorkspaceReadWrite,
+        "physical-max",
+    )
+    .await;
+    let worker = fixture
+        .dispatch("physical-max", vec!["read:.".into()], false, false, true)
+        .await;
+    let fact = worker.lifecycle().semantic_fact();
+    assert!(worker.lifecycle().no_direct_effects());
+    assert_eq!(
+        fact["envelope"]["command_digest"],
+        fixture.spec.command_digest
+    );
+    assert_eq!(fact["envelope"]["workspace_writable"], false);
+    assert_eq!(fact["envelope"]["network_enabled"], false);
+    let sentinel = fixture
+        .services
+        .workspace_root()
+        .join("out/physical-sentinel.txt");
+    assert_eq!(
+        worker
+            .probe(serde_json::json!({"kind":"read","path":"out/physical-sentinel.txt"}))
+            .await["value"],
+        "initial sentinel"
+    );
+    assert_eq!(worker.probe(serde_json::json!({"kind":"write","path":"out/physical-sentinel.txt","value":"forbidden direct"})).await["ok"], false);
+    assert_eq!(
+        std::fs::read_to_string(sentinel).unwrap(),
+        "initial sentinel"
+    );
+    let script = fixture
+        .services
+        .workspace_root()
+        .join(".cowd/fixtures/r1-worker.py");
+    let approved_script = std::fs::read(&script).unwrap();
+    assert_eq!(worker.probe(serde_json::json!({"kind":"write","path":".cowd/fixtures/r1-worker.py","value":"forbidden replacement"})).await["ok"], false);
+    assert_eq!(std::fs::read(&script).unwrap(), approved_script);
+    let edits = fixture.edit_calls();
+    assert!(worker
+        .tool(
+            "edit",
+            serde_json::json!({"path":"out/a","content":"forbidden Host write"})
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        fixture.edit_calls(),
+        edits,
+        "Host authorization rejection is separate from OS denial"
+    );
+    let scratch = worker.directory().join("private-control.txt");
+    assert_eq!(
+        worker
+            .probe(serde_json::json!({"kind":"write","path":scratch,"value":"private control"}))
+            .await["ok"],
+        true
+    );
+    assert_eq!(
+        std::fs::read_to_string(&scratch).unwrap(),
+        "private control"
+    );
+    worker.finish_readonly_control().await;
+    assert!(!worker.directory().exists());
+}
+
+#[tokio::test]
+async fn r1_process_envelope_host_write_survives_physical_readonly() {
+    if std::env::var("COWD_AUTO_CHECKPOINT").ok().as_deref() != Some("1") {
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "agentic::execution::tests::r1_process_envelope_host_write_survives_physical_readonly", "--nocapture"])
+            .env("COWD_AUTO_CHECKPOINT", "1").output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("R1_REAL_CHECKPOINT_P2"));
+        return;
+    }
+    fn checkpoint_files(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn collect(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            if !path.exists() {
+                return;
+            }
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        collect(root, &root.join(".cowd/checkpoints"), &mut files);
+        files
+    }
+    for (name, scopes) in [
+        (
+            "physical-original-dual-scope",
+            vec!["read:.", "write:out/a"],
+        ),
+        (
+            "physical-missing-target",
+            vec!["read:.", "write:.cowd/checkpoints"],
+        ),
+    ] {
+        let denied = PhysicalProcessFixture::new(
+            crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+            name,
+        )
+        .await;
+        let worker = denied
+            .dispatch(
+                name,
+                scopes.into_iter().map(str::to_string).collect(),
+                true,
+                false,
+                true,
+            )
+            .await;
+        let before = checkpoint_files(denied.services.workspace_root());
+        let calls = denied.edit_calls();
+        let error = worker
+            .tool(
+                "edit",
+                serde_json::json!({"action":"write","path":"out/a","content":"unauthorized"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("resource lease"), "{name}: {error}");
+        assert_eq!(denied.edit_calls(), calls);
+        assert_eq!(checkpoint_files(denied.services.workspace_root()), before);
+        assert_eq!(
+            std::fs::read_to_string(denied.services.workspace_root().join("out/a")).unwrap(),
+            "initial narrow target"
+        );
+        worker.finish().await;
+    }
+    let fixture = PhysicalProcessFixture::new(
+        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+        "physical-narrow-write",
+    )
+    .await;
+    let worker = fixture
+        .dispatch(
+            "physical-narrow-write",
+            vec![
+                "read:.".into(),
+                "write:out/a".into(),
+                "write:.cowd/checkpoints".into(),
+            ],
+            true,
+            false,
+            true,
+        )
+        .await;
+    assert_eq!(
+        worker
+            .packet
+            .resource_scopes
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "program:program-dispatch",
+            "read:.",
+            "session:session-dispatch",
+            "write:out/a",
+            "write:.cowd/checkpoints"
+        ])
+    );
+    assert!(worker
+        .packet
+        .binding
+        .as_ref()
+        .unwrap()
+        .effective_capabilities
+        .contains(&harness_contract::agent::AgentCapability::Write));
+    assert!(worker
+        .packet
+        .allowed_tools
+        .iter()
+        .any(|tool| tool == "edit"));
+    assert!(worker.lifecycle().no_direct_effects());
+    assert_eq!(
+        worker
+            .probe(serde_json::json!({"kind":"write","path":"out/a","value":"direct bypass"}))
+            .await["ok"],
+        false
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.services.workspace_root().join("out/a")).unwrap(),
+        "initial narrow target"
+    );
+    std::fs::create_dir_all(fixture.services.workspace_root().join(".cowd/checkpoints")).unwrap();
+    let checkpoints_before = checkpoint_files(fixture.services.workspace_root());
+    std::fs::write(
+        fixture
+            .services
+            .workspace_root()
+            .join("out/snapshot-sibling"),
+        "must not be copied",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.services.workspace_root().join(".env"),
+        "sensitive sentinel must not be copied",
+    )
+    .unwrap();
+    assert_eq!(worker.probe(serde_json::json!({"kind":"write","path":".cowd/checkpoints/direct-probe.txt","value":"forbidden child checkpoint"})).await["ok"], false);
+    assert_eq!(
+        checkpoint_files(fixture.services.workspace_root()),
+        checkpoints_before
+    );
+    worker
+        .tool(
+            "edit",
+            serde_json::json!({"path":"out/a","content":"actual narrow Host write"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fixture.services.workspace_root().join("out/a")).unwrap(),
+        "actual narrow Host write"
+    );
+    let checkpoints_after = checkpoint_files(fixture.services.workspace_root());
+    assert_ne!(
+        checkpoints_after, checkpoints_before,
+        "real Tools auto-checkpoint must have occurred"
+    );
+    assert!(checkpoints_after
+        .iter()
+        .any(|(path, bytes)| path.ends_with("out/a") && bytes == b"initial narrow target"));
+    assert!(checkpoints_after.iter().any(|(path, bytes)| {
+        if path.ends_with(".manifest.json") && !checkpoints_before.contains_key(path) {
+            let manifest: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(manifest["scopes"], serde_json::json!(["out/a"]));
+            assert_eq!(manifest["files"], serde_json::json!(["out/a"]));
+            true
+        } else {
+            false
+        }
+    }));
+    for (path, bytes) in &checkpoints_after {
+        if !checkpoints_before.contains_key(path) {
+            assert!(
+                !path.ends_with("snapshot-sibling") && !path.ends_with(".env"),
+                "{path:?}"
+            );
+            assert_ne!(bytes.as_slice(), b"must not be copied");
+            assert_ne!(bytes.as_slice(), b"sensitive sentinel must not be copied");
+        }
+    }
+    for target in [
+        "out/b",
+        ".",
+        "../escape",
+        "/tmp/r1-unauthorized",
+        ".cowd/outside",
+    ] {
+        let calls = fixture.edit_calls();
+        assert!(worker.tool("edit", serde_json::json!({"action":"write","path":target,"content":"forbidden sibling"})).await.is_err(), "{target}");
+        assert_eq!(fixture.edit_calls(), calls);
+        assert_eq!(
+            checkpoint_files(fixture.services.workspace_root()),
+            checkpoints_after
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.services.workspace_root().join("out/a")).unwrap(),
+            "actual narrow Host write"
+        );
+    }
+    let receipts = fixture
+        .services
+        .commit_service()
+        .load_delegated_agent_tool_receipts(
+            worker.packet.graph_id(),
+            worker.packet.node_id(),
+            worker.packet.attempt,
+        )
+        .unwrap();
+    assert!(receipts
+        .iter()
+        .any(|receipt| receipt.outcome.tool_name == "edit"
+            && receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed));
+    let reader = fixture
+        .dispatch(
+            "physical-narrow-independent",
+            vec!["read:.".into()],
+            false,
+            false,
+            true,
+        )
+        .await;
+    assert_ne!(reader.packet.agent_id(), worker.packet.agent_id());
+    assert!(reader
+        .read("physical-independent-read", "out/a")
+        .await
+        .contains("actual narrow Host write"));
+    reader.assert_host_read("physical-independent-read");
+    reader.finish().await;
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        let outside_target = outside.path().join("outside.txt");
+        std::fs::write(&outside_target, "outside unchanged").unwrap();
+        let target = fixture.services.workspace_root().join("out/a");
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&outside_target, &target).unwrap();
+        assert!(worker
+            .tool(
+                "edit",
+                serde_json::json!({"action":"write","path":"out/a","content":"symlink escape"})
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(&outside_target).unwrap(),
+            "outside unchanged"
+        );
+        assert_eq!(
+            checkpoint_files(fixture.services.workspace_root()),
+            checkpoints_after
+        );
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, "actual narrow Host write").unwrap();
+    }
+    worker.finish().await;
+    println!("R1_REAL_CHECKPOINT_P2: initial three scopes, concrete dual-scope denial, actual checkpoint/target/receipt and independent Process read");
+}
+
+#[tokio::test]
+async fn r1_process_envelope_opaque_write_blocks_goal_after_reap() {
+    exercise_r1_proof_scenario(R1ProofScenario::PhysicalOpaque, DelegatedEffectCase::Review).await;
+}
+
+#[tokio::test]
+async fn r1_process_envelope_network_policy_intersection_controls_direct_nonce() {
+    const CASE: &str = "COWD_PHYSICAL_NETWORK_CASE";
+    if let Ok(case) = std::env::var(CASE) {
+        let profile = if case == "host-only-profile" {
+            crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly
+        } else {
+            crate::config::AgentExecutorSandboxProfile::WorkspaceReadOnly
+        };
+        let fixture = PhysicalProcessFixture::new(profile, &format!("physical-net-{case}")).await;
+        let network = case != "missing-capability";
+        let scopes = if case == "missing-scope" {
+            vec!["read:.".into()]
+        } else if case == "domain-scope" {
+            vec!["read:.".into(), "network:example.invalid".into()]
+        } else {
+            vec!["read:.".into(), "network:*".into()]
+        };
+        let worker = fixture.dispatch(&case, scopes, false, network, true).await;
+        let expected = matches!(case.as_str(), "allow" | "presence-false");
+        assert_eq!(
+            worker.lifecycle().semantic_fact()["envelope"]["network_enabled"],
+            expected
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let response = worker.probe(serde_json::json!({"kind":"nonce","port":listener.local_addr().unwrap().port(),"nonce":nonce})).await;
+        let received = tokio::time::timeout(std::time::Duration::from_millis(700), async {
+            use tokio::io::AsyncReadExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            socket.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        })
+        .await;
+        if expected {
+            assert_eq!(received.unwrap(), nonce.as_bytes());
+            assert_eq!(response["ok"], true);
+        } else {
+            assert!(
+                received.is_err(),
+                "off envelope must deny actual child TCP, not merely Host tool calls: {case}"
+            );
+            assert_eq!(response["ok"], false);
+        }
+        if case == "host-only-profile" {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/physical-host-network",
+                host_listener.local_addr().unwrap()
+            );
+            let body = format!("actual Host-only network nonce {nonce}");
+            let expected_body = body.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = host_listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let bytes = socket.read(&mut request).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..bytes]).contains("/physical-host-network")
+                );
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            });
+            let output = worker
+                .tool(
+                    "web_fetch",
+                    serde_json::json!({"url":url,"prompt":"Return the complete local nonce text"}),
+                )
+                .await
+                .unwrap();
+            assert!(output.contains(&expected_body), "physically-off worker must retain its actually authorized Host network capability: {output}");
+            server.await.unwrap();
+            let receipts = fixture
+                .services
+                .commit_service()
+                .load_delegated_agent_tool_receipts(
+                    worker.packet.graph_id(),
+                    worker.packet.node_id(),
+                    worker.packet.attempt,
+                )
+                .unwrap();
+            assert!(receipts
+                .iter()
+                .any(|receipt| receipt.outcome.tool_name == "web_fetch"
+                    && receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed));
+        }
+        println!("PHYSICAL_NETWORK_CASE {case}: actual_child_nonce={expected}");
+        worker.finish().await;
+        return;
+    }
+    for case in [
+        "allow",
+        "presence-false",
+        "missing-private",
+        "allow-list",
+        "block-list",
+        "ask",
+        "deny",
+        "invalid-mode",
+        "missing-capability",
+        "missing-scope",
+        "domain-scope",
+        "host-only-profile",
+    ] {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "agentic::execution::tests::r1_process_envelope_network_policy_intersection_controls_direct_nonce", "--nocapture"]);
+        command
+            .env(CASE, case)
+            .env("COWD_NETWORK_DOMAIN_MODE", "allow")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env_remove("COWD_NETWORK_DOMAIN_ALLOW")
+            .env_remove("COWD_NETWORK_DOMAIN_BLOCK")
+            .env(
+                "COWD_ALLOW_PRIVATE_NETWORK",
+                if case == "presence-false" {
+                    "false"
+                } else {
+                    "1"
+                },
+            );
+        match case {
+            "missing-private" => {
+                command.env_remove("COWD_ALLOW_PRIVATE_NETWORK");
+            }
+            "allow-list" => {
+                command.env("COWD_NETWORK_DOMAIN_ALLOW", "example.invalid");
+            }
+            "block-list" => {
+                command.env("COWD_NETWORK_DOMAIN_BLOCK", "example.invalid");
+            }
+            "ask" | "deny" | "invalid-mode" => {
+                command.env("COWD_NETWORK_DOMAIN_MODE", case);
+            }
+            _ => {}
+        }
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("PHYSICAL_NETWORK_CASE {case}:")),
+            "exact subprocess selector must run the actual case, not select zero tests"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r1_process_envelope_narrow_read_rejected_before_spawn() {
+    for scopes in [vec!["read:out/a".into()], vec!["read:out".into()]] {
+        let fixture = PhysicalProcessFixture::new(
+            crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+            "physical-narrow-read",
+        )
+        .await;
+        let worker = fixture
+            .dispatch("physical-narrow-read", scopes.clone(), false, false, false)
+            .await;
+        worker.wait_terminal().await;
+        let exit = crate::agent_runtime::confirmed_run_exit(
+            fixture.services.event_store(),
+            &worker.packet,
+        )
+        .unwrap()
+        .expect("real adapter must record NotStarted");
+        assert!(worker.lifecycle().no_direct_effects());
+        assert_eq!(worker.lifecycle().semantic_fact()["not_started"], true);
+        let reason = worker.terminal_failure();
+        assert!(reason.contains("physical_grant"), "{reason}");
+        assert!(!worker.directory().join("started.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.services.workspace_root().join("out/a")).unwrap(),
+            "initial narrow target"
+        );
+        assert!(!exit.1.is_empty());
+        worker.withdraw().await;
+        println!("PHYSICAL_NARROW_READ adapter NotStarted {scopes:?}");
+    }
+    let ambiguous = PhysicalProcessFixture::new(
+        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+        "physical-root-ambiguity",
+    )
+    .await;
+    for repository in ["repository-a", "repository-b"] {
+        std::fs::create_dir_all(
+            ambiguous
+                .services
+                .workspace_root()
+                .join(repository)
+                .join(".git"),
+        )
+        .unwrap();
+    }
+    let worker = ambiguous
+        .dispatch(
+            "physical-root-ambiguity",
+            vec!["read:.".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+    worker.wait_terminal().await;
+    assert!(worker.terminal_failure().contains("physical_grant"));
+    assert!(crate::agent_runtime::confirmed_run_exit(
+        ambiguous.services.event_store(),
+        &worker.packet
+    )
+    .unwrap()
+    .is_some());
+    assert!(!worker.directory().join("started.json").exists());
+    worker.withdraw().await;
+    for scopes in [
+        Vec::<String>::new(),
+        vec!["session:session-dispatch".into()],
+        vec!["read:../outside".into()],
+        vec!["read:/foreign-workspace".into()],
+    ] {
+        let fixture = PhysicalProcessFixture::new(
+            crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+            "physical-early-layer",
+        )
+        .await;
+        match fixture.try_dispatch("physical-early-layer", scopes.clone(), false, false, false).await {
+            Err(error) => println!("PHYSICAL_NARROW_READ earlier production admission, not OS evidence: {scopes:?}: {error}"),
+            Ok(worker) => {
+                worker.wait_terminal().await;
+                let reason = worker.terminal_failure();
+                assert!(!reason.is_empty());
+                assert!(!worker.directory().join("started.json").exists());
+                println!("PHYSICAL_NARROW_READ actual immutable packet terminal rejection: {scopes:?}: {reason}");
+                worker.withdraw().await;
+            }
+        }
+    }
+    let fixture = PhysicalProcessFixture::new(
+        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+        "physical-pure-boundary",
+    )
+    .await;
+    let worker = fixture
+        .dispatch(
+            "physical-pure-boundary",
+            vec!["read:.".into()],
+            false,
+            false,
+            true,
+        )
+        .await;
+    for scopes in [
+        Vec::<String>::new(),
+        vec!["session:session-dispatch".into()],
+        vec!["read:../outside".into()],
+        vec!["read:/foreign-workspace".into()],
+    ] {
+        let mut pure_negative = worker.packet.clone();
+        pure_negative.resource_scopes = scopes.clone();
+        let error = fixture
+            .services
+            .agent_runtime()
+            .validate_process_fixture_boundary(&pure_negative)
+            .unwrap_err();
+        assert!(error.contains("physical_grant"), "{error}");
+        println!("PHYSICAL_NARROW_READ pure unpersisted boundary negative, not a production Task/OS claim: {scopes:?}");
+    }
+    worker.finish().await;
+    exercise_physical_native_narrow_read().await;
+}
+
+#[tokio::test]
+async fn r1_process_envelope_all_lineage_attempts_remain_in_proof_cut() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::PhysicalLineage,
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_process_envelope_host_only_early_goal_and_actual_cold_b() {
+    exercise_physical_cold_optional_goal(R1ProofScenario::OptionalSharedCheckpoint).await;
+    exercise_physical_cold_optional_goal(R1ProofScenario::PhysicalAfterA).await;
+}
+
+#[tokio::test]
+async fn r1_process_envelope_scratch_is_private_until_confirmed_exit() {
+    use std::sync::atomic::Ordering;
+    let fixture = PhysicalProcessFixture::new(
+        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+        "physical-private-scratch",
+    )
+    .await;
+    let first = fixture
+        .dispatch("private-first", vec!["read:.".into()], false, false, true)
+        .await;
+    let second = fixture
+        .dispatch("private-second", vec!["read:.".into()], false, false, true)
+        .await;
+    assert_ne!(first.directory(), second.directory());
+    for (reader, other) in [(&first, &second), (&second, &first)] {
+        assert_eq!(
+            reader
+                .probe(
+                    serde_json::json!({"kind":"read","path":other.directory().join("started.json")})
+                )
+                .await["ok"],
+            false
+        );
+        assert_eq!(reader.probe(serde_json::json!({"kind":"write","path":other.directory().join("cross-run.txt"),"value":"forbidden"})).await["ok"], false);
+        assert!(!other.directory().join("cross-run.txt").exists());
+    }
+    let gate = fixture
+        .services
+        .agent_runtime()
+        .process_fixture_exit_gate(false);
+    first.finish_only().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !gate.entered.load(Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        first.directory().exists(),
+        "result and kill request do not authorize scratch cleanup"
+    );
+    assert!(crate::agent_runtime::confirmed_run_exit(
+        fixture.services.event_store(),
+        &first.packet
+    )
+    .unwrap()
+    .is_none());
+    gate.release();
+    first.wait_exit().await;
+    assert!(!first.directory().exists());
+    assert!(second.directory().exists());
+    second.finish().await;
+    assert!(!second.directory().exists());
+    let unknown_gate = fixture
+        .services
+        .agent_runtime()
+        .process_fixture_exit_gate(true);
+    let unknown = fixture
+        .dispatch("private-unknown", vec!["read:.".into()], false, false, true)
+        .await;
+    unknown.finish_only().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !unknown_gate.entered.load(Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    unknown_gate.release();
+    unknown.wait_terminal().await;
+    assert!(
+        unknown.directory().exists(),
+        "driver join failure preserves quarantined scratch"
+    );
+    assert!(crate::agent_runtime::confirmed_run_exit(
+        fixture.services.event_store(),
+        &unknown.packet
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[tokio::test]
+async fn r1_process_cleanup_failure_preserves_reaped_and_reports_residue() {
+    use std::sync::atomic::Ordering;
+    let fixture = PhysicalProcessFixture::new(
+        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+        "cleanup-remove-failure",
+    )
+    .await;
+    let failed = fixture
+        .dispatch("cleanup-failed", vec!["read:.".into()], false, false, true)
+        .await;
+    let other = fixture
+        .dispatch("cleanup-other", vec!["read:.".into()], false, false, true)
+        .await;
+    let driver_error = observe_process_cleanup_driver(&failed.packet);
+    let exact = failed.directory();
+    let isolated = exact.with_extension("quarantine");
+    let gate = fixture
+        .services
+        .agent_runtime()
+        .process_fixture_exit_gate(false);
+    failed.finish_only().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !gate.entered.load(Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(crate::agent_runtime::confirmed_run_exit(
+        fixture.services.event_store(),
+        &failed.packet
+    )
+    .unwrap()
+    .is_none());
+    std::fs::rename(&exact, &isolated).unwrap();
+    std::fs::write(&exact, b"exact run sentinel").unwrap();
+    gate.release();
+    failed.wait_exit().await;
+    failed.wait_terminal().await;
+    let witness =
+        crate::agent_runtime::confirmed_run_exit(fixture.services.event_store(), &failed.packet)
+            .unwrap()
+            .expect("actual wait/join remains exact Reaped despite cleanup failure");
+    assert!(format!("{witness:?}").contains("ProcessReaped"));
+    let failure = driver_error
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert!(failure.contains("scratch cleanup failed"), "{failure}");
+    assert!(
+        failure.contains("NotADirectory") || failure.to_lowercase().contains("not a directory"),
+        "{failure}"
+    );
+    assert!(failure.contains(&exact.display().to_string()), "{failure}");
+    assert!(failure.contains(failed.packet.run_id()), "{failure}");
+    assert_eq!(std::fs::read(&exact).unwrap(), b"exact run sentinel");
+    assert!(isolated.is_dir());
+    assert!(other.directory().is_dir());
+    std::fs::remove_file(&exact).unwrap();
+    std::fs::rename(&isolated, &exact).unwrap();
+    retry_process_owned_scratch(&failed.packet, &exact).unwrap();
+    assert!(!exact.exists());
+    assert!(!isolated.exists());
+    assert!(other.directory().is_dir());
+    other.finish().await;
+    assert!(!other.directory().exists());
+}
 
 #[test]
 fn claim_heartbeat_follows_only_nonterminal_physical_graphs() {
@@ -315,6 +2098,141 @@ async fn proven_text_goal_is_satisfied_while_original_workers_physically_drain()
 }
 
 #[tokio::test]
+async fn r1_proof_unrelated_note_preserves_current_verdict() {
+    exercise_r1_proof_scenario(R1ProofScenario::UnrelatedNote, DelegatedEffectCase::None).await;
+}
+
+#[tokio::test]
+async fn r1_proof_execution_epoch_does_not_retroactively_revoke_acceptance() {
+    exercise_r1_proof_scenario(R1ProofScenario::ExecutionEpoch, DelegatedEffectCase::Review).await;
+}
+
+#[tokio::test]
+async fn r1_proof_related_result_and_policy_changes_require_new_review() {
+    exercise_reviewed_goal_delivery_kind(false, true, DelegatedEffectCase::None, false).await;
+    exercise_r1_proof_scenario(R1ProofScenario::AcceptancePolicy, DelegatedEffectCase::None).await;
+}
+
+#[tokio::test]
+async fn r1_proof_material_enumeration_race_requires_full_retry() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::MaterialEnumerationRace,
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_proof_partial_dependency_and_producer_only_reads_do_not_refresh_reviewer() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::PartialDependency,
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_optional_unknown_bound_tool_children_require_exact_parent_and_attempt() {
+    for scenario in [
+        R1ProofScenario::OptionalForeignChild,
+        R1ProofScenario::OptionalWrongChildAttempt,
+        R1ProofScenario::OptionalMixedChild,
+    ] {
+        exercise_r1_proof_scenario(scenario, DelegatedEffectCase::Review).await;
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_primary_influence_from_reviewer_material_is_rejected() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReviewerInfluence,
+        DelegatedEffectCase::None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_proof_transitive_materials_close_producer_and_approval_sources() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::TransitiveDependency,
+        DelegatedEffectCase::None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_optional_unknown_disjoint_scope_remains_visible() {
+    for scenario in [
+        R1ProofScenario::OptionalForgedB,
+        R1ProofScenario::OptionalForeignB,
+    ] {
+        exercise_r1_proof_scenario(scenario, DelegatedEffectCase::Review).await;
+    }
+    exercise_r1_proof_scenario(
+        R1ProofScenario::OptionalSharedCheckpoint,
+        DelegatedEffectCase::Review,
+    )
+    .await;
+    exercise_r1_proof_scenario(
+        R1ProofScenario::OptionalSourceRace,
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_proof_legacy_replay_does_not_recompute_policy() {
+    for unknown_version in [false, true] {
+        let host = Arc::new(ReviewReadHost::default());
+        let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
+        Box::pin(exercise_reviewed_goal_proof_scenario(
+            services,
+            host,
+            false,
+            false,
+            DelegatedEffectCase::None,
+            true,
+            PhysicalDrainTiming::BeforeGoal,
+            R1ProofScenario::LegacyReplay(unknown_version),
+        ))
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn r1_optional_unknown_missing_or_overlapping_scope_blocks_satisfied() {
+    for scenario in [
+        R1ProofScenario::OptionalOverlap,
+        R1ProofScenario::OptionalMissingIdentity,
+        R1ProofScenario::OptionalHardlink,
+        R1ProofScenario::OptionalBroad,
+        R1ProofScenario::OptionalMixedDomain,
+        R1ProofScenario::OptionalNotRetiring,
+    ] {
+        exercise_r1_proof_scenario(scenario, DelegatedEffectCase::Review).await;
+    }
+}
+
+async fn exercise_r1_proof_scenario(
+    scenario: R1ProofScenario,
+    delegated_case: DelegatedEffectCase,
+) {
+    let host = Arc::new(ReviewReadHost::default());
+    let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
+    Box::pin(exercise_reviewed_goal_proof_scenario(
+        services,
+        host,
+        false,
+        false,
+        delegated_case,
+        delegated_case == DelegatedEffectCase::None,
+        PhysicalDrainTiming::AfterGoal,
+        scenario,
+    ))
+    .await;
+}
+
+#[tokio::test]
 async fn proven_effect_goal_revokes_future_mutation_before_physical_worker_drain() {
     exercise_proven_goal_while_workers_drain(DelegatedEffectCase::Review, false).await;
 }
@@ -473,7 +2391,27 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
     // This admission test authors decline/exit itself. Keep each real Runner
     // backend pending so an unconfigured model cannot fail the opportunity
     // concurrently with those assertions.
-    struct MarketWorkerResolver(Vec<Arc<ReviewWorkerHold>>);
+    struct MarketPendingWorker {
+        task_ref: String,
+    }
+    #[async_trait::async_trait]
+    impl crate::execution_core::graph::executors::AgentTaskBackend for MarketPendingWorker {
+        async fn execute(
+            &self,
+            _: AgentTaskPacket,
+        ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
+            std::future::pending().await
+        }
+
+        async fn cancel(&self, _: &AgentTaskPacket) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancellation_finalized(&self, packet: &AgentTaskPacket) {
+            assert_eq!(packet.task_id(), self.task_ref);
+        }
+    }
+    struct MarketWorkerResolver(Vec<Arc<MarketPendingWorker>>);
     impl crate::execution_core::graph::executors::AgentTaskBackendResolver for MarketWorkerResolver {
         fn resolve(
             &self,
@@ -494,11 +2432,8 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
             tasks
                 .iter()
                 .map(|task_ref| {
-                    Arc::new(ReviewWorkerHold {
+                    Arc::new(MarketPendingWorker {
                         task_ref: task_ref.clone(),
-                        entered: tokio::sync::Notify::new(),
-                        cancelled: std::sync::atomic::AtomicBool::new(false),
-                        finalized: Default::default(),
                     })
                 })
                 .collect(),
@@ -521,20 +2456,16 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         second[0].agent_ref, volunteer,
         "an admitted but unclaimed opportunity is busy"
     );
-    assert!(
-        services
-            .dispatch_agentic_followups(&publications[2], context.clone())
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        services
-            .dispatch_agentic_followups(&offer, context.clone())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(services
+        .dispatch_agentic_followups(&publications[2], context.clone())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(services
+        .dispatch_agentic_followups(&offer, context.clone())
+        .await
+        .unwrap()
+        .is_empty());
     let mut occupied = root(
         "duplicate-member-dispatch",
         AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
@@ -576,25 +2507,21 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0].task_ref, tasks[2]);
     assert_eq!(resumed[0].agent_ref, volunteer);
-    assert!(
-        services
-            .dispatch_ready_agentic_work("program-dispatch")
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(services
+        .dispatch_ready_agentic_work("program-dispatch")
+        .await
+        .unwrap()
+        .is_empty());
     let projection = actions.project("program-dispatch").unwrap();
     assert_eq!(
         projection.tasks[&tasks[0]].status,
         AgenticTaskStatus::Published
     );
     assert!(projection.tasks[&tasks[0]].active_attempts.is_empty());
-    assert!(
-        projection
-            .tasks
-            .values()
-            .all(|task| task.claimant.is_none() && task.failed_attempts == 0)
-    );
+    assert!(projection
+        .tasks
+        .values()
+        .all(|task| task.claimant.is_none() && task.failed_attempts == 0));
 }
 
 #[tokio::test]
@@ -686,13 +2613,11 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
             .unwrap();
         assert_eq!(next.len(), usize::from(index == 0));
         assert!(actions.apply(&decline).unwrap().duplicate);
-        assert!(
-            services
-                .dispatch_agentic_followups(&decline, context.clone())
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(services
+            .dispatch_agentic_followups(&decline, context.clone())
+            .await
+            .unwrap()
+            .is_empty());
         if let Some(next) = next.first() {
             receipt = next.clone();
         }
@@ -701,17 +2626,17 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
     assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Published);
     assert_eq!(projection.tasks[&task].failed_attempts, 0);
     assert!(projection.tasks[&task].active_attempts.is_empty());
-    assert!(
-        helpers::eligible_members(&projection, &projection.tasks[&task], DispatchMode::Execute)
-            .is_empty()
-    );
-    assert!(
-        services
-            .recover_agentic_programs_on_startup()
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(helpers::eligible_members(
+        &projection,
+        &projection.tasks[&task],
+        DispatchMode::Execute
+    )
+    .is_empty());
+    assert!(services
+        .recover_agentic_programs_on_startup()
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         actions.project("program-dispatch").unwrap().revision,
         projection.revision
@@ -832,19 +2757,17 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
         .unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].agent_ref, valid);
-    assert!(
-        services
-            .dispatch_agentic_task(
-                &projection,
-                &task,
-                DispatchMode::Execute,
-                &context,
-                &trigger
-            )
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(services
+        .dispatch_agentic_task(
+            &projection,
+            &task,
+            DispatchMode::Execute,
+            &context,
+            &trigger
+        )
+        .await
+        .unwrap()
+        .is_empty());
     // Publishing discussion alone must not launch an idle worker. A typed
     // request for a ready Task enters the existing dispatcher once.
     let followup_task = actions
@@ -1439,13 +3362,11 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
         )
         .expect("cancel root");
     for mode in [DispatchMode::Execute, DispatchMode::Review] {
-        assert!(
-            services
-                .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger,)
-                .await
-                .expect("terminal root is not an admission error")
-                .is_empty()
-        );
+        assert!(services
+            .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger,)
+            .await
+            .expect("terminal root is not an admission error")
+            .is_empty());
     }
 }
 
@@ -1831,226 +3752,22 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
 
 #[tokio::test]
 async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
-    let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
-    services.publish_session_execution_policy(
-        "session-dispatch",
-        crate::permissions::SessionExecutionPolicyControl::from_policy(
-            harness_contract::policy::SessionExecutionPolicy::from_profile(
-                harness_contract::policy::AutonomyProfileId::Autonomous,
-                1,
-                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
-            ),
-        ),
-    );
-    let actions = services.agent_action_service();
-    let author_team = actions
-        .apply(&root(
-            "author-team",
-            AgentAction::TeamCreate(TeamCreateInput {
-                name: "Authors".to_string(),
-                mission: "produce".to_string(),
-                objective: None,
-            }),
-        ))
-        .expect("author team")
-        .changed_refs[0]
-        .clone();
-    let review_team = actions
-        .apply(&root(
-            "review-team",
-            AgentAction::TeamCreate(TeamCreateInput {
-                name: "Reviewers".to_string(),
-                mission: "independently verify".to_string(),
-                objective: None,
-            }),
-        ))
-        .expect("review team")
-        .changed_refs[0]
-        .clone();
-    let author = actions
-        .apply(&root(
-            "author",
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: author_team.clone(),
-                role: "Author".to_string(),
-                mission: "produce evidence".to_string(),
-                required_capabilities: vec!["read".to_string()],
-                existing_agent_ref: None,
-                definition_ref: None,
-                model_profile_ref: None,
-                expertise_hints: Vec::new(),
-                execution_requirements: Vec::new(),
-            }),
-        ))
-        .expect("author")
-        .changed_refs[0]
-        .clone();
-    let reviewer = actions
-        .apply(&root(
-            "reviewer",
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: review_team.clone(),
-                role: "Reviewer".to_string(),
-                mission: "verify another team".to_string(),
-                required_capabilities: vec!["read".to_string()],
-                existing_agent_ref: None,
-                definition_ref: Some("builtin/cowd/execute".into()),
-                model_profile_ref: None,
-                expertise_hints: Vec::new(),
-                execution_requirements: Vec::new(),
-            }),
-        ))
-        .expect("reviewer")
-        .changed_refs[0]
-        .clone();
-    let task = actions
-        .apply(&root(
-            "cross-review-task",
-            AgentAction::TaskPublish(TaskPublishInput {
-                team_ref: author_team.clone(),
-                title: "Cross-Team result".to_string(),
-                objective: "produce durable evidence".to_string(),
-                acceptance: "independent review".to_string(),
-                criterion_source: Default::default(),
-                acceptance_checks: Vec::new(),
-                required_capabilities: vec!["read".to_string(), "network".to_string()],
-                depends_on: Vec::new(),
-
-                obligation_refs: Vec::new(),
-                purpose: Default::default(),
-                execution_requirements: Vec::new(),
-                expertise_hints: Vec::new(),
-            }),
-        ))
-        .expect("task")
-        .changed_refs[0]
-        .clone();
-    let author_execution = "author-execution";
-    actions
-        .apply(&agent(
-            "author-claim",
-            &author_team,
-            &author,
-            author_execution,
-            AgentAction::TaskClaim(TaskClaimInput {
-                task_ref: task.clone(),
-                reason: None,
-            }),
-        ))
-        .expect("claim");
-    let content = services
-        .artifact_store()
-        .write_bytes(
-            harness_contract::context::ArtifactWriteDescriptor {
-                media_type: "text/markdown".to_string(),
-                visibility_scope: "session:session-dispatch".to_string(),
-                expected_bytes: None,
-                original_name: Some("cross-review.md".to_string()),
-            },
-            b"independently reviewable result",
-        )
-        .await
-        .expect("content");
-    let artifact = actions
-        .apply(&agent(
-            "author-artifact",
-            &author_team,
-            &author,
-            author_execution,
-            AgentAction::ArtifactCommit(ArtifactCommitInput {
-                content_ref: content.selector.clone(),
-                kind: "report".to_string(),
-                title: "Cross-Team report".to_string(),
-                relates_to: vec![task.clone()],
-            }),
-        ))
-        .expect("artifact")
-        .changed_refs[0]
-        .clone();
-    let submit = agent(
-        "author-submit",
-        &author_team,
-        &author,
-        author_execution,
-        AgentAction::TaskSubmit(TaskSubmitInput {
-            deliverable: None,
-            task_ref: task.clone(),
-            artifact_refs: vec![artifact],
-            evidence_refs: vec![content.selector.clone()],
-            unresolved: Vec::new(),
-        }),
-    );
-    actions.apply(&submit).expect("submit");
-    let review = services
-        .dispatch_agentic_followups(
-            &submit,
-            AgenticDispatchContext {
-                session_id: "session-dispatch".to_string(),
-                turn_id: "turn-dispatch".to_string(),
-                model_lease: "test".to_string(),
-                permission_ceiling: PermissionMode::ReadOnly,
-                resource_scopes: Vec::new(),
-            },
-        )
-        .await
-        .expect("review dispatch");
-    assert_eq!(review.len(), 1);
-    assert_eq!(review[0].agent_ref, reviewer);
-    let graph = services
-        .graph_state_store()
-        .load(&review[0].graph_id)
-        .expect("review graph");
-    let packet: AgentTaskPacket =
-        serde_json::from_str(&graph.nodes[0].payload_ref).expect("packet");
-    let agentic = packet
-        .agentic_binding
-        .as_ref()
-        .expect("typed Agentic execution binding");
-    assert_eq!(agentic.team_id, review_team);
-    assert_eq!(agentic.task_team_id, author_team);
-    assert!(matches!(
-        &agentic.focus,
-        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref: bound_task_ref }
-            if bound_task_ref == &task
-    ));
-    let binding = ExecutionParentBinding {
-        execution_id: graph.id.clone(),
-        node_id: graph.nodes[0].id.clone(),
-    };
-    let reviewer_actor = services
-        .resolve_agent_action_actor(&binding, None)
-        .await
-        .expect("trusted reviewer actor");
-    assert_eq!(
-        reviewer_actor.team_id.as_deref(),
-        Some(review_team.as_str())
-    );
-    let accepted = actions
-        .apply(&AgentActionEnvelope {
-            action_id: "cross-team-accept".to_string(),
-            actor: reviewer_actor,
-            expected_revision: None,
-            action: AgentAction::TaskReview(TaskReviewInput {
-                operator_requirement: None,
-                task_ref: task.clone(),
-                decision: TaskReviewDecision::Accept,
-                reason: "artifact evidence inspected".to_string(),
-                evidence_refs: vec![content.selector],
-            }),
-        })
-        .expect("review");
-    assert_eq!(
-        accepted.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    assert_eq!(
-        actions
-            .project("program-dispatch")
-            .expect("projection")
-            .tasks[&task]
-            .status,
-        AgenticTaskStatus::Accepted
-    );
+    with_native_cross_team_before_a(|services, program, prepared, _| {
+        let native = program
+            .tasks
+            .values()
+            .find(|task| task.title == "Native immutable source proof")
+            .unwrap();
+        assert_eq!(native.status, AgenticTaskStatus::Accepted);
+        assert_ne!(native.claimant, native.reviewed_by);
+        assert!(prepared.gaps.is_empty());
+        let after = services
+            .agent_action_service()
+            .commit_program_conclusion(program, prepared)
+            .unwrap();
+        assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2077,6 +3794,7 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
     let host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
     host.services.set(Arc::downgrade(&services)).unwrap();
+    install_real_process_fixture(&services, &host).await;
     services
         .goal_store()
         .create(GoalContract {
@@ -2166,15 +3884,13 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             }),
         )
     };
-    assert!(
-        services
-            .submit_agent_action(&review(
-                "missing-read",
-                vec![artifact.changed_refs[0].clone()]
-            ))
-            .await
-            .is_err()
-    );
+    assert!(services
+        .submit_agent_action(&review(
+            "missing-read",
+            vec![artifact.changed_refs[0].clone()]
+        ))
+        .await
+        .is_err());
     let (raw, runtime) =
         root_reads_generic_results(&services, host, &content.selector, true, local_effect).await;
     let raw = raw.unwrap();
@@ -2245,12 +3961,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
                 },
             )
             .unwrap();
-        assert!(
-            services
-                .approval_result_content("session-dispatch", &reference)
-                .await
-                .is_err()
-        );
+        assert!(services
+            .approval_result_content("session-dispatch", &reference)
+            .await
+            .is_err());
         services
             .approval_queue()
             .decide_surface_human(
@@ -2269,12 +3983,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
                 },
             )
             .unwrap();
-        assert!(
-            services
-                .approval_result_content("foreign-session", &reference)
-                .await
-                .is_err()
-        );
+        assert!(services
+            .approval_result_content("foreign-session", &reference)
+            .await
+            .is_err());
         let (_, decided, _) = services
             .approval_result_content("session-dispatch", &reference)
             .await
@@ -2284,12 +3996,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             "denial is an authentic result, not approval to execute"
         );
         references.push(reference.clone());
-        assert!(
-            services
-                .submit_agent_action(&review("external-unread", references.clone()))
-                .await
-                .is_err()
-        );
+        assert!(services
+            .submit_agent_action(&review("external-unread", references.clone()))
+            .await
+            .is_err());
         let activity = serde_json::from_value(serde_json::json!({
             "root_execution_id":"root-agentic-execution", "session_id":"session-dispatch", "turn_id":"turn-dispatch",
             "root_task_id":"task-root-dispatch", "task_id":"task-root-dispatch", "activity_id":"root-agentic-execution:model",
@@ -2320,13 +4030,11 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         assert_eq!(read.failed, 0, "{:?}", read.messages);
     }
     if local_effect {
-        assert!(
-            services
-                .submit_agent_action(&review("receipt-only", references.clone()))
-                .await
-                .unwrap_err()
-                .contains("review_requires_effect_observation")
-        );
+        assert!(services
+            .submit_agent_action(&review("receipt-only", references.clone()))
+            .await
+            .unwrap_err()
+            .contains("review_requires_effect_observation"));
         std::fs::write(
             services.workspace_root().join("unrelated-review.txt"),
             "unrelated",
@@ -2340,13 +4048,11 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             "",
         )
         .await;
-        assert!(
-            services
-                .submit_agent_action(&review("wrong-target", references.clone()))
-                .await
-                .unwrap_err()
-                .contains("review_requires_effect_observation")
-        );
+        assert!(services
+            .submit_agent_action(&review("wrong-target", references.clone()))
+            .await
+            .unwrap_err()
+            .contains("review_requires_effect_observation"));
         root_review_target_tool(
             &runtime,
             "root-current-local-target",
@@ -2375,12 +4081,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         assert!(proof.reads.iter().any(
             |read| read.result_kind == harness_contract::goal::GoalResultKind::ExternalDecision
         ));
-        assert!(
-            proof
-                .producer_execution_ids
-                .iter()
-                .any(|id| id.starts_with("approval-decision:"))
-        );
+        assert!(proof
+            .producer_execution_ids
+            .iter()
+            .any(|id| id.starts_with("approval-decision:")));
     }
     if local_effect {
         assert!(
@@ -2438,13 +4142,11 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
                 .status,
             crate::AgenticProgramStatus::Open
         );
-        assert!(
-            services
-                .submit_agent_action(&review("stale-local-observation", references.clone()))
-                .await
-                .unwrap_err()
-                .contains("review_requires_effect_observation")
-        );
+        assert!(services
+            .submit_agent_action(&review("stale-local-observation", references.clone()))
+            .await
+            .unwrap_err()
+            .contains("review_requires_effect_observation"));
         root_review_target_tool(
             &runtime,
             "root-current-local-target-again",
@@ -2497,13 +4199,11 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         )
         .await
         .unwrap();
-    assert!(
-        services
-            .submit_agent_action(&review("unpublished-result", vec![orphan.selector]))
-            .await
-            .unwrap_err()
-            .contains("Runtime-resolved producer")
-    );
+    assert!(services
+        .submit_agent_action(&review("unpublished-result", vec![orphan.selector]))
+        .await
+        .unwrap_err()
+        .contains("Runtime-resolved producer"));
     let foreign = services
         .artifact_store()
         .write_bytes(
@@ -2517,13 +4217,11 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         )
         .await
         .unwrap();
-    assert!(
-        services
-            .submit_agent_action(&review("foreign-result", vec![foreign.selector]))
-            .await
-            .unwrap_err()
-            .contains("not readable")
-    );
+    assert!(services
+        .submit_agent_action(&review("foreign-result", vec![foreign.selector]))
+        .await
+        .unwrap_err()
+        .contains("not readable"));
     let requested = services
         .submit_agent_action(&bind(
             "root-complete",
@@ -2570,12 +4268,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             payload: serde_json::json!({}),
         })
         .unwrap();
-    assert!(
-        services
-            .agent_action_service()
-            .commit_program_conclusion(&before, prepared)
-            .is_err()
-    );
+    assert!(services
+        .agent_action_service()
+        .commit_program_conclusion(&before, prepared)
+        .is_err());
     assert_eq!(
         services
             .agent_action_service()
@@ -2584,15 +4280,13 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             .revision,
         before.revision
     );
-    assert!(
-        services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap()
-            .terminal
-            .is_none()
-    );
+    assert!(services
+        .goal_store()
+        .get("goal:root-agentic-execution")
+        .unwrap()
+        .unwrap()
+        .terminal
+        .is_none());
     let supervisor =
         crate::execution_core::goal::ObjectiveSupervisor::new(Arc::clone(services.goal_store()));
     crate::agentic::supervision::reconcile_completion_request(
@@ -2676,15 +4370,13 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             verifier_decision: None,
             diagnostic_code: None,
         });
-    assert!(
-        crate::agentic::review_evidence::root_self_review_policy(
-            services.event_store(),
-            &final_program,
-            &independent_goal
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(crate::agentic::review_evidence::root_self_review_policy(
+        services.event_store(),
+        &final_program,
+        &independent_goal
+    )
+    .unwrap()
+    .is_none());
     let strategy = services
         .event_store()
         .list_stream("session:session-dispatch")
@@ -3082,4 +4774,239 @@ async fn one_shot_deliverable_without_a_resolved_ref_is_rejected() {
     assert!(guidance.contains("task_submit.deliverable"));
     assert!(guidance.contains("same Task, Agent, and attempt"));
     assert!(guidance.contains("file or multipart deliverables"));
+}
+
+#[tokio::test]
+async fn r1_proof_program_registration_preserves_tool_publisher_and_committer() {
+    for logical in [true, false] {
+        for encoding in [None] {
+            exercise_program_publication_case(ProgramPublicationCase {
+                logical,
+                encoding,
+                probe: ProgramPublicationProbe::Metadata,
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_program_registered_legacy_publication_never_becomes_strong() {
+    for logical in [true, false] {
+        for encoding in [Some("legacy")] {
+            exercise_program_publication_case(ProgramPublicationCase {
+                logical,
+                encoding,
+                probe: ProgramPublicationProbe::Independent,
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_program_registered_bad_raw_anchor_never_falls_back() {
+    for logical in [true, false] {
+        for encoding in [
+            Some("version"),
+            Some("tool_call_id"),
+            Some("ref_id"),
+            Some("visibility_scope"),
+            Some("sha256"),
+            Some("byte_count"),
+            Some("selector"),
+            Some("media_type"),
+        ] {
+            exercise_program_publication_case(ProgramPublicationCase {
+                logical,
+                encoding,
+                probe: ProgramPublicationProbe::Independent,
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_program_registered_original_publisher_cannot_review() {
+    for logical in [true, false] {
+        for encoding in [None] {
+            exercise_program_publication_case(ProgramPublicationCase {
+                logical,
+                encoding,
+                probe: ProgramPublicationProbe::Publisher,
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_program_registered_independent_read_review_survives_cold_b() {
+    for logical in [true, false] {
+        for encoding in [None] {
+            exercise_program_publication_case(ProgramPublicationCase {
+                logical,
+                encoding,
+                probe: ProgramPublicationProbe::Independent,
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_program_registered_recursive_primary_keeps_publisher_influence() {
+    for logical in [true, false] {
+        for encoding in [None, Some("legacy"), Some("version")] {
+            exercise_program_publication_case(ProgramPublicationCase {
+                logical,
+                encoding,
+                probe: ProgramPublicationProbe::Recursive,
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_proof_program_registered_anchor_loss_after_a_rejected_by_actual_b() {
+    for logical in [true, false] {
+        for encoding in [None] {
+            exercise_program_publication_case(ProgramPublicationCase {
+                logical,
+                encoding,
+                probe: ProgramPublicationProbe::AnchorLoss,
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_read_delivery_process_authorized_review_preserves_strong_grade() {
+    exercise_real_process_grade_contract().await;
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Authorized),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_read_delivery_process_failed_or_partial_send_cannot_promote() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Preview),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::FailedSend),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_read_delivery_mechanical_oracle_is_not_model_observation() {
+    exercise_real_process_grade_contract().await;
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Mechanical),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_read_delivery_pages_require_same_version_attempt_and_complete_extent() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Pages),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_read_delivery_late_delivery_does_not_refresh_old_acquisition() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::LateDelivery),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_proof_native_raw_anchor_source_change_rejected_by_actual_b() {
+    exercise_native_sources_with_changed_anchor_source().await;
+}
+
+#[tokio::test]
+async fn r1_proof_native_raw_content_anchor_survives_missing_session_mapping() {
+    exercise_native_sources_with_cold_readers().await;
+}
+
+#[tokio::test]
+async fn r1_read_delivery_proof_and_goal_cas_bind_actual_delivery_sources() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Sources),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+    exercise_native_sources_with_cold_readers().await;
+}
+
+#[tokio::test]
+async fn r1_read_delivery_legacy_missing_seal_never_reconstructs_current_files() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Authorized),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Legacy),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_optional_unknown_command_ack_does_not_settle_physical_attempt() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::CommandAck),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_optional_unknown_restarted_run_requires_exact_exit_evidence() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Restart),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_optional_unknown_process_reap_and_effect_settlement_are_independent() {
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::ReapAndEffect),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_proof_effect_observations_reject_wrong_target_or_old_acquisition() {
+    exercise_native_sources_with_cold_readers().await;
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::Effects),
+        DelegatedEffectCase::Review,
+    )
+    .await;
+    exercise_r1_proof_scenario(
+        R1ProofScenario::ReadDelivery(RealProcessProofCase::LateDelivery),
+        DelegatedEffectCase::Review,
+    )
+    .await;
 }

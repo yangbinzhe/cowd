@@ -127,6 +127,10 @@ pub fn harness_eval_worker_entry(args: &[String]) -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+#[path = "../../runtime-postgres/test-support/current_terminal_fixture.rs"]
+pub(crate) mod current_terminal_fixture;
+
+#[cfg(test)]
 pub(crate) mod pg_test_support {
     use std::sync::{Arc, OnceLock};
 
@@ -800,6 +804,7 @@ Run `cowd --help` for usage."
 
 fn run_backend_entry() -> Result<(), Box<dyn std::error::Error>> {
     logging::init_logging(VERSION);
+    let _logging_flush_guard = logging::LogFlushGuard;
     setup_sigchld_handler();
 
     let args: Vec<String> = env::args().skip(1).collect();
@@ -2107,6 +2112,7 @@ fn enforce_broad_cwd_policy(
         let trimmed = input.trim().to_lowercase();
         if trimmed != "y" && trimmed != "yes" {
             eprintln!("Aborted.");
+            logging::flush_logging();
             std::process::exit(0);
         }
         Ok(())
@@ -2133,6 +2139,7 @@ fn enforce_broad_cwd_policy(
                 eprintln!("error: {message}");
             }
         }
+        logging::flush_logging();
         std::process::exit(1);
     }
 }

@@ -390,8 +390,18 @@ fn auth_error_response(
     status: StatusCode,
     message: String,
 ) -> Response {
-    let _ = (state, path);
-    (status, Json(ErrorResponse { error: message })).into_response()
+    let _ = state;
+    let mut response = (status, Json(ErrorResponse { error: message })).into_response();
+    if path.starts_with("/api/sessions/")
+        && path.contains("/messages/")
+        && (path.ends_with("/receipt-context") || path.ends_with("/ack"))
+    {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 pub(super) fn authenticated_human_principal(
@@ -993,10 +1003,12 @@ pub mod test_support {
                             if let Err(error) = tokio_runtime
                                 .block_on(runtime_services.release_recovered_producers())
                             {
-                                let _ = ready_tx.send(Err(format!(
-                                    "Gateway test Runtime producer release failed: {error}"
-                                )));
                                 tokio_runtime.block_on(supervisor.shutdown());
+                                let execution_report = tokio_runtime.block_on(runtime_services.shutdown_execution());
+                                tokio_runtime.block_on(runtime_services.shutdown_maintenance());
+                                let _ = ready_tx.send(Err(format!(
+                                    "Gateway test Runtime producer release failed: {error}; Runtime rollback: {execution_report:?}"
+                                )));
                                 return;
                             }
                             supervisor.release_recovered_producers();
@@ -1263,7 +1275,7 @@ pub mod test_support {
     /// The owner PID is part of the name so the next process can tell a live
     /// root from a leaked one without guessing from age alone.
     fn unique_test_root(label: &str) -> PathBuf {
-        test_root_dir(label)
+        super::test_root_dir(label)
     }
 }
 

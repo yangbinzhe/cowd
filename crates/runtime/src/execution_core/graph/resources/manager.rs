@@ -550,8 +550,9 @@ struct ManagerState {
     next_enqueue_sequence: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Shared {
+    owner_generation: Uuid,
     state: Mutex<ManagerState>,
     changed: Notify,
 }
@@ -578,6 +579,16 @@ struct IncreaseBaseline {
     sample_sequence: u64,
     service_p95_ms: u64,
     throughput_per_minute: u64,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            owner_generation: Uuid::new_v4(),
+            state: Mutex::new(ManagerState::default()),
+            changed: Notify::new(),
+        }
+    }
 }
 
 /// Instance-owned dynamic quota and backpressure manager.
@@ -634,6 +645,7 @@ impl ExecutionResourceManager {
         let accepting_resources = resources.keys().cloned().collect();
         Self {
             shared: Arc::new(Shared {
+                owner_generation: Uuid::new_v4(),
                 state: Mutex::new(ManagerState {
                     resources,
                     accepting_resources,
@@ -1206,6 +1218,35 @@ impl ExecutionResourceManager {
         }
     }
 
+    pub(crate) fn lease_is_active(
+        &self,
+        reference: &str,
+    ) -> Result<Option<bool>, ResourceAcquireError> {
+        let Some((generation, identity)) = reference
+            .strip_prefix("resource-lease:")
+            .and_then(|value| value.split_once(':'))
+        else {
+            return Ok(None);
+        };
+        if generation != self.shared.owner_generation.to_string() {
+            return Ok(None);
+        }
+        let Ok(identity) = Uuid::parse_str(identity) else {
+            return Ok(None);
+        };
+        let guard = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| ResourceAcquireError::Poisoned)?;
+        Ok(Some(
+            guard
+                .resources
+                .values()
+                .any(|state| state.active.contains_key(&identity)),
+        ))
+    }
+
     pub fn snapshot(
         &self,
         kind: &ExecutionResourceKind,
@@ -1696,6 +1737,13 @@ pub struct ExecutionResourceLease {
 }
 
 impl ExecutionResourceLease {
+    pub(crate) fn projection_reference(&self) -> String {
+        format!(
+            "resource-lease:{}:{}",
+            self.shared.owner_generation, self.lease_id
+        )
+    }
+
     pub fn id(&self) -> Uuid {
         self.lease_id
     }
@@ -2331,11 +2379,9 @@ mod tests {
                 ResourceAdmissionObservationStatus::Granted,
             ]
         );
-        assert!(
-            observations
-                .iter()
-                .all(|observation| observation.request_id == request_id)
-        );
+        assert!(observations
+            .iter()
+            .all(|observation| observation.request_id == request_id));
         assert_eq!(
             observations[1].wait_reason,
             Some(ResourceWaitReason::Capacity)
@@ -2940,11 +2986,9 @@ mod tests {
         }
         let snapshot = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
         assert_eq!(snapshot.effective_limit, 3);
-        assert!(
-            snapshot
-                .failure_timeout_upper_bound_basis_points
-                .is_some_and(|value| value >= FAILURE_TIMEOUT_UCB_THRESHOLD_BP)
-        );
+        assert!(snapshot
+            .failure_timeout_upper_bound_basis_points
+            .is_some_and(|value| value >= FAILURE_TIMEOUT_UCB_THRESHOLD_BP));
     }
 
     #[test]

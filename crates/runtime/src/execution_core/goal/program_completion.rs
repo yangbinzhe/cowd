@@ -18,23 +18,91 @@ fn completion_reopen_bound() -> Result<Option<u64>, String> {
     match std::env::var("COWD_COMPLETION_REOPEN_BOUND") {
         Ok(value) => parse_completion_reopen_bound(&value).map(Some),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(format!("invalid operator completion resource limit: {error}")),
+        Err(error) => Err(format!(
+            "invalid operator completion resource limit: {error}"
+        )),
     }
 }
 
 fn parse_completion_reopen_bound(value: &str) -> Result<u64, String> {
-    value.trim().parse::<u64>().ok().filter(|limit| *limit > 0)
-        .ok_or_else(|| "COWD_COMPLETION_REOPEN_BOUND must be an explicit positive resource limit".to_string())
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            "COWD_COMPLETION_REOPEN_BOUND must be an explicit positive resource limit".to_string()
+        })
 }
 
-fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &str) -> Result<u64, String> {
+fn completion_reopen_count(
+    event_store: &crate::RuntimeEventStore,
+    program_id: &str,
+) -> Result<u64, String> {
     let stream_id = format!("agentic-program:{program_id}");
-    event_store
-        .list_stream(&stream_id)
-        .map(|events| events.iter().filter(|event| {
-            event.kind == COMPLETION_REOPENED_EVENT_KIND || event.kind == COMPLETION_REJECTED_EVENT_KIND
-        }).count() as u64)
-        .map_err(|error| error.to_string())
+    let head = event_store
+        .stream_revision(&stream_id)
+        .map_err(|error| error.to_string())?;
+    event_store.count_stream_kinds(
+        &stream_id,
+        &[
+            COMPLETION_REOPENED_EVENT_KIND,
+            COMPLETION_REJECTED_EVENT_KIND,
+        ],
+        head,
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn r1_bounded_history_completion_count_is_exact_without_event_hydration() {
+    let (store, backend) = crate::content_publication::tests::JournalFault::new_journal();
+    let stream = "agentic-program:count";
+    let mut expected = 0;
+    let events = (0..1000)
+        .map(|index| {
+            let kind = match index % 7 {
+                0 => COMPLETION_REOPENED_EVENT_KIND,
+                1 => COMPLETION_REJECTED_EVENT_KIND,
+                _ => "agentic.unrelated",
+            };
+            if index % 7 < 2 {
+                expected += 1;
+            }
+            crate::RuntimeEventInput {
+                stream_id: stream.into(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: kind.into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"index":index}),
+            }
+            .into()
+        })
+        .collect();
+    store
+        .append_batch_if_revision(stream, 0, "exact-count", events)
+        .unwrap();
+    backend.reset_history_reads();
+    assert_eq!(completion_reopen_count(&store, "count").unwrap(), expected);
+    assert_eq!(
+        store
+            .count_stream_kinds(
+                stream,
+                &[
+                    COMPLETION_REOPENED_EVENT_KIND,
+                    COMPLETION_REJECTED_EVENT_KIND
+                ],
+                0
+            )
+            .unwrap(),
+        0
+    );
+    assert!(store
+        .count_stream_kinds(stream, &[COMPLETION_REOPENED_EVENT_KIND], u64::MAX)
+        .is_err());
+    assert_eq!(backend.history_reads(), (0, 0));
 }
 
 /// The delivered result set: the artifacts accepted work produced. The
@@ -99,76 +167,86 @@ fn review_covers_current_goal(
     review: &harness_contract::goal::ObjectiveReviewRecord,
     result_refs: &[String],
     evidence: &[String],
-    policy: Option<&crate::agentic::review_evidence::RootReviewPolicySnapshot>,
-    effects: Option<&crate::agentic::review_evidence::RootReviewPolicySnapshot>,
-    result_sources: &std::collections::BTreeMap<String, u64>,
+    proof_inputs: Option<&crate::agentic::review_evidence::ProofInputSnapshot>,
 ) -> bool {
     review.spec_revision == goal.spec_revision
         && review.input_manifest_digest == goal.spec_digest
         && review.decision == "satisfied"
         && review.verification.as_ref().is_some_and(|proof| {
-            proof.result_source_revisions.iter().all(|(source, revision)| result_sources.get(source) == Some(revision))
-                && proof.reads.iter().all(|read| {
-                    (read.result_kind != harness_contract::goal::GoalResultKind::ExternalDecision
-                        && !read.result_ref.starts_with("approval:v1:"))
-                        || proof.result_source_revisions.contains_key(&format!("approval:{}", read.result_ref))
-                })
-                && proof.goal_spec_revision == Some(goal.spec_revision)
-                && proof.goal_spec_digest.as_deref() == Some(goal.spec_digest.as_str())
-                && proof.work_manifest_digest
-                    == crate::agentic::review_evidence::work_manifest_digest(program)
-                && !proof.reviewer_execution_id.is_empty()
-                && !proof.producer_execution_ids.is_empty()
-                // Historical delegated proofs predate canonical effect-source
-                // verification. They require a fresh review, not a default
-                // assumption that an Artifact producer performed no writes.
-                && (!proof.producer_execution_ids.iter().any(|producer| producer.starts_with("agent-run:"))
-                    || (!proof.effect_source_refs.is_empty() && proof.effect_manifest_digest.is_some()))
-                && proof.producer_execution_ids.iter().all(|producer| {
-                    !producer.is_empty()
-                        && (!proof.independence_required
-                            || producer != &proof.reviewer_execution_id)
-                })
-                && (if proof.independence_required {
-                    !review.producer_refs.contains(&review.reviewer_actor)
-                } else {
-                    proof.reviewer_execution_id
-                        == format!(
-                            "root-execution:{}",
-                            program.root_execution_id.as_deref().unwrap_or_default()
-                        )
-                        && policy.is_some_and(|policy| {
-                            proof.review_policy_digest.as_deref() == Some(policy.digest.as_str())
-                        })
-
-                })
-                && ((proof.effect_manifest_digest.is_none()
-                    && proof.effect_source_refs.is_empty()
-                    && effects.is_some_and(|effects| effects.last_effect_cursor == 0)
-                    && proof.reads.iter().all(|read| {
-                        read.result_kind != harness_contract::goal::GoalResultKind::ToolEffect
-                    }))
-                    || effects.is_some_and(|effects| {
-                        proof.effect_manifest_digest.as_deref() == Some(effects.digest.as_str())
-                    }))
-                && result_refs.iter().all(|reference| {
-                    proof.reads.iter().any(|read| {
-                        &read.result_ref == reference
-                            && !read.sha256.is_empty()
-                            && !read.receipt_refs.is_empty()
-                            && (read.result_kind
-                                != harness_contract::goal::GoalResultKind::ToolEffect
-                                || !read.effect_observation_refs.is_empty())
+            if let Some(inputs) = &proof.input_set {
+                return inputs.version == 2
+                    && inputs.condition_ref.as_deref() == Some(review.criterion_ref.as_str())
+                    && proof.goal_spec_revision == Some(goal.spec_revision)
+                    && proof.goal_spec_digest.as_deref() == Some(goal.spec_digest.as_str())
+                    && proof_inputs.is_some_and(|snapshot| {
+                        snapshot.semantic_digest == inputs.semantic_digest
+                            && snapshot.reviewer_matches(program, review)
+                            && proof
+                                .result_source_revisions
+                                .iter()
+                                .all(|(stream, revision)| {
+                                    snapshot.sources.iter().any(|source| {
+                                        &source.stream_id == stream
+                                            && source.expected_revision == *revision
+                                    })
+                                })
                     })
-                })
+                    && result_refs.iter().all(|reference| {
+                        crate::agentic::review_evidence::review_result_identity(program, reference)
+                            .is_ok_and(|identity| {
+                                inputs.result_refs.iter().any(|reference| {
+                                    crate::agentic::review_evidence::review_result_identity(
+                                        program, reference,
+                                    )
+                                    .is_ok_and(|current| current == identity)
+                                })
+                            })
+                    })
+                    && !proof.reviewer_execution_id.is_empty()
+                    && !proof.producer_execution_ids.is_empty()
+                    && proof.producer_execution_ids.iter().all(|producer| {
+                        !producer.is_empty()
+                            && (!proof.independence_required
+                                || producer != &proof.reviewer_execution_id)
+                    })
+                    && (!proof.independence_required
+                        || !review.producer_refs.contains(&review.reviewer_actor))
+                    && !inputs.material_events.is_empty()
+                    && result_refs.iter().all(|reference| {
+                        proof.reads.iter().any(|read| {
+                            crate::agentic::review_evidence::review_result_identity(
+                                program,
+                                &read.result_ref,
+                            )
+                            .is_ok_and(|identity| {
+                                crate::agentic::review_evidence::review_result_identity(
+                                    program, reference,
+                                )
+                                .is_ok_and(|expected| identity == expected)
+                            }) && !read.sha256.is_empty()
+                                && !read.receipt_refs.is_empty()
+                                && (read.result_kind
+                                    != harness_contract::goal::GoalResultKind::ToolEffect
+                                    || !read.effect_observation_refs.is_empty())
+                        })
+                    });
+            }
+            false
         })
         && !review.evidence_refs.is_empty()
         && !review.producer_refs.is_empty()
         && !review.result_refs.is_empty()
         && !result_refs.is_empty()
-        && result_refs
-            .iter()
-            .all(|reference| review.result_refs.contains(reference))
+        && result_refs.iter().all(|reference| {
+            crate::agentic::review_evidence::review_result_identity(program, reference).is_ok_and(
+                |identity| {
+                    review.result_refs.iter().any(|reviewed| {
+                        crate::agentic::review_evidence::review_result_identity(program, reviewed)
+                            .is_ok_and(|expected| identity == expected)
+                    })
+                },
+            )
+        })
         && review
             .evidence_refs
             .iter()
@@ -192,22 +270,6 @@ impl GoalStore {
             .projection(&format!("goal:{root}"))?
             .ok_or("missing bound Goal")?;
         let mut goal = projection.goal;
-        let mut result_sources = std::collections::BTreeMap::new();
-        for source in goal
-            .reviews
-            .iter()
-            .filter_map(|review| review.verification.as_ref())
-            .flat_map(|proof| proof.result_source_revisions.keys())
-        {
-            if !result_sources.contains_key(source) {
-                result_sources.insert(
-                    source.clone(),
-                    self.event_store
-                        .stream_revision(source)
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-        }
         let binding = goal
             .execution_binding
             .as_ref()
@@ -221,49 +283,6 @@ impl GoalStore {
             || goal.terminal.is_some()
         {
             return Err("completion request does not match the open bound Goal".into());
-        }
-        let policy = if goal.reviews.iter().any(|review| {
-            review
-                .verification
-                .as_ref()
-                .is_some_and(|proof| !proof.independence_required)
-        }) {
-            crate::agentic::review_evidence::root_self_review_policy(
-                &self.event_store,
-                program,
-                &goal,
-            )?
-        } else {
-            None
-        };
-        let mut effects = std::collections::BTreeMap::new();
-        effects.insert(
-            Vec::new(),
-            crate::agentic::review_evidence::effect_review_snapshot(
-                &self.event_store,
-                program,
-                Some(&goal),
-                &[],
-            )?,
-        );
-        for proof in goal
-            .reviews
-            .iter()
-            .filter_map(|review| review.verification.as_ref())
-        {
-            if proof.effect_manifest_digest.is_some()
-                && !effects.contains_key(&proof.effect_source_refs)
-            {
-                effects.insert(
-                    proof.effect_source_refs.clone(),
-                    crate::agentic::review_evidence::effect_review_snapshot(
-                        &self.event_store,
-                        program,
-                        Some(&goal),
-                        &proof.effect_source_refs,
-                    )?,
-                );
-            }
         }
         let mut evidence = goal.evidence_refs.clone();
         evidence.extend(projection.progress.evidence_refs.iter().cloned());
@@ -292,6 +311,80 @@ impl GoalStore {
         evidence.sort();
         evidence.dedup();
         apply_completion_criterion_state(&mut goal, &projection.progress, &evidence);
+        let conditions = crate::agentic::review_evidence::required_review_conditions(&goal);
+        let mut proof_inputs = std::collections::BTreeMap::new();
+        let history = self
+            .proof_session_queries
+            .as_ref()
+            .and_then(|queries| queries.get())
+            .and_then(|queries| queries.history_reader());
+        let process_frame = self
+            .process_input_verifier
+            .as_ref()
+            .map(crate::agentic::review_evidence::ProcessInputVerifier::frame);
+        let readers = crate::agentic::review_evidence::ResultContentReaders {
+            artifacts: self.proof_artifacts.as_deref(),
+            history: history.as_deref(),
+            process_inputs: process_frame.as_ref(),
+        };
+        for condition in conditions {
+            let Some(review) = goal
+                .reviews
+                .iter()
+                .rev()
+                .find(|review| review.criterion_ref == condition)
+            else {
+                continue;
+            };
+            if review.decision != "satisfied"
+                || review.spec_revision != goal.spec_revision
+                || review.input_manifest_digest != goal.spec_digest
+            {
+                continue;
+            }
+            let Some(proof) = review.verification.as_ref().filter(|proof| {
+                proof
+                    .input_set
+                    .as_ref()
+                    .is_some_and(|inputs| inputs.version == 2)
+            }) else {
+                continue;
+            };
+            match crate::agentic::review_evidence::validate_proof_inputs(
+                &self.event_store,
+                program,
+                Some(&goal),
+                proof,
+                readers,
+            ) {
+                Ok(snapshot) => {
+                    let mut results = review.result_refs.clone();
+                    if goal.user_intent_criterion_id.as_ref() == Some(&condition) {
+                        results.extend(delivered_result_refs(program, &goal, &request.result_refs));
+                    }
+                    for obligation in goal.obligations.iter().filter(|obligation| {
+                        obligation.required && obligation.obligation_id == condition
+                    }) {
+                        results.extend(obligation.artifact_refs.iter().cloned());
+                    }
+                    if review_covers_current_goal(
+                        &goal,
+                        program,
+                        review,
+                        &results,
+                        &evidence,
+                        Some(&snapshot),
+                    ) {
+                        proof_inputs.insert(
+                            crate::agentic::review_evidence::review_snapshot_key(proof),
+                            snapshot,
+                        );
+                    }
+                }
+                Err(error) if error.contains("effect_review_pending") => return Err(error),
+                Err(_) => {}
+            }
+        }
 
         // A graph identity proves execution lineage, not semantic coverage of
         // the user's request. Consume the current, independently attributed
@@ -341,12 +434,10 @@ impl GoalStore {
                     review,
                     &delivered_result_refs,
                     &evidence,
-                    policy.as_ref(),
-                    review
-                        .verification
-                        .as_ref()
-                        .and_then(|proof| effects.get(&proof.effect_source_refs)),
-                    &result_sources,
+                    review.verification.as_ref().and_then(|proof| {
+                        proof_inputs
+                            .get(&crate::agentic::review_evidence::review_snapshot_key(proof))
+                    }),
                 )
             });
         for obligation in &goal.obligations {
@@ -363,12 +454,11 @@ impl GoalStore {
                             review,
                             &obligation.artifact_refs,
                             &evidence,
-                            policy.as_ref(),
-                            review
-                                .verification
-                                .as_ref()
-                                .and_then(|proof| effects.get(&proof.effect_source_refs)),
-                            &result_sources,
+                            review.verification.as_ref().and_then(|proof| {
+                                proof_inputs.get(
+                                    &crate::agentic::review_evidence::review_snapshot_key(proof),
+                                )
+                            }),
                         )
                     });
                 if !current {
@@ -421,9 +511,10 @@ impl GoalStore {
             // satisfied the review, had a Task reworked, and then re-issued the
             // identical request four times because nothing told it the earlier
             // satisfaction no longer held.
-            let prior_satisfied = goal.reviews.iter().rev().find(|review| {
-                review.criterion_ref == intent && review.decision == "satisfied"
-            });
+            let prior_satisfied =
+                goal.reviews.iter().rev().find(|review| {
+                    review.criterion_ref == intent && review.decision == "satisfied"
+                });
             if let Some(prior) = prior_satisfied {
                 if !request
                     .result_refs
@@ -461,12 +552,11 @@ impl GoalStore {
                             review,
                             &review.result_refs,
                             &evidence,
-                            policy.as_ref(),
-                            review
-                                .verification
-                                .as_ref()
-                                .and_then(|proof| effects.get(&proof.effect_source_refs)),
-                            &result_sources,
+                            review.verification.as_ref().and_then(|proof| {
+                                proof_inputs.get(
+                                    &crate::agentic::review_evidence::review_snapshot_key(proof),
+                                )
+                            }),
                         )
                     })
             })
@@ -500,9 +590,12 @@ impl GoalStore {
             "agentic-objective:{}:request:{}",
             program.program_id, request.program_revision
         );
-        let reopen_budget = completion_reopen_bound()?.map(|limit|
-            completion_reopen_count(&self.event_store, &program.program_id).map(|count| (limit, count))
-        ).transpose()?;
+        let reopen_budget = completion_reopen_bound()?
+            .map(|limit| {
+                completion_reopen_count(&self.event_store, &program.program_id)
+                    .map(|count| (limit, count))
+            })
+            .transpose()?;
         let (kind, status) = if gaps.is_empty() {
             goal.completion = GoalCompletion::Satisfied;
             goal.phase = "completed".into();
@@ -527,7 +620,8 @@ impl GoalStore {
             });
             ("goal.completion_waiting", "open")
         } else {
-            let (limit, reopen_count) = reopen_budget.ok_or("missing explicit completion resource limit")?;
+            let (limit, reopen_count) =
+                reopen_budget.ok_or("missing explicit completion resource limit")?;
             goal.completion = GoalCompletion::Blocked;
             goal.phase = "completed".into();
             goal.waiting = None;
@@ -564,18 +658,14 @@ impl GoalStore {
             event,
             gaps,
             policy_sources: {
-                let mut sources = result_sources;
-                for snapshot in policy.into_iter().chain(effects.into_values()) {
-                    for source in
-                        std::iter::once(snapshot.source).chain(snapshot.additional_sources)
-                    {
+                let mut sources = std::collections::BTreeMap::new();
+                for snapshot in proof_inputs.into_values() {
+                    for source in snapshot.sources {
                         if sources
-                            .insert(source.stream_id.clone(), source.expected_revision)
+                            .insert(source.stream_id, source.expected_revision)
                             .is_some_and(|revision| revision != source.expected_revision)
                         {
-                            return Err(
-                                "effect source changed during conclusion preparation".into()
-                            );
+                            return Err("proof source changed during conclusion preparation".into());
                         }
                     }
                 }
@@ -596,6 +686,7 @@ impl GoalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_contract::agent_action::MessagePublishInput;
     #[test]
     fn the_objective_reviewers_own_report_is_not_a_delivered_result() {
         // Requiring a review to cover its own report is an unbounded regress:
@@ -907,25 +998,25 @@ mod tests {
 
     use harness_contract::agent_action::{
         AgentAction, AgentActionEnvelope, AgentActionStatus, AgentActorBinding, AgentActorKind,
-        MessagePublishInput, ObjectiveCompleteRequestInput, TeamCreateInput,
+        ObjectiveCompleteRequestInput, TeamCreateInput,
     };
     use harness_contract::goal::{
         AcceptanceCriterion, GoalExecutionBinding, GoalScope, ObjectiveReviewRecord,
     };
 
-    fn fixture(
-        reviewed: bool,
+    fn mechanical_fixture(
+        historical_review: bool,
     ) -> (
         Arc<RuntimeEventStore>,
         GoalStore,
         crate::AgentActionService,
         AgentActorBinding,
     ) {
-        fixture_with_request(reviewed, true)
+        mechanical_fixture_with_request(historical_review, true)
     }
 
-    fn fixture_with_request(
-        reviewed: bool,
+    fn mechanical_fixture_with_request(
+        historical_review: bool,
         request_completion: bool,
     ) -> (
         Arc<RuntimeEventStore>,
@@ -933,16 +1024,16 @@ mod tests {
         crate::AgentActionService,
         AgentActorBinding,
     ) {
-        fixture_with_ids(
-            reviewed,
+        mechanical_fixture_with_ids(
+            historical_review,
             request_completion,
             "objective-completion".into(),
             "program-completion".into(),
         )
     }
 
-    fn fixture_with_ids(
-        reviewed: bool,
+    fn mechanical_fixture_with_ids(
+        historical_review: bool,
         request_completion: bool,
         objective_id: String,
         program_id: String,
@@ -1049,7 +1140,7 @@ mod tests {
                 completion: GoalCompletion::Open,
                 revision: 1,
                 user_sequence: 1,
-                reviews: if reviewed {
+                reviews: if historical_review {
                     vec![ObjectiveReviewRecord {
                         review_id: "review".into(),
                         criterion_ref: "user_intent".into(),
@@ -1064,6 +1155,7 @@ mod tests {
                         reason_ref: "tool://evidence".into(),
                         // Mechanical transaction fixture, not physical-read acceptance evidence.
                         verification: Some(harness_contract::goal::ObjectiveReviewVerification {
+                            input_set: None,
                             result_source_revisions: Default::default(),
                             independence_required: true,
                             review_policy_digest: None,
@@ -1096,9 +1188,9 @@ mod tests {
         (events, goals, actions, actor)
     }
 
-    #[test]
-    fn historical_delegated_review_without_effect_sources_cannot_verify_goal() {
-        let (_, goals, actions, actor) = fixture(true);
+    #[tokio::test]
+    async fn historical_delegated_review_without_effect_sources_cannot_verify_goal() {
+        let (_, goals, actions, actor) = mechanical_fixture(true);
         let goal = goals.get("goal:root-completion").unwrap().unwrap();
         let program = actions.project(&actor.program_id).unwrap();
         let mut review = goal.reviews[0].clone();
@@ -1110,103 +1202,111 @@ mod tests {
             &review,
             &review.result_refs,
             &review.evidence_refs,
-            None,
-            None,
-            &Default::default()
+            None
         ));
-    }
-
-    #[test]
-    fn external_decision_review_requires_current_source_revision_and_final_cas() {
-        let (events, goals, actions, actor) = fixture(true);
-        let goal = goals.get("goal:root-completion").unwrap().unwrap();
-        let program = actions.project(&actor.program_id).unwrap();
-        let mut review = goal.reviews[0].clone();
-        let source = "approval:approval:v1:source:node".to_string();
-        review
-            .verification
-            .as_mut()
-            .unwrap()
-            .result_source_revisions
-            .insert(source.clone(), 1);
-        let effects = crate::agentic::review_evidence::effect_review_snapshot(
-            &events,
-            &program,
-            Some(&goal),
-            &[],
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, program, prepared, _| {
+                let goal = services
+                    .goal_store()
+                    .get(&prepared.goal.id)
+                    .unwrap()
+                    .unwrap();
+                let mut proof = goal.reviews.last().unwrap().verification.clone().unwrap();
+                assert_eq!(proof.input_set.as_ref().unwrap().version, 2);
+                let history = services.session_history_reader();
+                let readers = crate::agentic::review_evidence::ResultContentReaders {
+                    artifacts: Some(services.artifact_store().as_ref()),
+                    history: history.as_deref(),
+                    process_inputs: None,
+                };
+                crate::agentic::review_evidence::validate_proof_inputs(
+                    services.event_store(),
+                    program,
+                    Some(&goal),
+                    &proof,
+                    readers,
+                )
+                .expect("real effect donor is valid before mutation");
+                proof.effect_manifest_digest = None;
+                proof.effect_source_refs.clear();
+                let error = crate::agentic::review_evidence::validate_proof_inputs(
+                    services.event_store(),
+                    program,
+                    Some(&goal),
+                    &proof,
+                    readers,
+                )
+                .err()
+                .expect("v2 missing effect facts must fail real validation");
+                assert!(!error.contains("unsupported"), "{error}");
+            },
         )
-        .unwrap();
-        assert!(review_covers_current_goal(
-            &goal,
-            &program,
-            &review,
-            &review.result_refs,
-            &review.evidence_refs,
-            None,
-            Some(&effects),
-            &std::collections::BTreeMap::from([(source.clone(), 1)])
-        ));
-        // A missing or revised source cannot be accepted even if all older
-        // artifact and policy assertions still match.
-        assert!(!review_covers_current_goal(
-            &goal,
-            &program,
-            &review,
-            &review.result_refs,
-            &review.evidence_refs,
-            None,
-            Some(&effects),
-            &Default::default()
-        ));
-        assert!(!review_covers_current_goal(
-            &goal,
-            &program,
-            &review,
-            &review.result_refs,
-            &review.evidence_refs,
-            None,
-            Some(&effects),
-            &std::collections::BTreeMap::from([(source.clone(), 2)])
-        ));
-        let mut conclusion = goals.prepare_program_conclusion(&program).unwrap();
-        conclusion
-            .policy_sources
-            .push(crate::ExpectedStreamRevision {
-                stream_id: source.clone(),
-                expected_revision: 0,
-            });
-        events
-            .append(crate::RuntimeEventInput {
-                stream_id: source,
-                scope: crate::RuntimeEventScope::Approval,
-                kind: "test.concurrent_external_decision_source".into(),
-                status: None,
-                actor: None,
-                refs: vec![],
-                payload: serde_json::json!({}),
-            })
-            .unwrap();
-        assert!(
-            actions
-                .commit_program_conclusion(&program, conclusion)
-                .is_err()
-        );
-        assert_eq!(
-            actions.project(&actor.program_id).unwrap().revision,
-            program.revision
-        );
-        assert!(
-            goals
-                .get("goal:root-completion")
-                .unwrap()
-                .unwrap()
-                .terminal
-                .is_none()
-        );
+        .await;
     }
 
-    #[test]
-    fn a_satisfied_review_that_later_work_invalidated_says_so_in_the_gap() {
+    #[tokio::test]
+    async fn external_decision_review_requires_current_source_revision_and_final_cas() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_approval_before_a(|services, program, prepared, _| {
+            let goal = services.goal_store().get(&prepared.goal.id).unwrap().unwrap();
+            let history = services.session_history_reader();
+            let readers = crate::agentic::review_evidence::ResultContentReaders {
+                artifacts: Some(services.artifact_store().as_ref()), history: history.as_deref(), process_inputs: None,
+            };
+            let proof = crate::agentic::review_evidence::required_review_conditions(&goal).iter()
+                .filter_map(|condition| goal.reviews.iter().rev().find(|review| &review.criterion_ref == condition))
+                .filter_map(|review| review.verification.as_ref())
+                .find(|proof| !proof.result_source_revisions.is_empty()).expect("real selected approval donor");
+            let (source, revision) = proof.result_source_revisions.iter().next().unwrap();
+            let source = source.clone();
+            let revision = *revision;
+            assert_eq!(services.event_store().stream_revision(&source).unwrap(), revision);
+            assert!(prepared.policy_sources.iter().any(|cut| cut.stream_id == source && cut.expected_revision == revision));
+            crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
+                Some(&goal), proof, readers).expect("actual current approval is accepted");
+            let mut missing = proof.clone();
+            missing.result_source_revisions.remove(&source);
+            assert!(crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
+                Some(&goal), &missing, readers).err().unwrap().contains("external decision source"));
+            let mut revised = proof.clone();
+            revised.result_source_revisions.insert(source.clone(), revision + 1);
+            assert!(crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
+                Some(&goal), &revised, readers).err().unwrap().contains("external decision source"));
+            let events = services.event_store().clone();
+            let fault_source = source.clone();
+            let before_goal = goal.clone();
+            let error = crate::agentic::execution::reviewed_goal_fixture::with_native_conclusion_append_hook(
+                move |transaction| {
+                    assert!(transaction.expected_streams.iter().any(|cut|
+                        cut.stream_id == fault_source && cut.expected_revision == revision));
+                    events.append(RuntimeEventInput { stream_id: fault_source, scope: RuntimeEventScope::Approval,
+                        kind: "test.concurrent_external_decision_source".into(), status: None, actor: None,
+                        refs: vec![], payload: serde_json::json!({}) }).unwrap();
+                },
+                || services.agent_action_service().commit_program_conclusion(program, prepared),
+            ).err().expect("actual final approval storage CAS must fail");
+            match error {
+                crate::AgentActionServiceError::Store(crate::RuntimeEventStoreError::StaleRevision {
+                    stream_id, expected, actual,
+                }) => { assert_eq!(stream_id, source); assert_eq!(expected, revision); assert_eq!(actual, revision + 1); }
+                error => panic!("wrong failure layer: {error}"),
+            }
+            assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), before_goal);
+            assert!(services.agent_action_service().project(&program.program_id).unwrap().objective_verdict.is_none());
+        }).await;
+        crate::agentic::execution::reviewed_goal_fixture::with_native_approval_before_a(
+            |services, program, prepared, _| {
+                let after = services
+                    .agent_action_service()
+                    .commit_program_conclusion(program, prepared)
+                    .unwrap();
+                assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_satisfied_review_that_later_work_invalidated_says_so_in_the_gap() {
         // Naming only "review required" showed the model the same gap string it
         // had already answered once, so it repeated the same action: one live run
         // satisfied the review, had a Task reworked, and then re-issued the
@@ -1323,24 +1423,30 @@ mod tests {
             "it must name both the old and the current set: {gap}"
         );
         // A satisfaction that still covers the request is not called invalidated.
-        let (_, goals_current, actions_current, actor_current) = fixture(true);
-        let program_current = actions_current.project(&actor_current.program_id).unwrap();
-        let prepared_current = goals_current
-            .prepare_program_conclusion(&program_current)
-            .unwrap();
-        assert!(
-            prepared_current
-                .gaps
-                .iter()
-                .all(|gap| !gap.contains("previous_satisfied_review_invalidated")),
-            "a still-current satisfaction is not invalidated: {:?}",
-            prepared_current.gaps
-        );
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, program, prepared, _| {
+                assert!(prepared.gaps.is_empty());
+                assert!(
+                    prepared
+                        .gaps
+                        .iter()
+                        .all(|gap| !gap.contains("previous_satisfied_review_invalidated")),
+                    "a still-current satisfaction is not invalidated: {:?}",
+                    prepared.gaps
+                );
+                let after = services
+                    .agent_action_service()
+                    .commit_program_conclusion(program, prepared)
+                    .unwrap();
+                assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
+            },
+        )
+        .await;
     }
 
-    #[test]
-    fn historical_root_review_without_effect_digest_cannot_hide_a_later_effect() {
-        let (events, goals, actions, actor) = fixture(true);
+    #[tokio::test]
+    async fn historical_root_review_without_effect_digest_cannot_hide_a_later_effect() {
+        let (events, goals, actions, actor) = mechanical_fixture(true);
         // Negative historical corruption only: never used to prove a write or
         // successful review. A legacy unclassified effect must invalidate proof.
         events.append(RuntimeEventInput {
@@ -1352,26 +1458,43 @@ mod tests {
         let program = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&program).unwrap();
         assert!(prepared.goal.terminal.is_none());
-        assert!(
-            prepared
-                .gaps
-                .iter()
-                .any(|gap| gap.starts_with("original_intent_review_required:"))
-        );
+        assert!(prepared
+            .gaps
+            .iter()
+            .any(|gap| gap.starts_with("original_intent_review_required:")));
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, program, prepared, _| {
+            let goal = services.goal_store().get(&prepared.goal.id).unwrap().unwrap();
+            let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
+            assert_eq!(proof.input_set.as_ref().unwrap().version, 2);
+            let history = services.session_history_reader();
+            let readers = crate::agentic::review_evidence::ResultContentReaders {
+                artifacts: Some(services.artifact_store().as_ref()), history: history.as_deref(), process_inputs: None,
+            };
+            crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
+                Some(&goal), proof, readers).expect("unmodified v2 effect donor");
+            services.event_store().append(RuntimeEventInput {
+                stream_id: format!("session:{}", program.session_id), scope: RuntimeEventScope::Session,
+                kind: "tool.invocation.completed".into(), status: Some("completed".into()),
+                actor: Some("conversation_runtime".into()), refs: vec![],
+                payload: serde_json::json!({"tool_name":"unclassified_mutation","test_fault":"legacy-missing-descriptor"}),
+            }).unwrap();
+            let error = crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
+                Some(&goal), proof, readers).err().expect("actual unknown effect cannot be hidden by a v2 donor");
+            assert!(!error.contains("unsupported"), "{error}");
+            assert!(services.agent_action_service().project(&program.program_id).unwrap().objective_verdict.is_none());
+        }).await;
     }
 
     #[test]
     fn graph_identity_cannot_replace_original_review_and_gap_reopens_durably() {
-        let (events, goals, actions, actor) = fixture(false);
+        let (events, goals, actions, actor) = mechanical_fixture(false);
         let before = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&before).unwrap();
         assert!(prepared.goal.terminal.is_none());
-        assert!(
-            prepared
-                .gaps
-                .iter()
-                .any(|gap| gap.starts_with("original_intent_review_required:"))
-        );
+        assert!(prepared
+            .gaps
+            .iter()
+            .any(|gap| gap.starts_with("original_intent_review_required:")));
         actions
             .commit_program_conclusion(&before, prepared)
             .unwrap();
@@ -1379,14 +1502,12 @@ mod tests {
         let after = restarted.project(&actor.program_id).unwrap();
         assert_eq!(after.status, crate::AgenticProgramStatus::Open);
         assert!(after.completion_request.is_none());
-        assert!(
-            goals
-                .get("goal:root-completion")
-                .unwrap()
-                .unwrap()
-                .waiting
-                .is_some()
-        );
+        assert!(goals
+            .get("goal:root-completion")
+            .unwrap()
+            .unwrap()
+            .waiting
+            .is_some());
         let new_work = restarted
             .apply(&AgentActionEnvelope {
                 action_id: "fill-gap".into(),
@@ -1404,21 +1525,19 @@ mod tests {
 
     #[test]
     fn reconciling_an_existing_completion_request_reopens_goal_for_missing_review() {
-        let (events, goals, actions, actor) = fixture(false);
+        let (events, goals, actions, actor) = mechanical_fixture(false);
         let before = actions.project(&actor.program_id).unwrap();
         assert_eq!(
             before.status,
             crate::AgenticProgramStatus::CompletionRequested
         );
         assert!(before.completion_request.is_some());
-        assert!(
-            goals
-                .get("goal:root-completion")
-                .unwrap()
-                .unwrap()
-                .waiting
-                .is_none()
-        );
+        assert!(goals
+            .get("goal:root-completion")
+            .unwrap()
+            .unwrap()
+            .waiting
+            .is_none());
 
         let supervisor =
             crate::execution_core::goal::ObjectiveSupervisor::new(Arc::new(GoalStore::new(events)));
@@ -1440,344 +1559,283 @@ mod tests {
                 .map(|waiting| waiting.reason_code.as_str()),
             Some("completion_gap")
         );
-        assert!(
-            goal.waiting
-                .as_ref()
-                .expect("waiting")
-                .required_refs
-                .iter()
-                .any(|reference| reference
-                    .starts_with("original_intent_review_required:user_intent"))
-        );
+        assert!(goal
+            .waiting
+            .as_ref()
+            .expect("waiting")
+            .required_refs
+            .iter()
+            .any(|reference| reference.starts_with("original_intent_review_required:user_intent")));
         // The gap names the cited results no review covers, so the model can
         // complete the review instead of re-issuing a partial one.
         let mut goal = goal;
         let required_refs = goal.waiting.take().expect("waiting").required_refs;
-        assert!(
-            required_refs
-                .iter()
-                .any(|reference| reference.contains("uncovered_result_refs: tool://result"))
-        );
+        assert!(required_refs
+            .iter()
+            .any(|reference| reference.contains("uncovered_result_refs: tool://result")));
     }
 
-    #[test]
-    fn later_gap_review_supersedes_an_earlier_satisfied_review() {
-        let (_, goals, actions, actor) = fixture(true);
-        goals
-            .revise("goal:root-completion", 1, 2, "review found a gap", |goal| {
-                let mut review = goal.reviews.last().unwrap().clone();
-                review.review_id = "later-gap".into();
-                review.decision = "gap".into();
-                goal.reviews.push(review);
-                vec!["reviews".into()]
-            })
-            .unwrap();
-        let program = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&program).unwrap();
-        assert!(
-            prepared
-                .gaps
-                .iter()
-                .any(|gap| gap.starts_with("original_intent_review_required:"))
-        );
-        let reopened = actions
-            .commit_program_conclusion(&program, prepared)
-            .unwrap();
-        assert_eq!(reopened.status, crate::AgenticProgramStatus::Open);
-        assert!(
-            goals
-                .get("goal:root-completion")
-                .unwrap()
-                .unwrap()
-                .terminal
-                .is_none()
-        );
+    #[tokio::test]
+    async fn later_gap_review_supersedes_an_earlier_satisfied_review() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, before, baseline, envelope| {
+                let goals = services.goal_store();
+                let actions = services.agent_action_service();
+                let actor = &envelope.actor;
+                let goal_id = baseline.goal.id.clone();
+                let current_goal = goals.get(&goal_id).unwrap().unwrap();
+                assert!(baseline.gaps.is_empty());
+
+                goals
+                    .revise(
+                        goal_id.as_str(),
+                        current_goal.revision,
+                        current_goal.user_sequence + 1,
+                        "review found a gap",
+                        |goal| {
+                            let mut review = goal.reviews.last().unwrap().clone();
+                            review.review_id = "later-gap".into();
+                            review.decision = "gap".into();
+                            goal.reviews.push(review);
+                            vec!["reviews".into()]
+                        },
+                    )
+                    .unwrap();
+                let program = actions.project(&actor.program_id).unwrap();
+                let prepared = goals.prepare_program_conclusion(&program).unwrap();
+                assert!(prepared
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("original_intent_review_required:")));
+                let reopened = actions
+                    .commit_program_conclusion(&program, prepared)
+                    .unwrap();
+                assert_eq!(reopened.status, crate::AgenticProgramStatus::Open);
+                assert!(goals
+                    .get(goal_id.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .terminal
+                    .is_none());
+            },
+        )
+        .await;
     }
 
-    #[test]
-    fn new_counterevidence_invalidates_a_previous_positive_review() {
-        let (_, goals, actions, actor) = fixture_with_request(true, false);
-        let before = actions.project(&actor.program_id).unwrap();
-        let original = goals.get("goal:root-completion").unwrap().unwrap();
-        assert_eq!(
-            original.reviews[0]
-                .verification
-                .as_ref()
-                .unwrap()
-                .work_manifest_digest,
-            crate::agentic::review_evidence::work_manifest_digest(&before)
-        );
-        // A newly observed issue changes the source manifest even with the same Goal spec.
-        let published = actions
-            .apply(&AgentActionEnvelope {
-                action_id: "new-counterevidence".into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::MessagePublish(MessagePublishInput {
-                    topic_ref: format!("topic:{}", actor.program_id),
-                    summary: Some("New evidence contradicts the result".into()),
-                    content_ref: None,
-                    refs: vec!["tool://counterevidence".into()],
-                    recipients: vec![],
-                    intent: None,
-                    issue_dispositions: vec![],
-                }),
-            })
-            .unwrap();
-        assert_eq!(published.status, AgentActionStatus::Applied);
-        let requested = actions
-            .apply(&AgentActionEnvelope {
-                action_id: "request-after-new-evidence".into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                    blocked: false,
-                    blocked_reason: None,
-                    human_review_required: false,
-                    recommended_next_actions: Vec::new(),
-                    result_refs: vec!["tool://result".into()],
-                    evidence_refs: vec!["tool://evidence".into()],
-                    unresolved: vec![],
-                }),
-            })
-            .unwrap();
-        assert_eq!(requested.status, AgentActionStatus::Applied);
-        let current = actions.project(&actor.program_id).unwrap();
-        assert!(
-            goals
-                .prepare_program_conclusion(&current)
-                .unwrap()
-                .gaps
-                .iter()
-                .any(|gap| gap.starts_with("original_intent_review_required:"))
-        );
+    #[tokio::test]
+    async fn new_counterevidence_invalidates_a_previous_positive_review() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, program, baseline, envelope| {
+                assert!(baseline.gaps.is_empty());
+                let actions = services.agent_action_service();
+                let original = services
+                    .goal_store()
+                    .get(&baseline.goal.id)
+                    .unwrap()
+                    .unwrap();
+                let note = services
+                    .event_store()
+                    .event_by_idempotency_key(
+                        &format!("agentic-program:{}", program.program_id),
+                        "agent-action:mechanical-unrelated-note",
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(note.status.as_deref(), Some("applied"));
+                let current = actions.project(&program.program_id).unwrap();
+                assert!(
+                    services
+                        .goal_store()
+                        .prepare_program_conclusion(&current)
+                        .unwrap()
+                        .gaps
+                        .is_empty(),
+                    "the actual unrelated MessagePublish preserves selected current proof"
+                );
+                let goal_id = original.id.clone();
+                services
+                    .goal_store()
+                    .revise(
+                        &goal_id,
+                        original.revision,
+                        original.user_sequence + 1,
+                        "new acceptance risk",
+                        |goal| {
+                            goal.spec_revision += 1;
+                            goal.spec_digest = "actual changed acceptance policy".into();
+                            vec!["spec_revision".into(), "spec_digest".into()]
+                        },
+                    )
+                    .unwrap();
+                let prepared = services
+                    .goal_store()
+                    .prepare_program_conclusion(&current)
+                    .unwrap();
+                assert!(prepared
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("original_intent_review_required:")));
+                assert!(prepared.goal.terminal.is_none());
+            },
+        )
+        .await;
     }
 
-    #[test]
-    fn goal_cas_conflict_cannot_commit_half_a_program_terminal() {
-        let (_, goals, actions, actor) = fixture(true);
+    #[tokio::test]
+    async fn goal_cas_conflict_cannot_commit_half_a_program_terminal() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, before, baseline, envelope| {
+        let goals = services.goal_store();
+        let actions = services.agent_action_service();
+        let actor = &envelope.actor;
+        let goal_id = baseline.goal.id.clone();
+        let goal_stream_id = baseline.event.event.stream_id.clone();
+        let current_goal = goals.get(&goal_id).unwrap().unwrap();
+        assert!(baseline.gaps.is_empty());
+
         let before = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&before).unwrap();
         assert!(prepared.gaps.is_empty());
-        goals
-            .revise(
-                "goal:root-completion",
-                1,
-                2,
-                "concurrent new requirement",
-                |goal| {
-                    goal.constraints.push("new requirement".into());
-                    vec!["constraints".into()]
-                },
-            )
-            .unwrap();
-        assert!(
-            actions
-                .commit_program_conclusion(&before, prepared)
-                .is_err()
-        );
+        let concurrent_goals = Arc::clone(goals);
+        let fault_goal_id = goal_id.clone();
+        let source = goal_stream_id.clone();
+        let expected = prepared.expected_stream_revision;
+        let error = crate::agentic::execution::reviewed_goal_fixture::with_native_conclusion_append_hook(
+            move |transaction| {
+                assert!(transaction.expected_streams.iter().any(|cut|
+                    cut.stream_id == source && cut.expected_revision == expected));
+                concurrent_goals.revise(&fault_goal_id, current_goal.revision,
+                    current_goal.user_sequence + 1, "concurrent new requirement", |goal| {
+                        goal.constraints.push("new requirement".into());
+                        vec!["constraints".into()]
+                    }).unwrap();
+            },
+            || actions.commit_program_conclusion(&before, prepared),
+        ).err().expect("actual Goal storage CAS");
+        match error {
+            crate::AgentActionServiceError::Store(crate::RuntimeEventStoreError::StaleRevision {
+                stream_id, expected: found, actual,
+            }) => { assert_eq!(stream_id, goal_stream_id); assert_eq!(found, expected); assert_eq!(actual, expected + 1); }
+            error => panic!("wrong failure layer: {error}"),
+        }
         assert_eq!(
             actions.project(&actor.program_id).unwrap().revision,
             before.revision
         );
         assert!(
             goals
-                .get("goal:root-completion")
+                .get(goal_id.as_str())
                 .unwrap()
                 .unwrap()
                 .terminal
                 .is_none()
         );
+
+        }).await;
     }
 
-    #[test]
-    fn real_a_verdict_is_bound_into_b_with_goal_and_program_source_fences() {
-        use harness_contract::execution_graph::{
-            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeResult,
-            ExecutionNodeSpec, ExecutionNodeStatus,
-        };
-
-        let objective_id = harness_contract::agent_action::root_objective_id(
-            "session-completion",
-            "turn-completion",
-        );
-        let program_id =
-            harness_contract::agent_action::program_id_for_objective(&objective_id);
-        let (events, goals, actions, actor) =
-            fixture_with_ids(true, true, objective_id, program_id);
-        let root_id = actor.root_execution_id.as_ref().unwrap();
-        let mut graph = ExecutionGraph::new("deliver verified Objective");
-        graph.id = root_id.clone();
-        graph = graph.with_lineage(ExecutionGraphLineage {
-            session_id: actor.session_id.clone(),
-            turn_id: actor.turn_id.clone(),
-            root_task_id: format!("task:{root_id}"),
-            task_id: format!("task:{root_id}"),
-            generation: 1,
-        });
-        graph.nodes.push(ExecutionNodeSpec {
-            id: "terminal".into(),
-            kind: ExecutionNodeKind::ToolBatch,
-            payload_ref: "payload:terminal".into(),
-            executor_kind: "test".into(),
-            idempotency_key: "idempotency:terminal".into(),
-            lease_ref: None,
-            acceptance: Default::default(),
-            retry_policy: Default::default(),
-            resource_scopes: vec![],
-            work: None,
-        });
-        let commits = crate::ExecutionCommitService::new(Arc::clone(&events));
-        let graph = commits.register_graph(graph).unwrap().graph;
-        let program = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&program).unwrap();
-        assert!(prepared.gaps.is_empty());
-        let concluded = actions.commit_program_conclusion(&program, prepared).unwrap();
-        let verdict = concluded.objective_verdict.as_ref().unwrap();
-        let goal = goals.projection(&verdict.goal_id).unwrap().unwrap();
-        let a_cursor = events
-            .list_stream(&format!("agentic-program:{}", actor.program_id))
-            .unwrap()
-            .last()
-            .unwrap()
-            .commit_cursor;
-        let graph = commits
-            .transition_node(&graph, "terminal", ExecutionNodeStatus::Ready, None, vec![])
-            .unwrap()
-            .graph;
-        let graph = commits
-            .transition_node(&graph, "terminal", ExecutionNodeStatus::Running, None, vec![])
-            .unwrap()
-            .graph;
-        let terminal = crate::SessionTerminalInput {
-            terminal_id: "terminal:bound-a".into(),
-            message_id: "message:bound-a".into(),
-            session_id: actor.session_id.clone(),
-            execution_id: Some(root_id.clone()),
-            turn_id: Some(actor.turn_id.clone()),
-            request_id: Some("request:bound-a".into()),
-            session_generation: Some(1),
-            input_sequence: Some(1),
-            input_claim_owner: Some("claim:owner".into()),
-            input_claim_token: Some("claim:token".into()),
-            input_claim_revision: Some(1),
-            controlled_recovery_claim_fingerprints: vec![],
-            payload_ref: "artifact://terminal".into(),
-        };
-        let terminal_stream = "session-terminal:request:bound-a";
-        let terminal_event = RuntimeTransactionEventInput {
-            event: RuntimeEventInput {
-                stream_id: terminal_stream.into(),
-                scope: RuntimeEventScope::SessionInput,
-                kind: "runtime.session.terminal_requested".into(),
-                status: Some("pending_delivery".into()),
-                actor: Some("SynthesizeNodeExecutor".into()),
-                refs: vec![],
-                payload: serde_json::to_value(&terminal).unwrap(),
+    #[tokio::test]
+    async fn real_a_verdict_is_bound_into_b_with_goal_and_program_source_fences() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, program, prepared, _| {
+                let committed = services
+                    .agent_action_service()
+                    .commit_program_conclusion(program, prepared)
+                    .unwrap();
+                let goal = services
+                    .goal_store()
+                    .get(&committed.objective_verdict.as_ref().unwrap().goal_id)
+                    .unwrap()
+                    .unwrap();
+                services
+                    .event_store()
+                    .append(RuntimeEventInput {
+                        stream_id: format!("agentic-program:{}", program.program_id),
+                        scope: RuntimeEventScope::Program,
+                        kind: "agentic.task_lease_renewed".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({}),
+                    })
+                    .unwrap();
+                crate::agentic::execution::reviewed_goal_fixture::assert_native_sources_final_b(
+                    services,
+                    services.commit_service(),
+                    &goal,
+                    false,
+                );
             },
-            idempotency_key: Some("terminal:bound-a".into()),
-            schema_version: 1,
-        };
-        let completed = ExecutionNodeResult {
-            status: ExecutionNodeStatus::Completed,
-            result_ref: Some("result:terminal".into()),
-            wait_class: None,
-            summary: Some("terminal".into()),
-            evidence_refs: vec![],
-            failure: None,
-            usage: Default::default(),
-            finished_at_ms: 1,
-        };
-        let mut wrong_session = terminal_event.clone();
-        wrong_session.event.payload["session_id"] = serde_json::json!("foreign-session");
-        let rejected = commits
-            .transition_node(
-                &graph,
-                "terminal",
-                ExecutionNodeStatus::Completed,
-                Some(completed.clone()),
-                vec![wrong_session],
-            )
-            .err()
-            .expect("B cannot borrow another Session's A");
-        assert!(rejected
-            .to_string()
-            .contains("Session terminal does not match its Graph, Session and Turn"));
-        assert_eq!(events.stream_revision(terminal_stream).unwrap(), 0);
-        let receipt = commits
-            .transition_node(
-                &graph,
-                "terminal",
-                ExecutionNodeStatus::Completed,
-                Some(completed),
-                vec![terminal_event],
-            )
-            .unwrap();
-        let committed = events.list_stream(terminal_stream).unwrap();
-        assert_eq!(committed.len(), 1);
-        assert_eq!(
-            committed[0].payload["objective_verdict"]["a_commit_cursor"],
-            a_cursor
-        );
-        assert_eq!(
-            committed[0].payload["objective_verdict"]["verdict"],
-            serde_json::to_value(verdict).unwrap()
-        );
-        assert_eq!(
-            committed[0].payload["objective_verdict"]["goal_spec_revision"],
-            goal.goal.spec_revision
-        );
-        assert_eq!(
-            committed[0].payload["objective_verdict"]["goal_spec_digest"],
-            goal.goal.spec_digest
-        );
-        for (stream_id, revision) in [
-            (format!("agentic-program:{}", actor.program_id), concluded.revision),
-            (format!("goal:{}", verdict.goal_id), goal.stream_revision),
-        ] {
-            assert!(receipt.transaction.stream_revisions.iter().any(|source| {
-                source.stream_id == stream_id && source.expected_revision == revision
-            }));
-        }
-        assert!(events.session_terminal(&terminal.terminal_id).unwrap().is_some());
+        )
+        .await;
     }
 
-    #[test]
-    fn program_cas_conflict_cannot_commit_half_a_goal_terminal() {
-        let (events, goals, actions, actor) = fixture(true);
-        let before = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&before).unwrap();
-        events
-            .append(RuntimeEventInput {
-                stream_id: "agentic-program:program-completion".into(),
-                scope: RuntimeEventScope::Program,
-                kind: "test.concurrent_observation".into(),
-                status: None,
-                actor: None,
-                refs: vec![],
-                payload: serde_json::json!({}),
-            })
-            .unwrap();
-        assert!(
-            actions
-                .commit_program_conclusion(&before, prepared)
-                .is_err()
-        );
-        let goal = goals.get("goal:root-completion").unwrap().unwrap();
-        assert_eq!(goal.revision, 1);
-        assert!(goal.terminal.is_none());
-        assert!(
-            actions
-                .project(&actor.program_id)
-                .unwrap()
-                .objective_verdict
-                .is_none()
-        );
+    #[tokio::test]
+    async fn program_cas_conflict_cannot_commit_half_a_goal_terminal() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, before, baseline, envelope| {
+                let events = services.event_store();
+                let goals = services.goal_store();
+                let actions = services.agent_action_service();
+                let actor = &envelope.actor;
+                let goal_id = baseline.goal.id.clone();
+                let program_stream_id = format!("agentic-program:{}", before.program_id);
+                let current_goal = goals.get(&goal_id).unwrap().unwrap();
+                assert!(baseline.gaps.is_empty());
+
+                let before = actions.project(&actor.program_id).unwrap();
+                let prepared = goals.prepare_program_conclusion(&before).unwrap();
+                events
+                    .append(RuntimeEventInput {
+                        stream_id: program_stream_id.as_str().into(),
+                        scope: RuntimeEventScope::Program,
+                        kind: "test.concurrent_observation".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({}),
+                    })
+                    .unwrap();
+                let error = actions
+                    .commit_program_conclusion(&before, prepared)
+                    .err()
+                    .expect("non-lease Program fence must reject the valid v2 prepared A");
+                match error {
+                    crate::AgentActionServiceError::Store(
+                        crate::RuntimeEventStoreError::StaleRevision {
+                            stream_id,
+                            expected,
+                            actual,
+                        },
+                    ) => {
+                        assert_eq!(stream_id, program_stream_id);
+                        assert_eq!(expected, before.revision);
+                        assert_eq!(actual, before.revision + 1);
+                    }
+                    error => panic!("wrong Program fence failure layer: {error}"),
+                }
+                let goal = goals.get(goal_id.as_str()).unwrap().unwrap();
+                assert_eq!(goal.revision, current_goal.revision);
+                assert!(goal.terminal.is_none());
+                assert!(actions
+                    .project(&actor.program_id)
+                    .unwrap()
+                    .objective_verdict
+                    .is_none());
+            },
+        )
+        .await;
     }
 
-    #[test]
-    fn lease_renewals_do_not_starve_an_already_verified_current_goal() {
-        let (events, goals, actions, actor) = fixture(true);
+    #[tokio::test]
+    async fn lease_renewals_do_not_starve_an_already_verified_current_goal() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, before, baseline, envelope| {
+        let events = services.event_store();
+        let goals = services.goal_store();
+        let actions = services.agent_action_service();
+        let actor = &envelope.actor;
+        let goal_id = baseline.goal.id.clone();
+        assert!(baseline.gaps.is_empty());
+
         let before = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&before).unwrap();
         assert!(prepared.gaps.is_empty());
@@ -1793,13 +1851,23 @@ mod tests {
         let committed = actions.commit_program_conclusion(&before, prepared).unwrap();
         assert_eq!(committed.status, crate::AgenticProgramStatus::Verified);
         assert_eq!(committed.revision, before.revision + 26);
-        assert_eq!(goals.get("goal:root-completion").unwrap().unwrap().completion,
+        assert_eq!(goals.get(goal_id.as_str()).unwrap().unwrap().completion,
             GoalCompletion::Satisfied);
+
+        }).await;
     }
 
-    #[test]
-    fn lease_renewal_rebase_cannot_bypass_a_new_goal_revision() {
-        let (events, goals, actions, actor) = fixture(true);
+    #[tokio::test]
+    async fn lease_renewal_rebase_cannot_bypass_a_new_goal_revision() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, before, baseline, envelope| {
+        let events = services.event_store();
+        let goals = services.goal_store();
+        let actions = services.agent_action_service();
+        let actor = &envelope.actor;
+        let goal_id = baseline.goal.id.clone();
+        let current_goal = goals.get(&goal_id).unwrap().unwrap();
+        assert!(baseline.gaps.is_empty());
+
         let before = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&before).unwrap();
         events.append(RuntimeEventInput {
@@ -1808,158 +1876,201 @@ mod tests {
             status: Some("renewed".into()), actor: None, refs: vec![],
             payload: serde_json::json!({"task_ref":"task", "agent_id":"worker", "execution_id":"run"}),
         }).unwrap();
-        goals.revise("goal:root-completion", 1, 2, "new user requirement", |goal| {
+        goals.revise(goal_id.as_str(), current_goal.revision, current_goal.user_sequence + 1, "new user requirement", |goal| {
             goal.objective = "A revised objective must be reviewed again".into();
             vec!["objective".into()]
         }).unwrap();
         assert!(actions.commit_program_conclusion(&before, prepared).is_err());
-        let current = goals.get("goal:root-completion").unwrap().unwrap();
-        assert_eq!(current.revision, 2);
+        let current = goals.get(goal_id.as_str()).unwrap().unwrap();
+        assert_eq!(current.revision, current_goal.revision + 1);
         assert!(current.terminal.is_none());
         assert!(actions.project(&actor.program_id).unwrap().objective_verdict.is_none());
+
+        }).await;
     }
 
-    #[test]
-    fn ordinary_goal_writers_cannot_bypass_the_program_atomic_conclusion() {
-        let (events, goals, actions, actor) = fixture(true);
-        let goal_id = "goal:root-completion";
-        let before = events.stream_revision("goal:goal:root-completion").unwrap();
-        let terminal = ObjectiveTerminal {
-            kind: ObjectiveTerminalKind::Satisfied,
-            terminal_fence: "bypass".into(),
-            authority_revision: 1,
-            reason: "attempt ordinary completion".into(),
-            evidence_refs: vec!["execution_graph:root-completion".into()],
-            diagnostics: vec![],
-            committed_at_ms: 1,
-        };
-        for error in [
-            goals
-                .terminal_event(
-                    goal_id,
-                    GoalCompletion::Satisfied,
-                    terminal.evidence_refs.clone(),
-                    terminal.reason.clone(),
-                    terminal.terminal_fence.clone(),
-                )
-                .unwrap_err(),
-            goals
-                .complete(goal_id, 1, GoalCompletion::Satisfied, "done")
-                .unwrap_err(),
-            goals.complete_objective(goal_id, 1, terminal).unwrap_err(),
-        ] {
-            assert!(error.contains("program_terminal_authority"), "{error}");
-        }
-        assert_eq!(
-            events.stream_revision("goal:goal:root-completion").unwrap(),
-            before
-        );
-        let program = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&program).unwrap();
-        assert!(prepared.gaps.is_empty());
-        actions
-            .commit_program_conclusion(&program, prepared)
-            .unwrap();
-        assert_eq!(
-            goals.get(goal_id).unwrap().unwrap().completion,
-            GoalCompletion::Satisfied
-        );
+    #[tokio::test]
+    async fn ordinary_goal_writers_cannot_bypass_the_program_atomic_conclusion() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, before, baseline, envelope| {
+                let events = services.event_store();
+                let goals = services.goal_store();
+                let actions = services.agent_action_service();
+                let actor = &envelope.actor;
+                let goal_id = baseline.goal.id.clone();
+                let goal_stream_id = baseline.event.event.stream_id.clone();
+                let current_goal = goals.get(&goal_id).unwrap().unwrap();
+                assert!(baseline.gaps.is_empty());
+
+                let goal_id = goal_id.as_str();
+                let before = events.stream_revision(goal_stream_id.as_str()).unwrap();
+                let terminal = ObjectiveTerminal {
+                    kind: ObjectiveTerminalKind::Satisfied,
+                    terminal_fence: "bypass".into(),
+                    authority_revision: 1,
+                    reason: "attempt ordinary completion".into(),
+                    evidence_refs: vec!["execution_graph:root-completion".into()],
+                    diagnostics: vec![],
+                    committed_at_ms: 1,
+                };
+                for error in [
+                    goals
+                        .terminal_event(
+                            goal_id,
+                            GoalCompletion::Satisfied,
+                            terminal.evidence_refs.clone(),
+                            terminal.reason.clone(),
+                            terminal.terminal_fence.clone(),
+                        )
+                        .unwrap_err(),
+                    goals
+                        .complete(
+                            goal_id,
+                            current_goal.revision,
+                            GoalCompletion::Satisfied,
+                            "done",
+                        )
+                        .unwrap_err(),
+                    goals
+                        .complete_objective(goal_id, current_goal.revision, terminal)
+                        .unwrap_err(),
+                ] {
+                    assert!(error.contains("program_terminal_authority"), "{error}");
+                }
+                assert_eq!(
+                    events.stream_revision(goal_stream_id.as_str()).unwrap(),
+                    before
+                );
+                let program = actions.project(&actor.program_id).unwrap();
+                let prepared = goals.prepare_program_conclusion(&program).unwrap();
+                assert!(prepared.gaps.is_empty());
+                actions
+                    .commit_program_conclusion(&program, prepared)
+                    .unwrap();
+                assert_eq!(
+                    goals.get(goal_id).unwrap().unwrap().completion,
+                    GoalCompletion::Satisfied
+                );
+            },
+        )
+        .await;
     }
 
-    #[test]
-    fn valid_current_review_commits_goal_and_program_together() {
-        let (events, goals, actions, actor) = fixture(true);
-        let before = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&before).unwrap();
-        let after = actions
-            .commit_program_conclusion(&before, prepared)
-            .unwrap();
-        let goal = goals.get("goal:root-completion").unwrap().unwrap();
-        assert_eq!(goal.completion, GoalCompletion::Satisfied);
-        assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
-        assert_eq!(
-            after.objective_verdict.as_ref().unwrap().terminal_fence,
-            goal.terminal.as_ref().unwrap().terminal_fence
-        );
-        let goal_event = events.list_stream("goal:goal:root-completion").unwrap();
-        let program_event = events
-            .list_stream("agentic-program:program-completion")
-            .unwrap();
-        assert!(!goal_event.is_empty());
-        assert_eq!(
-            goal_event.last().unwrap().transaction_id,
-            program_event.last().unwrap().transaction_id
-        );
+    #[tokio::test]
+    async fn valid_current_review_commits_goal_and_program_together() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, before, baseline, envelope| {
+                let events = services.event_store();
+                let goals = services.goal_store();
+                let actions = services.agent_action_service();
+                let actor = &envelope.actor;
+                let goal_id = baseline.goal.id.clone();
+                let goal_stream_id = baseline.event.event.stream_id.clone();
+                let program_stream_id = format!("agentic-program:{}", before.program_id);
+                assert!(baseline.gaps.is_empty());
+
+                let before = actions.project(&actor.program_id).unwrap();
+                let prepared = goals.prepare_program_conclusion(&before).unwrap();
+                let after = actions
+                    .commit_program_conclusion(&before, prepared)
+                    .unwrap();
+                let goal = goals.get(goal_id.as_str()).unwrap().unwrap();
+                assert_eq!(goal.completion, GoalCompletion::Satisfied);
+                assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
+                assert_eq!(
+                    after.objective_verdict.as_ref().unwrap().terminal_fence,
+                    goal.terminal.as_ref().unwrap().terminal_fence
+                );
+                let goal_event = events.list_stream(goal_stream_id.as_str()).unwrap();
+                let program_event = events.list_stream(program_stream_id.as_str()).unwrap();
+                assert!(!goal_event.is_empty());
+                assert_eq!(
+                    goal_event.last().unwrap().transaction_id,
+                    program_event.last().unwrap().transaction_id
+                );
+            },
+        )
+        .await;
     }
 
-    #[test]
-    fn original_obligations_and_new_spec_cannot_be_erased_by_task_completion() {
-        let (_, goals, actions, actor) = fixture(true);
-        goals
-            .revise(
-                "goal:root-completion",
-                1,
-                2,
-                "retain required verification",
-                |goal| {
-                    goal.obligations
-                        .push(harness_contract::goal::ObjectiveObligation {
-                            obligation_id: "original-verification".into(),
-                            required: true,
-                            success_predicate: "verify the user's actual result".into(),
-                            producer: Default::default(),
-                            evidence_requirement: Default::default(),
-                            state: ObjectiveObligationState::Open,
-                            artifact_refs: vec![],
-                            evidence_refs: vec![],
-                            reread_receipts: vec![],
-                            verifier_decision: None,
-                            diagnostic_code: None,
-                        });
-                    goal.spec_revision = 2;
-                    goal.spec_digest = "new-spec".into();
-                    vec![
-                        "obligations".into(),
-                        "spec_revision".into(),
-                        "spec_digest".into(),
-                    ]
-                },
-            )
-            .unwrap();
-        let program = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&program).unwrap();
-        assert!(prepared.goal.terminal.is_none());
-        assert!(
-            prepared
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("original-verification"))
-        );
-        assert!(
-            prepared
-                .gaps
-                .iter()
-                .any(|gap| gap.starts_with("original_intent_review_required:"))
-        );
-        actions
-            .commit_program_conclusion(&program, prepared)
-            .unwrap();
-        let original = goals.get("goal:root-completion").unwrap().unwrap();
-        assert_eq!(original.obligations.len(), 1);
-        assert_eq!(
-            original.obligations[0].obligation_id,
-            "original-verification"
-        );
-        assert!(original.obligations[0].required);
-        assert_eq!(
-            original.obligations[0].state,
-            ObjectiveObligationState::Open
-        );
+    #[tokio::test]
+    async fn original_obligations_and_new_spec_cannot_be_erased_by_task_completion() {
+        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
+            |services, before, baseline, envelope| {
+                let goals = services.goal_store();
+                let actions = services.agent_action_service();
+                let actor = &envelope.actor;
+                let goal_id = baseline.goal.id.clone();
+                let current_goal = goals.get(&goal_id).unwrap().unwrap();
+                assert!(baseline.gaps.is_empty());
+
+                goals
+                    .revise(
+                        goal_id.as_str(),
+                        current_goal.revision,
+                        current_goal.user_sequence + 1,
+                        "retain required verification",
+                        |goal| {
+                            goal.obligations
+                                .push(harness_contract::goal::ObjectiveObligation {
+                                    obligation_id: "original-verification".into(),
+                                    required: true,
+                                    success_predicate: "verify the user's actual result".into(),
+                                    producer: Default::default(),
+                                    evidence_requirement: Default::default(),
+                                    state: ObjectiveObligationState::Open,
+                                    artifact_refs: vec![],
+                                    evidence_refs: vec![],
+                                    reread_receipts: vec![],
+                                    verifier_decision: None,
+                                    diagnostic_code: None,
+                                });
+                            goal.spec_revision = 2;
+                            goal.spec_digest = "new-spec".into();
+                            vec![
+                                "obligations".into(),
+                                "spec_revision".into(),
+                                "spec_digest".into(),
+                            ]
+                        },
+                    )
+                    .unwrap();
+                let program = actions.project(&actor.program_id).unwrap();
+                let prepared = goals.prepare_program_conclusion(&program).unwrap();
+                assert!(prepared.goal.terminal.is_none());
+                assert!(prepared
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.contains("original-verification")));
+                assert!(prepared
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("original_intent_review_required:")));
+                actions
+                    .commit_program_conclusion(&program, prepared)
+                    .unwrap();
+                let original = goals.get(goal_id.as_str()).unwrap().unwrap();
+                assert_eq!(
+                    original.obligations.len(),
+                    current_goal.obligations.len() + 1
+                );
+                assert_eq!(
+                    original.obligations.last().unwrap().obligation_id,
+                    "original-verification"
+                );
+                assert!(original.obligations.last().unwrap().required);
+                assert_eq!(
+                    original.obligations.last().unwrap().state,
+                    ObjectiveObligationState::Open
+                );
+            },
+        )
+        .await;
     }
 
     #[test]
     fn repeated_completion_rejections_do_not_invent_a_default_business_round_terminal() {
-        let (events, goals, actions, actor) = fixture(false);
+        let (events, goals, actions, actor) = mechanical_fixture(false);
         assert_eq!(completion_reopen_bound().unwrap(), None);
         for attempt in 0..20 {
             events.append(RuntimeEventInput {
@@ -1974,11 +2085,17 @@ mod tests {
         assert_eq!(prepared.goal.completion, GoalCompletion::Open);
         assert!(prepared.goal.waiting.is_some());
         assert!(!prepared.gaps.is_empty());
-        actions.commit_program_conclusion(&program, prepared).unwrap();
+        actions
+            .commit_program_conclusion(&program, prepared)
+            .unwrap();
         let goal = goals.get("goal:root-completion").unwrap().unwrap();
         assert_eq!(goal.completion, GoalCompletion::Open);
         assert!(goal.terminal.is_none());
-        assert!(actions.project(&actor.program_id).unwrap().completion_request.is_none());
+        assert!(actions
+            .project(&actor.program_id)
+            .unwrap()
+            .completion_request
+            .is_none());
     }
 
     #[test]
@@ -1992,6 +2109,9 @@ mod tests {
     #[test]
     fn completion_reopen_count_is_zero_without_reopen_events() {
         let store = crate::RuntimeEventStore::for_test();
-        assert_eq!(completion_reopen_count(&store, "absent-program").unwrap(), 0);
+        assert_eq!(
+            completion_reopen_count(&store, "absent-program").unwrap(),
+            0
+        );
     }
 }

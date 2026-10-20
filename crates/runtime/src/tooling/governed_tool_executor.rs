@@ -116,8 +116,42 @@ pub enum GovernedToolTaskTerminal<O> {
 }
 
 impl<O> GovernedToolTaskTerminal<O> {
+    pub(crate) fn undispatched_reason(&self) -> Option<String> {
+        match self {
+            Self::Refused { reason } => Some(format!("admission refused before dispatch: {reason}")),
+            Self::Blocked { predecessor_id, reason } => {
+                Some(format!("blocked before dispatch by predecessor `{predecessor_id}`: {reason}"))
+            }
+            _ => None,
+        }
+    }
+
     fn succeeded(&self) -> bool {
         matches!(self, Self::Succeeded(_))
+    }
+}
+
+#[cfg(test)]
+mod undispatched_733_tests {
+    use super::GovernedToolTaskTerminal;
+
+    #[test]
+    fn only_scheduler_proven_non_execution_is_a_refusal() {
+        let refused = GovernedToolTaskTerminal::<()>::Refused { reason: "policy".into() };
+        let blocked = GovernedToolTaskTerminal::<()>::Blocked {
+            predecessor_id: "original-call".into(), reason: "ordinary IO failure".into(),
+        };
+        assert!(refused.undispatched_reason().unwrap().contains("policy"));
+        assert!(blocked.undispatched_reason().unwrap().contains("original-call"));
+        for terminal in [
+            GovernedToolTaskTerminal::Succeeded(()),
+            GovernedToolTaskTerminal::FailedOutput { output: (), error: "IO".into() },
+            GovernedToolTaskTerminal::Failed { error: "unknown".into() },
+            GovernedToolTaskTerminal::Cancelled { reason: "not physical proof".into() },
+            GovernedToolTaskTerminal::Panicked { reason: "may have started".into() },
+        ] {
+            assert!(terminal.undispatched_reason().is_none());
+        }
     }
 }
 

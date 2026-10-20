@@ -383,10 +383,16 @@ struct PostgresExecutorInner {
     background: Arc<PostgresPoolInner>,
     migration_mode: PostgresMigrationMode,
     initialized_migration_ledgers: Mutex<BTreeSet<String>>,
-    expected_migration_catalogs: Mutex<BTreeMap<(String, String), String>>,
+    expected_migration_catalogs: Mutex<BTreeMap<(String, String), ExpectedMigrationCatalog>>,
     migration_transaction_count: AtomicU64,
     runtime_readiness_query_count: AtomicU64,
     search_path_switch_count: AtomicU64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ExpectedMigrationCatalog {
+    checksum: String,
+    baseline: Option<(String, String)>,
 }
 
 /// A bounded synchronous PostgreSQL executor.  Pool checkout is the only
@@ -1019,6 +1025,14 @@ impl PostgresExecutor {
             }
         }
 
+        let baseline = specs
+            .iter()
+            .find(|spec| spec.id.ends_with(".current-baseline"));
+        if baseline.is_some() && specs.len() != 1 {
+            return Err(StorageError::Other(
+                "a current PostgreSQL baseline must be the domain's only migration".into(),
+            ));
+        }
         let catalog_checksum = migration_catalog_checksum(specs);
         if self.inner.migration_mode == PostgresMigrationMode::RuntimeReadiness {
             let namespace = self.search_path.as_deref().unwrap_or("public").to_string();
@@ -1026,17 +1040,50 @@ impl PostgresExecutor {
             let mut expected = self.inner.expected_migration_catalogs.lock().map_err(|_| {
                 StorageError::Other("postgres expected migration catalog lock poisoned".to_string())
             })?;
-            if let Some(previous) = expected.insert(key, catalog_checksum.clone()) {
-                if previous != catalog_checksum {
+            let catalog = ExpectedMigrationCatalog {
+                checksum: catalog_checksum.clone(),
+                baseline: baseline.map(|spec| (spec.id.to_string(), spec.checksum())),
+            };
+            if let Some(previous) = expected.get(&key) {
+                if previous != &catalog {
                     return Err(StorageError::Other(format!(
                         "conflicting PostgreSQL schema catalogs registered for domain `{domain}`"
                     )));
                 }
+            } else {
+                expected.insert(key, catalog);
             }
             return Ok(migration_reports(specs, "catalog_registered"));
         }
 
         let mut connection = self.checkout_critical()?;
+        if let Some(spec) = baseline {
+            self.inner
+                .migration_transaction_count
+                .fetch_add(1, Ordering::Relaxed);
+            let mut transaction = connection.transaction()?;
+            transaction.query_one(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                &[&format!("cowd-storage:{domain}")],
+            )?;
+            let namespace = self.search_path.as_deref().unwrap_or("public");
+            transaction.batch_execute(&format!("SET LOCAL search_path TO \"{namespace}\""))?;
+            let exists: bool = transaction
+                .query_one("SELECT current_schema() = $1", &[&namespace])?
+                .try_get::<_, Option<bool>>(0)?
+                .unwrap_or(false);
+            if !exists {
+                return Err(StorageError::Other(
+                    "PostgreSQL baseline namespace is unavailable".into(),
+                ));
+            }
+            validate_clean_baseline_catalog(&mut transaction, spec)?;
+            ensure_migration_ledger_in_transaction(&mut transaction)?;
+            let report = apply_migration_in_transaction(&mut transaction, spec)?;
+            store_migration_catalog(&mut transaction, domain, &catalog_checksum)?;
+            transaction.commit()?;
+            return Ok(vec![report]);
+        }
         self.ensure_migration_ledger_once(&mut connection)?;
         let applied = load_applied_migrations(&mut connection, specs)?;
         let mut reports = Vec::with_capacity(specs.len());
@@ -1085,57 +1132,78 @@ impl PostgresExecutor {
                 StorageError::Other("postgres expected migration catalog lock poisoned".to_string())
             })?
             .clone();
-        let mut by_namespace = BTreeMap::<String, BTreeMap<String, String>>::new();
-        for ((namespace, domain), checksum) in expected {
+        let mut by_namespace =
+            BTreeMap::<String, BTreeMap<String, ExpectedMigrationCatalog>>::new();
+        for ((namespace, domain), catalog) in expected {
             by_namespace
                 .entry(namespace)
                 .or_default()
-                .insert(domain, checksum);
+                .insert(domain, catalog);
         }
         let mut verified = 0usize;
         for (namespace, catalogs) in by_namespace {
-            let executor = if namespace == "public" {
-                self.clone()
-            } else {
-                self.scoped_namespace(&namespace)?
-            };
+            let executor = self.scoped_namespace(&namespace)?;
             let domains = catalogs.keys().cloned().collect::<Vec<_>>();
+            let baseline_domains = catalogs
+                .iter()
+                .filter(|(_, catalog)| catalog.baseline.is_some())
+                .map(|(domain, _)| domain.clone())
+                .collect::<Vec<_>>();
             let mut connection = executor.checkout_critical()?;
             self.inner
                 .runtime_readiness_query_count
                 .fetch_add(1, Ordering::Relaxed);
             let rows = connection
                 .query(
-                    "SELECT domain, checksum FROM cowd_schema_catalogs
-                     WHERE domain = ANY($1)",
-                    &[&domains],
+                    &format!(
+                        "SELECT requested.domain, catalog.checksum, migration.id, migration.checksum
+                         FROM unnest($1::TEXT[]) AS requested(domain)
+                         LEFT JOIN \"{namespace}\".cowd_schema_catalogs AS catalog
+                           ON catalog.domain = requested.domain
+                         LEFT JOIN LATERAL (
+                             SELECT id, checksum FROM \"{namespace}\".cowd_schema_migrations
+                             WHERE domain = requested.domain AND requested.domain = ANY($2::TEXT[])
+                             ORDER BY id LIMIT 2
+                         ) AS migration ON TRUE"
+                    ),
+                    &[&domains, &baseline_domains],
                 )
-                .map_err(|error| {
+                .map_err(|_| {
                     StorageError::Other(format!(
                         "PostgreSQL schema catalog is unavailable in namespace `{namespace}`: \
-                         {error}; stop Gateway and run `cowd storage upgrade`"
+                         stop Gateway and run `cowd storage upgrade`"
                     ))
                 })?;
-            let actual = rows
-                .into_iter()
-                .map(|row| Ok((row.try_get::<_, String>(0)?, row.try_get::<_, String>(1)?)))
-                .collect::<Result<BTreeMap<_, _>, PostgresError>>()?;
-            for (domain, checksum) in catalogs {
-                match actual.get(&domain) {
-                    Some(actual) if actual == &checksum => verified = verified.saturating_add(1),
-                    Some(_) => {
-                        return Err(StorageError::Other(format!(
-                            "PostgreSQL schema catalog mismatch for `{namespace}.{domain}`; \
-                             stop Gateway and run `cowd storage upgrade`"
-                        )));
-                    }
-                    None => {
-                        return Err(StorageError::Other(format!(
-                            "PostgreSQL schema catalog is missing `{namespace}.{domain}`; \
-                             stop Gateway and run `cowd storage upgrade`"
-                        )));
-                    }
+            let mut identities = BTreeMap::<String, Vec<(String, String)>>::new();
+            for row in rows {
+                let domain: String = row.try_get(0)?;
+                let checksum: Option<String> = row.try_get(1)?;
+                let catalog = catalogs.get(&domain).ok_or_else(|| {
+                    StorageError::Other("unregistered PostgreSQL schema catalog".into())
+                })?;
+                if checksum.as_deref() != Some(catalog.checksum.as_str()) {
+                    return Err(StorageError::Other(format!(
+                        "PostgreSQL schema catalog missing or mismatched for `{namespace}.{domain}`; \
+                         stop Gateway and run `cowd storage upgrade`"
+                    )));
                 }
+                let domain_identities = identities.entry(domain).or_default();
+                if let Some(id) = row.try_get::<_, Option<String>>(2)? {
+                    domain_identities.push((id, row.try_get(3)?));
+                }
+            }
+            for (domain, catalog) in catalogs {
+                let actual = identities.get(&domain);
+                if actual.is_none()
+                    || catalog.baseline.as_ref().is_some_and(|baseline| {
+                        actual.map(Vec::as_slice) != Some(std::slice::from_ref(baseline))
+                    })
+                {
+                    return Err(StorageError::Other(format!(
+                        "PostgreSQL baseline catalog mismatch for `{namespace}.{domain}`; select a clean namespace"
+                    )));
+                }
+                verified = verified.saturating_add(1);
             }
         }
         Ok(verified)
@@ -1515,11 +1583,15 @@ pub struct PostgresMigrationReport {
 }
 
 fn ensure_migration_ledger(connection: &mut PostgresConnection) -> Result<(), StorageError> {
-    // Independent durable domains may initialize concurrently during process
-    // composition. PostgreSQL can race on catalog insertion even for
-    // `CREATE TABLE IF NOT EXISTS`, so serialize only this tiny ledger setup;
-    // each domain's actual migration retains its own transaction-scoped lock.
     let mut transaction = connection.transaction()?;
+    ensure_migration_ledger_in_transaction(&mut transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn ensure_migration_ledger_in_transaction(
+    transaction: &mut impl PostgresClient,
+) -> Result<(), StorageError> {
     transaction.query_one(
         "SELECT pg_advisory_xact_lock(hashtext($1))",
         &[&"cowd-storage:migration-ledger"],
@@ -1539,7 +1611,41 @@ fn ensure_migration_ledger(connection: &mut PostgresConnection) -> Result<(), St
             verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );",
     )?;
-    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_clean_baseline_catalog(
+    transaction: &mut impl PostgresClient,
+    spec: &PostgresMigrationSpec,
+) -> Result<(), StorageError> {
+    let exists: bool = transaction
+        .query_one(
+            "SELECT to_regclass('cowd_schema_migrations') IS NOT NULL",
+            &[],
+        )?
+        .try_get(0)?;
+    if !exists {
+        return Ok(());
+    }
+    let rows = transaction.query(
+        "SELECT id, checksum, domain FROM cowd_schema_migrations
+         WHERE domain = $1 OR id = $2 ORDER BY id LIMIT 2",
+        &[&spec.domain, &spec.id],
+    )?;
+    let valid = match rows.as_slice() {
+        [] => true,
+        [row] => {
+            row.try_get::<_, String>(0)? == spec.id
+                && row.try_get::<_, String>(1)? == spec.checksum()
+                && row.try_get::<_, String>(2)? == spec.domain
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(StorageError::Other(
+            "unsupported PostgreSQL baseline catalog; select a clean namespace".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1572,7 +1678,7 @@ fn migration_reports(
 }
 
 fn store_migration_catalog(
-    connection: &mut PostgresConnection,
+    connection: &mut impl PostgresClient,
     domain: &str,
     checksum: &str,
 ) -> Result<(), StorageError> {
@@ -1612,12 +1718,21 @@ fn apply_migration(
     connection: &mut PostgresConnection,
     spec: &PostgresMigrationSpec,
 ) -> Result<PostgresMigrationReport, StorageError> {
-    let checksum = spec.checksum();
     let mut transaction = connection.transaction()?;
     transaction.query_one(
         "SELECT pg_advisory_xact_lock(hashtext($1))",
         &[&format!("cowd-storage:{}", spec.domain)],
     )?;
+    let report = apply_migration_in_transaction(&mut transaction, spec)?;
+    transaction.commit()?;
+    Ok(report)
+}
+
+fn apply_migration_in_transaction(
+    transaction: &mut impl PostgresClient,
+    spec: &PostgresMigrationSpec,
+) -> Result<PostgresMigrationReport, StorageError> {
+    let checksum = spec.checksum();
     if let Some(row) = transaction.query_opt(
         "SELECT checksum FROM cowd_schema_migrations WHERE id = $1",
         &[&spec.id],
@@ -1629,7 +1744,6 @@ fn apply_migration(
                 spec.id, spec.domain
             )));
         }
-        transaction.commit()?;
         return Ok(PostgresMigrationReport {
             id: spec.id.to_string(),
             domain: spec.domain.to_string(),
@@ -1653,7 +1767,6 @@ fn apply_migration(
             &spec.description,
         ],
     )?;
-    transaction.commit()?;
     Ok(PostgresMigrationReport {
         id: spec.id.to_string(),
         domain: spec.domain.to_string(),
@@ -1667,6 +1780,451 @@ fn apply_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CLEAN_BASELINE: PostgresMigrationSpec = PostgresMigrationSpec {
+        id: "catalog_probe.current-baseline",
+        domain: "catalog_probe",
+        version: 1,
+        description: "atomic current baseline fixture",
+        statements: &[
+            "CREATE TABLE catalog_probe_data(value TEXT NOT NULL)",
+            "INSERT INTO catalog_probe_data VALUES('preserved')",
+        ],
+    };
+
+    fn readiness_executor(fixture: &crate::postgres_scope::PostgresTestScope) -> PostgresExecutor {
+        let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("isolated PostgreSQL required");
+        let resolver = StaticSecretRefResolver::new([("catalog-readiness".to_string(), url)]);
+        let mut config = PostgresConnectionConfig::new(
+            "catalog-readiness",
+            "catalog-readiness",
+            "catalog-readiness",
+        );
+        config.max_connections = test_fixture_pool_size();
+        config.checkout_timeout_ms = test_fixture_checkout_timeout_ms();
+        let executor = PostgresExecutor::connect_with_migration_mode(
+            config,
+            &resolver,
+            PostgresMigrationMode::RuntimeReadiness,
+        )
+        .unwrap();
+        fixture.bind(&executor)
+    }
+
+    fn baseline_snapshot(executor: &PostgresExecutor) -> String {
+        executor.checkout_online_read().unwrap().query_one(
+            "SELECT jsonb_build_object(
+                'migrations', (SELECT jsonb_agg(to_jsonb(record) ORDER BY id) FROM cowd_schema_migrations record),
+                'catalogs', (SELECT jsonb_agg(to_jsonb(record) ORDER BY domain) FROM cowd_schema_catalogs record),
+                'data', (SELECT jsonb_agg(value ORDER BY value) FROM catalog_probe_data),
+                'relations', (SELECT jsonb_agg(jsonb_build_array(oid::TEXT, relname, relkind::TEXT) ORDER BY relname)
+                              FROM pg_class WHERE relnamespace = current_schema()::regnamespace),
+                'columns', (SELECT jsonb_agg(jsonb_build_array(attrelid::TEXT, attname, atttypid::TEXT, attnotnull) ORDER BY attrelid, attnum)
+                            FROM pg_attribute WHERE attrelid IN (SELECT oid FROM pg_class WHERE relnamespace = current_schema()::regnamespace)),
+                'indexes', (SELECT jsonb_agg(indexdef ORDER BY indexname) FROM pg_indexes WHERE schemaname = current_schema())
+            )::TEXT", &[],
+        ).unwrap().get(0)
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn r1_clean_baseline_catalog_is_atomic_and_readiness_rejects_extra_ids() {
+        let fixture = crate::postgres_scope::PostgresTestScope::new();
+        let executor = fixture.reconnect();
+        let readiness = readiness_executor(&fixture);
+        let before_registration = readiness.health();
+        assert_eq!(
+            readiness
+                .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+                .unwrap()[0]
+                .status,
+            "catalog_registered"
+        );
+        assert_eq!(
+            readiness.health().metrics.query_count,
+            before_registration.metrics.query_count
+        );
+        assert!(readiness.verify_registered_migration_catalogs().is_err());
+        assert_eq!(readiness.health().migration_transaction_count, 0);
+        assert!(!executor.checkout_online_read().unwrap().query_one(
+            "SELECT to_regclass('cowd_schema_migrations') IS NOT NULL OR to_regclass('cowd_schema_catalogs') IS NOT NULL", &[],
+        ).unwrap().get::<_, bool>(0));
+
+        assert_eq!(
+            executor
+                .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+                .unwrap()[0]
+                .status,
+            "applied"
+        );
+        assert_eq!(
+            executor
+                .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+                .unwrap()[0]
+                .status,
+            "already_applied"
+        );
+        let before_readiness = baseline_snapshot(&executor);
+        let query_count = readiness.health().runtime_readiness_query_count;
+        assert_eq!(readiness.verify_registered_migration_catalogs().unwrap(), 1);
+        assert_eq!(
+            readiness.health().runtime_readiness_query_count - query_count,
+            1
+        );
+        assert_eq!(baseline_snapshot(&executor), before_readiness);
+        executor
+            .checkout_critical()
+            .unwrap()
+            .execute(
+                "UPDATE cowd_schema_catalogs SET checksum='unknown-catalog' WHERE domain=$1",
+                &[&CLEAN_BASELINE.domain],
+            )
+            .unwrap();
+        let unknown_catalog = baseline_snapshot(&executor);
+        assert!(readiness.verify_registered_migration_catalogs().is_err());
+        assert_eq!(baseline_snapshot(&executor), unknown_catalog);
+        executor
+            .checkout_critical()
+            .unwrap()
+            .execute(
+                "UPDATE cowd_schema_catalogs SET checksum=$1 WHERE domain=$2",
+                &[
+                    &migration_catalog_checksum(&[CLEAN_BASELINE.clone()]),
+                    &CLEAN_BASELINE.domain,
+                ],
+            )
+            .unwrap();
+        let conflict = PostgresMigrationSpec {
+            description: "conflicting expected checksum",
+            ..CLEAN_BASELINE.clone()
+        };
+        assert!(readiness
+            .apply_migrations(conflict.domain, &[conflict])
+            .is_err());
+        assert_eq!(readiness.verify_registered_migration_catalogs().unwrap(), 1);
+        let mixed = PostgresMigrationSpec {
+            id: "catalog_probe.other",
+            ..CLEAN_BASELINE.clone()
+        };
+        for candidate in [&executor, &readiness] {
+            assert!(candidate
+                .apply_migrations(
+                    CLEAN_BASELINE.domain,
+                    &[CLEAN_BASELINE.clone(), mixed.clone()]
+                )
+                .is_err());
+        }
+
+        executor.checkout_critical().unwrap().execute(
+            "INSERT INTO cowd_schema_migrations(id,domain,version,checksum,description)
+             SELECT 'catalog_probe.old',domain,version,checksum,description FROM cowd_schema_migrations WHERE id=$1",
+            &[&CLEAN_BASELINE.id],
+        ).unwrap();
+        let before = baseline_snapshot(&executor);
+        assert!(executor
+            .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+            .is_err());
+        assert!(fixture
+            .reconnect()
+            .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+            .is_err());
+        assert!(readiness.verify_registered_migration_catalogs().is_err());
+        assert_eq!(baseline_snapshot(&executor), before);
+
+        let other = PostgresMigrationSpec {
+            id: "unrelated.1",
+            domain: "unrelated",
+            version: 1,
+            description: "unrelated domain retains existing migration semantics",
+            statements: &[
+                "CREATE TABLE unrelated_data(value TEXT)",
+                "INSERT INTO unrelated_data VALUES('other')",
+            ],
+        };
+        assert_eq!(
+            executor
+                .apply_migrations(other.domain, &[other.clone()])
+                .unwrap()[0]
+                .status,
+            "applied"
+        );
+        assert_eq!(
+            executor
+                .apply_migrations(other.domain, &[other.clone()])
+                .unwrap()[0]
+                .status,
+            "already_applied"
+        );
+        let other_readiness = readiness_executor(&fixture);
+        other_readiness
+            .apply_migrations(other.domain, &[other])
+            .unwrap();
+        assert_eq!(
+            other_readiness
+                .verify_registered_migration_catalogs()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            executor
+                .checkout_online_read()
+                .unwrap()
+                .query_one("SELECT value FROM unrelated_data", &[])
+                .unwrap()
+                .get::<_, String>(0),
+            "other"
+        );
+
+        executor
+            .checkout_critical()
+            .unwrap()
+            .execute(
+                "DELETE FROM cowd_schema_migrations WHERE id='catalog_probe.old'",
+                &[],
+            )
+            .unwrap();
+        executor
+            .checkout_critical()
+            .unwrap()
+            .execute(
+                "UPDATE cowd_schema_migrations SET checksum='wrong' WHERE id=$1",
+                &[&CLEAN_BASELINE.id],
+            )
+            .unwrap();
+        let wrong_checksum = baseline_snapshot(&executor);
+        assert!(executor
+            .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+            .is_err());
+        assert!(readiness.verify_registered_migration_catalogs().is_err());
+        assert_eq!(baseline_snapshot(&executor), wrong_checksum);
+        executor
+            .checkout_critical()
+            .unwrap()
+            .execute(
+                "UPDATE cowd_schema_migrations SET checksum=$1 WHERE id=$2",
+                &[&CLEAN_BASELINE.checksum(), &CLEAN_BASELINE.id],
+            )
+            .unwrap();
+        assert_eq!(readiness.verify_registered_migration_catalogs().unwrap(), 1);
+        executor
+            .checkout_critical()
+            .unwrap()
+            .execute(
+                "DELETE FROM cowd_schema_migrations WHERE id=$1",
+                &[&CLEAN_BASELINE.id],
+            )
+            .unwrap();
+        assert!(readiness.verify_registered_migration_catalogs().is_err());
+
+        let concurrent = crate::postgres_scope::PostgresTestScope::new();
+        let peers = [concurrent.reconnect(), concurrent.reconnect()];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = peers
+            .into_iter()
+            .map(|peer| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    peer.apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+                        .unwrap()[0]
+                        .status
+                        .clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        let statuses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| status.as_str() == "applied")
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| status.as_str() == "already_applied")
+                .count(),
+            1
+        );
+        let mut connection = concurrent.reconnect().checkout_critical().unwrap();
+        assert_eq!(
+            connection
+                .query_one("SELECT COUNT(*) FROM catalog_probe_data", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_one(
+                    "SELECT COUNT(*) FROM cowd_schema_migrations WHERE domain=$1",
+                    &[&CLEAN_BASELINE.domain]
+                )
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_one(
+                    "SELECT COUNT(*) FROM cowd_schema_catalogs WHERE domain=$1",
+                    &[&CLEAN_BASELINE.domain]
+                )
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        drop(connection);
+
+        let failed = crate::postgres_scope::PostgresTestScope::new();
+        let failed_executor = failed.reconnect();
+        let bad = PostgresMigrationSpec {
+            statements: &[
+                "CREATE TABLE catalog_probe_data(value TEXT)",
+                "INSERT INTO catalog_probe_data VALUES('rollback')",
+                "SELECT 1/0",
+            ],
+            ..CLEAN_BASELINE.clone()
+        };
+        assert!(failed_executor
+            .apply_migrations(bad.domain, &[bad])
+            .is_err());
+        assert!(!failed_executor.checkout_online_read().unwrap().query_one(
+            "SELECT to_regclass('cowd_schema_migrations') IS NOT NULL OR to_regclass('cowd_schema_catalogs') IS NOT NULL OR to_regclass('catalog_probe_data') IS NOT NULL", &[],
+        ).unwrap().get::<_, bool>(0));
+        assert_eq!(
+            failed_executor
+                .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+                .unwrap()[0]
+                .status,
+            "applied"
+        );
+
+        let catalog_failure = crate::postgres_scope::PostgresTestScope::new();
+        let catalog_executor = catalog_failure.reconnect();
+        let prerequisite = PostgresMigrationSpec {
+            id: "prerequisite.1",
+            domain: "prerequisite",
+            version: 1,
+            description: "existing unrelated ledger fixture",
+            statements: &[],
+        };
+        catalog_executor
+            .apply_migrations(prerequisite.domain, &[prerequisite])
+            .unwrap();
+        catalog_executor.checkout_critical().unwrap().batch_execute(
+            "CREATE FUNCTION reject_probe_catalog() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN IF NEW.domain='catalog_probe' THEN RAISE EXCEPTION 'catalog fixture rejection'; END IF;
+             RETURN NEW; END $$;
+             CREATE TRIGGER reject_probe_catalog BEFORE INSERT OR UPDATE ON cowd_schema_catalogs
+             FOR EACH ROW EXECUTE FUNCTION reject_probe_catalog()",
+        ).unwrap();
+        let ledger_snapshot = |executor: &PostgresExecutor| -> String {
+            executor.checkout_online_read().unwrap().query_one(
+                "SELECT jsonb_build_array(
+                    (SELECT jsonb_agg(to_jsonb(record) ORDER BY id) FROM cowd_schema_migrations record),
+                    (SELECT jsonb_agg(to_jsonb(record) ORDER BY domain) FROM cowd_schema_catalogs record)
+                )::TEXT", &[],
+            ).unwrap().get(0)
+        };
+        let before_catalog_failure = ledger_snapshot(&catalog_executor);
+        assert!(catalog_executor
+            .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+            .is_err());
+        assert_eq!(ledger_snapshot(&catalog_executor), before_catalog_failure);
+        assert!(!catalog_executor
+            .checkout_online_read()
+            .unwrap()
+            .query_one("SELECT to_regclass('catalog_probe_data') IS NOT NULL", &[],)
+            .unwrap()
+            .get::<_, bool>(0));
+
+        let old = crate::postgres_scope::PostgresTestScope::new();
+        let old_executor = old.reconnect();
+        old_executor.checkout_critical().unwrap().batch_execute(
+            "CREATE TABLE cowd_schema_migrations(id TEXT PRIMARY KEY, domain TEXT, checksum TEXT);
+             INSERT INTO cowd_schema_migrations VALUES('catalog_probe.old','catalog_probe','old');
+             CREATE TABLE old_sentinel(value TEXT); INSERT INTO old_sentinel VALUES('untouched')",
+        ).unwrap();
+        assert!(old_executor
+            .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+            .is_err());
+        let mut connection = old_executor.checkout_online_read().unwrap();
+        assert!(!connection.query_one("SELECT to_regclass('cowd_schema_catalogs') IS NOT NULL OR to_regclass('catalog_probe_data') IS NOT NULL", &[]).unwrap().get::<_, bool>(0));
+        assert_eq!(
+            connection
+                .query_one("SELECT checksum FROM cowd_schema_migrations", &[])
+                .unwrap()
+                .get::<_, String>(0),
+            "old"
+        );
+        assert_eq!(
+            connection
+                .query_one("SELECT value FROM old_sentinel", &[])
+                .unwrap()
+                .get::<_, String>(0),
+            "untouched"
+        );
+        drop(connection);
+
+        let wrong_namespace = crate::postgres_scope::PostgresTestScope::new();
+        let wrong_readiness = readiness_executor(&wrong_namespace);
+        wrong_readiness
+            .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+            .unwrap();
+        assert!(wrong_readiness
+            .verify_registered_migration_catalogs()
+            .is_err());
+        executor
+            .checkout_critical()
+            .unwrap()
+            .batch_execute("DROP TABLE cowd_schema_catalogs")
+            .unwrap();
+        assert!(readiness.verify_registered_migration_catalogs().is_err());
+        assert!(!executor
+            .checkout_online_read()
+            .unwrap()
+            .query_one(
+                "SELECT to_regclass('cowd_schema_catalogs') IS NOT NULL",
+                &[],
+            )
+            .unwrap()
+            .get::<_, bool>(0));
+        let missing_ledger_readiness = readiness_executor(&concurrent);
+        missing_ledger_readiness
+            .apply_migrations(CLEAN_BASELINE.domain, &[CLEAN_BASELINE.clone()])
+            .unwrap();
+        assert_eq!(
+            missing_ledger_readiness
+                .verify_registered_migration_catalogs()
+                .unwrap(),
+            1
+        );
+        concurrent
+            .reconnect()
+            .checkout_critical()
+            .unwrap()
+            .batch_execute("DROP TABLE cowd_schema_migrations")
+            .unwrap();
+        assert!(missing_ledger_readiness
+            .verify_registered_migration_catalogs()
+            .is_err());
+        assert!(!concurrent
+            .reconnect()
+            .checkout_online_read()
+            .unwrap()
+            .query_one(
+                "SELECT to_regclass('cowd_schema_migrations') IS NOT NULL",
+                &[],
+            )
+            .unwrap()
+            .get::<_, bool>(0));
+        assert_eq!(readiness.health().migration_transaction_count, 0);
+    }
 
     #[test]
     fn an_explicit_pool_size_wins_over_the_derived_default() {
@@ -1691,9 +2249,10 @@ mod tests {
 
     #[test]
     fn the_default_pool_gives_headroom_over_the_thread_count_without_doubling_it() {
-        let threads =
-            u32::try_from(std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get))
-                .unwrap_or(u32::MAX);
+        let threads = u32::try_from(
+            std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get),
+        )
+        .unwrap_or(u32::MAX);
         let size = fixture_pool_size(None);
         assert!(
             size >= threads,

@@ -2,7 +2,7 @@ use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeStatus};
 use thiserror::Error;
 
 use super::commit_service::{ExecutionCommitError, ExecutionCommitService};
-use super::registry::{NodeExecutionTicket, NodeExecutorError, NodeExecutorRegistry};
+use super::registry::{NodeExecutorError, NodeExecutorRegistry};
 use super::state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
 
 #[derive(Debug, Error)]
@@ -13,6 +13,8 @@ pub enum ExecutionRecoveryError {
     Commit(#[from] ExecutionCommitError),
     #[error(transparent)]
     Executor(#[from] NodeExecutorError),
+    #[error("binding lease reconciliation blocked: {0}")]
+    LeaseReconciliation(String),
 }
 
 pub struct ExecutionGraphRecovery<'a> {
@@ -35,51 +37,111 @@ impl<'a> ExecutionGraphRecovery<'a> {
         }
     }
 
-    pub async fn recover(&self, graph_id: &str) -> Result<ExecutionGraph, ExecutionRecoveryError> {
-        let graph = self.state_store.load_async(graph_id).await?;
-        let mut next = graph.clone();
-        let mut recovered = Vec::new();
-        let mut blocked = Vec::new();
-        for node in &graph.nodes {
-            let status = graph.node_statuses[&node.id];
-            if status != ExecutionNodeStatus::Running {
-                continue;
+    pub(crate) async fn recover_with_leases(
+        &self,
+        graph_id: &str,
+        scopes: &super::resources::ScopeLockManager,
+        worktrees: &super::resources::WorktreeLeaseManager,
+        workspace_id: &str,
+    ) -> Result<ExecutionGraph, ExecutionRecoveryError> {
+        let head = self.state_store.load_async(graph_id).await?.revision;
+        let mut after = 0;
+        while after < head {
+            let (next, starts) = self
+                .state_store
+                .binding_starts_page(graph_id, after, head)?;
+            for (node_id, binding, position) in starts {
+                for retry in 0..8 {
+                    let graph = self.state_store.load_async(graph_id).await?;
+                    let already_closed = self
+                        .state_store
+                        .binding_lease_closure(&graph, &node_id, &binding, position)?;
+                    if already_closed {
+                        self.commit_service
+                            .recover_closed_binding_publication(
+                                &graph,
+                                &node_id,
+                                &binding,
+                                self.registry,
+                            )
+                            .await?;
+                        break;
+                    }
+                    let mut owner = if !already_closed {
+                        let key = super::events::ExecutionBindingLeaseClosure::fence_key(
+                            &graph, &node_id, &binding,
+                        );
+                        Some(scopes.try_recover_binding_owner(&key)
+                            .map_err(|error| ExecutionRecoveryError::LeaseReconciliation(error.to_string()))?
+                            .ok_or_else(|| ExecutionRecoveryError::LeaseReconciliation(format!(
+                                "{graph_id}/{node_id}/{}: original owner alive or unsupported missing fence",binding.attempt)))?)
+                    } else {
+                        None
+                    };
+                    let running = graph.node_statuses.get(&node_id)
+                        == Some(&ExecutionNodeStatus::Running)
+                        && graph.recovery_cursor.node_attempts.get(&node_id)
+                            == Some(&binding.attempt);
+                    if running {
+                        if !self
+                            .commit_service
+                            .recover_running_bound_tool_batch(
+                                &graph,
+                                &node_id,
+                                &binding,
+                                self.registry,
+                            )
+                            .await?
+                        {
+                            return Err(ExecutionRecoveryError::LeaseReconciliation(format!(
+                                "{graph_id}/{node_id}/{}: original outcome is not durably committed; provider/Host state unknown; no reexecute or Ready admission",
+                                binding.attempt)));
+                        }
+                    }
+                    let current = self.state_store.load_async(graph_id).await?;
+                    let owner = owner.as_mut().ok_or_else(|| {
+                        ExecutionRecoveryError::LeaseReconciliation(
+                            "missing exact recovery owner fence".into(),
+                        )
+                    })?;
+                    let physical = self.commit_service.authenticated_lease_recovery(&current,&node_id,&binding,self.registry).await?
+                        .ok_or_else(|| ExecutionRecoveryError::LeaseReconciliation(format!(
+                            "{graph_id}/{node_id}/{}: original backend/effect/after_commit quiescence unproven; no release or requeue",binding.attempt)))?;
+                    let released = owner
+                        .release_recovered(
+                            &current,
+                            &node_id,
+                            &binding,
+                            position,
+                            &physical,
+                            worktrees,
+                            workspace_id,
+                        )
+                        .map_err(ExecutionRecoveryError::LeaseReconciliation)?;
+                    match self
+                        .commit_service
+                        .commit_binding_lease_closure(&current, &released)
+                    {
+                        Ok(_) => break,
+                        Err(ExecutionCommitError::EventStore(
+                            crate::RuntimeEventStoreError::StaleRevision { .. },
+                        )) if retry < 7 => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
             }
-            let attempt = graph
-                .recovery_cursor
-                .node_attempts
-                .get(&node.id)
-                .copied()
-                .unwrap_or(1);
-            let Some(executor) = self.registry.get(&node.executor_kind) else {
-                next.node_statuses
-                    .insert(node.id.clone(), ExecutionNodeStatus::Blocked);
-                blocked.push(node.id.clone());
-                continue;
-            };
-            // A process crash does not consume a logical retry. Reattach the same
-            // idempotent attempt; the backend must deduplicate any completed side effect.
-            let ticket = NodeExecutionTicket {
-                graph_id: graph.id.clone(),
-                node_id: node.id.clone(),
-                executor_kind: node.executor_kind.clone(),
-                service_class: graph.service_class,
-                attempt,
-                idempotency_key: node.idempotency_key.clone(),
-                payload_ref: node.payload_ref.clone(),
-            };
-            executor.recover(&ticket).await?;
-            next.node_statuses
-                .insert(node.id.clone(), ExecutionNodeStatus::Ready);
-            recovered.push(node.id.clone());
+            after = next;
         }
-        if recovered.is_empty() && blocked.is_empty() {
-            return Ok(graph);
+        let graph = self.state_store.load_async(graph_id).await?;
+        if graph
+            .node_statuses
+            .values()
+            .any(|status| *status == ExecutionNodeStatus::Running)
+        {
+            return Err(ExecutionRecoveryError::LeaseReconciliation(
+                "Running execution has no authenticated recoverable original binding/result".into(),
+            ));
         }
-        Ok(self
-            .commit_service
-            .commit_recovery_async(graph, next, recovered, blocked)
-            .await?
-            .graph)
+        Ok(graph)
     }
 }

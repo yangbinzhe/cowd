@@ -14,6 +14,8 @@ pub struct PostgresTaskStore {
 
 impl PostgresTaskStore {
     pub fn new(executor: PostgresExecutor) -> Result<Self, String> {
+        validate_clean_domain_catalog(&executor, TASK_DOMAIN, TASK_MIGRATIONS)
+            .map_err(|error| error.to_string())?;
         executor
             .apply_migrations(TASK_DOMAIN, TASK_MIGRATIONS)
             .map_err(|error| error.to_string())?;

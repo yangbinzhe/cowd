@@ -78,14 +78,16 @@ pub(super) fn resolve_agentic_execution_admission(
             &context.resource_scopes,
         )
     });
-    let (allowed_tools, missing_capabilities, missing_tool_alternatives) = intersect_agentic_tools(
-        &resolved,
-        &requested_tools,
-        &skill_tool_refs,
-        host_snapshot.as_ref(),
-    )?;
+    let (mut allowed_tools, missing_capabilities, missing_tool_alternatives) =
+        intersect_agentic_tools(
+            &resolved,
+            &requested_tools,
+            &skill_tool_refs,
+            host_snapshot.as_ref(),
+        )?;
     let effective_capabilities =
         effective_capabilities_after_intersection(&required, &missing_capabilities)?;
+    constrain_tools_to_effective_capabilities(&mut allowed_tools, &effective_capabilities);
 
     Ok(AgenticExecutionAdmission {
         catalog_entry,
@@ -96,6 +98,13 @@ pub(super) fn resolve_agentic_execution_admission(
         missing_capabilities,
         missing_tool_alternatives,
     })
+}
+
+fn constrain_tools_to_effective_capabilities(
+    tools: &mut Vec<String>,
+    capabilities: &[AgentCapability],
+) {
+    tools.retain(|tool| crate::agent::binding::tool_contract_is_authorized(tool, capabilities));
 }
 
 pub(super) fn effective_capabilities_after_intersection(
@@ -354,16 +363,31 @@ pub(super) fn snapshot_agentic_tools(
     resource_scopes: &[String],
 ) -> AgenticToolHostSnapshot {
     let requested = requested_tools.iter().cloned().collect::<Vec<_>>();
-    let tools = host
-        .delegated_tool_definitions(&requested)
-        .into_iter()
+    let Some(lease) = host.pin_step_catalog() else {
+        return AgenticToolHostSnapshot::default();
+    };
+    let metadata = lease.catalog_receipt();
+    let projection =
+        crate::tool_host::DelegatedCatalogProjection::new(&lease, &metadata, requested_tools);
+    let exposed = host.delegated_tool_definitions(&requested);
+    let tools = projection
+        .definitions()
+        .filter(|definition| {
+            exposed.iter().any(|actual| {
+                actual.name == definition.name
+                    && actual.input_schema == definition.input_schema
+                    && actual.description == definition.description
+            })
+        })
         .filter_map(|definition| {
-            let effect =
-                host.delegated_tool_effect_descriptor(&definition.name, &serde_json::json!({}))?;
-            (permission_ceiling.permits(effect.required_permission)
-                && delegated_tool_effect_is_bounded(&effect)
-                && tool_effect_has_resource_lease(&definition.name, &effect, resource_scopes))
-            .then_some(definition.name)
+            projection
+                .discover(
+                    definition,
+                    requested_tools,
+                    permission_ceiling,
+                    Some(resource_scopes),
+                )
+                .map(|descriptor| descriptor.canonical_id)
         })
         .collect();
     AgenticToolHostSnapshot { tools }
@@ -386,27 +410,11 @@ pub(super) fn tool_effect_has_resource_lease(
     {
         return true;
     }
-    let requested = crate::governed_tool_plan::resource_scope_from_effect(effect);
-    if requested.network {
-        return resource_scopes.iter().any(|scope| scope == "network:*");
-    }
-    if effect.spawns_process {
-        return resource_scopes.iter().any(|scope| {
-            matches!(
-                scope.trim(),
-                "read:." | "read:./" | "write:." | "write:./" | "workspace:."
-            )
-        });
-    }
-    if requested.kind == "runtime" || requested.paths.is_empty() {
-        return true;
-    }
-    resource_scopes.iter().any(|scope| {
-        matches!(
-            scope.split_once(':').map(|(kind, _)| kind),
-            Some("read" | "write" | "worktree" | "workspace")
-        )
-    })
+    crate::tool_host::effect_has_resource_lease(
+        effect,
+        resource_scopes,
+        crate::tool_host::lexical_resource_path_is_authorized,
+    )
 }
 
 // Return the admitted tool subset plus the missing-capability diagnostics.
@@ -491,12 +499,221 @@ mod capability_truth_tests {
     use harness_contract::agent::AgentCapability;
 
     #[test]
+    fn r1_composite_effect_admission_never_widens_mixed_grants() {
+        struct CatalogHost(tools::ToolHostLease);
+        #[async_trait::async_trait]
+        impl crate::RuntimeExecutionHost for CatalogHost {
+            fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+                Some(self.0.clone())
+            }
+
+            fn delegated_tool_definitions(
+                &self,
+                names: &[String],
+            ) -> Vec<crate::ProviderToolDefinition> {
+                self.0
+                    .snapshot()
+                    .catalog
+                    .definitions(None)
+                    .into_iter()
+                    .filter(|definition| names.contains(&definition.name))
+                    .map(|definition| crate::ProviderToolDefinition {
+                        name: definition.name,
+                        description: definition.description,
+                        input_schema: definition.input_schema,
+                    })
+                    .collect()
+            }
+
+            fn delegated_tool_effect_descriptor(
+                &self,
+                name: &str,
+                input: &serde_json::Value,
+            ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+                Some(self.0.describe_effect(name, input))
+            }
+            async fn execute_runtime_tool(
+                &self,
+                _: &crate::RuntimeToolExecutionRequest,
+            ) -> crate::RuntimeToolExecutionOutcome {
+                panic!("admission never invokes a tool")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let host = CatalogHost(
+            tools::ToolHost::builtin("admission-resource-frame", root.path()).pin_snapshot(),
+        );
+        let mixed = serde_json::json!({"steps":[
+            {"id":"edit","op":"call","tool":"edit","input":{"action":"write","path":"held.txt","content":"x"}},
+            {"id":"read","op":"call","tool":"read_file","input":{"path":"source.txt"}},
+            {"id":"fetch","op":"call","tool":"web_fetch","input":{"url":"https://example.invalid","prompt":"summarize"}}
+        ]});
+        let effect = host.0.describe_effect("tool_orchestrate", &mixed);
+        let permits = |effect: &harness_contract::tool::ToolEffectDescriptor, scopes: &[&str]| {
+            super::tool_effect_has_resource_lease(
+                "tool_orchestrate",
+                effect,
+                &scopes
+                    .iter()
+                    .map(|scope| (*scope).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for denied in [
+            vec!["network:*"],
+            vec!["write:held.txt", "read:source.txt"],
+            vec!["network:*", "write:wrong.txt", "read:source.txt"],
+            vec!["network:*", "read:held.txt", "read:source.txt"],
+            vec!["network:*", "write:held.txt"],
+        ] {
+            assert!(!permits(&effect, &denied));
+        }
+        let complete = [
+            "network:*",
+            "write:held.txt",
+            "read:source.txt",
+            "write:.cowd/checkpoints",
+        ];
+        assert!(permits(&effect, &complete));
+        for missing in 0..complete.len() {
+            let mut narrow = complete.to_vec();
+            narrow.remove(missing);
+            assert!(!permits(&effect, &narrow));
+        }
+        let compute = serde_json::json!({"steps":[
+            {"id":"edit","op":"call","tool":"edit","input":{"action":"write","path":"held.txt","content":"x"}},
+            {"id":"compute","op":"compute","language":"python","code":"print(1)"}
+        ]});
+        let compute = host.0.describe_effect("tool_orchestrate", &compute);
+        assert!(compute.spawns_process && !compute.uses_network);
+        assert!(!permits(&compute, &["read:."]));
+        assert!(!permits(&compute, &["write:held.txt"]));
+        assert!(!permits(&compute, &["read:.", "write:held.txt"]));
+        assert!(permits(
+            &compute,
+            &["read:.", "write:held.txt", "write:.cowd/checkpoints"]
+        ));
+        let pure = host.0.describe_effect(
+            "tool_orchestrate",
+            &serde_json::json!({"steps":[
+                {"id":"compute","op":"compute","language":"python","code":"print(1)"}
+            ]}),
+        );
+        assert!(permits(&pure, &["read:."]));
+        assert!(!permits(&pure, &["read:held.txt"]));
+        let network = host
+            .0
+            .describe_effect("web_fetch", &mixed["steps"][2]["input"]);
+        assert!(super::tool_effect_has_resource_lease(
+            "web_fetch",
+            &network,
+            &["network:*".into()]
+        ));
+        assert!(!super::tool_effect_has_resource_lease(
+            "web_fetch",
+            &network,
+            &["read:.".into()]
+        ));
+
+        let requested =
+            std::collections::BTreeSet::from(["read_file".into(), "tool_orchestrate".into()]);
+        let scopes = vec!["read:held.txt".to_string()];
+        let snapshot = super::snapshot_agentic_tools(
+            &host,
+            &requested,
+            harness_contract::tool::ToolPermissionMode::ReadOnly,
+            &scopes,
+        );
+        assert_eq!(snapshot.tools, requested);
+        assert_eq!(scopes, vec!["read:held.txt"]);
+        let probe = host.0.describe_effect("read_file", &serde_json::json!({}));
+        assert!(!super::tool_effect_has_resource_lease(
+            "read_file",
+            &probe,
+            &scopes
+        ));
+        assert!(super::tool_effect_has_resource_lease(
+            "read_file",
+            &probe,
+            &["read:.".into()]
+        ));
+        let network = super::snapshot_agentic_tools(
+            &host,
+            &requested,
+            harness_contract::tool::ToolPermissionMode::ReadOnly,
+            &["network:*".into()],
+        );
+        assert!(network.tools.contains("tool_orchestrate"));
+        assert!(!network.tools.contains("read_file"));
+        assert!(!permits(&effect, &["network:*"]));
+        let empty = super::snapshot_agentic_tools(
+            &host,
+            &requested,
+            harness_contract::tool::ToolPermissionMode::ReadOnly,
+            &[],
+        );
+        assert!(empty.tools.is_empty());
+        let unregistered = super::snapshot_agentic_tools(
+            &host,
+            &std::collections::BTreeSet::from(["unregistered".into()]),
+            harness_contract::tool::ToolPermissionMode::ReadOnly,
+            &["read:.".into()],
+        );
+        assert!(unregistered.tools.is_empty());
+        for scopes in [
+            vec!["read:src/../secret".into()],
+            vec!["execute:held.txt".into()],
+        ] {
+            assert!(super::snapshot_agentic_tools(
+                &host,
+                &requested,
+                harness_contract::tool::ToolPermissionMode::ReadOnly,
+                &scopes,
+            )
+            .tools
+            .is_empty());
+        }
+        let edit = super::snapshot_agentic_tools(
+            &host,
+            &std::collections::BTreeSet::from(["edit".into()]),
+            harness_contract::tool::ToolPermissionMode::ReadOnly,
+            &["write:held.txt".into()],
+        );
+        assert!(edit.tools.is_empty());
+    }
+
+    #[test]
     fn capability_grants_exclude_tools_missing_after_host_intersection() {
         let requested = vec!["read".to_string(), "network".to_string()];
         let effective =
             effective_capabilities_after_intersection(&requested, &["network".to_string()])
                 .expect("known requested capabilities");
         assert_eq!(effective, vec![AgentCapability::Read]);
+        let effective = effective_capabilities_after_intersection(
+            &["read".into(), "write".into()],
+            &["write".into()],
+        )
+        .unwrap();
+        let mut tools = vec![
+            "read_file".into(),
+            "task_claim".into(),
+            "edit".into(),
+            "artifact_materialize".into(),
+        ];
+        super::constrain_tools_to_effective_capabilities(&mut tools, &effective);
+        assert_eq!(
+            tools,
+            vec!["read_file".to_string(), "task_claim".to_string()]
+        );
+        let mut tools = vec!["edit".into(), "artifact_materialize".into()];
+        super::constrain_tools_to_effective_capabilities(
+            &mut tools,
+            &[AgentCapability::Read, AgentCapability::Write],
+        );
+        assert_eq!(
+            tools,
+            vec!["edit".to_string(), "artifact_materialize".to_string()]
+        );
     }
 
     #[test]

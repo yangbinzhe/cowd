@@ -86,12 +86,40 @@ pub(crate) fn register_running_root(
     let node_id = node.id.clone();
     graph.nodes.push(node);
     graph = commits.register_graph(graph).unwrap().graph;
-    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
-        graph = commits
-            .transition_node(&graph, &node_id, status, None, vec![])
-            .unwrap()
-            .graph;
-    }
+    graph = commits
+        .transition_node(&graph, &node_id, ExecutionNodeStatus::Ready, None, vec![])
+        .unwrap()
+        .graph;
+    let node = graph.nodes.iter().find(|node| node.id == node_id).unwrap();
+    let attempt =
+        crate::execution_core::graph::ExecutionNodeBinding::next_attempt(&graph, &node_id).unwrap();
+    let ticket = crate::execution_core::graph::NodeExecutionTicket {
+        graph_id: graph.id.clone(),
+        node_id: node_id.clone(),
+        executor_kind: node.executor_kind.clone(),
+        service_class: graph.service_class,
+        attempt,
+        idempotency_key: node.idempotency_key.clone(),
+        payload_ref: node.payload_ref.clone(),
+    };
+    crate::execution_core::graph::ExecutionNodeBinding::validate_ticket(
+        &ticket, &graph, node, attempt,
+    )
+    .unwrap();
+    commits
+        .bind_and_start_node(
+            &graph,
+            &node_id,
+            crate::execution_core::graph::ExecutionNodeBinding {
+                executor_kind: ticket.executor_kind,
+                ticket_idempotency_key: ticket.idempotency_key,
+                attempt,
+                resource_lease_refs: vec![],
+                scope_lease_ref: None,
+                worktree_lease_ref: None,
+            },
+        )
+        .unwrap();
 }
 
 #[allow(clippy::too_many_arguments)]

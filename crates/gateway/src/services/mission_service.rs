@@ -654,13 +654,17 @@ impl MissionService {
         // the event cursor so the returned snapshot never trails the commit
         // performed while constructing its own projection.
         self.runtime().ensure_default_mission()?;
+        let latest_cursor = self.runtime().durable_commit_cursor()?;
+        let directory_revision = self.runtime().control_directory_revision()?;
         let sessions = self.canonical_session_nodes().await?;
         let active_session_id = sessions
             .iter()
             .filter(|session| session.active)
             .max_by_key(|session| session.updated_at_ms)
             .map(|session| session.session_id.clone());
-        let latest_cursor = *self.events().subscribe_commits().borrow();
+        if self.runtime().durable_commit_cursor()? != latest_cursor {
+            return Err("mission projection source changed; resync required".into());
+        }
         let cache_key = format!(
             "{}:{}",
             if include_execution_details {
@@ -679,6 +683,8 @@ impl MissionService {
             // payload, but invalidate it on the same commit cursor as the full
             // graph. SSE still resumes cheaply from the returned cursor.
             if entry.snapshot.cursor == latest_cursor
+                && entry.snapshot.projection.health["directory_revision"].as_str()
+                    == Some(directory_revision.as_str())
                 && entry.canonical_sessions == sessions
                 && entry.snapshot.projection.workspace.active_session_id == active_session_id
             {
@@ -688,19 +694,20 @@ impl MissionService {
         let revision = cache
             .get(&cache_key)
             .map_or(1, |entry| entry.snapshot.revision.saturating_add(1));
-        let projection = if include_execution_details {
-            self.runtime().control_projection(
-                sessions.clone(),
-                active_session_id,
-                selected_mission_id.map(str::to_owned),
-            )?
-        } else {
-            self.runtime().control_summary_projection(
-                sessions.clone(),
-                active_session_id,
-                selected_mission_id.map(str::to_owned),
-            )?
-        };
+        let projection = self.runtime().control_projection_through(
+            sessions.clone(),
+            active_session_id,
+            selected_mission_id.map(str::to_owned),
+            include_execution_details,
+            latest_cursor,
+        )?;
+        if self.runtime().durable_commit_cursor()? != latest_cursor
+            || self.canonical_session_nodes().await? != sessions
+            || projection.health["directory_revision"].as_str() != Some(directory_revision.as_str())
+            || self.runtime().control_directory_revision()? != directory_revision
+        {
+            return Err("mission projection directory changed; resync required".into());
+        }
         let snapshot = MissionMaterializedSnapshot {
             schema_version: MISSION_CONTROL_SCHEMA_VERSION,
             kind: "mission_control.materialized_snapshot".to_string(),
@@ -1501,6 +1508,106 @@ mod tests {
             ),
             runtime_services,
         )
+    }
+
+    #[tokio::test]
+    async fn r1_bounded_history_mission_failure_is_not_cached_as_success() {
+        let (service, services) = scoped_mission_service_with_runtime();
+        let initial = service
+            .materialized_snapshot_for_detail(None, false)
+            .await
+            .expect("initial summary");
+        let cached = service
+            .projection_cache
+            .lock()
+            .await
+            .get("summary:")
+            .unwrap()
+            .snapshot
+            .clone();
+        assert_eq!(initial, cached);
+        let mission_id = services.mission_runtime().default_mission_id().to_string();
+        let probe = service.events().append_fixture(runtime::RuntimeEventInput {
+            stream_id: format!("mission:{mission_id}"), scope: runtime::RuntimeEventScope::Session,
+            kind: "session.metadata_budget_fault".into(), status: None,
+            actor: Some("x".repeat(1024 * 1024 + 1)), refs: Vec::new(),
+            payload: serde_json::json!({"negative": "oversized scalar, not a completion ledger"}),
+        }).expect("persist deterministic metadata budget fault");
+        assert!(probe.commit_cursor > initial.cursor);
+        for _ in 0..2 {
+            let error = service
+                .materialized_snapshot_for_detail(None, false)
+                .await
+                .unwrap_err();
+            assert!(
+                error.starts_with("HistoryBudgetExceeded:"),
+                "recent backend budget fault-hit: {error}"
+            );
+            let after = service
+                .projection_cache
+                .lock()
+                .await
+                .get("summary:")
+                .unwrap()
+                .snapshot
+                .clone();
+            assert_eq!(after, cached);
+            assert_eq!(after.cursor, initial.cursor);
+            assert_eq!(after.revision, initial.revision);
+        }
+        assert!(service
+            .materialized_snapshot_for_detail(None, true)
+            .await
+            .unwrap_err()
+            .starts_with("HistoryBudgetExceeded:"));
+        assert!(!service.projection_cache.lock().await.contains_key("graph:"));
+        services.shutdown_execution().await;
+        let (directory_service, directory_services) = scoped_mission_service_with_runtime();
+        let before = directory_service
+            .materialized_snapshot_for_detail(None, false)
+            .await
+            .unwrap();
+        directory_service
+            .events()
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: "agentic-program:mission-directory-negative".into(),
+                scope: runtime::RuntimeEventScope::Program,
+                kind: "agentic.program_opened".into(),
+                status: None,
+                actor: Some("negative-fixture".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"negative": "missing required objective"}),
+            })
+            .unwrap();
+        let mut directory_fault_hits = 0;
+        for details in [false, true] {
+            let error = directory_service
+                .materialized_snapshot_for_detail(None, details)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("program_opened_missing_objective"),
+                "real list_programs fault-hit: {error}"
+            );
+            directory_fault_hits += 1;
+            assert_eq!(
+                directory_service
+                    .projection_cache
+                    .lock()
+                    .await
+                    .get("summary:")
+                    .unwrap()
+                    .snapshot,
+                before
+            );
+            assert!(!directory_service
+                .projection_cache
+                .lock()
+                .await
+                .contains_key("graph:"));
+        }
+        assert_eq!(directory_fault_hits, 2);
+        directory_services.shutdown_execution().await;
     }
 
     #[tokio::test]

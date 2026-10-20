@@ -45,6 +45,7 @@ pub struct WorkspacePathIdentityResolver {
     workspace_root: PathBuf,
     workspace_id: String,
     repositories: Vec<RepositoryBinding>,
+    workspace_repository: RepositoryBinding,
 }
 
 impl WorkspacePathIdentityResolver {
@@ -90,16 +91,92 @@ impl WorkspacePathIdentityResolver {
                 .then_with(|| left.repository_id.cmp(&right.repository_id))
         });
         repositories.dedup();
+        let workspace_repository = RepositoryBinding {
+            repository_id: repository_id(&workspace_root),
+            workspace_prefix: String::new(),
+        };
         Ok(Self {
             workspace_root,
             workspace_id,
             repositories,
+            workspace_repository,
         })
     }
 
     #[must_use]
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
+    }
+
+    pub(crate) fn is_workspace_scope(&self, normalized_path: &str) -> bool {
+        let path = Path::new(normalized_path);
+        path == Path::new(".") || path == self.workspace_root
+    }
+
+    pub(crate) fn physical_file_identity_at_admission(
+        &self,
+        identity: &WorkspacePathIdentity,
+    ) -> Result<Option<String>, WorkspacePathIdentityError> {
+        let invalid =
+            || WorkspacePathIdentityError::InvalidPath(identity.workspace_relative_path.clone());
+        if identity.workspace_id != self.workspace_id {
+            return Err(invalid());
+        }
+        let relative = if identity.workspace_relative_path == "." {
+            PathBuf::from(".")
+        } else {
+            self.workspace_relative_input(&identity.workspace_relative_path)?
+        };
+        if path_to_slash(&relative) != identity.workspace_relative_path {
+            return Err(invalid());
+        }
+        let mut ancestor = self.workspace_root.clone();
+        for component in relative.components() {
+            ancestor.push(component.as_os_str());
+            match ancestor.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_symlink() => return Err(invalid()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(invalid()),
+            }
+        }
+        let full = self.workspace_root.join(&relative);
+        let metadata = match full.symlink_metadata() {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(invalid()),
+        };
+        let actual = if metadata.is_some() {
+            if relative == Path::new(".") {
+                self.resolve_existing(".")?
+            } else {
+                self.identity_for_existing(&relative)?
+            }
+        } else {
+            self.resolve_planned_file(&identity.workspace_relative_path)?
+        };
+        let mut expected = identity.clone();
+        expected.observed_revision_or_digest = None;
+        if actual != expected {
+            return Err(invalid());
+        }
+        let Some(metadata) = metadata.filter(|metadata| metadata.is_file()) else {
+            return Ok(None);
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() == 1 {
+                return Ok(Some(format!(
+                    "unix-file:{}:{}",
+                    metadata.dev(),
+                    metadata.ino()
+                )));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = metadata;
+        Ok(None)
     }
 
     pub fn resolve_existing(
@@ -127,6 +204,9 @@ impl WorkspacePathIdentityResolver {
             });
         }
         let relative = self.workspace_relative_input(path)?;
+        if relative.starts_with(Path::new(".cowd/checkpoints")) {
+            return self.identity_for_existing(&relative);
+        }
         let direct = self.workspace_root.join(&relative);
         if direct.exists() {
             return self.identity_for_existing(&relative);
@@ -168,6 +248,22 @@ impl WorkspacePathIdentityResolver {
             return Ok(identity);
         }
         let relative = self.workspace_relative_input(path)?;
+        if relative.starts_with(Path::new(".cowd/checkpoints")) {
+            let mut ancestor = self.workspace_root.clone();
+            for component in relative.components() {
+                ancestor.push(component.as_os_str());
+                match ancestor.symlink_metadata() {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(WorkspacePathIdentityError::InvalidPath(path.to_string()));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        return Err(WorkspacePathIdentityError::InvalidPath(path.to_string()))
+                    }
+                }
+            }
+        }
         let repository = self
             .repository_for_relative(&relative)
             .or_else(|| (self.repositories.len() == 1).then(|| &self.repositories[0]));
@@ -210,7 +306,11 @@ impl WorkspacePathIdentityResolver {
             repository_id: repository.repository_id.clone(),
             workspace_relative_path,
             repository_relative_path,
-            object_kind: WorkspaceObjectKind::File,
+            object_kind: if relative == Path::new(".cowd/checkpoints") {
+                WorkspaceObjectKind::Directory
+            } else {
+                WorkspaceObjectKind::File
+            },
             observed_revision_or_digest: None,
         })
     }
@@ -678,6 +778,9 @@ impl WorkspacePathIdentityResolver {
     }
 
     fn repository_for_relative(&self, relative: &Path) -> Option<&RepositoryBinding> {
+        if relative.starts_with(Path::new(".cowd/checkpoints")) {
+            return Some(&self.workspace_repository);
+        }
         let rendered = path_to_slash(relative);
         self.repositories
             .iter()
@@ -757,6 +860,12 @@ fn observed_from_identity(
 #[must_use]
 pub fn observed_scope_key(observed: &ObservedEvidence) -> String {
     match &observed.target {
+        EvidenceTargetIdentity::ToolExecution { execution } => {
+            format!("tool_execution:{}", execution.admission.binding.call_key)
+        }
+        EvidenceTargetIdentity::LocalNetwork { operation } => {
+            format!("local_network:{}", operation.binding.call_key)
+        }
         EvidenceTargetIdentity::Network { endpoint } => format!("network:{endpoint}"),
         EvidenceTargetIdentity::AmbiguousWorkspace { display_alias, .. }
         | EvidenceTargetIdentity::UnavailableWorkspace { display_alias, .. } => {
@@ -780,6 +889,12 @@ pub fn observed_scope_key(observed: &ObservedEvidence) -> String {
 #[must_use]
 pub fn obligation_scope_key(obligation: &EvidenceObligation) -> String {
     match &obligation.target {
+        EvidenceTargetIdentity::ToolExecution { execution } => {
+            format!("tool_execution:{}", execution.admission.binding.call_key)
+        }
+        EvidenceTargetIdentity::LocalNetwork { operation } => {
+            format!("local_network:{}", operation.binding.call_key)
+        }
         EvidenceTargetIdentity::Network { endpoint } => format!("network:{endpoint}"),
         EvidenceTargetIdentity::AmbiguousWorkspace { display_alias, .. }
         | EvidenceTargetIdentity::UnavailableWorkspace { display_alias, .. } => {
@@ -1170,8 +1285,413 @@ fn obligation_kind(raw_scope: &str) -> EvidenceObligationKind {
 }
 
 #[cfg(test)]
+pub(crate) fn untrusted_process_observation_283() -> ObservedEvidence {
+    use harness_contract::context::{
+        ArtifactRef, ToolExecutionAdmission, ToolExecutionBinding, ToolExecutionFact,
+        ToolExecutionInput, ToolExecutionTerminal,
+    };
+    let artifact = ArtifactRef::durable(
+        "artifact://untrusted",
+        "a".repeat(64),
+        1,
+        "application/json",
+        "session:negative",
+    );
+    ObservedEvidence {
+        obligation_id: "untrusted-process".into(),
+        target: EvidenceTargetIdentity::ToolExecution {
+            execution: ToolExecutionFact {
+                version: 1,
+                admission: ToolExecutionAdmission {
+                    version: 1,
+                    binding: ToolExecutionBinding {
+                        call_key: "untrusted-call".into(),
+                        tool_use_id: "untrusted-tool-use".into(),
+                        input_sha256: "a".repeat(64),
+                        descriptor_sha256: "b".repeat(64),
+                        authority_sha256: "c".repeat(64),
+                    },
+                    code_sha256: "d".repeat(64),
+                    inputs: vec![ToolExecutionInput {
+                        relative_path: "source.py".into(),
+                        sha256: "e".repeat(64),
+                        bytes: 1,
+                        device: 1,
+                        inode: 2,
+                        mtime_ns: 3,
+                        ctime_ns: 4,
+                    }],
+                    source_bundle: artifact.clone(),
+                },
+                terminal: ToolExecutionTerminal::Unknown {
+                    reason_code: "public_dto_is_not_authority".into(),
+                },
+                body: artifact,
+                stdout_sha256: "f".repeat(64),
+                stderr_sha256: "a".repeat(64),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                capture_complete: false,
+            },
+        },
+        observed_at_sequence: 1,
+        tool_name: "execute_code".into(),
+        provenance: Default::default(),
+        evidence_ref: None,
+        model_observation: None,
+        workspace_prior_state: None,
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_process_target_never_satisfies_workspace_or_network_283() {
+        use super::*;
+        let observed = untrusted_process_observation_283();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.py"), "actual file\n").unwrap();
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        for kind in [
+            EvidenceObligationKind::ContentRead,
+            EvidenceObligationKind::VerifyAfterWrite,
+            EvidenceObligationKind::WriteEffect,
+            EvidenceObligationKind::NetworkEvidence,
+        ] {
+            let target = if kind == EvidenceObligationKind::NetworkEvidence {
+                EvidenceTargetIdentity::Network {
+                    endpoint: "*".into(),
+                }
+            } else {
+                EvidenceTargetIdentity::Workspace {
+                    scope: WorkspaceScopeIdentity {
+                        access_mode: WorkspaceAccessMode::Read,
+                        path: resolver.resolve_existing("source.py").unwrap(),
+                        coverage: EvidenceCoverageKind::ExactContent,
+                    },
+                }
+            };
+            let obligation = EvidenceObligation {
+                obligation_id: "required".into(),
+                kind,
+                target,
+                observation_requirement: Default::default(),
+            };
+            assert!(!observed_evidence_satisfies(&obligation, &observed));
+        }
+        let obligation = EvidenceObligation {
+            obligation_id: "same-public-target".into(),
+            kind: EvidenceObligationKind::ContentRead,
+            target: observed.target.clone(),
+            observation_requirement: Default::default(),
+        };
+        assert!(!observed_evidence_satisfies(&obligation, &observed));
+        assert_eq!(
+            observed_scope_key(&observed),
+            "tool_execution:untrusted-call"
+        );
+        assert_eq!(
+            obligation_scope_key(&obligation),
+            "tool_execution:untrusted-call"
+        );
+        let encoded = serde_json::to_value(&observed.target).unwrap();
+        assert_eq!(
+            serde_json::from_value::<EvidenceTargetIdentity>(encoded.clone()).unwrap(),
+            observed.target
+        );
+        let mut unknown = encoded;
+        unknown["execution"]["version"] = 2.into();
+        assert!(serde_json::from_value::<EvidenceTargetIdentity>(unknown).is_err());
+        let mut identities = std::collections::BTreeSet::new();
+        identities.insert(observed.target.clone());
+        assert!(identities.contains(&observed.target));
+        let mut hashed = std::collections::HashSet::new();
+        hashed.insert(observed.target.clone());
+        assert!(hashed.contains(&observed.target));
+        let schema = schemars::schema_for!(EvidenceTargetIdentity);
+        assert!(serde_json::to_string(&schema)
+            .unwrap()
+            .contains("tool_execution"));
+    }
     use super::*;
+
+    #[test]
+    fn checkpoint_storage_identity_is_workspace_root_not_a_repository_guess() {
+        for count in [0, 1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            for repository in ["first", "second"].into_iter().take(count) {
+                std::fs::create_dir_all(root.path().join(repository).join(".git")).unwrap();
+                std::fs::create_dir_all(root.path().join(repository).join(".cowd/checkpoints"))
+                    .unwrap();
+            }
+            let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+            assert!(resolver.resolve_existing(".cowd/checkpoints").is_err());
+            let planned = resolver.resolve_planned_file(".cowd/checkpoints").unwrap();
+            assert_eq!(
+                planned.repository_id,
+                repository_id(&root.path().canonicalize().unwrap())
+            );
+            assert_eq!(planned.workspace_relative_path, ".cowd/checkpoints");
+            assert_eq!(planned.repository_relative_path, ".cowd/checkpoints");
+            assert_eq!(planned.object_kind, WorkspaceObjectKind::Directory);
+            assert_eq!(
+                resolver
+                    .physical_file_identity_at_admission(&planned)
+                    .unwrap(),
+                None
+            );
+            let child = resolver
+                .resolve_planned_file(".cowd/checkpoints/new/manifest.json")
+                .unwrap();
+            assert_eq!(child.repository_id, planned.repository_id);
+            assert_eq!(
+                child.workspace_relative_path,
+                ".cowd/checkpoints/new/manifest.json"
+            );
+            if count > 0 {
+                let decoy = resolver
+                    .resolve_existing("first/.cowd/checkpoints")
+                    .unwrap();
+                assert_ne!(decoy.repository_id, planned.repository_id);
+            }
+            if count == 2 {
+                assert!(resolver.resolve_planned_file("unqualified.txt").is_err());
+                assert!(resolver
+                    .resolve_planned_file(".cowd/checkpoints-other")
+                    .is_err());
+                assert!(resolver.resolve_existing(".").is_err());
+            }
+            std::fs::create_dir_all(root.path().join(".cowd/checkpoints")).unwrap();
+            assert_eq!(
+                resolver.resolve_existing(".cowd/checkpoints").unwrap(),
+                planned
+            );
+            assert_eq!(
+                resolver
+                    .physical_file_identity_at_admission(&planned)
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_storage_identity_rejects_symlink_ancestors() {
+        use std::os::unix::fs::symlink;
+        for dangling in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            if !dangling {
+                std::fs::create_dir_all(other.path().join("checkpoints")).unwrap();
+            }
+            let target = if dangling {
+                other.path().join("missing")
+            } else {
+                other.path().to_path_buf()
+            };
+            symlink(&target, root.path().join(".cowd")).unwrap();
+            let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+            assert!(resolver.resolve_existing(".cowd/checkpoints").is_err());
+            assert!(resolver.resolve_planned_file(".cowd/checkpoints").is_err());
+            assert!(resolver
+                .resolve_planned_file(".cowd/checkpoints/new/manifest.json")
+                .is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_physical_identity_is_device_inode_without_path_or_digest_salt() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path(), "cowd", "src/lib.rs");
+        std::fs::write(root.path().join("cowd/src/other.rs"), "cowd").unwrap();
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let identity = resolver.resolve_existing("src/lib.rs").unwrap();
+        let metadata = root.path().join("cowd/src/lib.rs").metadata().unwrap();
+        let physical = resolver
+            .physical_file_identity_at_admission(&identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            physical,
+            format!("unix-file:{}:{}", metadata.dev(), metadata.ino())
+        );
+        assert_eq!(
+            Some(physical.clone()),
+            resolver
+                .physical_file_identity_at_admission(
+                    &identity
+                        .clone()
+                        .with_observed_revision_or_digest("new digest")
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            Some(physical.clone()),
+            resolver
+                .physical_file_identity_at_admission(
+                    &resolver.resolve_existing("cowd/src/lib.rs").unwrap()
+                )
+                .unwrap()
+        );
+        assert_ne!(
+            Some(physical),
+            resolver
+                .physical_file_identity_at_admission(
+                    &resolver.resolve_existing("cowd/src/other.rs").unwrap()
+                )
+                .unwrap()
+        );
+        let before = resolver
+            .physical_file_identity_at_admission(&identity)
+            .unwrap();
+        std::fs::rename(
+            root.path().join("cowd/src/lib.rs"),
+            root.path().join("cowd/src/retained.rs"),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("cowd/src/lib.rs"), "cowd").unwrap();
+        assert_ne!(
+            before,
+            resolver
+                .physical_file_identity_at_admission(&identity)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn admission_physical_identity_rejects_foreign_binding_and_keeps_missing_directory_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path(), "cowd", "src/lib.rs");
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let identity = resolver.resolve_existing("cowd/src/lib.rs").unwrap();
+        let mut foreign = identity.clone();
+        foreign.workspace_id = "another workspace".into();
+        assert!(resolver
+            .physical_file_identity_at_admission(&foreign)
+            .is_err());
+        foreign = identity.clone();
+        foreign.repository_id = "another repository".into();
+        assert!(resolver
+            .physical_file_identity_at_admission(&foreign)
+            .is_err());
+        foreign = identity;
+        foreign.repository_relative_path = "other.rs".into();
+        assert!(resolver
+            .physical_file_identity_at_admission(&foreign)
+            .is_err());
+        assert_eq!(
+            None,
+            resolver
+                .physical_file_identity_at_admission(
+                    &resolver.resolve_existing("cowd/src").unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            None,
+            resolver
+                .physical_file_identity_at_admission(
+                    &resolver
+                        .resolve_planned_file("cowd/src/missing.rs")
+                        .unwrap()
+                )
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_physical_identity_keeps_hardlinks_unknown_and_rejects_symlink_drift() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path(), "cowd", "src/lib.rs");
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let identity = resolver.resolve_existing("cowd/src/lib.rs").unwrap();
+        std::fs::hard_link(
+            root.path().join("cowd/src/lib.rs"),
+            root.path().join("cowd/src/alias.rs"),
+        )
+        .unwrap();
+        assert_eq!(
+            None,
+            resolver
+                .physical_file_identity_at_admission(&identity)
+                .unwrap()
+        );
+        assert_eq!(
+            None,
+            resolver
+                .physical_file_identity_at_admission(
+                    &resolver.resolve_existing("cowd/src/alias.rs").unwrap()
+                )
+                .unwrap()
+        );
+        std::fs::remove_file(root.path().join("cowd/src/lib.rs")).unwrap();
+        symlink("alias.rs", root.path().join("cowd/src/lib.rs")).unwrap();
+        assert!(resolver
+            .physical_file_identity_at_admission(&identity)
+            .is_err());
+        let mut dangling = identity.clone();
+        dangling.workspace_relative_path = "cowd/src/dangling.rs".into();
+        dangling.repository_relative_path = "src/dangling.rs".into();
+        symlink("absent.rs", root.path().join("cowd/src/dangling.rs")).unwrap();
+        assert!(resolver
+            .physical_file_identity_at_admission(&dangling)
+            .is_err());
+        std::fs::create_dir(root.path().join("cowd/real")).unwrap();
+        std::fs::write(root.path().join("cowd/real/target.rs"), "target").unwrap();
+        let mut ancestor = identity;
+        ancestor.workspace_relative_path = "cowd/link/target.rs".into();
+        ancestor.repository_relative_path = "link/target.rs".into();
+        symlink("real", root.path().join("cowd/link")).unwrap();
+        assert!(resolver
+            .physical_file_identity_at_admission(&ancestor)
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_physical_identity_never_marks_socket_or_workspace_directory_exact() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(root.path().join("special.sock")).unwrap();
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        assert_eq!(
+            None,
+            resolver
+                .physical_file_identity_at_admission(
+                    &resolver.resolve_existing("special.sock").unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            None,
+            resolver
+                .physical_file_identity_at_admission(&resolver.resolve_existing(".").unwrap())
+                .unwrap()
+        );
+        drop(listener);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn admission_physical_identity_is_conservative_on_non_unix() {
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path(), "cowd", "src/lib.rs");
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        assert_eq!(
+            None,
+            resolver
+                .physical_file_identity_at_admission(
+                    &resolver.resolve_existing("cowd/src/lib.rs").unwrap()
+                )
+                .unwrap()
+        );
+    }
 
     fn repository(root: &Path, name: &str, relative: &str) {
         let repository = root.join(name);
@@ -1287,24 +1807,18 @@ mod tests {
         truncated["truncated"] = serde_json::Value::Bool(true);
         truncated["file"]["content"] = serde_json::Value::String("one\n".to_string());
         truncated["file"]["numLines"] = serde_json::json!(1);
-        assert!(
-            resolver
-                .observe_complete_read_tool_output("read_file", &truncated, 8)
-                .is_err()
-        );
+        assert!(resolver
+            .observe_complete_read_tool_output("read_file", &truncated, 8)
+            .is_err());
 
         let mut invalid_digest = complete.clone();
         invalid_digest["file"]["sha256"] = serde_json::json!("not-a-digest");
-        assert!(
-            resolver
-                .observe_complete_read_tool_output("read_file", &invalid_digest, 9)
-                .is_err()
-        );
-        assert!(
-            resolver
-                .observe_complete_read_tool_output("grep_search", &complete, 10)
-                .is_err()
-        );
+        assert!(resolver
+            .observe_complete_read_tool_output("read_file", &invalid_digest, 9)
+            .is_err());
+        assert!(resolver
+            .observe_complete_read_tool_output("grep_search", &complete, 10)
+            .is_err());
     }
 
     #[test]
@@ -1463,13 +1977,11 @@ mod tests {
         retained_changed_digest.provenance =
             harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
 
-        assert!(
-            fresh_novel_observed_evidence_fingerprints(
-                std::slice::from_ref(&prior),
-                std::slice::from_ref(&same_fact_new_sequence),
-            )
-            .is_empty()
-        );
+        assert!(fresh_novel_observed_evidence_fingerprints(
+            std::slice::from_ref(&prior),
+            std::slice::from_ref(&same_fact_new_sequence),
+        )
+        .is_empty());
         assert_eq!(
             fresh_novel_observed_evidence_fingerprints(
                 std::slice::from_ref(&prior),
@@ -1477,13 +1989,11 @@ mod tests {
             ),
             BTreeSet::from([observed_evidence_fingerprint(&changed_digest)])
         );
-        assert!(
-            fresh_novel_observed_evidence_fingerprints(
-                std::slice::from_ref(&prior),
-                std::slice::from_ref(&retained_changed_digest),
-            )
-            .is_empty()
-        );
+        assert!(fresh_novel_observed_evidence_fingerprints(
+            std::slice::from_ref(&prior),
+            std::slice::from_ref(&retained_changed_digest),
+        )
+        .is_empty());
         assert_eq!(
             observed_evidence_fingerprint(&changed_digest),
             observed_evidence_fingerprint(&retained_changed_digest),

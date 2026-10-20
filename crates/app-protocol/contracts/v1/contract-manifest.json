@@ -39,6 +39,8 @@
     "golden/query-success.json": "sha256:2bde7ec9dadbdf6ef5fb468e4fe3bc984242a7575452375661beeff075712a1a",
     "golden/stream-open.json": "sha256:4c0d8edffa6facf4414c1890479f1abee3ba88a9b51b0caf639586af61c96411",
     "openapi.json": "sha256:b79b48e0e03334a98d46c889521be74be580e874221a1070571e669a3f34425b",
+    "schemas/app-frame-source-binding-request.schema.json": "sha256:8b5466a37cf252060cf1c880d716aa498b9b729a232304a4e272412af404fd2f",
+    "schemas/app-frame-source-binding.schema.json": "sha256:52f3586004882bf6d5f59c8b0155b93fd8844fa990e1d9dae90291a844885fad",
     "schemas/app-manifest.schema.json": "sha256:fdab92a9a5a84e0823ca82ea8b7e329c0428128835a3086368fb2c9d5a146179",
     "schemas/application-execution-outcome.schema.json": "sha256:3b19c8719df0b885d48aa254dc9eb4e279cc7b6ab9128060c2f6909346c5d590",
     "schemas/application-execution-summary-intent.schema.json": "sha256:948b1983abca74c107865db2852d3f38df1ee2807291777f544582ca4d66cdef",
@@ -51,7 +53,7 @@
     "schemas/handshake-request.schema.json": "sha256:1946cd07921184374a62323287798be4aa35a22a5093c8c842b1aedf2e9e4d7e",
     "schemas/handshake.schema.json": "sha256:56b08e69d0754f25449c62e0712c9662524f67ccf6e297f3e649fb7f6047d2d3",
     "schemas/health.schema.json": "sha256:001caea79a0dad468f15cdb38705f872fb461aab0e4a64d472b732ebbf2ba12a",
-    "schemas/iframe-api.schema.json": "sha256:9a0f5024d392c597d80bfbbfd6b5a22ffd8071b7a93511c4a687f179b4842e0b",
+    "schemas/iframe-api.schema.json": "sha256:67410a1174f2be967deab2ec8140b6afcc47fb94512bdfb03a9f20614865d90f",
     "schemas/iframe-bridge.schema.json": "sha256:3e2b5edf1193663e4ae2bd58ddbbf76926ee3c549826a082b95660fbedfdf871",
     "schemas/invocation.schema.json": "sha256:faff87280b7653f1de5de0896a2d0087c16c3d850a2167cbc8a95ba6f105efba",
     "schemas/operation.schema.json": "sha256:ecbfdf909e353ae071561d044ea75ded5629d10065cdebeece68b69fc960c0f4",
@@ -67,7 +69,7 @@
     "schemas/tui-stream-request.schema.json": "sha256:e26f3673e61556c4ee6b4ef03552d9f61488bae7e42ea57c4c99cd7be62d5a79",
     "schemas/tui-view.schema.json": "sha256:0d15f28844e8e6f4aeccf683eb4769c1f927ea90bb8e8ecfe112cf373c3e57db"
   },
-  "protocol_digest": "sha256:2c61ceb144b819e88060a3f813585ebe3d064ad2acf8888104719fb82363c766",
+  "protocol_digest": "sha256:2c8e4abbf70746a8fa6d40a3fcdf0a69164ee7a3e38b89aab3b75677e1b984d5",
   "protocol_revision": 1,
   "schema_version": 1
 }

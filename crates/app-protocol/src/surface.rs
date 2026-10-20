@@ -575,6 +575,16 @@ impl ProtocolValidate for IframeBridgeHeaderV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IframeApiFrameV1 {
+    AppTerminalSave {
+        schema_version: u16,
+        request_id: String,
+        payload: crate::FrameTerminalSaveV1,
+    },
+    HostTerminalSaved {
+        schema_version: u16,
+        request_id: String,
+        tuple: crate::FrameTerminalSavedV1,
+    },
     AppApiRequest {
         schema_version: u16,
         request_id: String,
@@ -620,7 +630,17 @@ pub enum IframeApiFrameV1 {
 impl ProtocolValidate for IframeApiFrameV1 {
     fn validate(&self) -> Result<(), ProtocolValidationError> {
         let (schema_version, request_id) = match self {
-            Self::AppApiRequest {
+            Self::AppTerminalSave {
+                schema_version,
+                request_id,
+                ..
+            }
+            | Self::HostTerminalSaved {
+                schema_version,
+                request_id,
+                ..
+            }
+            | Self::AppApiRequest {
                 schema_version,
                 request_id,
                 ..
@@ -657,6 +677,14 @@ impl ProtocolValidate for IframeApiFrameV1 {
         };
         require_schema("IframeApiFrameV1", schema_version)?;
         require_bounded("request_id", request_id, 128)?;
+        if let Self::AppTerminalSave { payload, .. } = self {
+            payload
+                .validate_exact()
+                .map_err(|reason| ProtocolValidationError::InvalidField {
+                    field: "payload",
+                    reason,
+                })?;
+        }
         if let Self::AppApiRequest {
             method,
             path,

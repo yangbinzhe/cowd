@@ -1,5 +1,259 @@
 use super::*;
 
+#[cfg(test)]
+mod resource_frame_tests {
+    use super::*;
+
+    struct CatalogHost(tools::ToolHostLease);
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutionHost for CatalogHost {
+        fn delegated_tool_effect_descriptor(
+            &self,
+            name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            Some(self.0.describe_effect(name, input))
+        }
+
+        async fn execute_runtime_tool(
+            &self,
+            _: &RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            panic!("rejected composite must not reach a prefix effect")
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_composite_effect_parent_requires_all_domains_and_file_operations() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("held.txt"), "preimage").unwrap();
+        std::fs::write(root.path().join("source.txt"), "source").unwrap();
+        let host = Arc::new(CatalogHost(
+            tools::ToolHost::builtin("parent-resource-frame", root.path()).pin_snapshot(),
+        ));
+        let mut executor = ScopedRuntimeToolExecutor {
+            tool_batch: None,
+            host: host.clone(),
+            allowed_tools: BTreeSet::from([
+                "edit".into(),
+                "read_file".into(),
+                "web_fetch".into(),
+                "tool_orchestrate".into(),
+            ]),
+            session_id: "session".into(),
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
+            reality_context: None,
+            model_lease: "model".into(),
+            execution_id: "graph".into(),
+            node_id: "node".into(),
+            attempt: 1,
+            workspace_root: root.path().into(),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap(),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
+            resource_scopes: None,
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
+        };
+        let mixed = serde_json::json!({"steps":[
+            {"id":"write","op":"call","tool":"edit","input":{"action":"write","path":"held.txt","content":"changed"}},
+            {"id":"read","op":"call","tool":"read_file","input":{"path":"source.txt"}},
+            {"id":"fetch","op":"call","tool":"web_fetch","input":{"url":"https://example.invalid","prompt":"summarize"}}
+        ]});
+        let descriptor = host.0.describe_effect("tool_orchestrate", &mixed);
+        assert!(descriptor.uses_network && !descriptor.spawns_process);
+        for scopes in [
+            vec!["network:*"],
+            vec!["write:held.txt", "read:source.txt"],
+            vec!["network:*", "write:other.txt", "read:source.txt"],
+            vec!["network:*", "read:held.txt", "read:source.txt"],
+            vec!["network:*", "write:held.txt"],
+        ] {
+            executor.resource_scopes = Some(scopes.into_iter().map(str::to_string).collect());
+            assert!(executor
+                .enforce_resource_ceiling("tool_orchestrate", &mixed.to_string())
+                .is_err());
+            assert!(executor
+                .execute_output("tool_orchestrate", &mixed.to_string())
+                .await
+                .is_err());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("held.txt")).unwrap(),
+                "preimage"
+            );
+            assert!(executor.receipts.lock().unwrap().is_empty());
+        }
+        let complete = vec![
+            "network:*".to_string(),
+            "write:held.txt".into(),
+            "read:source.txt".into(),
+            "write:.cowd/checkpoints".into(),
+        ];
+        for missing in 0..complete.len() {
+            let mut narrow = complete.clone();
+            narrow.remove(missing);
+            executor.resource_scopes = Some(narrow);
+            assert!(executor
+                .enforce_resource_ceiling("tool_orchestrate", &mixed.to_string())
+                .is_err());
+            assert!(executor
+                .execute_output("tool_orchestrate", &mixed.to_string())
+                .await
+                .is_err());
+            assert!(executor.receipts.lock().unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("held.txt")).unwrap(),
+                "preimage"
+            );
+        }
+        executor.resource_scopes = Some(complete);
+        executor
+            .enforce_resource_ceiling("tool_orchestrate", &mixed.to_string())
+            .unwrap();
+        assert_eq!(
+            crate::tool_host::effect_resource_evidence(&descriptor),
+            vec![
+                "network:*",
+                "read:held.txt",
+                "read:source.txt",
+                "write:.cowd/checkpoints",
+                "write:held.txt"
+            ]
+        );
+        executor.allowed_tools.remove("web_fetch");
+        assert!(executor
+            .execute_output("tool_orchestrate", &mixed.to_string())
+            .await
+            .is_err());
+
+        let compute = serde_json::json!({"steps":[
+            {"id":"write","op":"call","tool":"edit","input":{"action":"write","path":"held.txt","content":"changed"}},
+            {"id":"compute","op":"compute","language":"python","code":"print(1)"}
+        ]});
+        let descriptor = host.0.describe_effect("tool_orchestrate", &compute);
+        assert!(descriptor.spawns_process && !descriptor.uses_network);
+        executor.resource_scopes = Some(vec!["read:.".into()]);
+        assert!(executor
+            .enforce_resource_ceiling("tool_orchestrate", &compute.to_string())
+            .is_err());
+        executor.resource_scopes = Some(vec!["read:.".into(), "write:held.txt".into()]);
+        assert!(executor
+            .enforce_resource_ceiling("tool_orchestrate", &compute.to_string())
+            .is_err());
+        executor.resource_scopes = Some(vec![
+            "read:.".into(),
+            "write:held.txt".into(),
+            "write:.cowd/checkpoints".into(),
+        ]);
+        executor
+            .enforce_resource_ceiling("tool_orchestrate", &compute.to_string())
+            .unwrap();
+        assert_eq!(
+            crate::tool_host::effect_resource_evidence(&descriptor),
+            vec![
+                "read:.",
+                "read:held.txt",
+                "write:.cowd/checkpoints",
+                "write:held.txt"
+            ]
+        );
+        let pure = serde_json::json!({"steps":[
+            {"id":"compute","op":"compute","language":"python","code":"print(1)"}
+        ]});
+        executor.resource_scopes = Some(vec!["read:.".into()]);
+        executor
+            .enforce_resource_ceiling("tool_orchestrate", &pure.to_string())
+            .unwrap();
+        executor.resource_scopes = Some(vec!["read:held.txt".into()]);
+        assert!(executor
+            .enforce_resource_ceiling("tool_orchestrate", &pure.to_string())
+            .is_err());
+        executor.resource_scopes = Some(vec!["network:*".into()]);
+        executor
+            .enforce_resource_ceiling("web_fetch", &mixed["steps"][2]["input"].to_string())
+            .unwrap();
+        assert_eq!(
+            crate::tool_host::effect_resource_evidence(
+                &host
+                    .0
+                    .describe_effect("web_fetch", &mixed["steps"][2]["input"])
+            ),
+            vec!["network:*"]
+        );
+
+        for repository in ["first", "second"] {
+            std::fs::create_dir_all(root.path().join(repository).join(".git")).unwrap();
+        }
+        executor.path_identity_resolver = Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap(),
+        );
+        assert!(executor
+            .path_identity_resolver
+            .resolve_existing(".")
+            .is_err());
+        std::fs::write(root.path().join("first/held.txt"), "first preimage").unwrap();
+        let multi = serde_json::json!({"steps":[
+            {"id":"edit","op":"call","tool":"edit","input":{"action":"write","path":"first/held.txt","content":"x"}},
+            {"id":"compute","op":"compute","language":"python","code":"print(1)"}
+        ]});
+        executor.resource_scopes = Some(vec![
+            "read:.".into(),
+            "write:first/held.txt".into(),
+            "write:.cowd/checkpoints".into(),
+        ]);
+        executor
+            .enforce_resource_ceiling("tool_orchestrate", &multi.to_string())
+            .unwrap();
+        for denied in [
+            vec!["read:.", "write:second/held.txt", "write:.cowd/checkpoints"],
+            vec!["read:.", "write:first/held.txt"],
+            vec![
+                "read:.",
+                "write:first/held.txt",
+                "write:first/.cowd/checkpoints",
+            ],
+            vec![
+                "read:.",
+                "write:first/held.txt",
+                "write:second/.cowd/checkpoints",
+            ],
+        ] {
+            executor.resource_scopes = Some(denied.into_iter().map(str::to_string).collect());
+            assert!(executor
+                .enforce_resource_ceiling("tool_orchestrate", &multi.to_string())
+                .is_err());
+            assert!(executor
+                .execute_output("tool_orchestrate", &multi.to_string())
+                .await
+                .is_err());
+            assert!(executor.receipts.lock().unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("first/held.txt")).unwrap(),
+                "first preimage"
+            );
+        }
+        let broad = serde_json::json!({"steps":[
+            {"id":"read","op":"call","tool":"read_file","input":{"path":"first/held.txt"}},
+            {"id":"edit","op":"call","tool":"edit","input":{"action":"write","path":"$read.file.content","content":"x"}}
+        ]});
+        executor.resource_scopes = Some(vec!["read:.".into(), "write:first/held.txt".into()]);
+        assert!(executor
+            .enforce_resource_ceiling("tool_orchestrate", &broad.to_string())
+            .is_err());
+        executor.resource_scopes = Some(vec!["write:.".into()]);
+        executor
+            .enforce_resource_ceiling("tool_orchestrate", &broad.to_string())
+            .unwrap();
+    }
+}
+
 impl ScopedRuntimeToolExecutor {
     pub(super) fn provider_model_obligation_ids(
         &self,
@@ -135,17 +389,23 @@ impl ScopedRuntimeToolExecutor {
             ));
         }
         let request = RuntimeToolExecutionRequest {
-            compiled_invocation: binding.map(|binding| binding.prepare_invocation(self.host.pin_step_catalog(), "checkpoint", &input))
-                .transpose().map_err(|error| ToolError::new(error.to_string()))?,
+            compiled_invocation: binding
+                .map(|binding| {
+                    binding.prepare_invocation(self.host.pin_step_catalog(), "checkpoint", &input)
+                })
+                .transpose()
+                .map_err(|error| ToolError::new(error.to_string()))?,
             step_binding: binding.cloned(),
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: 1,
             observation_wave_sequence: 0,
-            idempotency_key: binding.map(crate::step_snapshot::StepCallBinding::effect_idempotency_key).or_else(|| authorization
-                .idempotency_key
-                .clone())
+            idempotency_key: binding
+                .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+                .or_else(|| authorization.idempotency_key.clone())
                 .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
-            tool_use_id: binding.map(|binding| binding.origin.call_id.clone()).unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
+            tool_use_id: binding
+                .map(|binding| binding.origin.call_id.clone())
+                .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
             tool_name: "checkpoint".to_string(),
             input: serde_json::to_string(&input).map_err(|error| {
                 ToolError::new(format!("serialize Runtime checkpoint input: {error}"))
@@ -199,10 +459,18 @@ impl ScopedRuntimeToolExecutor {
         let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
             ToolError::new(format!("invalid Runtime delegated tool input: {error}"))
         })?;
-        let descriptor = step_binding.map(|binding| {
-            binding.resolve(self.host.pin_step_catalog()).map(|step| step.lease().describe_effect(tool_name, &input))
-        }).transpose().map_err(|error| ToolError::new(error.to_string()))?
-            .or_else(|| self.host.delegated_tool_effect_descriptor(tool_name, &input))
+        let descriptor = step_binding
+            .map(|binding| {
+                binding
+                    .resolve(self.host.pin_step_catalog())
+                    .map(|step| step.lease().describe_effect(tool_name, &input))
+            })
+            .transpose()
+            .map_err(|error| ToolError::new(error.to_string()))?
+            .or_else(|| {
+                self.host
+                    .delegated_tool_effect_descriptor(tool_name, &input)
+            })
             .ok_or_else(|| {
                 ToolError::new("Runtime delegated tool has no registered effect descriptor")
             })?;
@@ -215,18 +483,25 @@ impl ScopedRuntimeToolExecutor {
             0
         };
         let request = RuntimeToolExecutionRequest {
-            compiled_invocation: step_binding.map(|binding| binding.prepare_invocation(self.host.pin_step_catalog(), tool_name, &input))
-                .transpose().map_err(|error| ToolError::new(error.to_string()))?,
+            compiled_invocation: step_binding
+                .map(|binding| {
+                    binding.prepare_invocation(self.host.pin_step_catalog(), tool_name, &input)
+                })
+                .transpose()
+                .map_err(|error| ToolError::new(error.to_string()))?,
             step_binding: step_binding.cloned(),
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: 1,
             observation_wave_sequence: read_sequence,
-            idempotency_key: step_binding.map(crate::step_snapshot::StepCallBinding::effect_idempotency_key).or_else(|| authorization
-                .idempotency_key
-                .clone())
+            idempotency_key: step_binding
+                .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+                .or_else(|| authorization.idempotency_key.clone())
                 .unwrap_or_else(|| format!("agent-runtime-tool:{}", uuid::Uuid::new_v4())),
-            tool_use_id: step_binding.map(|binding| binding.origin.call_id.clone())
-                .unwrap_or_else(|| format!("agent-runtime-tool:{}:{}", tool_name, uuid::Uuid::new_v4())),
+            tool_use_id: step_binding
+                .map(|binding| binding.origin.call_id.clone())
+                .unwrap_or_else(|| {
+                    format!("agent-runtime-tool:{}:{}", tool_name, uuid::Uuid::new_v4())
+                }),
             tool_name: tool_name.to_string(),
             input: serde_json::to_string(&input).map_err(|error| {
                 ToolError::new(format!("serialize Runtime delegated tool input: {error}"))
@@ -261,13 +536,8 @@ impl ScopedRuntimeToolExecutor {
         };
         if tool_name == "evidence_retrieve" {
             if let Some(commit) = &self.commit_service {
-                let mut receipt = outcome.clone();
-                receipt.output = receipt
-                    .output
-                    .as_deref()
-                    .map(crate::agentic::review_evidence::compact_read_receipt);
                 commit
-                    .commit_readonly_tool_receipts(&[(request.clone(), receipt)])
+                    .commit_readonly_tool_receipts(&[(request.clone(), outcome.clone())])
                     .map_err(|error| {
                         ToolError::new(format!(
                             "evidence read completed but durable receipt commit failed: {error}"
@@ -335,71 +605,21 @@ impl ScopedRuntimeToolExecutor {
             .host
             .delegated_tool_effect_descriptor(tool_name, &input)
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
-        let bounded_sandbox_process = descriptor.spawns_process
-            && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Process
-            && crate::delegated_tool_effect_is_bounded(&descriptor);
-        if descriptor.spawns_process
-            || matches!(
-                descriptor.effect_kind,
-                harness_contract::tool::ToolEffectKind::Process
-                    | harness_contract::tool::ToolEffectKind::Package
-                    | harness_contract::tool::ToolEffectKind::System
-                    | harness_contract::tool::ToolEffectKind::Destructive
-                    | harness_contract::tool::ToolEffectKind::Unknown
-            )
-        {
-            if bounded_sandbox_process {
-                return allowed_scopes
-                    .iter()
-                    .any(|scope| {
-                        matches!(
-                            scope.trim(),
-                            "read:." | "read:./" | "write:." | "write:./" | "workspace:."
-                        )
-                    })
-                    .then_some(())
-                    .ok_or_else(|| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` requires a whole-workspace read lease for its read-only sandbox"
-                        ))
-                    });
-            }
+        if !crate::tool_host::effect_has_resource_lease(
+            &descriptor,
+            allowed_scopes,
+            |path, scopes, write| {
+                resource_path_is_authorized(&self.path_identity_resolver, path, scopes, write)
+                    || (crate::tool_host::whole_workspace_resource_lease(scopes, write)
+                        && self
+                            .path_identity_resolver
+                            .resolve_planned_file(path)
+                            .is_ok())
+            },
+        ) {
             return Err(ToolError::new(format!(
-                "tool `{tool_name}` cannot prove a bounded Team resource scope"
+                "tool `{tool_name}` is outside the Agent network/File operation resource lease"
             )));
-        }
-        let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
-        if requested.network {
-            return allowed_scopes
-                .iter()
-                .any(|scope| scope == "network:*")
-                .then_some(())
-                .ok_or_else(|| {
-                    ToolError::new(format!(
-                        "tool `{tool_name}` is outside the Team network resource lease"
-                    ))
-                });
-        }
-        if requested.unknown || requested.kind == "runtime" || requested.paths.is_empty() {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` did not declare a bounded workspace path"
-            )));
-        }
-        let write = matches!(
-            descriptor.effect_kind,
-            harness_contract::tool::ToolEffectKind::Write
-        );
-        for path in &requested.paths {
-            if !resource_path_is_authorized(
-                &self.path_identity_resolver,
-                path,
-                allowed_scopes,
-                write,
-            ) {
-                return Err(ToolError::new(format!(
-                    "tool `{tool_name}` path `{path}` is outside the Agent focus/resource lease"
-                )));
-            }
         }
         Ok(())
     }
@@ -411,7 +631,14 @@ impl ScopedRuntimeToolExecutor {
         authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
         provider_invocation_id: Option<&str>,
     ) -> Result<String, ToolError> {
-        self.execute_scoped_bound(tool_name, input, authorization, provider_invocation_id, None).await
+        self.execute_scoped_bound(
+            tool_name,
+            input,
+            authorization,
+            provider_invocation_id,
+            None,
+        )
+        .await
     }
 
     pub(super) async fn execute_scoped_bound(
@@ -424,37 +651,32 @@ impl ScopedRuntimeToolExecutor {
     ) -> Result<String, ToolError> {
         let parsed_input = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
-        let descriptor = step_binding.map(|binding| {
-            binding.resolve(self.host.pin_step_catalog()).map(|step| step.lease().describe_effect(tool_name, &parsed_input))
-        }).transpose().map_err(|error| ToolError::new(error.to_string()))?
-            .or_else(|| self.host.delegated_tool_effect_descriptor(tool_name, &parsed_input))
+        let descriptor = step_binding
+            .map(|binding| {
+                binding
+                    .resolve(self.host.pin_step_catalog())
+                    .map(|step| step.lease().describe_effect(tool_name, &parsed_input))
+            })
+            .transpose()
+            .map_err(|error| ToolError::new(error.to_string()))?
+            .or_else(|| {
+                self.host
+                    .delegated_tool_effect_descriptor(tool_name, &parsed_input)
+            })
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
         let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
-        let bounded_sandbox_process = descriptor.spawns_process
-            && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Process
-            && crate::delegated_tool_effect_is_bounded(&descriptor);
-        let resource_scopes = if bounded_sandbox_process {
-            vec!["read:.".to_string()]
-        } else if requested.network {
-            vec!["network:*".to_string()]
-        } else {
-            let mode = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Write {
-                "write"
-            } else {
-                "read_ref"
-            };
-            requested
-                .paths
-                .iter()
-                .map(|path| format!("{mode}:{path}"))
-                .collect()
-        };
+        let resource_scopes = crate::tool_host::effect_resource_evidence(&descriptor);
         let sequence = self
             .next_receipt_sequence
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        let idempotency_key = step_binding.map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
-            .or_else(|| authorization.as_ref().and_then(|value| value.idempotency_key.clone()))
+        let idempotency_key = step_binding
+            .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+            .or_else(|| {
+                authorization
+                    .as_ref()
+                    .and_then(|value| value.idempotency_key.clone())
+            })
             .unwrap_or_else(|| {
                 deterministic_scoped_tool_idempotency_key(
                     &self.execution_id,
@@ -466,17 +688,29 @@ impl ScopedRuntimeToolExecutor {
                 )
             });
         let request = RuntimeToolExecutionRequest {
-            compiled_invocation: step_binding.map(|binding| binding.prepare_invocation(self.host.pin_step_catalog(), tool_name, &parsed_input))
-                .transpose().map_err(|error| ToolError::new(error.to_string()))?,
+            compiled_invocation: step_binding
+                .map(|binding| {
+                    binding.prepare_invocation(
+                        self.host.pin_step_catalog(),
+                        tool_name,
+                        &parsed_input,
+                    )
+                })
+                .transpose()
+                .map_err(|error| ToolError::new(error.to_string()))?,
             step_binding: step_binding.cloned(),
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: sequence,
             observation_wave_sequence: sequence,
             idempotency_key,
-            tool_use_id: step_binding.map(|binding| binding.origin.call_id.clone()).unwrap_or_else(|| format!(
-                "agent-tool:{}:{}:{}:{tool_name}",
-                self.node_id, self.attempt, sequence
-            )),
+            tool_use_id: step_binding
+                .map(|binding| binding.origin.call_id.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "agent-tool:{}:{}:{}:{tool_name}",
+                        self.node_id, self.attempt, sequence
+                    )
+                }),
             tool_name: tool_name.to_string(),
             input: input.to_string(),
             category: crate::ToolSafetyCategory::from_effect(&descriptor),
@@ -628,7 +862,10 @@ impl ScopedRuntimeToolExecutor {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(ScopedToolExecutionReceipt {
-                        sequence,
+                        sequence: if let Some(commit) = &self.commit_service {
+                            commit.exact_delegated_receipt_sequence(&request)
+                                .map_err(|error| ToolError::new(error.to_string()))?
+                        } else { sequence },
                         provider_invocation_id: provider_invocation_id.map(str::to_string),
                         tool_name: tool_name.to_string(),
                         effect_kind: descriptor.effect_kind,

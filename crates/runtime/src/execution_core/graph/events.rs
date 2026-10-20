@@ -16,6 +16,347 @@ pub struct ExecutionNodeBinding {
     pub worktree_lease_ref: Option<String>,
 }
 
+impl ExecutionNodeBinding {
+    pub(crate) fn effect_stream_id(ticket: &super::registry::NodeExecutionTicket) -> String {
+        use sha2::{Digest, Sha256};
+        let identity = serde_json::to_vec(&(
+            "node-effect-attempt-v1",
+            &ticket.graph_id,
+            &ticket.node_id,
+            &ticket.executor_kind,
+            &ticket.idempotency_key,
+            ticket.attempt,
+        ))
+        .expect("node effect identity");
+        format!(
+            "{}{:x}",
+            Self::effect_stream_prefix(&ticket.graph_id),
+            Sha256::digest(identity)
+        )
+    }
+
+    pub(crate) fn effect_stream_prefix(graph_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "execution-node-effect:{:x}:",
+            Sha256::digest(graph_id.as_bytes())
+        )
+    }
+    pub(crate) fn lease_closure_key(&self, graph: &ExecutionGraph, node_id: &str) -> String {
+        ExecutionBindingLeaseClosure::key(graph, node_id, self)
+    }
+
+    pub(crate) fn has_lease_obligations(&self) -> bool {
+        ExecutionBindingLeaseClosure::required(self)
+    }
+
+    pub(crate) fn validate_lease_closure(
+        &self,
+        graph: &ExecutionGraph,
+        node_id: &str,
+        start: (u64, u32),
+        record: &crate::DurableRuntimeEvent,
+    ) -> Result<bool, String> {
+        let Some(closure) =
+            ExecutionBindingLeaseClosure::from_record(record, graph, node_id, self)?
+        else {
+            return Ok(false);
+        };
+        Ok(closure.matches(
+            graph,
+            node_id,
+            self,
+            (closure.start_sequence, start.0, start.1),
+        ) && closure.start_sequence > 0
+            && closure.start_sequence < record.sequence
+            && (record.commit_cursor, record.transaction_index) > start)
+    }
+
+    pub(crate) fn next_attempt(graph: &ExecutionGraph, node_id: &str) -> Result<u32, String> {
+        graph
+            .recovery_cursor
+            .node_attempts
+            .get(node_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| format!("execution node `{node_id}` attempt overflow"))
+    }
+
+    pub(crate) fn validate_identity(&self, node: &ExecutionNodeSpec) -> Result<(), String> {
+        if self.attempt == 0
+            || self.ticket_idempotency_key.trim().is_empty()
+            || self.executor_kind != node.executor_kind
+        {
+            return Err(format!("invalid execution start binding for `{}`", node.id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_start(
+        &self,
+        graph: &ExecutionGraph,
+        node_id: &str,
+    ) -> Result<(), String> {
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| format!("execution start node `{node_id}` is missing"))?;
+        self.validate_identity(node)?;
+        if self.attempt != Self::next_attempt(graph, node_id)? {
+            return Err(format!("execution start attempt mismatch for `{node_id}`"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_ticket(
+        ticket: &super::registry::NodeExecutionTicket,
+        graph: &ExecutionGraph,
+        node: &ExecutionNodeSpec,
+        attempt: u32,
+    ) -> Result<(), String> {
+        if graph.nodes.iter().find(|candidate| candidate.id == node.id) != Some(node)
+            || attempt == 0
+            || ticket.attempt != attempt
+            || ticket.graph_id != graph.id
+            || ticket.node_id != node.id
+            || ticket.executor_kind != node.executor_kind
+            || ticket.service_class != graph.service_class
+            || ticket.payload_ref != node.payload_ref
+            || ticket.idempotency_key.trim().is_empty()
+        {
+            return Err(format!(
+                "execution ticket identity mismatch for `{}`",
+                node.id
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_effect_records(
+        ticket: &super::registry::NodeExecutionTicket,
+        intent: Option<&crate::DurableRuntimeEvent>,
+        receipt: Option<&crate::DurableRuntimeEvent>,
+        through: u64,
+    ) -> Result<Option<super::registry::NodeExecutionOutcome>, String> {
+        let Some(intent) = intent else {
+            return if receipt.is_some() {
+                Err("execution effect receipt has no intent".into())
+            } else {
+                Ok(None)
+            };
+        };
+        let validate_source = |event: &crate::DurableRuntimeEvent, suffix: &str, status: &str| {
+            if event.stream_id != Self::effect_stream_id(ticket)
+                || event.kind != format!("execution.effect.{suffix}")
+                || event.scope != crate::RuntimeEventScope::ExecutionNode
+                || event.schema_version != 1
+                || event.actor.as_deref() != Some(ticket.executor_kind.as_str())
+                || event.status.as_deref() != Some(status)
+                || event.idempotency_key.as_deref()
+                    != Some(format!("{}:{suffix}", ticket.idempotency_key).as_str())
+                || event.refs
+                    != vec![crate::RuntimeEventRef {
+                        kind: "execution_node".into(),
+                        id: ticket.node_id.clone(),
+                    }]
+                || event.commit_cursor == 0
+                || event.commit_cursor > through
+                || event.transaction_id.trim().is_empty()
+            {
+                return Err("execution effect source identity mismatch".to_string());
+            }
+            Ok(())
+        };
+        validate_source(intent, "intent", "inflight")?;
+        let fields = intent
+            .payload
+            .as_object()
+            .ok_or_else(|| "invalid execution effect intent".to_string())?;
+        if [
+            "graph_id",
+            "node_id",
+            "executor_kind",
+            "service_class",
+            "attempt",
+            "idempotency_key",
+            "payload_ref",
+        ]
+        .iter()
+        .any(|field| !fields.contains_key(*field))
+        {
+            return Err("execution effect intent identity field missing".into());
+        }
+        let original: super::registry::NodeExecutionTicket =
+            serde_json::from_value(intent.payload.clone())
+                .map_err(|_| "invalid execution effect intent".to_string())?;
+        if original.graph_id != ticket.graph_id
+            || original.node_id != ticket.node_id
+            || original.executor_kind != ticket.executor_kind
+            || original.service_class != ticket.service_class
+            || original.payload_ref != ticket.payload_ref
+            || original.idempotency_key != ticket.idempotency_key
+            || original.idempotency_key.trim().is_empty()
+            || original.attempt == 0
+            || original.attempt != ticket.attempt
+        {
+            return Err("execution effect intent ticket mismatch".into());
+        }
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        validate_source(receipt, "receipt", "completed")?;
+        if (receipt.commit_cursor, receipt.transaction_index)
+            <= (intent.commit_cursor, intent.transaction_index)
+            || receipt.sequence <= intent.sequence
+        {
+            return Err("execution effect receipt precedes intent".into());
+        }
+        let outcome: super::registry::NodeExecutionOutcome =
+            serde_json::from_value(receipt.payload.clone())
+                .map_err(|_| "invalid execution effect receipt".to_string())?;
+        Ok(Some(outcome))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionBindingLeaseClosure {
+    pub schema: u32,
+    pub graph_id: String,
+    pub node_id: String,
+    pub binding: ExecutionNodeBinding,
+    pub start_sequence: u64,
+    pub start_cursor: u64,
+    pub start_transaction_index: u32,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) no_dispatch: Option<super::executors::agent_tool::NoDispatchFact>,
+}
+
+impl ExecutionBindingLeaseClosure {
+    pub(crate) fn required(binding: &ExecutionNodeBinding) -> bool {
+        binding.attempt > 0
+    }
+
+    pub(crate) fn key(
+        graph: &ExecutionGraph,
+        node_id: &str,
+        binding: &ExecutionNodeBinding,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&(
+            "binding-leases-v1",
+            &graph.id,
+            &graph.lineage,
+            &graph.parent_execution,
+            node_id,
+            binding,
+        ))
+        .expect("lease identity is serializable");
+        format!("{}:lease-closed:{:x}", graph.id, Sha256::digest(bytes))
+    }
+
+    pub(crate) fn fence_key(
+        graph: &ExecutionGraph,
+        node_id: &str,
+        binding: &ExecutionNodeBinding,
+    ) -> String {
+        Self::key(graph, node_id, binding)
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    pub(crate) fn matches(
+        &self,
+        graph: &ExecutionGraph,
+        node_id: &str,
+        binding: &ExecutionNodeBinding,
+        start: (u64, u64, u32),
+    ) -> bool {
+        self.schema == 1
+            && self.graph_id == graph.id
+            && self.node_id == node_id
+            && self.binding == *binding
+            && Self::required(binding)
+            && (
+                self.start_sequence,
+                self.start_cursor,
+                self.start_transaction_index,
+            ) == start
+            && matches!(self.source.as_str(), "normal_release" | "recovery_release")
+    }
+
+    pub(crate) fn from_record(
+        record: &crate::DurableRuntimeEvent,
+        graph: &ExecutionGraph,
+        node_id: &str,
+        binding: &ExecutionNodeBinding,
+    ) -> Result<Option<Self>, String> {
+        let key = Self::key(graph, node_id, binding);
+        let lineage = graph
+            .lineage
+            .as_ref()
+            .ok_or("lease closure lineage missing")?;
+        let activity = record
+            .activity_binding()
+            .ok_or("lease closure activity missing")?;
+        let parent = graph.parent_execution.as_ref().map(|parent| {
+            format!(
+                "activity:execution:{}:node:{}",
+                parent.execution_id, parent.node_id
+            )
+        });
+        if record.scope != crate::RuntimeEventScope::ExecutionGraph
+            || record.schema_version != 2
+            || record.stream_id != graph.id
+            || record.actor.as_deref() != Some("execution_commit_service")
+            || record.idempotency_key.as_deref() != Some(key.as_str())
+            || record.transaction_id != key
+            || record.commit_cursor == 0
+            || activity.root_execution_id != graph.id
+            || activity.node_id.is_some()
+            || activity.activity_id != format!("activity:execution:{}", graph.id)
+            || activity.session_id != lineage.session_id
+            || activity.turn_id != lineage.turn_id
+            || activity.task_id != lineage.task_id
+            || activity.root_task_id != lineage.root_task_id
+            || activity.generation != lineage.generation
+            || activity.revision != record.sequence
+            || activity.fence != record.sequence
+            || activity.parent_activity_id != parent
+            || activity.initiator_activity_id != parent
+        {
+            return Err("lease closure source identity mismatch".into());
+        }
+        let event: ExecutionGraphEvent = serde_json::from_value(record.payload.clone())
+            .map_err(|_| "lease closure Graph body invalid")?;
+        if event.kind() != record.kind {
+            return Err("lease closure kind mismatch".into());
+        }
+        let closures = match event {
+            ExecutionGraphEvent::Recovered { lease_closures, .. } => lease_closures,
+            ExecutionGraphEvent::Checkpoint {
+                cause,
+                lease_closures,
+                ..
+            } if cause == "execution_graph.recovered" => lease_closures,
+            _ => return Err("lease closure source is not original recovery".into()),
+        };
+        if closures.len() != 1 {
+            return Err("lease closure cardinality mismatch".into());
+        }
+        let closure = closures.into_iter().next().unwrap();
+        if closure.graph_id != graph.id || closure.node_id != node_id || closure.binding != *binding
+        {
+            return Err("lease closure binding mismatch".into());
+        }
+        Ok(Some(closure))
+    }
+}
+
 /// Minimal reconstruction payload between durable graph checkpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionGraphDelta {
@@ -278,6 +619,9 @@ pub enum ExecutionGraphEvent {
     Checkpoint {
         cause: String,
         graph: ExecutionGraph,
+        bindings: BTreeMap<String, ExecutionNodeBinding>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lease_closures: Vec<ExecutionBindingLeaseClosure>,
     },
     NodeTransitioned {
         node_id: String,
@@ -318,6 +662,8 @@ pub enum ExecutionGraphEvent {
     Recovered {
         recovered_nodes: Vec<String>,
         blocked_nodes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lease_closures: Vec<ExecutionBindingLeaseClosure>,
         delta: ExecutionGraphDelta,
     },
 }
@@ -436,10 +782,19 @@ impl ExecutionGraphEvent {
             Self::Recovered {
                 recovered_nodes,
                 blocked_nodes,
+                lease_closures,
                 delta,
             } => std::mem::size_of::<Self>()
                 .saturating_add(recovered_nodes.iter().map(String::len).sum::<usize>())
                 .saturating_add(blocked_nodes.iter().map(String::len).sum::<usize>())
+                .saturating_add(
+                    lease_closures
+                        .iter()
+                        .map(|closure| {
+                            serde_json::to_vec(closure).map_or(usize::MAX, |bytes| bytes.len())
+                        })
+                        .fold(0usize, usize::saturating_add),
+                )
                 .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
         };
         u64::try_from(bytes).unwrap_or(u64::MAX)

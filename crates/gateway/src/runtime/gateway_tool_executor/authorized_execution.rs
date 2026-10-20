@@ -16,6 +16,77 @@ fn program_logical_artifact_key(selector: &str) -> Option<String> {
 }
 
 impl GatewayToolExecutor {
+    fn validated_bounded_process_lease(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> Result<tools::ToolHostLease, ToolError> {
+        if request.tool_name != "execute_code"
+            || self
+                .allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains("execute_code"))
+        {
+            return Err(ToolError::new("bounded process tool is not enabled"));
+        }
+        if request.evaluation_isolated
+            && request.category != runtime::ToolSafetyCategory::ReadOnly
+            && !request
+                .authorized_scopes
+                .iter()
+                .any(|scope| scope.starts_with("write:.cowd/evaluation/"))
+        {
+            return Err(ToolError::new(
+                "paired evaluation mutation is missing its Runtime-issued isolated output lease",
+            ));
+        }
+        let services = self
+            .upgrade_runtime_services()
+            .ok_or_else(|| ToolError::new("bounded process Runtime unavailable"))?;
+        let session = request
+            .session_id
+            .as_deref()
+            .ok_or_else(|| ToolError::new("bounded process Session missing"))?;
+        let policy = services
+            .session_execution_policy(session)
+            .ok_or_else(|| ToolError::new("bounded process live policy missing"))?;
+        if request.policy_revision == 0
+            || policy.revision != request.policy_revision
+            || policy.sandbox_posture != request.sandbox_posture
+        {
+            return Err(ToolError::new("bounded process live policy mismatch"));
+        }
+        let binding = request
+            .step_binding
+            .as_ref()
+            .ok_or_else(|| ToolError::new("production_tool_origin_required"))?;
+        let step = binding
+            .resolve(Some(self.tool_host.pin_snapshot()))
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        step.validate_call(
+            &binding.origin,
+            session,
+            &request.tool_use_id,
+            &request.tool_name,
+            &request.input,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|error| ToolError::new(error.to_string()))?;
+        let authorization = request
+            .authorization
+            .as_ref()
+            .ok_or_else(|| ToolError::new("bounded process authorization missing"))?;
+        if authorization.policy_revision != policy.revision {
+            return Err(ToolError::new("bounded process grant policy mismatch"));
+        }
+        let input = harness_contract::step::parse_strict_json(&request.input)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        self.reject_orchestrated_tools_outside_allow_list("execute_code", &input)?;
+        step.lease()
+            .validate_authorization(authorization, "execute_code", &input)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        Ok(step.lease().clone())
+    }
+
     async fn execute_authorized_output_with_progress(
         &self,
         authorization: &harness_contract::tool::ToolExecutionAuthorization,
@@ -34,6 +105,11 @@ impl GatewayToolExecutor {
         let value: serde_json::Value = serde_json::from_str(input)
             .map_err(|error| self.input_contract_error(&tool_name, error))?;
         self.reject_orchestrated_tools_outside_allow_list(&tool_name, &value)?;
+        if tool_name == "execute_code" {
+            return Err(ToolError::new(
+                "governed execute_code requires the original bounded process owner",
+            ));
+        }
         if tool_name == "tool_search"
             || is_gateway_runtime_control_tool(&tool_name)
             || is_gateway_context_tool(&tool_name)
@@ -109,7 +185,6 @@ impl GatewayToolExecutor {
             output,
         ))
     }
-
 
     async fn execute_evidence_retrieve(
         &self,
@@ -218,7 +293,8 @@ impl GatewayToolExecutor {
                     // issued. The Program projection holds the mapping from that
                     // logical key to the real selector, so consult it before
                     // refusing: the read is legitimate and the identity unambiguous.
-                    let logical = format!("artifact:{}", selector.trim_start_matches("artifact://"));
+                    let logical =
+                        format!("artifact:{}", selector.trim_start_matches("artifact://"));
                     let mapped = services
                         .agent_action_service()
                         .list_programs()
@@ -327,7 +403,13 @@ mod program_logical_key_tests {
         );
         // Other schemes and malformed targets are not ours to reinterpret.
         assert_eq!(program_logical_artifact_key("tool://tool-raw-abc"), None);
-        assert_eq!(program_logical_artifact_key("artifact://not-hex-at-all"), None);
-        assert_eq!(program_logical_artifact_key("artifact://576a1504640073bfc867d00"), None);
+        assert_eq!(
+            program_logical_artifact_key("artifact://not-hex-at-all"),
+            None
+        );
+        assert_eq!(
+            program_logical_artifact_key("artifact://576a1504640073bfc867d00"),
+            None
+        );
     }
 }

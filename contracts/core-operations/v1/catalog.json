@@ -1,6 +1,6 @@
 {
   "authority": "cowd-core",
-  "catalog_digest": "sha256:4eca9846776038c313615c06072e057876e9552d6c488a05a32c92562eebea93",
+  "catalog_digest": "sha256:906199833265faeec201464108ade872f6064abcbc8e1f976813965f66be4adc",
   "operations": [
     {
       "audit_classification": "approval.decide",
@@ -213,6 +213,60 @@
       "read_only": false,
       "required_capabilities": [
         "runtime.task.write"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "session.terminal_receipt.ack",
+      "default_deadline_ms": 30000,
+      "delegation": "user",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:22f9cb05518d692f93ec44084d20e8677ec2dc0f2682d3aa55d33fe381f008e3",
+        "path": "schemas/core.session.terminal_receipt.ack.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.session.terminal_receipt.ack",
+      "output_schema": {
+        "digest": "sha256:4b31b6392acb3a8f925aa4b4ce6a32b3fdfe5b6c52438b06bda3d09bd3990df2",
+        "path": "schemas/core.session.terminal_receipt.ack.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "session.read"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "session.terminal_receipt.read",
+      "default_deadline_ms": 10000,
+      "delegation": "user",
+      "idempotency": "read_only",
+      "input_schema": {
+        "digest": "sha256:1b6495937bbbbaa1c7c9276bdb639c99d2db1d73f79bca248ddaecc4a36fecd0",
+        "path": "schemas/core.session.terminal_receipt.read.input.schema.json"
+      },
+      "kind": "query",
+      "maximum_deadline_ms": 30000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 16842752,
+      "operation_id": "core.session.terminal_receipt.read",
+      "output_schema": {
+        "digest": "sha256:6fbb08919536b4720623798ce22a86291df520f0e9ef172b8146a559dc61350e",
+        "path": "schemas/core.session.terminal_receipt.read.output.schema.json"
+      },
+      "read_only": true,
+      "required_capabilities": [
+        "session.read"
       ],
       "streaming": false,
       "tenant_scoped": false,

@@ -95,6 +95,18 @@ fn platform_internal_process_command() -> Result<Command, String> {
 /// 只读挂载进 bwrap，再通过 `--inner` 安装 Landlock 与 seccomp。
 #[doc(hidden)]
 pub fn internal_process_entry(args: &[String]) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("--bounded-outer") {
+        return bounded::outer_entry(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("--bounded-inner") {
+        return bounded::inner_entry(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("--bounded-child") {
+        return bounded::child_entry(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("--protocol-version") {
         println!("{LAUNCHER_PROTOCOL}");
         return ExitCode::SUCCESS;
@@ -983,11 +995,17 @@ fn run_fd_closing_wrapper(
     args: &[String],
 ) -> Result<Output, SandboxError> {
     ensure_bootstrap_shell()?;
+    let image = fs::File::open(inner_launcher)
+        .map_err(|error| SandboxError::ProbeFailed(error.to_string()))?;
+    let script = format!(
+        "exec 3</proc/self/fd/0 || exit 125; exec 0</dev/null; {}",
+        fd_closing_script(bwrap_path, Path::new("/proc/self/fd/3"), args)
+    );
     Command::new(BOOTSTRAP_SHELL)
         .arg("-c")
-        .arg(fd_closing_script(bwrap_path, inner_launcher, args))
+        .arg(script)
         .env_clear()
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(image))
         .output()
         .map_err(|error| SandboxError::ProbeFailed(error.to_string()))
 }
@@ -1229,6 +1247,1652 @@ impl Drop for ProbeFixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+
+#[cfg(target_os = "linux")]
+mod bounded {
+    use super::*;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::os::unix::net::UnixDatagram;
+    use std::time::{Duration, Instant};
+
+    const FRAME_BYTES: usize = 128;
+    const MAGIC: &[u8; 8] = b"CWDBP279";
+    const CAPTURE: usize = 2 * 1024 * 1024;
+    pub struct PreparedBoundedCommand {
+        state: PreparedBoundedState,
+    }
+    struct PreparedBoundedState {
+        spec: SandboxLaunchSpec,
+        command: String,
+        deadline: Instant,
+        digest: [u8; 32],
+        preflight: SandboxPreflight,
+        project: File,
+        image: File,
+    }
+    pub struct BoundedSandboxObservation {
+        state: BoundedObservationState,
+    }
+    struct BoundedObservationState {
+        started: bool,
+        exit: Option<i32>,
+        signal: Option<i32>,
+        reason: String,
+        stop: &'static str,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        complete: bool,
+        identity: Option<(u64, u32, u64)>,
+        children_reaped: bool,
+        init_reaped: bool,
+        protected: bool,
+        profile: Option<SandboxLaunchReceipt>,
+    }
+    impl BoundedSandboxObservation {
+        pub fn started(&self) -> bool {
+            self.state.started
+        }
+        pub fn exit_code(&self) -> Option<i32> {
+            self.state.exit
+        }
+        pub fn signal(&self) -> Option<i32> {
+            self.state.signal
+        }
+        pub fn reason_code(&self) -> &str {
+            &self.state.reason
+        }
+        pub fn stop_reason(&self) -> &str {
+            self.state.stop
+        }
+        pub fn stdout(&self) -> &[u8] {
+            &self.state.stdout
+        }
+        pub fn stderr(&self) -> &[u8] {
+            &self.state.stderr
+        }
+        pub fn capture_complete(&self) -> bool {
+            self.state.complete
+        }
+        pub fn identity(&self) -> Option<(u64, u32, u64)> {
+            self.state.identity
+        }
+        pub fn all_children_reaped(&self) -> bool {
+            self.state.children_reaped
+        }
+        pub fn init_reaped(&self) -> bool {
+            self.state.init_reaped
+        }
+        pub fn status_channel_protected(&self) -> bool {
+            self.state.protected
+        }
+        pub fn applied_profile(&self) -> Option<&SandboxLaunchReceipt> {
+            self.state.profile.as_ref()
+        }
+    }
+    fn empty(reason: &str) -> BoundedSandboxObservation {
+        BoundedSandboxObservation {
+            state: BoundedObservationState {
+                started: false,
+                exit: None,
+                signal: None,
+                reason: reason.into(),
+                stop: "command_exit",
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                complete: false,
+                identity: None,
+                children_reaped: false,
+                init_reaped: false,
+                protected: false,
+                profile: None,
+            },
+        }
+    }
+    pub fn prepare_bounded_command(
+        mut spec: SandboxLaunchSpec,
+        command: String,
+        timeout: Duration,
+        admission_sha256: [u8; 32],
+    ) -> Result<PreparedBoundedCommand, SandboxError> {
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(120));
+        if spec.network_enabled
+            || spec.workspace_access != SandboxWorkspaceAccess::ReadOnly
+            || !spec.require_kernel_hardening
+            || !spec.readable_roots.is_empty()
+            || !spec.writable_roots.is_empty()
+            || !spec.tool_roots.is_empty()
+            || !spec.environment.is_empty()
+            || command.len() > 131072
+            || timeout.is_zero()
+            || timeout > Duration::from_secs(120)
+        {
+            return Err(SandboxError::ProbeFailed("bounded_profile_invalid".into()));
+        }
+        let root = canonical(&spec.workspace_root)?;
+        for system in SYSTEM_READ_ONLY_ROOTS {
+            for runtime in [
+                PathBuf::from(system),
+                Path::new(system)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(system)),
+            ] {
+                if root.starts_with(&runtime) || runtime.starts_with(&root) {
+                    return Err(SandboxError::ProbeFailed(
+                        "bounded_system_root_overlap".into(),
+                    ));
+                }
+            }
+        }
+        spec.working_directory = Some(root.clone());
+        let project = rustix::fs::openat2(
+            rustix::fs::CWD,
+            root.as_path(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+        )
+        .map_err(|error| SandboxError::ProbeFailed(error.to_string()))?;
+        let preflight = preflight(&spec)?;
+        let image = File::open(&preflight.cowd_binary_path)
+            .map_err(|error| SandboxError::ProbeFailed(error.to_string()))?;
+        Ok(PreparedBoundedCommand {
+            state: PreparedBoundedState {
+                spec,
+                command,
+                deadline,
+                digest: admission_sha256,
+                preflight,
+                project: File::from(project),
+                image,
+            },
+        })
+    }
+    fn send_capabilities(
+        socket: &UnixDatagram,
+        descriptors: [std::os::fd::BorrowedFd<'_>; 4],
+    ) -> Result<(), String> {
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+        let mut ancillary = rustix::net::SendAncillaryBuffer::new(&mut space);
+        if !ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(&descriptors)) {
+            return Err("bounded_handoff_capacity".into());
+        }
+        let sent = rustix::net::sendmsg(
+            socket,
+            &[std::io::IoSlice::new(b"CWDFD702")],
+            &mut ancillary,
+            rustix::net::SendFlags::NOSIGNAL | rustix::net::SendFlags::DONTWAIT,
+        )
+        .map_err(|error| error.to_string())?;
+        if sent != 8 {
+            return Err("bounded_handoff_incomplete".into());
+        }
+        Ok(())
+    }
+    fn receive_capabilities(socket: impl AsFd) -> Result<Vec<OwnedFd>, String> {
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+        let mut ancillary = rustix::net::RecvAncillaryBuffer::new(&mut space);
+        let mut magic = [0; 8];
+        let received = rustix::net::recvmsg(
+            socket,
+            &mut [std::io::IoSliceMut::new(&mut magic)],
+            &mut ancillary,
+            rustix::net::RecvFlags::CMSG_CLOEXEC | rustix::net::RecvFlags::DONTWAIT,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut descriptors = Vec::new();
+        for message in ancillary.drain() {
+            if let rustix::net::RecvAncillaryMessage::ScmRights(rights) = message {
+                descriptors.extend(rights);
+            }
+        }
+        if received.bytes != 8
+            || magic != *b"CWDFD702"
+            || received.flags.intersects(rustix::net::ReturnFlags::CTRUNC | rustix::net::ReturnFlags::TRUNC)
+            || descriptors.len() != 4
+        {
+            return Err("bounded_handoff_invalid".into());
+        }
+        let metadata = descriptors.iter().map(|descriptor| {
+            rustix::fs::fstat(descriptor).map_err(|error| error.to_string())
+        }).collect::<Result<Vec<_>, _>>()?;
+        if rustix::fs::FileType::from_raw_mode(metadata[0].st_mode) != rustix::fs::FileType::Directory
+            || rustix::fs::FileType::from_raw_mode(metadata[1].st_mode) != rustix::fs::FileType::Fifo
+            || rustix::fs::FileType::from_raw_mode(metadata[2].st_mode) != rustix::fs::FileType::Fifo
+            || metadata[1].st_ino == metadata[2].st_ino
+            || rustix::fs::FileType::from_raw_mode(metadata[3].st_mode) != rustix::fs::FileType::RegularFile
+        {
+            return Err("bounded_handoff_types_invalid".into());
+        }
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            let access = rustix::fs::fcntl_getfl(descriptor).map_err(|error| error.to_string())?
+                & rustix::fs::OFlags::ACCMODE;
+            let expected = if index == 2 { rustix::fs::OFlags::WRONLY } else { rustix::fs::OFlags::RDONLY };
+            if access != expected {
+                return Err("bounded_handoff_access_invalid".into());
+            }
+        }
+        Ok(descriptors)
+    }
+    pub(super) fn outer_entry(args: &[String]) -> ExitCode {
+        match run_outer(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("bounded outer: {error}");
+                ExitCode::from(125)
+            }
+        }
+    }
+    fn run_outer(args: &[String]) -> Result<(), String> {
+        if args.len() < 2
+            || !Path::new(&args[0]).is_absolute()
+            || Path::new(&args[0]).file_name().is_none_or(|name| name != "bwrap")
+            || !Path::new(&args[0]).is_file()
+        {
+            return Err("bounded_outer_arguments_invalid".into());
+        }
+        let descriptors = receive_capabilities(std::io::stdin())?;
+        let pinned = descriptors.iter().map(|descriptor| {
+            rustix::io::fcntl_dupfd_cloexec(descriptor, 16).map_err(|error| error.to_string())
+        }).collect::<Result<Vec<_>, _>>()?;
+        drop(descriptors);
+        for descriptor in &pinned {
+            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
+                .map_err(|error| error.to_string())?;
+        }
+        let script = format!(
+            "exec 3</proc/self/fd/{} || exit 125; exec 4</proc/self/fd/{} || exit 125; exec 5>/proc/self/fd/{} || exit 125; exec 6</proc/self/fd/{} || exit 125; exec 0</dev/null; for entry in /proc/$$/fd/*; do fd=${{entry##*/}}; case \"$fd\" in 0|1|2|3|4|5|6|*[!0-9]*|'') ;; *) eval \"exec $fd>&-\" ;; esac; done; exec {}",
+            pinned[3].as_raw_fd(), pinned[1].as_raw_fd(), pinned[2].as_raw_fd(), pinned[0].as_raw_fd(),
+            args.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>().join(" "),
+        );
+        let error = Command::new(BOOTSTRAP_SHELL).args(["-c", &script]).env_clear().exec();
+        Err(error.to_string())
+    }
+    struct RunningTree {
+        child: std::process::Child,
+        wrapper: OwnedFd,
+        init: Option<OwnedFd>,
+        reaped: bool,
+    }
+    impl Drop for RunningTree {
+        fn drop(&mut self) {
+            if self.init.is_none() && !self.reaped {
+                self.init = find_init(self.child.id(), None).map(|(_, descriptor, _)| descriptor);
+            }
+            if let Some(init) = &self.init {
+                let _ = rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL);
+            }
+            if !self.reaped {
+                let _ = rustix::process::pidfd_send_signal(
+                    &self.wrapper,
+                    rustix::process::Signal::KILL,
+                );
+                if self.child.wait().is_ok() {
+                    self.reaped = true;
+                }
+            }
+            if let Some(init) = &self.init {
+                while !pidfd_exited(init) {
+                    let _ = rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+    fn nonblocking(descriptor: impl AsFd) -> Result<(), String> {
+        let flags = rustix::fs::fcntl_getfl(&descriptor).map_err(|error| error.to_string())?;
+        rustix::fs::fcntl_setfl(&descriptor, flags | rustix::fs::OFlags::NONBLOCK)
+            .map_err(|error| error.to_string())
+    }
+    impl PreparedBoundedCommand {
+        pub fn run(self, cancellation: &AtomicBool) -> BoundedSandboxObservation {
+            if cancellation.load(Ordering::Acquire) {
+                return empty("bounded_cancelled_before_spawn");
+            }
+            match self.run_inner(cancellation) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("bounded start: {error}");
+                    empty("bounded_launch_state_unknown")
+                }
+            }
+        }
+        fn run_inner(self, cancellation: &AtomicBool) -> Result<BoundedSandboxObservation, String> {
+            let state = self.state;
+            let timeout = state.deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                return Err("bounded_deadline_before_spawn".into());
+            }
+            let (cancel_read, cancel_write) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                    .map_err(|error| error.to_string())?;
+            let (status_read, status_write) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                    .map_err(|error| error.to_string())?;
+            let root = canonical(&state.spec.workspace_root).map_err(|error| error.to_string())?;
+            let mut args = bwrap_args(
+                &state.preflight.bwrap_path,
+                &state.preflight.cowd_binary_path,
+                &state.spec,
+                String::new(),
+            )
+            .map_err(|error| error.to_string())?;
+            let end = args
+                .iter()
+                .position(|value| value == "--")
+                .ok_or("bounded_missing_exec_boundary")?;
+            args.truncate(end);
+            let root_text = root.to_string_lossy().to_string();
+            let mut index = 0;
+            while index < args.len() {
+                if args[index] == "--ro-bind" && args.get(index + 1) == Some(&root_text) {
+                    args[index] = "--ro-bind-fd".into();
+                    args[index + 1] = "6".into();
+                    args[index + 2] = "/project".into();
+                    index += 3;
+                } else if args[index] == "--chdir" {
+                    args[index + 1] = "/project".into();
+                    index += 2;
+                } else if args[index] == "--tmpfs"
+                    && args.get(index + 1).is_some_and(|path| path == "/tmp")
+                {
+                    args.splice(index..index, ["--size".into(), "33554432".into()]);
+                    index += 4;
+                } else {
+                    index += 1;
+                }
+            }
+            args.splice(
+                0..0,
+                ["--cap-drop".into(), "ALL".into(), "--as-pid-1".into()],
+            );
+            let hex = state
+                .digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            args.extend([
+                "--".into(),
+                INNER_LAUNCHER_PATH.into(),
+                INTERNAL_DISPATCH.into(),
+                INTERNAL_ROLE.into(),
+                "--bounded-inner".into(),
+                hex,
+                state.command,
+            ]);
+            let (handoff, inherited) = UnixDatagram::pair().map_err(|error| error.to_string())?;
+            send_capabilities(&handoff, [
+                state.project.as_fd(), cancel_read.as_fd(), status_write.as_fd(), state.image.as_fd(),
+            ])?;
+            let inherited: OwnedFd = inherited.into();
+            let mut child = match Command::new(format!("/proc/self/fd/{}", state.image.as_raw_fd()))
+                .args([INTERNAL_DISPATCH, INTERNAL_ROLE, "--bounded-outer"])
+                .arg(&state.preflight.bwrap_path)
+                .args(args)
+                .env_clear()
+                .stdin(Stdio::from(inherited))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    eprintln!("bounded spawn: {error}");
+                    return Ok(empty("bounded_launcher_start_failed"));
+                }
+            };
+            drop(handoff);
+            drop(cancel_read);
+            drop(status_write);
+            let pid = rustix::process::Pid::from_raw(child.id() as i32)
+                .ok_or("bounded_wrapper_pid_invalid")?;
+            let wrapper =
+                match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+                    Ok(descriptor) => descriptor,
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error.to_string());
+                    }
+                };
+            let mut tree = RunningTree {
+                child,
+                wrapper,
+                init: None,
+                reaped: false,
+            };
+            let mut stdout = tree.child.stdout.take().ok_or("bounded_stdout_missing")?;
+            let mut stderr = tree.child.stderr.take().ok_or("bounded_stderr_missing")?;
+            let mut control = File::from(status_read);
+            let mut cancel = File::from(cancel_write);
+            nonblocking(&stdout)?;
+            nonblocking(&stderr)?;
+            nonblocking(&control)?;
+            nonblocking(&cancel)?;
+            let mut result = empty("");
+            result.state.complete = true;
+            let limit = env::var("COWD_EXEC_MAX_OUTPUT_KIB")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|value| value.saturating_mul(1024))
+                .unwrap_or(CAPTURE)
+                .min(CAPTURE);
+            let mut frames = Vec::with_capacity(FRAME_BYTES * 2);
+            let mut start: Option<[u8; FRAME_BYTES]> = None;
+            let mut terminal: Option<[u8; FRAME_BYTES]> = None;
+            let mut go = false;
+            let mut stopped: Option<Instant> = None;
+            let mut reaped_at: Option<Instant> = None;
+            let mut stdout_eof = false;
+            let mut stderr_eof = false;
+            let began = Instant::now();
+            loop {
+                let mut stop = None;
+                if tree.init.is_none() {
+                    if let Some((pid, descriptor, ticks)) = find_init(tree.child.id(), None) {
+                        tree.init = Some(descriptor);
+                        result.state.identity = Some((0, pid, ticks));
+                        if !cancellation.load(Ordering::Acquire) && Instant::now() < state.deadline
+                        {
+                            go = true;
+                            if cancel.write_all(b"G").is_err() {
+                                result.state.reason = "bounded_handshake_failed".into();
+                                stop = Some(b'C');
+                            }
+                        } else {
+                            stop = Some(if cancellation.load(Ordering::Acquire) {
+                                b'C'
+                            } else {
+                                b'T'
+                            });
+                        }
+                    }
+                }
+                for (stream, output, eof) in [
+                    (
+                        &mut stdout as &mut dyn Read,
+                        &mut result.state.stdout,
+                        &mut stdout_eof,
+                    ),
+                    (
+                        &mut stderr as &mut dyn Read,
+                        &mut result.state.stderr,
+                        &mut stderr_eof,
+                    ),
+                ] {
+                    match drain(stream, output, limit) {
+                        Ok((overflow, ended)) => {
+                            *eof |= ended;
+                            if overflow {
+                                result.state.complete = false;
+                                stop = Some(b'L');
+                            }
+                        }
+                        Err(_) => {
+                            *eof = true;
+                            result.state.complete = false;
+                            result.state.reason = "bounded_reader_failed".into();
+                            stop = Some(b'C');
+                        }
+                    }
+                }
+                let mut buffer = [0; FRAME_BYTES * 2];
+                match control.read(&mut buffer) {
+                    Ok(count) if count > 0 => {
+                        if frames.len() + count > FRAME_BYTES * 2 {
+                            result.state.reason = "bounded_control_overflow".into();
+                            stop = Some(b'C');
+                        } else {
+                            frames.extend_from_slice(&buffer[..count]);
+                        }
+                    }
+                    Err(error)
+                        if !matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        result.state.reason = "bounded_control_failed".into();
+                        stop = Some(b'C');
+                    }
+                    _ => {}
+                }
+                if start.is_none() && frames.len() >= FRAME_BYTES {
+                    let mut frame = [0; FRAME_BYTES];
+                    frame.copy_from_slice(&frames[..FRAME_BYTES]);
+                    if !valid_frame(&frame, 1, &state.digest)
+                        || result
+                            .state
+                            .identity
+                            .is_none_or(|(_, _, ticks)| ticks != u64_at(&frame, 64))
+                    {
+                        result.state.reason = "bounded_started_frame_invalid".into();
+                        stop = Some(b'C');
+                    } else if let Some((_, pid, ticks)) = result.state.identity {
+                        result.state.identity = Some((u64_at(&frame, 44), pid, ticks));
+                        start = Some(frame);
+                        result.state.protected = true;
+                        result.state.started = frame[72] == 1;
+                    }
+                }
+                if terminal.is_none() && frames.len() == FRAME_BYTES * 2 {
+                    let mut frame = [0; FRAME_BYTES];
+                    frame.copy_from_slice(&frames[FRAME_BYTES..]);
+                    if valid_frame(&frame, 2, &state.digest)
+                        && start.as_ref().is_some_and(|first| {
+                            first[44..56] == frame[44..56]
+                                && first[64..72] == frame[64..72]
+                                && first[72] == frame[72]
+                        })
+                    {
+                        terminal = Some(frame);
+                    } else {
+                        result.state.reason = "bounded_terminal_frame_invalid".into();
+                        stop = Some(b'C');
+                    }
+                }
+                if cancellation.load(Ordering::Acquire) {
+                    stop = Some(b'C');
+                }
+                if Instant::now() >= state.deadline {
+                    stop = Some(b'T');
+                }
+                if !go && began.elapsed() >= Duration::from_secs(10) {
+                    result.state.reason = "bounded_startup_deadline".into();
+                    stop = Some(b'C');
+                }
+                if let Some(reason) = stop.filter(|_| stopped.is_none()) {
+                    let _ = cancel.write_all(&[reason]);
+                    stopped = Some(Instant::now());
+                    result.state.stop = match reason {
+                        b'T' => "timeout",
+                        b'L' => "capture_limit",
+                        _ => "cancelled",
+                    };
+                }
+                if stopped.is_some_and(|instant| instant.elapsed() >= Duration::from_secs(5))
+                    && !tree.reaped
+                {
+                    result.state.reason = "bounded_reap_deadline".into();
+                    if let Some(init) = &tree.init {
+                        let _ =
+                            rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL);
+                    }
+                    let _ = rustix::process::pidfd_send_signal(
+                        &tree.wrapper,
+                        rustix::process::Signal::KILL,
+                    );
+                }
+                match tree.child.try_wait() {
+                    Ok(Some(status)) => {
+                        tree.reaped = true;
+                        let reaped = *reaped_at.get_or_insert_with(Instant::now);
+                        if frames.len() < FRAME_BYTES * 2
+                            && reaped.elapsed() < Duration::from_millis(100)
+                        {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        if (!stdout_eof || !stderr_eof) && reaped.elapsed() < Duration::from_secs(5)
+                        {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        if !stdout_eof || !stderr_eof {
+                            result.state.complete = false;
+                            result.state.reason = "bounded_output_drain_incomplete".into();
+                        }
+                        if let Some(frame) = terminal {
+                            result.state.exit =
+                                (i32_at(&frame, 56) >= 0).then(|| i32_at(&frame, 56));
+                            result.state.signal =
+                                (i32_at(&frame, 60) > 0).then(|| i32_at(&frame, 60));
+                            result.state.children_reaped = frame[11] & 128 != 0;
+                            result.state.started = frame[72] == 1;
+                            if frame[11] & 16 != 0 {
+                                result.state.reason = "bounded_cleanup_deadline".into();
+                            }
+                            result.state.stop = match frame[10] {
+                                1 => "command_exit",
+                                2 => "timeout",
+                                3 => "cancelled",
+                                4 => "capture_limit",
+                                _ => {
+                                    result.state.reason = "bounded_stop_invalid".into();
+                                    "command_exit"
+                                }
+                            };
+                            result.state.init_reaped =
+                                status.success() && tree.init.as_ref().is_some_and(pidfd_exited);
+                            if result.state.started {
+                                result.state.profile = Some(SandboxLaunchReceipt {
+                                    backend: "bubblewrap+landlock+seccomp+pid1",
+                                    workspace_access: SandboxWorkspaceAccess::ReadOnly,
+                                    network_enabled: false,
+                                    kernel_hardening_applied: true,
+                                    protected_roots_denied: true,
+                                    inherited_fds_closed: true,
+                                    environment_allowlist_enforced: true,
+                                    prepared_at_ms: now_ms(),
+                                });
+                            } else if result.state.reason.is_empty() {
+                                result.state.reason = "bounded_not_started".into();
+                            }
+                        } else {
+                            result.state.reason = "bounded_terminal_missing".into();
+                        }
+                        if frames.len() != FRAME_BYTES * 2 || start.is_none() {
+                            result.state.reason = "bounded_control_incomplete".into();
+                        }
+                        return Ok(result);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        result.state.reason = "bounded_wrapper_wait_failed".into();
+                        if stopped.is_none() {
+                            let _ = cancel.write_all(b"C");
+                            stopped = Some(Instant::now());
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    fn pidfd_exited(descriptor: &OwnedFd) -> bool {
+        let mut descriptors = [rustix::event::PollFd::new(
+            descriptor,
+            rustix::event::PollFlags::IN,
+        )];
+        rustix::event::poll(
+            &mut descriptors,
+            Some(&rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        )
+        .is_ok_and(|count| count > 0)
+    }
+    fn drain(
+        stream: &mut dyn Read,
+        output: &mut Vec<u8>,
+        limit: usize,
+    ) -> std::io::Result<(bool, bool)> {
+        let mut buffer = [0; 8192];
+        for _ in 0..32 {
+            match stream.read(&mut buffer) {
+                Ok(0) => return Ok((false, true)),
+                Ok(count) => {
+                    let available = limit.saturating_sub(output.len());
+                    output.extend_from_slice(&buffer[..count.min(available)]);
+                    if count > available {
+                        return Ok((true, false));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok((false, false))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((false, false))
+    }
+    fn u64_at(frame: &[u8; FRAME_BYTES], offset: usize) -> u64 {
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(&frame[offset..offset + 8]);
+        u64::from_le_bytes(bytes)
+    }
+    fn i32_at(frame: &[u8; FRAME_BYTES], offset: usize) -> i32 {
+        let mut bytes = [0; 4];
+        bytes.copy_from_slice(&frame[offset..offset + 4]);
+        i32::from_le_bytes(bytes)
+    }
+    fn valid_frame(frame: &[u8; FRAME_BYTES], sequence: u8, digest: &[u8; 32]) -> bool {
+        &frame[..8] == MAGIC
+            && frame[8] == 1
+            && frame[9] == sequence
+            && frame[12..44] == digest[..]
+            && frame[11] & 15 == 15
+            && frame[52..56] == 1_u32.to_le_bytes()
+            && frame[73..].iter().all(|byte| *byte == 0)
+            && u64_at(frame, 44) != 0
+            && u64_at(frame, 64) != 0
+            && if sequence == 1 {
+                frame[10] == 1
+                    && frame[11] == 15
+                    && frame[72] <= 1
+                    && i32_at(frame, 56) == -1
+                    && i32_at(frame, 60) == 0
+            } else {
+                (1..=4).contains(&frame[10])
+                    && matches!(frame[11], 143 | 159)
+                    && frame[72] <= 1
+                    && (frame[72] == 0 || ((i32_at(frame, 56) >= 0) != (i32_at(frame, 60) > 0)))
+            }
+    }
+    fn process_ticks(pid: u32) -> Option<u64> {
+        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        text.rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()
+    }
+    fn find_init(wrapper: u32, expected_ticks: Option<u64>) -> Option<(u32, OwnedFd, u64)> {
+        let mut pending = vec![wrapper];
+        let mut seen = BTreeSet::new();
+        while let Some(pid) = pending.pop() {
+            if !seen.insert(pid) || seen.len() > 256 {
+                continue;
+            }
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            let nested_init = status
+                .lines()
+                .find(|line| line.starts_with("NSpid:"))
+                .is_some_and(|line| {
+                    let ids = line.split_whitespace().skip(1).collect::<Vec<_>>();
+                    ids.len() >= 2 && ids.last() == Some(&"1")
+                });
+            if nested_init
+                && process_ticks(pid)
+                    .is_some_and(|ticks| expected_ticks.is_none_or(|expected| expected == ticks))
+            {
+                let ticks = process_ticks(pid)?;
+                let descriptor = rustix::process::pidfd_open(
+                    rustix::process::Pid::from_raw(pid as i32)?,
+                    rustix::process::PidfdFlags::empty(),
+                )
+                .ok()?;
+                if process_ticks(pid) == Some(ticks) {
+                    return Some((pid, descriptor, ticks));
+                }
+            }
+            if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+                pending.extend(
+                    children
+                        .split_whitespace()
+                        .filter_map(|value| value.parse::<u32>().ok()),
+                );
+            }
+        }
+        None
+    }
+    fn frame(
+        sequence: u8,
+        digest: &[u8; 32],
+        namespace: u64,
+        ticks: u64,
+        exit: Option<i32>,
+        signal: Option<i32>,
+        stop: u8,
+        reaped: bool,
+        launched: bool,
+    ) -> [u8; FRAME_BYTES] {
+        let mut frame = [0; FRAME_BYTES];
+        frame[..8].copy_from_slice(MAGIC);
+        frame[8] = 1;
+        frame[9] = sequence;
+        frame[10] = stop;
+        frame[11] = 15 | if reaped { 128 } else { 0 };
+        frame[12..44].copy_from_slice(digest);
+        frame[44..52].copy_from_slice(&namespace.to_le_bytes());
+        frame[52..56].copy_from_slice(&1_u32.to_le_bytes());
+        frame[56..60].copy_from_slice(&exit.unwrap_or(-1).to_le_bytes());
+        frame[60..64].copy_from_slice(&signal.unwrap_or(0).to_le_bytes());
+        frame[64..72].copy_from_slice(&ticks.to_le_bytes());
+        frame[72] = u8::from(launched);
+        frame
+    }
+    struct NamespaceTree;
+    impl Drop for NamespaceTree {
+        fn drop(&mut self) {
+            loop {
+                kill_descendants();
+                match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
+                    Err(rustix::io::Errno::CHILD) => break,
+                    _ => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        }
+    }
+    fn kill_descendants() {
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(Result::ok) {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .filter(|pid| *pid > 1)
+                    .and_then(rustix::process::Pid::from_raw)
+                else {
+                    continue;
+                };
+                if let Ok(descriptor) =
+                    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                {
+                    let _ = rustix::process::pidfd_send_signal(
+                        &descriptor,
+                        rustix::process::Signal::KILL,
+                    );
+                }
+            }
+        }
+    }
+    pub(super) fn inner_entry(args: &[String]) -> ExitCode {
+        match run_init(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("bounded init: {error}");
+                ExitCode::from(125)
+            }
+        }
+    }
+    fn run_init(args: &[String]) -> Result<(), String> {
+        if rustix::process::getpid().as_raw_nonzero().get() != 1 || args.len() != 2 {
+            return Err("bounded_requires_namespace_pid1".into());
+        }
+        let mut digest = [0; 32];
+        if args[0].len() != 64 || !args[0].is_ascii() {
+            return Err("bounded_digest_invalid".into());
+        }
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&args[0][index * 2..index * 2 + 2], 16)
+                .map_err(|_| "bounded_digest_invalid")?;
+        }
+        let mut control = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open("/proc/self/fd/4")
+            .map_err(|error| error.to_string())?;
+        let mut status = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open("/proc/self/fd/5")
+            .map_err(|error| error.to_string())?;
+        let control_metadata = control.metadata().map_err(|error| error.to_string())?;
+        let status_metadata = status.metadata().map_err(|error| error.to_string())?;
+        if !control_metadata.file_type().is_fifo()
+            || !status_metadata.file_type().is_fifo()
+            || control_metadata.ino() == status_metadata.ino()
+        {
+            return Err("bounded_private_pipe_invalid".into());
+        }
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .map_err(|error| error.to_string())?;
+        if rustix::process::dumpable_behavior().map_err(|error| error.to_string())?
+            != rustix::process::DumpableBehavior::NotDumpable
+        {
+            return Err("bounded_dumpable_not_disabled".into());
+        }
+        install_landlock(&[PathBuf::from("/tmp"), PathBuf::from("/dev")])?;
+        install_seccomp(true)?;
+        let mounts =
+            fs::read_to_string("/proc/self/mountinfo").map_err(|error| error.to_string())?;
+        if !mounts.lines().any(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields.get(4) == Some(&"/project")
+                && fields
+                    .get(5)
+                    .is_some_and(|options| options.split(',').any(|option| option == "ro"))
+        }) {
+            return Err("bounded_project_mount_not_read_only".into());
+        }
+        let interfaces = fs::read_to_string("/proc/net/dev").map_err(|error| error.to_string())?;
+        let temporary = rustix::fs::statvfs("/tmp").map_err(|error| error.to_string())?;
+        if (temporary.f_blocks as u64).saturating_mul(temporary.f_frsize as u64) > 33554432 {
+            return Err("bounded_private_tmpfs_limit_missing".into());
+        }
+        if interfaces.lines().skip(2).any(|line| {
+            line.split(':')
+                .next()
+                .is_some_and(|name| name.trim() != "lo")
+        }) {
+            return Err("bounded_network_namespace_not_private".into());
+        }
+        let rules = [libc::SYS_setns, libc::SYS_unshare, libc::SYS_pidfd_getfd]
+            .into_iter()
+            .map(|syscall| (syscall, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        let filter: BpfProgram = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Trap,
+            std::env::consts::ARCH
+                .try_into()
+                .map_err(|error| format!("{error}"))?,
+        )
+        .map_err(|error| error.to_string())?
+        .try_into()
+        .map_err(|error: seccompiler::BackendError| error.to_string())?;
+        seccompiler::apply_filter(&filter).map_err(|error| error.to_string())?;
+        if !rustix::thread::no_new_privs().map_err(|error| error.to_string())? {
+            return Err("bounded_no_new_privs_missing".into());
+        }
+        let security =
+            fs::read_to_string("/proc/self/status").map_err(|error| error.to_string())?;
+        for key in ["CapEff:", "CapPrm:", "CapInh:", "CapAmb:"] {
+            if !security
+                .lines()
+                .find(|line| line.starts_with(key))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| u64::from_str_radix(value, 16).ok())
+                .is_some_and(|capabilities| capabilities == 0)
+            {
+                return Err("bounded_untrusted_capability_ceiling".into());
+            }
+        }
+        let namespace = fs::metadata("/proc/self/ns/pid")
+            .map_err(|error| error.to_string())?
+            .ino();
+        let ticks = process_ticks(1).ok_or("bounded_init_ticks_missing")?;
+        let _tree = NamespaceTree;
+        let began = Instant::now();
+        let mut stop = 1;
+        loop {
+            let mut input = [0];
+            match control.read(&mut input) {
+                Ok(1) if input[0] == b'G' => break,
+                Ok(1) => {
+                    stop = match input[0] {
+                        b'T' => 2,
+                        b'L' => 4,
+                        _ => 3,
+                    };
+                    break;
+                }
+                Ok(0) => {
+                    stop = 3;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if began.elapsed() >= Duration::from_secs(10) {
+                        stop = 3;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => {
+                    stop = 3;
+                    break;
+                }
+            }
+        }
+        let mut command_pid = None;
+        if stop == 1 {
+            let script = format!(
+                "exec 3<&-; exec 4<&-; exec 5>&-; exec {} {} {} --bounded-child {}",
+                shell_quote(INNER_LAUNCHER_PATH),
+                shell_quote(INTERNAL_DISPATCH),
+                shell_quote(INTERNAL_ROLE),
+                shell_quote(&args[1])
+            );
+            let child = Command::new(BOOTSTRAP_SHELL)
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::null())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            command_pid = Some(child.id());
+        }
+        status
+            .write_all(&frame(
+                1,
+                &digest,
+                namespace,
+                ticks,
+                None,
+                None,
+                1,
+                false,
+                command_pid.is_some(),
+            ))
+            .map_err(|error| error.to_string())?;
+        let mut exit = None;
+        let mut signal = None;
+        let mut done = command_pid.is_none();
+        let mut cleanup_at: Option<Instant> = None;
+        loop {
+            let mut input = [0];
+            match control.read(&mut input) {
+                Ok(1) => {
+                    stop = match input[0] {
+                        b'T' => 2,
+                        b'L' => 4,
+                        _ => 3,
+                    };
+                    kill_descendants();
+                }
+                Ok(0) => {
+                    stop = 3;
+                    kill_descendants();
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                _ => {
+                    stop = 3;
+                    kill_descendants();
+                }
+            }
+            match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
+                Ok(Some((pid, result))) => {
+                    if !done && Some(pid.as_raw_nonzero().get() as u32) == command_pid {
+                        exit = result.exit_status();
+                        signal = result.terminating_signal();
+                        done = true;
+                    }
+                }
+                Err(rustix::io::Errno::CHILD) => break,
+                Err(rustix::io::Errno::INTR) | Ok(None) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            if done || stop != 1 {
+                cleanup_at.get_or_insert_with(Instant::now);
+                kill_descendants();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut terminal = frame(
+            2,
+            &digest,
+            namespace,
+            ticks,
+            exit,
+            signal,
+            stop,
+            true,
+            command_pid.is_some(),
+        );
+        if cleanup_at.is_some_and(|instant| instant.elapsed() >= Duration::from_secs(5)) {
+            terminal[11] |= 16;
+        }
+        status
+            .write_all(&terminal)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+    pub(super) fn child_entry(args: &[String]) -> ExitCode {
+        if args.len() != 1 {
+            return ExitCode::from(64);
+        }
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        for (resource, ceiling) in [
+            (Resource::Nproc, 128),
+            (Resource::As, 536870912),
+            (Resource::Nofile, 64),
+            (Resource::Fsize, 16777216),
+            (Resource::Core, 0),
+        ] {
+            let previous = getrlimit(resource);
+            let maximum = previous.maximum.map_or(ceiling, |value| value.min(ceiling));
+            let current = previous.current.map_or(maximum, |value| value.min(maximum));
+            if setrlimit(
+                resource,
+                Rlimit {
+                    current: Some(current),
+                    maximum: Some(maximum),
+                },
+            )
+            .is_err()
+            {
+                return ExitCode::from(125);
+            }
+        }
+        let error = Command::new("/bin/sh").arg("-c").arg(&args[0]).exec();
+        eprintln!("bounded command exec: {error}");
+        ExitCode::from(125)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        struct Project(PathBuf);
+        impl Project {
+            fn new() -> Self {
+                static SEQUENCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let path = env::temp_dir().join(format!(
+                    "cowd-bounded-launch-tests-{}-{}-{}",
+                    std::process::id(),
+                    now_ms(),
+                    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+            fn spec(&self) -> SandboxLaunchSpec {
+                let mut spec = SandboxLaunchSpec::workspace(&self.0);
+                spec.workspace_access = SandboxWorkspaceAccess::ReadOnly;
+                spec.network_enabled = false;
+                spec
+            }
+        }
+        impl Drop for Project {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        fn command(project: &Project, source: &str, timeout: Duration) -> PreparedBoundedCommand {
+            prepare_bounded_command(
+                project.spec(),
+                format!("exec python3 -c {}", shell_quote(source)),
+                timeout,
+                [7; 32],
+            )
+            .unwrap()
+        }
+        fn assert_settled(result: &BoundedSandboxObservation) {
+            assert!(result.started(), "{}", result.reason_code());
+            assert_eq!(result.reason_code(), "");
+            assert!(result.all_children_reaped());
+            assert!(result.init_reaped());
+            assert!(result.status_channel_protected());
+            assert!(result
+                .identity()
+                .is_some_and(|(namespace, pid, ticks)| namespace != 0 && pid > 1 && ticks != 0));
+            assert!(result
+                .applied_profile()
+                .is_some_and(
+                    |profile| profile.backend == "bubblewrap+landlock+seccomp+pid1"
+                        && !profile.network_enabled
+                        && profile.workspace_access == SandboxWorkspaceAccess::ReadOnly
+                        && profile.kernel_hardening_applied
+                ));
+        }
+
+        #[test]
+        fn r1_702_bounded_non_dumpable_parent_high_fd_and_private_handoff() {
+            const CHILD: &str = "COWD_702_NON_DUMPABLE_CHILD";
+            if env::var_os(CHILD).is_none() {
+                let mut child = Command::new(env::current_exe().unwrap())
+                    .args(["--exact", "bounded::tests::r1_702_bounded_non_dumpable_parent_high_fd_and_private_handoff", "--nocapture"])
+                    .env(CHILD, "1")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(45);
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        let output = child.wait_with_output().unwrap();
+                        assert!(status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        let _ = child.wait();
+                        panic!("bounded non-dumpable production child exceeded its deadline");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return;
+            }
+            rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).unwrap();
+            let project = Project::new();
+            fs::write(project.0.join("input.txt"), "one\ntwo\n").unwrap();
+            let source = r#"
+import os
+assert open('/project/input.txt').read().count('\n') == 2
+for entry in os.listdir('/proc/self/fd'):
+    descriptor = int(entry)
+    if descriptor > 2:
+        try: os.fstat(descriptor)
+        except OSError: continue
+        raise AssertionError('leaked private descriptor')
+assert 'COWD_702_NON_DUMPABLE_CHILD' not in os.environ
+print('production-payload-complete')
+"#;
+            let mut prepared = command(&project, source, Duration::from_secs(15));
+            let high = rustix::io::fcntl_dupfd_cloexec(&prepared.state.project, 1025).unwrap();
+            prepared.state.project = File::from(high);
+            assert!(prepared.state.project.as_raw_fd() >= 1025);
+            let observer = prepared.state.project.try_clone().unwrap();
+            let result = prepared.run(&AtomicBool::new(false));
+            assert_settled(&result);
+            assert_eq!(result.exit_code(), Some(0));
+            assert_eq!(result.stdout(), b"production-payload-complete\n");
+            assert!(rustix::io::fcntl_getfd(&observer).unwrap().contains(rustix::io::FdFlags::CLOEXEC));
+            assert_eq!(rustix::process::dumpable_behavior().unwrap(), rustix::process::DumpableBehavior::NotDumpable);
+        }
+
+        #[test]
+        fn r1_702_bounded_mount_stays_pinned_across_path_replacement() {
+            let project = Project::new();
+            fs::write(project.0.join("input.txt"), "original").unwrap();
+            let prepared = command(&project, "assert open('/project/input.txt').read() == 'original'; print('pinned')", Duration::from_secs(15));
+            let replacement = Project::new();
+            let original = replacement.0.join("original");
+            fs::rename(&project.0, &original).unwrap();
+            fs::create_dir(&project.0).unwrap();
+            fs::write(project.0.join("input.txt"), "replacement").unwrap();
+            let result = prepared.run(&AtomicBool::new(false));
+            assert_settled(&result);
+            assert_eq!(result.exit_code(), Some(0));
+            assert_eq!(result.stdout(), b"pinned\n");
+        }
+
+        #[test]
+        fn r1_702_handoff_rejects_missing_truncated_and_wrong_access_capabilities() {
+            let project = Project::new();
+            let directory = File::open(&project.0).unwrap();
+            let image = File::open(env::current_exe().unwrap()).unwrap();
+            let (cancel_read, cancel_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+            let (status_read, status_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+            let (sender, receiver) = UnixDatagram::pair().unwrap();
+            assert!(receive_capabilities(&receiver).is_err());
+            sender.send(b"CWDFD702").unwrap();
+            assert!(receive_capabilities(&receiver).is_err());
+            send_capabilities(&sender, [directory.as_fd(), cancel_write.as_fd(), status_read.as_fd(), image.as_fd()]).unwrap();
+            assert!(receive_capabilities(&receiver).is_err());
+            let descriptors = [directory.as_fd(), cancel_read.as_fd(), status_write.as_fd(), image.as_fd(), image.as_fd()];
+            let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(5))];
+            let mut ancillary = rustix::net::SendAncillaryBuffer::new(&mut space);
+            assert!(ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(&descriptors)));
+            rustix::net::sendmsg(&sender, &[std::io::IoSlice::new(b"CWDFD702")], &mut ancillary, rustix::net::SendFlags::NOSIGNAL).unwrap();
+            assert!(receive_capabilities(&receiver).is_err());
+            send_capabilities(&sender, [directory.as_fd(), cancel_read.as_fd(), status_write.as_fd(), image.as_fd()]).unwrap();
+            let received = receive_capabilities(&receiver).unwrap();
+            assert_eq!(received.len(), 4);
+            assert!(received.iter().all(|descriptor| rustix::io::fcntl_getfd(descriptor).unwrap().contains(rustix::io::FdFlags::CLOEXEC)));
+            assert_eq!(rustix::fs::fstat(&received[0]).unwrap().st_ino, directory.metadata().unwrap().ino());
+        }
+
+        #[test]
+        fn r1_702_bounded_ordinary_nonzero_is_not_unknown_or_success() {
+            let project = Project::new();
+            let prepared = command(&project, "raise SystemExit(7)", Duration::from_secs(15));
+            let result = prepared.run(&AtomicBool::new(false));
+            assert_settled(&result);
+            assert_eq!(result.exit_code(), Some(7));
+            assert_eq!(result.signal(), None);
+            assert_eq!(result.stop_reason(), "command_exit");
+            let prepared = prepare_bounded_command(project.spec(), "exec /missing-702-program".into(), Duration::from_secs(15), [7; 32]).unwrap();
+            let result = prepared.run(&AtomicBool::new(false));
+            assert_settled(&result);
+            assert_ne!(result.exit_code(), Some(0));
+        }
+
+        #[test]
+        fn r1_702_bounded_sigterm_reaps_detached_tree_and_preserves_signal() {
+            let project = Project::new();
+            let prepared = command(&project, "import os,signal,time\nif os.fork()==0:\n os.setsid(); time.sleep(600); os._exit(0)\nos.kill(os.getpid(), signal.SIGTERM)", Duration::from_secs(15));
+            let result = prepared.run(&AtomicBool::new(false));
+            assert_settled(&result);
+            assert_eq!(result.exit_code(), None);
+            assert_eq!(result.signal(), Some(15));
+            assert_eq!(result.stop_reason(), "command_exit");
+        }
+
+        #[test]
+        fn r1_702_outer_failure_never_forges_payload_or_namespace_reap() {
+            let project = Project::new();
+            let mut prepared = command(&project, "print('must-not-run')", Duration::from_secs(15));
+            prepared.state.preflight.bwrap_path = PathBuf::from("/missing-702-bwrap");
+            let result = prepared.run(&AtomicBool::new(false));
+            assert!(!result.started());
+            assert_eq!(result.reason_code(), "bounded_control_incomplete");
+            assert_eq!(result.exit_code(), None);
+            assert_eq!(result.signal(), None);
+            assert!(!result.all_children_reaped());
+            assert!(!result.init_reaped());
+            assert!(!result.status_channel_protected());
+            assert!(result.applied_profile().is_none());
+            assert!(!String::from_utf8_lossy(result.stdout()).contains("must-not-run"));
+        }
+
+        #[test]
+        fn bounded_pid1_actively_reaps_detached_doublefork_and_closed_stdio() {
+            let project = Project::new();
+            let marker = format!("P1_TREE_{}_{}", std::process::id(), now_ms());
+            let source = format!(
+                r#"
+import os, time
+marker = '{marker}'
+first = os.fork()
+if first == 0:
+    os.setsid()
+    second = os.fork()
+    if second == 0:
+        os.close(0); os.close(1); os.close(2)
+        time.sleep(600)
+        os._exit(0)
+    os._exit(0)
+os.waitpid(first, 0)
+print('command-complete', flush=True)
+time.sleep(0.25)
+"#
+            );
+            let prepared = command(&project, &source, Duration::from_secs(15));
+            let began = Instant::now();
+            let worker = std::thread::spawn(move || prepared.run(&AtomicBool::new(false)));
+            let mut witnessed = BTreeSet::new();
+            while !worker.is_finished() {
+                for entry in fs::read_dir("/proc").unwrap().filter_map(Result::ok) {
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|value| value.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    if fs::read(entry.path().join("cmdline"))
+                        .ok()
+                        .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(&marker))
+                    {
+                        if let Some(ticks) = process_ticks(pid) {
+                            witnessed.insert((pid, ticks));
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let result = worker.join().unwrap();
+            assert_settled(&result);
+            assert_eq!(result.exit_code(), Some(0));
+            assert_eq!(result.stop_reason(), "command_exit");
+            assert!(began.elapsed() < Duration::from_secs(15));
+            assert!(!witnessed.is_empty());
+            for (pid, ticks) in witnessed {
+                assert_ne!(
+                    process_ticks(pid),
+                    Some(ticks),
+                    "actual old process {pid} survived"
+                );
+            }
+            assert!(String::from_utf8_lossy(result.stdout()).contains("command-complete"));
+        }
+
+        #[test]
+        fn bounded_pid1_private_status_preserves_binary_stdout_and_stderr() {
+            let project = Project::new();
+            let source = r#"
+import os
+assert os.read(0, 1) == b''
+os.write(1, b'\xff\x00CWDBP279' + bytes(248))
+os.write(2, b'command-stderr-not-status')
+raise SystemExit(7)
+"#;
+            let result =
+                command(&project, source, Duration::from_secs(15)).run(&AtomicBool::new(false));
+            assert_settled(&result);
+            assert_eq!(result.exit_code(), Some(7));
+            assert_eq!(result.stop_reason(), "command_exit");
+            assert!(result.capture_complete());
+            let mut expected = b"\xff\x00CWDBP279".to_vec();
+            expected.extend_from_slice(&[0; 248]);
+            assert_eq!(result.stdout(), expected.as_slice());
+            assert_eq!(result.stderr(), b"command-stderr-not-status");
+        }
+
+        #[test]
+        fn bounded_control_fds_are_not_reopenable_and_stdout_is_not_status() {
+            let project = Project::new();
+            let source = r#"
+import os, subprocess, sys
+for target in ['/proc/1/fd/3', '/proc/1/fd/4', '/proc/1/fd/5', '/proc/1/root']:
+    try:
+        descriptor = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        pass
+    else:
+        os.close(descriptor)
+        raise AssertionError('reopened private init capability: ' + target)
+for entry in os.listdir('/proc/self/fd'):
+    descriptor = int(entry)
+    if descriptor <= 2:
+        continue
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        pass
+    else:
+        raise AssertionError('inherited private fd: ' + entry)
+probe = subprocess.run(['/run/cowd-sandbox-inner','__cowd_internal','sandbox-launcher',
+                        '--bounded-inner','0'*64,'true'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+assert probe.returncode != 0
+for attack in ["import ctypes; ctypes.CDLL(None).ptrace(0,1,0,0)",
+               "import ctypes; ctypes.CDLL(None).syscall(438,1,5,0)",
+               "import ctypes; ctypes.CDLL(None).syscall(310,1,0,0,0,0,0)",
+               "import ctypes; ctypes.CDLL(None).syscall(311,1,0,0,0,0,0)"]:
+    probe = subprocess.run([sys.executable,'-c',attack], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert probe.returncode != 0
+print('{"kind":"settled","exit_code":0,"all_children_reaped":true}')
+raise SystemExit(7)
+"#;
+            let result =
+                command(&project, source, Duration::from_secs(15)).run(&AtomicBool::new(false));
+            assert_settled(&result);
+            assert_eq!(result.exit_code(), Some(7));
+            assert!(String::from_utf8_lossy(result.stdout()).contains("all_children_reaped"));
+        }
+
+        #[test]
+        fn bounded_cancel_timeout_and_capture_limit_close_the_actual_tree() {
+            let project = Project::new();
+            let timeout = command(
+                &project,
+                "import os,time\nif os.fork()==0: os.setsid()\ntime.sleep(600)",
+                Duration::from_millis(1000),
+            )
+            .run(&AtomicBool::new(false));
+            assert_settled(&timeout);
+            assert_eq!(timeout.stop_reason(), "timeout");
+            assert_ne!(timeout.exit_code(), Some(0));
+            let overflow = command(
+                &project,
+                "import os\nwhile True: os.write(1,b'x'*8192)",
+                Duration::from_secs(15),
+            )
+            .run(&AtomicBool::new(false));
+            assert_settled(&overflow);
+            assert_eq!(overflow.stop_reason(), "capture_limit");
+            assert!(!overflow.capture_complete());
+            assert!(overflow.stdout().len() <= CAPTURE);
+            let marker = format!("P1_CANCEL_{}_{}", std::process::id(), now_ms());
+            let prepared = command(
+                &project,
+                &format!(
+                    "import time; marker='{marker}'; print('started',flush=True); time.sleep(600)"
+                ),
+                Duration::from_secs(15),
+            );
+            let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+            let signal = cancellation.clone();
+            let worker = std::thread::spawn(move || prepared.run(&signal));
+            let barrier = Instant::now();
+            let mut actual_started = false;
+            while barrier.elapsed() < Duration::from_secs(5) && !actual_started {
+                for entry in fs::read_dir("/proc").unwrap().filter_map(Result::ok) {
+                    if fs::read_link(entry.path().join("exe"))
+                        .ok()
+                        .is_some_and(|path| {
+                            path.file_name()
+                                .is_some_and(|name| name.to_string_lossy().starts_with("python"))
+                        })
+                        && fs::read(entry.path().join("cmdline"))
+                            .ok()
+                            .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(&marker))
+                    {
+                        actual_started = true;
+                        break;
+                    }
+                }
+                if !actual_started {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            cancellation.store(true, Ordering::Release);
+            let cancelled = worker.join().unwrap();
+            assert!(
+                actual_started,
+                "cancellation requires an actual command-start barrier"
+            );
+            assert_settled(&cancelled);
+            assert_eq!(cancelled.stop_reason(), "cancelled");
+            assert_ne!(cancelled.exit_code(), Some(0));
+        }
+
+        #[test]
+        fn bounded_frames_reject_wrong_version_digest_sequence_profile_and_reentry() {
+            let digest = [7; 32];
+            let started = frame(1, &digest, 42, 99, None, None, 1, false, false);
+            let terminal = frame(2, &digest, 42, 99, Some(7), None, 1, true, true);
+            assert!(valid_frame(&started, 1, &digest));
+            assert!(valid_frame(&terminal, 2, &digest));
+            assert!(!valid_frame(&terminal, 1, &digest));
+            for offset in [0, 8, 9, 11, 12, 52, 100] {
+                let mut tampered = started;
+                tampered[offset] ^= 1;
+                assert!(!valid_frame(&tampered, 1, &digest), "offset {offset}");
+            }
+            assert!(<[u8; FRAME_BYTES]>::try_from(&started[..FRAME_BYTES - 1]).is_err());
+            assert_ne!(
+                inner_entry(&["0".repeat(64), "true".into()]),
+                ExitCode::SUCCESS
+            );
+            let project = Project::new();
+            for mode in ["network", "write", "readable", "tools", "unhardened"] {
+                let mut spec = project.spec();
+                match mode {
+                    "network" => spec.network_enabled = true,
+                    "write" => spec.workspace_access = SandboxWorkspaceAccess::ReadWrite,
+                    "readable" => spec.readable_roots.push(PathBuf::from("/usr")),
+                    "tools" => spec.tool_roots.push(PathBuf::from("/usr")),
+                    "unhardened" => spec.require_kernel_hardening = false,
+                    _ => unreachable!(),
+                }
+                assert!(prepare_bounded_command(
+                    spec,
+                    "true".into(),
+                    Duration::from_secs(1),
+                    digest
+                )
+                .is_err());
+            }
+            let mut system = SandboxLaunchSpec::workspace("/usr");
+            system.workspace_access = SandboxWorkspaceAccess::ReadOnly;
+            system.network_enabled = false;
+            assert!(
+                prepare_bounded_command(system, "true".into(), Duration::from_secs(1), digest)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn bounded_nonblocking_capture_retains_binary_bytes_and_reports_reader_errors() {
+            let mut bytes = std::io::Cursor::new(vec![255, 0, 1, 2]);
+            let mut output = Vec::new();
+            assert_eq!(drain(&mut bytes, &mut output, 8).unwrap(), (false, true));
+            assert_eq!(output, [255, 0, 1, 2]);
+            let mut exact = std::io::Cursor::new(vec![1; 8]);
+            assert_eq!(
+                drain(&mut exact, &mut Vec::new(), 8).unwrap(),
+                (false, true)
+            );
+            assert_eq!(
+                drain(
+                    &mut std::io::Cursor::new(Vec::<u8>::new()),
+                    &mut Vec::new(),
+                    0
+                )
+                .unwrap(),
+                (false, true)
+            );
+            let mut oversized = std::io::Cursor::new(vec![1; 20]);
+            assert!(drain(&mut oversized, &mut Vec::new(), 8).unwrap().0);
+            struct Broken;
+            impl Read for Broken {
+                fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::other("injected reader fault"))
+                }
+            }
+            assert!(drain(&mut Broken, &mut Vec::new(), 8).is_err());
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+pub use bounded::{prepare_bounded_command, BoundedSandboxObservation, PreparedBoundedCommand};
+
+#[cfg(not(target_os = "linux"))]
+mod bounded_unsupported {
+    use super::*;
+    pub struct PreparedBoundedCommand {
+        state: (),
+    }
+    pub struct BoundedSandboxObservation {
+        state: (),
+    }
+    pub fn prepare_bounded_command(
+        _: SandboxLaunchSpec,
+        _: String,
+        _: std::time::Duration,
+        _: [u8; 32],
+    ) -> Result<PreparedBoundedCommand, SandboxError> {
+        Err(SandboxError::UnsupportedPlatform)
+    }
+    impl PreparedBoundedCommand {
+        pub fn run(self, _: &AtomicBool) -> BoundedSandboxObservation {
+            BoundedSandboxObservation { state: self.state }
+        }
+    }
+    impl BoundedSandboxObservation {
+        pub fn started(&self) -> bool {
+            false
+        }
+        pub fn exit_code(&self) -> Option<i32> {
+            None
+        }
+        pub fn signal(&self) -> Option<i32> {
+            None
+        }
+        pub fn reason_code(&self) -> &str {
+            "bounded_linux_required"
+        }
+        pub fn stop_reason(&self) -> &str {
+            "command_exit"
+        }
+        pub fn stdout(&self) -> &[u8] {
+            &[]
+        }
+        pub fn stderr(&self) -> &[u8] {
+            &[]
+        }
+        pub fn capture_complete(&self) -> bool {
+            false
+        }
+        pub fn identity(&self) -> Option<(u64, u32, u64)> {
+            None
+        }
+        pub fn all_children_reaped(&self) -> bool {
+            false
+        }
+        pub fn init_reaped(&self) -> bool {
+            false
+        }
+        pub fn status_channel_protected(&self) -> bool {
+            false
+        }
+        pub fn applied_profile(&self) -> Option<&SandboxLaunchReceipt> {
+            None
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub use bounded_unsupported::{
+    prepare_bounded_command, BoundedSandboxObservation, PreparedBoundedCommand,
+};
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

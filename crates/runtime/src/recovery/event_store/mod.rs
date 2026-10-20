@@ -7,8 +7,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    Arc, Mutex as StdMutex, OnceLock,
     atomic::{AtomicU64, Ordering},
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,9 @@ thread_local! {
         const { Cell::new(None) };
 }
 
+pub(crate) mod content;
 mod ports;
+pub use content::QuiescedContentRoots;
 pub use ports::*;
 mod domain;
 pub use domain::{
@@ -51,6 +53,8 @@ pub use ephemeral::EphemeralRuntimeEventStore;
 /// schema. Backend adapters are composed explicitly at the trusted host root.
 #[derive(Debug)]
 pub struct RuntimeEventStore {
+    session_recovery_exclusions: std::sync::RwLock<BTreeSet<String>>,
+    artifacts: OnceLock<Arc<crate::ArtifactStore>>,
     backend: Arc<dyn RuntimeEventStoreBackend>,
     commit_signal: tokio::sync::watch::Sender<u64>,
     /// Monotonic time of the latest non-projection commit. Maintenance lanes
@@ -110,10 +114,217 @@ impl RuntimeEventStore {
         let (commit_signal, _) = tokio::sync::watch::channel(latest_cursor);
         Self {
             backend,
+            session_recovery_exclusions: std::sync::RwLock::new(BTreeSet::new()),
+            artifacts: OnceLock::new(),
             commit_signal,
             last_foreground_commit_ms: AtomicU64::new(0),
             stream_locks: StdMutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub(crate) fn has_session_recovery_exclusions(&self) -> bool {
+        !self
+            .session_recovery_exclusions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    pub(crate) fn session_recovery_exclusions(&self) -> Vec<String> {
+        self.session_recovery_exclusions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn replace_session_recovery_exclusions(&self, excluded: BTreeSet<String>) {
+        *self
+            .session_recovery_exclusions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = excluded;
+    }
+
+    pub(crate) fn is_session_recovery_excluded(&self, session_id: &str) -> bool {
+        self.session_recovery_exclusions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
+    }
+
+    pub(crate) fn ensure_session_recovery_admitted(&self, session_id: &str) -> Result<(), String> {
+        if self.is_session_recovery_excluded(session_id) {
+            return Err(format!("session_recovery_quarantined:{session_id}"));
+        }
+        Ok(())
+    }
+
+    fn ensure_graph_transaction_recovery_admitted(
+        &self,
+        request: &AppendTransactionRequest,
+    ) -> RuntimeEventStoreResult<()> {
+        if !self.has_session_recovery_exclusions() {
+            return Ok(());
+        }
+        for input in &request.events {
+            if !matches!(
+                input.event.scope,
+                RuntimeEventScope::ExecutionGraph | RuntimeEventScope::ExecutionNode
+            ) {
+                continue;
+            }
+            let activity = input.event.activity_binding();
+            if let Some(binding) = &activity {
+                binding.validate().map_err(|error| {
+                    RuntimeEventStoreError::InvalidTransaction(error.to_string())
+                })?;
+                self.ensure_session_recovery_admitted(&binding.session_id)
+                    .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            }
+            if input.event.scope == RuntimeEventScope::ExecutionGraph {
+                if activity.is_none() {
+                    return Err(RuntimeEventStoreError::InvalidTransaction(
+                        "session_recovery_graph_activity_binding_missing".into(),
+                    ));
+                }
+                continue;
+            }
+            let mut graphs = input
+                .event
+                .refs
+                .iter()
+                .filter(|reference| reference.kind == "execution_graph")
+                .map(|reference| reference.id.clone())
+                .collect::<BTreeSet<_>>();
+            if let Some(binding) = &activity {
+                graphs.insert(binding.root_execution_id.clone());
+            }
+            let governed_session = if input.event.actor.as_deref() == Some("governed_tool")
+                && input
+                    .event
+                    .payload
+                    .get("replay")
+                    .is_some_and(|replay| !replay.is_null())
+            {
+                let replay = &input.event.payload["replay"];
+                let origin: harness_contract::step::CallOrigin =
+                    serde_json::from_value(replay["origin"].clone())?;
+                let invocation: harness_contract::tool::GovernedToolInvocation =
+                    serde_json::from_value(replay["invocation"].clone())?;
+                let session = replay["session_id"]
+                    .as_str()
+                    .filter(|session| !session.trim().is_empty())
+                    .ok_or_else(|| {
+                        RuntimeEventStoreError::InvalidTransaction(
+                            "session_recovery_tool_session_missing".into(),
+                        )
+                    })?;
+                if invocation.origin.as_ref() != Some(&origin)
+                    || invocation.invocation_id != origin.call_id
+                    || replay["call_id"].as_str() != Some(origin.call_id.as_str())
+                    || origin.origin_step_id.is_empty()
+                    || origin.catalog_digest.is_empty()
+                {
+                    return Err(RuntimeEventStoreError::InvalidTransaction(
+                        "session_recovery_tool_replay_mismatch".into(),
+                    ));
+                }
+                self.ensure_session_recovery_admitted(session)
+                    .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+                true
+            } else {
+                false
+            };
+            let original_intent;
+            let owner = if input.event.kind == "execution.effect.receipt"
+                && graphs.is_empty()
+                && input.event.actor.as_deref() != Some("governed_tool")
+            {
+                let call = input
+                    .idempotency_key
+                    .as_deref()
+                    .and_then(|key| key.strip_suffix(":receipt"))
+                    .ok_or_else(|| {
+                        RuntimeEventStoreError::InvalidTransaction(
+                            "session_recovery_receipt_key_missing".into(),
+                        )
+                    })?;
+                original_intent = self
+                    .event_by_idempotency_key(&input.event.stream_id, &format!("{call}:intent"))?;
+                let original = original_intent.as_ref().ok_or_else(|| {
+                    RuntimeEventStoreError::InvalidTransaction(
+                        "session_recovery_receipt_intent_missing".into(),
+                    )
+                })?;
+                if original.stream_id != input.event.stream_id
+                    || original.scope != RuntimeEventScope::ExecutionNode
+                    || original.kind != "execution.effect.intent"
+                    || original.schema_version != 1
+                    || original.idempotency_key.as_deref()
+                        != Some(format!("{call}:intent").as_str())
+                    || original.actor != input.event.actor
+                {
+                    return Err(RuntimeEventStoreError::InvalidTransaction(
+                        "session_recovery_receipt_intent_invalid".into(),
+                    ));
+                }
+                &original.payload
+            } else {
+                &input.event.payload
+            };
+            if graphs.is_empty()
+                && matches!(
+                    input.event.kind.as_str(),
+                    "execution.effect.intent" | "execution.effect.receipt"
+                )
+                && input.event.actor.as_deref() != Some("governed_tool")
+            {
+                let ticket: crate::execution_core::NodeExecutionTicket =
+                    serde_json::from_value(owner.clone())?;
+                graphs.insert(ticket.graph_id);
+            }
+            if graphs.is_empty() && !governed_session {
+                return Err(RuntimeEventStoreError::InvalidTransaction(
+                    "session_recovery_node_owner_unknown".into(),
+                ));
+            }
+            for graph_id in graphs {
+                let in_transaction = request.events.iter().find(|event| {
+                    event.event.scope == RuntimeEventScope::ExecutionGraph
+                        && event.event.stream_id == graph_id
+                });
+                let original = if in_transaction.is_none() {
+                    self.event_by_idempotency_key(&graph_id, &format!("{graph_id}:revision:1"))?
+                } else {
+                    None
+                };
+                let binding = match in_transaction {
+                    Some(event) => event.event.activity_binding(),
+                    None => original
+                        .as_ref()
+                        .filter(|event| {
+                            event.stream_id == graph_id
+                                && event.scope == RuntimeEventScope::ExecutionGraph
+                                && event.sequence == 1
+                                && event.kind == "execution_graph.planned"
+                                && event.schema_version == 2
+                        })
+                        .and_then(|event| event.activity_binding()),
+                }
+                .ok_or_else(|| {
+                    RuntimeEventStoreError::InvalidTransaction(
+                        "session_recovery_original_graph_owner_missing".into(),
+                    )
+                })?;
+                binding.validate().map_err(|error| {
+                    RuntimeEventStoreError::InvalidTransaction(error.to_string())
+                })?;
+                self.ensure_session_recovery_admitted(&binding.session_id)
+                    .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn with_stream_locks<T>(
@@ -161,6 +372,20 @@ impl RuntimeEventStore {
     }
 
     pub fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
+        let mut validation = AppendTransactionRequest {
+            transaction_id: "append-validation".into(),
+            expected_streams: Vec::new(),
+            events: vec![RuntimeTransactionEventInput {
+                event: input,
+                idempotency_key: None,
+                schema_version: 1,
+            }],
+        };
+        self.ensure_graph_transaction_recovery_admitted(&validation)
+            .map_err(|error| error.to_string())?;
+        self.validate_content_publication(&mut validation)
+            .map_err(|error| error.to_string())?;
+        let input = validation.events.remove(0).event;
         let stream_id = input.stream_id.clone();
         let event = self.with_stream_lock(&stream_id, || self.backend.append(input))?;
         self.publish_commit(event.commit_cursor);
@@ -171,6 +396,9 @@ impl RuntimeEventStore {
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.ensure_graph_transaction_recovery_admitted(&request)?;
+        let mut request = request;
+        self.validate_content_publication(&mut request)?;
         let stream_ids = request
             .expected_streams
             .iter()
@@ -199,6 +427,48 @@ impl RuntimeEventStore {
         )
     }
 
+    pub fn position_page(
+        &self,
+        scope: RuntimeEventScope,
+        identity: &str,
+        kind: Option<&str>,
+        after: Option<(u64, u32)>,
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend.position_page(
+            scope,
+            identity,
+            kind,
+            after,
+            through_cursor,
+            max_events,
+            max_bytes,
+        )
+    }
+
+    pub fn list_stream_before(
+        &self,
+        stream_id: &str,
+        through_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend
+            .list_stream_before(stream_id, through_sequence, max_events, max_bytes)
+    }
+
+    pub fn count_stream_kinds(
+        &self,
+        stream_id: &str,
+        kinds: &[&str],
+        through_sequence: u64,
+    ) -> Result<u64, String> {
+        self.backend
+            .count_stream_kinds(stream_id, kinds, through_sequence)
+    }
+
     /// Appends without acquiring the per-stream lock. Only callers that
     /// already hold [`Self::with_stream_lock`] for every expected stream may
     /// use this; it avoids a non-reentrant deadlock on the same stream.
@@ -206,9 +476,37 @@ impl RuntimeEventStore {
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.ensure_graph_transaction_recovery_admitted(&request)?;
+        let mut request = request;
+        self.validate_content_publication(&mut request)?;
         let receipt = self.backend.append_transaction(request)?;
         self.publish_commit(receipt.commit_cursor);
         Ok(receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_content_transaction_fault(
+        &self,
+        request: AppendTransactionRequest,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.backend.append_transaction(request)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_content_checkpoint_fault(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &serde_json::Value,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        self.backend.compare_and_repair_projection_checkpoint(
+            projection_id,
+            source_cursor,
+            expected_revision,
+            payload,
+            0,
+        )
     }
 
     pub fn append_transaction_with_terminal(
@@ -216,6 +514,12 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.ensure_graph_transaction_recovery_admitted(&request)?;
+        self.ensure_session_recovery_admitted(&terminal.session_id)
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+        let mut request = request;
+        self.validate_content_publication(&mut request)?;
+        self.validate_terminal_publication(&terminal, &request)?;
         let stream_ids = request
             .expected_streams
             .iter()
@@ -258,6 +562,9 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         lease: &crate::VerifiedDecisionLease,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.ensure_graph_transaction_recovery_admitted(&request)?;
+        let mut request = request;
+        self.validate_content_publication(&mut request)?;
         let stream_ids = request
             .expected_streams
             .iter()
@@ -279,17 +586,14 @@ impl RuntimeEventStore {
         events: Vec<RuntimeTransactionEventInput>,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
         let stream_id = stream_id.into();
-        let lock_stream_id = stream_id.clone();
-        let receipt = self.with_stream_lock(&lock_stream_id, || {
-            self.backend.append_batch_if_revision(
+        self.append_transaction(AppendTransactionRequest {
+            transaction_id: transaction_id.into(),
+            expected_streams: vec![ExpectedStreamRevision {
                 stream_id,
                 expected_revision,
-                transaction_id.into(),
-                events,
-            )
-        })?;
-        self.publish_commit(receipt.commit_cursor);
-        Ok(receipt)
+            }],
+            events,
+        })
     }
 
     #[must_use]
@@ -363,8 +667,28 @@ impl RuntimeEventStore {
         payload: &serde_json::Value,
         updated_at_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        self.validate_checkpoint_content(projection_id, source_cursor, payload)?;
         self.backend
             .put_projection_checkpoint(projection_id, source_cursor, payload, updated_at_ms)
+    }
+
+    pub fn source_mutation_fence(&self) -> RuntimeEventStoreResult<RuntimeSourceMutationFence> {
+        self.backend.source_mutation_fence()
+    }
+
+    pub fn compare_and_put_projection_checkpoint_fenced(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &serde_json::Value,
+        updated_at_ms: u64,
+        source_fence: &RuntimeSourceMutationFence,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        self.validate_checkpoint_content(projection_id, source_cursor, payload)?;
+        self.backend.compare_and_put_projection_checkpoint_fenced(
+            projection_id, source_cursor, expected_revision, payload, updated_at_ms, source_fence,
+        )
     }
 
     pub fn compare_and_put_projection_checkpoint(
@@ -375,6 +699,7 @@ impl RuntimeEventStore {
         payload: &serde_json::Value,
         updated_at_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        self.validate_checkpoint_content(projection_id, source_cursor, payload)?;
         self.backend.compare_and_put_projection_checkpoint(
             projection_id,
             source_cursor,
@@ -425,6 +750,7 @@ impl RuntimeEventStore {
         payload: &serde_json::Value,
         updated_at_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        self.validate_checkpoint_content(projection_id, source_cursor, payload)?;
         self.backend.compare_and_repair_projection_checkpoint(
             projection_id,
             source_cursor,
@@ -450,6 +776,23 @@ impl RuntimeEventStore {
         self.backend.durable_commit_cursor()
     }
 
+    pub fn recent_event_lines(
+        &self,
+        stream_id: &str,
+        references: &[RuntimeEventRef],
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<harness_contract::mission::MissionControlEventLine>, String> {
+        self.backend.recent_event_lines(
+            stream_id,
+            references,
+            through_cursor,
+            max_events,
+            max_bytes,
+        )
+    }
+
     pub fn event_by_idempotency_key(
         &self,
         stream_id: &str,
@@ -457,6 +800,16 @@ impl RuntimeEventStore {
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
         self.backend
             .event_by_idempotency_key(stream_id, idempotency_key)
+    }
+
+    pub fn bounded_event_by_idempotency_key(
+        &self,
+        stream: &str,
+        key: &str,
+        through: u64,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<RuntimeBoundedEventLookup> {
+        self.backend.bounded_event_by_idempotency_key(stream, key, through, max_bytes)
     }
 
     pub fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
@@ -764,6 +1117,36 @@ impl RuntimeEventStore {
         session_id: &str,
     ) -> RuntimeEventStoreResult<bool> {
         self.backend.has_unsettled_session_terminals(session_id)
+    }
+
+    pub fn validate_terminal_execution_selector(
+        session_id: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> RuntimeEventStoreResult<()> {
+        for (name, value) in [
+            ("session_id", session_id),
+            ("execution_id", execution_id),
+            ("turn_id", turn_id),
+        ] {
+            if value.is_empty() || value.trim() != value || value.contains('\0') {
+                return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                    "invalid terminal selector {name}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn session_terminal_for_execution(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
+        Self::validate_terminal_execution_selector(session_id, execution_id, turn_id)?;
+        self.backend
+            .session_terminal_for_execution(session_id, execution_id, turn_id)
     }
 
     pub fn materialized_session_terminals_after(

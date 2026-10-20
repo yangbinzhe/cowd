@@ -235,7 +235,9 @@ pub enum GovernedToolCompileError {
         scope: String,
         reason: String,
     },
-    #[error("tool task `{task_id}` depends on rejected task `{dependency_id}`: {rejection_reason}")]
+    #[error(
+        "tool task `{task_id}` depends on rejected task `{dependency_id}`: {rejection_reason}"
+    )]
     DependencyReferencesRejectedTask {
         task_id: String,
         dependency_id: String,
@@ -283,7 +285,10 @@ impl GovernedToolCompiler {
         F: Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     {
         self.compile_partial_with_rejections(
-            workspace_root, requests, &BTreeMap::new(), describe_registered_tool,
+            workspace_root,
+            requests,
+            &BTreeMap::new(),
+            describe_registered_tool,
         )
     }
 
@@ -298,9 +303,15 @@ impl GovernedToolCompiler {
         F: Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     {
         let id_to_index = validate_task_ids(requests)?;
-        let mut rejected = requests.iter().enumerate().filter_map(|(index, request)| {
-            admission_rejections.get(&request.tool_use_id).map(|reason| (index, reason.clone()))
-        }).collect::<BTreeMap<_, _>>();
+        let mut rejected = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                admission_rejections
+                    .get(&request.tool_use_id)
+                    .map(|reason| (index, reason.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
 
         for (index, request) in requests.iter().enumerate() {
             for dependency in &request.depends_on {
@@ -1190,10 +1201,43 @@ impl GovernedToolExecutionMode {
 
 pub(crate) fn resource_scope_from_effect(effect: &ToolEffectDescriptor) -> ToolResourceScope {
     if effect.effect_kind == ToolEffectKind::Unknown {
-        return ToolResourceScope::unknown();
+        let mut scope = ToolResourceScope::unknown();
+        scope.network = effect.uses_network;
+        return scope;
     }
+    let file_scopes = effect
+        .scopes
+        .iter()
+        .filter(|scope| scope.resource == PermissionResource::File)
+        .collect::<Vec<_>>();
+    let file_accesses = crate::tool_host::effect_file_accesses(effect);
+    let untargeted_file = effect.spawns_process
+        || file_scopes.iter().any(|scope| {
+            scope
+                .target
+                .as_deref()
+                .is_none_or(|target| target.trim().is_empty())
+        });
     if effect.uses_network {
-        return ToolResourceScope::network();
+        if file_accesses.is_empty() {
+            return ToolResourceScope::network();
+        }
+        let mut scope = if untargeted_file {
+            ToolResourceScope::workspace()
+        } else {
+            let mut paths = file_accesses
+                .iter()
+                .map(|(path, _)| normalize_resource_path(path))
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths.dedup();
+            ToolResourceScope::paths(paths)
+        };
+        scope.network = true;
+        return scope;
+    }
+    if untargeted_file {
+        return ToolResourceScope::workspace();
     }
     // Runtime-owned control actions commit through their own transactional
     // aggregate. They do not mutate a workspace path, and the aggregate
@@ -1215,21 +1259,30 @@ pub(crate) fn resource_scope_from_effect(effect: &ToolEffectDescriptor) -> ToolR
     {
         return ToolResourceScope::internal_transaction();
     }
-    if matches!(
-        effect.effect_kind,
-        ToolEffectKind::Process
-            | ToolEffectKind::Package
-            | ToolEffectKind::System
-            | ToolEffectKind::Destructive
-    ) {
+    if file_accesses.is_empty()
+        && matches!(
+            effect.effect_kind,
+            ToolEffectKind::Process
+                | ToolEffectKind::Package
+                | ToolEffectKind::System
+                | ToolEffectKind::Destructive
+        )
+    {
         return ToolResourceScope::runtime();
     }
-    let mut paths = effect
-        .scopes
-        .iter()
-        .filter_map(|scope| scope.target.as_deref())
-        .map(normalize_resource_path)
-        .collect::<Vec<_>>();
+    let mut paths = if file_accesses.is_empty() {
+        effect
+            .scopes
+            .iter()
+            .filter_map(|scope| scope.target.as_deref())
+            .map(normalize_resource_path)
+            .collect::<Vec<_>>()
+    } else {
+        file_accesses
+            .iter()
+            .map(|(path, _)| normalize_resource_path(path))
+            .collect::<Vec<_>>()
+    };
     paths.sort();
     paths.dedup();
     if paths.is_empty() {
@@ -1251,6 +1304,12 @@ fn normalized_resource_scope(
             "registered descriptors must declare a concrete effect scope".to_string(),
         ));
     }
+    for (path, _) in crate::tool_host::effect_file_accesses(effect) {
+        let normalized = normalize_workspace_relative_scope_path(&path, workspace_root)?;
+        if normalized != "." {
+            validate_relative_scope_path(&normalized)?;
+        }
+    }
     for path in &mut scope.paths {
         *path = normalize_workspace_relative_scope_path(path, workspace_root)?;
         if path == "." {
@@ -1271,7 +1330,9 @@ fn normalized_resource_scope(
         && effect.effect_kind == ToolEffectKind::Read
         && scope.paths.iter().any(|path| path == ".")
     {
-        return Ok(ToolResourceScope::workspace());
+        let mut workspace_scope = ToolResourceScope::workspace();
+        workspace_scope.network = scope.network;
+        return Ok(workspace_scope);
     }
     scope.paths.sort();
     scope.paths.dedup();
@@ -1298,7 +1359,7 @@ fn normalize_workspace_relative_scope_path(
     Ok(normalize_resource_path(&relative.to_string_lossy()))
 }
 
-fn validate_relative_scope_path(path: &str) -> Result<(), (String, String)> {
+pub(crate) fn validate_relative_scope_path(path: &str) -> Result<(), (String, String)> {
     use std::path::{Component, Path};
 
     if path.is_empty() || path.contains('\0') {
@@ -1307,6 +1368,8 @@ fn validate_relative_scope_path(path: &str) -> Result<(), (String, String)> {
             "scope path is empty or contains NUL".to_string(),
         ));
     }
+    let normalized = path.replace('\\', "/");
+    let path = normalized.as_str();
     let path_value = Path::new(path);
     if path_value.is_absolute() {
         return Err((
@@ -1314,10 +1377,12 @@ fn validate_relative_scope_path(path: &str) -> Result<(), (String, String)> {
             "scope path must be workspace-relative".to_string(),
         ));
     }
-    if path
-        .split('/')
-        .next()
-        .is_some_and(|component| component.ends_with(':'))
+    if (path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && path.as_bytes().get(1) == Some(&b':'))
+        || path
+            .split('/')
+            .next()
+            .is_some_and(|component| component.ends_with(':'))
     {
         return Err((
             path.to_string(),
@@ -1338,7 +1403,7 @@ fn validate_relative_scope_path(path: &str) -> Result<(), (String, String)> {
     Ok(())
 }
 
-fn normalize_resource_path(path: &str) -> String {
+pub(crate) fn normalize_resource_path(path: &str) -> String {
     let replaced = path.trim().replace('\\', "/");
     if replaced.is_empty() {
         ".".to_string()
@@ -1355,6 +1420,26 @@ fn normalize_resource_path(path: &str) -> String {
             (false, true) => ".".to_string(),
             (false, false) => normalized,
         }
+    }
+}
+
+#[cfg(test)]
+mod relative_scope_grammar_tests {
+    #[test]
+    fn drive_relative_scopes_are_rejected_before_normalization() {
+        for path in [
+            "C:secret",
+            "c:../secret",
+            "C:/secret",
+            "C:\\secret",
+            "\\\\server\\share",
+            "/secret",
+            "../secret",
+            "volume:/secret",
+        ] {
+            assert!(super::validate_relative_scope_path(path).is_err(), "{path}");
+        }
+        assert!(super::validate_relative_scope_path("src/a.rs").is_ok());
     }
 }
 
@@ -1617,6 +1702,178 @@ mod tests {
 
     use crate::execution_core::build_runtime_execution_decision;
 
+    #[test]
+    fn r1_composite_effect_mixed_scope_keeps_local_paths_and_network() {
+        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let lease = tools::ToolHost::builtin("mixed-runtime-scope", &workspace).pin_snapshot();
+        let mixed = serde_json::json!({"steps":[
+            {"id":"write","op":"call","tool":"edit","input":{"action":"write","path":"src/shared.rs","content":"x"}},
+            {"id":"fetch","op":"call","tool":"web_fetch","input":{"url":"https://example.invalid/no-transport","prompt":"summarize"}}
+        ]});
+        let effect = lease.describe_effect("tool_orchestrate", &mixed);
+        let scope = resource_scope_from_effect(&effect);
+        assert_eq!(scope.kind, "paths");
+        assert_eq!(scope.paths, vec![".cowd/checkpoints", "src/shared.rs"]);
+        assert!(scope.network && !scope.unknown);
+        assert_eq!(
+            normalized_resource_scope(&effect, &workspace).unwrap(),
+            scope
+        );
+        let requests = [
+            request_with_input("mixed", "tool_orchestrate", &mixed.to_string(), Vec::new()),
+            request_with_input(
+                "same",
+                "edit",
+                r#"{"action":"write","path":"src/shared.rs","content":"y"}"#,
+                Vec::new(),
+            ),
+            request_with_input(
+                "different",
+                "edit",
+                r#"{"action":"write","path":"src/different.rs","content":"z"}"#,
+                Vec::new(),
+            ),
+            request_with_input(
+                "independent-read",
+                "read_file",
+                r#"{"path":"src/independent.rs"}"#,
+                Vec::new(),
+            ),
+        ];
+        let plan = GovernedToolCompiler
+            .compile(&workspace, &requests, |tool, input| {
+                Some((
+                    lease.describe_effect(tool, input),
+                    lease.revision(),
+                    lease.snapshot().descriptor_set_hash.clone(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(plan.tasks[0].resource_scope, scope);
+        assert_eq!(plan.tasks[0].conflicts.len(), 2);
+        assert_eq!(plan.tasks[0].conflicts[0].tool_call_id, "same");
+        assert_eq!(plan.tasks[0].conflicts[0].kind, "path_overlap");
+        assert_eq!(plan.tasks[0].conflicts[1].tool_call_id, "different");
+        assert_eq!(plan.tasks[0].conflicts[1].kind, "path_overlap");
+        assert_eq!(plan.tasks[1].predecessors, vec![0]);
+        assert_eq!(
+            plan.tasks[1].invocation.compiled_dependencies[0].depends_on,
+            "mixed"
+        );
+        assert_eq!(plan.tasks[2].predecessors, vec![0, 1]);
+        assert!(plan.tasks[3].conflicts.is_empty() && plan.tasks[3].predecessors.is_empty());
+        let network = lease.describe_effect("web_fetch", &mixed["steps"][1]["input"]);
+        assert_eq!(
+            resource_scope_from_effect(&network),
+            ToolResourceScope::network()
+        );
+        assert_eq!(
+            normalized_resource_scope(&network, &workspace).unwrap(),
+            ToolResourceScope::network()
+        );
+        let mut absolute = effect.clone();
+        for file in absolute
+            .scopes
+            .iter_mut()
+            .filter(|scope| scope.resource == PermissionResource::File)
+        {
+            file.target = Some(
+                workspace
+                    .join(file.target.as_deref().unwrap())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        assert_eq!(
+            normalized_resource_scope(&absolute, &workspace).unwrap(),
+            scope
+        );
+        let mut escaped = effect.clone();
+        for file in escaped
+            .scopes
+            .iter_mut()
+            .filter(|scope| scope.resource == PermissionResource::File)
+        {
+            file.target = Some("../outside".into());
+        }
+        assert!(normalized_resource_scope(&escaped, &workspace).is_err());
+        for target in [None, Some(String::new())] {
+            let mut untargeted = effect.clone();
+            untargeted.scopes.push(PermissionScope {
+                resource: PermissionResource::File,
+                operation: PermissionOperation::Write,
+                target,
+            });
+            let scope = resource_scope_from_effect(&untargeted);
+            assert_eq!(scope.kind, "workspace");
+            assert_eq!(scope.paths, vec!["."]);
+            assert!(scope.network && !scope.unknown);
+            assert_eq!(
+                normalized_resource_scope(&untargeted, &workspace).unwrap(),
+                scope
+            );
+        }
+        let mut unknown = effect.clone();
+        unknown.effect_kind = ToolEffectKind::Unknown;
+        let scope = resource_scope_from_effect(&unknown);
+        assert!(scope.unknown && scope.network && scope.paths.is_empty());
+        assert!(normalized_resource_scope(&unknown, &workspace).is_err());
+        let mut root_read = effect.clone();
+        root_read.effect_kind = ToolEffectKind::Read;
+        root_read
+            .scopes
+            .iter_mut()
+            .filter(|scope| scope.resource == PermissionResource::File)
+            .for_each(|scope| scope.target = Some(workspace.to_string_lossy().into_owned()));
+        let scope = normalized_resource_scope(&root_read, &workspace).unwrap();
+        assert_eq!(scope.kind, "workspace");
+        assert_eq!(scope.paths, vec!["."]);
+        assert!(scope.network);
+        let sandbox = lease.describe_effect(
+            "execute_code",
+            &serde_json::json!({"language":"python","code":"print(1)"}),
+        );
+        let scope = resource_scope_from_effect(&sandbox);
+        assert_eq!(scope.kind, "workspace");
+        assert_eq!(scope.paths, vec!["."]);
+        assert!(!scope.network && !scope.unknown);
+        let mut process_mixed = effect.clone();
+        process_mixed.effect_kind = ToolEffectKind::Process;
+        process_mixed.uses_network = false;
+        process_mixed
+            .scopes
+            .retain(|scope| scope.resource == PermissionResource::File);
+        assert_eq!(
+            resource_scope_from_effect(&process_mixed),
+            ToolResourceScope::paths(vec![".cowd/checkpoints".into(), "src/shared.rs".into()])
+        );
+        assert!(!process_mixed.spawns_process);
+        process_mixed.spawns_process = true;
+        let process_scope = resource_scope_from_effect(&process_mixed);
+        assert_eq!(process_scope.kind, "workspace");
+        assert_eq!(process_scope.paths, vec!["."]);
+        assert!(!process_scope.network && !process_scope.unknown);
+        assert_eq!(
+            normalized_resource_scope(&process_mixed, &workspace).unwrap(),
+            process_scope
+        );
+        process_mixed.uses_network = true;
+        let network_process_scope = resource_scope_from_effect(&process_mixed);
+        assert_eq!(network_process_scope.kind, "workspace");
+        assert_eq!(network_process_scope.paths, vec!["."]);
+        assert!(network_process_scope.network && !network_process_scope.unknown);
+        assert_eq!(
+            normalized_resource_scope(&process_mixed, &workspace).unwrap(),
+            network_process_scope
+        );
+        process_mixed.scopes.push(PermissionScope {
+            resource: PermissionResource::File,
+            operation: PermissionOperation::Write,
+            target: Some("../escaped-child".into()),
+        });
+        assert!(normalized_resource_scope(&process_mixed, &workspace).is_err());
+    }
+
     fn request(id: &str, tool_name: &str, depends_on: Vec<String>) -> ToolRequest {
         request_with_input(id, tool_name, "{}", depends_on)
     }
@@ -1866,12 +2123,10 @@ mod tests {
         assert_eq!(plan.tasks[0].tool_call_id, "independent");
         assert_eq!(plan.tasks[0].original_call_index, 2);
         assert_eq!(compilation.rejected.len(), 2);
-        assert!(
-            compilation
-                .rejected
-                .iter()
-                .all(|rejection| rejection.reason.contains("cycle"))
-        );
+        assert!(compilation
+            .rejected
+            .iter()
+            .all(|rejection| rejection.reason.contains("cycle")));
     }
 
     #[test]
@@ -1976,11 +2231,9 @@ mod tests {
             plan.tasks[0].contract_version,
             GOVERNED_TOOL_PLAN_CONTRACT_VERSION
         );
-        assert!(
-            plan.tasks[0]
-                .idempotency_key
-                .starts_with("tool-plan-task:v4:")
-        );
+        assert!(plan.tasks[0]
+            .idempotency_key
+            .starts_with("tool-plan-task:v4:"));
         assert_eq!(plan.tasks[0].model_visible_name, "read");
         assert!(plan.tasks[0].can_parallelize);
         assert_eq!(
@@ -2011,11 +2264,10 @@ mod tests {
         ]);
 
         assert!(plan.tasks.iter().all(|task| task.can_parallelize));
-        assert!(
-            plan.tasks
-                .iter()
-                .all(|task| task.contract_version == GOVERNED_TOOL_PLAN_CONTRACT_VERSION)
-        );
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|task| task.contract_version == GOVERNED_TOOL_PLAN_CONTRACT_VERSION));
     }
 
     #[test]
@@ -2038,12 +2290,10 @@ mod tests {
             event.payload["tasks"][0]["contract_version"],
             GOVERNED_TOOL_PLAN_CONTRACT_VERSION
         );
-        assert!(
-            event.payload["tasks"][0]["idempotency_key"]
-                .as_str()
-                .unwrap()
-                .starts_with("tool-plan-task:v4:")
-        );
+        assert!(event.payload["tasks"][0]["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("tool-plan-task:v4:"));
     }
 
     #[test]
@@ -2597,11 +2847,10 @@ mod tests {
 
         assert_eq!(plan.tasks[0].resource_scope.kind, "runtime");
         assert_eq!(plan.tasks[1].resource_scope.kind, "internal_transaction");
-        assert!(
-            plan.tasks
-                .iter()
-                .all(|task| task.resource_scope.paths.is_empty())
-        );
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|task| task.resource_scope.paths.is_empty()));
     }
 
     #[test]

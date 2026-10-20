@@ -355,6 +355,26 @@ fn mission_control_delta_spec() -> TypedRouteSpec<(), (), MissionProjectionDelta
 
 pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
     vec![
+        TypedRouteSpec::<cowd_app_protocol::AppFrameSourceBindingRequestV1, (), cowd_app_protocol::AppFrameSourceBindingV1>::new(
+            surface::gateway_api::routes::POST_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS, "app_frame_source_binding_create",
+        ).metadata(Some("AppFrameSourceBindingRequestV1"), "AppFrameSourceBindingV1", false),
+        TypedRouteSpec::<cowd_app_protocol::AppFrameSourceBindingRequestV1, (), serde_json::Value>::new(
+            surface::gateway_api::routes::DELETE_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS, "app_frame_source_binding_detach",
+        ).metadata(Some("AppFrameSourceBindingRequestV1"), "SessionAttachReceipt", false),
+        TypedRouteSpec::<super::session_routes::SessionAttachRequest, (), serde_json::Value>::new(
+            surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_ATTACH,"session_attach",
+        ).metadata(Some("SessionAttachRequest"),"SessionAttachReceipt",false),
+        TypedRouteSpec::<super::session_routes::SessionDetachRequest, (), serde_json::Value>::new(
+            surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_DETACH,"session_detach",
+        ).metadata(Some("SessionDetachRequest"),"SessionAttachReceipt",false),
+        TypedRouteSpec::<(), (), harness_contract::live::SessionMessageReceiptContext>::new(
+            surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT,
+            "session_message_receipt_context_get",
+        ).metadata(None,"SessionMessageReceiptContext",false),
+        TypedRouteSpec::<harness_contract::live::SessionMessageAckRequest, (), harness_contract::live::SessionMessageAck>::new(
+            surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK,
+            "session_message_ack",
+        ).metadata(Some("SessionMessageAckRequest"),"SessionMessageAck",false),
         TypedRouteSpec::<
             super::session_routes::BranchSessionRequest,
             (),

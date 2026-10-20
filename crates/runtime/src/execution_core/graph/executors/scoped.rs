@@ -1,6 +1,6 @@
 use futures::{
-    FutureExt,
     future::{BoxFuture, Shared},
+    FutureExt,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,11 +41,20 @@ enum PhysicalOutcome {
 }
 type PhysicalWork = Shared<BoxFuture<'static, Result<PhysicalOutcome, NodeExecutorError>>>;
 
+#[derive(Clone, Default)]
+struct PhysicalEntry {
+    work: Option<PhysicalWork>,
+    publication_completed: bool,
+    observation: Option<Arc<super::agent_tool::NoDispatchObservation>>,
+    closed: bool,
+    original_binding: bool,
+}
+
 /// A fixed executor that reconstructs its backend through durable-ticket resolvers.
 pub struct ScopedNodeExecutor {
     kind: &'static str,
     resolvers: RwLock<Vec<Arc<dyn ScopedNodeBackendResolver>>>,
-    physical: Mutex<BTreeMap<PhysicalKey, Option<PhysicalWork>>>,
+    physical: Mutex<BTreeMap<PhysicalKey, PhysicalEntry>>,
 }
 
 impl ScopedNodeExecutor {
@@ -91,6 +100,109 @@ impl ScopedNodeExecutor {
         )
     }
 
+    pub(crate) fn observe_binding(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<Arc<super::agent_tool::NoDispatchObservation>, NodeExecutorError> {
+        if self.kind != "tool_batch" || ticket.executor_kind != self.kind {
+            return Err(NodeExecutorError::Invalid {
+                node_id: ticket.node_id.clone(),
+                reason: "not the builtin ToolBatch owner".into(),
+            });
+        }
+        let observation = super::agent_tool::NoDispatchObservation::new(ticket)?;
+        let mut physical = self
+            .physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = Self::physical_key(ticket, "");
+        if physical.contains_key(&key) {
+            return Err(NodeExecutorError::Invalid {
+                node_id: ticket.node_id.clone(),
+                reason: "original ToolBatch observation already admitted".into(),
+            });
+        }
+        physical.insert(
+            key,
+            PhysicalEntry {
+                observation: Some(observation.clone()),
+                original_binding: true,
+                ..Default::default()
+            },
+        );
+        Ok(observation)
+    }
+
+    pub(crate) fn rollback_unadmitted_binding(
+        &self,
+        ticket: &NodeExecutionTicket,
+        observation: &Arc<super::agent_tool::NoDispatchObservation>,
+    ) -> Result<(), NodeExecutorError> {
+        let mut physical = self
+            .physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = Self::physical_key(ticket, "");
+        let original = physical.get(&key).is_some_and(|entry| {
+            entry.original_binding
+                && !entry.closed
+                && entry.work.is_none()
+                && observation.ticket_matches(ticket)
+                && entry
+                    .observation
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, observation))
+        });
+        let has_leaf = physical
+            .keys()
+            .any(|candidate| candidate != &key && Self::owns_key(ticket, candidate));
+        if !original || has_leaf || !observation.abandon_unadmitted() {
+            return Err(NodeExecutorError::Invalid {
+                node_id: ticket.node_id.clone(),
+                reason: "unadmitted rollback cannot discard an entered or foreign original owner"
+                    .into(),
+            });
+        }
+        physical.remove(&key);
+        Ok(())
+    }
+
+    pub(crate) fn binding_observation(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Option<Arc<super::agent_tool::NoDispatchObservation>> {
+        self.physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&Self::physical_key(ticket, ""))
+            .and_then(|entry| entry.observation.clone())
+            .filter(|observation| observation.ticket_matches(ticket))
+    }
+
+    pub(crate) fn forget_closed_binding(&self, ticket: &NodeExecutionTicket) {
+        let mut physical = self
+            .physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = Self::physical_key(ticket, "");
+        if physical.get(&key).is_some_and(|entry| {
+            entry.closed && entry.work.as_ref().is_none_or(|work| work.peek().is_some())
+        }) {
+            if let Some(entry) = physical.get_mut(&key) {
+                entry.work = None;
+                entry.observation = None;
+                entry.publication_completed = false;
+            }
+        }
+    }
+
+    fn close_entry(entry: &mut PhysicalEntry) {
+        entry.closed = true;
+        if let Some(observation) = &entry.observation {
+            observation.close();
+        }
+    }
+
     fn owns_key(ticket: &NodeExecutionTicket, key: &PhysicalKey) -> bool {
         key.0 == ticket.graph_id && key.1 == ticket.node_id && key.2 == ticket.attempt
     }
@@ -119,7 +231,7 @@ impl ScopedNodeExecutor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if physical
                 .get(&Self::physical_key(ticket, ""))
-                .is_some_and(Option::is_none)
+                .is_some_and(|entry| entry.closed)
             {
                 return Err(NodeExecutorError::Cancel {
                     node_id: ticket.node_id.clone(),
@@ -128,13 +240,15 @@ impl ScopedNodeExecutor {
             }
             physical
                 .entry(key.clone())
-                .or_insert_with(|| {
-                    Some(
+                .or_insert_with(|| PhysicalEntry {
+                    work: Some(
                         async move { operation.await.map(PhysicalOutcome::Tool) }
                             .boxed()
                             .shared(),
-                    )
+                    ),
+                    ..Default::default()
                 })
+                .work
                 .clone()
                 .expect("leaf entry is an execution")
         };
@@ -174,13 +288,14 @@ async fn cancel_scoped_bounded(
             .physical
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        physical
+        let entry = physical
             .entry(ScopedNodeExecutor::physical_key(ticket, ""))
-            .or_insert(None);
+            .or_default();
+        ScopedNodeExecutor::close_entry(entry);
         physical
             .iter()
             .filter(|(key, _)| ScopedNodeExecutor::owns_key(ticket, key))
-            .filter_map(|(_, work)| work.clone())
+            .filter_map(|(_, entry)| entry.work.clone())
             .collect::<Vec<_>>()
     };
     let retained = pending.clone();
@@ -238,6 +353,25 @@ impl NodeExecutor for ScopedNodeExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        {
+            let mut physical = self
+                .physical
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = physical.get_mut(&Self::physical_key(ticket, "")) {
+                if entry.closed
+                    || entry
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| !observation.enter())
+                {
+                    return Err(NodeExecutorError::Cancel {
+                        node_id: ticket.node_id.clone(),
+                        reason: "original physical admission closed".into(),
+                    });
+                }
+            }
+        }
         let backend = self
             .resolve(ticket)
             .ok_or_else(|| NodeExecutorError::Unavailable {
@@ -245,25 +379,67 @@ impl NodeExecutor for ScopedNodeExecutor {
                 node_id: ticket.node_id.clone(),
             })?;
         if !backend.retains_physical_execution() {
-            return backend.execute(ticket).await;
+            let observation = {
+                let mut physical = self
+                    .physical
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = physical.entry(Self::physical_key(ticket, "")).or_default();
+                if entry.closed
+                    || entry
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| !observation.enter())
+                {
+                    return Err(NodeExecutorError::Cancel {
+                        node_id: ticket.node_id.clone(),
+                        reason: "original physical admission closed".into(),
+                    });
+                }
+                entry.observation.clone()
+            };
+            return super::agent_tool::finish_observed_outcome(
+                ticket,
+                observation.as_deref(),
+                backend.execute(ticket).await,
+            );
         }
         let key = Self::physical_key(ticket, "");
-        let work = {
+        let work: Option<PhysicalWork> = {
             let mut physical = self
                 .physical
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            physical
-                .entry(key)
-                .or_insert_with(|| {
+            let entry = physical.entry(key).or_default();
+            if entry.closed
+                || entry
+                    .observation
+                    .as_ref()
+                    .is_some_and(|observation| !observation.enter())
+            {
+                return Err(NodeExecutorError::Cancel {
+                    node_id: ticket.node_id.clone(),
+                    reason: "original physical admission closed".into(),
+                });
+            }
+            let observation = entry.observation.clone();
+            entry
+                .work
+                .get_or_insert_with(|| {
                     let ticket = ticket.clone();
-                    Some(
-                        async move { backend.execute(&ticket).await.map(PhysicalOutcome::Node) }
-                            .boxed()
-                            .shared(),
-                    )
+                    async move {
+                        super::agent_tool::finish_observed_outcome(
+                            &ticket,
+                            observation.as_deref(),
+                            backend.execute(&ticket).await,
+                        )
+                        .map(PhysicalOutcome::Node)
+                    }
+                    .boxed()
+                    .shared()
                 })
                 .clone()
+                .into()
         };
         match work {
             Some(work) => match work.await? {
@@ -280,6 +456,32 @@ impl NodeExecutor for ScopedNodeExecutor {
         }
     }
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        let published = {
+            let physical = self
+                .physical
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = physical.get(&Self::physical_key(ticket, ""));
+            if entry.is_some_and(|entry| {
+                entry
+                    .observation
+                    .as_ref()
+                    .is_some_and(|observation| !observation.ticket_matches(ticket))
+            }) {
+                return Err(NodeExecutorError::Invalid {
+                    node_id: ticket.node_id.clone(),
+                    reason: "publication retry does not match original physical ticket".into(),
+                });
+            }
+            entry.is_some_and(|entry| {
+                entry.original_binding
+                    && entry.publication_completed
+                    && entry
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| observation.ticket_matches(ticket))
+            })
+        };
         // The success path must not abandon an in-flight physical write: wait
         // for it. Bounded cancellation is reserved for cancel/abort paths, where
         // stopping is the point (PLAN W3 / R-02).
@@ -287,14 +489,33 @@ impl NodeExecutor for ScopedNodeExecutor {
         self.physical
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|key, _| !Self::owns_key(ticket, key));
+            .retain(|key, entry| !Self::owns_key(ticket, key) || entry.original_binding);
+        if published {
+            return Ok(());
+        }
         let backend = self
             .resolve(ticket)
             .ok_or_else(|| NodeExecutorError::Unavailable {
                 executor_kind: self.kind.to_string(),
                 node_id: ticket.node_id.clone(),
             })?;
-        backend.after_commit(ticket).await
+        backend.after_commit(ticket).await?;
+        if let Some(entry) = self
+            .physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&Self::physical_key(ticket, ""))
+            .filter(|entry| {
+                entry.original_binding
+                    && entry
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| observation.ticket_matches(ticket))
+            })
+        {
+            entry.publication_completed = true;
+        }
+        Ok(())
     }
     async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         let pending = {
@@ -302,13 +523,12 @@ impl NodeExecutor for ScopedNodeExecutor {
                 .physical
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            physical
-                .entry(Self::physical_key(ticket, ""))
-                .or_insert(None);
+            let entry = physical.entry(Self::physical_key(ticket, "")).or_default();
+            Self::close_entry(entry);
             physical
                 .iter()
                 .filter(|(key, _)| Self::owns_key(ticket, key))
-                .filter_map(|(_, work)| work.clone())
+                .filter_map(|(_, entry)| entry.work.clone())
                 .collect::<Vec<_>>()
         };
         futures::future::join_all(pending).await;
@@ -333,16 +553,24 @@ impl NodeExecutor for ScopedNodeExecutor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .map(|(key, work)| (key.clone(), work.clone()))
+            .map(|(key, entry)| (key.clone(), entry.work.clone()))
             .collect::<Vec<_>>();
         futures::future::join_all(pending.into_iter().map(|(key, work)| async move {
             if let Some(work) = work {
                 let _ = work.await;
             }
-            self.physical
+            let mut physical = self
+                .physical
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&key);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = physical.get_mut(&key) {
+                Self::close_entry(entry);
+                if entry.original_binding {
+                    entry.work = None;
+                } else {
+                    physical.remove(&key);
+                }
+            }
         }))
         .await;
     }
@@ -354,11 +582,12 @@ impl NodeExecutor for ScopedNodeExecutor {
         // A graph command waiter may itself be abandoned. Finalization of its
         // intent must not drop a still-running physical future.
         if physical.iter().any(|(key, work)| {
-            Self::owns_key(ticket, key) && work.as_ref().is_some_and(|work| work.peek().is_none())
+            Self::owns_key(ticket, key)
+                && work.work.as_ref().is_some_and(|work| work.peek().is_none())
         }) {
             return;
         }
-        physical.retain(|key, _| !Self::owns_key(ticket, key));
+        physical.retain(|key, entry| !Self::owns_key(ticket, key) || entry.original_binding);
     }
     async fn after_abort(
         &self,
@@ -423,6 +652,112 @@ mod tests {
             idempotency_key: "physical-request".into(),
             payload_ref: "physical-payload".into(),
         }
+    }
+
+    struct Publication704 {
+        calls: std::sync::atomic::AtomicUsize,
+        allowed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ScopedNodeBackend for Publication704 {
+        async fn execute(
+            &self,
+            _: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            panic!("publication recovery cannot execute a tool");
+        }
+
+        async fn after_commit(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<(), NodeExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.allowed.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: "704 publication pending".into(),
+                })
+            }
+        }
+    }
+
+    struct PublicationResolver704(std::sync::Weak<Publication704>);
+
+    impl ScopedNodeBackendResolver for PublicationResolver704 {
+        fn resolve(&self, _: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+            self.0
+                .upgrade()
+                .map(|backend| backend as Arc<dyn ScopedNodeBackend>)
+        }
+    }
+
+    fn publication_ticket_704() -> NodeExecutionTicket {
+        let mut request = ticket();
+        request.payload_ref =
+            crate::step_snapshot::encode_persisted_tool_batch(&serde_json::json!({
+                "session_id": "704-session",
+                "step_snapshots": {},
+                "calls": [{"id":"704-read","name":"read_file","input":"{}","depends_on":[]}]
+            }))
+            .unwrap();
+        request
+    }
+
+    #[tokio::test]
+    async fn r1_704_published_original_callback_survives_dropped_host_without_reexecution() {
+        let executor = ScopedNodeExecutor::new("tool_batch");
+        let request = publication_ticket_704();
+        executor.observe_binding(&request).unwrap();
+        let backend = Arc::new(Publication704 {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            allowed: AtomicBool::new(true),
+        });
+        executor.install_resolver(Arc::new(PublicationResolver704(Arc::downgrade(&backend))));
+        executor.after_commit(&request).await.unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        drop(backend);
+        assert!(!executor.is_bound(&request));
+        executor.after_commit(&request).await.unwrap();
+        for field in ["payload", "idempotency", "attempt", "graph", "node"] {
+            let mut foreign = request.clone();
+            match field {
+                "payload" => foreign.payload_ref.push(' '),
+                "idempotency" => foreign.idempotency_key.push_str("-foreign"),
+                "attempt" => foreign.attempt += 1,
+                "graph" => foreign.graph_id.push_str("-foreign"),
+                _ => foreign.node_id.push_str("-foreign"),
+            }
+            assert!(executor.after_commit(&foreign).await.is_err(), "{field}");
+        }
+        executor.forget_closed_binding(&request);
+        assert!(executor.after_commit(&request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn r1_704_failed_publication_is_not_cached_and_cold_owner_must_rebind() {
+        let executor = ScopedNodeExecutor::new("tool_batch");
+        let request = publication_ticket_704();
+        executor.observe_binding(&request).unwrap();
+        let backend = Arc::new(Publication704 {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            allowed: AtomicBool::new(false),
+        });
+        executor.install_resolver(Arc::new(PublicationResolver704(Arc::downgrade(&backend))));
+        assert!(executor.after_commit(&request).await.is_err());
+        assert!(executor.after_commit(&request).await.is_err());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        drop(backend);
+        assert!(executor.after_commit(&request).await.is_err());
+        let rebound = Arc::new(Publication704 {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            allowed: AtomicBool::new(true),
+        });
+        executor.install_resolver(Arc::new(PublicationResolver704(Arc::downgrade(&rebound))));
+        executor.after_commit(&request).await.unwrap();
+        assert_eq!(rebound.calls.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
     async fn tool_and_early_model_owners_drain_abandoned_leaf_before_unlocking() {
@@ -602,5 +937,190 @@ mod tests {
         assert!(!backend.started.load(Ordering::Acquire));
         executor.cancellation_finalized(&ticket());
         assert!(executor.physical.lock().unwrap().is_empty());
+    }
+
+    #[cfg(test)]
+    mod nodispatch_520_tests {
+        use super::*;
+
+        fn original_batch_ticket() -> NodeExecutionTicket {
+            let mut original = ticket();
+            original.payload_ref =
+                crate::step_snapshot::encode_persisted_tool_batch(&serde_json::json!({
+                    "session_id": "session-520",
+                    "calls": [
+                        {"id": "refused-520", "name": "read_file", "input": "{}", "depends_on": []},
+                        {"id": "dispatched-520", "name": "read_file", "input": "{}", "depends_on": []}
+                    ],
+                    "step_snapshots": {}
+                }))
+                .unwrap();
+            original
+        }
+
+        #[tokio::test]
+        async fn nodispatch_520_cancel_before_first_poll_prevents_backend_and_leaf() {
+            let original = original_batch_ticket();
+            let backend = Arc::new(PhysicalBackend {
+                started: AtomicBool::new(false),
+                completed: AtomicBool::new(false),
+                release: tokio::sync::Notify::new(),
+            });
+            let executor = ScopedNodeExecutor::new("tool_batch");
+            executor.install_resolver(Arc::new(Resolver(backend.clone())));
+            let observation = executor.observe_binding(&original).unwrap();
+            executor.cancel(&original).await.unwrap();
+            assert!(matches!(
+                executor.poll_or_await(&original).await,
+                Err(NodeExecutorError::Cancel { .. })
+            ));
+            assert!(matches!(
+                executor
+                    .execute_physical_tool(
+                        &original,
+                        "dispatched-520",
+                        Box::pin(async { panic!("closed owner must not poll a physical leaf") })
+                    )
+                    .await,
+                Err(NodeExecutorError::Cancel { .. })
+            ));
+            assert!(!backend.started.load(Ordering::Acquire));
+            assert!(!backend.completed.load(Ordering::Acquire));
+            let witness = observation.witness().unwrap();
+            assert!(witness.fact().never_polled);
+            assert_eq!(witness.fact().calls.len(), 2);
+            assert!(witness
+                .fact()
+                .calls
+                .iter()
+                .all(|call| call.reason == "cancelled_before_first_poll"));
+            witness.authenticate(&original, None).unwrap();
+        }
+
+        #[tokio::test]
+        async fn nodispatch_520_polled_unavailable_owner_cannot_become_never_polled() {
+            let original = original_batch_ticket();
+            let executor = ScopedNodeExecutor::new("tool_batch");
+            let observation = executor.observe_binding(&original).unwrap();
+            assert!(matches!(
+                executor.poll_or_await(&original).await,
+                Err(NodeExecutorError::Unavailable { .. })
+            ));
+            executor.cancel(&original).await.unwrap();
+            executor.drain_physical_execution().await;
+            executor.cancellation_finalized(&original);
+            assert!(observation.witness().is_none());
+            assert!(!observation.enter());
+        }
+
+        #[tokio::test]
+        async fn nodispatch_520_repeated_cancel_cleanup_cannot_remint_never_polled() {
+            for entered in [false, true] {
+                let original = original_batch_ticket();
+                let executor = ScopedNodeExecutor::new("tool_batch");
+                let observation = executor.observe_binding(&original).unwrap();
+                if entered {
+                    assert!(matches!(
+                        executor.poll_or_await(&original).await,
+                        Err(NodeExecutorError::Unavailable { .. })
+                    ));
+                }
+                executor.cancel(&original).await.unwrap();
+                let initial = observation.witness();
+                assert_eq!(initial.is_some(), !entered);
+                for _round in 0..3 {
+                    executor
+                        .cancel_bounded(&original, std::time::Duration::from_secs(1))
+                        .await
+                        .unwrap();
+                    executor.drain_physical_execution().await;
+                    executor.cancellation_finalized(&original);
+                    executor.forget_closed_binding(&original);
+                    executor.cancel(&original).await.unwrap();
+                    assert_eq!(observation.witness(), initial);
+                    assert!(executor.binding_observation(&original).is_none());
+                    assert!(
+                        executor.observe_binding(&original).is_err(),
+                        "cleanup must retain the original closed admission tombstone"
+                    );
+                    assert!(matches!(
+                        executor.poll_or_await(&original).await,
+                        Err(NodeExecutorError::Cancel { .. })
+                    ));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn nodispatch_520_mixed_finish_excludes_real_dispatched_read() {
+            let original = original_batch_ticket();
+            let executor = ScopedNodeExecutor::new("tool_batch");
+            let observation = executor.observe_binding(&original).unwrap();
+            assert!(observation.enter());
+            observation.refuse("refused-520", "admission refused".into());
+            let request = crate::RuntimeToolExecutionRequest::from_tool_request(
+                &crate::tool_dispatch::ToolRequest {
+                    tool_use_id: "dispatched-520".into(),
+                    tool_name: "read_file".into(),
+                    input: "{}".into(),
+                    depends_on: Vec::new(),
+                },
+            );
+            observation.uncertain(&request);
+            let workspace = tempfile::tempdir().unwrap();
+            let path = workspace.path().join("physical-read-520.txt");
+            std::fs::write(&path, "actual dispatched bytes").unwrap();
+            let polled = Arc::new(AtomicBool::new(false));
+            let polled_by_leaf = polled.clone();
+            let leaf = executor
+                .execute_physical_tool(
+                    &original,
+                    "dispatched-520",
+                    Box::pin(async move {
+                        polled_by_leaf.store(true, Ordering::Release);
+                        let output = std::fs::read_to_string(&path).unwrap();
+                        Ok(crate::RuntimeToolExecutionOutcome {
+                            tool_use_id: "dispatched-520".into(),
+                            tool_name: "read_file".into(),
+                            status: crate::RuntimeToolExecutionStatus::Executed,
+                            category: crate::ToolSafetyCategory::ReadOnly,
+                            output: Some(output),
+                            error: None,
+                            evidence_ref: String::new(),
+                            observed_evidence: Vec::new(),
+                        })
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(polled.load(Ordering::Acquire));
+            assert_eq!(leaf.status, crate::RuntimeToolExecutionStatus::Executed);
+            assert_eq!(leaf.output.as_deref(), Some("actual dispatched bytes"));
+            observation.refuse(
+                "dispatched-520",
+                "late refusal must not hide dispatch".into(),
+            );
+            let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Failed,
+                result_ref: None,
+                wait_class: None,
+                summary: Some("one refused call and one completed read".into()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            });
+            observation.finish(&mut outcome).unwrap();
+            let witness = outcome.no_dispatch.as_ref().unwrap();
+            assert!(!witness.fact().never_polled);
+            assert_eq!(witness.fact().calls.len(), 1);
+            assert_eq!(witness.fact().calls[0].call_id, "refused-520");
+            assert_eq!(witness.fact().calls[0].reason, "admission refused");
+            witness
+                .authenticate(&original, Some(&outcome.result))
+                .unwrap();
+            executor.cancel(&original).await.unwrap();
+            assert_eq!(observation.witness().as_ref(), Some(witness));
+        }
     }
 }

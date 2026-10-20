@@ -10,7 +10,13 @@ BASE_URL="http://127.0.0.1:${PORT}"
 TOKEN="openapi-generation-$$-credential"
 TARGET_ROOT="${CARGO_TARGET_DIR:-${ROOT}/target}"
 BIN="${COWD_BIN:-${TARGET_ROOT}/debug/cowd}"
-SCENARIO_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cowd-openapi-generation.XXXXXX")"
+: "${COWD_OPENAPI_PRIVATE_ROOT:?set a private plan candidate root; this scenario builds and uses isolated PostgreSQL}"
+mkdir -p "${COWD_OPENAPI_PRIVATE_ROOT}"
+SCENARIO_ROOT="$(mktemp -d "${COWD_OPENAPI_PRIVATE_ROOT}/cowd-openapi-generation.XXXXXX")"
+export TMPDIR="${SCENARIO_ROOT}"
+export COWD_GENERATED_SPEC_ROOT="${SCENARIO_ROOT}/spec"
+export COWD_GENERATED_STAGE_ROOT="${COWD_OPENAPI_STAGE_ROOT:-${SCENARIO_ROOT}}"
+: "${COWD_GENERATION_FROZEN_SOURCESET:?generation requires the frozen R1 source manifest}"
 CONFIG_HOME="${SCENARIO_ROOT}/config"
 TEST_HOME="${SCENARIO_ROOT}/home"
 WORKSPACE="${SCENARIO_ROOT}/workspace"
@@ -128,7 +134,14 @@ curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/gateway/openapi.j
     ' >/dev/null
 
 if [[ "${MODE}" == "update" ]]; then
+  : "${COWD_OPENAPI_STAGE_ROOT:?update emits private outputs only; set COWD_OPENAPI_STAGE_ROOT}"
+  mkdir -p "${COWD_OPENAPI_STAGE_ROOT}"
   env COWD_GATEWAY_URL="${BASE_URL}" COWD_API_TOKEN="${TOKEN}" \
+    COWD_GENERATED_API_OUTPUT="${COWD_OPENAPI_STAGE_ROOT}/gateway-api.ts" \
+    COWD_GENERATED_LIVE_CONTRACT_OUTPUT="${COWD_OPENAPI_STAGE_ROOT}/live-contract-meta.ts" \
+    COWD_GENERATED_PROJECTION_GOLDEN_OUTPUT="${COWD_OPENAPI_STAGE_ROOT}/projection-golden.ts" \
+    COWD_GENERATED_PROJECTION_CONTRACT_OUTPUT="${COWD_OPENAPI_STAGE_ROOT}/projection-contract-meta.ts" \
+    COWD_GENERATED_APP_PROTOCOL_OUTPUT="${COWD_OPENAPI_STAGE_ROOT}/app-protocol-meta.ts" \
     npm --prefix "${WEBUI_ROOT}" run generate:api
 else
   CANDIDATE="${SCENARIO_ROOT}/gateway-api.ts"

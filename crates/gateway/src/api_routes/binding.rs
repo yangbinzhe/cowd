@@ -10,6 +10,26 @@ pub(crate) struct GatewayRouteBinding {
 
 pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
     GatewayRouteBinding {
+        route: routes::POST_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS,
+        source: "app_routes.rs",
+        handler: "create_frame_source_binding",
+    },
+    GatewayRouteBinding {
+        route: routes::DELETE_API_APPS_BY_APP_ID_FRAME_SOURCE_BINDINGS,
+        source: "app_routes.rs",
+        handler: "detach_frame_source_binding",
+    },
+    GatewayRouteBinding {
+        route: routes::GET_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT,
+        source: "message_routes.rs",
+        handler: "get_terminal_message_receipt_context",
+    },
+    GatewayRouteBinding {
+        route: routes::POST_API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK,
+        source: "message_routes.rs",
+        handler: "record_terminal_message_ack",
+    },
+    GatewayRouteBinding {
         route: routes::DELETE_API_APPS_BY_APP_ID_SUBSCRIPTIONS_BY_SUBSCRIPTION_ID,
         source: "app_routes.rs",
         handler: "cancel_subscription",

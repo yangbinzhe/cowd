@@ -49,6 +49,10 @@ mod host_backend;
 /// its own actions, so without this a reference Runtime spells `artifact:<24 hex>`
 /// is refused inside a batch while the same reference works when sent directly.
 pub use host_backend::normalize_bare_evidence_ref;
+
+pub(crate) fn closure_mutation_tool_ids(rungs: &[String]) -> std::collections::BTreeSet<String> {
+    host_backend::mandatory_action_tool_ids(false, rungs)
+}
 #[path = "host_presentation.rs"]
 mod host_presentation;
 use host_presentation::*;
@@ -107,7 +111,11 @@ fn next_consecutive_tool_failure_batches(
 /// and the guard refused it again.
 ///
 /// The predicate is the guard's own, so it cannot disagree with the dispatch decision.
-fn executed_failures(failed: usize, calls: &[ModelToolCall], turn_id: &crate::repetition_guard::RepetitionScope) -> usize {
+fn executed_failures(
+    failed: usize,
+    calls: &[ModelToolCall],
+    turn_id: &crate::repetition_guard::RepetitionScope,
+) -> usize {
     failed.saturating_sub(
         calls
             .iter()
@@ -614,6 +622,148 @@ fn continuation_context_item(binding: &CollaborationContinuationBinding) -> Cont
     item
 }
 
+fn owned_root_activity(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    ingress: Option<&TurnIngressRef>,
+) -> Result<harness_contract::projection::RuntimeActivityBinding, RuntimeError> {
+    if graph.parent_execution.is_some() {
+        return Err(RuntimeError::new("RootTurn cannot have a parent execution"));
+    }
+    let lineage = graph
+        .lineage
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("owned root requires canonical execution lineage"))?;
+    lineage.validate().map_err(RuntimeError::new)?;
+    if graph.id.trim().is_empty() {
+        return Err(RuntimeError::new(
+            "owned root graph identity must not be empty",
+        ));
+    }
+    let revision = if let Some(ingress) = ingress {
+        if ingress.session_generation == 0
+            || ingress.claim_revision == 0
+            || graph.id
+                != crate::session_execution::session_ingress_graph_id(
+                    &ingress.session_id,
+                    &ingress.request_id,
+                    &ingress.turn_id,
+                )
+            || lineage.session_id != ingress.session_id
+            || lineage.turn_id != ingress.turn_id
+            || lineage.root_task_id != ingress.root_task_id
+            || lineage.task_id != ingress.primary_task_id
+            || lineage.generation != ingress.session_generation
+        {
+            return Err(RuntimeError::new(
+                "ingress root graph/claim lineage mismatch",
+            ));
+        }
+        ingress.claim_revision
+    } else {
+        1
+    };
+    let binding = harness_contract::projection::RuntimeActivityBinding {
+        root_execution_id: graph.id.clone(),
+        session_id: lineage.session_id.clone(),
+        turn_id: lineage.turn_id.clone(),
+        root_task_id: lineage.root_task_id.clone(),
+        task_id: lineage.task_id.clone(),
+        activity_id: format!("activity:execution:{}", graph.id),
+        node_id: None,
+        parent_activity_id: None,
+        initiator_activity_id: None,
+        team_run_id: None,
+        agent_instance_id: None,
+        agent_run_id: None,
+        skill_id: None,
+        skill_revision: None,
+        skill_activation_id: None,
+        tool_contract_id: None,
+        tool_call_id: None,
+        approval_id: None,
+        parallel_group_id: None,
+        revision,
+        fence: lineage.generation,
+        generation: lineage.generation,
+    };
+    binding.validate().map_err(RuntimeError::new)?;
+    Ok(binding)
+}
+
+fn validate_existing_owned_root(
+    services: &crate::RuntimeServices,
+    bus: &CowdEventBus,
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    ingress: Option<&TurnIngressRef>,
+) -> Result<(), RuntimeError> {
+    let expected = owned_root_activity(graph, ingress)?;
+    let context = bus
+        .current_execution_context()
+        .ok_or_else(|| RuntimeError::new("owned root has no original execution context"))?;
+    let binding = bus
+        .current_activity_binding()
+        .ok_or_else(|| RuntimeError::new("owned root has no original activity"))?;
+    binding.validate().map_err(RuntimeError::new)?;
+    if context.execution_id != graph.id
+        || context.session_id != expected.session_id
+        || context.turn_id != expected.turn_id
+        || binding != expected
+    {
+        return Err(RuntimeError::new(
+            "owned root original context/activity mismatch",
+        ));
+    }
+    let registered = services
+        .active_execution_bus(&graph.id)
+        .ok_or_else(|| RuntimeError::new("owned root has no original active bus lease"))?;
+    if !bus.subscribe().same_channel(&registered.subscribe()) || !bus.has_live_telemetry_observer()
+    {
+        return Err(RuntimeError::new(
+            "owned root original bus/telemetry lease mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn enter_owned_root_scope(
+    services: &crate::RuntimeServices,
+    bus: &CowdEventBus,
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    ingress: Option<&TurnIngressRef>,
+) -> Result<
+    (
+        Option<crate::CowdExecutionScope>,
+        Option<crate::execution_core::services::ActiveExecutionBusLease>,
+    ),
+    RuntimeError,
+> {
+    let binding = owned_root_activity(graph, ingress)?;
+    if bus.current_execution_context().is_some() || bus.current_activity_binding().is_some() {
+        validate_existing_owned_root(services, bus, graph, ingress)?;
+        return Ok((None, None));
+    }
+    if ingress.is_some() {
+        return Err(RuntimeError::new("ingress lost its original root owner"));
+    }
+    if services.active_execution_bus(&graph.id).is_some() || bus.has_live_telemetry_observer() {
+        return Err(RuntimeError::new(
+            "direct root cannot replace an active bus lease",
+        ));
+    }
+    let lease = services
+        .bind_active_execution_bus(&graph.id, bus.clone())
+        .map_err(RuntimeError::new)?;
+    let scope = bus.enter_execution_with_activity(
+        crate::CowdExecutionContext {
+            execution_id: graph.id.clone(),
+            session_id: binding.session_id.clone(),
+            turn_id: binding.turn_id.clone(),
+        },
+        Some(binding),
+    );
+    Ok((Some(scope), Some(lease)))
+}
+
 #[allow(
     clippy::panic,
     reason = "a leaked graph-runner Arc would otherwise make it impossible to return the uniquely owned runtime"
@@ -650,16 +800,12 @@ where
         .with_artifact_store(Arc::clone(services.artifact_store()))
         .with_maintenance_supervisor(services.maintenance_supervisor())
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
+    if execution_role == TurnExecutionRole::RootTurn && runtime.cowd_bus().is_none() {
+        runtime = runtime.with_cowd_event_bus(CowdEventBus::new());
+    }
     if let Some(journal) = services.session_journal_port() {
         runtime = runtime.with_session_journal_port(journal);
     }
-    // This is the sole top-level turn boundary. Runtime-prefetched tool
-    // evidence may be created before the first Provider node, so no model-step
-    // path may reset these ledgers later in the same turn.
-    runtime.begin_turn_runtime_epoch().await;
-    let recovered_provider_usage = runtime.turn_recovered_provider_usage();
-    let recovered_provider_attempt_count = runtime.turn_recovered_provider_attempt_count();
-    let recovered_cache_dimensions_known = runtime.turn_cache_dimensions_known();
     let session = runtime.session_snapshot().await;
     let evaluation_control = match evaluation_turn_control(content) {
         Ok(control) => control,
@@ -719,6 +865,80 @@ where
                 .map(|lineage| lineage.turn_id.clone())
         })
         .unwrap_or_else(|| TurnId::new().to_string());
+    if execution_role == TurnExecutionRole::DelegatedLeaf
+        && (execution_parent.is_none() || ingress.is_some())
+    {
+        return Ok((
+            runtime,
+            Err(RuntimeError::new(
+                "delegated leaf requires its original parent and cannot own root ingress",
+            )),
+        ));
+    }
+    if execution_role == TurnExecutionRole::RootTurn {
+        let validation = (|| {
+            if execution_parent.is_some() {
+                return Err(RuntimeError::new("RootTurn cannot have a parent execution"));
+            }
+            let bus = runtime
+                .cowd_bus()
+                .ok_or_else(|| RuntimeError::new("owned root requires its event bus"))?;
+            let mut expected = harness_contract::execution_graph::ExecutionGraph::new(content);
+            if let Some(ingress) = ingress.as_ref() {
+                expected.id = crate::session_execution::session_ingress_graph_id(
+                    &ingress.session_id,
+                    &ingress.request_id,
+                    &ingress.turn_id,
+                );
+                expected.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+                    session_id: ingress.session_id.clone(),
+                    turn_id: ingress.turn_id.clone(),
+                    root_task_id: ingress.root_task_id.clone(),
+                    task_id: ingress.primary_task_id.clone(),
+                    generation: ingress.session_generation,
+                });
+                if execution_lineage
+                    .as_ref()
+                    .is_some_and(|lineage| expected.lineage.as_ref() != Some(lineage))
+                {
+                    return Err(RuntimeError::new(
+                        "ingress conflicts with supplied execution lineage",
+                    ));
+                }
+                if ingress.session_id != session_id || ingress.turn_id != turn_ref {
+                    return Err(RuntimeError::new("ingress root session/turn mismatch"));
+                }
+                validate_existing_owned_root(&services, bus, &expected, Some(ingress))
+            } else {
+                expected.lineage = execution_lineage.clone();
+                let binding = owned_root_activity(&expected, None)?;
+                if binding.session_id != session_id || binding.turn_id != turn_ref {
+                    return Err(RuntimeError::new(
+                        "direct root session/turn lineage mismatch",
+                    ));
+                }
+                if bus.current_execution_context().is_some()
+                    || bus.current_activity_binding().is_some()
+                    || bus.has_live_telemetry_observer()
+                {
+                    return Err(RuntimeError::new(
+                        "fresh direct root cannot inherit an existing owner",
+                    ));
+                }
+                Ok(())
+            }
+        })();
+        if let Err(error) = validation {
+            return Ok((runtime, Err(error)));
+        }
+    }
+    // This is the sole top-level turn boundary. Runtime-prefetched tool
+    // evidence may be created before the first Provider node, so no model-step
+    // path may reset these ledgers later in the same turn.
+    runtime.begin_turn_runtime_epoch().await;
+    let recovered_provider_usage = runtime.turn_recovered_provider_usage();
+    let recovered_provider_attempt_count = runtime.turn_recovered_provider_attempt_count();
+    let recovered_cache_dimensions_known = runtime.turn_cache_dimensions_known();
     let _delegated_input_turn = execution_role.is_delegated_leaf().then(|| {
         runtime
             .session_input_stream()
@@ -726,12 +946,8 @@ where
     });
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
-    if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
-        bus.emit(CowdEvent::ExecutionPhase {
-            status: harness_contract::projection::ExecutionLiveStatus::PreparingContext,
-            detail: Some("assembling context".to_string()),
-        });
-    }
+    let mut owned_root_scope = None;
+    let mut owned_root_bus_lease = None;
     let mut result = async {
         let state = Arc::new(tokio::sync::Mutex::new(TurnGraphState {
             content: content.to_string(),
@@ -1038,6 +1254,19 @@ where
                 kind: ExecutionEdgeKind::DependsOn,
             });
         }
+        if execution_role == TurnExecutionRole::RootTurn && ingress.is_some() {
+            let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
+                RuntimeError::new("owned root requires its event bus")
+            })?;
+            (owned_root_scope, owned_root_bus_lease) =
+                enter_owned_root_scope(&services, &bus, &graph, ingress.as_ref())?;
+        }
+        if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
+            bus.emit(CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::PreparingContext,
+                detail: Some("assembling context".to_string()),
+            });
+        }
         let strategy_parent_node_id = graph
             .nodes
             .iter()
@@ -1341,14 +1570,29 @@ where
                 services: Arc::downgrade(&services),
             }));
         let run_result = if persisted_graph.is_some() {
-            crate::execution_core::graph::ExecutionGraphRecovery::new(
-                services.graph_state_store(),
-                services.commit_service(),
-                services.executor_registry(),
-            )
-            .recover(&graph_id)
+            let recovered_root = services.execution_supervisor().recover_graph(&graph_id)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if execution_role == TurnExecutionRole::RootTurn && ingress.is_none() {
+                if recovered_root.lineage != graph.lineage
+                    || recovered_root.parent_execution != graph.parent_execution
+                {
+                    return Err(RuntimeError::new("recovered direct root identity mismatch"));
+                }
+                let lineage = recovered_root.lineage.as_ref().ok_or_else(|| {
+                    RuntimeError::new("registered direct root requires lineage")
+                })?;
+                services.record_live_execution(
+                    &lineage.session_id,
+                    recovered_root.id.clone(),
+                    lineage.turn_id.clone(),
+                );
+                let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
+                    RuntimeError::new("owned root requires its event bus")
+                })?;
+                (owned_root_scope, owned_root_bus_lease) =
+                    enter_owned_root_scope(&services, &bus, &recovered_root, None)?;
+            }
             let revised_strategy = runtime
                 .lock()
                 .await
@@ -1394,6 +1638,21 @@ where
                 .register_continuation_graph(graph, continuation_actor)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if execution_role == TurnExecutionRole::RootTurn && ingress.is_none() {
+                let lineage = registered.lineage.as_ref().ok_or_else(|| {
+                    RuntimeError::new("registered direct root requires lineage")
+                })?;
+                services.record_live_execution(
+                    &lineage.session_id,
+                    registered.id.clone(),
+                    lineage.turn_id.clone(),
+                );
+                let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
+                    RuntimeError::new("owned root requires its event bus")
+                })?;
+                (owned_root_scope, owned_root_bus_lease) =
+                    enter_owned_root_scope(&services, &bus, &registered, None)?;
+            }
             if let Some(lineage) = registered.lineage.as_ref() {
                 services
                     .task_runtime_port()
@@ -1843,6 +2102,8 @@ where
             "turn executors still hold the conversation runtime; the turn is refused rather than aborting the process",
         ))?
         .into_inner();
+    drop(owned_root_scope);
+    drop(owned_root_bus_lease);
     Ok((runtime, result))
 }
 
@@ -2354,28 +2615,8 @@ fn citable_refs(
     session_id: &str,
     turn_id: &str,
 ) -> serde_json::Value {
-    let criteria = services
-        .goal_store()
-        .projection(&format!(
-            "goal:{}",
-            program.root_execution_id.as_deref().unwrap_or("")
-        ))
-        .ok()
-        .flatten()
-        .map(|projection| {
-            projection
-                .goal
-                .criteria
-                .iter()
-                .map(|criterion| {
-                    serde_json::json!({
-                        "criterion_ref": criterion.id,
-                        "status": format!("{:?}", criterion.status).to_lowercase(),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let goal_snapshot = bound_goal_context(program, services, session_id, turn_id);
+    let criteria = goal_snapshot["criteria"].clone();
     let accepted_results = program
         .tasks
         .values()
@@ -2383,8 +2624,9 @@ fn citable_refs(
         .flat_map(|task| task.artifact_refs.iter().cloned())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .take(32)
         .collect::<Vec<_>>();
+    let accepted_total = accepted_results.len();
+    let accepted_results = accepted_results.into_iter().take(32).collect::<Vec<_>>();
     let artifact_total = program.artifacts.len();
     let artifacts = program
         .artifacts
@@ -2419,16 +2661,76 @@ fn citable_refs(
         "accepted_results": accepted_results,
         "artifacts": artifacts,
         "active_completion_results": active_completion_results,
-        "note": "Facts Runtime already holds. Cite from here instead of guessing a reference; anything outside it is still refused.",
+        "goal": goal_snapshot,
+        "coverage": {
+            "program_revision": program.revision,
+            "accepted_results_total": accepted_total,
+            "accepted_results_omitted": accepted_total.saturating_sub(32),
+            "artifacts_total": artifact_total,
+            "artifacts_omitted": artifact_total.saturating_sub(32),
+            "read_request": {"name":"state_inspect","input":{"entry_ref":program.program_id}},
+        },
+        "note": "These are registered Program refs, not all filesystem facts. File hashes are not content selectors. Authenticated tool receipts remain evidence, not registered deliverables. Empty means no entries in this snapshot only; unknown Goal data is explicitly labelled. Use returned refs, never construct selectors.",
     });
     // Never truncate silently: an unannounced omission is indistinguishable
     // from "there is nothing more".
     if artifact_total > 32 {
         value["artifacts_more"] = serde_json::json!(artifact_total - 32);
     }
-    let _ = session_id;
-    let _ = turn_id;
     value
+}
+
+fn bound_goal_context(
+    program: &crate::AgenticProgramProjection,
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+) -> serde_json::Value {
+    let Some(root) = program.root_execution_id.as_deref() else {
+        return serde_json::json!({"status":"unknown","reason":"missing_root_binding"});
+    };
+    let projection = match services.goal_store().projection(&format!("goal:{root}")) {
+        Ok(Some(projection)) => projection,
+        Ok(None) => return serde_json::json!({"status":"absent","goal_ref":format!("goal:{root}")}),
+        Err(error) => return serde_json::json!({"status":"unavailable","reason":error.to_string()}),
+    };
+    let goal = &projection.goal;
+    if !goal.execution_binding.as_ref().is_some_and(|binding| {
+        binding.agentic_program_id == program.program_id
+            && binding.objective_id == program.objective_id
+            && binding.session_id == session_id
+            && binding.turn_id == turn_id
+            && binding.root_execution_id == root
+            && program.session_id == session_id
+            && program.turn_id == turn_id
+    }) {
+        return serde_json::json!({"status":"binding_mismatch","goal_ref":goal.id});
+    }
+    serde_json::json!({
+        "status":"known",
+        "goal_ref":goal.id,
+        "stream_revision":projection.stream_revision,
+        "spec_revision":goal.spec_revision,
+        "spec_digest":goal.spec_digest,
+        "completion":goal.completion,
+        "user_intent_criterion_ref":goal.user_intent_criterion_id,
+        "source_intent_ref":goal.source_intent_ref,
+        "participation_requirement":goal.participation_requirement,
+        "criteria":goal.criteria.iter().map(|criterion| serde_json::json!({
+            "criterion_ref":criterion.id,
+            "status":format!("{:?}",criterion.status).to_lowercase(),
+        })).collect::<Vec<_>>(),
+        "required_obligations":goal.obligations.iter().filter(|obligation| obligation.required)
+            .collect::<Vec<_>>(),
+        "blockers":goal.blockers,
+        "unresolved":goal.unresolved,
+        "waiting":goal.waiting,
+        "review_readiness":{
+            "current_reviews_satisfied":crate::agentic::current_reviews_satisfy_the_goal(goal),
+            "uncovered_result_refs":crate::agentic::uncovered_delivered_result_refs(program, goal),
+            "note":"Snapshot of existing ingress review predicates, not Goal satisfaction or a CAS grant.",
+        },
+    })
 }
 
 #[must_use]
@@ -2445,11 +2747,45 @@ pub(super) fn agentic_turn_framing(
         "tool_calls": tool_calls,
         "elapsed_ms": elapsed_ms,
     });
-    match root_agentic_program_projection(services, session_id, turn_id) {
-        Some(program) => {
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    match services.agent_action_service().project_if_exists(&program_id) {
+        Ok(Some(program)) => {
             let completion_gap =
                 crate::agentic::agentic_program_completion_gap(services, session_id, turn_id);
             let mut view = agentic_closure_view(&program, completion_gap.as_deref());
+            let goal = bound_goal_context(&program, services, session_id, turn_id);
+            if goal["status"] != "known" {
+                view["blocked"] = serde_json::json!({"reason":"goal_context_unavailable","goal":goal});
+                view["current"] = serde_json::json!("blocked");
+                view["remaining"] = serde_json::json!([]);
+            } else {
+                let open_required = goal["required_obligations"].as_array().into_iter().flatten()
+                    .filter(|obligation| obligation["state"] != "satisfied").cloned().collect::<Vec<_>>();
+                if open_required.is_empty()
+                    && goal["completion"] == "open"
+                    && view["blocked"]["reason"] == "objective_review_readiness_unknown"
+                    && goal["review_readiness"]["current_reviews_satisfied"] == true
+                    && goal["review_readiness"]["uncovered_result_refs"].as_array().is_some_and(Vec::is_empty)
+                {
+                    view["blocked"] = serde_json::Value::Null;
+                    view["current"] = serde_json::json!("objective_complete_request");
+                    if let Some(remaining) = view["remaining"].as_array_mut() {
+                        remaining.push(serde_json::json!({"step":"objective_complete_request",
+                            "actionability":"request_governed_verification",
+                            "hint":"Current ingress review predicates are ready at this snapshot. Request verification with the actual result refs; independent review, work manifest and Goal CAS still determine the outcome. This is not acceptance."}));
+                    }
+                }
+                if !open_required.is_empty() {
+                    view["blocked"] = serde_json::json!({"reason":"required_goal_obligations_open","obligations":open_required});
+                    view["current"] = serde_json::json!("blocked");
+                    if let Some(remaining) = view["remaining"].as_array_mut() {
+                        remaining.retain(|entry| entry["step"] != "objective_complete_request");
+                    }
+                }
+                view["goal"] = goal;
+            }
+            view["program_source"] = serde_json::json!({"program_ref":program.program_id,"revision":program.revision});
             if let Some(object) = view.as_object_mut() {
                 object.insert("budgets".to_string(), budgets);
                 object.insert(
@@ -2474,20 +2810,28 @@ pub(super) fn agentic_turn_framing(
                                     == Some(serde_json::json!("active"))
                             })
                             .count(),
-                        "note": "Runtime runs the work. While any sub-task is in flight your only role is to coordinate; spawn only for genuinely independent domains.",
+                        "note": "Root may perform independent work outside delegated scopes. Do not duplicate in-flight delegated work. Occupancy is observation, not a mandatory collaboration plan.",
                     }),
                 );
             }
             view
         }
-        None => serde_json::json!({
-            "closure": {
-                "current": "not_started",
-                "exit_ready": false,
-                "satisfied": [],
-                "remaining": [{"step": "team_create"}],
-            },
-            "budgets": budgets,
+        Ok(None) => serde_json::json!({
+            "program_source":{"status":"absent","program_ref":program_id},
+            "current":"uninitialized",
+            "exit_ready":false,
+            "remaining":[],
+            "satisfied":[],
+            "suggestions":["Perform the user task using governed tools. Absence of a Program does not require a Team or Task and does not certify completion. For a real file deliverable, tool_search(query=artifact_publish) discovers artifact_publish; publish source=file with actual path, sha256 and media_type, then artifact_commit its returned content_ref with kind/title. For actual response Text use artifact_commit(content_ref=message://current,kind,title). No guessed selector or duplicate deliverable."],
+            "budgets":budgets,
+        }),
+        Err(error) => serde_json::json!({
+            "program_source":{"status":"unavailable","program_ref":program_id},
+            "current":"blocked",
+            "exit_ready":false,
+            "remaining":[],
+            "blocked":{"reason":"program_projection_failed","detail":error.to_string()},
+            "budgets":budgets,
         }),
     }
 }
@@ -2502,10 +2846,17 @@ pub(super) fn scope_turn_framing_for_role(
     if !role.is_delegated_leaf() {
         return framing;
     }
-    if let Some(root_closure) = framing
-        .as_object_mut()
+    let mut root_closure = framing.as_object_mut()
         .and_then(|object| object.remove("closure"))
-    {
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = framing.as_object_mut() {
+        for key in ["current", "exit_ready", "remaining", "satisfied", "completion_gap", "blocked", "suggestions"] {
+            if let Some(value) = object.remove(key) {
+                root_closure[key] = value;
+            }
+        }
+    }
+    if root_closure.as_object().is_some_and(|object| !object.is_empty()) {
         framing["program_progress"] = serde_json::json!({
             "owner": "RootTurn",
             "root_closure": root_closure,
@@ -2675,6 +3026,11 @@ fn agentic_closure_view(
 ) -> serde_json::Value {
     let tasks = program.tasks.values().collect::<Vec<_>>();
     let published = tasks.len();
+    let active_tasks = tasks.iter().filter(|task| !task.status.is_retired()).collect::<Vec<_>>();
+    let unclaimed = active_tasks.iter().filter(|task| matches!(task.status,
+        crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Rework)).count();
+    let submitted = active_tasks.iter().filter(|task| task.status == crate::AgenticTaskStatus::Submitted).count();
+    let pending = active_tasks.iter().filter(|task| task.status != crate::AgenticTaskStatus::Accepted).count();
     let claimed = tasks.iter().filter(|task| task.claimant.is_some()).count();
     let reviewed = tasks
         .iter()
@@ -2685,7 +3041,7 @@ fn agentic_closure_view(
         .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
         .count();
     let teams = program.teams.len();
-    let required_teams = usize::from(program.required_team_count.max(1));
+    let required_teams = usize::from(program.required_team_count);
     // The unclassified-issue count comes from the Task-recorded issues that
     // `issues::completion_gap` reads, NOT from `program.unresolved` (which is
     // derived from Goal-level gaps). Run one19 had the two disagree: this view
@@ -2705,24 +3061,34 @@ fn agentic_closure_view(
             "hint": "Runtime requires at least this many Teams; names/roles are yours."
         }));
     }
-    if published == 0 {
-        remaining.push(serde_json::json!({"step": "publish_task"}));
+    if published == 0 && required_teams > 0 {
+        remaining.push(serde_json::json!({"step": "publish_task", "requirement":"required_participation"}));
     }
-    if claimed < published {
+    if unclaimed > 0 {
         remaining.push(serde_json::json!({
-            "step": "claim_task", "outstanding": published - claimed
+            "step": "claim_task", "outstanding": unclaimed
         }));
     }
-    if reviewed < published {
+    if submitted > 0 {
         remaining.push(serde_json::json!({
-            "step": "independent_review", "outstanding": published - reviewed,
+            "step": "independent_review", "outstanding": submitted,
             "hint": "A different Agent must review each submitted Task."
         }));
     }
-    if accepted < published {
-        remaining.push(serde_json::json!({
-            "step": "accepted_task", "outstanding": published - accepted
-        }));
+    let mut blocked = serde_json::Value::Null;
+    if pending > 0 {
+        blocked = serde_json::json!({"reason":"tasks_not_accepted","outstanding":pending,
+            "hint":"Advance the actual Task state; task_review cannot close an unsubmitted Task. Retired Tasks are not accepted results."});
+    }
+    if required_teams == 0 && active_tasks.is_empty() && program.artifacts.is_empty() {
+        remaining.push(serde_json::json!({"step":"register_delivery","closing_tool":"artifact_commit",
+            "hint":"No Program deliverable is registered. For a real file, discover artifact_publish using tool_search(query=artifact_publish) if deferred; read the actual file, then artifact_publish(source=file,path,sha256,media_type) and artifact_commit(content_ref=<returned immutable selector>,kind,title). For actual response Text use artifact_commit(content_ref=message://current,kind,title). File/tool receipts alone are not registration; never guess a selector or force a Team/Task.",
+            "publication_route":{"discovery_tool":"tool_search","query":"artifact_publish",
+                "file_publication_tool":"artifact_publish","file_source":"file",
+                "file_fields":["path","sha256","media_type"],
+                "registration_tool":"artifact_commit","selector":"returned content_ref",
+                "body_alternative":"actual response Text + artifact_commit(content_ref=message://current,kind,title)",
+                "execution":"explicit_authorized_calls_only","exposure":"requires_actual_native_schema"}}));
     }
     // The integration obligation is a durable structural fact the Program
     // already records, so it belongs in this always-on view. It used to live
@@ -2766,7 +3132,8 @@ fn agentic_closure_view(
         // the exit action is a lie the model will act on: one live run was told
         // to request completion while the Goal gate required an Objective
         // review, and it looped on rejected requests until the window expired.
-        if completion_gap.is_none() {
+        if completion_gap.is_none() && remaining.is_empty() && blocked.is_null()
+            && !program.artifacts.is_empty() {
             remaining.push(serde_json::json!({
             "step": "objective_complete_request",
             "hint": "The Objective cannot close without this action; accepted Tasks alone do not certify it."
@@ -2793,18 +3160,43 @@ fn agentic_closure_view(
         } else {
             "The Goal verifier records a completion gap, so the Objective is not closable yet. Close this gap first; do not re-request completion until it clears. Close it by having an Agent READ the delivered results itself in its own execution and then call objective_review: a read by another Agent, by the root, or by an earlier attempt of the same Agent does not count, and submitting the review before those reads only burns the retry budget.".to_string()
         };
+        let needs_independent_actor = kind.closing_tool() == "objective_review";
+        let optional_route = needs_independent_actor.then(|| serde_json::json!({
+            "status":"requires_explicit_independent_actor",
+            "team_observation":if program.teams.is_empty() {"absent"} else {"present_admission_unverified"},
+            "strategy":"Use a suitable existing Team or explicitly choose a minimal reviewer-only Team, subject to user constraints and authorization. Minimum zero Teams is not a prohibition. This is an optional execution carrier, not a new business deliverable.",
+            "admission":"If chosen and authorized, team_create only when needed; agent_invite a distinct read-capable Agent; task_publish(purpose=exploration) with the original criterion and actual current registered result refs. Existing membership alone does not prove reviewer eligibility.",
+            "review":"The distinct admitted Agent must really claim the Task and read the current result refs in its own execution, then objective_review with complete current results, read evidence and durable reason.",
+            "retirement":"After recorded control work, explicitly task_withdraw with truthful reason_ref/evidence_refs, or task_release if work remains. Retired is not Accepted; do not delete the Task or create a redundant report.",
+            "completion":"Independent review does not complete the Goal. Preserve original criterion, manifest and real Goal verifier/CAS; objective_complete_request remains governed.",
+            "execution":"optional_explicit_authorized_calls_only",
+            "prohibitions":["no_auto_create","no_self_review","no_auto_accept","no_manifest_rewrite"],
+            "exposure":"requires_actual_native_schema_and_actor_authorization"
+        }));
         remaining.push(serde_json::json!({
             "step": kind.closure_step(),
             "outstanding_gap": gap,
             "closing_tool": kind.closing_tool(),
+            "actionability":if needs_independent_actor { "requires_explicit_independent_actor" } else { "requires_actor_and_reads" },
+            "optional_route":optional_route,
             "hint": hint
         }));
     }
 
-    let current = if program.completion_request.is_some() {
+    if completion_gap.is_none() && required_teams == 0 && active_tasks.is_empty()
+        && !program.artifacts.is_empty() && program.completion_request.is_none() {
+        blocked = serde_json::json!({"reason":"objective_review_readiness_unknown",
+            "hint":"A registered artifact and no reported gap do not prove current original-intent review. Inspect the bound Goal and current review evidence first. If review is missing, a suitable existing Team or explicitly chosen minimal reviewer-only Team with a distinct admitted Agent and typed Exploration Task is an optional authorized route, not business Task debt. Do not auto-create, self-review, autoaccept or infer success."});
+    }
+    if !blocked.is_null() {
+        remaining.retain(|entry| entry["step"] != "objective_complete_request");
+    }
+    let current = if !blocked.is_null() {
+        "blocked"
+    } else if program.completion_request.is_some() {
         "completion_requested"
     } else if remaining.is_empty() {
-        "closure_ready"
+        "goal_verification_required"
     } else {
         remaining
             .first()
@@ -2824,10 +3216,10 @@ fn agentic_closure_view(
     if published > 0 {
         satisfied.push("publish_task");
     }
-    if claimed >= published && published > 0 {
+    if unclaimed == 0 && pending == 0 && published > 0 {
         satisfied.push("claim_task");
     }
-    if reviewed >= published && published > 0 {
+    if reviewed >= published && accepted == published && published > 0 {
         satisfied.push("independent_review");
     }
     if accepted >= published && published > 0 {
@@ -2839,21 +3231,10 @@ fn agentic_closure_view(
 
     serde_json::json!({
         "current": current,
-        // The exit condition is a fact, not a request: when it is true every
-        // framework-owned condition holds and the MODEL decides to close out.
-        // Runtime then verifies the request and rejects it if anything
-        // regressed. The framework never submits on the model's behalf.
-        // `remaining` always carries the request step while no request exists,
-        // so readiness means "every framework-owned rung holds and the only
-        // outstanding action is the model's own completion request". A live
-        // run with four accepted Tasks kept verifying for ten minutes because
-        // this flag never turned true and no signal ever said "request now".
-        "exit_ready": program.completion_request.is_none()
-            && completion_gap.is_none()
-            && remaining.iter().all(|step| {
-                step.get("step").and_then(serde_json::Value::as_str)
-                    == Some("objective_complete_request")
-            }),
+        "exit_ready": false,
+        "readiness":"requires_bound_goal_verification",
+        "blocked":blocked,
+        "suggestions":["Topology is optional unless required by the bound user participation contract. Completion remains a governed request, not a count-derived verdict."],
         "completion_gap": completion_gap,
         "facts": {
             "teams": teams,
@@ -3253,7 +3634,7 @@ fn closure_view_names_the_outstanding_rung_in_a_stalled_program() {
         .filter_map(|step| step.get("step").and_then(serde_json::Value::as_str))
         .collect::<Vec<_>>();
     assert!(steps.contains(&"publish_task"), "{steps:?}");
-    assert!(steps.contains(&"objective_complete_request"), "{steps:?}");
+    assert!(!steps.contains(&"objective_complete_request"), "no registered result permits exit: {steps:?}");
     assert_eq!(view["facts"]["required_teams"], serde_json::json!(1));
 }
 
@@ -3497,7 +3878,7 @@ fn citable_refs_states_what_exists_and_never_what_to_choose() {
     assert!(
         refs["note"]
             .as_str()
-            .is_some_and(|note| note.contains("never") == false && note.contains("Cite from here")),
+            .is_some_and(|note| note.contains("registered Program refs") && note.contains("not all filesystem facts")),
         "the note must offer the facts without prescribing a choice: {}",
         refs["note"]
     );
@@ -3510,7 +3891,7 @@ fn citable_refs_states_what_exists_and_never_what_to_choose() {
 
 #[test]
 #[cfg(test)]
-fn closure_view_opens_the_exit_when_only_the_request_remains() {
+fn closure_view_does_not_infer_goal_readiness_from_accepted_counts() {
     let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
     program.required_team_count = 1;
     // Every framework-owned rung holds: one Team, one accepted Task, no
@@ -3575,10 +3956,10 @@ fn closure_view_opens_the_exit_when_only_the_request_remains() {
     program.tasks.insert("task:1".to_string(), task);
 
     let view = agentic_closure_view(&program, None);
-    assert_eq!(view["exit_ready"], serde_json::json!(true));
+    assert_eq!(view["exit_ready"], serde_json::json!(false));
     assert_eq!(
         view["current"],
-        serde_json::json!("objective_complete_request")
+        serde_json::json!("goal_verification_required")
     );
 }
 
@@ -4638,10 +5019,17 @@ fn encode_tool_calls_with_continuation(
     calls: &[ModelToolCall],
     continue_with_tool_batch: bool,
 ) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&PersistedToolBatch {
-        step_snapshots: calls.iter().filter_map(|call| call.binding.as_ref()).map(|binding| {
-            (binding.snapshot.identity.step_id.clone(), Arc::clone(&binding.snapshot))
-        }).collect(),
+    let value = serde_json::to_value(&PersistedToolBatch {
+        step_snapshots: calls
+            .iter()
+            .filter_map(|call| call.binding.as_ref())
+            .map(|binding| {
+                (
+                    binding.snapshot.identity.step_id.clone(),
+                    Arc::clone(&binding.snapshot),
+                )
+            })
+            .collect(),
         session_id: session_id.to_string(),
         calls: calls
             .iter()
@@ -4654,26 +5042,46 @@ fn encode_tool_calls_with_continuation(
             })
             .collect(),
         continue_with_tool_batch,
-    })
+    })?;
+    crate::step_snapshot::encode_persisted_tool_batch(&value)
 }
 
-fn decode_tool_batch(payload: &str) -> Result<(Vec<ModelToolCall>, bool), serde_json::Error> {
-    let batch = serde_json::from_str::<PersistedToolBatch>(payload)?;
-    let calls = batch.calls.into_iter().map(|call| {
-        let binding = call.origin.map(|origin| {
-            let snapshot = batch.step_snapshots.get(&origin.origin_step_id).ok_or_else(|| {
-                serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, "persisted tool origin has no step snapshot"))
-            })?;
-            Ok::<_, serde_json::Error>(crate::step_snapshot::StepCallBinding::persisted(origin, Arc::clone(snapshot)))
-        }).transpose()?;
-        Ok(ModelToolCall {
-            binding,
-            id: call.id,
-            name: call.name,
-            input: call.input,
-            depends_on: call.depends_on,
+pub(crate) fn decode_tool_batch(
+    payload: &str,
+) -> Result<(Vec<ModelToolCall>, bool), serde_json::Error> {
+    let value = crate::step_snapshot::decode_persisted_tool_batch_value(payload)?;
+    let batch = serde_json::from_value::<PersistedToolBatch>(value)?;
+    let calls = batch
+        .calls
+        .into_iter()
+        .map(|call| {
+            let binding = call
+                .origin
+                .map(|origin| {
+                    let snapshot = batch
+                        .step_snapshots
+                        .get(&origin.origin_step_id)
+                        .ok_or_else(|| {
+                            serde_json::Error::io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "persisted tool origin has no step snapshot",
+                            ))
+                        })?;
+                    Ok::<_, serde_json::Error>(crate::step_snapshot::StepCallBinding::persisted(
+                        origin,
+                        Arc::clone(snapshot),
+                    ))
+                })
+                .transpose()?;
+            Ok(ModelToolCall {
+                binding,
+                id: call.id,
+                name: call.name,
+                input: call.input,
+                depends_on: call.depends_on,
+            })
         })
-    }).collect::<Result<Vec<_>, serde_json::Error>>()?;
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
     Ok((calls, batch.continue_with_tool_batch))
 }
 
@@ -4871,17 +5279,23 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 input: candidate.call.input.clone(),
                 depends_on: Vec::new(),
             };
-            let request =
-                match tool_executor.validate_step_tool_input(candidate.call.binding.as_ref(), &request.tool_name, &request.input) {
-                    Ok(repaired) => crate::tool_dispatch::ToolRequest {
-                        input: repaired,
-                        ..request
-                    },
-                    Err(error) => {
-                        return defer(format!("input_contract_rejected:{error}"));
-                    }
-                };
-            let prepared = match tool_executor.prepare_step_invocations(std::slice::from_ref(&request), std::slice::from_ref(&candidate.call)) {
+            let request = match tool_executor.validate_step_tool_input(
+                candidate.call.binding.as_ref(),
+                &request.tool_name,
+                &request.input,
+            ) {
+                Ok(repaired) => crate::tool_dispatch::ToolRequest {
+                    input: repaired,
+                    ..request
+                },
+                Err(error) => {
+                    return defer(format!("input_contract_rejected:{error}"));
+                }
+            };
+            let prepared = match tool_executor.prepare_step_invocations(
+                std::slice::from_ref(&request),
+                std::slice::from_ref(&candidate.call),
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => return defer(format!("step_binding_rejected:{error}")),
             };
@@ -5021,7 +5435,10 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
             let mut idempotency_keys = std::collections::HashMap::new();
             idempotency_keys.insert(
                 candidate.call.id.clone(),
-                format!("{}:early-read:{}:{early_fingerprint}", ticket.graph_id, candidate.call.id),
+                format!(
+                    "{}:early-read:{}:{early_fingerprint}",
+                    ticket.graph_id, candidate.call.id
+                ),
             );
             let calls = [candidate.call.clone()];
             let early_ticket = ticket;
@@ -5133,40 +5550,108 @@ fn tool_nodes_for_calls(
     system_authored: bool,
 ) -> Result<Vec<ExecutionNodeSpec>, NodeExecutorError> {
     if system_authored {
-        if let Some((services, lease)) = services.and_then(|services| services.tool_execution_host()
-            .and_then(|host| host.pin_step_catalog()).map(|lease| (services, lease))) {
+        if let Some((services, lease)) = services.and_then(|services| {
+            services
+                .tool_execution_host()
+                .and_then(|host| host.pin_step_catalog())
+                .map(|lease| (services, lease))
+        }) {
             let bind = || -> Result<crate::step_snapshot::BoundStep, String> {
-                let graph = services.graph_state_store().load(&ticket.graph_id).map_err(|error| error.to_string())?;
-                let lineage = graph.lineage.as_ref().ok_or("system origin parent lineage missing")?;
-                if lineage.session_id != session_id { return Err("system origin parent session mismatch".into()); }
-                let names = calls.iter().map(|call| call.name.clone()).collect::<BTreeSet<_>>();
-                let definitions = lease.snapshot().catalog.definitions(Some(&names)).into_iter().map(|definition| ProviderToolDefinition {
-                    name: definition.name, description: definition.description, input_schema: definition.input_schema,
-                }).collect::<Vec<_>>();
-                let step = crate::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
-                    step_id: uuid::Uuid::new_v4().to_string(), session_id: session_id.to_string(), turn_id: lineage.turn_id.clone(),
-                    execution_id: Some(ticket.graph_id.clone()), goal_ref: None, program_ref: None, task_ref: Some(lineage.task_id.clone()),
-                    actor_ref: Some("runtime:bounded-verification".to_string()), run_ref: None,
-                    attempt: Some(ticket.attempt), epoch: Some(lineage.generation.to_string()),
-                    build_ref: option_env!("COWD_GIT_SHA").unwrap_or("unverified").to_string(),
-                }, lease, &definitions, &serde_json::json!({"source":"runtime_system"}),
+                let graph = services
+                    .graph_state_store()
+                    .load(&ticket.graph_id)
+                    .map_err(|error| error.to_string())?;
+                let lineage = graph
+                    .lineage
+                    .as_ref()
+                    .ok_or("system origin parent lineage missing")?;
+                if lineage.session_id != session_id {
+                    return Err("system origin parent session mismatch".into());
+                }
+                let names = calls
+                    .iter()
+                    .map(|call| call.name.clone())
+                    .collect::<BTreeSet<_>>();
+                let definitions = lease
+                    .snapshot()
+                    .catalog
+                    .definitions(Some(&names))
+                    .into_iter()
+                    .map(|definition| ProviderToolDefinition {
+                        name: definition.name,
+                        description: definition.description,
+                        input_schema: definition.input_schema,
+                    })
+                    .collect::<Vec<_>>();
+                let step = crate::step_snapshot::BoundStep::bind(
+                    harness_contract::step::StepIdentity {
+                        step_id: uuid::Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        turn_id: lineage.turn_id.clone(),
+                        execution_id: Some(ticket.graph_id.clone()),
+                        goal_ref: None,
+                        program_ref: None,
+                        task_ref: Some(lineage.task_id.clone()),
+                        actor_ref: Some("runtime:bounded-verification".to_string()),
+                        run_ref: None,
+                        attempt: Some(ticket.attempt),
+                        epoch: Some(lineage.generation.to_string()),
+                        build_ref: option_env!("COWD_GIT_SHA")
+                            .unwrap_or("unverified")
+                            .to_string(),
+                    },
+                    lease,
+                    &definitions,
+                    &serde_json::json!({"source":"runtime_system"}),
                     &serde_json::json!({"parent_node":ticket.node_id,"attempt":ticket.attempt}),
-                    BTreeMap::from([("parent_attempt".to_string(), ticket.attempt.to_string()),
-                        ("parent_generation".to_string(), lineage.generation.to_string())]),
-                    chrono::Utc::now().timestamp_millis().saturating_add(3_600_000))
-                    .map_err(|error| error.to_string())?.with_parent(&format!("{}:{}:{}", ticket.graph_id, ticket.node_id, ticket.attempt));
-                services.event_store().append(crate::runtime_event_store::RuntimeEventInput {
-                    stream_id: format!("session:{session_id}"), scope: crate::runtime_event_store::RuntimeEventScope::Session,
-                    kind: "system.step_bound".to_string(), status: Some("prepared".to_string()), actor: Some("runtime".to_string()), refs: vec![],
-                    payload: serde_json::to_value(step.snapshot()).map_err(|error| error.to_string())?,
-                }).map_err(|error| error.to_string())?;
+                    BTreeMap::from([
+                        ("parent_attempt".to_string(), ticket.attempt.to_string()),
+                        (
+                            "parent_generation".to_string(),
+                            lineage.generation.to_string(),
+                        ),
+                    ]),
+                    chrono::Utc::now()
+                        .timestamp_millis()
+                        .saturating_add(3_600_000),
+                )
+                .map_err(|error| error.to_string())?
+                .with_parent(&format!(
+                    "{}:{}:{}",
+                    ticket.graph_id, ticket.node_id, ticket.attempt
+                ));
+                services
+                    .event_store()
+                    .append(crate::runtime_event_store::RuntimeEventInput {
+                        stream_id: format!("session:{session_id}"),
+                        scope: crate::runtime_event_store::RuntimeEventScope::Session,
+                        kind: "system.step_bound".to_string(),
+                        status: Some("prepared".to_string()),
+                        actor: Some("runtime".to_string()),
+                        refs: vec![],
+                        payload: serde_json::to_value(step.snapshot())
+                            .map_err(|error| error.to_string())?,
+                    })
+                    .map_err(|error| error.to_string())?;
                 Ok(step)
             };
-            let step = Arc::new(bind().map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?);
+            let step = Arc::new(bind().map_err(|reason| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason,
+            })?);
             let parent = format!("{}:{}:{}", ticket.graph_id, ticket.node_id, ticket.attempt);
             for call in &mut calls {
-                if call.binding.is_some() { return Err(NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "system compiler cannot relabel a provider call".into() }); }
-                call.binding = Some(crate::step_snapshot::StepCallBinding::system(step.clone(), &parent, &call.id));
+                if call.binding.is_some() {
+                    return Err(NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: "system compiler cannot relabel a provider call".into(),
+                    });
+                }
+                call.binding = Some(crate::step_snapshot::StepCallBinding::system(
+                    step.clone(),
+                    &parent,
+                    &call.id,
+                ));
             }
         }
     }
@@ -5216,8 +5701,12 @@ fn tool_nodes_for_calls(
 fn runtime_authored_tool_batch(calls: &[ModelToolCall]) -> bool {
     !calls.is_empty()
         && calls.iter().all(|call| {
-            call.binding.as_ref().is_some_and(|binding| matches!(binding.origin.source,
-                harness_contract::step::CallSource::SystemDerived { .. }))
+            call.binding.as_ref().is_some_and(|binding| {
+                matches!(
+                    binding.origin.source,
+                    harness_contract::step::CallSource::SystemDerived { .. }
+                )
+            })
         })
 }
 
@@ -5256,6 +5745,7 @@ where
         .collect::<BTreeMap<_, _>>();
     let runtime = runtime.lock().await;
     let mut messages = Vec::with_capacity(raw_messages.len());
+    runtime.remember_native_tool_calls(calls)?;
     for raw_message in raw_messages {
         let Some((tool_use_id, tool_name, output, is_error)) =
             raw_message.blocks.iter().find_map(|block| match block {
@@ -5336,6 +5826,7 @@ struct HostGovernedToolContext<'a> {
 }
 
 fn rejected_tool_invocations(
+    session_id: &str,
     calls: &[ModelToolCall],
     safety_category: crate::ToolSafetyCategory,
     plan_id: Option<&str>,
@@ -5347,7 +5838,7 @@ fn rejected_tool_invocations(
         .map(|call| {
             let started_at_ms = crate::tool_invocation::now_ms();
             let mut record = ToolInvocationRecord::started(
-                "unknown",
+                session_id,
                 0,
                 call.id.clone(),
                 call.name.clone(),
@@ -5434,8 +5925,17 @@ async fn execute_fenced_runtime_tool(
     commit_service: &crate::execution_core::graph::ExecutionCommitService,
     request: &crate::RuntimeToolExecutionRequest,
     effect: Option<&harness_contract::tool::ToolEffectDescriptor>,
+    observation: Option<
+        &crate::execution_core::graph::executors::agent_tool::NoDispatchObservation,
+    >,
 ) -> crate::RuntimeToolExecutionOutcome {
     let Some(effect) = effect else {
+        if let Some(observation) = observation {
+            observation.refuse(
+                &request.tool_use_id,
+                "registered effect descriptor missing before dispatch".into(),
+            );
+        }
         return crate::RuntimeToolExecutionOutcome {
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
@@ -5450,7 +5950,85 @@ async fn execute_fenced_runtime_tool(
             observed_evidence: Vec::new(),
         };
     };
-    match commit_service.begin_tool_effect(request, effect) {
+    if request.tool_name == "execute_code" {
+        let result = async {
+            if let Some(outcome) = commit_service
+                .completed_tool_effect(request, effect)
+                .map_err(|error| crate::ToolError::new(error.to_string()))?
+            {
+                return Ok(crate::bound_tool_batch::retained_replay_outcome(outcome));
+            }
+            let lease = host.bounded_process_lease(request)?;
+            let authority = host.bounded_process_authority(request)?;
+            let plane = host
+                .bounded_process_plane()
+                .ok_or_else(|| crate::ToolError::new("bounded process plane unsupported"))?;
+            crate::bound_tool_batch::execute_bounded_process_observed(
+                lease,
+                plane,
+                authority,
+                commit_service.clone(),
+                request.clone(),
+                effect.clone(),
+                None,
+                None,
+                observation.cloned(),
+            )
+            .await
+        }
+        .await;
+        return result.unwrap_or_else(|error: crate::ToolError| {
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Failed,
+                category: request.category,
+                output: None,
+                error: Some(error.to_string()),
+                evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+                observed_evidence: Vec::new(),
+            }
+        });
+    }
+    let mut admitted_scope = None;
+    let admission = (|| {
+        if let Some(outcome) = commit_service.completed_tool_effect(request, effect)? {
+            return Ok(crate::execution_core::graph::ToolEffectState::Completed(
+                outcome,
+            ));
+        }
+        let build_scope =
+            || -> Result<harness_contract::goal::ProofEffectScope, crate::ToolError> {
+                let current = host.pin_step_catalog();
+                let step = request
+                    .step_binding
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::ToolError::new("effect admission requires the original Step")
+                    })?
+                    .resolve(current.clone())
+                    .map_err(|error| crate::ToolError::new(error.to_string()))?;
+                let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(
+                    step.lease().workspace_root(),
+                )
+                .map_err(|error| crate::ToolError::new(error.to_string()))?;
+                crate::bound_tool_batch::admitted_effect_scope(request, effect, current, &resolver)
+            };
+        let scope = build_scope().map_err(|error| {
+            if let Some(observation) = observation {
+                observation.refuse(&request.tool_use_id, error.to_string());
+            }
+            crate::execution_core::graph::ExecutionCommitError::InvalidCommand(error.to_string())
+        })?;
+        admitted_scope = Some(scope);
+        commit_service.begin_bound_tool_effect_observed(
+            request,
+            effect,
+            admitted_scope.as_ref().unwrap(),
+            observation,
+        )
+    })();
+    match admission {
         Ok(crate::execution_core::graph::ToolEffectState::Completed(mut outcome)) => {
             // A bounded read receipt may have been produced by an interrupted
             // Provider generation whose call id differs. The effect identity
@@ -5484,9 +6062,17 @@ async fn execute_fenced_runtime_tool(
             crate::execution_core::graph::ToolEffectState::Fresh
             | crate::execution_core::graph::ToolEffectState::NotRequired,
         ) => {
+            if let Some(observation) = observation {
+                observation.uncertain(request);
+            }
             let outcome = host.execute_runtime_tool(request).await;
             let committed = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                commit_service.commit_readonly_tool_receipts(&[(request.clone(), outcome.clone())])
+                commit_service.commit_bound_readonly_tool_receipt(
+                    request,
+                    &outcome,
+                    effect,
+                    admitted_scope.as_ref().unwrap(),
+                )
             } else {
                 commit_service.commit_tool_effect(request, effect, &outcome)
             };
@@ -5544,7 +6130,10 @@ fn bound_runtime_tool_request(
         governed_plan_id: plan_id.to_string(),
         governed_plan_revision: plan_revision,
         observation_wave_sequence,
-        idempotency_key: call.binding.as_ref().map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+        idempotency_key: call
+            .binding
+            .as_ref()
+            .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
             .or_else(|| idempotency_key.cloned())
             .unwrap_or_else(|| format!("{}:{}", ticket.idempotency_key, call.id)),
         tool_use_id: call.id.clone(),
@@ -5572,11 +6161,12 @@ fn bound_runtime_tool_request(
 }
 
 fn tool_outcome_message(outcome: crate::RuntimeToolExecutionOutcome) -> ConversationMessage {
+    let is_error = outcome.model_feedback_is_error();
     ConversationMessage::tool_result(
         outcome.tool_use_id,
         outcome.tool_name,
         outcome.output.or(outcome.error).unwrap_or_default(),
-        outcome.status != crate::RuntimeToolExecutionStatus::Executed,
+        is_error,
     )
 }
 
@@ -6373,11 +6963,13 @@ mod turn_framing_tests {
     };
 
     #[test]
-    fn framing_without_a_program_reports_not_started_and_budgets() {
+    fn framing_without_a_program_reports_absence_without_topology_debt() {
         let services = crate::RuntimeServices::in_memory().expect("services");
         let view = agentic_turn_framing(&services, "no-session", "no-turn", 7, 12, 90_000);
-        assert_eq!(view["closure"]["current"], serde_json::json!("not_started"));
-        assert_eq!(view["closure"]["exit_ready"], serde_json::json!(false));
+        assert_eq!(view["current"], serde_json::json!("uninitialized"));
+        assert_eq!(view["exit_ready"], serde_json::json!(false));
+        assert_eq!(view["remaining"], serde_json::json!([]));
+        assert_eq!(view["program_source"]["status"], "absent");
         assert_eq!(view["budgets"]["rounds"], serde_json::json!(7));
         assert_eq!(view["budgets"]["tool_calls"], serde_json::json!(12));
         assert_eq!(view["budgets"]["elapsed_ms"], serde_json::json!(90_000));
@@ -6391,7 +6983,7 @@ mod turn_framing_tests {
         assert!(steps.contains(&"team".to_string()), "{steps:?}");
         assert!(steps.contains(&"publish_task".to_string()), "{steps:?}");
         assert!(
-            steps.contains(&"objective_complete_request".to_string()),
+            !steps.contains(&"objective_complete_request".to_string()),
             "{steps:?}"
         );
     }
@@ -6438,5 +7030,67 @@ mod turn_framing_tests {
         });
         let scoped = scope_turn_framing_for_role(view.clone(), TurnExecutionRole::RootTurn);
         assert_eq!(scoped, view);
+    }
+}
+
+#[cfg(test)]
+mod next_turn_contract_tests {
+    use super::*;
+
+    #[test]
+    fn zero_participation_has_registration_not_team_or_task_debt() {
+        let program = crate::AgenticProgramProjection::empty("program:zero", "objective:zero");
+        let view = agentic_closure_view(&program, None);
+        assert_eq!(view["facts"]["required_teams"], 0);
+        assert_eq!(view["remaining"][0]["step"], "register_delivery");
+        assert_eq!(view["remaining"][0]["publication_route"]["file_publication_tool"], "artifact_publish");
+        assert_eq!(view["remaining"][0]["publication_route"]["discovery_tool"], "tool_search");
+        assert!(view["remaining"][0]["publication_route"]["body_alternative"].as_str().unwrap()
+            .contains("message://current"));
+        assert!(!view["exit_ready"].as_bool().unwrap());
+        for step in view["remaining"].as_array().unwrap() {
+            assert_ne!(step["step"], "team");
+            assert_ne!(step["step"], "publish_task");
+        }
+    }
+
+    #[test]
+    fn review_gap_without_team_offers_optional_route_not_false_blocker() {
+        let program = crate::AgenticProgramProjection::empty("program:zero", "objective:zero");
+        let view = agentic_closure_view(&program, Some("original_intent_review_required:user_intent"));
+        assert!(view["blocked"].is_null());
+        let review = view["remaining"].as_array().unwrap().iter()
+            .find(|entry| entry["closing_tool"] == "objective_review").unwrap();
+        assert_eq!(review["actionability"], "requires_explicit_independent_actor");
+        assert_eq!(review["optional_route"]["team_observation"], "absent");
+        assert_eq!(review["optional_route"]["execution"], "optional_explicit_authorized_calls_only");
+        assert!(review["optional_route"]["admission"].as_str().unwrap()
+            .contains("task_publish(purpose=exploration)"));
+        assert_eq!(view["exit_ready"], false);
+        assert!(program.teams.is_empty());
+        assert!(program.tasks.is_empty());
+        assert!(program.completion_request.is_none());
+    }
+
+    #[test]
+    fn leaf_flat_root_state_is_background_not_action_debt() {
+        let scoped = scope_turn_framing_for_role(serde_json::json!({
+            "current":"register_delivery","remaining":[{"step":"artifact_commit"}],
+            "exit_ready":false,"blocked":{"reason":"review"},"facts":{"required_teams":0}
+        }), TurnExecutionRole::DelegatedLeaf);
+        for key in ["current", "remaining", "exit_ready", "blocked"] {
+            assert!(scoped.get(key).is_none());
+        }
+        assert_eq!(scoped["program_progress"]["root_closure"]["current"], "register_delivery");
+    }
+
+    #[test]
+    fn missing_goal_is_unknown_not_empty_known_criteria() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let program = crate::AgenticProgramProjection::empty("program:zero", "objective:zero");
+        let refs = citable_refs(&program, &services, "session", "turn");
+        assert_eq!(refs["goal"]["status"], "unknown");
+        assert!(refs["criteria"].is_null());
+        assert_eq!(refs["coverage"]["accepted_results_omitted"], 0);
     }
 }

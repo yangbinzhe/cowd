@@ -1,5 +1,346 @@
 use super::*;
 
+fn receipt_overlay(client: &str, epoch: u64) -> crate::protocol::TerminalReceiptOverlay {
+    crate::protocol::TerminalReceiptOverlay {
+        expires_at_ms: u64::MAX,
+        session_id: "receipt-session".into(),
+        message_id: "assistant:receipt".into(),
+        turn_id: "receipt-turn".into(),
+        client_id: client.into(),
+        epoch,
+        received: true,
+        runtime_commit_cursor: "9007199254740993".into(),
+        content_digest: format!("session-public-v1:sha256:{}", "a".repeat(64)),
+    }
+}
+
+#[test]
+fn r1_client_receipt_exact_client_overlay_only() {
+    let mut app = App::new("test", "receipt-session");
+    app.apply_event(CowdEvent::TerminalReceiptSelection {
+        session_id: "receipt-session".into(),
+        client_id: "client-b".into(),
+        epoch: 2,
+    });
+    app.apply_event(CowdEvent::TerminalReceiptContext {
+        overlay: receipt_overlay("client-a", 1),
+    });
+    assert!(app.terminal_receipt.is_none());
+    app.apply_event(CowdEvent::TerminalReceiptContext {
+        overlay: receipt_overlay("client-b", 2),
+    });
+    assert!(app.terminal_receipt.as_ref().unwrap().received);
+    app.apply_event(CowdEvent::TerminalReceiptContext {
+        overlay: receipt_overlay("client-a", 99),
+    });
+    assert_eq!(app.terminal_receipt.as_ref().unwrap().client_id, "client-b");
+}
+
+#[tokio::test]
+#[ignore = "requires a parent-owned PostgreSQL producer allocation and prebuilt step binary"]
+async fn r1_client_receipt_historical_ack_survives_without_current_credit() {
+    use std::sync::atomic::Ordering;
+    let scenario = crate::gateway_client::RealReceiptScenario::load("tui-history").await;
+    let (loss_client, loss_server) = scenario.fixture(true).await;
+    let (loss_tx, mut loss_receiver) = crate::cowd_event_channel();
+    let mut loss_app = App::new("integration", scenario.session());
+    loss_client
+        .attach_session(scenario.session(), "tui", Some("reader"))
+        .await
+        .unwrap();
+    scenario.publish(&loss_client, &loss_tx).await;
+    assert!(scenario.recover(&loss_client).await.is_err());
+    while let Ok(event) = loss_receiver.try_recv() {
+        loss_app.apply_event(event);
+    }
+    assert!(receipt_panel_text(&loss_app).contains("This client unknown"));
+    assert!(scenario.recover(&loss_client).await.unwrap().received);
+    scenario.publish(&loss_client, &loss_tx).await;
+    while let Ok(event) = loss_receiver.try_recv() {
+        loss_app.apply_event(event);
+    }
+    assert!(receipt_panel_text(&loss_app).contains("received (fresh)"));
+    scenario.assert_old().await;
+    scenario.fresh_transport_unknown().await;
+    loss_server.abort();
+    for mode in [403, 409, 1, 2] {
+        scenario.mode.store(0, Ordering::SeqCst);
+        let (client, server) = scenario.fixture(false).await;
+        let (tx, mut receiver) = crate::cowd_event_channel();
+        let mut app = App::new("integration", scenario.session());
+        assert!(
+            crate::runner::receipt_presence_heartbeat(&client, scenario.session(), "reader").await
+        );
+        scenario.publish(&client, &tx).await;
+        let historical = scenario.recover(&client).await.unwrap();
+        assert!(historical.received);
+        scenario.publish(&client, &tx).await;
+        while let Ok(event) = receiver.try_recv() {
+            app.apply_event(event);
+        }
+        assert!(receipt_panel_text(&app).contains("received (fresh)"));
+        let saved = receipt_files(&scenario.root);
+        let old_epoch = app.terminal_receipt.as_ref().unwrap().epoch;
+        let message_version = app.timeline.msg_version;
+        scenario.mode.store(mode, Ordering::SeqCst);
+        if mode == 2 {
+            let cloned = client.clone();
+            let session = scenario.session().to_string();
+            let pending = tokio::spawn(async move {
+                crate::runner::receipt_presence_heartbeat(&cloned, &session, "reader").await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                scenario.attach_started.notified(),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                scenario.expire_locally(&client),
+            )
+            .await
+            .unwrap();
+            scenario.attach_release.notify_one();
+            assert!(!pending.await.unwrap());
+        } else {
+            assert!(
+                !crate::runner::receipt_presence_heartbeat(&client, scenario.session(), "reader")
+                    .await
+            );
+        }
+        while let Ok(event) = receiver.try_recv() {
+            app.apply_event(event);
+        }
+        assert!(app.terminal_receipt.is_none());
+        assert!(app.timeline.msg_version > message_version);
+        assert!(app.terminal_receipt_selection.as_ref().unwrap().2 > old_epoch);
+        assert!(receipt_panel_text(&app).contains("This client unknown · requires fresh context"));
+        assert_eq!(receipt_files(&scenario.root), saved);
+        scenario.assert_old().await;
+        server.abort();
+    }
+    scenario.mode.store(0, Ordering::SeqCst);
+    let (client, server) = scenario.fixture(false).await;
+    let (tx, mut receiver) = crate::cowd_event_channel();
+    client
+        .attach_session(scenario.session(), "tui", Some("reader"))
+        .await
+        .unwrap();
+    scenario.publish(&client, &tx).await;
+    let (started, release) = scenario.save_barrier(&client);
+    let cloned = client.clone();
+    let pending_scenario = scenario.clone();
+    let pending = tokio::spawn(async move { pending_scenario.recover(&cloned).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    let before = scenario.attempted_acks.load(Ordering::SeqCst);
+    scenario.expire_locally(&client).await;
+    release.send(()).unwrap();
+    assert!(pending.await.unwrap().is_err());
+    assert_eq!(scenario.attempted_acks.load(Ordering::SeqCst), before);
+    server.abort();
+    let (late_client, late_server) = scenario.fixture(false).await;
+    let mut late_app = App::new("integration", scenario.session());
+    late_client
+        .attach_session(scenario.session(), "tui", Some("reader"))
+        .await
+        .unwrap();
+    scenario.publish(&late_client, &tx).await;
+    let committed_before = scenario.acknowledgements.load(Ordering::SeqCst);
+    scenario.mode.store(3, Ordering::SeqCst);
+    let cloned = late_client.clone();
+    let pending_scenario = scenario.clone();
+    let pending = tokio::spawn(async move { pending_scenario.recover(&cloned).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        scenario.attach_started.notified(),
+    )
+    .await
+    .unwrap();
+    let admitted = scenario.acknowledgements.load(Ordering::SeqCst);
+    assert_eq!(admitted, committed_before + 1);
+    scenario.expire_locally(&late_client).await;
+    scenario.attach_release.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    assert_eq!(scenario.acknowledgements.load(Ordering::SeqCst), admitted);
+    while let Ok(event) = receiver.try_recv() {
+        late_app.apply_event(event);
+    }
+    assert!(receipt_panel_text(&late_app).contains("This client unknown"));
+    scenario.assert_old().await;
+    late_server.abort();
+    scenario.mode.store(0, Ordering::SeqCst);
+    let (client, server) = scenario.fixture(false).await;
+    client
+        .attach_session(scenario.session(), "tui", Some("reader"))
+        .await
+        .unwrap();
+    let mut app = App::new("integration", scenario.session());
+    scenario.publish(&client, &tx).await;
+    assert!(scenario.recover(&client).await.unwrap().received);
+    scenario.publish(&client, &tx).await;
+    while let Ok(event) = receiver.try_recv() {
+        app.apply_event(event);
+    }
+    assert!(receipt_panel_text(&app).contains("received (fresh)"));
+    let saved = receipt_files(&scenario.root);
+    scenario.step("usage-only", false).await;
+    assert!(scenario.recover(&client).await.unwrap().received);
+    scenario.assert_old().await;
+    scenario.step("body-b", false).await;
+    scenario.publish(&client, &tx).await;
+    while let Ok(event) = receiver.try_recv() {
+        app.apply_event(event);
+    }
+    assert!(receipt_panel_text(&app).contains("This client unknown"));
+    scenario.step("restore-body-a", false).await;
+    scenario.reject_old(&client).await;
+    scenario.publish(&client, &tx).await;
+    while let Ok(event) = receiver.try_recv() {
+        app.apply_event(event);
+    }
+    assert!(receipt_panel_text(&app).contains("This client unknown"));
+    assert_eq!(receipt_files(&scenario.root), saved);
+    scenario.fresh_transport_unknown().await;
+    scenario.assert_old().await;
+    scenario.finish(&app).await;
+    server.abort();
+}
+
+fn receipt_files(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+#[test]
+fn r1_surface_axes_non_program_three_clients() {
+    use crate::protocol::{ExecutionProjectionReducer, ProjectionDeltaApply};
+    use harness_contract::projection::*;
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
+    ))
+    .unwrap();
+    let mut snapshot: ExecutionProjection =
+        serde_json::from_value(corpus["initial"].clone()).unwrap();
+    snapshot.session_id = Some("receipt-session".into());
+    snapshot.turn_id = Some("receipt-turn".into());
+    snapshot.agentic_collaboration = Default::default();
+    snapshot.terminal_axes = Default::default();
+    let mut reducer = ExecutionProjectionReducer::default();
+    assert_eq!(
+        reducer.install_snapshot(&snapshot),
+        ProjectionDeltaApply::Applied
+    );
+    let mut app = App::new("test", "receipt-session");
+    assert!(app.apply_execution_projection(reducer.projection().unwrap().clone()));
+    assert!(!receipt_panel_text(&app).contains("Satisfied"));
+    let mut axes = snapshot.terminal_axes.clone();
+    axes.outcome.outcome = Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied);
+    axes.execution.phase = TerminalExecutionPhase::Draining;
+    let delta = ProjectionDelta {
+        schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
+        reducer_version: EXECUTION_PROJECTION_REDUCER_VERSION,
+        execution_id: snapshot.execution_id.clone(),
+        from_revision: snapshot.revision,
+        target_revision: snapshot.revision,
+        base_cursor: snapshot.cursor,
+        target_cursor: snapshot.cursor,
+        detail_scope: snapshot.detail_scope,
+        authorization_revision: snapshot.authorization_revision,
+        redaction_revision: snapshot.redaction_revision.clone(),
+        source_health: ProjectionSourceHealth::Fresh,
+        operations: vec![ProjectionOperation::ReplaceTerminalAxes {
+            terminal_axes: axes.clone(),
+        }],
+        resync_reason: None,
+    };
+    assert_eq!(reducer.apply_delta(&delta), ProjectionDeltaApply::Applied);
+    assert_eq!(reducer.projection().unwrap().terminal_axes, axes);
+    assert!(app.apply_execution_projection(reducer.projection().unwrap().clone()));
+    assert_eq!(
+        app.execution
+            .latest_execution_projection
+            .as_ref()
+            .unwrap()
+            .terminal_axes,
+        axes
+    );
+    assert!(app
+        .execution
+        .latest_execution_projection
+        .as_ref()
+        .unwrap()
+        .agentic_collaboration
+        .programs
+        .is_empty());
+    let rendered = receipt_panel_text(&app);
+    for text in ["Satisfied", "Draining", "Unknown", "This client unknown"] {
+        assert!(rendered.contains(text), "{rendered}");
+    }
+    for client in ["tui", "edge", "mfg"] {
+        app.apply_event(CowdEvent::TerminalReceiptSelection {
+            session_id: "receipt-session".into(),
+            client_id: client.into(),
+            epoch: 1,
+        });
+        let other = if client == "tui" { "edge" } else { "tui" };
+        app.apply_event(CowdEvent::TerminalReceiptContext {
+            overlay: receipt_overlay(other, 1),
+        });
+        assert!(app.terminal_receipt.is_none());
+        app.apply_event(CowdEvent::TerminalReceiptContext {
+            overlay: receipt_overlay(client, 1),
+        });
+        assert_eq!(app.terminal_receipt.as_ref().unwrap().client_id, client);
+        let rendered = receipt_panel_text(&app);
+        assert!(rendered.contains("received (fresh)"));
+        assert!(rendered.contains("Draining"));
+    }
+    let mut axes = harness_contract::projection::ExecutionTerminalAxes::default();
+    axes.outcome.outcome = Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied);
+    axes.execution.phase = harness_contract::projection::TerminalExecutionPhase::Draining;
+    assert_eq!(
+        axes.execution.settlement,
+        harness_contract::projection::TerminalEffectSettlement::Unknown
+    );
+    assert_eq!(
+        axes.delivery.session_client_evidence,
+        harness_contract::projection::SessionClientEvidence::RequiresFreshContext
+    );
+}
+
+fn receipt_panel_text(app: &App) -> String {
+    use crate::components::{Component, RenderContext};
+    let mut panel = crate::components::runtime_activity_panel::RuntimeActivityPanel::new();
+    panel.sync_from_app(app);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 80)).unwrap();
+    let skin = crate::skin::SkinConfig::default();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let mut context = RenderContext::new(frame, &skin);
+            panel.render(&mut context, area);
+        })
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+}
+
 fn make_msg(content: &str) -> TimelineEntry {
     TimelineEntry::Message {
         role: "user".into(),
@@ -150,6 +491,7 @@ fn execution_projection_owner_rejects_lower_revision_for_same_execution() {
         schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: "execution-monotonic".to_string(),
         agentic_collaboration: Default::default(),
+        terminal_axes: Default::default(),
         revision,
         cursor: revision,
         detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
@@ -241,6 +583,7 @@ fn execution_projection_without_live_facts_cannot_reuse_previous_execution_value
         schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: "execution-new".to_string(),
         agentic_collaboration: Default::default(),
+        terminal_axes: Default::default(),
         revision: 1,
         cursor: 1,
         detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
@@ -1029,6 +1372,7 @@ fn dropped_abort_then_projection_resync_clears_orphaned_root_preview() {
         schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: "execution-root".to_string(),
         agentic_collaboration: Default::default(),
+        terminal_axes: Default::default(),
         revision: 1,
         cursor: 1,
         detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

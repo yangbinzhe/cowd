@@ -174,12 +174,8 @@ fn readme_review_calls() -> Vec<FanoutToolCall> {
         call(
             "tool_orchestrate",
             json!({
-                "calls": [
-                    {"name": "read_file", "input": {"path": "README.md"}},
-                    {"name": "grep_search", "input": {"pattern": "runtime|gateway|surface|tui|memory|matrix|skill|tool|session", "path": "README.md", "-i": true, "head_limit": 80}},
-                    {"name": "glob_search", "input": {"pattern": "**/Cargo.toml"}}
-                ],
-                "max_concurrency": 8
+                "steps": [{"op": "call", "id": "readme", "tool": "read_file", "input": {"path": "README.md", "complete": true}}],
+                "return": "$readme"
             }),
         ),
     ]
@@ -299,6 +295,33 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readme_caller_renders_complete_schema_valid_programs() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let lease = tools::ToolHost::builtin("readme-schema", workspace.path()).pin_snapshot();
+        for prompt in [
+            "我已经更新，看是否最新的readme还有问题",
+            "审查 README、代码架构调用链和 runtime supervisor 接线是否一致",
+        ] {
+            let plan = plan_evidence(prompt);
+            for call in &plan.recommended_calls {
+                lease
+                    .validate_input(&call.name, &call.input)
+                    .expect("native input schema");
+                let rendered = compact_json(&call.input);
+                let decoded: Value = serde_json::from_str(&rendered).expect("unclipped example");
+                assert_eq!(decoded, call.input);
+                if call.name == "tool_orchestrate" {
+                    for step in call.input["steps"].as_array().expect("steps") {
+                        lease
+                            .validate_input(step["tool"].as_str().expect("tool"), &step["input"])
+                            .expect("nested native schema");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn readme_review_prefers_small_batch_evidence() {

@@ -15,6 +15,181 @@ use crate::projection::ProjectionDetailScope;
 use crate::turn::CancellationReceipt;
 
 pub const LIVE_CONTRACT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(try_from = "String", into = "String")]
+pub struct ReceiptCursor(String);
+
+impl TryFrom<String> for ReceiptCursor {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<ReceiptCursor> for String {
+    fn from(value: ReceiptCursor) -> Self {
+        value.0
+    }
+}
+
+impl ReceiptCursor {
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        if value.is_empty()
+            || value.starts_with('0')
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err("receipt cursor must be a positive decimal string");
+        }
+        let parsed = value
+            .parse::<u64>()
+            .map_err(|_| "receipt cursor exceeds u64")?;
+        i64::try_from(parsed).map_err(|_| "receipt cursor exceeds PostgreSQL BIGINT")?;
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn value(&self) -> Result<u64, &'static str> {
+        Self::parse(&self.0)?;
+        self.0.parse().map_err(|_| "invalid receipt cursor")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMessageAckRequest {
+    pub runtime_commit_cursor: ReceiptCursor,
+    pub content_digest: String,
+}
+
+impl SessionMessageAckRequest {
+    pub fn validate(&self) -> Result<u64, &'static str> {
+        let suffix = self
+            .content_digest
+            .strip_prefix("session-public-v1:sha256:")
+            .ok_or("unsupported receipt digest")?;
+        if suffix.len() != 64
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("invalid receipt digest");
+        }
+        self.runtime_commit_cursor.value()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum SessionPublicPayloadKind {
+    #[serde(rename = "session-public-v1")]
+    SessionPublicV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMessageReceiptUnavailableReason {
+    UnboundOrInvalidated,
+    PayloadTooLarge,
+    InvalidPublicPayload,
+    BindingMismatch,
+    AmbiguousTerminalInput,
+    TerminalInputMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "source", rename = "session_snapshot", deny_unknown_fields)]
+pub struct SessionReceiptSessionObservation {
+    pub request_id: String,
+    pub turn_id: String,
+    pub session_generation: String,
+    pub input_sequence: String,
+    pub presence_revision: String,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionReceiptOutboxObservation {
+    RuntimeOutboxUnknown,
+    RuntimeOutbox {
+        terminal_id: String,
+        revision: String,
+        status: String,
+        materialized_at_ms: Option<u64>,
+        runtime_commit_cursor: ReceiptCursor,
+        execution_id: Option<String>,
+        turn_id: String,
+        request_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMessageAck {
+    pub session_id: String,
+    pub message_id: String,
+    pub client_id: String,
+    pub runtime_commit_cursor: ReceiptCursor,
+    pub content_digest: String,
+    pub received_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionMessageAckHistory {
+    Historical { receipt: SessionMessageAck },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionMessageReceiptContext {
+    Unavailable {
+        reason: SessionMessageReceiptUnavailableReason,
+    },
+    Available {
+        payload_kind: SessionPublicPayloadKind,
+        payload_json: String,
+        session_id: String,
+        message_id: String,
+        client_id: String,
+        message_sequence: String,
+        runtime_commit_cursor: ReceiptCursor,
+        content_digest: String,
+        receipt: Option<SessionMessageAck>,
+        session_source: SessionReceiptSessionObservation,
+        outbox_observation: SessionReceiptOutboxObservation,
+    },
+}
+
+#[cfg(test)]
+mod receipt_wire_tests {
+    use super::*;
+
+    #[test]
+    fn r1_message_ack_wire_is_closed_and_cursor_is_lossless() {
+        for value in ["9007199254740993", "9223372036854775807"] {
+            let cursor = ReceiptCursor::parse(value).unwrap();
+            assert_eq!(serde_json::to_value(&cursor).unwrap(), value);
+            assert_eq!(cursor.value().unwrap().to_string(), value);
+        }
+        for value in [
+            "0",
+            "+1",
+            "01",
+            "-1",
+            "1.0",
+            "9223372036854775808",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            assert!(ReceiptCursor::parse(value).is_err());
+        }
+        assert!(serde_json::from_value::<SessionMessageAckRequest>(
+            serde_json::json!({"runtime_commit_cursor":1,"content_digest":"x"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<SessionMessageAckRequest>(serde_json::json!({"runtime_commit_cursor":"1","content_digest":"x","client_id":"injected"})).is_err());
+    }
+}
 pub const LIVE_ENVELOPE_CANONICAL_FIXTURE_JSON: &str =
     include_str!("../tests/fixtures/live-envelope-v1.json");
 pub const CAUSAL_SURFACE_TIMELINE_V1_FIXTURE_JSON: &str =

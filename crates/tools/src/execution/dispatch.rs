@@ -7,6 +7,7 @@ pub(crate) fn execute_with_lease(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    lease.observe_local_network_dispatch(name, input)?;
     match name {
         "bash" => {
             // `shell` is a backend selector, not part of the bash/powershell
@@ -97,7 +98,8 @@ pub(crate) fn execute_with_lease(
         }
         "grep_search" => {
             if input.get("searches").is_some() {
-                from_value::<GrepSearchBatchInput>(input).and_then(|parsed| run_grep_search_batch(lease, parsed))
+                from_value::<GrepSearchBatchInput>(input)
+                    .and_then(|parsed| run_grep_search_batch(lease, parsed))
             } else if input.get("language").is_some() {
                 from_value::<GrepSearchLanguageInput>(input)
                     .and_then(|parsed| run_grep_search_language(lease, parsed))
@@ -110,7 +112,7 @@ pub(crate) fn execute_with_lease(
             .and_then(|parsed| run_workspace_snapshot(lease, parsed)),
         "tool_cache_stats" => to_pretty_json(lease.cache().stats()),
         "tool_orchestrate" => run_orchestrate(lease, input),
-        "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
+        "web_fetch" => from_value::<WebFetchInput>(input).and_then(|input| run_web_fetch(lease, input)),
         "web_search" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "skill" => {
             // The merged family's own `action` field is not part of the per-action
@@ -156,12 +158,10 @@ pub(crate) fn execute_with_lease(
         "sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "config" => from_value::<ConfigInput>(input).and_then(|parsed| run_config(lease, parsed)),
         "plan_mode" => match input.get("action").and_then(|value| value.as_str()) {
-            Some("enter") => {
-                from_value::<EnterPlanModeInput>(input).and_then(|parsed| run_enter_plan_mode(lease, parsed))
-            }
-            Some("exit") => {
-                from_value::<ExitPlanModeInput>(input).and_then(|parsed| run_exit_plan_mode(lease, parsed))
-            }
+            Some("enter") => from_value::<EnterPlanModeInput>(input)
+                .and_then(|parsed| run_enter_plan_mode(lease, parsed)),
+            Some("exit") => from_value::<ExitPlanModeInput>(input)
+                .and_then(|parsed| run_exit_plan_mode(lease, parsed)),
             other => Err(format!(
                 "plan_mode action must be `enter` or `exit`, got {other:?}"
             )),
@@ -208,7 +208,25 @@ pub(crate) fn execute_with_lease(
                 .unwrap_or("python");
             let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let timeout_ms = input.get("timeout_ms").and_then(serde_json::Value::as_u64);
-            let result = execute_code_in_workspace(lang, code, timeout_ms, lease.workspace_root());
+            let input_files = input
+                .get("input_files")
+                .and_then(Value::as_array)
+                .ok_or("bounded_input_files_required_replan")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or("bounded_input_path_required")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = execute_code_in_workspace(
+                lang,
+                code,
+                timeout_ms,
+                lease.workspace_root(),
+                &input_files,
+            );
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "stdout": result.stdout,
                 "stderr": result.stderr,

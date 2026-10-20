@@ -10,6 +10,4442 @@ use harness_contract::agent_action::{
 use harness_contract::turn::TurnId;
 use sha2::{Digest, Sha256};
 
+fn own834_refusal_error<'outcome>(
+    outcome: &'outcome crate::RuntimeToolExecutionOutcome,
+    call_id: &str,
+    tool_name: &str,
+) -> &'outcome str {
+    assert_eq!(outcome.tool_use_id, call_id);
+    assert_eq!(outcome.tool_name, tool_name);
+    assert_eq!(outcome.status, crate::RuntimeToolExecutionStatus::Failed);
+    assert!(outcome.output.is_none());
+    assert!(outcome.evidence_ref.is_empty());
+    assert!(outcome.observed_evidence.is_empty());
+    outcome.error.as_deref().expect("refusal has original reason")
+}
+
+#[tokio::test]
+async fn process_read_confirmation_174_fences_original_cut_and_identity() {
+    for mutation in ["none", "source_race", "frame", "fingerprint", "policy"] {
+        let root = tempfile::tempdir().unwrap();
+        let (services, host, packet) = discovery_test_services(root.path(), true);
+        let commits = services.commit_service();
+        let planned = services
+            .graph_state_store()
+            .load(packet.graph_id())
+            .unwrap();
+        let ready = commits
+            .transition_node(
+                &planned,
+                packet.node_id(),
+                harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        commits
+            .transition_node(
+                &ready,
+                packet.node_id(),
+                harness_contract::execution_graph::ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-discovery".into(),
+            registry_revision: 0,
+        };
+        let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+        let step = bridge.begin_step().unwrap();
+        let step_id = step["step"]["identity"]["step_id"].as_str().unwrap();
+        let request_id = "confirmation-174";
+        let fingerprint = "confirmation-174-original-fingerprint";
+        assert!(bridge
+            .replay_or_begin_transport_request(request_id, fingerprint)
+            .unwrap()
+            .is_none());
+        let output = bridge
+            .execute_step_tool(
+                step_id,
+                1,
+                request_id,
+                "read_file",
+                r#"{"path":"src/a.rs","complete":true}"#,
+            )
+            .await
+            .unwrap();
+        assert!(crate::context_evidence::read_body_seal("read_file", &output).is_some());
+        let mut sent = serde_json::json!({
+            "kind":"tool_result", "run_id":packet.run_id(), "agent_id":packet.agent_id(),
+            "request_id":request_id, "origin_step_id":step_id, "output":output,
+        });
+        bridge
+            .complete_transport_request(request_id, fingerprint, &sent)
+            .unwrap();
+        let cut = bridge
+            .process_read_confirmation_revision("read_file", &sent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bridge
+                .process_read_confirmation_revision("edit", &sent)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            bridge
+                .process_read_confirmation_revision(
+                    "read_file",
+                    &serde_json::json!({"error":"failed"})
+                )
+                .unwrap(),
+            None
+        );
+        sent["protocol_version"] = 3.into();
+        sent["sequence"] = 1.into();
+        let frame = serde_json::to_vec(&sent).unwrap();
+        let digest = crate::context_evidence::read_sha256(&frame);
+        let stream = format!("session:{}", packet.session_id());
+        if mutation == "source_race" {
+            services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: stream.clone(),
+                    scope: crate::RuntimeEventScope::Session,
+                    kind: "test.original_source_advanced_after_send_cut".into(),
+                    status: None,
+                    actor: None,
+                    refs: Vec::new(),
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+        if mutation == "policy" {
+            let control = services
+                .session_execution_policy_control(packet.session_id())
+                .unwrap();
+            let mut policy = control.snapshot();
+            policy.revision += 1;
+            control.replace(policy).unwrap();
+        }
+        if mutation == "frame" {
+            sent["output"] = "not-the-sent-frame".into();
+        }
+        let supplied_fingerprint = if mutation == "fingerprint" {
+            "foreign-fingerprint"
+        } else {
+            fingerprint
+        };
+        let result = bridge.record_process_read_delivery(
+            "read_file",
+            supplied_fingerprint,
+            &sent,
+            &digest,
+            frame.len(),
+            cut,
+        );
+        let deliveries = || {
+            services
+                .event_store()
+                .list_stream(&stream)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == crate::context_evidence::PROCESS_DELIVERY_KIND)
+                .collect::<Vec<_>>()
+        };
+        if mutation == "none" {
+            result.unwrap();
+            let original = deliveries();
+            assert_eq!(original.len(), 1);
+            assert_eq!(original[0].sequence, cut + 1);
+            bridge
+                .record_process_read_delivery(
+                    "read_file",
+                    fingerprint,
+                    &sent,
+                    &digest,
+                    frame.len(),
+                    cut,
+                )
+                .unwrap();
+            assert_eq!(deliveries(), original);
+            let mut conflicting = sent.clone();
+            conflicting["output"] = "conflicting presentation".into();
+            let bytes = serde_json::to_vec(&conflicting).unwrap();
+            assert!(bridge
+                .record_process_read_delivery(
+                    "read_file",
+                    fingerprint,
+                    &conflicting,
+                    &crate::context_evidence::read_sha256(&bytes),
+                    bytes.len(),
+                    cut
+                )
+                .is_err());
+            assert_eq!(deliveries(), original);
+        } else {
+            let error = result.unwrap_err();
+            if mutation == "source_race" {
+                assert!(
+                    error.contains("confirmation unknown") && error.contains("revision mismatch"),
+                    "{error}"
+                );
+            }
+            assert!(deliveries().is_empty(), "{mutation}");
+        }
+        assert_eq!(
+            host.calls.load(Ordering::SeqCst),
+            1,
+            "{mutation}: confirmation must not redo ToolHost"
+        );
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+}
+
+#[test]
+fn evidence_retrieve_174_digest_only_receipt_is_not_acquisition_body() {
+    let text = "actual immutable small artifact";
+    let output = serde_json::json!({
+        "kind":"evidence_retrieve", "available":true, "evidence_ref":"artifact://original",
+        "sha256":crate::context_evidence::read_sha256(text.as_bytes()), "bytes":text.len(),
+        "total_chunks":1, "chunks":[{"index":0,"content":text}],
+    })
+    .to_string();
+    assert!(crate::context_evidence::read_body_seal("evidence_retrieve", &output).is_some());
+    let compact = crate::agentic::review_evidence::compact_read_receipt(&output);
+    assert!(crate::context_evidence::read_body_seal("evidence_retrieve", &compact).is_none());
+    let mut missing: serde_json::Value = serde_json::from_str(&output).unwrap();
+    missing["chunks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("content");
+    assert!(
+        crate::context_evidence::read_body_seal("evidence_retrieve", &missing.to_string())
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn r1_receipt_replay_uses_typed_file_observation_scope() {
+    const CHILD_ENV: &str = "COWD_R1_TYPED_FILE_REPLAY_CHILD";
+    const CHILD_VALUE: &str = "owned-loopback-v1";
+    const COMPLETION: &str = "COWD_R1_TYPED_FILE_REPLAY_MATRIX_COMPLETE";
+    if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(CHILD_VALUE)) {
+        let selector =
+            "agent_in_process_worker::tests::r1_receipt_replay_uses_typed_file_observation_scope";
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", selector, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, CHILD_VALUE)
+            .env("COWD_NETWORK_DOMAIN_MODE", "allow")
+            .env("COWD_NETWORK_DOMAIN_ALLOW", "127.0.0.1")
+            .env("COWD_NETWORK_DOMAIN_BLOCK", "")
+            .env("COWD_ALLOW_PRIVATE_NETWORK", "1")
+            .env("COWD_AUTO_CHECKPOINT", "1")
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .output()
+            .expect("spawn isolated real typed-file replay matrix");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(child.status.success()
+            && stdout.lines().any(|line| line == "running 1 test")
+            && stdout.lines().any(|line| line.starts_with(format!("test {selector} ...").as_str()))
+            && stdout.lines().any(|line| line.trim() == COMPLETION)
+            && stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+            "isolated typed-file replay matrix failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}", child.status);
+        for line in stdout.lines() {
+            println!("[typed-file-replay child stdout] {line}");
+        }
+        eprint!("{stderr}");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let network_url = format!("http://{}/evidence", listener.local_addr().unwrap());
+    let network_calls = Arc::new(AtomicU64::new(0));
+    let served = network_calls.clone();
+    let (network_start, network_ready) = tokio::sync::oneshot::channel::<()>();
+    let mut network_start = Some(network_start);
+    let mut network_server = Some(tokio::spawn(async move {
+        network_ready
+            .await
+            .expect("Running parent releases the real network probe");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 1024];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0 && headers.len() + count <= 8192);
+                headers.extend_from_slice(&buffer[..count]);
+                if headers.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+            }
+            assert!(headers.starts_with(b"GET /evidence HTTP/1.1\r\n"));
+            let body = "retained-network-evidence";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            served.fetch_add(1, Ordering::SeqCst);
+        }).await.unwrap();
+    }));
+    for (tool, value, reads) in [
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"file","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"network","op":"call","tool":"web_fetch","input":{"url":network_url,"prompt":"retain evidence"}}
+            ]}),
+            vec!["read:src/a.rs"],
+        ),
+        (
+            "read_file",
+            serde_json::json!({"path":"src/a.rs"}),
+            vec!["read:src/a.rs"],
+        ),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"first","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"second","op":"call","tool":"read_file","input":{"path":"src/b.rs"}}
+            ]}),
+            vec!["read:src/a.rs", "read:src/b.rs"],
+        ),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"file","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"metadata","op":"call","tool":"tool_search","input":{"query":"read_file"}}
+            ]}),
+            vec!["read:src/a.rs"],
+        ),
+        (
+            "edit",
+            serde_json::json!({"action":"write","path":"src/a.rs","content":"historical write"}),
+            vec!["read:src/a.rs", "read:.cowd/checkpoints"],
+        ),
+        (
+            "tool_search",
+            serde_json::json!({"query":"read_file"}),
+            vec![],
+        ),
+        (
+            "glob_search",
+            serde_json::json!({"pattern":"src/*.rs"}),
+            vec!["read:."],
+        ),
+        (
+            "glob_search",
+            serde_json::json!({"pattern":"src/*.rs","path":""}),
+            vec!["read:."],
+        ),
+        (
+            "execute_code",
+            serde_json::json!({"language":"bash","code":"printf replay-process-proof","input_files":[],"timeout_ms":5000}),
+            vec!["read:."],
+        ),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"read","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"compute","op":"compute","language":"python","code":"print('replay-compute-proof')"}
+            ]}),
+            vec!["read:."],
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let network = value["steps"]
+            .as_array()
+            .is_some_and(|steps| steps.iter().any(|step| step["tool"] == "web_fetch"));
+        let metadata = tools::ToolHost::builtin("typed-replay-permission-contract", root.path())
+            .pin_snapshot();
+        let required = crate::AuthorizationNegotiator::compile_effective_descriptor(
+            &metadata.describe_effect(tool, &value),
+            &value.to_string(),
+        )
+        .descriptor
+        .required_permission;
+        let mode = if required.rank() > PermissionMode::WorkspaceWrite.rank() {
+            required
+        } else {
+            PermissionMode::WorkspaceWrite
+        };
+        let mut names = vec![
+            "read_file",
+            "glob_search",
+            "execute_code",
+            "tool_orchestrate",
+            "tool_search",
+            "edit",
+        ];
+        let mut scopes = vec![
+            "read:.".into(),
+            "write:src/a.rs".into(),
+            "write:.cowd/checkpoints".into(),
+        ];
+        if network {
+            names.push("web_fetch");
+            scopes.push("network:*".into());
+        }
+        let (services, host, packet) =
+            discovery_configured_services(root.path(), false, &names, mode, scopes, true);
+        services
+            .release_recovered_producers()
+            .await
+            .expect("release real Runtime graph producers before dispatch");
+        assert!(services.execution_supervisor().graph_producers_released());
+        std::fs::write(
+            services.workspace_root().join("src/b.rs"),
+            "second historical observation",
+        )
+        .unwrap();
+        let (live, _, allowed) =
+            model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+        let mut executor = discovery_native_executor(&services, live, &packet, allowed);
+        let step = discovery_bound_step(&executor, &packet, "typed-replay", mode);
+        let input = normalize_delegated_resource_paths(
+            tool,
+            &value.to_string(),
+            services.workspace_root(),
+            services.path_identity_resolver(),
+            executor.resource_scopes.as_deref(),
+        )
+        .unwrap();
+        let binding =
+            crate::step_snapshot::StepCallBinding::provider(step.clone(), "typed-replay-call");
+        let authorization = discovery_authorization_with_mode_and_issuer(
+            &executor, tool, &input, "typed-replay-call", mode, Some(services.event_store()),
+        );
+        if network {
+            let inactive_binding =
+                crate::step_snapshot::StepCallBinding::provider(step.clone(), "inactive-parent");
+            let inactive_authorization = discovery_authorization_with_mode_and_issuer(
+                &executor, tool, &input, "inactive-parent", mode, Some(services.event_store()),
+            );
+            let error = executor
+                .execute_step_authorized_invocation_output(
+                    Some(&inactive_binding),
+                    "inactive-parent",
+                    &inactive_authorization,
+                    tool,
+                    &input,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("parent node is not running"), "{error}");
+            assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+            assert!(executor.receipts.lock().unwrap().is_empty());
+            assert_eq!(network_calls.load(Ordering::SeqCst), 0);
+        }
+        let commits = services.commit_service();
+        let planned = services
+            .graph_state_store()
+            .load(packet.graph_id())
+            .unwrap();
+        assert_eq!(
+            planned.node_statuses[packet.node_id()],
+            harness_contract::execution_graph::ExecutionNodeStatus::Planned
+        );
+        let ready = commits
+            .transition_node(
+                &planned,
+                packet.node_id(),
+                harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let running = commits
+            .transition_node(
+                &ready,
+                packet.node_id(),
+                harness_contract::execution_graph::ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        assert_eq!(
+            running.recovery_cursor.node_attempts[packet.node_id()],
+            packet.attempt
+        );
+        if network {
+            network_start.take().unwrap().send(()).unwrap();
+        }
+        let output = executor
+            .execute_step_authorized_invocation_output(
+                Some(&binding),
+                "typed-replay-call",
+                &authorization,
+                tool,
+                &input,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("typed replay tool={tool} input={input}: {error}"));
+        let call = crate::conversation::ModelToolCall {
+            id: "typed-replay-call".into(),
+            name: tool.into(),
+            input: input.clone(),
+            depends_on: vec![],
+            binding: Some(serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap()),
+        };
+        let parent = harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: packet.graph_id().into(),
+            node_id: packet.node_id().into(),
+        };
+        let key = binding.effect_idempotency_key();
+        let query = crate::execution_core::graph::ToolReceiptQuery {
+            step_binding: &binding,
+            parent_execution: &parent,
+            session_id: packet.session_id(),
+            policy_revision: executor.policy_revision,
+            idempotency_key: &key,
+            tool_use_id: &call.id,
+            tool_name: tool,
+            input: &input,
+        };
+        let original = commits
+            .query_completed_agent_tool_effect(&query)
+            .unwrap()
+            .unwrap();
+        let original_bytes = serde_json::to_vec(&original.invocation).unwrap();
+        if network {
+            assert!(original.invocation.effect.uses_network);
+            assert!(
+                output.model_text().contains("retained-network-evidence"),
+                "actual authorized network result must precede retained replay: {}",
+                output.model_text()
+            );
+            network_server.take().unwrap().await.unwrap();
+            assert_eq!(network_calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        if tool == "execute_code" {
+            let observations = &original.outcome.observed_evidence;
+            let facts = observations
+                .iter()
+                .filter_map(|observed| match &observed.target {
+                    harness_contract::context::EvidenceTargetIdentity::ToolExecution {
+                        execution,
+                    } => Some(execution),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(facts.len(), 1);
+            let fact = facts[0];
+            assert!(
+                matches!(&fact.terminal, harness_contract::context::ToolExecutionTerminal::Settled {
+                exit_code:Some(0), closure, ..
+            } if closure.init_reaped && closure.all_children_reaped && closure.network_disabled
+                && closure.project_read_only && closure.status_channel_protected)
+            );
+            assert!(fact.capture_complete);
+            assert!(fact.admission.inputs.is_empty());
+            assert_eq!(fact.admission.binding.call_key, key);
+            let body = services
+                .artifact_store()
+                .read(&fact.body, &fact.body.visibility_scope, None)
+                .await
+                .unwrap();
+            assert_eq!(body.len() as u64, fact.body.bytes);
+            assert_eq!(
+                crate::context_evidence::read_sha256(&body).trim_start_matches("sha256:"),
+                fact.body.sha256.trim_start_matches("sha256:")
+            );
+            assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
+        }
+        if tool == "execute_code"
+            || value["steps"]
+                .as_array()
+                .is_some_and(|steps| steps.iter().any(|step| step["op"] == "compute"))
+        {
+            assert!(original.invocation.effect.spawns_process);
+            assert!(
+                crate::tool_host::effect_file_accesses(&original.invocation.effect)
+                    .contains(&(".".into(), false))
+            );
+        }
+        let calls = host.calls.load(Ordering::SeqCst);
+        executor.sandbox_posture = harness_contract::policy::SandboxPosture::ReadOnlySandbox;
+        executor.resource_scopes = Some(reads.iter().map(|scope| scope.to_string()).collect());
+        host.tools
+            .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+        assert!(call
+            .binding
+            .as_ref()
+            .unwrap()
+            .resolve(Some(host.tools.pin_snapshot()))
+            .is_err());
+        let replay = executor
+            .recover_step_tool_receipt(&call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&replay.0).unwrap(), original_bytes);
+        if tool == "tool_search" {
+            let receipt: serde_json::Value =
+                serde_json::from_str(replay.1.output.as_deref().unwrap()).unwrap();
+            assert_eq!(receipt["activation_candidates"], serde_json::json!([]));
+            assert_eq!(receipt["provenance"], "retained_replay");
+        } else {
+            assert_eq!(replay.1.output.as_deref(), Some(output.model_text()));
+        }
+        for missing in 0..reads.len() {
+            let mut narrow = reads
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect::<Vec<_>>();
+            narrow.remove(missing);
+            executor.resource_scopes = Some(narrow);
+            let error = executor
+                .recover_step_tool_receipt(&call)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("receipt read is outside the bound Agent resource lease"),
+                "{tool}: {error}"
+            );
+        }
+        executor.resource_scopes = Some(vec!["read:.".into()]);
+        assert!(executor
+            .recover_step_tool_receipt(&call)
+            .await
+            .unwrap()
+            .is_some());
+        executor.resource_scopes = None;
+        assert!(executor
+            .recover_step_tool_receipt(&call)
+            .await
+            .unwrap()
+            .is_some());
+        let unchanged = commits
+            .query_completed_agent_tool_effect(&query)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&unchanged.invocation).unwrap(),
+            original_bytes
+        );
+        assert_eq!(unchanged.outcome.output, original.outcome.output);
+        assert_eq!(
+            unchanged.outcome.observed_evidence,
+            original.outcome.observed_evidence
+        );
+        assert_eq!(unchanged.completed_at_ms, original.completed_at_ms);
+        assert_eq!(host.calls.load(Ordering::SeqCst), calls);
+        let mut conflict = call.clone();
+        conflict.id.push_str("-foreign");
+        assert!(executor.recover_step_tool_receipt(&conflict).await.is_err());
+        if tool == "read_file" {
+            for path in ["../outside.txt", "/outside-replay-scope.txt"] {
+                let mut changed_input = call.clone();
+                changed_input.input = serde_json::json!({"path":path}).to_string();
+                assert!(
+                    executor
+                        .recover_step_tool_receipt(&changed_input)
+                        .await
+                        .map(|receipt| receipt.is_none())
+                        .unwrap_or(true),
+                    "{path}"
+                );
+            }
+        }
+        assert_eq!(host.calls.load(Ordering::SeqCst), calls);
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+    assert!(network_start.is_none());
+    assert!(network_server.is_none());
+    assert_eq!(network_calls.load(Ordering::SeqCst), 1);
+    println!("\n{COMPLETION}");
+}
+
+#[tokio::test]
+async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_configured_services(
+        root.path(),
+        false,
+        &[
+            "read_file",
+            "tool_orchestrate",
+            "tool_search",
+            "working_context",
+        ],
+        PermissionMode::ReadOnly,
+        vec!["read:src/a.rs".into()],
+        true,
+    );
+    let (live, _, allowed) =
+        model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+    let executor = discovery_native_executor(&services, live, &packet, allowed);
+    assert!(executor.tool_batch.is_some());
+    let step = discovery_bound_step(
+        &executor,
+        &packet,
+        "native-controls-search",
+        PermissionMode::ReadOnly,
+    );
+    let control_input = r#"{"operation":"list"}"#;
+    let control_binding =
+        crate::step_snapshot::StepCallBinding::provider(step.clone(), "native-context");
+    let authorization = discovery_native_authorization(
+        &executor,
+        "working_context",
+        control_input,
+        "native-context",
+    );
+    let output = executor
+        .execute_step_authorized_invocation_output(
+            Some(&control_binding),
+            "native-context",
+            &authorization,
+            "working_context",
+            control_input,
+        )
+        .await
+        .unwrap();
+    let control: serde_json::Value = serde_json::from_str(output.model_text()).unwrap();
+    assert_eq!(control["kind"], "runtime.working_context");
+    assert_eq!(control["coverage"]["active_references"], 0);
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    let query = "select:edit,web_fetch,execute_code,bash,checkpoint,read_file";
+    assert!(!step
+        .lease()
+        .search(query, 5)
+        .activation_candidates
+        .contains(&"read_file".into()));
+    let mut replay_call = None;
+    for (index, max_results) in [None, Some(1), Some(7)].into_iter().enumerate() {
+        let mut value = serde_json::json!({"query":query});
+        if let Some(limit) = max_results {
+            value["max_results"] = serde_json::json!(limit);
+        }
+        let input = value.to_string();
+        let call_id = format!("native-search-{index}");
+        let binding = crate::step_snapshot::StepCallBinding::provider(step.clone(), &call_id);
+        let authorization =
+            discovery_native_authorization(&executor, "tool_search", &input, &call_id);
+        let before = host.calls.load(Ordering::SeqCst);
+        let forged_id = format!("{call_id}-forged");
+        let forged_binding =
+            crate::step_snapshot::StepCallBinding::provider(step.clone(), &forged_id);
+        let mut forged =
+            discovery_native_authorization(&executor, "tool_search", &input, &forged_id);
+        forged.authorization_lease.signature.push_str("-forged");
+        let error = executor
+            .execute_step_authorized_invocation_output(
+                Some(&forged_binding),
+                &forged_id,
+                &forged,
+                "tool_search",
+                &input,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("signature"), "{error}");
+        assert_eq!(host.calls.load(Ordering::SeqCst), before);
+        assert!(executor
+            .execute_authorized_output(&authorization, "tool_search", &input)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("production_tool_origin_required"));
+        assert!(executor
+            .execute_authorized_invocation_output(&call_id, &authorization, "tool_search", &input)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("production_tool_origin_required"));
+        let output = executor
+            .execute_step_authorized_invocation_output(
+                Some(&binding),
+                &call_id,
+                &authorization,
+                "tool_search",
+                &input,
+            )
+            .await
+            .unwrap();
+        let receipt: harness_contract::tool::ToolDiscoveryReceipt =
+            serde_json::from_str(output.model_text()).unwrap();
+        assert_eq!(receipt.query, query);
+        assert_eq!(receipt.catalog_revision, step.lease().revision());
+        assert_eq!(receipt.activation_candidates, vec!["read_file"]);
+        assert_eq!(receipt.descriptors.len(), 1);
+        assert_eq!(receipt.descriptors[0].canonical_id, "read_file");
+        assert_eq!(host.calls.load(Ordering::SeqCst), before + 1);
+        if index == 0 {
+            replay_call = Some(crate::conversation::ModelToolCall {
+                id: call_id,
+                name: "tool_search".into(),
+                input,
+                depends_on: Vec::new(),
+                binding: Some(
+                    serde_json::from_value(serde_json::to_value(binding).unwrap()).unwrap(),
+                ),
+            });
+        }
+    }
+    let missing_query = r#"{"query":"not_a_real_tool_51f72"}"#;
+    let missing_binding =
+        crate::step_snapshot::StepCallBinding::provider(step.clone(), "native-empty-search");
+    let authorization = discovery_native_authorization(
+        &executor,
+        "tool_search",
+        missing_query,
+        "native-empty-search",
+    );
+    let output = executor
+        .execute_step_authorized_invocation_output(
+            Some(&missing_binding),
+            "native-empty-search",
+            &authorization,
+            "tool_search",
+            missing_query,
+        )
+        .await
+        .unwrap();
+    let empty: harness_contract::tool::ToolDiscoveryReceipt =
+        serde_json::from_str(output.model_text()).unwrap();
+    assert!(empty.descriptors.is_empty() && empty.activation_candidates.is_empty());
+    for (index, (invalid, field)) in [
+        (
+            serde_json::json!({"query":"read","max_results":0}),
+            "max_results",
+        ),
+        (
+            serde_json::json!({"query":"read","max_results":-1}),
+            "max_results",
+        ),
+        (
+            serde_json::json!({"query":"read","max_results":0.5}),
+            "max_results",
+        ),
+        (serde_json::json!({"max_results":1}), "query"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let call_id = format!("native-invalid-search-{index}");
+        let binding = crate::step_snapshot::StepCallBinding::provider(step.clone(), &call_id);
+        let input = invalid.to_string();
+        let authorization =
+            discovery_native_authorization(&executor, "tool_search", &input, &call_id);
+        let before = executor.receipts.lock().unwrap().len();
+        let calls_before = host.calls.load(Ordering::SeqCst);
+        let error = executor
+            .execute_step_authorized_invocation_output(
+                Some(&binding),
+                &call_id,
+                &authorization,
+                "tool_search",
+                &input,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("input violates its pinned schema") && error.contains(field),
+            "{error}"
+        );
+        assert_eq!(executor.receipts.lock().unwrap().len(), before);
+        assert_eq!(host.calls.load(Ordering::SeqCst), calls_before);
+    }
+    let call = replay_call.unwrap();
+    let binding = call.binding.as_ref().unwrap();
+    let parent = harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: executor.execution_id.clone(),
+        node_id: executor.node_id.clone(),
+    };
+    let key = binding.effect_idempotency_key();
+    let query_context = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding: binding,
+        parent_execution: &parent,
+        session_id: &executor.session_id,
+        policy_revision: executor.policy_revision,
+        idempotency_key: &key,
+        tool_use_id: &call.id,
+        tool_name: &call.name,
+        input: &call.input,
+    };
+    let historical = services
+        .commit_service()
+        .query_completed_agent_tool_effect(&query_context)
+        .unwrap()
+        .unwrap();
+    let history: harness_contract::tool::ToolDiscoveryReceipt =
+        serde_json::from_str(historical.outcome.output.as_deref().unwrap()).unwrap();
+    assert!(!history.activation_candidates.is_empty());
+    let revision = services
+        .event_store()
+        .stream_revision(&format!("execution-effect:{key}"))
+        .unwrap();
+    let before = host.calls.load(Ordering::SeqCst);
+    host.tools
+        .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+    let (invocation, replay, _) = executor
+        .recover_step_tool_receipt(&call)
+        .await
+        .unwrap()
+        .unwrap();
+    let projection: serde_json::Value =
+        serde_json::from_str(replay.output.as_deref().unwrap()).unwrap();
+    let replay_receipt: harness_contract::tool::ToolDiscoveryReceipt =
+        serde_json::from_value(projection.clone()).unwrap();
+    assert_eq!(projection["provenance"], "retained_replay");
+    assert_eq!(replay_receipt.catalog_revision, history.catalog_revision);
+    assert_eq!(replay_receipt.descriptors, history.descriptors);
+    assert_eq!(replay_receipt.query, history.query);
+    assert!(replay_receipt.activation_candidates.is_empty());
+    assert_eq!(invocation.catalog_revision, step.lease().revision());
+    assert_eq!(host.calls.load(Ordering::SeqCst), before);
+    assert_eq!(
+        services
+            .event_store()
+            .stream_revision(&format!("execution-effect:{key}"))
+            .unwrap(),
+        revision
+    );
+    let unchanged = services
+        .commit_service()
+        .query_completed_agent_tool_effect(&query_context)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.outcome.output, historical.outcome.output);
+    assert!(replay
+        .observed_evidence
+        .iter()
+        .all(|evidence| evidence.provenance
+            == harness_contract::context::ObservedEvidenceProvenance::RetainedReplay));
+    let definitions = step
+        .lease()
+        .snapshot()
+        .catalog
+        .definitions(Some(&executor.allowed_tools))
+        .into_iter()
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name,
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect();
+    let replay_runtime = discovery_runtime(
+        &services,
+        &packet,
+        Arc::new(executor),
+        definitions,
+        Arc::new(AtomicU64::new(0)),
+        crate::CowdEventBus::new(),
+    );
+    replay_runtime.r1_assert_replay_activation_for_test(replay.output.as_deref().unwrap());
+
+    let process_root = tempfile::tempdir().unwrap();
+    let (process_services, process_host, process_packet) = discovery_configured_services(
+        process_root.path(),
+        true,
+        &[
+            "read_file",
+            "tool_orchestrate",
+            "tool_search",
+            "working_context",
+        ],
+        PermissionMode::ReadOnly,
+        vec!["read:src/a.rs".into()],
+        true,
+    );
+    let selection = AgentModelSelection {
+        model: process_packet.model_lease.clone(),
+        provider: "local-discovery".into(),
+        registry_revision: 0,
+    };
+    let bridge =
+        ProcessJsonlToolSession::prepare(&process_services, &process_packet, &selection).unwrap();
+    let response = bridge.begin_step().unwrap();
+    let step_id = response["step"]["identity"]["step_id"].as_str().unwrap();
+    let output = bridge
+        .execute_step_tool(
+            step_id,
+            1,
+            "process-context",
+            "working_context",
+            control_input,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&output).unwrap()["kind"],
+        "runtime.working_context"
+    );
+    let output = bridge
+        .execute_step_tool(
+            step_id,
+            2,
+            "process-search",
+            "tool_search",
+            &serde_json::json!({"query":query,"max_results":1}).to_string(),
+        )
+        .await
+        .unwrap();
+    let receipt: harness_contract::tool::ToolDiscoveryReceipt =
+        serde_json::from_str(&output).unwrap();
+    assert_eq!(receipt.activation_candidates, vec!["read_file"]);
+    assert_eq!(
+        receipt.catalog_revision,
+        process_host.tools.pin_snapshot().revision()
+    );
+    assert_eq!(process_host.calls.load(Ordering::SeqCst), 2);
+    assert!(bridge
+        .execute_tool(
+            "process-unbound-search",
+            "tool_search",
+            r#"{"query":"read"}"#
+        )
+        .await
+        .unwrap_err()
+        .contains("production_tool_origin_required"));
+    assert_eq!(process_host.calls.load(Ordering::SeqCst), 2);
+    let unknown_process = r#"{"steps":[{"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},{"id":"unknown","op":"not_an_operation"}]}"#;
+    let error = bridge
+        .execute_step_tool(
+            step_id,
+            3,
+            "process-unknown",
+            "tool_orchestrate",
+            unknown_process,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("input violates its pinned schema") && error.contains("$.steps[1].op"),
+        "{error}"
+    );
+    assert_eq!(process_host.calls.load(Ordering::SeqCst), 2);
+    let denied_process = r#"{"steps":[{"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},{"id":"write","op":"call","tool":"edit","input":{"action":"write","path":"src/a.rs","content":"DENIED"}}]}"#;
+    let pinned = bridge.steps.lock().unwrap().back().unwrap().clone();
+    let denied_binding = crate::step_snapshot::StepCallBinding::process(
+        pinned.clone(),
+        process_packet.run_id(),
+        4,
+        "process-unauthorized-child",
+    );
+    pinned
+        .validate_call(
+            &denied_binding.origin,
+            process_packet.session_id(),
+            "process-unauthorized-child",
+            "tool_orchestrate",
+            denied_process,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap();
+    let receipts_before = bridge.executor.receipts.lock().unwrap().len();
+    let error = bridge
+        .execute_step_tool(
+            step_id,
+            4,
+            "process-unauthorized-child",
+            "tool_orchestrate",
+            denied_process,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("authorization denied") || error.contains("authorization unavailable"),
+        "{error}"
+    );
+    assert!(!error.contains("pinned schema"), "{error}");
+    assert_eq!(process_host.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        bridge.executor.receipts.lock().unwrap().len(),
+        receipts_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(process_services.workspace_root().join("src/a.rs")).unwrap(),
+        "narrow-read-proof"
+    );
+
+    let axis_root = tempfile::tempdir().unwrap();
+    let (axis_services, axis_host, axis_packet) = discovery_configured_services(
+        axis_root.path(),
+        false,
+        &[
+            "read_file",
+            "edit",
+            "web_fetch",
+            "execute_code",
+            "tool_orchestrate",
+        ],
+        PermissionMode::DangerFullAccess,
+        vec!["write:.".into(), "network:*".into()],
+        false,
+    );
+    let mut axis_policy = axis_services
+        .session_execution_policy(axis_packet.session_id())
+        .unwrap();
+    axis_policy.permission_mode = PermissionMode::ReadOnly;
+    axis_services.publish_session_execution_policy(
+        axis_packet.session_id(),
+        crate::permissions::SessionExecutionPolicyControl::from_policy(axis_policy),
+    );
+    let (live, _, allowed) =
+        model_loop::activate_native_tools(axis_host.clone(), &axis_packet, true).unwrap();
+    assert_eq!(allowed, axis_packet.allowed_tools.iter().cloned().collect());
+    let mut axis_executor = discovery_native_executor(&axis_services, live, &axis_packet, allowed);
+    let axis_step = discovery_bound_step(
+        &axis_executor,
+        &axis_packet,
+        "single-axis",
+        PermissionMode::DangerFullAccess,
+    );
+    let mixed = serde_json::json!({"steps":[
+        {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+        {"id":"first","op":"call","tool":"edit","input":{"action":"write","path":"src/a.rs","content":"DENIED"}},
+        {"id":"second","op":"call","tool":"edit","input":{"action":"write","path":"src/sibling.rs","content":"DENIED"}},
+        {"id":"network","op":"call","tool":"web_fetch","input":{"url":"https://example.invalid","prompt":"never dispatch"}}
+    ]});
+    let complete = vec![
+        "read:src/a.rs",
+        "write:src/a.rs",
+        "write:src/sibling.rs",
+        "write:.cowd/checkpoints",
+        "network:*",
+    ];
+    axis_executor.resource_scopes = Some(complete.iter().map(|scope| scope.to_string()).collect());
+    tool_turn::reject_orchestrated_tools_outside_allow_list(
+        &axis_executor.allowed_tools,
+        "tool_orchestrate",
+        &mixed.to_string(),
+    )
+    .unwrap();
+    axis_executor
+        .enforce_resource_ceiling("tool_orchestrate", &mixed.to_string())
+        .unwrap();
+    let normalized = normalize_delegated_resource_paths(
+        "tool_orchestrate",
+        &mixed.to_string(),
+        axis_services.workspace_root(),
+        axis_services.path_identity_resolver(),
+        axis_executor.resource_scopes.as_deref(),
+    )
+    .unwrap();
+    for missing in [
+        "network:*",
+        "write:src/a.rs",
+        "write:src/sibling.rs",
+        "write:.cowd/checkpoints",
+    ] {
+        axis_executor.resource_scopes = Some(
+            complete
+                .iter()
+                .filter(|scope| **scope != missing)
+                .map(|scope| scope.to_string())
+                .collect(),
+        );
+        let call_id = format!("single-axis-{missing}");
+        let authorization = discovery_authorization_with_mode(
+            &axis_executor,
+            "tool_orchestrate",
+            &normalized,
+            &call_id,
+            PermissionMode::DangerFullAccess,
+        );
+        let binding = crate::step_snapshot::StepCallBinding::provider(axis_step.clone(), &call_id);
+        let error = axis_executor
+            .execute_step_authorized_invocation_output(
+                Some(&binding),
+                &call_id,
+                &authorization,
+                "tool_orchestrate",
+                &normalized,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("network/File operation resource lease"),
+            "{missing}: {error}"
+        );
+        assert_eq!(axis_host.calls.load(Ordering::SeqCst), 0);
+        assert!(axis_executor.receipts.lock().unwrap().is_empty());
+    }
+    let compute = serde_json::json!({"steps":[
+        {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+        {"id":"compute","op":"compute","language":"python","code":"print(1)"}
+    ]})
+    .to_string();
+    axis_executor.resource_scopes = Some(vec!["read:.".into()]);
+    tool_turn::reject_orchestrated_tools_outside_allow_list(
+        &axis_executor.allowed_tools,
+        "tool_orchestrate",
+        &compute,
+    )
+    .unwrap();
+    axis_executor
+        .enforce_resource_ceiling("tool_orchestrate", &compute)
+        .unwrap();
+    axis_executor.resource_scopes = Some(vec!["read:src/a.rs".into()]);
+    let authorization = discovery_authorization_with_mode(
+        &axis_executor,
+        "tool_orchestrate",
+        &compute,
+        "single-axis-compute",
+        PermissionMode::DangerFullAccess,
+    );
+    let binding =
+        crate::step_snapshot::StepCallBinding::provider(axis_step.clone(), "single-axis-compute");
+    assert!(axis_executor
+        .execute_step_authorized_invocation_output(
+            Some(&binding),
+            "single-axis-compute",
+            &authorization,
+            "tool_orchestrate",
+            &compute
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("network/File operation resource lease"));
+    axis_executor.resource_scopes = Some(complete.iter().map(|scope| scope.to_string()).collect());
+    axis_executor.allowed_tools.remove("web_fetch");
+    let authorization = discovery_authorization_with_mode(
+        &axis_executor,
+        "tool_orchestrate",
+        &normalized,
+        "single-axis-child",
+        PermissionMode::DangerFullAccess,
+    );
+    let binding =
+        crate::step_snapshot::StepCallBinding::provider(axis_step.clone(), "single-axis-child");
+    let child_error = axis_executor
+        .execute_step_authorized_invocation_output(
+            Some(&binding),
+            "single-axis-child",
+            &authorization,
+            "tool_orchestrate",
+            &normalized,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(child_error.contains("allow-list"), "{child_error}");
+    axis_executor.allowed_tools.insert("web_fetch".into());
+    let unknown = r#"{"steps":[{"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},{"id":"unknown","op":"not_an_operation"}]}"#;
+    let unknown_effect = axis_step
+        .lease()
+        .describe_effect("tool_orchestrate", &serde_json::from_str(unknown).unwrap());
+    assert_eq!(
+        unknown_effect.effect_kind,
+        harness_contract::tool::ToolEffectKind::Unknown
+    );
+    let error = tool_turn::reject_orchestrated_tools_outside_allow_list(
+        &axis_executor.allowed_tools,
+        "tool_orchestrate",
+        unknown,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("tool_orchestrate input is invalid"),
+        "{error}"
+    );
+    let mode_input = r#"{"action":"write","path":"src/a.rs","content":"DENIED"}"#;
+    let effect = axis_executor
+        .registered_tool_effect("edit", &serde_json::from_str(mode_input).unwrap())
+        .unwrap();
+    let policy = permission_policy(None, PermissionMode::ReadOnly, &axis_executor.allowed_tools);
+    let denied = crate::AuthorizationNegotiator::new().assess_effective(
+        &policy,
+        &crate::AuthorizationRequest {
+            principal_id: "single-axis-mode".into(),
+            capability: "edit".into(),
+            input: mode_input.into(),
+            idempotency_key: "single-axis-mode".into(),
+            effect,
+            parent_ceiling: PermissionMode::DangerFullAccess,
+            parent_lease_id: None,
+            policy_revision: axis_executor.policy_revision,
+            recovery_scope: "single-axis".into(),
+            context: crate::PermissionContext::default(),
+            safe_alternatives: Vec::new(),
+        },
+    );
+    assert!(denied.assessment.lease.is_none());
+    axis_executor.resource_scopes = Some(axis_packet.resource_scopes.clone());
+    assert!(axis_executor
+        .prepare_step_catalog(PermissionMode::DangerFullAccess)
+        .is_ok());
+    assert!(axis_executor
+        .prepare_step_catalog(PermissionMode::ReadOnly)
+        .is_err());
+    assert!(axis_executor.receipts.lock().unwrap().is_empty());
+    let definitions = axis_step
+        .lease()
+        .snapshot()
+        .catalog
+        .definitions(Some(&axis_executor.allowed_tools))
+        .into_iter()
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name,
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect();
+    let counter = Arc::new(AtomicU64::new(0));
+    let bus = crate::CowdEventBus::new();
+    let _scope = bus.enter_execution(crate::CowdExecutionContext {
+        execution_id: axis_packet.run_id().into(),
+        session_id: axis_packet.session_id().into(),
+        turn_id: axis_packet
+            .assignment
+            .execution_identity
+            .turn_id()
+            .unwrap()
+            .into(),
+    });
+    let mut runtime = discovery_runtime(
+        &axis_services,
+        &axis_packet,
+        Arc::new(axis_executor),
+        definitions,
+        counter.clone(),
+        bus.clone(),
+    );
+    let error = runtime
+        .r1_dispatch_provider_step_for_test(discovery_request())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("agent_tool_inventory_drift"), "{error}");
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+    assert_eq!(axis_host.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read_to_string(axis_services.workspace_root().join("src/a.rs")).unwrap(),
+        "narrow-read-proof"
+    );
+    assert_eq!(
+        std::fs::read_to_string(axis_services.workspace_root().join("src/sibling.rs")).unwrap(),
+        "untouched-sibling"
+    );
+    assert!(axis_services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+    assert!(process_services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+    assert!(services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
+
+fn discovery_bootstrap_request(
+    executor: &ScopedRuntimeToolExecutor,
+    binding: crate::step_snapshot::StepCallBinding,
+    tool: &str,
+    input: &str,
+) -> RuntimeToolExecutionRequest {
+    let mut request =
+        RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
+            tool_use_id: binding.origin.call_id.clone(),
+            tool_name: tool.into(),
+            input: input.into(),
+            depends_on: Vec::new(),
+        });
+    request.governed_plan_id = executor.execution_id.clone();
+    request.session_id = Some(executor.session_id.clone());
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: executor.execution_id.clone(),
+        node_id: executor.node_id.clone(),
+    });
+    request.parent_execution_attempt = Some(executor.attempt);
+    request.policy_revision = executor.policy_revision;
+    request.sandbox_posture = executor.sandbox_posture;
+    request.governed_plan_revision = 1;
+    request.observation_wave_sequence = 1;
+    request.idempotency_key = binding.effect_idempotency_key();
+    request.authorization = Some(discovery_native_authorization(
+        executor,
+        tool,
+        input,
+        &binding.origin.call_id,
+    ));
+    request.compiled_invocation = Some(
+        binding
+            .prepare_invocation(
+                executor.pin_step_catalog(),
+                tool,
+                &serde_json::from_str(input).unwrap(),
+            )
+            .unwrap(),
+    );
+    request.step_binding = Some(binding);
+    request
+}
+
+fn discovery_bootstrap_variant(
+    original: &crate::step_snapshot::BoundStep,
+    packet: &AgentTaskPacket,
+    mutation: &str,
+) -> Arc<crate::step_snapshot::BoundStep> {
+    let mut identity = original.snapshot().identity.clone();
+    identity.step_id = format!("{}-{mutation}", identity.step_id);
+    let mut names = original
+        .snapshot()
+        .tools
+        .iter()
+        .map(|tool| tool.tool_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut expiry = chrono::Utc::now().timestamp_millis() + 60_000;
+    match mutation {
+        "session" => identity.session_id = "foreign-session".into(),
+        "run" => identity.run_ref = Some("foreign-run".into()),
+        "missing-run" => identity.run_ref = None,
+        "execution" => {
+            identity.execution_id = Some(if identity.attempt.is_none() {
+                packet.graph_id().into()
+            } else {
+                packet.run_id().into()
+            })
+        }
+        "attempt" => identity.attempt = Some(identity.attempt.unwrap_or(0) + 100),
+        "unadvertised" => {
+            names.remove("tool_search");
+        }
+        "expired" => expiry = chrono::Utc::now().timestamp_millis() - 1,
+        "worker" | "system" | "provider-source" | "sequence" => {}
+        _ => panic!("unknown bootstrap mutation"),
+    }
+    let definitions = original
+        .lease()
+        .snapshot()
+        .catalog
+        .definitions(Some(&names))
+        .into_iter()
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name,
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect::<Vec<_>>();
+    Arc::new(
+        crate::step_snapshot::BoundStep::bind(
+            identity,
+            original.lease().clone(),
+            &definitions,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            original.snapshot().related_revisions.clone(),
+            expiry,
+        )
+        .unwrap()
+        .with_parent("admitted-parent"),
+    )
+}
+
+#[tokio::test]
+async fn r1_composite_discovery_bootstrap_uses_canonical_durable_readonly_entry() {
+    for process in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (services, host, packet) = discovery_test_services(root.path(), process);
+        let packet_before = serde_json::to_vec(&packet).unwrap();
+        let binding_before = serde_json::to_vec(packet.binding.as_ref().unwrap()).unwrap();
+        assert_eq!(packet.allowed_tools, vec!["read_file", "tool_orchestrate"]);
+        assert!(!packet
+            .binding
+            .as_ref()
+            .unwrap()
+            .tool_contract_refs
+            .contains(&"tool_search".into()));
+        assert!(!packet
+            .binding
+            .as_ref()
+            .unwrap()
+            .effective_capabilities
+            .contains(&harness_contract::agent::AgentCapability::Search));
+        assert_ne!(packet.run_id(), packet.graph_id());
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-bootstrap".into(),
+            registry_revision: 0,
+        };
+        let calls = Arc::new(AtomicU64::new(0));
+        let bus = crate::CowdEventBus::new();
+        let _scope = bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: packet.run_id().into(),
+            session_id: packet.session_id().into(),
+            turn_id: packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap()
+                .into(),
+        });
+        let (live, definitions, allowed) =
+            model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+        let native = Arc::new(discovery_native_executor(&services, live, &packet, allowed));
+        let bridge = process
+            .then(|| ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap());
+        let mut runtime = discovery_runtime(
+            &services,
+            &packet,
+            native.clone(),
+            definitions,
+            calls.clone(),
+            bus.clone(),
+        )
+        .with_checkpoint_identity(
+            "bootstrap-workspace",
+            Some(packet.assignment.execution_identity.clone()),
+        );
+        let step = if let Some(bridge) = &bridge {
+            bridge.begin_step().unwrap();
+            bridge.steps.lock().unwrap().back().unwrap().clone()
+        } else {
+            runtime
+                .r1_dispatch_provider_step_for_test(discovery_request())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let executor = bridge
+            .as_ref()
+            .map_or(native.as_ref(), |bridge| bridge.executor.as_ref());
+        assert!(executor.tool_batch.is_some());
+        assert_eq!(
+            step.snapshot().identity.run_ref.as_deref(),
+            Some(packet.run_id())
+        );
+        assert_eq!(
+            step.snapshot().identity.execution_id.as_deref(),
+            Some(if process {
+                packet.graph_id()
+            } else {
+                packet.run_id()
+            })
+        );
+        assert_eq!(
+            step.snapshot().identity.attempt,
+            process.then_some(packet.attempt)
+        );
+        if !process {
+            assert_eq!(
+                step.snapshot().identity.actor_ref.as_deref(),
+                Some(packet.assignment.execution_identity.principal_id())
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), u64::from(!process));
+        let input = r#"{"query":"select:read_file,edit,web_fetch,bash","max_results":10}"#;
+        let call_id = "canonical-bootstrap-search";
+        let binding = if process {
+            crate::step_snapshot::StepCallBinding::process(
+                step.clone(),
+                packet.run_id(),
+                1,
+                call_id,
+            )
+        } else {
+            crate::step_snapshot::StepCallBinding::provider(step.clone(), call_id)
+        };
+        let output = if let Some(bridge) = &bridge {
+            bridge
+                .execute_step_tool(
+                    &step.snapshot().identity.step_id,
+                    1,
+                    call_id,
+                    "tool_search",
+                    input,
+                )
+                .await
+                .unwrap()
+        } else {
+            let authorization =
+                discovery_native_authorization(executor, "tool_search", input, call_id);
+            executor
+                .execute_step_authorized_invocation_output(
+                    Some(&binding),
+                    call_id,
+                    &authorization,
+                    "tool_search",
+                    input,
+                )
+                .await
+                .unwrap()
+                .model_text()
+                .to_string()
+        };
+        let receipt: harness_contract::tool::ToolDiscoveryReceipt =
+            serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt.activation_candidates, vec!["read_file"]);
+        assert_eq!(
+            receipt
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.canonical_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file"]
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        discovery_assert_receipt_revision(
+            executor,
+            &binding,
+            "tool_search",
+            input,
+            step.lease().revision(),
+        );
+        let durable_binding =
+            serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap();
+        let replay = executor
+            .recover_step_tool_receipt(&crate::conversation::ModelToolCall {
+                id: call_id.into(),
+                name: "tool_search".into(),
+                input: input.into(),
+                depends_on: Vec::new(),
+                binding: Some(durable_binding),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let retained: serde_json::Value =
+            serde_json::from_str(replay.1.output.as_deref().unwrap()).unwrap();
+        assert_eq!(retained["provenance"], "retained_replay");
+        assert_eq!(retained["activation_candidates"], serde_json::json!([]));
+        let success_count = services
+            .commit_service()
+            .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
+            .unwrap()
+            .len();
+        for mutation in [
+            "session",
+            "run",
+            "missing-run",
+            "execution",
+            "attempt",
+            "unadvertised",
+            "expired",
+            "system",
+            "provider-source",
+            "worker",
+            "sequence",
+        ] {
+            let altered = discovery_bootstrap_variant(&step, &packet, mutation);
+            let call_id = format!("bootstrap-negative-{process}-{mutation}");
+            let mut hostile = if mutation == "system" {
+                crate::step_snapshot::StepCallBinding::system(altered, "admitted-parent", &call_id)
+            } else if process {
+                crate::step_snapshot::StepCallBinding::process(
+                    altered,
+                    if mutation == "worker" {
+                        "foreign-worker"
+                    } else {
+                        packet.run_id()
+                    },
+                    if mutation == "sequence" { 0 } else { 2 },
+                    &call_id,
+                )
+            } else {
+                crate::step_snapshot::StepCallBinding::provider(altered, &call_id)
+            };
+            if mutation == "provider-source"
+                || (!process && matches!(mutation, "worker" | "sequence"))
+            {
+                hostile.origin.source = harness_contract::step::CallSource::Provider {
+                    attempt_id: "foreign-provider-attempt".into(),
+                };
+            }
+            let request = discovery_bootstrap_request(executor, hostile, "tool_search", input);
+            let result = executor
+                .tool_batch
+                .as_ref()
+                .unwrap()
+                .execute(request)
+                .await;
+            let error = if mutation == "system" {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("system_tool_parent_fence_rejected"),
+                    "{process}/{mutation}: {error}"
+                );
+                error
+            } else {
+                let outcome = result.unwrap();
+                own834_refusal_error(&outcome, &call_id, "tool_search").to_owned()
+            };
+            let expected = match mutation {
+                "session" => "step_origin_mismatch",
+                "unadvertised" => "tool_outside_bound_step",
+                "expired" => "step_origin_expired",
+                "system" => "system_tool_parent_fence_rejected",
+                "provider-source" | "worker" | "sequence" => "step_origin_source_rejected",
+                _ => "tool_effect_authority",
+            };
+            assert!(error.contains(expected), "{process}/{mutation}: {error}");
+            assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                services
+                    .commit_service()
+                    .load_delegated_agent_tool_receipts(
+                        packet.graph_id(),
+                        packet.node_id(),
+                        packet.attempt
+                    )
+                    .unwrap()
+                    .len(),
+                success_count
+            );
+        }
+        let mut request =
+            discovery_bootstrap_request(executor, binding.clone(), "tool_search", input);
+        request.tool_name = "edit".into();
+        let collision = executor
+            .tool_batch
+            .as_ref()
+            .unwrap()
+            .execute(request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            collision.contains("read-only receipt collision for idempotency key"),
+            "{process}: {collision}"
+        );
+        let mut parent_binding = binding.clone();
+        parent_binding.origin.call_id = format!("bootstrap-wrong-parent-attempt-{process}");
+        let mut wrong_parent_attempt =
+            discovery_bootstrap_request(executor, parent_binding, "tool_search", input);
+        let parent_call_id = wrong_parent_attempt.tool_use_id.clone();
+        assert_ne!(
+            wrong_parent_attempt.idempotency_key,
+            binding.effect_idempotency_key()
+        );
+        wrong_parent_attempt.parent_execution_attempt = Some(packet.attempt + 1);
+        let refused = executor
+            .tool_batch
+            .as_ref()
+            .unwrap()
+            .execute(wrong_parent_attempt)
+            .await
+            .unwrap();
+        let error = own834_refusal_error(&refused, &parent_call_id, "tool_search");
+        assert!(
+            error.contains("tool_effect_authority"),
+            "{process}: {error}"
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            services
+                .commit_service()
+                .load_delegated_agent_tool_receipts(
+                    packet.graph_id(),
+                    packet.node_id(),
+                    packet.attempt
+                )
+                .unwrap()
+                .len(),
+            success_count
+        );
+        for mutation in [
+            "unknown",
+            "write",
+            "permission",
+            "network",
+            "process",
+            "package",
+            "system",
+            "scope",
+        ] {
+            let mut effect = step
+                .lease()
+                .describe_effect("tool_search", &serde_json::from_str(input).unwrap());
+            match mutation {
+                "unknown" => effect.effect_kind = harness_contract::tool::ToolEffectKind::Unknown,
+                "write" => effect.effect_kind = harness_contract::tool::ToolEffectKind::Write,
+                "permission" => effect.required_permission = PermissionMode::WorkspaceWrite,
+                "network" => effect.uses_network = true,
+                "process" => effect.spawns_process = true,
+                "package" => effect.mutates_packages = true,
+                "system" => effect.mutates_system = true,
+                "scope" => effect
+                    .scopes
+                    .push(harness_contract::policy::PermissionScope::new(
+                        harness_contract::policy::PermissionResource::Tool,
+                        harness_contract::policy::PermissionOperation::Write,
+                    )),
+                _ => unreachable!(),
+            }
+            *host.effect_override.lock().unwrap() = Some(effect);
+            let mut hostile = binding.clone();
+            hostile.origin.call_id = format!("descriptor-{process}-{mutation}");
+            let request = discovery_bootstrap_request(executor, hostile, "tool_search", input);
+            assert_eq!(
+                request
+                    .compiled_invocation
+                    .as_ref()
+                    .unwrap()
+                    .effect
+                    .effect_kind,
+                harness_contract::tool::ToolEffectKind::Read
+            );
+            let refused = executor
+                .tool_batch
+                .as_ref()
+                .unwrap()
+                .execute(request)
+                .await
+                .unwrap();
+            let error = own834_refusal_error(
+                &refused,
+                &format!("descriptor-{process}-{mutation}"),
+                "tool_search",
+            );
+            assert!(
+                error.contains("tool_effect_authority"),
+                "{process}/{mutation}: {error}"
+            );
+            *host.effect_override.lock().unwrap() = None;
+            assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                services
+                    .commit_service()
+                    .load_delegated_agent_tool_receipts(
+                        packet.graph_id(),
+                        packet.node_id(),
+                        packet.attempt
+                    )
+                    .unwrap()
+                    .len(),
+                success_count
+            );
+        }
+        let forged_id = "bootstrap-forged-signature";
+        let forged_binding = if process {
+            crate::step_snapshot::StepCallBinding::process(
+                step.clone(),
+                packet.run_id(),
+                3,
+                forged_id,
+            )
+        } else {
+            crate::step_snapshot::StepCallBinding::provider(step.clone(), forged_id)
+        };
+        let mut authorization =
+            discovery_native_authorization(executor, "tool_search", input, forged_id);
+        authorization
+            .authorization_lease
+            .signature
+            .push_str("-forged");
+        let error = executor
+            .execute_step_authorized_invocation_output(
+                Some(&forged_binding),
+                forged_id,
+                &authorization,
+                "tool_search",
+                input,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("signature"), "Host signature layer: {error}");
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            services
+                .commit_service()
+                .load_delegated_agent_tool_receipts(
+                    packet.graph_id(),
+                    packet.node_id(),
+                    packet.attempt
+                )
+                .unwrap()
+                .iter()
+                .filter(|receipt| receipt.outcome.status == RuntimeToolExecutionStatus::Executed)
+                .count(),
+            success_count
+        );
+        let definition = step
+            .lease()
+            .snapshot()
+            .catalog
+            .definitions(Some(&BTreeSet::from(["tool_search".into()])))
+            .pop()
+            .unwrap();
+        for mutation in ["registration", "resolver", "version"] {
+            let mut resolver = tools::builtin_effect_resolver_spec("tool_search");
+            if mutation == "resolver" {
+                resolver.resolver_id = "runtime.readonly".into();
+            }
+            if mutation == "version" {
+                resolver.resolver_version += 1;
+            }
+            let shadow = tools::RuntimeToolDefinition {
+                name: "tool_search".into(),
+                description: definition.description.clone(),
+                input_schema: definition.input_schema.clone(),
+                required_permission: PermissionMode::ReadOnly,
+                effect_resolver: resolver,
+            };
+            assert!(
+                tools::ToolCatalog::builtin()
+                    .with_runtime_tools(vec![shadow])
+                    .is_err(),
+                "registration layer must reject builtin shadow: {mutation}"
+            );
+        }
+        if !process {
+            let mut identity = step.snapshot().identity.clone();
+            identity.step_id = "native-optional-canonical-attempt".into();
+            identity.attempt = Some(packet.attempt);
+            let names = step
+                .snapshot()
+                .tools
+                .iter()
+                .map(|tool| tool.tool_id.clone())
+                .collect::<BTreeSet<_>>();
+            let advertised = step
+                .lease()
+                .snapshot()
+                .catalog
+                .definitions(Some(&names))
+                .into_iter()
+                .map(|definition| crate::ProviderToolDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    input_schema: definition.input_schema,
+                })
+                .collect::<Vec<_>>();
+            let optional = Arc::new(
+                crate::step_snapshot::BoundStep::bind(
+                    identity,
+                    step.lease().clone(),
+                    &advertised,
+                    &serde_json::json!({}),
+                    &serde_json::json!({}),
+                    step.snapshot().related_revisions.clone(),
+                    chrono::Utc::now().timestamp_millis() + 60_000,
+                )
+                .unwrap(),
+            );
+            let binding = crate::step_snapshot::StepCallBinding::provider(
+                optional,
+                "optional-attempt-search",
+            );
+            let authorization = discovery_native_authorization(
+                executor,
+                "tool_search",
+                input,
+                "optional-attempt-search",
+            );
+            executor
+                .execute_step_authorized_invocation_output(
+                    Some(&binding),
+                    "optional-attempt-search",
+                    &authorization,
+                    "tool_search",
+                    input,
+                )
+                .await
+                .unwrap();
+            discovery_assert_receipt_revision(
+                executor,
+                &binding,
+                "tool_search",
+                input,
+                step.lease().revision(),
+            );
+            assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(serde_json::to_vec(&packet).unwrap(), packet_before);
+        assert_eq!(
+            serde_json::to_vec(packet.binding.as_ref().unwrap()).unwrap(),
+            binding_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(services.workspace_root().join("src/a.rs")).unwrap(),
+            "narrow-read-proof"
+        );
+        assert_eq!(
+            std::fs::read_to_string(services.workspace_root().join("src/sibling.rs")).unwrap(),
+            "untouched-sibling"
+        );
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn r1_composite_discovery_metadata_requires_actual_host_exposure() {
+    assert!(EchoRuntimeExecutionHost.pin_step_catalog().is_none());
+    assert!(EchoRuntimeExecutionHost
+        .delegated_tool_definitions(&["read_file".into(), "unregistered_tool".into()])
+        .is_empty());
+    for process in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (services, host, packet) = discovery_test_services(root.path(), process);
+        let packet_before = serde_json::to_vec(&packet).unwrap();
+        let (live, definitions, allowed) =
+            model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.name == "tool_search"));
+        let native = Arc::new(discovery_native_executor(&services, live, &packet, allowed));
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-exposure".into(),
+            registry_revision: 0,
+        };
+        let bridge = process
+            .then(|| ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap());
+        let executor = bridge
+            .as_ref()
+            .map_or(native.as_ref(), |bridge| bridge.executor.as_ref());
+        let calls = Arc::new(AtomicU64::new(0));
+        let bus = crate::CowdEventBus::new();
+        let _scope = bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: packet.run_id().into(),
+            session_id: packet.session_id().into(),
+            turn_id: packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap()
+                .into(),
+        });
+        let mut runtime = discovery_runtime(
+            &services,
+            &packet,
+            native.clone(),
+            definitions,
+            calls.clone(),
+            bus.clone(),
+        )
+        .with_checkpoint_identity(
+            "exposure-workspace",
+            Some(packet.assignment.execution_identity.clone()),
+        );
+        let step = if let Some(bridge) = &bridge {
+            bridge.begin_step().unwrap();
+            bridge.steps.lock().unwrap().back().unwrap().clone()
+        } else {
+            runtime
+                .r1_dispatch_provider_step_for_test(discovery_request())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let revision = step.lease().revision();
+        for mutation in ["missing", "schema", "description", "duplicate", "identical"] {
+            *host.exposure.lock().unwrap() = Some(("read_file", mutation));
+            let before_metadata = host.exposure_calls.load(Ordering::SeqCst);
+            let receipt =
+                executor.tool_discovery_receipt_for_step(step.lease(), PermissionMode::ReadOnly);
+            assert_eq!(
+                host.exposure_calls.load(Ordering::SeqCst),
+                before_metadata + 1
+            );
+            assert!(!receipt
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.canonical_id == "read_file"));
+            assert!(!receipt.activation_candidates.contains(&"read_file".into()));
+            assert!(executor
+                .prepare_step_catalog(PermissionMode::ReadOnly)
+                .is_err());
+            let input = r#"{"query":"select:read_file,tool_orchestrate"}"#;
+            let call_id = format!("exposure-search-{mutation}");
+            let output = if let Some(bridge) = &bridge {
+                bridge
+                    .execute_step_tool(
+                        &step.snapshot().identity.step_id,
+                        1,
+                        &call_id,
+                        "tool_search",
+                        input,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                let binding =
+                    crate::step_snapshot::StepCallBinding::provider(step.clone(), &call_id);
+                let authorization =
+                    discovery_native_authorization(executor, "tool_search", input, &call_id);
+                executor
+                    .execute_step_authorized_invocation_output(
+                        Some(&binding),
+                        &call_id,
+                        &authorization,
+                        "tool_search",
+                        input,
+                    )
+                    .await
+                    .unwrap()
+                    .model_text()
+                    .to_string()
+            };
+            let projected: harness_contract::tool::ToolDiscoveryReceipt =
+                serde_json::from_str(&output).unwrap();
+            assert!(!projected
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.canonical_id == "read_file"));
+            assert!(!projected
+                .activation_candidates
+                .contains(&"read_file".into()));
+            assert_eq!(host.tools.pin_snapshot().revision(), revision);
+        }
+        for mutation in ["missing", "schema", "description", "duplicate", "identical"] {
+            *host.exposure.lock().unwrap() = Some(("tool_search", mutation));
+            let receipt =
+                executor.tool_discovery_receipt_for_step(step.lease(), PermissionMode::ReadOnly);
+            assert!(!receipt
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.canonical_id == "tool_search"));
+            let input = r#"{"query":"select:read_file"}"#;
+            let call_id = format!("bootstrap-exposure-{process}-{mutation}");
+            let binding = if process {
+                crate::step_snapshot::StepCallBinding::process(
+                    step.clone(),
+                    packet.run_id(),
+                    5,
+                    &call_id,
+                )
+            } else {
+                crate::step_snapshot::StepCallBinding::provider(step.clone(), &call_id)
+            };
+            let request = discovery_bootstrap_request(executor, binding, "tool_search", input);
+            let before = host.calls.load(Ordering::SeqCst);
+            let outcome = executor
+                .tool_batch
+                .as_ref()
+                .unwrap()
+                .execute(request)
+                .await
+                .unwrap();
+            let error = own834_refusal_error(&outcome, &call_id, "tool_search");
+            assert!(
+                error.contains("tool_effect_authority"),
+                "{process}/{mutation}: {error}"
+            );
+            assert_eq!(host.calls.load(Ordering::SeqCst), before);
+            assert_eq!(host.tools.pin_snapshot().revision(), revision);
+        }
+        *host.exposure.lock().unwrap() = Some(("tool_search", "missing"));
+        assert!(executor
+            .prepare_step_catalog(PermissionMode::ReadOnly)
+            .is_ok());
+        let receipt =
+            executor.tool_discovery_receipt_for_step(step.lease(), PermissionMode::ReadOnly);
+        assert!(!receipt
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.canonical_id == "tool_search"));
+        let before_provider = calls.load(Ordering::SeqCst);
+        let before_leaf = host.calls.load(Ordering::SeqCst);
+        let error = runtime
+            .r1_dispatch_provider_step_for_test(discovery_request())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("agent_tool_inventory_drift"),
+            "real binder: {error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before_provider);
+        assert_eq!(host.calls.load(Ordering::SeqCst), before_leaf);
+        let zero_counter = Arc::new(AtomicU64::new(0));
+        let (_, advertised, _) = {
+            *host.exposure.lock().unwrap() = None;
+            let activated = model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+            *host.exposure.lock().unwrap() = Some(("tool_search", "missing"));
+            activated
+        };
+        let mut zero_runtime = discovery_runtime(
+            &services,
+            &packet,
+            native.clone(),
+            advertised,
+            zero_counter.clone(),
+            bus.clone(),
+        )
+        .with_checkpoint_identity(
+            "exposure-workspace",
+            Some(packet.assignment.execution_identity.clone()),
+        );
+        assert!(zero_runtime
+            .r1_dispatch_provider_step_for_test(discovery_request())
+            .await
+            .is_err());
+        assert_eq!(zero_counter.load(Ordering::SeqCst), 0);
+        if let Some(bridge) = &bridge {
+            let response = bridge.begin_step().unwrap();
+            assert!(!response["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|definition| definition["name"] == "tool_search"));
+            let step_id = response["step"]["identity"]["step_id"].as_str().unwrap();
+            assert!(bridge
+                .execute_step_tool(
+                    step_id,
+                    1,
+                    "exposure-ordinary-read",
+                    "read_file",
+                    r#"{"path":"src/a.rs"}"#
+                )
+                .await
+                .unwrap()
+                .contains("narrow-read-proof"));
+            let bound = bridge.steps.lock().unwrap().back().unwrap().clone();
+            let binding = crate::step_snapshot::StepCallBinding::process(
+                bound,
+                packet.run_id(),
+                1,
+                "exposure-ordinary-read",
+            );
+            discovery_assert_receipt_revision(
+                executor,
+                &binding,
+                "read_file",
+                r#"{"path":"src/a.rs"}"#,
+                revision,
+            );
+            assert_eq!(host.calls.load(Ordering::SeqCst), before_leaf + 1);
+            assert!(bridge
+                .execute_step_tool(
+                    step_id,
+                    2,
+                    "unadvertised-bootstrap",
+                    "tool_search",
+                    r#"{"query":"read"}"#
+                )
+                .await
+                .is_err());
+        }
+        *host.exposure.lock().unwrap() = None;
+        let input = r#"{"query":"select:read_file"}"#;
+        let before_leaf = host.calls.load(Ordering::SeqCst);
+        if let Some(bridge) = &bridge {
+            let response = bridge.begin_step().unwrap();
+            let step_id = response["step"]["identity"]["step_id"].as_str().unwrap();
+            let output = bridge
+                .execute_step_tool(step_id, 1, "restored-bootstrap", "tool_search", input)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(&output)
+                    .unwrap()
+                    .activation_candidates,
+                vec!["read_file"]
+            );
+        } else {
+            let fresh = runtime
+                .r1_dispatch_provider_step_for_test(discovery_request())
+                .await
+                .unwrap()
+                .unwrap();
+            let binding =
+                crate::step_snapshot::StepCallBinding::provider(fresh, "restored-bootstrap");
+            let authorization = discovery_native_authorization(
+                executor,
+                "tool_search",
+                input,
+                "restored-bootstrap",
+            );
+            let output = executor
+                .execute_step_authorized_invocation_output(
+                    Some(&binding),
+                    "restored-bootstrap",
+                    &authorization,
+                    "tool_search",
+                    input,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(
+                    output.model_text()
+                )
+                .unwrap()
+                .activation_candidates,
+                vec!["read_file"]
+            );
+        }
+        assert_eq!(host.calls.load(Ordering::SeqCst), before_leaf + 1);
+        assert_eq!(host.tools.pin_snapshot().revision(), revision);
+        assert_eq!(serde_json::to_vec(&packet).unwrap(), packet_before);
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+    struct NoCatalogExecutor;
+    #[async_trait::async_trait]
+    impl ToolExecutor for NoCatalogExecutor {
+        async fn execute_output(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+            panic!("None compatibility must not execute a tool")
+        }
+    }
+    struct NoCatalogProvider(Arc<AtomicU64>);
+    impl crate::conversation::ApiClient for NoCatalogProvider {
+        fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+            panic!("None compatibility must return before requesting advertised definitions")
+        }
+        fn stream(
+            &mut self,
+            request: crate::conversation::ApiRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<crate::conversation::AssistantEvent, crate::RuntimeError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            assert!(request.bound_step.is_none());
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures::stream::empty())
+        }
+    }
+    let counter = Arc::new(AtomicU64::new(0));
+    let mut runtime = crate::ConversationRuntime::new_with_features(
+        crate::Session::new(),
+        NoCatalogProvider(counter.clone()),
+        Arc::new(NoCatalogExecutor),
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        vec!["None compatibility".into()],
+        &crate::RuntimeFeatureConfig::default(),
+    )
+    .without_memory();
+    assert!(runtime
+        .r1_dispatch_provider_step_for_test(discovery_request())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone)]
+struct DiscoveryProvider {
+    definitions: Vec<crate::ProviderToolDefinition>,
+    calls: Arc<AtomicU64>,
+}
+
+impl crate::conversation::ApiClient for DiscoveryProvider {
+    fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+        Some(self.definitions.clone())
+    }
+
+    fn stream(
+        &mut self,
+        request: crate::conversation::ApiRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = Result<crate::conversation::AssistantEvent, crate::RuntimeError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        assert!(request.bound_step.is_some());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(futures::stream::empty())
+    }
+}
+
+fn discovery_assert_receipt_revision(
+    executor: &ScopedRuntimeToolExecutor,
+    binding: &crate::step_snapshot::StepCallBinding,
+    tool: &str,
+    input: &str,
+    revision: u64,
+) {
+    let parent = harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: executor.execution_id.clone(),
+        node_id: executor.node_id.clone(),
+    };
+    let input = normalize_delegated_resource_paths(
+        tool,
+        input,
+        &executor.workspace_root,
+        &executor.path_identity_resolver,
+        executor.resource_scopes.as_deref(),
+    )
+    .unwrap();
+    let key = binding.effect_idempotency_key();
+    let query = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding: binding,
+        parent_execution: &parent,
+        session_id: &executor.session_id,
+        policy_revision: executor.policy_revision,
+        idempotency_key: &key,
+        tool_use_id: &binding.origin.call_id,
+        tool_name: tool,
+        input: &input,
+    };
+    let replay = executor
+        .commit_service
+        .as_ref()
+        .unwrap()
+        .query_completed_agent_tool_effect(&query)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.invocation.catalog_revision, revision);
+    assert_eq!(replay.outcome.status, RuntimeToolExecutionStatus::Executed);
+}
+
+fn discovery_request() -> crate::conversation::ApiRequest {
+    crate::conversation::ApiRequest {
+        bound_step: None,
+        prompt: crate::PromptAssembly::new(vec!["discovery".into()]),
+        messages: Vec::<crate::ConversationMessage>::new().into(),
+        model: "local-discovery".into(),
+        reasoning_effort_override: None,
+        request_compiler_cache_hit: false,
+        budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+            "local-discovery",
+            8192,
+            1024,
+            0,
+            0,
+            0,
+        ),
+        provider_evidence_context: None,
+    }
+}
+
+fn discovery_runtime(
+    services: &Arc<RuntimeServices>,
+    packet: &AgentTaskPacket,
+    executor: Arc<ScopedRuntimeToolExecutor>,
+    definitions: Vec<crate::ProviderToolDefinition>,
+    calls: Arc<AtomicU64>,
+    bus: crate::CowdEventBus,
+) -> crate::ConversationRuntime<DiscoveryProvider, ScopedRuntimeToolExecutor> {
+    let mut session = crate::Session::new();
+    session.session_id = packet.session_id().into();
+    let policy = permission_policy(
+        services.session_execution_policy_control(packet.session_id()),
+        packet.permission_ceiling,
+        &executor.allowed_tools,
+    );
+    crate::ConversationRuntime::new_with_features(
+        session,
+        DiscoveryProvider { definitions, calls },
+        executor,
+        policy,
+        vec!["discovery".into()],
+        &crate::RuntimeFeatureConfig::default(),
+    )
+    .without_memory()
+    .with_runtime_event_store(Arc::clone(services.event_store()))
+    .with_cowd_event_bus(bus)
+    .with_checkpoint_identity(
+        services.workspace_key(),
+        Some(packet.assignment.execution_identity.clone()),
+    )
+}
+
+fn discovery_control_definition() -> tools::RuntimeToolDefinition {
+    tools::RuntimeToolDefinition {
+        name: "working_context".into(),
+        description: Some("Runtime working context".into()),
+        input_schema: serde_json::to_value(schemars::schema_for!(
+            crate::working_context::WorkingContextInput
+        ))
+        .unwrap(),
+        required_permission: PermissionMode::ReadOnly,
+        effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+            resolver_id: "runtime.readonly".into(),
+            resolver_version: 1,
+        },
+    }
+}
+
+fn discovery_replace_runtime(
+    host: &DiscoveryTestHost,
+    definitions: Vec<tools::RuntimeToolDefinition>,
+) {
+    let catalog = tools::ToolCatalog::builtin()
+        .with_runtime_tools(definitions)
+        .unwrap();
+    host.tools.replace_snapshot(tools::ToolHostSnapshot::new(
+        Arc::new(catalog),
+        Arc::new(tools::lsp_client::LspRegistry::new()),
+        None,
+    ));
+}
+
+fn discovery_bound_step(
+    executor: &ScopedRuntimeToolExecutor,
+    packet: &AgentTaskPacket,
+    step_id: &str,
+    mode: PermissionMode,
+) -> Arc<crate::step_snapshot::BoundStep> {
+    assert_ne!(packet.run_id(), packet.graph_id());
+    let lease = executor.prepare_step_catalog(mode).unwrap().unwrap();
+    let definitions = lease
+        .snapshot()
+        .catalog
+        .definitions(Some(&executor.allowed_tools))
+        .into_iter()
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name,
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect::<Vec<_>>();
+    let step = Arc::new(
+        crate::step_snapshot::BoundStep::bind(
+            serde_json::from_value(serde_json::json!({
+                "step_id":step_id, "session_id":packet.session_id(),
+                "turn_id":packet.assignment.execution_identity.turn_id().unwrap(),
+                "execution_id":packet.run_id(), "run_ref":packet.run_id(),
+                "actor_ref":packet.assignment.execution_identity.principal_id(), "attempt":null,
+                "build_ref":"discovery-livepin"
+            }))
+            .unwrap(),
+            lease,
+            &definitions,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            BTreeMap::from([("policy".into(), executor.policy_revision.to_string())]),
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        step.snapshot().identity.execution_id.as_deref(),
+        Some(packet.run_id())
+    );
+    assert_eq!(
+        step.snapshot().identity.run_ref.as_deref(),
+        Some(packet.run_id())
+    );
+    assert_eq!(
+        step.snapshot().identity.actor_ref.as_deref(),
+        Some(packet.assignment.execution_identity.principal_id())
+    );
+    assert_eq!(step.snapshot().identity.attempt, None);
+    step
+}
+
+fn discovery_authorization_with_mode(
+    executor: &ScopedRuntimeToolExecutor,
+    tool: &str,
+    input: &str,
+    call_id: &str,
+    mode: PermissionMode,
+) -> harness_contract::tool::ToolExecutionAuthorization {
+    discovery_authorization_with_mode_and_issuer(executor, tool, input, call_id, mode, None)
+}
+
+fn discovery_authorization_with_mode_and_issuer(
+    executor: &ScopedRuntimeToolExecutor,
+    tool: &str,
+    input: &str,
+    call_id: &str,
+    mode: PermissionMode,
+    issuer_store: Option<&crate::RuntimeEventStore>,
+) -> harness_contract::tool::ToolExecutionAuthorization {
+    use harness_contract::policy::{
+        ApprovalContext, ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand,
+        ApprovalDomain, ApprovalGrantScope, ApprovalGrantStatus, ApprovalSource,
+        ApprovalSourceKind, ApprovalTimeoutPolicy, AuthorizationPath, CapabilityGapKind, RiskLevel,
+        SubmitApprovalRequest,
+    };
+    let input_value = serde_json::from_str(input).unwrap();
+    let pin = executor
+        .host
+        .pin_step_catalog()
+        .expect("fixture requires the real pinned ToolHost");
+    let effect = pin.describe_effect(tool, &input_value);
+    assert_eq!(
+        executor.registered_tool_effect(tool, &input_value).unwrap(),
+        effect
+    );
+    let required = crate::AuthorizationNegotiator::compile_effective_descriptor(&effect, input)
+        .descriptor
+        .required_permission;
+    assert!(
+        mode.permits(required),
+        "fixture ceiling must cover {tool}/{call_id}: {required:?}"
+    );
+    let policy = permission_policy(None, mode, &executor.allowed_tools);
+    let request = crate::AuthorizationRequest {
+        principal_id: "discovery-native".into(),
+        capability: tool.into(),
+        input: input.into(),
+        idempotency_key: call_id.into(),
+        effect,
+        parent_ceiling: mode,
+        parent_lease_id: None,
+        policy_revision: executor.policy_revision,
+        recovery_scope: "discovery-native".into(),
+        context: crate::PermissionContext::default(),
+        safe_alternatives: Vec::new(),
+    };
+    let negotiator = crate::AuthorizationNegotiator::new();
+    let evaluated = negotiator.assess_effective(&policy, &request);
+    let mut assessment = evaluated.assessment.clone();
+    if assessment.lease.is_none() {
+        assert_eq!(
+            assessment.path,
+            AuthorizationPath::HumanApproval,
+            "{tool}/{call_id}: {assessment:?}"
+        );
+        assert_eq!(
+            assessment.gap.as_ref().unwrap().kind,
+            CapabilityGapKind::ApprovalRequired
+        );
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let approvals = crate::ApprovalQueue::new(store.clone());
+        let source = ApprovalSource {
+            kind: ApprovalSourceKind::Session,
+            session_id: Some(executor.session_id.clone()),
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: None,
+            review_ref: None,
+            application: None,
+        };
+        let mut context = ApprovalContext::owned(
+            &source,
+            tool,
+            executor.path_identity_resolver.workspace_id(),
+        );
+        context.principal_id = request.principal_id.clone();
+        context.invocation_id = Some(call_id.into());
+        context.execution_id = Some(executor.execution_id.clone());
+        context.effect = Some(evaluated.effective.descriptor.clone());
+        context.policy_revision = executor.policy_revision;
+        context.resource_targets = evaluated
+            .effective
+            .descriptor
+            .scopes
+            .iter()
+            .map(|scope| scope.target.clone())
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        let risk = match assessment.risk {
+            RiskLevel::Low => harness_contract::core::TaskRisk::Low,
+            RiskLevel::Medium => harness_contract::core::TaskRisk::Medium,
+            RiskLevel::High => harness_contract::core::TaskRisk::High,
+            RiskLevel::Critical => harness_contract::core::TaskRisk::Critical,
+        };
+        let pending = approvals
+            .submit_scoped_with_policy(
+                format!("fixture-approval:{call_id}"),
+                SubmitApprovalRequest {
+                    source,
+                    context,
+                    action: format!("execute:{tool}"),
+                    summary: format!(
+                        "Human fixture approves this exact pinned invocation: {call_id}"
+                    ),
+                    risk,
+                    domain: ApprovalDomain::Execution,
+                    blocks_execution: true,
+                    evidence_refs: vec![evaluated.effective.fingerprint.clone()],
+                    timeout_policy: ApprovalTimeoutPolicy::AutoDeny,
+                },
+                None,
+                false,
+                vec![ApprovalGrantScope::Once],
+            )
+            .unwrap();
+        let human = crate::security::test_human_interactive_principal();
+        approvals
+            .decide(
+                &human,
+                ApprovalDecisionCommand {
+                    approval_id: pending.approval_id.clone(),
+                    approved: true,
+                    skip: false,
+                    reason: "explicit fixture human decision for exact descriptor and invocation"
+                        .into(),
+                    scope: ApprovalGrantScope::Once,
+                    actor: ApprovalDecisionActor {
+                        kind: ApprovalDecisionActorKind::Human,
+                        actor_id: human.claims().principal_id.clone(),
+                    },
+                    evidence_refs: vec![evaluated.effective.fingerprint.clone()],
+                },
+            )
+            .unwrap();
+        let grant = approvals.grant_for_approval(&pending.approval_id).unwrap();
+        assert_eq!(grant.issued_by.kind, ApprovalDecisionActorKind::Human);
+        for mutation in ["revoked", "invocation", "policy", "descriptor"] {
+            let mut invalid = grant.clone();
+            match mutation {
+                "revoked" => invalid.status = ApprovalGrantStatus::Revoked,
+                "invocation" => invalid.invocation_id = Some(format!("{call_id}-foreign")),
+                "policy" => invalid.policy_revision += 1,
+                "descriptor" => invalid.effect_descriptor_hash = Some("foreign".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                negotiator
+                    .approve_effective(&policy, &request, &evaluated.effective, &invalid)
+                    .lease
+                    .is_none(),
+                "{mutation}"
+            );
+        }
+        assessment = negotiator.approve_effective(&policy, &request, &evaluated.effective, &grant);
+        assert_eq!(assessment.path, AuthorizationPath::HumanApproval);
+        approvals.consume_once_grant(&grant.grant_id).unwrap();
+        assert!(approvals.active_grants().is_empty());
+        assert!(
+            store
+                .stream_revision(&format!("approval:{}", pending.approval_id))
+                .unwrap()
+                > 0
+        );
+    }
+    let signed = assessment
+        .lease
+        .clone()
+        .unwrap_or_else(|| panic!("real authorization refused {tool}/{call_id}: {assessment:?}"));
+    assert!(crate::AuthorizationNegotiator::verify_lease_signature(
+        &signed
+    ));
+    let authorized = crate::ToolPolicy
+        .authorize(&evaluated.effective, &assessment, call_id, signed, 30)
+        .unwrap()
+        .authorization;
+    pin.validate_authorization(&authorized, tool, &input_value)
+        .unwrap();
+    if let Some(store) = issuer_store {
+        let _ = negotiator.take_transitions_for_persistence();
+        for transition in negotiator.transitions_awaiting_persistence() {
+            crate::authorization_negotiator::persist_authorization_transition(
+                store,
+                &format!("authorization-lease:{}", transition.lease.lease_id),
+                "own834.discovery_fixture",
+                &transition,
+            ).unwrap();
+            negotiator.acknowledge_persisted_transitions(
+                std::slice::from_ref(&transition.transition_id),
+            );
+        }
+        assert!(store.stream_revision(&format!(
+            "authorization-lease:{}", authorized.authorization_lease.lease_id,
+        )).unwrap() > 0);
+    }
+    authorized
+}
+
+#[tokio::test]
+async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_before_model() {
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_test_services(root.path(), false);
+    let (live, definitions, allowed) =
+        model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+    let executor = Arc::new(discovery_native_executor(&services, live, &packet, allowed));
+    let calls = Arc::new(AtomicU64::new(0));
+    let bus = crate::CowdEventBus::new();
+    let _execution = bus.enter_execution(crate::CowdExecutionContext {
+        execution_id: packet.run_id().into(),
+        session_id: packet.session_id().into(),
+        turn_id: packet
+            .assignment
+            .execution_identity
+            .turn_id()
+            .unwrap()
+            .into(),
+    });
+    let mut runtime = discovery_runtime(
+        &services,
+        &packet,
+        executor.clone(),
+        definitions,
+        calls.clone(),
+        bus.clone(),
+    );
+    let mut stale_compile = discovery_request();
+    stale_compile.budget.compiled_policy_revision = Some(executor.policy_revision + 1);
+    assert!(runtime
+        .r1_dispatch_provider_step_for_test(stale_compile)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("context_policy_changed_after_compilation"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let old_step = runtime
+        .r1_dispatch_provider_step_for_test(discovery_request())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    host.tools
+        .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+    let current = host.tools.pin_snapshot();
+    assert_ne!(current.revision(), old_step.lease().revision());
+    let receipts_before = executor.receipts.lock().unwrap().len();
+    let old_binding = crate::step_snapshot::StepCallBinding::provider(old_step, "native-late");
+    let restored: crate::step_snapshot::StepCallBinding =
+        serde_json::from_value(serde_json::to_value(old_binding).unwrap()).unwrap();
+    let input = r#"{"path":"src/a.rs"}"#;
+    let authorization =
+        discovery_native_authorization(&executor, "read_file", input, "native-late");
+    let error = executor
+        .execute_step_authorized_invocation_output(
+            Some(&restored),
+            "native-late",
+            &authorization,
+            "read_file",
+            input,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("step_binding_stale"), "{error}");
+    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.receipts.lock().unwrap().len(), receipts_before);
+    let step = runtime
+        .r1_dispatch_provider_step_for_test(discovery_request())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(step.lease().revision(), current.revision());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    for (call_id, tool, value) in [
+        (
+            "native-live-read",
+            "read_file",
+            serde_json::json!({"path":"src/a.rs"}),
+        ),
+        (
+            "native-live-composite",
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"read","op":"call","tool":"read_file","input":{"path":"src/a.rs"}}
+            ]}),
+        ),
+    ] {
+        let input = value.to_string();
+        let authorization = discovery_native_authorization(&executor, tool, &input, call_id);
+        let binding = crate::step_snapshot::StepCallBinding::provider(step.clone(), call_id);
+        let output = executor
+            .execute_step_authorized_invocation_output(
+                Some(&binding),
+                call_id,
+                &authorization,
+                tool,
+                &input,
+            )
+            .await
+            .unwrap();
+        assert!(output.model_text().contains("narrow-read-proof"));
+        discovery_assert_receipt_revision(&executor, &binding, tool, &input, current.revision());
+    }
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(executor.receipts.lock().unwrap().len(), receipts_before + 2);
+    let durable = services
+        .commit_service()
+        .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
+        .unwrap();
+    assert_eq!(durable.len(), 2);
+    assert!(durable
+        .iter()
+        .all(|receipt| receipt.outcome.status == RuntimeToolExecutionStatus::Executed));
+    assert_eq!(
+        executor
+            .tool_discovery_receipt_for_step(step.lease(), PermissionMode::ReadOnly)
+            .catalog_revision,
+        current.revision()
+    );
+    let mut missing_pin = discovery_native_executor(
+        &services,
+        host.clone(),
+        &packet,
+        packet.allowed_tools.iter().cloned().collect(),
+    );
+    missing_pin.host = Arc::new(NoopRuntimeExecutionHost);
+    assert!(missing_pin
+        .prepare_step_catalog(PermissionMode::ReadOnly)
+        .unwrap_err()
+        .to_string()
+        .contains("catalog unavailable"));
+    assert!(!missing_pin.has_tool("read_file"));
+    assert!(missing_pin
+        .tool_discovery_receipt()
+        .activation_candidates
+        .is_empty());
+
+    for mutation in ["schema", "presentation", "resolver", "floor", "missing"] {
+        let case_root = tempfile::tempdir().unwrap();
+        let (case_services, case_host, case_packet) = discovery_configured_services(
+            case_root.path(),
+            false,
+            &["read_file", "tool_orchestrate", "working_context"],
+            PermissionMode::ReadOnly,
+            vec!["read:src/a.rs".into()],
+            true,
+        );
+        let original = discovery_control_definition();
+        let (live, advertised, allowed) =
+            model_loop::activate_native_tools(case_host.clone(), &case_packet, true).unwrap();
+        let executor = Arc::new(discovery_native_executor(
+            &case_services,
+            live,
+            &case_packet,
+            allowed,
+        ));
+        let old_step = discovery_bound_step(
+            &executor,
+            &case_packet,
+            "before-incompatible-reload",
+            PermissionMode::ReadOnly,
+        );
+        let old_metadata = executor.tool_discovery_receipt();
+        let mut changed = original;
+        match mutation {
+            "schema" => {
+                changed.input_schema =
+                    serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}})
+            }
+            "presentation" => changed.description = Some("changed presentation".into()),
+            "resolver" => changed.effect_resolver.resolver_version += 1,
+            "floor" => changed.required_permission = PermissionMode::WorkspaceWrite,
+            "missing" => {}
+            _ => unreachable!(),
+        }
+        discovery_replace_runtime(
+            &case_host,
+            if mutation == "missing" {
+                vec![]
+            } else {
+                vec![changed]
+            },
+        );
+        let current_metadata = executor.tool_discovery_receipt();
+        assert_ne!(
+            current_metadata.catalog_revision,
+            old_metadata.catalog_revision
+        );
+        if mutation == "missing" {
+            assert!(!executor.has_tool("working_context"));
+            assert!(!current_metadata
+                .activation_candidates
+                .contains(&"working_context".into()));
+        } else {
+            assert!(executor.has_tool("working_context"));
+            let fresh = case_host.tools.pin_snapshot().catalog_receipt();
+            let descriptor = current_metadata
+                .descriptors
+                .iter()
+                .find(|descriptor| descriptor.canonical_id == "working_context")
+                .unwrap();
+            assert!(fresh.descriptors.contains(descriptor));
+            if mutation == "floor" {
+                assert_eq!(
+                    descriptor.required_permission,
+                    PermissionMode::WorkspaceWrite
+                );
+                let mut policy = case_services
+                    .session_execution_policy(case_packet.session_id())
+                    .unwrap();
+                policy.permission_mode = PermissionMode::DangerFullAccess;
+                case_services.publish_session_execution_policy(
+                    case_packet.session_id(),
+                    crate::permissions::SessionExecutionPolicyControl::from_policy(policy),
+                );
+            }
+            if mutation == "schema" {
+                assert_ne!(
+                    descriptor.schema_hash,
+                    old_metadata
+                        .descriptors
+                        .iter()
+                        .find(|descriptor| descriptor.canonical_id == "working_context")
+                        .unwrap()
+                        .schema_hash
+                );
+            }
+        }
+        let counter = Arc::new(AtomicU64::new(0));
+        let case_bus = crate::CowdEventBus::new();
+        let _case_execution = case_bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: case_packet.run_id().into(),
+            session_id: case_packet.session_id().into(),
+            turn_id: case_packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap()
+                .into(),
+        });
+        let mut runtime = discovery_runtime(
+            &case_services,
+            &case_packet,
+            executor.clone(),
+            advertised,
+            counter.clone(),
+            case_bus.clone(),
+        );
+        if mutation == "resolver" {
+            assert!(executor
+                .prepare_step_catalog(PermissionMode::ReadOnly)
+                .is_ok());
+            let binding =
+                crate::step_snapshot::StepCallBinding::provider(old_step, "resolver-late");
+            let persisted: crate::step_snapshot::StepCallBinding =
+                serde_json::from_value(serde_json::to_value(binding).unwrap()).unwrap();
+            assert!(persisted
+                .resolve(Some(case_host.tools.pin_snapshot()))
+                .unwrap_err()
+                .to_string()
+                .contains("step_binding_stale"));
+        } else {
+            let error = runtime
+                .r1_dispatch_provider_step_for_test(discovery_request())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("agent_tool_inventory_drift")
+                    || error.contains("disagrees with pinned catalog"),
+                "{mutation}: {error}"
+            );
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(case_host.calls.load(Ordering::SeqCst), 0);
+        assert!(executor.receipts.lock().unwrap().is_empty());
+        assert!(case_services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+
+    let process_root = tempfile::tempdir().unwrap();
+    let (process_services, process_host, process_packet) =
+        discovery_test_services(process_root.path(), true);
+    let selection = AgentModelSelection {
+        model: process_packet.model_lease.clone(),
+        provider: "local-discovery".into(),
+        registry_revision: 0,
+    };
+    let bridge =
+        ProcessJsonlToolSession::prepare(&process_services, &process_packet, &selection).unwrap();
+    let old = bridge.begin_step().unwrap();
+    let old_id = old["step"]["identity"]["step_id"].as_str().unwrap();
+    process_host
+        .tools
+        .replace_snapshot(process_host.tools.pin_snapshot().snapshot().clone());
+    let error = bridge
+        .execute_step_tool(old_id, 1, "process-late", "read_file", input)
+        .await
+        .unwrap_err();
+    assert!(error.contains("step_binding_stale"), "{error}");
+    assert_eq!(process_host.calls.load(Ordering::SeqCst), 0);
+    assert!(bridge.executor.receipts.lock().unwrap().is_empty());
+    let rejected = process_services
+        .commit_service()
+        .load_delegated_agent_tool_receipts(
+            process_packet.graph_id(),
+            process_packet.node_id(),
+            process_packet.attempt,
+        )
+        .unwrap();
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].outcome.tool_use_id, "process-late");
+    assert_eq!(rejected[0].outcome.tool_name, "read_file");
+    assert_eq!(
+        rejected[0].outcome.status,
+        RuntimeToolExecutionStatus::Failed
+    );
+    assert!(rejected[0]
+        .outcome
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("step_binding_stale"));
+    assert!(rejected[0].outcome.output.is_none());
+    assert!(rejected[0].outcome.observed_evidence.is_empty());
+    let before_retry = process_services.event_store().all_events(100_000).unwrap();
+    let rejection_sources = before_retry
+        .iter()
+        .filter(|event| {
+            event.kind == "execution.read.receipt" && event.payload["tool_use_id"] == "process-late"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rejection_sources.len(), 1);
+    assert!(
+        rejection_sources[0].payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null()
+    );
+    assert!(rejection_sources[0].payload["resolved_effect_scope"].is_null());
+    let original_rejection = (*rejection_sources[0]).clone();
+    let rejection_indexes = before_retry
+        .iter()
+        .filter(|event| {
+            event.kind == "execution.agent_tool.receipt"
+                && event.payload["idempotency_key"] == original_rejection.payload["idempotency_key"]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rejection_indexes.len(), 1);
+    let original_index = (*rejection_indexes[0]).clone();
+    assert_eq!(
+        original_index.transaction_id,
+        original_rejection.transaction_id
+    );
+    assert_eq!(
+        original_index.commit_cursor,
+        original_rejection.commit_cursor
+    );
+    assert!(original_index.transaction_index > original_rejection.transaction_index);
+    assert_eq!(
+        original_index.payload["outcome"],
+        original_rejection.payload["outcome"]
+    );
+    assert!(original_index.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null());
+    assert!(original_index.payload["resolved_effect_scope"].is_null());
+    let retry = bridge
+        .execute_step_tool(old_id, 1, "process-late", "read_file", input)
+        .await
+        .unwrap_err();
+    assert!(retry.contains("step_binding_stale"), "{retry}");
+    assert_eq!(process_host.calls.load(Ordering::SeqCst), 0);
+    assert!(bridge.executor.receipts.lock().unwrap().is_empty());
+    let after_retry = process_services.event_store().all_events(100_000).unwrap();
+    let retained = after_retry
+        .iter()
+        .filter(|event| {
+            event.kind == "execution.read.receipt" && event.payload["tool_use_id"] == "process-late"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0], &original_rejection);
+    let retained_indexes = after_retry
+        .iter()
+        .filter(|event| {
+            event.kind == "execution.agent_tool.receipt"
+                && event.payload["idempotency_key"] == original_rejection.payload["idempotency_key"]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retained_indexes.len(), 1);
+    assert_eq!(retained_indexes[0], &original_index);
+    assert_eq!(
+        process_services
+            .commit_service()
+            .load_delegated_agent_tool_receipts(
+                process_packet.graph_id(),
+                process_packet.node_id(),
+                process_packet.attempt
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(bridge
+        .execute_step_tool("foreign-step", 2, "process-foreign", "read_file", input)
+        .await
+        .is_err());
+    let next = bridge.begin_step().unwrap();
+    let next_id = next["step"]["identity"]["step_id"].as_str().unwrap();
+    for (sequence, tool, value) in [
+        (1, "read_file", serde_json::json!({"path":"src/a.rs"})),
+        (
+            2,
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"read","op":"call","tool":"read_file","input":{"path":"src/a.rs"}}
+            ]}),
+        ),
+    ] {
+        let call_id = format!("process-live-{sequence}");
+        let output = bridge
+            .execute_step_tool(next_id, sequence, &call_id, tool, &value.to_string())
+            .await
+            .unwrap();
+        assert!(output.contains("narrow-read-proof"));
+        let bound = bridge.steps.lock().unwrap().back().unwrap().clone();
+        let binding = crate::step_snapshot::StepCallBinding::process(
+            bound,
+            process_packet.run_id(),
+            sequence,
+            &call_id,
+        );
+        discovery_assert_receipt_revision(
+            &bridge.executor,
+            &binding,
+            tool,
+            &value.to_string(),
+            process_host.tools.pin_snapshot().revision(),
+        );
+    }
+    assert_eq!(process_host.calls.load(Ordering::SeqCst), 2);
+    let bound = bridge.steps.lock().unwrap().back().unwrap().clone();
+    assert_eq!(
+        bound.lease().revision(),
+        process_host.tools.pin_snapshot().revision()
+    );
+    let durable = process_services
+        .commit_service()
+        .load_delegated_agent_tool_receipts(
+            process_packet.graph_id(),
+            process_packet.node_id(),
+            process_packet.attempt,
+        )
+        .unwrap();
+    assert_eq!(durable.len(), 3);
+    assert_eq!(durable[0], rejected[0]);
+    assert_eq!(
+        durable[1..]
+            .iter()
+            .map(|receipt| (
+                receipt.outcome.tool_use_id.as_str(),
+                receipt.outcome.tool_name.as_str(),
+                receipt.outcome.status.clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "process-live-1",
+                "read_file",
+                RuntimeToolExecutionStatus::Executed
+            ),
+            (
+                "process-live-2",
+                "tool_orchestrate",
+                RuntimeToolExecutionStatus::Executed
+            ),
+        ]
+    );
+
+    for mutation in [
+        "schema",
+        "presentation",
+        "resolver",
+        "floor",
+        "missing",
+        "scope",
+        "policy",
+        "pin",
+    ] {
+        let case_root = tempfile::tempdir().unwrap();
+        let (case_services, case_host, case_packet) = discovery_configured_services(
+            case_root.path(),
+            true,
+            &["read_file", "tool_orchestrate", "working_context"],
+            PermissionMode::ReadOnly,
+            vec!["read:src/a.rs".into()],
+            true,
+        );
+        let original = discovery_control_definition();
+        let selection = AgentModelSelection {
+            model: case_packet.model_lease.clone(),
+            provider: "local-discovery".into(),
+            registry_revision: 0,
+        };
+        let mut bridge =
+            ProcessJsonlToolSession::prepare(&case_services, &case_packet, &selection).unwrap();
+        let old = bridge.begin_step().unwrap();
+        let original_step = bridge.steps.lock().unwrap().back().unwrap().clone();
+        let mut changed = original;
+        match mutation {
+            "schema" => {
+                changed.input_schema =
+                    serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}})
+            }
+            "presentation" => changed.description = Some("Process current presentation".into()),
+            "resolver" => changed.effect_resolver.resolver_version += 1,
+            "floor" => changed.required_permission = PermissionMode::WorkspaceWrite,
+            "missing" => {}
+            "scope" => {
+                Arc::get_mut(&mut bridge.executor).unwrap().resource_scopes = Some(Vec::new())
+            }
+            "policy" => {
+                let control = case_services
+                    .session_execution_policy_control(case_packet.session_id())
+                    .unwrap();
+                let mut snapshot = control.snapshot();
+                snapshot.revision += 1;
+                control.replace(snapshot).unwrap();
+            }
+            "pin" => {
+                Arc::get_mut(&mut bridge.executor).unwrap().host =
+                    Arc::new(NoopRuntimeExecutionHost)
+            }
+            _ => unreachable!(),
+        }
+        discovery_replace_runtime(
+            &case_host,
+            if mutation == "missing" {
+                vec![]
+            } else {
+                vec![changed]
+            },
+        );
+        if matches!(mutation, "floor" | "missing" | "scope" | "policy" | "pin") {
+            let error = bridge.begin_step().unwrap_err();
+            assert!(
+                error.contains("agent_tool_inventory_drift")
+                    || error.contains("policy revision is stale"),
+                "{mutation}: {error}"
+            );
+        } else {
+            let current = bridge.begin_step().unwrap();
+            let step_id = current["step"]["identity"]["step_id"].as_str().unwrap();
+            let actual = case_host.tools.pin_snapshot();
+            let definitions: Vec<crate::ProviderToolDefinition> =
+                serde_json::from_value(current["tools"].clone()).unwrap();
+            for definition in definitions {
+                assert!(actual
+                    .snapshot()
+                    .catalog
+                    .definitions(None)
+                    .iter()
+                    .any(|registered| registered.name == definition.name
+                        && registered.input_schema == definition.input_schema
+                        && registered.description == definition.description));
+            }
+            assert!(bridge
+                .execute_step_tool(step_id, 1, "process-current-read", "read_file", input)
+                .await
+                .unwrap()
+                .contains("narrow-read-proof"));
+            assert_eq!(case_host.calls.load(Ordering::SeqCst), 1);
+            let current_step = bridge.steps.lock().unwrap().back().unwrap().clone();
+            let binding = crate::step_snapshot::StepCallBinding::process(
+                current_step.clone(),
+                case_packet.run_id(),
+                1,
+                "process-current-read",
+            );
+            discovery_assert_receipt_revision(
+                &bridge.executor,
+                &binding,
+                "read_file",
+                input,
+                actual.revision(),
+            );
+            assert_eq!(current_step.lease().revision(), actual.revision());
+        }
+        let old_binding = crate::step_snapshot::StepCallBinding::process(
+            original_step,
+            case_packet.run_id(),
+            2,
+            "old-after-reload",
+        );
+        let persisted: crate::step_snapshot::StepCallBinding =
+            serde_json::from_value(serde_json::to_value(old_binding).unwrap()).unwrap();
+        assert!(persisted
+            .resolve(Some(case_host.tools.pin_snapshot()))
+            .unwrap_err()
+            .to_string()
+            .contains("step_binding_stale"));
+        let before = case_host.calls.load(Ordering::SeqCst);
+        let before_receipts = bridge.executor.receipts.lock().unwrap().len();
+        assert!(bridge
+            .execute_step_tool(
+                old["step"]["identity"]["step_id"].as_str().unwrap(),
+                2,
+                "old-after-reload",
+                "read_file",
+                input
+            )
+            .await
+            .is_err());
+        assert_eq!(case_host.calls.load(Ordering::SeqCst), before);
+        assert_eq!(
+            bridge.executor.receipts.lock().unwrap().len(),
+            before_receipts
+        );
+        assert_eq!(
+            std::fs::read_to_string(case_services.workspace_root().join("src/a.rs")).unwrap(),
+            "narrow-read-proof"
+        );
+        assert!(case_services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+    assert!(process_services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+    assert!(services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
+
+pub(super) struct DiscoveryTestHost {
+    pub(super) tools: tools::ToolHost,
+    pub(super) calls: AtomicU64,
+    services: Mutex<Weak<RuntimeServices>>,
+    exposure: Mutex<Option<(&'static str, &'static str)>>,
+    exposure_calls: AtomicU64,
+    effect_override: Mutex<Option<harness_contract::tool::ToolEffectDescriptor>>,
+}
+
+impl DiscoveryTestHost {
+    fn new(root: &std::path::Path) -> Self {
+        Self {
+            tools: tools::ToolHost::builtin("discovery-fixture", root)
+                .with_authorization_lease_verifier(Arc::new(
+                    crate::AuthorizationNegotiator::verify_lease_signature,
+                )),
+            calls: AtomicU64::new(0),
+            services: Mutex::new(Weak::new()),
+            exposure: Mutex::new(None),
+            exposure_calls: AtomicU64::new(0),
+            effect_override: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeExecutionHost for DiscoveryTestHost {
+    fn bounded_process_authority(
+        &self,
+        request: &RuntimeToolExecutionRequest,
+    ) -> Result<crate::tool_host::BoundedProcessAuthority, crate::ToolError> {
+        let services =
+            self.services.lock().unwrap().upgrade().ok_or_else(|| {
+                crate::ToolError::new("bounded fixture original Runtime unavailable")
+            })?;
+        crate::tool_host::BoundedProcessAuthority::bind(services, request.clone())
+    }
+
+    fn bounded_process_lease(
+        &self,
+        request: &RuntimeToolExecutionRequest,
+    ) -> Result<tools::ToolHostLease, crate::ToolError> {
+        let binding = request
+            .step_binding
+            .as_ref()
+            .ok_or_else(|| crate::ToolError::new("bounded fixture requires original Step"))?;
+        let step = binding
+            .resolve(Some(self.tools.pin_snapshot()))
+            .map_err(|error| crate::ToolError::new(error.to_string()))?;
+        let input = step
+            .validate_call(
+                &binding.origin,
+                request
+                    .session_id
+                    .as_deref()
+                    .ok_or_else(|| crate::ToolError::new("missing Session"))?,
+                &request.tool_use_id,
+                &request.tool_name,
+                &request.input,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|error| crate::ToolError::new(error.to_string()))?;
+        let authorization = request
+            .authorization
+            .as_ref()
+            .ok_or_else(|| crate::ToolError::new("missing original authorization"))?;
+        step.lease()
+            .validate_authorization(authorization, &request.tool_name, &input)
+            .map_err(|error| crate::ToolError::new(error.to_string()))?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(step.lease().clone())
+    }
+
+    fn bounded_process_plane(&self) -> Option<Arc<crate::ToolExecutionPlane>> {
+        self.services
+            .lock()
+            .unwrap()
+            .upgrade()
+            .map(|services| Arc::clone(services.tool_execution_plane()))
+    }
+
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.tools.pin_snapshot())
+    }
+
+    fn delegated_tool_definitions(&self, names: &[String]) -> Vec<crate::ProviderToolDefinition> {
+        self.exposure_calls.fetch_add(1, Ordering::SeqCst);
+        let requested = names.iter().cloned().collect::<BTreeSet<_>>();
+        let mut definitions = self
+            .tools
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .definitions(Some(&requested))
+            .into_iter()
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect::<Vec<_>>();
+        if let Some((name, mutation)) = *self.exposure.lock().unwrap() {
+            if mutation == "missing" {
+                definitions.retain(|definition| definition.name != name);
+            } else if let Some(definition) = definitions
+                .iter_mut()
+                .find(|definition| definition.name == name)
+            {
+                match mutation {
+                    "schema" => definition.input_schema = serde_json::json!({"type":"object"}),
+                    "description" => {
+                        definition.description = Some("changed actual exposure".into())
+                    }
+                    "duplicate" | "identical" => {
+                        let mut conflict = definition.clone();
+                        if mutation == "duplicate" {
+                            conflict.description = Some("conflicting duplicate".into());
+                        }
+                        definitions.push(conflict);
+                    }
+                    _ => panic!("unknown exposure mutation"),
+                }
+            }
+        }
+        definitions
+    }
+
+    fn delegated_tool_effect_descriptor(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        let lease = self.tools.pin_snapshot();
+        lease.snapshot().catalog.canonical_name(name)?;
+        if name == "tool_search" {
+            if let Some(effect) = self.effect_override.lock().unwrap().clone() {
+                return Some(effect);
+            }
+        }
+        Some(lease.describe_effect(name, input))
+    }
+
+    async fn execute_runtime_tool(
+        &self,
+        request: &RuntimeToolExecutionRequest,
+    ) -> crate::RuntimeToolExecutionOutcome {
+        let prepared = (|| {
+            let binding = request.step_binding.as_ref().ok_or("missing Step")?;
+            let step = binding
+                .resolve(Some(self.tools.pin_snapshot()))
+                .map_err(|error| error.to_string())?;
+            let input = step
+                .validate_call(
+                    &binding.origin,
+                    request.session_id.as_deref().ok_or("missing Session")?,
+                    &request.tool_use_id,
+                    &request.tool_name,
+                    &request.input,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .map_err(|error| error.to_string())?;
+            let authorization = request
+                .authorization
+                .as_ref()
+                .ok_or("missing authorization")?;
+            step.lease()
+                .validate_authorization(authorization, &request.tool_name, &input)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((step, input))
+        })();
+        let mut typed_observations = Vec::new();
+        let result = match prepared {
+            Err(error) => Err(error),
+            Ok((step, input)) => {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if request.tool_name == "working_context" {
+                    let services = self.services.lock().unwrap().upgrade();
+                    match services.zip(request.memory_context.as_ref()) {
+                        Some((services, context))
+                            if request.session_id.as_deref()
+                                == Some(context.session_id.as_str()) =>
+                        {
+                            match serde_json::from_value::<
+                                crate::working_context::WorkingContextInput,
+                            >(input)
+                            {
+                                Ok(command) => services
+                                    .working_context_command(context, &request.tool_use_id, command)
+                                    .await
+                                    .and_then(|output| {
+                                        serde_json::to_string(&output)
+                                            .map_err(|error| error.to_string())
+                                    }),
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        _ => Err("working context Runtime/Session binding missing".into()),
+                    }
+                } else {
+                    let lease = step.lease().clone();
+                    let authorization = request.authorization.as_ref().unwrap().clone();
+                    let tool_name = request.tool_name.clone();
+                    if request.compiled_invocation.as_ref().is_some_and(|invocation| {
+                        invocation.effect.uses_network && !invocation.effect.spawns_process
+                    }) {
+                        match (crate::ExecutionCommitService::local_network_binding(request), request.session_id.as_deref(), request.step_binding.as_ref()) {
+                            (Err(error), _, _) => Err(error.to_string()),
+                            (Ok(binding), Some(session), Some(original)) => lease.execute_joined_local_network(
+                                &authorization, &tool_name, &request.input, binding, session, &original.origin,
+                            ).await.map(|(output, fact)| {
+                                typed_observations.push(fact.into_observation(
+                                    request.tool_name.clone(), request.observation_wave_sequence,
+                                ));
+                                output
+                            }).map_err(|error| error.to_string()),
+                            _ => Err("local network original Session/Step missing".into()),
+                        }
+                    } else {
+                        crate::ToolExecutionPlane::adapt_blocking(move || {
+                            lease
+                                .execute(&authorization, &tool_name, &input)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result)
+                    }
+                }
+            }
+        };
+        crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: if result.is_ok() {
+                RuntimeToolExecutionStatus::Executed
+            } else {
+                RuntimeToolExecutionStatus::Failed
+            },
+            category: request.category,
+            output: result.as_ref().ok().cloned(),
+            error: result.err(),
+            evidence_ref: format!("real-toolhost:{}", request.tool_use_id),
+            observed_evidence: typed_observations,
+        }
+    }
+}
+
+pub(super) fn discovery_test_services(
+    root: &std::path::Path,
+    process: bool,
+) -> (
+    Arc<RuntimeServices>,
+    Arc<DiscoveryTestHost>,
+    AgentTaskPacket,
+) {
+    discovery_configured_services(
+        root,
+        process,
+        &["read_file", "tool_orchestrate"],
+        PermissionMode::ReadOnly,
+        vec!["read:src/a.rs".into()],
+        false,
+    )
+}
+
+fn discovery_configured_services(
+    root: &std::path::Path,
+    process: bool,
+    names: &[&str],
+    ceiling: PermissionMode,
+    scopes: Vec<String>,
+    controls: bool,
+) -> (
+    Arc<RuntimeServices>,
+    Arc<DiscoveryTestHost>,
+    AgentTaskPacket,
+) {
+    use harness_contract::agent::{
+        AgentDefinitionId, AgentExecutorPolicy, DefinitionScope, ReleaseAssignment,
+        ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionSelector,
+    };
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/a.rs"), "narrow-read-proof").unwrap();
+    std::fs::write(workspace.join("src/sibling.rs"), "untouched-sibling").unwrap();
+    let host = Arc::new(DiscoveryTestHost::new(&workspace));
+    if controls {
+        discovery_replace_runtime(&host, vec![discovery_control_definition()]);
+    }
+    let services = RuntimeServices::test_builder(root.join("home"), &workspace)
+        .tool_execution_host(host.clone())
+        .build()
+        .unwrap();
+    *host.services.lock().unwrap() = Arc::downgrade(&services);
+    let mut packet = test_agent_packet(Vec::new());
+    packet.allowed_tools = names.iter().map(|name| name.to_string()).collect();
+    packet.resource_scopes = scopes;
+    packet.permission_ceiling = ceiling;
+    let definition = if names.contains(&"web_fetch") {
+        "cowd/autonomous"
+    } else {
+        "cowd/execute"
+    };
+    let mut definition_id = AgentDefinitionId::new(DefinitionScope::Builtin, definition).unwrap();
+    if process {
+        let registry = services.definition_registry();
+        let base = registry
+            .resolve_agent(&definition_id, RevisionSelector::LatestApprovedStable)
+            .unwrap();
+        let spec = crate::ProcessJsonlSpec::new(
+            "command:discovery-worker",
+            "discovery-worker",
+            Vec::new(),
+        );
+        let mut manifest = base.revision.manifest.clone();
+        definition_id =
+            AgentDefinitionId::new(DefinitionScope::Workspace, "discovery/process-reader").unwrap();
+        manifest.definition_id = definition_id.clone();
+        manifest.executor = AgentExecutorPolicy::ProcessJsonl {
+            command_ref: spec.command_ref,
+            command_digest: spec.command_digest,
+        };
+        let stored = registry
+            .agents()
+            .store_revision(manifest, &base.agent_markdown)
+            .unwrap();
+        registry
+            .agents()
+            .record_release_assignment(&ReleaseAssignment {
+                scope: DefinitionScope::Workspace,
+                revision_ref: stored.revision.revision_ref.clone(),
+                channel: ReleaseChannel::Stable,
+                status: ReleaseAssignmentStatus::Active,
+                authorization: ReleaseAuthorization::HumanApproval {
+                    approval_ref: "test:discovery-process".into(),
+                },
+                content_digest: stored.revision.content_digest,
+            })
+            .unwrap();
+    }
+    let mut request = crate::AgentBindingRequest::new(
+        definition_id,
+        RevisionSelector::LatestApprovedStable,
+        packet.agent_id(),
+        packet.session_id(),
+        packet.task_id(),
+    );
+    request.team_id = packet.team_id().map(str::to_string);
+    request.granted_capabilities = vec![harness_contract::agent::AgentCapability::Read];
+    if names.contains(&"tool_search") {
+        request
+            .granted_capabilities
+            .push(harness_contract::agent::AgentCapability::Search);
+    }
+    if names.contains(&"edit") {
+        request
+            .granted_capabilities
+            .push(harness_contract::agent::AgentCapability::Write);
+    }
+    if names.contains(&"execute_code") {
+        request
+            .granted_capabilities
+            .push(harness_contract::agent::AgentCapability::Test);
+    }
+    if names.contains(&"web_fetch") {
+        request
+            .granted_capabilities
+            .push(harness_contract::agent::AgentCapability::Network);
+    }
+    request.allowed_tool_contract_refs = packet.allowed_tools.clone();
+    let binding = crate::AgentBindingCompiler::new(Arc::clone(services.definition_registry()))
+        .compile(request)
+        .unwrap()
+        .snapshot;
+    assert_eq!(
+        binding
+            .tool_contract_refs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        packet.allowed_tools.iter().cloned().collect()
+    );
+    packet.assignment = crate::test_support::agent_assignment(
+        Some(binding.definition_ref.clone()),
+        packet.agent_id(),
+        packet.run_id(),
+        packet.task_id(),
+        packet.session_id(),
+        packet.mission_id(),
+        packet.team_id(),
+        packet.graph_id(),
+        packet.node_id(),
+    );
+    packet.binding = Some(binding);
+    let mut graph = harness_contract::execution_graph::ExecutionGraph::new("discovery fixture");
+    graph.id = packet.graph_id().into();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: packet.session_id().into(),
+        turn_id: packet
+            .assignment
+            .execution_identity
+            .turn_id()
+            .unwrap()
+            .into(),
+        root_task_id: packet.assignment.root_task_id.clone(),
+        task_id: packet.task_id().into(),
+        generation: 1,
+    });
+    let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+        harness_contract::execution_graph::ExecutionNodeKind::AgentTask,
+        "agent_task",
+        serde_json::to_string(&packet).unwrap(),
+    );
+    node.id = packet.node_id().into();
+    graph.nodes.push(node);
+    services.commit_service().register_graph(graph).unwrap();
+    services.publish_session_execution_policy(
+        packet.session_id(),
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Supervised,
+                packet.policy_revision,
+                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+            ),
+        ),
+    );
+    (services, host, packet)
+}
+
+fn discovery_native_executor(
+    services: &Arc<RuntimeServices>,
+    host: Arc<dyn RuntimeExecutionHost>,
+    packet: &AgentTaskPacket,
+    allowed_tools: BTreeSet<String>,
+) -> ScopedRuntimeToolExecutor {
+    let policy = services
+        .session_execution_policy(packet.session_id())
+        .unwrap();
+    ScopedRuntimeToolExecutor {
+        tool_batch: Some(
+            crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+                services, packet,
+            ),
+        ),
+        host,
+        allowed_tools,
+        session_id: packet.session_id().into(),
+        sandbox_posture: policy.sandbox_posture,
+        policy_revision: policy.revision,
+        memory_context: memory::MemoryTurnContext::new(packet.session_id(), packet.agent_id()),
+        reality_context: packet
+            .binding
+            .as_ref()
+            .map(|binding| binding.data_lease.clone()),
+        model_lease: packet.model_lease.clone(),
+        execution_id: packet.graph_id().into(),
+        node_id: packet.node_id().into(),
+        attempt: packet.attempt,
+        workspace_root: services.workspace_root().into(),
+        path_identity_resolver: Arc::clone(services.path_identity_resolver()),
+        scope_locks: Arc::clone(services.scope_locks()),
+        commit_service: Some(services.commit_service().clone()),
+        resource_scopes: Some(packet.resource_scopes.clone()),
+        managed_invocation: None,
+        next_receipt_sequence: AtomicU64::new(0),
+        receipts: Mutex::new(Vec::new()),
+        provider_model_obligations: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn bounded_process_fixture_live_authority_rejects_revoked_session_before_source_copy_287() {
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_configured_services(
+        root.path(),
+        false,
+        &["execute_code"],
+        PermissionMode::DangerFullAccess,
+        vec!["read:.".into()],
+        false,
+    );
+    let (live, _, allowed) =
+        model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+    let executor = discovery_native_executor(&services, live, &packet, allowed);
+    let input =
+        serde_json::json!({"language":"python","code":"print(open('/project/src/a.rs').read())",
+        "input_files":["src/a.rs"],"timeout_ms":5000})
+        .to_string();
+    let step = discovery_bound_step(
+        &executor,
+        &packet,
+        "live-authority-287",
+        PermissionMode::DangerFullAccess,
+    );
+    let binding = crate::step_snapshot::StepCallBinding::provider(step, "live-authority-call-287");
+    let authorization = discovery_authorization_with_mode(
+        &executor,
+        "execute_code",
+        &input,
+        "live-authority-call-287",
+        PermissionMode::DangerFullAccess,
+    );
+    let mut request =
+        RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
+            tool_use_id: "live-authority-call-287".into(),
+            tool_name: "execute_code".into(),
+            input: input.clone(),
+            depends_on: vec![],
+        });
+    request.compiled_invocation = Some(
+        binding
+            .prepare_invocation(
+                Some(host.tools.pin_snapshot()),
+                "execute_code",
+                &serde_json::from_str(&input).unwrap(),
+            )
+            .unwrap(),
+    );
+    request.idempotency_key = binding.effect_idempotency_key();
+    request.step_binding = Some(binding);
+    request.authorization = Some(authorization);
+    request.session_id = Some(packet.session_id().into());
+    request.policy_revision = executor.policy_revision;
+    request.sandbox_posture = executor.sandbox_posture;
+    request.authorized_scopes = packet.resource_scopes.clone();
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: packet.graph_id().into(),
+        node_id: packet.node_id().into(),
+    });
+    request.parent_execution_attempt = Some(packet.attempt);
+    let mut graph = services
+        .graph_state_store()
+        .load(packet.graph_id())
+        .unwrap();
+    for status in [
+        harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+        harness_contract::execution_graph::ExecutionNodeStatus::Running,
+    ] {
+        graph = services
+            .commit_service()
+            .transition_node(&graph, packet.node_id(), status, None, vec![])
+            .unwrap()
+            .graph;
+    }
+    let effect = &request.compiled_invocation.as_ref().unwrap().effect;
+    let scope = crate::bound_tool_batch::admitted_effect_scope(
+        &request,
+        effect,
+        Some(host.tools.pin_snapshot()),
+        services.path_identity_resolver(),
+    )
+    .unwrap();
+    assert_eq!(
+        services
+            .commit_service()
+            .begin_bound_tool_effect(&request, effect, &scope)
+            .unwrap(),
+        crate::execution_core::graph::ToolEffectState::Fresh
+    );
+    let authority = host.bounded_process_authority(&request).unwrap();
+    authority.check(&request).unwrap();
+    let mut substituted = request.clone();
+    substituted.input.push(' ');
+    assert!(authority
+        .check(&substituted)
+        .unwrap_err()
+        .to_string()
+        .contains("immutable authority request changed"));
+    let control = services
+        .session_execution_policy_control(packet.session_id())
+        .unwrap();
+    let mut policy = control.snapshot();
+    policy.revision += 1;
+    control.replace(policy).unwrap();
+    assert!(authority
+        .check(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("live Session authority revoked or changed"));
+    assert!(host.bounded_process_authority(&request).is_err());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+    assert!(services
+        .commit_service()
+        .completed_tool_effect(&request, effect)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        std::fs::read_to_string(services.workspace_root().join("src/a.rs")).unwrap(),
+        "narrow-read-proof"
+    );
+    assert!(services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
+
+fn discovery_native_authorization(
+    executor: &ScopedRuntimeToolExecutor,
+    tool: &str,
+    input: &str,
+    call_id: &str,
+) -> harness_contract::tool::ToolExecutionAuthorization {
+    let descriptor = executor
+        .registered_tool_effect(tool, &serde_json::from_str(input).unwrap())
+        .unwrap();
+    let policy = permission_policy(None, PermissionMode::ReadOnly, &executor.allowed_tools);
+    let negotiator = crate::AuthorizationNegotiator::new();
+    let evaluated = negotiator.assess_effective(
+        &policy,
+        &crate::AuthorizationRequest {
+            principal_id: "discovery-native".into(),
+            capability: tool.into(),
+            input: input.into(),
+            idempotency_key: call_id.into(),
+            effect: descriptor,
+            parent_ceiling: PermissionMode::ReadOnly,
+            parent_lease_id: None,
+            policy_revision: executor.policy_revision,
+            recovery_scope: "discovery-native".into(),
+            context: crate::PermissionContext::default(),
+            safe_alternatives: Vec::new(),
+        },
+    );
+    crate::ToolPolicy
+        .authorize(
+            &evaluated.effective,
+            &evaluated.assessment,
+            call_id,
+            evaluated.assessment.lease.clone().unwrap(),
+            30,
+        )
+        .unwrap()
+        .authorization
+}
+
+#[test]
+fn r1_composite_discovery_pinned_catalog_does_not_authorize_unknown_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let host = DiscoveryTestHost::new(root.path());
+    let requested = BTreeSet::from(["read_file".into(), "tool_orchestrate".into()]);
+    let lease = host.tools.pin_snapshot();
+    let metadata = lease.catalog_receipt();
+    for definition in
+        host.delegated_tool_definitions(&requested.iter().cloned().collect::<Vec<_>>())
+    {
+        let narrow = vec!["read:src/a.rs".into()];
+        let discovered = crate::tool_host::discover_delegated_tool(
+            &lease,
+            &metadata,
+            &definition,
+            &requested,
+            PermissionMode::ReadOnly,
+            Some(&narrow),
+        )
+        .unwrap();
+        assert_eq!(
+            discovered,
+            *metadata
+                .descriptors
+                .iter()
+                .find(|descriptor| descriptor.canonical_id == definition.name)
+                .unwrap()
+        );
+        assert!(!crate::tool_host::effect_has_resource_lease(
+            &lease.describe_effect(&definition.name, &serde_json::json!({})),
+            &narrow,
+            crate::tool_host::lexical_resource_path_is_authorized,
+        ));
+        for scopes in [
+            vec![],
+            vec!["read:src/../secret".into()],
+            vec!["read:../secret".into()],
+            vec!["read:/secret".into()],
+            vec!["execute:src/a.rs".into()],
+            vec!["read:".into()],
+            vec!["read:C:/secret".into()],
+            vec!["read:C:secret".into()],
+            vec!["read:c:../secret".into()],
+            vec!["read:\\\\server\\share".into()],
+            vec!["read:src\\..\\secret".into()],
+        ] {
+            assert!(
+                crate::tool_host::discover_delegated_tool(
+                    &lease,
+                    &metadata,
+                    &definition,
+                    &requested,
+                    PermissionMode::ReadOnly,
+                    Some(&scopes),
+                )
+                .is_none(),
+                "{scopes:?}"
+            );
+        }
+        assert!(!delegated_tool_is_eligible(
+            None,
+            None,
+            &definition,
+            &requested,
+            PermissionMode::ReadOnly,
+            Some(&narrow)
+        ));
+        assert!(crate::tool_host::discover_delegated_tool(
+            &lease,
+            &metadata,
+            &definition,
+            &BTreeSet::new(),
+            PermissionMode::ReadOnly,
+            Some(&narrow),
+        )
+        .is_none());
+        let mut fake_schema = definition.clone();
+        fake_schema.input_schema = serde_json::json!({"type":"object"});
+        assert!(crate::tool_host::discover_delegated_tool(
+            &lease,
+            &metadata,
+            &fake_schema,
+            &requested,
+            PermissionMode::ReadOnly,
+            Some(&narrow),
+        )
+        .is_none());
+        let network_only = vec!["network:*".into()];
+        assert_eq!(
+            crate::tool_host::discover_delegated_tool(
+                &lease,
+                &metadata,
+                &definition,
+                &requested,
+                PermissionMode::ReadOnly,
+                Some(&network_only),
+            )
+            .is_some(),
+            definition.name == "tool_orchestrate"
+        );
+    }
+    let unavailable = host
+        .delegated_tool_definitions(&["mcp_tool".into()])
+        .pop()
+        .unwrap();
+    assert!(crate::tool_host::discover_delegated_tool(
+        &lease,
+        &metadata,
+        &unavailable,
+        &BTreeSet::from(["mcp_tool".into()]),
+        PermissionMode::DangerFullAccess,
+        Some(&["network:*".into()]),
+    )
+    .is_none());
+    let edit = host
+        .delegated_tool_definitions(&["edit".into()])
+        .pop()
+        .unwrap();
+    assert!(crate::tool_host::discover_delegated_tool(
+        &lease,
+        &metadata,
+        &edit,
+        &BTreeSet::from(["edit".into()]),
+        PermissionMode::ReadOnly,
+        Some(&["write:src/a.rs".into()]),
+    )
+    .is_none());
+    let mut unknown = edit;
+    unknown.name = "unregistered_read_file".into();
+    assert!(crate::tool_host::discover_delegated_tool(
+        &lease,
+        &metadata,
+        &unknown,
+        &BTreeSet::from([unknown.name.clone()]),
+        PermissionMode::DangerFullAccess,
+        Some(&["read:src/a.rs".into()]),
+    )
+    .is_none());
+    let custom = tools::RuntimeToolDefinition {
+        name: "custom_read_file".into(),
+        description: None,
+        input_schema: serde_json::json!({"type":"object"}),
+        required_permission: tools::permissions::PermissionMode::ReadOnly,
+        effect_resolver: tools::builtin_effect_resolver_spec("read_file"),
+    };
+    let catalog = tools::ToolCatalog::builtin()
+        .with_runtime_tools(vec![custom.clone()])
+        .unwrap();
+    let custom_host = tools::ToolHost::new(
+        "custom-discovery",
+        root.path(),
+        tools::ToolHostSnapshot::new(
+            Arc::new(catalog),
+            Arc::new(tools::lsp_client::LspRegistry::new()),
+            None,
+        ),
+    );
+    let custom_lease = custom_host.pin_snapshot();
+    let custom_definition = crate::ProviderToolDefinition {
+        name: custom.name.clone(),
+        description: None,
+        input_schema: custom.input_schema.clone(),
+    };
+    assert!(crate::tool_host::discover_delegated_tool(
+        &custom_lease,
+        &custom_lease.catalog_receipt(),
+        &custom_definition,
+        &BTreeSet::from([custom.name.clone()]),
+        PermissionMode::ReadOnly,
+        Some(&["read:src/a.rs".into()]),
+    )
+    .is_none());
+    let mut shadow = custom;
+    shadow.name = "read_file".into();
+    shadow.effect_resolver.resolver_id = "runtime.readonly".into();
+    assert!(tools::ToolCatalog::builtin()
+        .with_runtime_tools(vec![shadow])
+        .is_err());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn r1_composite_discovery_native_narrow_read_keeps_exact_execution_ceiling() {
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_test_services(root.path(), false);
+    let (pinned, definitions, allowed) =
+        model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
+    assert_eq!(allowed, packet.allowed_tools.iter().cloned().collect());
+    let executor = discovery_native_executor(&services, pinned, &packet, allowed);
+    let catalog = executor.pin_step_catalog().unwrap();
+    let metadata = catalog.catalog_receipt();
+    let step = Arc::new(
+        crate::step_snapshot::BoundStep::bind(
+            serde_json::from_value(serde_json::json!({
+                "step_id":"native-discovery", "session_id":packet.session_id(),
+                "turn_id":packet.assignment.execution_identity.turn_id().unwrap(),
+                "execution_id":packet.run_id(), "run_ref":packet.run_id(),
+                "actor_ref":packet.assignment.execution_identity.principal_id(), "attempt":null,
+                "build_ref":"discovery-fixture"
+            }))
+            .unwrap(),
+            catalog.clone(),
+            &definitions,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            BTreeMap::new(),
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        )
+        .unwrap(),
+    );
+    for (call_id, tool, value) in [
+        (
+            "native-read",
+            "read_file",
+            serde_json::json!({"path":"src/a.rs"}),
+        ),
+        (
+            "native-composite",
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"read","op":"call","tool":"read_file","input":{"path":"src/a.rs"}}
+            ]}),
+        ),
+    ] {
+        let input = normalize_delegated_resource_paths(
+            tool,
+            &value.to_string(),
+            services.workspace_root(),
+            services.path_identity_resolver(),
+            Some(&packet.resource_scopes),
+        )
+        .unwrap();
+        let authorization = discovery_native_authorization(&executor, tool, &input, call_id);
+        let binding = crate::step_snapshot::StepCallBinding::provider(step.clone(), call_id);
+        let output = executor
+            .execute_step_authorized_invocation_output(
+                Some(&binding),
+                call_id,
+                &authorization,
+                tool,
+                &input,
+            )
+            .await
+            .unwrap();
+        assert!(output.model_text().contains("narrow-read-proof"));
+    }
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(executor.receipts.lock().unwrap().len(), 2);
+    let receipt = executor.tool_discovery_receipt();
+    assert_eq!(receipt.catalog_revision, metadata.catalog_revision);
+    assert_eq!(
+        receipt
+            .activation_candidates
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        executor.allowed_tools
+    );
+    for descriptor in &receipt.descriptors {
+        assert!(metadata.descriptors.contains(descriptor));
+        assert_ne!(descriptor.canonical_id, "checkpoint");
+    }
+    assert!(executor.has_tool("checkpoint"));
+    let receipts_before = executor.receipts.lock().unwrap().len();
+    for (tool, value) in discovery_denied_calls() {
+        let input = value.to_string();
+        let binding =
+            crate::step_snapshot::StepCallBinding::provider(step.clone(), "native-denied");
+        let valid_input = if tool == "tool_orchestrate" {
+            serde_json::json!({"steps":[{"id":"read","op":"call","tool":"read_file","input":{"path":"src/a.rs"}}]}).to_string()
+        } else {
+            r#"{"path":"src/a.rs"}"#.to_string()
+        };
+        let valid = discovery_native_authorization(
+            &executor,
+            tool,
+            &normalize_delegated_resource_paths(
+                tool,
+                &valid_input,
+                services.workspace_root(),
+                services.path_identity_resolver(),
+                Some(&packet.resource_scopes),
+            )
+            .unwrap(),
+            "native-denied",
+        );
+        assert!(
+            executor
+                .execute_step_authorized_invocation_output(
+                    Some(&binding),
+                    "native-denied",
+                    &valid,
+                    tool,
+                    &input,
+                )
+                .await
+                .is_err(),
+            "{tool} {input}"
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read_to_string(services.workspace_root().join("src/sibling.rs")).unwrap(),
+            "untouched-sibling"
+        );
+        assert_eq!(
+            std::fs::read_to_string(services.workspace_root().join("src/a.rs")).unwrap(),
+            "narrow-read-proof"
+        );
+    }
+    assert_eq!(executor.receipts.lock().unwrap().len(), receipts_before);
+    let edit = serde_json::json!({"steps":[
+        {"id":"edit","op":"call","tool":"edit","input":{"action":"write","path":"src/a.rs","content":"DENIED"}}
+    ]});
+    assert!(executor
+        .enforce_resource_ceiling("tool_orchestrate", &edit.to_string())
+        .is_err());
+    host.tools
+        .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+    let reloaded = executor.tool_discovery_receipt();
+    assert_ne!(reloaded.catalog_revision, receipt.catalog_revision);
+    assert_eq!(reloaded.descriptors, receipt.descriptors);
+    assert_eq!(
+        reloaded.activation_candidates,
+        receipt.activation_candidates
+    );
+    assert_ne!(host.tools.pin_snapshot().revision(), catalog.revision());
+    assert_eq!(
+        executor
+            .prepare_step_catalog(PermissionMode::ReadOnly)
+            .unwrap()
+            .unwrap()
+            .revision(),
+        reloaded.catalog_revision
+    );
+    for scopes in [
+        vec![],
+        vec!["read:src/../a.rs".into()],
+        vec!["network:*".into()],
+    ] {
+        let mut denied = packet.clone();
+        denied.resource_scopes = scopes;
+        assert!(model_loop::activate_native_tools(host.clone(), &denied, true).is_err());
+    }
+    let no_pin: Arc<dyn RuntimeExecutionHost> = Arc::new(NoopRuntimeExecutionHost);
+    assert!(model_loop::activate_native_tools(no_pin, &packet, true).is_err());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    assert!(services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
+
+pub(super) fn discovery_denied_calls() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("read_file", serde_json::json!({})),
+        ("read_file", serde_json::json!({"path":"src/sibling.rs"})),
+        ("read_file", serde_json::json!({"path":"../secret"})),
+        ("read_file", serde_json::json!({"path":"/etc/passwd"})),
+        ("tool_orchestrate", serde_json::json!({})),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"edit","op":"call","tool":"edit","input":{"action":"write","path":"src/a.rs","content":"DENIED"}}
+            ]}),
+        ),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"network","op":"call","tool":"web_fetch","input":{"url":"https://example.invalid","prompt":"denied"}}
+            ]}),
+        ),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"unknown","op":"call","tool":"not_registered","input":{}}
+            ]}),
+        ),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+                {"id":"compute","op":"compute","language":"python","code":"print(1)"}
+            ]}),
+        ),
+        (
+            "tool_orchestrate",
+            serde_json::json!({"steps":[
+                {"id":"read","op":"call","tool":"read_file","input":{"path":"$missing.path"}}
+            ]}),
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn scoped_expired_receipt_replays_without_loading_or_dispatching_an_adapter() {
     struct ReceiptOnlyHost;
@@ -222,20 +4658,23 @@ async fn native_coordination_wire(supplement: bool, fail_input_request: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let provider = Arc::new(
-        crate::ProviderRegistry::new_with_context_windows(model_protocol::provider_config::ProvidersConfig {
-            providers: std::collections::HashMap::from([(
-                "test".into(),
-                model_protocol::provider_config::ProviderConfig {
-                    name: "test".into(),
-                    base_url: format!("http://{address}/v1"),
-                    api_key: "local-test-only".into(),
-                    models: vec!["test".into()],
-                    protocol: Some("responses".into()),
-                    parallel_tool_calls: Default::default(),
-                    early_tool_start: Default::default(),
-                },
-            )]),
-        }, std::collections::BTreeMap::from([("test".into(), 128_000)]))
+        crate::ProviderRegistry::new_with_context_windows(
+            model_protocol::provider_config::ProvidersConfig {
+                providers: std::collections::HashMap::from([(
+                    "test".into(),
+                    model_protocol::provider_config::ProviderConfig {
+                        name: "test".into(),
+                        base_url: format!("http://{address}/v1"),
+                        api_key: "local-test-only".into(),
+                        models: vec!["test".into()],
+                        protocol: Some("responses".into()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
+                    },
+                )]),
+            },
+            std::collections::BTreeMap::from([("test".into(), 128_000)]),
+        )
         .unwrap(),
     );
     let fixture = crate::agentic::coordination::tests::fixture_with_provider(provider).await;
@@ -1143,6 +5582,31 @@ fn concurrency_test_executor(
     }
 }
 
+#[test]
+fn delegated_control_effect_parent_is_the_scoped_packet_not_the_root() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut executor = concurrency_test_executor(
+        workspace.path(),
+        Arc::new(ConcurrencyTrackingRuntimeExecutionHost::new()),
+        Arc::new(ScopeLockManager::new()),
+    );
+    executor.execution_id = "physical-agent-graph".into();
+    executor.node_id = "physical-agent-node".into();
+    executor.attempt = 9;
+    executor.allowed_tools.extend([
+        "task_claim".into(),
+        "task_submit".into(),
+        "task_review".into(),
+    ]);
+    let (parent, attempt) = executor.durable_tool_effect_parent().unwrap();
+    assert_eq!(parent.execution_id, "physical-agent-graph");
+    assert_eq!(parent.node_id, "physical-agent-node");
+    assert_eq!(attempt, 9);
+    for tool in ["task_claim", "task_submit", "task_review"] {
+        assert!(!executor.owns_durable_tool_effect(tool), "{tool}");
+    }
+}
+
 #[tokio::test]
 async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_paths() {
     let root = tempfile::tempdir().expect("workspace");
@@ -1889,7 +6353,7 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
         receipts: Mutex::new(Vec::new()),
         provider_model_obligations: Vec::new(),
     };
-    let input = r#"{"language":"python","code":"print(1)"}"#;
+    let input = r#"{"language":"python","code":"print(1)","input_files":[]}"#;
 
     let whole_workspace = build(vec!["read:.".to_string()]);
     assert!(whole_workspace.owns_durable_tool_effect("execute_code"));
@@ -2158,9 +6622,10 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
 
 #[tokio::test]
 async fn scoped_executor_advertises_only_packet_authorized_tools() {
+    let root = tempfile::tempdir().unwrap();
     let executor = ScopedRuntimeToolExecutor {
         tool_batch: None,
-        host: Arc::new(NoopRuntimeExecutionHost),
+        host: Arc::new(DiscoveryTestHost::new(root.path())),
         allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
         session_id: "session".to_string(),
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
@@ -3812,5 +8277,652 @@ fn autonomous_checkpoint_never_repeats_after_non_satisfied_terminal() {
         GoalCompletion::Cancelled,
     ] {
         assert!(!autonomy_continuation_may_advance(completion));
+    }
+}
+
+fn process_request_366(
+    services: &Arc<RuntimeServices>,
+    bridge: &ProcessJsonlToolSession,
+    packet: &AgentTaskPacket,
+    call_id: &str,
+) -> RuntimeToolExecutionRequest {
+    let step = bridge.steps.lock().unwrap().back().unwrap().clone();
+    let binding = crate::step_snapshot::StepCallBinding::process(step, packet.run_id(), 1, call_id);
+    let input = r#"{"path":"src/a.rs","complete":true}"#;
+    let value = serde_json::from_str(input).unwrap();
+    let invocation = binding
+        .prepare_invocation(bridge.executor.host.pin_step_catalog(), "read_file", &value)
+        .unwrap();
+    let policy = permission_policy(
+        services.session_execution_policy_control(packet.session_id()),
+        packet.permission_ceiling,
+        &bridge.executor.allowed_tools,
+    );
+    let authorization_id = format!(
+        "process-tool:{:x}",
+        Sha256::digest(serde_json::to_vec(&(packet.graph_id(), packet.attempt, call_id)).unwrap())
+    );
+    let negotiator = crate::AuthorizationNegotiator::new();
+    let evaluated = negotiator.assess_effective(
+        &policy,
+        &crate::AuthorizationRequest {
+            principal_id: format!("agent:{}", packet.agent_id()),
+            capability: "read_file".into(),
+            input: input.into(),
+            idempotency_key: authorization_id.clone(),
+            effect: invocation.effect.clone(),
+            parent_ceiling: packet.permission_ceiling,
+            parent_lease_id: None,
+            policy_revision: bridge.executor.policy_revision,
+            recovery_scope: format!("execution:{}", packet.graph_id()),
+            context: crate::PermissionContext::default(),
+            safe_alternatives: vec![],
+        },
+    );
+    let authorization = crate::ToolPolicy
+        .authorize(
+            &evaluated.effective,
+            &evaluated.assessment,
+            authorization_id,
+            evaluated.assessment.lease.clone().unwrap(),
+            60,
+        )
+        .unwrap()
+        .authorization;
+    let mut request =
+        RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
+            tool_use_id: call_id.into(),
+            tool_name: "read_file".into(),
+            input: input.into(),
+            depends_on: vec![],
+        });
+    request.idempotency_key = binding.effect_idempotency_key();
+    request.compiled_invocation = Some(invocation);
+    request.step_binding = Some(binding);
+    request.governed_plan_id = packet.graph_id().into();
+    request.governed_plan_revision = 1;
+    request.observation_wave_sequence = 1;
+    request.category = crate::ToolSafetyCategory::ReadOnly;
+    request.authorization = Some(authorization);
+    request.session_id = Some(packet.session_id().into());
+    request.policy_revision = bridge.executor.policy_revision;
+    request.sandbox_posture = bridge.executor.sandbox_posture;
+    request.authorized_scopes = bridge.executor.authorized_scopes_for_tool();
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: packet.graph_id().into(),
+        node_id: packet.node_id().into(),
+    });
+    request.parent_execution_attempt = Some(packet.attempt);
+    serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap()
+}
+
+fn process_pair_366(
+    services: &RuntimeServices,
+    request: &RuntimeToolExecutionRequest,
+) -> Vec<crate::DurableRuntimeEvent> {
+    let parent = request.parent_execution.as_ref().unwrap();
+    let store = services.event_store();
+    [
+        (
+            format!("execution-effect:{}", request.idempotency_key),
+            format!("{}:read-receipt", request.idempotency_key),
+        ),
+        (
+            format!(
+                "execution-agent-receipts:{}:{}:{}",
+                parent.execution_id,
+                parent.node_id,
+                request.parent_execution_attempt.unwrap()
+            ),
+            format!("agent-tool-receipt:{}", request.idempotency_key),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(stream, key)| store.event_by_idempotency_key(&stream, &key).unwrap())
+    .collect()
+}
+
+#[tokio::test]
+async fn agent_tool_366_executed_terminal_before_delivery_survives_host_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_test_services(root.path(), true);
+    let selection = AgentModelSelection {
+        model: packet.model_lease.clone(),
+        provider: "local-discovery".into(),
+        registry_revision: 0,
+    };
+    let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+    bridge.begin_step().unwrap();
+    let request = process_request_366(&services, &bridge, &packet, "terminal-before-delivery-366");
+    let descriptor = request.compiled_invocation.as_ref().unwrap().effect.clone();
+    let executed = crate::bound_tool_batch::execute_bound_agent_tool(
+        host.as_ref(),
+        Some(services.commit_service()),
+        services.path_identity_resolver(),
+        services.scope_locks(),
+        &request,
+        &descriptor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(executed.status, RuntimeToolExecutionStatus::Executed);
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    let original = process_pair_366(&services, &request);
+    assert_eq!(original.len(), 2);
+    assert_eq!(original[0].transaction_id, original[1].transaction_id);
+    assert!(!services
+        .event_store()
+        .all_events(100_000)
+        .unwrap()
+        .iter()
+        .any(|event| event.stream_id.starts_with("agent-tool-batch:")));
+    host.tools
+        .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+    assert_eq!(
+        request
+            .step_binding
+            .as_ref()
+            .unwrap()
+            .resolve(Some(host.tools.pin_snapshot()))
+            .unwrap_err()
+            .to_string(),
+        "step_binding_stale"
+    );
+    let dispatcher =
+        crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+            &services, &packet,
+        );
+    let delivered = dispatcher.execute(request.clone()).await.unwrap();
+    assert_eq!(delivered.status, RuntimeToolExecutionStatus::Executed);
+    assert_eq!(delivered.output, executed.output);
+    assert_eq!(delivered.error, executed.error);
+    assert_eq!(delivered.tool_use_id, executed.tool_use_id);
+    assert!(delivered
+        .observed_evidence
+        .iter()
+        .all(|evidence| evidence.provenance
+            == harness_contract::context::ObservedEvidenceProvenance::RetainedReplay));
+    assert_eq!(process_pair_366(&services, &request), original);
+    let mut retry = request.clone();
+    retry.governed_plan_revision += 1;
+    retry.observation_wave_sequence += 1;
+    assert_eq!(dispatcher.execute(retry).await.unwrap(), delivered);
+    assert_eq!(process_pair_366(&services, &request), original);
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert!(bridge.executor.receipts.lock().unwrap().is_empty());
+    assert_eq!(services.tool_execution_plane().stats().active, 0);
+    assert!(services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
+
+#[tokio::test]
+async fn agent_tool_366_actual_stale_and_concurrent_replay_keep_original_failed_pair() {
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_test_services(root.path(), true);
+    let selection = AgentModelSelection {
+        model: packet.model_lease.clone(),
+        provider: "local-discovery".into(),
+        registry_revision: 0,
+    };
+    let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+    bridge.begin_step().unwrap();
+    let request = process_request_366(&services, &bridge, &packet, "failed-pair-366");
+    host.tools
+        .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+    let dispatcher =
+        crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+            &services, &packet,
+        );
+    let mut second = request.clone();
+    second.governed_plan_revision += 1;
+    second.observation_wave_sequence += 1;
+    let (first, second) = tokio::join!(
+        dispatcher.execute(request.clone()),
+        dispatcher.execute(second)
+    );
+    let failed = first.unwrap();
+    assert_eq!(second.unwrap(), failed);
+    assert_eq!(failed.status, RuntimeToolExecutionStatus::Failed);
+    assert_eq!(failed.error.as_deref(), Some("step_binding_stale"));
+    assert!(failed.output.is_none() && failed.observed_evidence.is_empty());
+    let original = process_pair_366(&services, &request);
+    assert_eq!(original.len(), 2);
+    assert_eq!(original[0].transaction_id, original[1].transaction_id);
+    assert_eq!(original[0].commit_cursor, original[1].commit_cursor);
+    assert!(original[1].transaction_index > original[0].transaction_index);
+    assert_eq!(
+        original[0].payload["outcome"],
+        original[1].payload["outcome"]
+    );
+    for event in &original {
+        assert!(event.payload["resolved_effect_scope"].is_null());
+        assert!(event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null());
+        assert!(event.payload["process_admission_ref"].is_null());
+    }
+    let mut third = request.clone();
+    third.governed_plan_revision += 2;
+    third.observation_wave_sequence += 2;
+    assert_eq!(dispatcher.execute(third).await.unwrap(), failed);
+    assert_eq!(process_pair_366(&services, &request), original);
+    assert_eq!(
+        services
+            .commit_service()
+            .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+    assert!(bridge.executor.receipts.lock().unwrap().is_empty());
+    assert_eq!(services.tool_execution_plane().stats().active, 0);
+    assert!(services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
+
+#[tokio::test]
+async fn agent_tool_366_stale_rejection_does_not_bypass_original_authority() {
+    for mutation in [
+        "call",
+        "key",
+        "actor",
+        "turn",
+        "run",
+        "attempt",
+        "catalog",
+        "expired",
+        "signature",
+        "policy",
+        "scope",
+        "descriptor",
+        "process",
+        "network",
+        "write",
+        "provider",
+        "generic_error",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (services, host, packet) = discovery_test_services(root.path(), true);
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-discovery".into(),
+            registry_revision: 0,
+        };
+        let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+        bridge.begin_step().unwrap();
+        let mut request =
+            process_request_366(&services, &bridge, &packet, "rejected-authority-366");
+        if mutation != "generic_error" {
+            host.tools
+                .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+        }
+        match mutation {
+            "call" => request.step_binding.as_mut().unwrap().origin.call_id = "foreign-call".into(),
+            "key" => request.idempotency_key = "foreign-key".into(),
+            "actor" => {
+                Arc::make_mut(&mut request.step_binding.as_mut().unwrap().snapshot)
+                    .identity
+                    .actor_ref = Some("foreign".into())
+            }
+            "turn" => {
+                Arc::make_mut(&mut request.step_binding.as_mut().unwrap().snapshot)
+                    .identity
+                    .turn_id = "foreign".into()
+            }
+            "run" => {
+                Arc::make_mut(&mut request.step_binding.as_mut().unwrap().snapshot)
+                    .identity
+                    .run_ref = Some("foreign".into())
+            }
+            "attempt" => {
+                Arc::make_mut(&mut request.step_binding.as_mut().unwrap().snapshot)
+                    .identity
+                    .attempt = Some(packet.attempt + 1)
+            }
+            "catalog" | "generic_error" => {
+                let binding = request.step_binding.as_mut().unwrap();
+                binding.origin.catalog_digest = "foreign".into();
+                Arc::make_mut(&mut binding.snapshot).catalog_digest = "foreign".into();
+                request.compiled_invocation.as_mut().unwrap().origin = Some(binding.origin.clone());
+            }
+            "expired" => {
+                Arc::make_mut(&mut request.step_binding.as_mut().unwrap().snapshot).expires_at_ms =
+                    1
+            }
+            "signature" => {
+                request
+                    .authorization
+                    .as_mut()
+                    .unwrap()
+                    .authorization_lease
+                    .signature = "forged".into()
+            }
+            "policy" => {
+                let control = services
+                    .session_execution_policy_control(packet.session_id())
+                    .unwrap();
+                let mut policy = control.snapshot();
+                policy.revision += 1;
+                control.replace(policy).unwrap();
+            }
+            "scope" => request.authorized_scopes.push("read:src/sibling.rs".into()),
+            "descriptor" => {
+                request
+                    .compiled_invocation
+                    .as_mut()
+                    .unwrap()
+                    .effect
+                    .descriptor_hash = "foreign".into()
+            }
+            "process" => {
+                request
+                    .compiled_invocation
+                    .as_mut()
+                    .unwrap()
+                    .effect
+                    .spawns_process = true
+            }
+            "network" => {
+                request
+                    .compiled_invocation
+                    .as_mut()
+                    .unwrap()
+                    .effect
+                    .uses_network = true
+            }
+            "write" => {
+                request
+                    .compiled_invocation
+                    .as_mut()
+                    .unwrap()
+                    .effect
+                    .effect_kind = harness_contract::tool::ToolEffectKind::Write
+            }
+            "provider" => {
+                let binding = request.step_binding.as_mut().unwrap();
+                binding.origin.source = harness_contract::step::CallSource::Provider {
+                    attempt_id: binding.snapshot.provider_attempt.attempt_id.clone(),
+                };
+                request.compiled_invocation.as_mut().unwrap().origin = Some(binding.origin.clone());
+            }
+            _ => unreachable!(),
+        }
+        let dispatcher =
+            crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+                &services, &packet,
+            );
+        let returned = dispatcher.execute(request.clone()).await;
+        if mutation == "generic_error" {
+            let outcome = returned.unwrap();
+            let error = own834_refusal_error(
+                &outcome,
+                &request.tool_use_id,
+                &request.tool_name,
+            );
+            assert!(
+                error.contains("step_catalog_digest_mismatch"),
+                "{error}"
+            );
+        } else {
+            assert!(returned.is_err(), "{mutation}: {returned:?}");
+        }
+        assert!(
+            process_pair_366(&services, &request).is_empty(),
+            "{mutation}"
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0, "{mutation}");
+        assert!(
+            bridge.executor.receipts.lock().unwrap().is_empty(),
+            "{mutation}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(services.workspace_root().join("src/a.rs")).unwrap(),
+            "narrow-read-proof"
+        );
+        assert_eq!(
+            std::fs::read_to_string(services.workspace_root().join("src/sibling.rs")).unwrap(),
+            "untouched-sibling"
+        );
+        assert_eq!(services.tool_execution_plane().stats().active, 0);
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn agent_tool_366_receipt_transaction_failure_is_not_a_local_failed_success() {
+    use crate::runtime_event_store::{
+        AppendTransactionRequest, ExpectedStreamRevision, RuntimeTransactionEventInput,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_test_services(root.path(), true);
+    let selection = AgentModelSelection {
+        model: packet.model_lease.clone(),
+        provider: "local-discovery".into(),
+        registry_revision: 0,
+    };
+    let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+    bridge.begin_step().unwrap();
+    let request = process_request_366(&services, &bridge, &packet, "commit-conflict-366");
+    let key = format!("{}:read-receipt", request.idempotency_key);
+    let transaction_id = format!("readonly-tool-wave:{:x}", Sha256::digest(key.as_bytes()));
+    services
+        .event_store()
+        .append_transaction(AppendTransactionRequest {
+            transaction_id,
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: "test:transaction-conflict-366".into(),
+                expected_revision: 0,
+            }],
+            events: vec![RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: "test:transaction-conflict-366".into(),
+                    scope: crate::RuntimeEventScope::Session,
+                    kind: "test.injected_transaction_conflict".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({"fault":"reserved transaction identity"}),
+                },
+                idempotency_key: Some("fault-366".into()),
+                schema_version: 1,
+            }],
+        })
+        .unwrap();
+    host.tools
+        .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+    let dispatcher =
+        crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+            &services, &packet,
+        );
+    let error = dispatcher.execute(request.clone()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stale Step rejection receipt commit failed"),
+        "{error}"
+    );
+    assert!(process_pair_366(&services, &request).is_empty());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+    assert!(bridge.executor.receipts.lock().unwrap().is_empty());
+    assert_eq!(services.tool_execution_plane().stats().active, 0);
+    assert!(services
+        .execution_supervisor()
+        .shutdown()
+        .await
+        .errors
+        .is_empty());
+}
+
+#[tokio::test]
+async fn agent_tool_366_missing_or_conflicting_pair_never_repaired_or_promoted() {
+    use crate::runtime_event_store::{
+        AppendTransactionRequest, ExpectedStreamRevision, RuntimeTransactionEventInput,
+    };
+    for mutation in [
+        "missing_index",
+        "split_transaction",
+        "outcome",
+        "owner",
+        "witness",
+        "scope",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (services, host, packet) = discovery_test_services(root.path(), true);
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-discovery".into(),
+            registry_revision: 0,
+        };
+        let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+        bridge.begin_step().unwrap();
+        let request = process_request_366(&services, &bridge, &packet, "pair-fault-366");
+        host.tools
+            .replace_snapshot(host.tools.pin_snapshot().snapshot().clone());
+        let descriptor = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        let actual_error = crate::bound_tool_batch::execute_bound_agent_tool(
+            host.as_ref(),
+            Some(services.commit_service()),
+            services.path_identity_resolver(),
+            services.scope_locks(),
+            &request,
+            &descriptor,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(actual_error.to_string(), "step_binding_stale");
+        let outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: RuntimeToolExecutionStatus::Failed,
+            category: request.category,
+            output: None,
+            error: Some(actual_error.to_string()),
+            evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+            observed_evidence: vec![],
+        };
+        let source_store = Arc::new(crate::RuntimeEventStore::for_test());
+        crate::execution_core::graph::ExecutionCommitService::new(source_store.clone())
+            .commit_readonly_tool_receipts(&[(request.clone(), outcome)])
+            .unwrap();
+        let mut records = source_store.all_events(100).unwrap();
+        records.sort_by_key(|event| event.transaction_index);
+        assert_eq!(records.len(), 2);
+        match mutation {
+            "missing_index" => {
+                records.pop();
+            }
+            "outcome" => records[1].payload["outcome"]["error"] = "forged-error".into(),
+            "owner" => {
+                records[1]
+                    .refs
+                    .iter_mut()
+                    .find(|reference| reference.kind == "agent_attempt")
+                    .unwrap()
+                    .id = "999".into()
+            }
+            "witness" => {
+                for record in &mut records {
+                    record.payload[crate::context_evidence::READ_ACQUISITION_FIELD] =
+                        serde_json::json!({"forged":true});
+                }
+            }
+            "scope" => {
+                for record in &mut records {
+                    record.payload["resolved_effect_scope"] =
+                        serde_json::json!({"version":2,"forged":true});
+                }
+            }
+            "split_transaction" => {}
+            _ => unreachable!(),
+        }
+        let groups = if mutation == "split_transaction" {
+            records
+                .into_iter()
+                .map(|record| vec![record])
+                .collect::<Vec<_>>()
+        } else {
+            vec![records]
+        };
+        for (ordinal, records) in groups.into_iter().enumerate() {
+            services
+                .event_store()
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!("test-malformed-pair-366-{ordinal}"),
+                    expected_streams: records
+                        .iter()
+                        .map(|record| ExpectedStreamRevision {
+                            stream_id: record.stream_id.clone(),
+                            expected_revision: 0,
+                        })
+                        .collect(),
+                    events: records
+                        .into_iter()
+                        .map(|record| RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: record.stream_id,
+                                scope: record.scope,
+                                kind: record.kind,
+                                status: record.status,
+                                actor: record.actor,
+                                refs: record.refs,
+                                payload: record.payload,
+                            },
+                            idempotency_key: record.idempotency_key,
+                            schema_version: record.schema_version,
+                        })
+                        .collect(),
+                })
+                .unwrap();
+        }
+        let before = process_pair_366(&services, &request);
+        let dispatcher =
+            crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+                &services, &packet,
+            );
+        assert!(
+            dispatcher.execute(request.clone()).await.is_err(),
+            "{mutation}"
+        );
+        assert_eq!(process_pair_366(&services, &request), before, "{mutation}");
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0, "{mutation}");
+        assert!(
+            bridge.executor.receipts.lock().unwrap().is_empty(),
+            "{mutation}"
+        );
+        assert_eq!(services.tool_execution_plane().stats().active, 0);
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+}
+
+#[test]
+fn process_human_grant_cannot_exceed_packet_or_service_mode() {
+    let tools = BTreeSet::from(["execute_code".to_string()]);
+    for (service_mode, packet_mode, allowed) in [
+        (PermissionMode::WorkspaceWrite, PermissionMode::DangerFullAccess, false),
+        (PermissionMode::DangerFullAccess, PermissionMode::WorkspaceWrite, false),
+        (PermissionMode::ReadOnly, PermissionMode::DangerFullAccess, false),
+        (PermissionMode::DangerFullAccess, PermissionMode::DangerFullAccess, true),
+    ] {
+        let control = crate::permissions::SessionExecutionPolicyControl::new(service_mode);
+        let policy = permission_policy(Some(control), packet_mode, &tools);
+        assert_eq!(process_tool_approval_ceiling_allows(&policy, packet_mode,
+            PermissionMode::DangerFullAccess), allowed);
     }
 }

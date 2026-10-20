@@ -1,6 +1,7 @@
 use super::*;
 
 mod policy_transition;
+mod r1_terminal_recovery;
 
 #[test]
 fn execution_policy_default_equality_includes_sandbox_posture() {
@@ -93,52 +94,23 @@ fn test_runtime_service_with_services(
 }
 
 async fn write_test_session_terminal_artifact(
+    events: &runtime::RuntimeEventStore,
     services: &runtime::RuntimeServices,
-    terminal_id: &str,
-    session_id: &str,
+    terminal: &mut runtime::SessionTerminalInput,
     ingress_message_id: &str,
     consumed_input_sequence: usize,
-) -> String {
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
-        "text": "done",
-        "goal_completion": "satisfied",
-        "ingress_message_id": ingress_message_id,
-        "consumed_input_sequence": consumed_input_sequence,
-        "token_usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
-        },
-        "transcript": [{
-            "role": "assistant",
-            "blocks": [{"type": "text", "text": "done"}]
-        }]
-    }))
-    .unwrap();
-    let artifact = services
-        .artifact_store()
-        .write_bytes(
-            harness_contract::context::ArtifactWriteDescriptor {
-                media_type: "application/vnd.cowd.session-terminal+json".to_string(),
-                visibility_scope: format!("session:{session_id}"),
-                expected_bytes: Some(payload.len() as u64),
-                original_name: Some(format!("{terminal_id}.json")),
-            },
-            &payload,
-        )
-        .await
+) {
+    let mut payload = crate::current_terminal_fixture::current_payload(
+        &terminal.terminal_id,
+        ingress_message_id,
+        consumed_input_sequence,
+        "done",
+    );
+    payload["goal_completion"] = serde_json::json!("satisfied");
+    crate::session_runtime_bridge::decode_terminal_payload(&serde_json::to_vec(&payload).unwrap())
         .unwrap();
-    services
-        .artifact_store()
-        .pin(
-            &artifact,
-            terminal_id,
-            runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
-        )
-        .unwrap();
-    runtime::encode_session_terminal_artifact_ref(&artifact).unwrap()
+    crate::current_terminal_fixture::publish(events, services.artifact_store(), terminal, &payload)
+        .await;
 }
 
 fn test_runtime_service(
@@ -1290,7 +1262,7 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
         .unwrap();
     let claim_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let claimed = store
-        .claim_session_runtime_outbox("worker-a", claim_at, 30_000, 1)
+        .claim_session_runtime_outbox("worker-a", claim_at, 30_000, 1, &[])
         .await
         .unwrap()
         .pop()
@@ -1339,10 +1311,29 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
             .is_terminal(),
         "pre-carrier ingress errors must never fabricate a terminal live winner"
     );
-    let terminal_payload_ref = write_test_session_terminal_artifact(
+    let mut terminal = runtime::SessionTerminalInput {
+        terminal_id: "turn-terminal:restart-request".to_string(),
+        message_id: "assistant-restart-message".to_string(),
+        session_id: "restart-session".to_string(),
+        execution_id: Some(runtime::session_ingress_graph_id(
+            "restart-session",
+            "restart-request",
+            "restart-turn",
+        )),
+        turn_id: Some("restart-turn".to_string()),
+        request_id: Some("restart-request".to_string()),
+        session_generation: Some(record.session_generation),
+        input_sequence: Some(record.sequence as u64),
+        input_claim_owner: record.claim_owner.clone(),
+        input_claim_token: record.claim_token.clone(),
+        input_claim_revision: record.claim_fence_epoch,
+        controlled_recovery_claim_fingerprints: Vec::new(),
+        payload_ref: String::new(),
+    };
+    write_test_session_terminal_artifact(
+        &runtime_event_store,
         services.as_ref(),
-        "turn-terminal:restart-request",
-        "restart-session",
+        &mut terminal,
         "restart-message",
         record.sequence,
     )
@@ -1369,25 +1360,7 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
                     schema_version: 1,
                 }],
             },
-            runtime::SessionTerminalInput {
-                terminal_id: "turn-terminal:restart-request".to_string(),
-                message_id: "assistant-restart-message".to_string(),
-                session_id: "restart-session".to_string(),
-                execution_id: Some(runtime::session_ingress_graph_id(
-                    "restart-session",
-                    "restart-request",
-                    "restart-turn",
-                )),
-                turn_id: Some("restart-turn".to_string()),
-                request_id: Some("restart-request".to_string()),
-                session_generation: Some(record.session_generation),
-                input_sequence: Some(record.sequence as u64),
-                input_claim_owner: record.claim_owner.clone(),
-                input_claim_token: record.claim_token.clone(),
-                input_claim_revision: record.claim_fence_epoch,
-                controlled_recovery_claim_fingerprints: Vec::new(),
-                payload_ref: terminal_payload_ref,
-            },
+            terminal,
         )
         .unwrap();
     let terminal_port = services.session_terminal_delivery();
@@ -1535,7 +1508,7 @@ async fn recovered_terminal_settles_the_exact_primary_input_projection() {
         .expect("persisted ingress");
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let claimed = store
-        .claim_session_runtime_outbox("projection-worker", now_ms, 30_000, 1)
+        .claim_session_runtime_outbox("projection-worker", now_ms, 30_000, 1, &[])
         .await
         .expect("claim persisted ingress")
         .into_iter()
@@ -1558,14 +1531,30 @@ async fn recovered_terminal_settles_the_exact_primary_input_projection() {
         .await
         .expect("mark claimed ingress running");
     let recovery_services = service.runtime_services();
-    let terminal_payload_ref = write_test_session_terminal_artifact(
+    let mut terminal = runtime::SessionTerminalInput {
+        terminal_id: admission.terminal_id.clone(),
+        message_id: "assistant-projection-primary".to_string(),
+        session_id: record.session_id.clone(),
+        execution_id: Some(admission.execution_graph_id.clone()),
+        turn_id: Some(record.turn_id.clone()),
+        request_id: Some(record.request_id.clone()),
+        session_generation: Some(record.session_generation),
+        input_sequence: Some(record.sequence as u64),
+        input_claim_owner: record.claim_owner.clone(),
+        input_claim_token: record.claim_token.clone(),
+        input_claim_revision: record.claim_fence_epoch,
+        controlled_recovery_claim_fingerprints: Vec::new(),
+        payload_ref: String::new(),
+    };
+    write_test_session_terminal_artifact(
+        &runtime_event_store,
         recovery_services.as_ref(),
-        &admission.terminal_id,
-        &record.session_id,
+        &mut terminal,
         &record.message_id,
         record.sequence,
     )
     .await;
+    let terminal_payload_ref = terminal.payload_ref.clone();
     let terminal_commit = runtime_event_store
         .append_transaction_with_terminal(
             runtime::AppendTransactionRequest {
@@ -1588,21 +1577,7 @@ async fn recovered_terminal_settles_the_exact_primary_input_projection() {
                     schema_version: 1,
                 }],
             },
-            runtime::SessionTerminalInput {
-                terminal_id: admission.terminal_id.clone(),
-                message_id: "assistant-projection-primary".to_string(),
-                session_id: record.session_id.clone(),
-                execution_id: Some(admission.execution_graph_id.clone()),
-                turn_id: Some(record.turn_id.clone()),
-                request_id: Some(record.request_id.clone()),
-                session_generation: Some(record.session_generation),
-                input_sequence: Some(record.sequence as u64),
-                input_claim_owner: record.claim_owner.clone(),
-                input_claim_token: record.claim_token.clone(),
-                input_claim_revision: record.claim_fence_epoch,
-                controlled_recovery_claim_fingerprints: Vec::new(),
-                payload_ref: terminal_payload_ref.clone(),
-            },
+            terminal,
         )
         .expect("terminal and its exact Session fence commit atomically");
     let persisted_terminal = service

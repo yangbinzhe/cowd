@@ -339,7 +339,7 @@ impl<'a> EndpointRunner<'a> {
                     return json!({
                         "endpoint": self.label,
                         "pair_index": pair_index,
-                        "status": if accepted && first_surface_delta_ms.is_some() { "passed" } else { "failed" },
+                        "status": if paired_sample_passed(accepted, first_surface_delta_ms.is_some(), &cleanup) { "passed" } else { "failed" },
                         "session_id": session_id,
                         "execution_id": execution_id,
                         "first_surface_delta_ms": first_surface_delta_ms,
@@ -348,6 +348,8 @@ impl<'a> EndpointRunner<'a> {
                         "terminal_wall_ms": terminal_wall_ms,
                         "measurement_error": if first_surface_delta_ms.is_none() {
                             Some("no visible TextDelta was observed; durable response was not substituted for TTFT")
+                        } else if cleanup["status"] != "passed" {
+                            Some("session actor cleanup did not confirm release; sample cannot pass")
                         } else {
                             None
                         },
@@ -383,6 +385,14 @@ impl<'a> EndpointRunner<'a> {
             .and_then(|health| health.get("performance").cloned())
             .unwrap_or_else(|| json!({"status": "unavailable"}))
     }
+}
+
+fn paired_sample_passed(
+    answer_accepted: bool,
+    observed_surface_delta: bool,
+    cleanup: &Value,
+) -> bool {
+    answer_accepted && observed_surface_delta && cleanup["status"] == "passed"
 }
 
 fn validate_reported_metric_ids(process_metrics: &Value) -> Result<(), String> {
@@ -692,6 +702,70 @@ fn summarize_json(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r1_integrated_provider_metric_ids_preserve_real_usage_and_unknowns() {
+        assert!(super::paired_sample_passed(
+            true,
+            true,
+            &serde_json::json!({"status":"passed"})
+        ));
+        assert!(!super::paired_sample_passed(
+            false,
+            true,
+            &serde_json::json!({"status":"passed"})
+        ));
+        assert!(!super::paired_sample_passed(
+            true,
+            false,
+            &serde_json::json!({"status":"passed"})
+        ));
+        for cleanup in [
+            serde_json::json!({"status":"failed"}),
+            serde_json::json!({"status":"unavailable"}),
+            serde_json::json!({}),
+        ] {
+            assert!(!super::paired_sample_passed(true, true, &cleanup));
+        }
+        let provider_metrics = [
+            "actual_first_delta_ms",
+            "provider_stream_ms",
+            "provider_service_ms",
+            "provider_input_tokens",
+            "provider_output_tokens",
+            "provider_output_tokens_per_second",
+        ]
+        .map(|metric_id| serde_json::json!({"metric_id":metric_id,"count":1,"p50":7}));
+        let real = serde_json::json!({"baseline":provider_metrics,"candidate":provider_metrics});
+        assert!(super::validate_reported_metric_ids(&real).is_ok());
+        let unknown = serde_json::json!({"baseline":[],"candidate":[{"metric_id":"estimated_provider_usage"}]});
+        assert!(super::validate_reported_metric_ids(&unknown)
+            .unwrap_err()
+            .contains("unknown metric"));
+        let missing = serde_json::json!({"baseline":[],"candidate":[{"count":0}]});
+        assert!(super::validate_reported_metric_ids(&missing)
+            .unwrap_err()
+            .contains("without metric_id"));
+        let unavailable = serde_json::json!({"baseline":{"status":"unavailable"},"candidate":{"status":"unavailable"}});
+        assert!(super::validate_reported_metric_ids(&unavailable).is_ok());
+        assert!(!unavailable["candidate"].is_array());
+        for metric_id in [
+            "provider_input_tokens",
+            "provider_output_tokens",
+            "provider_output_tokens_per_second",
+        ] {
+            let definition = crate::measurement::METRIC_DEFINITIONS
+                .iter()
+                .find(|metric| metric.id == metric_id)
+                .unwrap();
+            assert_eq!(definition.unit, "count");
+        }
+        assert!(crate::measurement::METRIC_DEFINITIONS
+            .iter()
+            .any(|metric| metric.id == "input_tokens"));
+        assert!(crate::measurement::METRIC_DEFINITIONS
+            .iter()
+            .any(|metric| metric.id == "output_tokens"));
+    }
     use super::*;
 
     #[test]

@@ -12,7 +12,9 @@ pub(crate) fn admitted_turn_id(
     execution: Option<&crate::CowdExecutionContext>,
     input_turn: Option<String>,
 ) -> Result<String, RuntimeError> {
-    execution.map(|context| context.turn_id.clone()).or(input_turn)
+    execution
+        .map(|context| context.turn_id.clone())
+        .or(input_turn)
         .ok_or_else(|| RuntimeError::new("production step has no admitted turn identity"))
 }
 
@@ -20,9 +22,19 @@ pub(crate) fn admitted_turn_id(
 mod turn_identity_tests {
     #[test]
     fn execution_owner_turn_is_not_replaced_by_supplemental_input_identity() {
-        let execution = crate::CowdExecutionContext { execution_id: "graph".into(), session_id: "session".into(), turn_id: "admitted-turn".into() };
-        assert_eq!(super::admitted_turn_id(Some(&execution), Some("supplement-turn".into())).unwrap(), "admitted-turn");
-        assert_eq!(super::admitted_turn_id(None, Some("standalone-turn".into())).unwrap(), "standalone-turn");
+        let execution = crate::CowdExecutionContext {
+            execution_id: "graph".into(),
+            session_id: "session".into(),
+            turn_id: "admitted-turn".into(),
+        };
+        assert_eq!(
+            super::admitted_turn_id(Some(&execution), Some("supplement-turn".into())).unwrap(),
+            "admitted-turn"
+        );
+        assert_eq!(
+            super::admitted_turn_id(None, Some("standalone-turn".into())).unwrap(),
+            "standalone-turn"
+        );
         assert!(super::admitted_turn_id(None, None).is_err());
     }
 }
@@ -451,5 +463,198 @@ pub(crate) fn bind_plan_calls(
             .step_binding
             .as_ref()
             .map(|binding| binding.origin.clone());
+    }
+}
+
+const PERSISTED_BATCH_LIMIT: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum PersistedBatchKind {
+    Normal,
+    BoundAgent,
+}
+
+impl PersistedBatchKind {
+    fn envelope_kind(self) -> &'static str {
+        match self {
+            Self::Normal => "cowd_tool_batch_zlib_v1",
+            Self::BoundAgent => "cowd_bound_agent_tool_zlib_v1",
+        }
+    }
+
+    fn session_id(self, value: &serde_json::Value) -> Option<&str> {
+        match self {
+            Self::Normal => value["session_id"]
+                .as_str()
+                .filter(|session| !session.is_empty()),
+            Self::BoundAgent => value["request"]["session_id"]
+                .as_str()
+                .filter(|session| !session.trim().is_empty()),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackedToolBatch {
+    kind: String,
+    session_id: String,
+    decoded_bytes: usize,
+    sha256: String,
+    body: String,
+}
+
+fn persisted_batch_error(reason: &str) -> serde_json::Error {
+    serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+}
+
+pub(crate) fn encode_persisted_tool_batch(
+    value: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    encode_persisted_batch(value, PersistedBatchKind::Normal)
+}
+
+pub(crate) fn encode_persisted_bound_agent_tool(
+    value: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    encode_persisted_batch(value, PersistedBatchKind::BoundAgent)
+}
+
+fn encode_persisted_batch(
+    value: &serde_json::Value,
+    kind: PersistedBatchKind,
+) -> Result<String, serde_json::Error> {
+    use base64::Engine;
+    use sha2::Digest;
+    let session_id = kind
+        .session_id(value)
+        .ok_or_else(|| persisted_batch_error("tool batch Session missing"))?;
+    let decoded = serde_json::to_vec(value)?;
+    if decoded.len() > PERSISTED_BATCH_LIMIT {
+        return Err(persisted_batch_error("tool batch decoded budget exceeded"));
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut encoder, &decoded).map_err(serde_json::Error::io)?;
+    let compressed = encoder.finish().map_err(serde_json::Error::io)?;
+    let packed = PackedToolBatch {
+        kind: kind.envelope_kind().into(),
+        session_id: session_id.into(),
+        decoded_bytes: decoded.len(),
+        sha256: format!("sha256:{:x}", sha2::Sha256::digest(&decoded)),
+        body: base64::engine::general_purpose::STANDARD.encode(&compressed),
+    };
+    let encoded = serde_json::to_string(&packed)?;
+    if encoded
+        .len()
+        .checked_add(packed.body.len())
+        .and_then(|bytes| bytes.checked_add(decoded.len()))
+        .is_none_or(|bytes| bytes > PERSISTED_BATCH_LIMIT)
+    {
+        return Err(persisted_batch_error(
+            "tool batch codec working-set budget exceeded",
+        ));
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn decode_persisted_tool_batch_value(
+    payload: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    decode_persisted_batch_value(payload, PersistedBatchKind::Normal)
+}
+
+pub(crate) fn decode_persisted_bound_agent_tool_value(
+    payload: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    decode_persisted_batch_value(payload, PersistedBatchKind::BoundAgent)
+}
+
+fn decode_persisted_batch_value(
+    payload: &str,
+    kind: PersistedBatchKind,
+) -> Result<serde_json::Value, serde_json::Error> {
+    use base64::Engine;
+    use sha2::Digest;
+    if payload.len() > PERSISTED_BATCH_LIMIT {
+        return Err(persisted_batch_error("tool batch encoded budget exceeded"));
+    }
+    let envelope = harness_contract::step::parse_strict_json(payload)
+        .map_err(|_| persisted_batch_error("invalid tool batch envelope JSON"))?;
+    let packed: PackedToolBatch = serde_json::from_value(envelope)?;
+    if packed.kind != kind.envelope_kind()
+        || packed.session_id.is_empty()
+        || packed.decoded_bytes == 0
+        || payload
+            .len()
+            .checked_add(packed.decoded_bytes)
+            .and_then(|bytes| bytes.checked_add(packed.body.len()))
+            .is_none_or(|bytes| bytes > PERSISTED_BATCH_LIMIT)
+    {
+        return Err(persisted_batch_error("tool batch codec extent invalid"));
+    }
+    let compressed = base64::engine::general_purpose::STANDARD
+        .decode(&packed.body)
+        .map_err(|_| persisted_batch_error("tool batch base64 invalid"))?;
+    let mut decoded = vec![0; packed.decoded_bytes];
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
+    std::io::Read::read_exact(&mut decoder, &mut decoded)
+        .map_err(|_| persisted_batch_error("tool batch compressed body invalid"))?;
+    let mut trailing = [0u8; 1];
+    let extra = std::io::Read::read(&mut decoder, &mut trailing)
+        .map_err(|_| persisted_batch_error("tool batch compressed tail invalid"))?;
+    if extra != 0
+        || decoder.total_in() != compressed.len() as u64
+        || format!("sha256:{:x}", sha2::Sha256::digest(&decoded)) != packed.sha256
+    {
+        return Err(persisted_batch_error("tool batch bytes/digest conflict"));
+    }
+    let text = std::str::from_utf8(&decoded)
+        .map_err(|_| persisted_batch_error("tool batch UTF8 invalid"))?;
+    let value = harness_contract::step::parse_strict_json(text)
+        .map_err(|_| persisted_batch_error("tool batch body JSON invalid"))?;
+    if kind.session_id(&value) != Some(packed.session_id.as_str()) {
+        return Err(persisted_batch_error("tool batch Session conflict"));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod persisted_payload_413_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_batch_codec_preserves_every_nested_origin_and_snapshot_field() {
+        let value = serde_json::json!({"session_id":"session-413","calls":[{"origin":{"origin_step_id":"step-413","catalog_digest":"catalog","source":{"kind":"provider","attempt_id":"attempt-413"}},"input":"unchanged","depends_on":["original"]}],
+            "step_snapshots":{"step-413":{"identity":{"attempt":"original","parent":"original","generation":3},"tools":[{"permissions":{"allow_write":false},"purpose":"business","schema":"complete schema ".repeat(1500)}],"catalog_digest":"catalog","related_revisions":{"goal":"7"}}},"continue_with_tool_batch":true});
+        let packed = encode_persisted_tool_batch(&value).unwrap();
+        assert!(packed.len() < serde_json::to_vec(&value).unwrap().len() / 2);
+        assert_eq!(decode_persisted_tool_batch_value(&packed).unwrap(), value);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&packed).unwrap()["session_id"],
+            "session-413"
+        );
+    }
+
+    #[test]
+    fn bounded_batch_codec_rejects_forged_extent_digest_owner_and_old_carrier() {
+        let value = serde_json::json!({"session_id":"session-413","calls":[],"step_snapshots":{}});
+        assert!(decode_persisted_tool_batch_value(&value.to_string()).is_err());
+        let packed = encode_persisted_tool_batch(&value).unwrap();
+        let original: serde_json::Value = serde_json::from_str(&packed).unwrap();
+        for (field, replacement) in [
+            ("decoded_bytes", serde_json::json!(usize::MAX)),
+            ("sha256", serde_json::json!("sha256:wrong")),
+            ("session_id", serde_json::json!("foreign")),
+            ("body", serde_json::json!("!!!!")),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = replacement;
+            assert!(
+                decode_persisted_tool_batch_value(&changed.to_string()).is_err(),
+                "{field}"
+            );
+        }
+        let too_large = serde_json::json!({"session_id":"session-413","payload":"x".repeat(PERSISTED_BATCH_LIMIT)});
+        assert!(encode_persisted_tool_batch(&too_large).is_err());
     }
 }

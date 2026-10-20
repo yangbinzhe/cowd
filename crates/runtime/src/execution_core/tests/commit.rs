@@ -62,6 +62,397 @@ fn request(id: &str) -> crate::RuntimeToolExecutionRequest {
     }
 }
 
+#[tokio::test]
+async fn bounded_process_private_terminal_original_owner_recovery_and_public_forgery_283() {
+    use harness_contract::context::{
+        ArtifactWriteDescriptor, EvidenceTargetIdentity, ToolExecutionTerminal,
+    };
+    for (exit_code, cancel_before_spawn, wrong_text) in [
+        (0, false, None),
+        (3, false, None),
+        (0, true, None),
+        (0, false, Some("stdout_utf8")),
+        (0, false, Some("stderr_utf8")),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("source.py"), "VALUE = 7\n").unwrap();
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("artifacts"),
+        ));
+        let services = super::bounded_process_tests::services(
+            workspace.path(),
+            store.clone(),
+            artifacts.clone(),
+        );
+        let service =
+            ExecutionCommitService::new(store.clone()).with_artifact_store(artifacts.clone());
+        let host = tools::ToolHost::builtin("bounded-private-terminal-283", workspace.path())
+            .with_authorization_lease_verifier(Arc::new(
+                crate::AuthorizationNegotiator::verify_lease_signature,
+            ));
+        let input = json!({"language":"python","input_files":["source.py"],"timeout_ms":5000,
+            "code":format!("import os\nfrom source import VALUE\nassert VALUE == 7\nos.write(1, b'x' * 20000 + bytes([255]))\nos.write(2, b'bounded UTF8 stderr\\n')\nraise SystemExit({exit_code})\n")});
+        let mut call = crate::bound_tool_batch::scope_admission_tests::bound_request(
+            &host,
+            "execute_code",
+            input,
+        );
+        let effect = call.compiled_invocation.as_ref().unwrap().effect.clone();
+        crate::bound_tool_batch::scope_admission_tests::authorize_bounded_fixture(
+            &host,
+            &mut call,
+            store.clone(),
+            harness_contract::tool::ToolPermissionMode::DangerFullAccess,
+        );
+        let mut graph = ExecutionGraph::new("actual bounded ToolBatch owner");
+        graph.id = "scope2-graph".into();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "scope2-session".into(),
+            turn_id: "scope2-turn".into(),
+            root_task_id: "bounded-root".into(),
+            task_id: "bounded-root".into(),
+            generation: 1,
+        });
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            "bounded-process",
+        );
+        node.id = "bounded-node".into();
+        graph.nodes.push(node);
+        graph = service.register_graph(graph).unwrap().graph;
+        graph = service
+            .transition_node(
+                &graph,
+                "bounded-node",
+                ExecutionNodeStatus::Ready,
+                None,
+                vec![],
+            )
+            .unwrap()
+            .graph;
+        let binding = ExecutionNodeBinding {
+            executor_kind: graph.nodes[0].executor_kind.clone(),
+            ticket_idempotency_key: graph.nodes[0].idempotency_key.clone(),
+            attempt: 1,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        graph = service
+            .bind_and_start_node(&graph, "bounded-node", binding)
+            .unwrap()
+            .graph;
+        call.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: graph.id.clone(),
+            node_id: "bounded-node".into(),
+        });
+        call.parent_execution_attempt = Some(graph.recovery_cursor.node_attempts["bounded-node"]);
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let scope = crate::bound_tool_batch::admitted_effect_scope(
+            &call,
+            &effect,
+            Some(host.pin_snapshot()),
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(scope.version, 2);
+        assert_eq!(
+            service
+                .begin_bound_tool_effect(&call, &effect, &scope)
+                .unwrap(),
+            ToolEffectState::Fresh
+        );
+        let binding = service.bounded_process_binding(&call, &effect).unwrap();
+        let normalized = harness_contract::step::parse_strict_json(&call.input).unwrap();
+        let reformatted = harness_contract::step::parse_strict_json(
+            &serde_json::to_string_pretty(&normalized).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            binding.input_sha256,
+            ExecutionCommitService::bounded_process_input_sha256(&normalized).unwrap()
+        );
+        assert_eq!(
+            binding.input_sha256,
+            ExecutionCommitService::bounded_process_input_sha256(&reformatted).unwrap()
+        );
+        let mut changed = normalized.clone();
+        changed["code"] = "raise SystemExit(290)".into();
+        assert_ne!(
+            binding.input_sha256,
+            ExecutionCommitService::bounded_process_input_sha256(&changed).unwrap()
+        );
+        assert!(harness_contract::step::parse_strict_json(
+            r#"{"code":"pass","code":"raise SystemExit(1)"}"#
+        )
+        .is_err());
+        assert_eq!(effect.descriptor_hash.len(), 16);
+        assert_eq!(binding.descriptor_sha256.len(), 64);
+        assert_eq!(
+            binding.descriptor_sha256,
+            ExecutionCommitService::bounded_process_descriptor_sha256(&effect).unwrap()
+        );
+        let prepared = host
+            .pin_snapshot()
+            .prepare_bounded_process(
+                call.authorization.as_ref().unwrap(),
+                &serde_json::from_str(&call.input).unwrap(),
+                binding,
+            )
+            .unwrap();
+        let source = artifacts
+            .write_bytes(
+                ArtifactWriteDescriptor {
+                    media_type: "application/octet-stream".into(),
+                    visibility_scope: "session:scope2-session".into(),
+                    expected_bytes: Some(prepared.source_bundle_bytes().len() as u64),
+                    original_name: None,
+                },
+                prepared.source_bundle_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut wrong_archive = source.clone();
+        wrong_archive.bytes += 1;
+        assert!(service
+            .admit_bounded_process(&call, &effect, &prepared, &wrong_archive)
+            .is_err());
+        let mut wrong_revision = call.clone();
+        wrong_revision
+            .authorization
+            .as_mut()
+            .unwrap()
+            .policy_revision += 1;
+        assert!(service
+            .bounded_process_binding(&wrong_revision, &effect)
+            .unwrap_err()
+            .to_string()
+            .contains("grant and request policy revision differ"));
+        let mut wrong_parent = call.clone();
+        wrong_parent.parent_execution.as_mut().unwrap().node_id = "foreign-owner".into();
+        assert!(service
+            .bounded_process_binding(&wrong_parent, &effect)
+            .is_err());
+        let admission = service
+            .admit_bounded_process(&call, &effect, &prepared, &source)
+            .unwrap();
+        let restored =
+            ExecutionCommitService::new(store.clone()).with_artifact_store(artifacts.clone());
+        assert_eq!(
+            restored
+                .begin_bound_tool_effect(&call, &effect, &scope)
+                .unwrap(),
+            ToolEffectState::Uncertain
+        );
+        assert!(restored
+            .admit_bounded_process(&call, &effect, &prepared, &source)
+            .is_err());
+        let mut forged = outcome(&call.tool_use_id, "a public DTO is not a completed process");
+        forged.tool_name = call.tool_name.clone();
+        let mut observation = crate::path_identity::untrusted_process_observation_283();
+        if let EvidenceTargetIdentity::ToolExecution { execution } = &mut observation.target {
+            execution.admission = admission.clone();
+            execution.terminal = ToolExecutionTerminal::Settled {
+                exit_code: Some(0),
+                signal: None,
+                stop_reason: harness_contract::context::ToolExecutionStopReason::CommandExit,
+                closure: harness_contract::context::ToolProcessClosure {
+                    backend: "publicly-fabricated-not-a-private-handle".into(),
+                    namespace_inode: 1,
+                    init_host_pid: 1,
+                    init_start_ticks: 1,
+                    all_children_reaped: true,
+                    init_reaped: true,
+                    kernel_hardening_applied: true,
+                    network_disabled: true,
+                    project_read_only: true,
+                    status_channel_protected: true,
+                },
+            };
+            execution.capture_complete = true;
+        }
+        forged.observed_evidence.push(observation);
+        assert!(restored
+            .commit_tool_effect(&call, &effect, &forged)
+            .unwrap_err()
+            .to_string()
+            .contains("public ToolExecution observations are not an execution capability"));
+        assert!(restored
+            .completed_tool_effect(&call, &effect)
+            .unwrap()
+            .is_none());
+        let cancellation = tools::ToolExecutionCancellation::new();
+        if cancel_before_spawn {
+            cancellation.cancel();
+        }
+        let completed = prepared.run(admission, &cancellation);
+        if cancel_before_spawn {
+            assert!(matches!(
+                completed.terminal(),
+                ToolExecutionTerminal::NotStarted { .. }
+            ));
+        } else {
+            assert!(
+                matches!(completed.terminal(), ToolExecutionTerminal::Settled {
+                exit_code:Some(actual), closure, ..
+            } if *actual == exit_code && closure.all_children_reaped && closure.init_reaped
+                && closure.project_read_only && closure.network_disabled && closure.status_channel_protected)
+            );
+        }
+        if let Some(field) = wrong_text {
+            let mut modified: serde_json::Value =
+                serde_json::from_slice(completed.body_bytes()).unwrap();
+            modified[field] =
+                "untrusted replacement text does not equal the complete original stream".into();
+            let bytes = serde_json::to_vec(&modified).unwrap();
+            let modified_body = artifacts
+                .write_bytes(
+                    ArtifactWriteDescriptor {
+                        media_type: "application/json".into(),
+                        visibility_scope: "session:scope2-session".into(),
+                        expected_bytes: Some(bytes.len() as u64),
+                        original_name: None,
+                    },
+                    &bytes,
+                )
+                .await
+                .unwrap();
+            assert!(completed
+                .into_output(modified_body)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded_body_archive_mismatch"));
+            assert!(restored
+                .completed_tool_effect(&call, &effect)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                restored
+                    .begin_bound_tool_effect(&call, &effect, &scope)
+                    .unwrap(),
+                ToolEffectState::Uncertain
+            );
+            services.shutdown_execution().await;
+            services.shutdown_maintenance().await;
+            continue;
+        }
+        let authority =
+            crate::tool_host::BoundedProcessAuthority::bind(services.clone(), call.clone()).unwrap();
+        let committed = authority
+            .with_commit_context(
+                restored.commit_bounded_process(&call, &effect, completed, &artifacts),
+            )
+            .await
+            .unwrap();
+        let fact = committed
+            .observed_evidence
+            .iter()
+            .find_map(|observed| match &observed.target {
+                EvidenceTargetIdentity::ToolExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            fact.stdout_bytes,
+            if cancel_before_spawn { 0 } else { 20001 }
+        );
+        assert_eq!(fact.capture_complete, !cancel_before_spawn);
+        assert_eq!(fact.admission.source_bundle, source);
+        let body = artifacts
+            .read(&fact.body, "session:scope2-session", None)
+            .await
+            .unwrap();
+        assert_eq!(body.len() as u64, fact.body.bytes);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        use base64::Engine;
+        let stdout = base64::engine::general_purpose::STANDARD
+            .decode(body["stdout_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(stdout.len() as u64, fact.stdout_bytes);
+        assert_eq!(body["capture_complete"], fact.capture_complete);
+        if !cancel_before_spawn {
+            assert_eq!(stdout.last(), Some(&255));
+            assert!(body.get("stdout_utf8").is_none());
+            assert_eq!(body["stderr_utf8"], "bounded UTF8 stderr\n");
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(body["stderr_base64"].as_str().unwrap())
+                    .unwrap(),
+                body["stderr_utf8"].as_str().unwrap().as_bytes()
+            );
+            assert!(committed.output.as_ref().unwrap().len() < 16 * 1024);
+        }
+        assert!(
+            serde_json::to_vec(&committed.observed_evidence)
+                .unwrap()
+                .len()
+                < 128 * 1024
+        );
+        let before = store
+            .stream_event_count(&format!("execution-effect:{}", call.idempotency_key))
+            .unwrap();
+        graph = restored
+            .transition_node(
+                &graph,
+                "bounded-node",
+                ExecutionNodeStatus::Completed,
+                None,
+                vec![],
+            )
+            .unwrap()
+            .graph;
+        assert_eq!(
+            graph.node_statuses["bounded-node"],
+            ExecutionNodeStatus::Completed
+        );
+        host.replace_snapshot(host.pin_snapshot().snapshot().clone());
+        assert!(call
+            .step_binding
+            .as_ref()
+            .unwrap()
+            .resolve(Some(host.pin_snapshot()))
+            .is_err());
+        let historical = restored
+            .completed_tool_effect(&call, &effect)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&historical).unwrap(),
+            serde_json::to_value(&committed).unwrap()
+        );
+        let parent = call.parent_execution.as_ref().unwrap();
+        let queried = restored
+            .query_completed_agent_tool_effect(&crate::execution_core::graph::ToolReceiptQuery {
+                step_binding: call.step_binding.as_ref().unwrap(),
+                parent_execution: parent,
+                session_id: call.session_id.as_deref().unwrap(),
+                policy_revision: call.policy_revision,
+                idempotency_key: &call.idempotency_key,
+                tool_use_id: &call.tool_use_id,
+                tool_name: &call.tool_name,
+                input: &call.input,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&queried.outcome).unwrap(),
+            serde_json::to_value(&committed).unwrap()
+        );
+        assert_eq!(
+            store
+                .stream_event_count(&format!("execution-effect:{}", call.idempotency_key))
+                .unwrap(),
+            before
+        );
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+}
+
 fn outcome(id: &str, output: &str) -> crate::RuntimeToolExecutionOutcome {
     crate::RuntimeToolExecutionOutcome {
         tool_use_id: id.to_string(),
@@ -179,6 +570,7 @@ fn receipt_query_fixture() -> ReceiptQueryFixture {
         execution_id: "graph:receipt-recovery".into(),
         node_id: "node:write".into(),
     });
+    request.parent_execution_attempt = Some(graph.recovery_cursor.node_attempts["node:write"]);
     request.idempotency_key = binding.effect_idempotency_key();
     request.compiled_invocation = Some(
         binding
@@ -187,8 +579,21 @@ fn receipt_query_fixture() -> ReceiptQueryFixture {
     );
     request.step_binding = Some(binding.clone());
     let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+    let resolver =
+        crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path()).unwrap();
+    let scope = crate::bound_tool_batch::admitted_effect_scope(
+        &request,
+        &effect,
+        Some(host.pin_snapshot()),
+        &resolver,
+    )
+    .unwrap();
+    assert_eq!(scope.version, 2);
+    scope.validate_purpose_mapping(&effect).unwrap();
     assert_eq!(
-        service.begin_tool_effect(&request, &effect).unwrap(),
+        service
+            .begin_bound_tool_effect(&request, &effect, &scope)
+            .unwrap(),
         ToolEffectState::Fresh
     );
     std::fs::write(workspace.path().join("proof.txt"), "one physical write").unwrap();
@@ -640,12 +1045,10 @@ fn planned_graph_and_continuation_claim_commit_in_one_transaction() {
         error,
         ExecutionCommitError::AlreadyAppliedSame { ref graph_id } if graph_id == "root-current"
     ));
-    assert!(
-        store
-            .list_stream("root-retry-must-not-exist")
-            .expect("retry graph stream")
-            .is_empty()
-    );
+    assert!(store
+        .list_stream("root-retry-must-not-exist")
+        .expect("retry graph stream")
+        .is_empty());
 }
 
 #[test]
@@ -809,7 +1212,9 @@ fn a_nodes_reads_are_visible_across_its_own_attempts_but_never_across_nodes() {
             .map(|receipt| receipt.outcome.tool_use_id.clone())
             .collect::<Vec<_>>()
     );
-    assert!(unioned.iter().all(|receipt| receipt.outcome.tool_use_id != "other-node-read"));
+    assert!(unioned
+        .iter()
+        .all(|receipt| receipt.outcome.tool_use_id != "other-node-read"));
     // The per-attempt loader is unchanged: attempt-exact callers still see one.
     let exact = service
         .load_delegated_agent_tool_receipts("order-graph", "order-node", 1)
@@ -832,8 +1237,6 @@ fn delegated_agent_receipts_reload_restores_causal_order_when_indexed_writes_are
         request.authorized_scopes = vec!["read:src/early.rs".to_string()];
         request
     };
-    // Commit the higher causal sequence first so the index stream is
-    // appended in non-causal order; reload must restore causal order.
     service
         .commit_readonly_tool_receipts(&[(later.clone(), outcome("later", "later-durable"))])
         .expect("commit higher-sequence receipt first");
@@ -847,22 +1250,28 @@ fn delegated_agent_receipts_reload_restores_causal_order_when_indexed_writes_are
     assert_eq!(recovered.len(), 2);
     assert_eq!(recovered[0].sequence, 1);
     assert_eq!(recovered[1].sequence, 2);
-    assert_eq!(recovered[0].outcome, outcome("earlier", "earlier-durable"));
-    assert_eq!(recovered[1].outcome, outcome("later", "later-durable"));
+    assert_eq!(recovered[0].outcome, outcome("later", "later-durable"));
+    assert_eq!(recovered[1].outcome, outcome("earlier", "earlier-durable"));
 }
 
 #[test]
 fn delegated_agent_receipts_reload_rejects_duplicate_causal_sequence() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));
-    let mut a = request_with_parent(1, "dup-a");
-    let mut b = request_with_parent(1, "dup-b");
-    service
-        .commit_readonly_tool_receipts(&[(a.clone(), outcome("dup-a", "a-durable"))])
-        .expect("commit first duplicate-sequence receipt");
-    service
-        .commit_readonly_tool_receipts(&[(b, outcome("dup-b", "b-durable"))])
-        .expect("commit second duplicate-sequence receipt");
+    let stream = "execution-agent-receipts:order-graph:order-node:7";
+    for identifier in ["dup-a", "dup-b"] {
+        store.append_batch_if_revision(
+            stream.to_string(), store.stream_revision(stream).unwrap(), identifier.to_string(),
+            vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id:stream.into(), scope:RuntimeEventScope::ExecutionNode,
+                    kind:"execution.agent_tool.receipt".into(), status:Some("completed".into()),
+                    actor:Some("governed_tool".into()), refs:vec![],
+                    payload:serde_json::json!({"sequence":1}),
+                }, idempotency_key:Some(identifier.into()), schema_version:1,
+            }],
+        ).unwrap();
+    }
 
     assert!(matches!(
         service.load_delegated_agent_tool_receipts("order-graph", "order-node", 7),
@@ -1142,12 +1551,10 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
         )
     };
     assert!(snapshot().err().unwrap().contains("effect_review_pending"));
-    assert!(
-        service
-            .load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(service
+        .load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1)
+        .unwrap()
+        .is_empty());
     service
         .commit_tool_effect(&request, &effect, &outcome("indexed-write", "written"))
         .unwrap();
@@ -1170,27 +1577,25 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
     assert!(snapshot().err().unwrap().contains("effect_review_pending"));
     // A conclusion prepared before the second write cannot commit even its
     // unrelated terminal stream if the original receipt source changed.
-    assert!(
-        store
-            .append_transaction(AppendTransactionRequest {
-                transaction_id: "negative-stale-effect-conclusion".into(),
-                expected_streams: before.additional_sources,
-                events: vec![RuntimeTransactionEventInput {
-                    event: RuntimeEventInput {
-                        stream_id: "negative-terminal".into(),
-                        scope: RuntimeEventScope::ExecutionNode,
-                        kind: "test.negative_terminal".into(),
-                        status: None,
-                        actor: None,
-                        refs: vec![],
-                        payload: json!({}),
-                    },
-                    idempotency_key: Some("negative-terminal".into()),
-                    schema_version: 1,
-                }],
-            })
-            .is_err()
-    );
+    assert!(store
+        .append_transaction(AppendTransactionRequest {
+            transaction_id: "negative-stale-effect-conclusion".into(),
+            expected_streams: before.additional_sources,
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: "negative-terminal".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "test.negative_terminal".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: json!({}),
+                },
+                idempotency_key: Some("negative-terminal".into()),
+                schema_version: 1,
+            }],
+        })
+        .is_err());
     assert_eq!(store.stream_revision("negative-terminal").unwrap(), 0);
     service
         .apply_command(
@@ -1230,6 +1635,39 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
     assert_ne!(snapshot().unwrap().digest, before.digest);
 }
 
+fn root_ledger_scope(effect: &ToolEffectDescriptor) -> harness_contract::goal::ProofEffectScope {
+    assert!(effect.scopes.is_empty());
+    harness_contract::goal::ProofEffectScope {
+        version: 2,
+        descriptor_hash: effect.descriptor_hash.clone(),
+        complete: false,
+        targets: Vec::new(),
+        scope_purposes: Vec::new(),
+    }
+}
+
+fn root_ledger_owner(
+    store: &RuntimeEventStore,
+    graph: &ExecutionGraph,
+    node_id: &str,
+) -> (harness_contract::projection::RuntimeActivityBinding, u32) {
+    let original = store
+        .latest_for_stream(&format!("{}:node:{node_id}", graph.id))
+        .unwrap()
+        .or_else(|| store.latest_for_stream(&graph.id).unwrap())
+        .unwrap();
+    let owner = original
+        .activity_binding()
+        .expect("original persisted activity");
+    let attempt = graph
+        .recovery_cursor
+        .node_attempts
+        .get(node_id)
+        .copied()
+        .unwrap_or_default();
+    (owner, attempt)
+}
+
 #[test]
 fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_receipts() {
     let store = Arc::new(RuntimeEventStore::for_test());
@@ -1248,11 +1686,11 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     let mut write = request("root-write");
     write.session_id = Some(context.session_id.clone());
     let effect = mutation_effect(ToolIdempotency::Idempotent);
-    assert!(
-        service
-            .begin_root_tool_effect(&write, &effect, &context)
-            .is_err()
-    );
+    let scope = root_ledger_scope(&effect);
+    let (owner, attempt) = root_ledger_owner(&store, &graph, &node);
+    assert!(service
+        .begin_root_tool_effect(&write, &effect, &context, &scope, &owner, attempt)
+        .is_err());
     for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
         graph = service
             .transition_node(&graph, &node, status, None, vec![])
@@ -1260,12 +1698,11 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
             .graph;
     }
     let mut stale = context.clone();
+    let (owner, attempt) = root_ledger_owner(&store, &graph, &node);
     stale.turn_id = "old-turn".into();
-    assert!(
-        service
-            .begin_root_tool_effect(&write, &effect, &stale)
-            .is_err()
-    );
+    assert!(service
+        .begin_root_tool_effect(&write, &effect, &stale, &scope, &owner, attempt)
+        .is_err());
     assert_eq!(
         store
             .stream_revision("execution-effect:idem-root-write")
@@ -1284,7 +1721,7 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     );
     assert_eq!(
         service
-            .begin_root_tool_effect(&write, &effect, &context)
+            .begin_root_tool_effect(&write, &effect, &context, &scope, &owner, attempt)
             .unwrap(),
         ToolEffectState::Fresh
     );
@@ -1295,7 +1732,7 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     pending.session_id = write.session_id.clone();
     assert_eq!(
         service
-            .begin_root_tool_effect(&pending, &effect, &context)
+            .begin_root_tool_effect(&pending, &effect, &context, &scope, &owner, attempt)
             .unwrap(),
         ToolEffectState::Fresh
     );
@@ -1308,18 +1745,14 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
             },
         )
         .unwrap();
-    assert!(
-        service
-            .begin_root_tool_effect(&pending, &effect, &context)
-            .is_err()
-    );
+    assert!(service
+        .begin_root_tool_effect(&pending, &effect, &context, &scope, &owner, attempt)
+        .is_err());
     let mut late = request("root-late");
     late.session_id = write.session_id.clone();
-    assert!(
-        service
-            .begin_root_tool_effect(&late, &effect, &context)
-            .is_err()
-    );
+    assert!(service
+        .begin_root_tool_effect(&late, &effect, &context, &scope, &owner, attempt)
+        .is_err());
     assert_eq!(
         store
             .stream_revision("execution-effect:idem-root-late")
@@ -1328,7 +1761,7 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     );
     assert!(matches!(
         service
-            .begin_root_tool_effect(&write, &effect, &context)
+            .begin_root_tool_effect(&write, &effect, &context, &scope, &owner, attempt)
             .unwrap(),
         ToolEffectState::Completed(_)
     ));
@@ -1341,7 +1774,7 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
         .unwrap();
     assert!(matches!(
         service
-            .begin_root_tool_effect(&pending, &effect, &context)
+            .begin_root_tool_effect(&pending, &effect, &context, &scope, &owner, attempt)
             .unwrap(),
         ToolEffectState::Completed(_)
     ));
@@ -1383,32 +1816,32 @@ fn root_effect_goal_states_and_absent_source_revisions_are_enforced() {
             "root_execution_id":context.execution_id, "agentic_program_id":"root-admission-program"
         }
     })).unwrap()).unwrap();
-    assert!(
-        store
-            .append_transaction(AppendTransactionRequest {
-                transaction_id: "stale-absent-goal".into(),
-                expected_streams: absent,
-                events: vec![RuntimeTransactionEventInput {
-                    event: RuntimeEventInput {
-                        stream_id: "stale-root-effect".into(),
-                        scope: RuntimeEventScope::ExecutionNode,
-                        kind: "test.stale_effect".into(),
-                        status: None,
-                        actor: None,
-                        refs: vec![],
-                        payload: json!({}),
-                    },
-                    idempotency_key: Some("stale-root-effect".into()),
-                    schema_version: 1,
-                }],
-            })
-            .is_err()
-    );
+    assert!(store
+        .append_transaction(AppendTransactionRequest {
+            transaction_id: "stale-absent-goal".into(),
+            expected_streams: absent,
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: "stale-root-effect".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "test.stale_effect".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: json!({}),
+                },
+                idempotency_key: Some("stale-root-effect".into()),
+                schema_version: 1,
+            }],
+        })
+        .is_err());
     assert_eq!(store.stream_revision("stale-root-effect").unwrap(), 0);
     let mut write = request("goal-state-write");
     write.session_id = Some(context.session_id.clone());
     let effect = mutation_effect(ToolIdempotency::Idempotent);
     assert!(service.root_effect_authority(&context).is_ok());
+    let scope = root_ledger_scope(&effect);
+    let (owner, attempt) = root_ledger_owner(&store, &graph, &node);
     for state in [
         GoalCompletion::WaitingExternalDecision,
         GoalCompletion::Blocked,
@@ -1432,7 +1865,7 @@ fn root_effect_goal_states_and_absent_source_revisions_are_enforced() {
             .0;
         assert!(
             service
-                .begin_root_tool_effect(&write, &effect, &context)
+                .begin_root_tool_effect(&write, &effect, &context, &scope, &owner, attempt)
                 .is_err(),
             "{state:?}"
         );
@@ -1443,4 +1876,196 @@ fn root_effect_goal_states_and_absent_source_revisions_are_enforced() {
             0
         );
     }
+}
+
+
+#[test]
+fn own864_original_index_allocates_across_native_wave_and_scoped_read_replay_and_recovery() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = agent_task_graph();
+    graph.nodes[0].kind = ExecutionNodeKind::ToolBatch;
+    graph.nodes[0].executor_kind = "tool".into();
+    let mut graph = service.register_graph(graph).unwrap().graph;
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service.transition_node(&graph, &graph.nodes[0].id, status, None, vec![])
+            .unwrap().graph;
+    }
+    let mut write = request("own864-native-claim");
+    write.session_id = Some(graph.lineage.as_ref().unwrap().session_id.clone());
+    write.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id:graph.id.clone(), node_id:graph.nodes[0].id.clone(),
+    });
+    write.parent_execution_attempt = Some(1);
+    write.observation_wave_sequence = 1;
+    let effect = mutation_effect(ToolIdempotency::Idempotent);
+    assert_eq!(service.begin_tool_effect(&write, &effect).unwrap(), ToolEffectState::Fresh);
+    service.commit_tool_effect(&write, &effect, &outcome("own864-native-claim", "claimed")).unwrap();
+    let mut read = write.clone();
+    read.idempotency_key = "own864-preview".into();
+    read.tool_use_id = "own864-preview".into();
+    read.observation_wave_sequence = 1;
+    service.commit_readonly_tool_receipts(&[(read.clone(), outcome("own864-preview", "read"))]).unwrap();
+    let before = store.list_stream(&delegated_agent_receipt_stream_id(&read).unwrap()).unwrap();
+    let recovered = ExecutionCommitService::new(store.clone());
+    recovered.commit_tool_effect(&write, &effect, &outcome("own864-native-claim", "claimed")).unwrap();
+    recovered.commit_readonly_tool_receipts(&[(read.clone(), outcome("own864-preview", "read"))]).unwrap();
+    assert_eq!(before, store.list_stream(&delegated_agent_receipt_stream_id(&read).unwrap()).unwrap());
+    let receipts = recovered.load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1).unwrap();
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts[0].sequence < receipts[1].sequence);
+    let source_sequences = before.iter().filter_map(ExecutionCommitService::receipt_observation_sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(source_sequences, vec![1, 1]);
+    let mut false_source = before.iter().find(|event| event.kind == "execution.agent_tool.receipt")
+        .unwrap().clone();
+    false_source.payload["sequence_base"] = json!(u64::MAX);
+    assert!(ExecutionCommitService::receipt_observation_sequence(&false_source).is_none());
+    false_source = before.iter().find(|event| event.kind == "execution.agent_tool.receipt")
+        .unwrap().clone();
+    false_source.payload["index_revision_before"] = json!(u64::MAX);
+    assert!(ExecutionCommitService::receipt_observation_sequence(&false_source).is_none());
+    assert_eq!(recovered.delegated_observation_high_water(&graph.id, &graph.nodes[0].id, 1).unwrap(), 1);
+    let mut later = read.clone();
+    later.idempotency_key = "own864-later".into();
+    later.tool_use_id = "own864-later".into();
+    recovered.commit_readonly_tool_receipts(&[(later, outcome("own864-later", "later"))]).unwrap();
+    let final_receipts = recovered.load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1).unwrap();
+    assert_eq!(final_receipts.len(), 3);
+    assert!(final_receipts[2].sequence > receipts[1].sequence);
+    let repeated = request_with_parent(1, "own864-repeat-wave");
+    let pair = (repeated.clone(), outcome("own864-repeat-wave", "read"));
+    recovered.commit_readonly_tool_receipts(&[pair.clone(), pair]).unwrap();
+    let repeat = recovered.load_delegated_agent_tool_receipts("order-graph", "order-node", 7).unwrap();
+    assert_eq!(repeat.len(), 1);
+    let mut collision = repeated;
+    collision.input = "different original input".into();
+    assert!(recovered.commit_readonly_tool_receipts(&[(collision,
+        outcome("own864-repeat-wave", "read"))]).is_err());
+}
+
+#[test]
+fn own864_original_index_serializes_independent_concurrent_services_and_same_wave_batch() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let workers = (0..4).map(|worker| {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let service = ExecutionCommitService::new(store);
+            let identifier = format!("own864-concurrent-{worker}");
+            let first = request_with_parent(1, &identifier);
+            let second_identifier = format!("{identifier}-second");
+            let second = request_with_parent(1, &second_identifier);
+            barrier.wait();
+            service.commit_readonly_tool_receipts(&[
+                (first, outcome(&identifier, "first")),
+                (second, outcome(&second_identifier, "second")),
+            ]).unwrap();
+        })
+    }).collect::<Vec<_>>();
+    for worker in workers { worker.join().unwrap(); }
+    let service = ExecutionCommitService::new(store);
+    let receipts = service.load_delegated_agent_tool_receipts("order-graph", "order-node", 7).unwrap();
+    assert_eq!(receipts.len(), 8);
+    assert_eq!(receipts.iter().map(|receipt| receipt.sequence).collect::<BTreeSet<_>>().len(), 8);
+    assert!(receipts.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+}
+
+#[test]
+fn own864_original_index_recovers_legacy_high_water_and_rejects_unknown_schema() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let stream = "execution-agent-receipts:order-graph:order-node:7";
+    let legacy = RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id:stream.into(), scope:RuntimeEventScope::ExecutionNode,
+            kind:"execution.agent_tool.receipt".into(), status:Some("completed".into()),
+            actor:Some("governed_tool".into()), refs:vec![],
+            payload:json!({"sequence":1000,"effect_kind":"read","effect_scope":null,
+                "authorized_scopes":[],"outcome":outcome("own864-legacy", "legacy")}),
+        }, idempotency_key:Some("own864-legacy".into()), schema_version:1,
+    };
+    store.append_batch_if_revision(stream, 0, "own864-legacy", vec![legacy.clone()]).unwrap();
+    let service = ExecutionCommitService::new(store.clone());
+    service.commit_readonly_tool_receipts(&[(request_with_parent(1, "own864-after-legacy"),
+        outcome("own864-after-legacy", "read"))]).unwrap();
+    let receipts = service.load_delegated_agent_tool_receipts("order-graph", "order-node", 7).unwrap();
+    assert_eq!(receipts.iter().map(|receipt| receipt.sequence).collect::<Vec<_>>(), vec![1000, 1001]);
+    let mut unsupported = legacy;
+    unsupported.schema_version = 99;
+    unsupported.idempotency_key = Some("own864-unsupported".into());
+    store.append_batch_if_revision(stream, 2, "own864-unsupported", vec![unsupported]).unwrap();
+    assert!(service.load_delegated_agent_tool_receipts("order-graph", "order-node", 7).is_err());
+    assert!(service.commit_readonly_tool_receipts(&[(request_with_parent(1, "own864-refuse"),
+        outcome("own864-refuse", "read"))]).is_err());
+}
+
+#[test]
+fn own864_original_index_concurrent_same_effect_replays_only_once() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let workers = (0..4).map(|_| {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let service = ExecutionCommitService::new(store);
+            barrier.wait();
+            service.commit_readonly_tool_receipts(&[(request_with_parent(1, "own864-same-effect"),
+                outcome("own864-same-effect", "read"))]).unwrap();
+        })
+    }).collect::<Vec<_>>();
+    for worker in workers { worker.join().unwrap(); }
+    let receipts = ExecutionCommitService::new(store)
+        .load_delegated_agent_tool_receipts("order-graph", "order-node", 7).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].sequence, 1);
+}
+
+#[test]
+fn own864_exact_receipt_sequence_binds_step_and_effect_not_reused_call_id() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("same.txt"), "same").unwrap();
+    let host = tools::ToolHost::builtin("own864-step-owner", workspace.path());
+    let input = json!({"path":"same.txt","complete":true});
+    let mut first = crate::bound_tool_batch::scope_admission_tests::bound_request(
+        &host, "read_file", input.clone());
+    first.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id:"scope2-graph".into(), node_id:"scope2-node".into(),
+    });
+    first.parent_execution_attempt = Some(1);
+    let mut identity = first.step_binding.as_ref().unwrap().snapshot.identity.clone();
+    identity.step_id = "own864-second-original-step".into();
+    let lease = host.pin_snapshot();
+    let definitions = lease.snapshot().catalog.definitions(None).into_iter()
+        .filter(|definition| definition.name == "read_file")
+        .map(|definition| crate::ProviderToolDefinition {
+            name:definition.name, description:definition.description, input_schema:definition.input_schema,
+        }).collect::<Vec<_>>();
+    let step = Arc::new(crate::step_snapshot::BoundStep::bind(identity, lease, &definitions,
+        &json!({}), &json!({}), BTreeMap::new(), i64::MAX).unwrap());
+    let binding = crate::step_snapshot::StepCallBinding::provider(step, &first.tool_use_id);
+    let mut second = first.clone();
+    second.idempotency_key = binding.effect_idempotency_key();
+    second.compiled_invocation = Some(binding.prepare_invocation(Some(host.pin_snapshot()),
+        "read_file", &input).unwrap());
+    second.step_binding = Some(binding);
+    assert_eq!(first.tool_use_id, second.tool_use_id);
+    assert_ne!(first.idempotency_key, second.idempotency_key);
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(store);
+    let mut result = outcome(&first.tool_use_id, "same");
+    result.tool_name = "read_file".into();
+    service.commit_readonly_tool_receipts(&[(first.clone(), result.clone())]).unwrap();
+    service.commit_readonly_tool_receipts(&[(second.clone(), result.clone())]).unwrap();
+    let first_sequence = service.exact_delegated_receipt_sequence(&first).unwrap();
+    let second_sequence = service.exact_delegated_receipt_sequence(&second).unwrap();
+    assert!(first_sequence < second_sequence);
+    service.commit_readonly_tool_receipts(&[(second.clone(), result)]).unwrap();
+    assert_eq!(service.exact_delegated_receipt_sequence(&second).unwrap(), second_sequence);
+    let mut foreign = second.clone();
+    foreign.idempotency_key = first.idempotency_key.clone();
+    assert!(service.exact_delegated_receipt_sequence(&foreign).is_err());
+    foreign = second;
+    foreign.observation_wave_sequence += 1;
+    assert!(service.exact_delegated_receipt_sequence(&foreign).is_err());
 }

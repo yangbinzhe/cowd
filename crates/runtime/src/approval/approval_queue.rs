@@ -1137,7 +1137,34 @@ impl ApprovalQueue {
     /// Consume a one-shot grant after the exact invocation has received its
     /// authorization lease. Other grant scopes remain active until revoked or
     /// expired.
+    pub fn matching_exact_once_grant(
+        &self,
+        context: &ApprovalContext,
+        risk: harness_contract::core::TaskRisk,
+    ) -> Option<ApprovalGrant> {
+        self.refresh();
+        self.active_grants().into_iter().find(|grant|
+            exact_once_grant_matches(grant, context, risk))
+    }
+
+    pub fn consume_exact_once_grant(
+        &self,
+        grant_id: &str,
+        context: &ApprovalContext,
+        risk: harness_contract::core::TaskRisk,
+    ) -> Result<(), String> {
+        self.consume_once_grant_inner(grant_id, Some((context, risk)))
+    }
+
     pub fn consume_once_grant(&self, grant_id: &str) -> Result<(), String> {
+        self.consume_once_grant_inner(grant_id, None)
+    }
+
+    fn consume_once_grant_inner(
+        &self,
+        grant_id: &str,
+        expected: Option<(&ApprovalContext, harness_contract::core::TaskRisk)>,
+    ) -> Result<(), String> {
         let mut grants = self
             .grants
             .lock()
@@ -1145,7 +1172,9 @@ impl ApprovalQueue {
         let grant = grants
             .get_mut(grant_id)
             .ok_or_else(|| format!("approval grant not found: {grant_id}"))?;
-        if grant.scope != ApprovalGrantScope::Once || grant.status != ApprovalGrantStatus::Active {
+        if expected.is_none()
+            && (grant.scope != ApprovalGrantScope::Once || grant.status != ApprovalGrantStatus::Active)
+        {
             return Ok(());
         }
         let stream_id = format!("approval:{}", grant.approval_id);
@@ -1153,8 +1182,24 @@ impl ApprovalQueue {
             .event_store
             .stream_revision(&stream_id)
             .map_err(|error| error.to_string())?;
+        if let Some((context, risk)) = expected {
+            if !exact_once_grant_matches(grant, context, risk) {
+                return Err("exact once approval context is no longer active".into());
+            }
+            let events = self.event_store.list_stream(&stream_id)?;
+            let mut requests = BTreeMap::new();
+            let mut durable_grants = BTreeMap::new();
+            for event in events {
+                apply_approval_event(&mut requests, &mut durable_grants, &event);
+            }
+            let durable_grant = durable_grants.get(grant_id)
+                .ok_or_else(|| "exact once approval has no durable grant".to_string())?;
+            if !exact_once_grant_matches(durable_grant, context, risk) {
+                return Err("exact once approval is durably inactive or mismatched".into());
+            }
+        }
         let consumed_at_ms = now_ms();
-        self.event_store
+        let receipt = self.event_store
             .append_batch_if_revision(
                 stream_id.clone(),
                 revision,
@@ -1180,6 +1225,9 @@ impl ApprovalQueue {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if expected.is_some() {
+            require_exclusive_once_receipt(receipt.duplicate)?;
+        }
         grant.status = ApprovalGrantStatus::Expired;
         grant.expires_at_ms = Some(consumed_at_ms);
         grants.remove(grant_id);
@@ -1617,6 +1665,28 @@ pub(crate) fn canonical_graph_decision_events(
         stream_id,
         expected_stream_revision,
     })
+}
+
+fn require_exclusive_once_receipt(duplicate: bool) -> Result<(), String> {
+    if duplicate {
+        return Err("exact once approval transaction was already committed".into());
+    }
+    Ok(())
+}
+
+fn exact_once_grant_matches(
+    grant: &ApprovalGrant,
+    context: &ApprovalContext,
+    risk: harness_contract::core::TaskRisk,
+) -> bool {
+    grant.scope == ApprovalGrantScope::Once
+        && grant.issued_by.kind == ApprovalDecisionActorKind::Human
+        && context.session_id.is_some()
+        && grant.session_id == context.session_id
+        && grant.turn_id == context.turn_id
+        && grant.task_id == context.task_id
+        && context.invocation_id.is_some()
+        && grant_matches(grant, context, risk)
 }
 
 fn grant_matches(
@@ -2164,6 +2234,72 @@ mod tests {
                 .status,
             GlobalApprovalStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn exact_once_duplicate_receipt_is_not_exclusive_execution_authority() {
+        assert!(require_exclusive_once_receipt(false).is_ok());
+        assert!(require_exclusive_once_receipt(true).is_err());
+    }
+
+    #[test]
+    fn exact_once_grant_checks_every_context_and_consumes_only_once() {
+        let queue = queue();
+        let context = approval_context();
+        let pending = queue.submit_scoped_with_policy("Own848-exact-context",
+            pending_request("exact context"), None, false, vec![ApprovalGrantScope::Once]).unwrap();
+        let human = crate::security::test_human_interactive_principal();
+        queue.decide(&human, human_decision(&pending.approval_id, true, "exact human approval")).unwrap();
+        let grant = queue.matching_exact_once_grant(&context, TaskRisk::Low).unwrap();
+        for defect in ["session", "turn", "task", "principal", "profile", "workspace", "capability", "invocation", "policy", "descriptor"] {
+            let mut wrong = context.clone();
+            match defect {
+                "session" => wrong.session_id = Some("foreign".into()),
+                "turn" => wrong.turn_id = Some("foreign".into()),
+                "task" => wrong.task_id = Some("foreign".into()),
+                "principal" => wrong.principal_id.push_str("-foreign"),
+                "profile" => wrong.profile_id.push_str("-foreign"),
+                "workspace" => wrong.workspace_key.push_str("-foreign"),
+                "capability" => wrong.capability.push_str("-foreign"),
+                "invocation" => wrong.invocation_id = Some("foreign".into()),
+                "policy" => wrong.policy_revision += 1,
+                "descriptor" => {
+                    let root = tempfile::tempdir().unwrap();
+                    wrong.effect = Some(tools::ToolHost::builtin("Own848-wrong-effect", root.path())
+                        .pin_snapshot()
+                        .describe_effect("read_file", &serde_json::json!({"path":"source.py"})));
+                }
+                _ => unreachable!(),
+            }
+            assert!(queue.matching_exact_once_grant(&wrong, TaskRisk::Low).is_none(), "{defect}");
+            assert!(queue.consume_exact_once_grant(&grant.grant_id, &wrong, TaskRisk::Low).is_err(), "{defect}");
+        }
+        assert!(queue.matching_exact_once_grant(&context, TaskRisk::High).is_none());
+        let restarted = ApprovalQueue::new(queue.event_store.clone());
+        queue.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).unwrap();
+        assert!(queue.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).is_err());
+        assert!(restarted.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).is_err());
+        assert!(queue.matching_exact_once_grant(&context, TaskRisk::Low).is_none());
+    }
+
+    #[test]
+    fn exact_once_grant_rejects_revocation_after_lookup_and_expiry() {
+        let queue = queue();
+        let context = approval_context();
+        let pending = queue.submit_scoped_with_policy("Own848-revoked-context",
+            pending_request("revoked context"), None, false, vec![ApprovalGrantScope::Once]).unwrap();
+        let human = crate::security::test_human_interactive_principal();
+        queue.decide(&human, human_decision(&pending.approval_id, true, "exact human approval")).unwrap();
+        let grant = queue.matching_exact_once_grant(&context, TaskRisk::Low).unwrap();
+        let restarted = ApprovalQueue::new(queue.event_store.clone());
+        assert!(restarted.matching_exact_once_grant(&context, TaskRisk::Low).is_some());
+        queue.revoke_grant(&human, &grant.grant_id, "revoked before physical dispatch").unwrap();
+        assert!(restarted.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).is_err());
+        assert!(!queue.event_store.list_stream(&format!("approval:{}", pending.approval_id))
+            .unwrap().iter().any(|event| event.kind == "approval.grant_consumed"));
+        let mut expired = grant;
+        expired.expires_at_ms = Some(0);
+        assert!(!exact_once_grant_matches(&expired, &context, TaskRisk::Low));
     }
 
     #[test]

@@ -49,6 +49,38 @@ struct TestPostgresNamespace {
     executor: PostgresExecutor,
     name: String,
     _permit: TestPostgresFixturePermit,
+    #[cfg(test)]
+    session_execution: runtime::SessionStorageExecutionConfig,
+    #[cfg(test)]
+    artifacts: runtime::ArtifactStorageConfig,
+}
+
+#[cfg(test)]
+pub(crate) struct DetachedTestPostgresRestartLease {
+    registry: StorageRegistry,
+    executor: PostgresExecutor,
+    namespace: Arc<TestPostgresNamespace>,
+}
+
+#[cfg(test)]
+impl DetachedTestPostgresRestartLease {
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace.name
+    }
+
+    pub(crate) fn rebuild(&self) -> Result<SelectedStorageTopology, String> {
+        if Arc::strong_count(&self.namespace) != 1 {
+            return Err("previous test topology still owns the restart namespace".into());
+        }
+        let mut topology = SelectedStorageTopology::postgres(
+            self.registry.clone(),
+            self.executor.clone(),
+            self.namespace.session_execution,
+            self.namespace.artifacts,
+        )?;
+        topology.test_namespace = Some(Arc::clone(&self.namespace));
+        topology.verify_runtime_readiness()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -109,6 +141,22 @@ impl Drop for TestPostgresNamespace {
 }
 
 impl SelectedStorageTopology {
+    pub(crate) fn artifact_maintenance_guard(&self) -> ArtifactMaintenanceGuard {
+        ArtifactMaintenanceGuard {
+            #[cfg(any(test, feature = "test-support"))]
+            _namespace: self.test_namespace.clone(),
+        }
+    }
+    pub(crate) fn quiesced_artifact_roots(&self) -> runtime::QuiescedContentRoots {
+        self.runtime_event_store.quiesced_content_roots()
+    }
+    pub(crate) fn into_exclusive_artifact_store(self) -> Result<runtime::ArtifactStore, String> {
+        let artifact_store = Arc::clone(&self.artifact_store);
+        drop(self);
+        Arc::try_unwrap(artifact_store)
+            .map_err(|_| "artifact maintenance requires exclusive local ownership".to_string())
+    }
+
     pub(crate) fn compose_for_runtime(
         config: &runtime::StorageTopologyConfig,
         config_home: &Path,
@@ -179,6 +227,10 @@ impl SelectedStorageTopology {
             executor,
             name,
             _permit: permit,
+            #[cfg(test)]
+            session_execution: config.session_execution,
+            #[cfg(test)]
+            artifacts: config.artifacts,
         });
         let result = Self::postgres(registry, scoped, config.session_execution, config.artifacts);
         match result {
@@ -191,6 +243,23 @@ impl SelectedStorageTopology {
                 Err(error)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detach_for_test_restart(
+        self,
+    ) -> Result<DetachedTestPostgresRestartLease, String> {
+        let namespace = self
+            .test_namespace
+            .ok_or_else(|| "restart requires an isolated test namespace".to_string())?;
+        if Arc::strong_count(&namespace) != 1 {
+            return Err("cannot detach while another test topology owns the namespace".into());
+        }
+        Ok(DetachedTestPostgresRestartLease {
+            registry: self.registry,
+            executor: self.postgres_executor,
+            namespace,
+        })
     }
 
     fn compose(
@@ -288,6 +357,9 @@ impl SelectedStorageTopology {
                 .map_err(stringify)?
                 .into_runtime_event_store(),
         );
+        runtime_event_store
+            .bind_artifact_store(Arc::clone(&artifact_store))
+            .map_err(stringify)?;
         let task_service = Arc::new(
             runtime_postgres::PostgresTaskStore::new(executor.clone())
                 .map_err(stringify)?
@@ -352,6 +424,11 @@ impl SelectedStorageTopology {
             .map_err(stringify)?;
         Ok(self)
     }
+}
+
+pub(crate) struct ArtifactMaintenanceGuard {
+    #[cfg(any(test, feature = "test-support"))]
+    _namespace: Option<Arc<TestPostgresNamespace>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -597,6 +674,648 @@ fn resolved_postgres_lane_sizes(total: u32, config: &runtime::PostgresTopologyCo
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(unix)]
+    fn fixture_runtime_executor(
+        fixture: &SelectedStorageTopology,
+        home: &Path,
+    ) -> PostgresExecutor {
+        let namespace = fixture
+            .test_namespace
+            .as_ref()
+            .expect("original fixture namespace");
+        let config = runtime::PostgresTopologyConfig {
+            logical_identity: fixture.postgres_executor.logical_identity().to_string(),
+            secret_ref: "env:COWD_TEST_POSTGRES_URL".into(),
+            max_connections: 12,
+            ..runtime::PostgresTopologyConfig::default()
+        };
+        connect_postgres(&config, PostgresMigrationMode::RuntimeReadiness, home)
+            .unwrap()
+            .scoped_namespace(&namespace.name)
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn fixture_runtime_topology(
+        registry: StorageRegistry,
+        executor: PostgresExecutor,
+        namespace: &Arc<TestPostgresNamespace>,
+    ) -> Result<SelectedStorageTopology, String> {
+        assert_eq!(
+            executor.migration_mode(),
+            PostgresMigrationMode::RuntimeReadiness
+        );
+        let mut topology = SelectedStorageTopology::postgres(
+            registry,
+            executor,
+            namespace.session_execution,
+            namespace.artifacts,
+        )?;
+        topology.test_namespace = Some(Arc::clone(namespace));
+        topology.verify_runtime_readiness()
+    }
+
+    #[cfg(unix)]
+    fn fixture_database_snapshot(executor: &PostgresExecutor) -> Vec<(String, String)> {
+        let mut connection = executor.checkout_online_read().unwrap();
+        let tables = connection.query(
+            "SELECT tablename FROM pg_tables WHERE schemaname=current_schema() ORDER BY tablename", &[],
+        ).unwrap().iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+        let mut snapshot = Vec::new();
+        for table in tables {
+            let quoted = table.replace('"', "\"\"");
+            let contents = connection.query_one(&format!(
+                "SELECT COALESCE(jsonb_agg(to_jsonb(snapshot_row) ORDER BY to_jsonb(snapshot_row)::TEXT),'[]'::JSONB)::TEXT FROM \"{quoted}\" snapshot_row"
+            ), &[]).unwrap().get::<_, String>(0);
+            snapshot.push((table, contents));
+        }
+        let catalogs = connection.query_one(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_array(oid::TEXT,relname,relkind::TEXT,relfilenode::TEXT) ORDER BY relname),'[]'::JSONB)::TEXT FROM pg_class WHERE relnamespace=current_schema()::regnamespace", &[],
+        ).unwrap().get::<_, String>(0);
+        snapshot.push(("pg_class".into(), catalogs));
+        snapshot
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL and existing runtime POSIX scratch"]
+    fn artifact_consumption_releases_event_binding_but_never_bypasses_either_owner_gate() {
+        for case in ["exclusive", "outer_arc", "inner_store", "event_owner"] {
+            let home = crate::storage_cutover::tests::posix_scratch();
+            let workspace = crate::storage_cutover::tests::posix_scratch();
+            let topology =
+                SelectedStorageTopology::compose_for_test(home.path(), workspace.path()).unwrap();
+            let namespace = Arc::clone(topology.test_namespace.as_ref().unwrap());
+            match case {
+                "exclusive" => {
+                    let mut store = topology.into_exclusive_artifact_store().unwrap();
+                    assert!(store.reconcile_quiesced_orphans(false, 100).is_err());
+                    assert_eq!(
+                        store
+                            .reconcile_quiesced_orphans(true, 100)
+                            .unwrap()
+                            .removed_objects,
+                        0
+                    );
+                }
+                "outer_arc" => {
+                    let owner = Arc::clone(&topology.artifact_store);
+                    assert!(topology.into_exclusive_artifact_store().is_err());
+                    assert!(owner.stats().is_ok());
+                }
+                "inner_store" => {
+                    let owner = (*topology.artifact_store).clone();
+                    let mut store = topology.into_exclusive_artifact_store().unwrap();
+                    assert!(store.reconcile_quiesced_orphans(true, 100).is_err());
+                    drop(owner);
+                    assert!(store.reconcile_quiesced_orphans(true, 100).is_ok());
+                }
+                "event_owner" => {
+                    let events = Arc::clone(&topology.runtime_event_store);
+                    assert!(topology.into_exclusive_artifact_store().is_err());
+                    drop(events);
+                }
+                _ => unreachable!(),
+            }
+            assert!(namespace
+                .executor
+                .checkout_online_read()
+                .unwrap()
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
+                    &[&namespace.name],
+                )
+                .unwrap()
+                .get::<_, bool>(0));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL and existing runtime POSIX scratch"]
+    fn artifact_caller_uses_runtime_readiness_preserves_unknown_and_repeats_idempotently() {
+        use crate::storage_cutover::{
+            execute_quiesced_artifact_cleanup,
+            tests::{evidence_json, posix_scratch, write_evidence},
+        };
+        use runtime::ArtifactMetadataRepository;
+
+        let home = posix_scratch();
+        let workspace = posix_scratch();
+        let fixture =
+            SelectedStorageTopology::compose_for_test(home.path(), workspace.path()).unwrap();
+        let namespace = Arc::clone(fixture.test_namespace.as_ref().unwrap());
+        let executor = fixture_runtime_executor(&fixture, home.path());
+        let registry = fixture.registry.clone();
+        let identity = executor.logical_identity().to_string();
+        let repository =
+            runtime_postgres::PostgresArtifactRepository::new(fixture.postgres_executor.clone())
+                .unwrap();
+        let write = |name: &str, body: &[u8]| {
+            let path = workspace.path().join(name);
+            fs::write(&path, body).unwrap();
+            fixture
+                .artifact_store
+                .write_path_blocking(
+                    runtime::ArtifactWriteDescriptor {
+                        media_type: "application/octet-stream".into(),
+                        visibility_scope: "session:caller".into(),
+                        expected_bytes: None,
+                        original_name: None,
+                    },
+                    &path,
+                )
+                .unwrap()
+        };
+        let orphan_body =
+            vec![b'o'; fixture.artifact_store.config().compact_threshold_bytes as usize + 1];
+        let orphan = write("orphan", &orphan_body);
+        fixture
+            .artifact_store
+            .delete(&orphan, "session:caller")
+            .unwrap();
+        fixture
+            .postgres_executor
+            .checkout_critical()
+            .unwrap()
+            .execute(
+                "UPDATE artifact_objects SET created_at_ms=0 WHERE sha256=$1",
+                &[&orphan.sha256],
+            )
+            .unwrap();
+        let audit = write("audit", b"permanent audit pin");
+        fixture
+            .artifact_store
+            .pin(&audit, "prepared-unknown-owner", i64::MAX as u64)
+            .unwrap();
+        assert!(fixture
+            .artifact_store
+            .delete(&audit, "session:caller")
+            .is_err());
+        let live = write("live", b"live unpinned record must remain");
+        let young = write("young", b"within original orphan grace");
+        fixture
+            .artifact_store
+            .delete(&young, "session:caller")
+            .unwrap();
+        fixture
+            .runtime_event_store
+            .append(runtime::RuntimeEventInput {
+                stream_id: "session:caller".into(),
+                scope: runtime::RuntimeEventScope::Session,
+                kind: "maintenance.fixture.audit".into(),
+                status: None,
+                actor: None,
+                refs: vec![],
+                payload: serde_json::to_value(&audit).unwrap(),
+            })
+            .unwrap();
+        let events_before = fixture
+            .runtime_event_store
+            .list_stream("session:caller")
+            .unwrap();
+        let unknown = runtime::ArtifactObjectRecord {
+            sha256: format!("sha256:{}", "f".repeat(64)),
+            bytes: 4,
+            tier: runtime::ArtifactObjectTier::Compact,
+            compact_body: Some(b"????".to_vec()),
+            created_at_ms: 0,
+            generation: "unknown-reserved-generation".into(),
+        };
+        fixture.postgres_executor.checkout_critical().unwrap().execute(
+            "INSERT INTO artifact_objects(sha256,generation,bytes,tier,compact_body,created_at_ms,inflight) VALUES($1,$2,$3,'compact',$4,0,1)",
+            &[&unknown.sha256,&unknown.generation,&(unknown.bytes as i64),&unknown.compact_body],
+        ).unwrap();
+        let pins_before = fixture.artifact_store.stats().unwrap().pins;
+        drop(fixture);
+        let before_readiness = fixture_database_snapshot(&executor);
+        let evidence_path = workspace.path().join("evidence");
+        write_evidence(
+            &evidence_path,
+            &serde_json::to_vec(&evidence_json(
+                workspace.path(),
+                &identity,
+                std::time::SystemTime::now(),
+            ))
+            .unwrap(),
+        );
+        let pid_path = home.path().join("absent-pid");
+        let run = || {
+            execute_quiesced_artifact_cleanup(
+                &identity,
+                workspace.path(),
+                &evidence_path,
+                &pid_path,
+                || {
+                    let topology =
+                        fixture_runtime_topology(registry.clone(), executor.clone(), &namespace)?;
+                    assert_eq!(fixture_database_snapshot(&executor), before_readiness);
+                    assert_eq!(executor.health().migration_transaction_count, 0);
+                    Ok(topology)
+                },
+            )
+        };
+        let report = run().unwrap();
+        assert_eq!(report["removed_objects"], 1);
+        assert_eq!(report["reclaimed_bytes"], orphan_body.len() as u64);
+        assert_eq!(report["full_reconciliation_complete"], false);
+        assert_eq!(
+            report["canonical_transaction_reconciliation"],
+            "closed_typed_exact_roots"
+        );
+        assert_eq!(
+            report["unknown_reservations_count"],
+            serde_json::Value::Null
+        );
+        assert_eq!(report["unknown_pins_count"], serde_json::Value::Null);
+        assert_eq!(report["remaining_candidates"], "unknown");
+        assert!(report["reclaimed_bytes_basis"]
+            .as_str()
+            .unwrap()
+            .contains("not_measured_disk"));
+        assert!(repository.object(&orphan.sha256).unwrap().is_none());
+        assert_eq!(repository.object(&unknown.sha256).unwrap(), Some(unknown));
+        assert!(repository.object(&young.sha256).unwrap().is_some());
+        let topology =
+            fixture_runtime_topology(registry.clone(), executor.clone(), &namespace).unwrap();
+        assert_eq!(
+            topology
+                .artifact_store
+                .read_blocking(&audit, "session:caller", None)
+                .unwrap(),
+            b"permanent audit pin"
+        );
+        assert_eq!(
+            topology
+                .artifact_store
+                .read_blocking(&live, "session:caller", None)
+                .unwrap(),
+            b"live unpinned record must remain"
+        );
+        assert_eq!(topology.artifact_store.stats().unwrap().pins, pins_before);
+        assert_eq!(
+            topology
+                .runtime_event_store
+                .list_stream("session:caller")
+                .unwrap(),
+            events_before
+        );
+        drop(topology);
+        let after_cleanup = fixture_database_snapshot(&executor);
+        let second = execute_quiesced_artifact_cleanup(
+            &identity,
+            workspace.path(),
+            &evidence_path,
+            &pid_path,
+            || {
+                let topology =
+                    fixture_runtime_topology(registry.clone(), executor.clone(), &namespace)?;
+                assert_eq!(fixture_database_snapshot(&executor), after_cleanup);
+                Ok(topology)
+            },
+        )
+        .unwrap();
+        assert_eq!(second["removed_objects"], 0);
+        assert_eq!(second["full_reconciliation_complete"], false);
+        assert_eq!(executor.health().migration_transaction_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL and existing runtime POSIX scratch"]
+    fn runtime_artifact_composition_rejects_bad_catalogs_without_repair_or_ddl() {
+        use crate::storage_cutover::tests::posix_scratch;
+
+        for damage in [
+            "checksum",
+            "missing_catalog",
+            "extra_migration",
+            "missing_table",
+        ] {
+            let home = posix_scratch();
+            let workspace = posix_scratch();
+            let fixture =
+                SelectedStorageTopology::compose_for_test(home.path(), workspace.path()).unwrap();
+            let namespace = Arc::clone(fixture.test_namespace.as_ref().unwrap());
+            let executor = fixture_runtime_executor(&fixture, home.path());
+            let registry = fixture.registry.clone();
+            let sql = match damage {
+                "checksum" => "UPDATE cowd_schema_catalogs SET checksum='invalid' WHERE domain='runtime_artifact'",
+                "missing_catalog" => "DELETE FROM cowd_schema_catalogs WHERE domain='runtime_artifact'",
+                "extra_migration" => "INSERT INTO cowd_schema_migrations(id,domain,version,description,checksum) SELECT 'runtime_artifact.extra',domain,version,description,checksum FROM cowd_schema_migrations WHERE domain='runtime_artifact'",
+                "missing_table" => "DROP TABLE artifact_pins",
+                _ => unreachable!(),
+            };
+            fixture
+                .postgres_executor
+                .checkout_critical()
+                .unwrap()
+                .batch_execute(sql)
+                .unwrap();
+            drop(fixture);
+            let before = fixture_database_snapshot(&executor);
+            assert!(
+                fixture_runtime_topology(registry, executor.clone(), &namespace).is_err(),
+                "{damage}"
+            );
+            assert_eq!(fixture_database_snapshot(&executor), before, "{damage}");
+            assert_eq!(executor.health().migration_transaction_count, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL and existing runtime POSIX scratch"]
+    fn artifact_caller_revalidates_identity_local_pid_freshness_and_ownership_after_compose() {
+        use crate::storage_cutover::{
+            execute_quiesced_artifact_cleanup,
+            tests::{evidence_json, posix_scratch, write_evidence},
+        };
+        use std::time::{Duration, SystemTime};
+
+        let home = posix_scratch();
+        let workspace = posix_scratch();
+        let fixture =
+            SelectedStorageTopology::compose_for_test(home.path(), workspace.path()).unwrap();
+        let namespace = Arc::clone(fixture.test_namespace.as_ref().unwrap());
+        let executor = fixture_runtime_executor(&fixture, home.path());
+        let registry = fixture.registry.clone();
+        let identity = executor.logical_identity().to_string();
+        drop(fixture);
+        for case in [
+            "identity",
+            "local_pid",
+            "expired",
+            "outer_owner",
+            "inner_owner",
+            "readiness_error",
+        ] {
+            let evidence_path = workspace.path().join(format!("evidence-{case}"));
+            let pid_path = home.path().join(format!("pid-{case}"));
+            let declared_identity = if case == "identity" {
+                "different-configured-label"
+            } else {
+                &identity
+            };
+            let mut declaration =
+                evidence_json(workspace.path(), declared_identity, SystemTime::now());
+            let topology =
+                fixture_runtime_topology(registry.clone(), executor.clone(), &namespace).unwrap();
+            let expiry = SystemTime::now() + Duration::from_secs(2);
+            if case == "expired" {
+                declaration["expires_at_unix_ms"] = serde_json::json!(expiry
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    as u64);
+            }
+            write_evidence(&evidence_path, &serde_json::to_vec(&declaration).unwrap());
+            let before = fixture_database_snapshot(&executor);
+            let mut outer_owner = None;
+            let mut inner_owner = None;
+            let mut composed = false;
+            let result = execute_quiesced_artifact_cleanup(
+                declared_identity,
+                workspace.path(),
+                &evidence_path,
+                &pid_path,
+                || {
+                    composed = true;
+                    match case {
+                        "local_pid" => {
+                            fs::write(&pid_path, std::process::id().to_string()).unwrap()
+                        }
+                        "expired" => std::thread::sleep(
+                            expiry.duration_since(SystemTime::now()).unwrap_or_default()
+                                + Duration::from_millis(10),
+                        ),
+                        "outer_owner" => outer_owner = Some(Arc::clone(&topology.artifact_store)),
+                        "inner_owner" => inner_owner = Some((*topology.artifact_store).clone()),
+                        "readiness_error" => return Err("fixture readiness rejected".into()),
+                        _ => {}
+                    }
+                    Ok(topology)
+                },
+            );
+            assert!(
+                composed,
+                "{case}: gate must have been reached after initial admission"
+            );
+            assert!(result.is_err(), "{case}");
+            assert_eq!(fixture_database_snapshot(&executor), before, "{case}");
+            assert_eq!(executor.health().migration_transaction_count, 0);
+            drop(outer_owner);
+            drop(inner_owner);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL and existing runtime POSIX scratch"]
+    fn artifact_caller_keeps_fixed_batch_limit_and_never_reports_full_reconciliation() {
+        use crate::storage_cutover::{
+            execute_quiesced_artifact_cleanup,
+            tests::{evidence_json, posix_scratch, write_evidence},
+        };
+        use runtime::ArtifactMetadataRepository;
+
+        let home = posix_scratch();
+        let workspace = posix_scratch();
+        let fixture =
+            SelectedStorageTopology::compose_for_test(home.path(), workspace.path()).unwrap();
+        let namespace = Arc::clone(fixture.test_namespace.as_ref().unwrap());
+        let executor = fixture_runtime_executor(&fixture, home.path());
+        let registry = fixture.registry.clone();
+        let identity = executor.logical_identity().to_string();
+        let repository =
+            runtime_postgres::PostgresArtifactRepository::new(fixture.postgres_executor.clone())
+                .unwrap();
+        let mut hashes = Vec::new();
+        for index in 0..101 {
+            let path = workspace.path().join("source");
+            fs::write(&path, format!("batch-only-ready-object-{index}")).unwrap();
+            let artifact = fixture
+                .artifact_store
+                .write_path_blocking(
+                    runtime::ArtifactWriteDescriptor {
+                        media_type: "text/plain".into(),
+                        visibility_scope: "session:batch".into(),
+                        expected_bytes: None,
+                        original_name: None,
+                    },
+                    &path,
+                )
+                .unwrap();
+            fixture
+                .artifact_store
+                .delete(&artifact, "session:batch")
+                .unwrap();
+            fixture
+                .postgres_executor
+                .checkout_critical()
+                .unwrap()
+                .execute(
+                    "UPDATE artifact_objects SET created_at_ms=0 WHERE sha256=$1",
+                    &[&artifact.sha256],
+                )
+                .unwrap();
+            hashes.push(artifact.sha256);
+        }
+        drop(fixture);
+        let evidence = workspace.path().join("evidence");
+        write_evidence(
+            &evidence,
+            &serde_json::to_vec(&evidence_json(
+                workspace.path(),
+                &identity,
+                std::time::SystemTime::now(),
+            ))
+            .unwrap(),
+        );
+        for expected in [100, 1, 0] {
+            let report = execute_quiesced_artifact_cleanup(
+                &identity,
+                workspace.path(),
+                &evidence,
+                &home.path().join("absent-pid"),
+                || fixture_runtime_topology(registry.clone(), executor.clone(), &namespace),
+            )
+            .unwrap();
+            assert_eq!(report["removed_objects"], expected);
+            assert!(report["examined"].as_u64().unwrap() <= 100);
+            assert_eq!(report["full_reconciliation_complete"], false);
+            assert_eq!(report["remaining_candidates"], "unknown");
+        }
+        for hash in hashes {
+            assert!(repository.object(&hash).unwrap().is_none());
+        }
+        assert_eq!(executor.health().migration_transaction_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL and existing runtime POSIX scratch"]
+    fn artifact_caller_retries_seeded_generation_states_and_reports_io_failure_without_rollback() {
+        use crate::storage_cutover::{
+            execute_quiesced_artifact_cleanup,
+            tests::{evidence_json, posix_scratch, write_evidence},
+        };
+        use runtime::ArtifactMetadataRepository;
+
+        for case in ["unlink_before_finish", "io_failure"] {
+            let home = posix_scratch();
+            let workspace = posix_scratch();
+            let fixture =
+                SelectedStorageTopology::compose_for_test(home.path(), workspace.path()).unwrap();
+            let namespace = Arc::clone(fixture.test_namespace.as_ref().unwrap());
+            let executor = fixture_runtime_executor(&fixture, home.path());
+            let registry = fixture.registry.clone();
+            let identity = executor.logical_identity().to_string();
+            let repository = runtime_postgres::PostgresArtifactRepository::new(
+                fixture.postgres_executor.clone(),
+            )
+            .unwrap();
+            let body =
+                vec![b'r'; fixture.artifact_store.config().compact_threshold_bytes as usize + 1];
+            let source = workspace.path().join("source");
+            fs::write(&source, &body).unwrap();
+            let artifact = fixture
+                .artifact_store
+                .write_path_blocking(
+                    runtime::ArtifactWriteDescriptor {
+                        media_type: "application/octet-stream".into(),
+                        visibility_scope: "session:retry".into(),
+                        expected_bytes: None,
+                        original_name: None,
+                    },
+                    &source,
+                )
+                .unwrap();
+            fixture
+                .artifact_store
+                .delete(&artifact, "session:retry")
+                .unwrap();
+            fixture
+                .postgres_executor
+                .checkout_critical()
+                .unwrap()
+                .execute(
+                    "UPDATE artifact_objects SET created_at_ms=0 WHERE sha256=$1",
+                    &[&artifact.sha256],
+                )
+                .unwrap();
+            let object = repository.object(&artifact.sha256).unwrap().unwrap();
+            let digest = artifact.sha256.strip_prefix("sha256:").unwrap();
+            let blob_path = registry
+                .endpoint(&StorageDomainId::Blobs)
+                .unwrap()
+                .path
+                .join("objects")
+                .join(&digest[..2])
+                .join(digest)
+                .join(&object.generation);
+            assert!(blob_path.is_file());
+            if case == "unlink_before_finish" {
+                assert!(repository
+                    .claim_object_deletion(&object.sha256, &object.generation)
+                    .unwrap());
+                fs::remove_file(&blob_path).unwrap();
+            } else {
+                fs::remove_file(&blob_path).unwrap();
+                fs::create_dir(&blob_path).unwrap();
+            }
+            drop(fixture);
+            let evidence = workspace.path().join("evidence");
+            write_evidence(
+                &evidence,
+                &serde_json::to_vec(&evidence_json(
+                    workspace.path(),
+                    &identity,
+                    std::time::SystemTime::now(),
+                ))
+                .unwrap(),
+            );
+            let run = || {
+                execute_quiesced_artifact_cleanup(
+                    &identity,
+                    workspace.path(),
+                    &evidence,
+                    &home.path().join("absent-pid"),
+                    || fixture_runtime_topology(registry.clone(), executor.clone(), &namespace),
+                )
+            };
+            if case == "io_failure" {
+                let error = run().unwrap_err();
+                assert!(error.contains("partial FS/PG deletion may have occurred"));
+                assert!(error.contains("no global rollback"));
+                assert!(repository.object(&object.sha256).unwrap().is_some());
+                fs::remove_dir(&blob_path).unwrap();
+                fs::write(&blob_path, &body).unwrap();
+            }
+            assert_eq!(run().unwrap()["removed_objects"], 1);
+            assert!(!blob_path.exists());
+            assert!(repository.object(&object.sha256).unwrap().is_none());
+            let mut replacement = object.clone();
+            replacement.generation = "replacement-unknown-reservation".into();
+            executor.checkout_critical().unwrap().execute(
+                "INSERT INTO artifact_objects(sha256,generation,bytes,tier,created_at_ms,inflight) VALUES($1,$2,$3,'blob',0,1)",
+                &[&replacement.sha256,&replacement.generation,&(replacement.bytes as i64)],
+            ).unwrap();
+            assert!(!repository
+                .claim_object_deletion(&object.sha256, &object.generation)
+                .unwrap());
+            repository
+                .finish_object_deletion(&object.sha256, &object.generation)
+                .unwrap();
+            assert_eq!(run().unwrap()["removed_objects"], 0);
+            assert_eq!(
+                repository.object(&object.sha256).unwrap(),
+                Some(replacement)
+            );
+            assert_eq!(executor.health().migration_transaction_count, 0);
+        }
+    }
 
     #[test]
     fn postgres_session_workers_are_bounded_by_the_online_read_lane() {

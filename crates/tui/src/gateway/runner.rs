@@ -28,6 +28,27 @@ use crate::state::{
 };
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
 
+pub(crate) async fn receipt_expiry_tick(client: &GatewayApiClient) {
+    client.expire_terminal_receipts().await;
+}
+
+pub(crate) async fn receipt_presence_heartbeat(
+    client: &GatewayApiClient,
+    session_id: &str,
+    role: &str,
+) -> bool {
+    if client
+        .attach_session(session_id, "tui", Some(role))
+        .await
+        .is_ok()
+    {
+        client.refresh_terminal_receipts(session_id).await;
+        true
+    } else {
+        false
+    }
+}
+
 #[path = "input.rs"]
 mod input;
 
@@ -622,6 +643,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    receipt_expiry_tick(&gateway_client).await;
                     drain_cowd_events_state(
                         &mut tui_rx,
                         &mut state,
@@ -671,9 +693,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                 |(session_id, role)| {
                                     let client = client.clone();
                                     async move {
-                                        let _ = client
-                                            .attach_session(&session_id, "tui", Some(role))
-                                            .await;
+                                        receipt_presence_heartbeat(&client, &session_id, role).await;
                                     }
                                 },
                             ))
@@ -3288,6 +3308,8 @@ fn cowd_event_session_id(event: &CowdEvent) -> Option<&str> {
         | CowdEvent::SessionHistoryOlderPage { page, .. }
         | CowdEvent::SessionHistoryNewerPage { page, .. }
         | CowdEvent::SessionHistoryLatestPage { page, .. } => Some(&page.session_id),
+        CowdEvent::TerminalReceiptContext { overlay } => Some(&overlay.session_id),
+        CowdEvent::TerminalReceiptSelection { session_id, .. } => Some(session_id),
         CowdEvent::GatewaySession { event } => Some(match event {
             crate::protocol::GatewaySessionEvent::UserMessageCommitted { correlation, .. }
             | crate::protocol::GatewaySessionEvent::TextDelta { correlation, .. }
@@ -4161,6 +4183,7 @@ mod tests {
                 schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
                 execution_id: "execution-old".to_string(),
                 agentic_collaboration: Default::default(),
+                terminal_axes: Default::default(),
                 revision: 9,
                 cursor: 9,
                 detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

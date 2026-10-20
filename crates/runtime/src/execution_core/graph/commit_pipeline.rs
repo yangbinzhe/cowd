@@ -2,7 +2,60 @@
 
 use super::*;
 
+#[cfg(test)]
+mod replay_scope_tests {
+    use super::*;
+
+    #[test]
+    fn replay_scope_classifier_distinguishes_historical_raw_and_damaged_v2() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("scope2-classifier", workspace.path()).pin_snapshot();
+        let resolution = host.describe_effect_resolution(
+            "edit",
+            &json!({
+                "action":"write","path":"proof.txt","content":"after",
+            }),
+        );
+        let effect = &resolution.descriptor;
+        let scope = harness_contract::goal::ProofEffectScope {
+            version: 2,
+            descriptor_hash: effect.descriptor_hash.clone(),
+            complete: false,
+            targets: vec![],
+            scope_purposes: resolution.scope_purposes,
+        };
+        let valid = json!({"resolved_effect_scope":scope});
+        assert!(validate_replay_effect_scope(&valid, effect).is_ok());
+        assert!(validate_replay_effect_scope(&json!({}), effect).is_ok());
+        assert!(validate_replay_effect_scope(&json!({
+            "resolved_effect_scope":{"version":1,"descriptor_hash":effect.descriptor_hash,"complete":false,"targets":[]},
+        }), effect).is_ok());
+        for malformed in [
+            json!({"version":2,"descriptor_hash":effect.descriptor_hash,"complete":false,"targets":[]}),
+            json!({"version":1,"scope_purposes":[]}),
+            json!({"version":3}),
+            json!("invalid-json-object"),
+        ] {
+            assert!(validate_replay_effect_scope(
+                &json!({"resolved_effect_scope":malformed}),
+                effect
+            )
+            .is_err());
+        }
+        let mut missing = valid.clone();
+        missing["resolved_effect_scope"]["scope_purposes"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(validate_replay_effect_scope(&missing, effect).is_err());
+        let mut forged = valid;
+        forged["resolved_effect_scope"]["descriptor_hash"] = json!("foreign-descriptor");
+        assert!(validate_replay_effect_scope(&forged, effect).is_err());
+    }
+}
+
 pub(super) fn maybe_checkpoint(
+    store: &RuntimeEventStore,
     graph: &ExecutionGraph,
     event: ExecutionGraphEvent,
 ) -> Result<ExecutionGraphEvent, ExecutionCommitError> {
@@ -15,12 +68,53 @@ pub(super) fn maybe_checkpoint(
     let delta_bytes = event.estimated_delta_bytes();
     let snapshot_bytes = crate::execution_core::hot_state::estimate_graph_bytes(graph).max(1);
     let topology_interval = (256 / graph.nodes.len().max(1)).clamp(8, 64) as u64;
+    let head = graph.revision.checked_sub(1).ok_or_else(|| {
+        ExecutionCommitError::InvalidCommand("invalid graph checkpoint revision".into())
+    })?;
+    let recent = store
+        .list_stream_before(&graph.id, head, 100, 1024 * 1024)
+        .map_err(ExecutionCommitError::InvalidCommand)?;
+    let mut tail_bytes = 0u64;
+    let mut tail_count = 0usize;
+    let mut found_checkpoint = false;
+    for record in &recent {
+        if matches!(
+            record.kind.as_str(),
+            "execution_graph.planned" | "execution_graph.checkpoint"
+        ) {
+            found_checkpoint = true;
+            break;
+        }
+        tail_bytes = tail_bytes
+            .checked_add(serde_json::to_vec(record)?.len() as u64)
+            .ok_or_else(|| {
+                ExecutionCommitError::InvalidCommand("graph tail bytes overflow".into())
+            })?;
+        tail_count += 1;
+    }
     if delta_bytes.saturating_mul(4) >= snapshot_bytes.saturating_mul(3)
         || graph.revision % topology_interval == 0
+        || !found_checkpoint
+        || tail_count >= 99
+        || tail_bytes.saturating_add(delta_bytes) >= 1024 * 1024
     {
+        let bindings = match &event {
+            ExecutionGraphEvent::NodeTransitioned {
+                node_id,
+                binding: Some(binding),
+                ..
+            } => BTreeMap::from([(node_id.clone(), binding.clone())]),
+            ExecutionGraphEvent::NodesStarted { bindings, .. } => bindings.clone(),
+            _ => BTreeMap::new(),
+        };
         return Ok(ExecutionGraphEvent::Checkpoint {
             cause: event.kind().to_string(),
             graph: graph.clone(),
+            bindings,
+            lease_closures: match &event {
+                ExecutionGraphEvent::Recovered { lease_closures, .. } => lease_closures.clone(),
+                _ => Vec::new(),
+            },
         });
     }
     Ok(event)
@@ -29,6 +123,14 @@ pub(super) fn maybe_checkpoint(
 pub(super) fn validate_executor_domain_events(
     domain_events: &[RuntimeTransactionEventInput],
 ) -> Result<(), ExecutionCommitError> {
+    if domain_events
+        .iter()
+        .any(|event| event.event.kind.starts_with("execution.effect."))
+    {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "executor domain input cannot author reserved execution effect facts".into(),
+        ));
+    }
     if let Some(event) = domain_events.iter().find(|event| {
         !matches!(
             event.event.scope,
@@ -50,11 +152,78 @@ pub(super) fn validate_executor_domain_events(
     Ok(())
 }
 
+#[cfg(test)]
+mod reserved_node_effect_452_tests {
+    use super::*;
+
+    fn domain(kind: &str, actor: &str, scope: RuntimeEventScope) -> RuntimeTransactionEventInput {
+        RuntimeEventInput {
+            stream_id: "reserved-domain-452".into(),
+            scope,
+            kind: kind.into(),
+            status: None,
+            actor: Some(actor.into()),
+            refs: Vec::new(),
+            payload: json!({}),
+        }
+        .into()
+    }
+
+    #[test]
+    fn r1_452_executor_domain_cannot_forge_node_effect_intent_or_receipt() {
+        for kind in ["execution.effect.intent", "execution.effect.receipt"] {
+            for actor in ["execution_commit_service", "governed_tool", "foreign"] {
+                let events = [domain(kind, actor, RuntimeEventScope::ExecutionNode)];
+                assert!(matches!(validate_executor_domain_events(&events),
+                    Err(ExecutionCommitError::InvalidCommand(reason))
+                        if reason == "executor domain input cannot author reserved execution effect facts"));
+            }
+        }
+    }
+
+    #[test]
+    fn r1_452_reserved_guard_preserves_ordinary_domains_and_scope_rejection() {
+        let ordinary = domain("goal.test.ordinary", "test-owner", RuntimeEventScope::Goal);
+        assert!(validate_executor_domain_events(&[ordinary.clone()]).is_ok());
+        assert!(validate_executor_domain_events(&[domain(
+            "node.test.ordinary",
+            "test-owner",
+            RuntimeEventScope::ExecutionNode
+        ),])
+        .is_ok());
+        assert!(matches!(
+            validate_executor_domain_events(&[
+                ordinary,
+                domain(
+                    "execution.effect.receipt",
+                    "foreign",
+                    RuntimeEventScope::ExecutionNode
+                ),
+            ]),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            validate_executor_domain_events(&[domain(
+                "protected.test",
+                "test-owner",
+                RuntimeEventScope::ExecutionGraph
+            ),]),
+            Err(ExecutionCommitError::ProtectedDomainScope(_))
+        ));
+    }
+}
+
 pub(super) fn graph_identity_refs(graph: &ExecutionGraph) -> Vec<RuntimeEventRef> {
     let mut refs = vec![RuntimeEventRef {
         kind: "execution_graph".to_string(),
         id: graph.id.clone(),
     }];
+    if let Some(lineage) = &graph.lineage {
+        refs.push(RuntimeEventRef {
+            kind: "session".into(),
+            id: lineage.session_id.clone(),
+        });
+    }
     for packet in graph
         .nodes
         .iter()
@@ -130,8 +299,106 @@ pub(super) fn tool_effect_refs(
             kind: "execution_node".to_string(),
             id: parent.node_id.clone(),
         });
+        if let Some(attempt) = request.parent_execution_attempt {
+            refs.push(RuntimeEventRef {
+                kind: "agent_attempt".into(),
+                id: attempt.to_string(),
+            });
+        }
     }
     refs
+}
+
+pub(super) fn validate_replay_effect_scope(
+    payload: &serde_json::Value,
+    effect: &ToolEffectDescriptor,
+) -> Result<(), ExecutionCommitError> {
+    let value = &payload["resolved_effect_scope"];
+    if value.is_null() {
+        return Ok(());
+    }
+    match value["version"].as_u64() {
+        Some(1) if value.get("scope_purposes").is_none() => {
+            if value["descriptor_hash"] != effect.descriptor_hash
+                || value["complete"].as_bool().is_none()
+            {
+                return Err(ExecutionCommitError::InvalidCommand(
+                    "legacy replay descriptor or scope structure conflict".into(),
+                ));
+            }
+            let _: Vec<harness_contract::goal::ProofEffectTarget> =
+                serde_json::from_value(value["targets"].clone())?;
+            Ok(())
+        }
+        Some(2) => {
+            let scope: harness_contract::goal::ProofEffectScope =
+                serde_json::from_value(value.clone())?;
+            ExecutionCommitService::validate_bound_effect_scope(effect, &scope)
+        }
+        _ => Err(ExecutionCommitError::InvalidCommand(
+            "invalid terminal effect scope; refusing replay or fresh execution".into(),
+        )),
+    }
+}
+
+pub(super) fn root_effect_receipt_refs(
+    request: &crate::RuntimeToolExecutionRequest,
+    owner: &harness_contract::projection::RuntimeActivityBinding,
+    attempt: u32,
+) -> Vec<RuntimeEventRef> {
+    let mut refs = tool_effect_refs(request);
+    refs.extend([
+        RuntimeEventRef {
+            kind: "execution_graph".into(),
+            id: owner.root_execution_id.clone(),
+        },
+        RuntimeEventRef {
+            kind: "execution_node".into(),
+            id: owner.node_id.clone().unwrap_or_default(),
+        },
+        RuntimeEventRef {
+            kind: "agent_attempt".into(),
+            id: attempt.to_string(),
+        },
+        RuntimeEventRef {
+            kind: "turn".into(),
+            id: owner.turn_id.clone(),
+        },
+    ]);
+    refs
+}
+
+pub(super) fn root_index_receipt_event(
+    request: &crate::RuntimeToolExecutionRequest,
+    effect_kind: ToolEffectKind,
+    outcome: &crate::RuntimeToolExecutionOutcome,
+    owner: &harness_contract::projection::RuntimeActivityBinding,
+    attempt: u32,
+) -> RuntimeTransactionEventInput {
+    RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: format!(
+                "execution-agent-receipts:{}:{}:{attempt}",
+                owner.root_execution_id,
+                owner.node_id.as_deref().unwrap_or_default()
+            ),
+            scope: RuntimeEventScope::ExecutionNode,
+            kind: "execution.agent_tool.receipt".into(),
+            status: Some("completed".into()),
+            actor: Some("governed_tool".into()),
+            refs: root_effect_receipt_refs(request, owner, attempt),
+            payload: json!({
+                "idempotency_key":request.idempotency_key,
+                "sequence":0,"source_observation_wave_sequence":request.observation_wave_sequence,
+                "effect_kind":effect_kind,
+                "effect_scope":request.authorization.as_ref().map(|authorization| &authorization.scope),
+                "authorized_scopes":request.authorized_scopes,
+                "outcome":bounded_tool_effect_outcome(outcome),
+            }),
+        },
+        idempotency_key: Some(delegated_agent_receipt_key(request)),
+        schema_version: 2,
+    }
 }
 
 pub(super) fn delegated_agent_receipt_stream_id(
@@ -155,13 +422,7 @@ pub(super) fn delegated_agent_receipt_event(
     outcome: &crate::RuntimeToolExecutionOutcome,
 ) -> Option<RuntimeTransactionEventInput> {
     let stream_id = delegated_agent_receipt_stream_id(request)?;
-    let mut refs = tool_effect_refs(request);
-    if let Some(attempt) = request.parent_execution_attempt {
-        refs.push(RuntimeEventRef {
-            kind: "agent_attempt".to_string(),
-            id: attempt.to_string(),
-        });
-    }
+    let refs = tool_effect_refs(request);
     Some(RuntimeTransactionEventInput {
         event: RuntimeEventInput {
             stream_id,
@@ -172,7 +433,7 @@ pub(super) fn delegated_agent_receipt_event(
             refs,
             payload: json!({
                 "idempotency_key": request.idempotency_key,
-                "sequence": request.observation_wave_sequence,
+                "sequence": 0,"source_observation_wave_sequence": request.observation_wave_sequence,
                 "effect_kind": effect_kind,
                 "effect_scope": request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes": request.authorized_scopes,
@@ -180,7 +441,7 @@ pub(super) fn delegated_agent_receipt_event(
             }),
         },
         idempotency_key: Some(delegated_agent_receipt_key(request)),
-        schema_version: 1,
+        schema_version: 2,
     })
 }
 
@@ -416,18 +677,14 @@ pub(super) fn expected_domain_revision(
     if existing_event.transaction_id != transaction_id {
         return event_store.stream_revision(stream_id);
     }
-    let existing = event_store
-        .list_stream(stream_id)
-        .map_err(RuntimeEventStoreError::Corrupt)?;
-    existing
-        .iter()
-        .filter(|event| event.transaction_id == transaction_id)
-        .map(|event| event.sequence)
-        .min()
-        .map_or_else(
-            || event_store.stream_revision(stream_id),
-            |first_sequence| Ok(first_sequence.saturating_sub(1)),
-        )
+    event_store
+        .transaction_stream_revision_exact(transaction_id, stream_id)?
+        .map(|revision| revision.expected_revision)
+        .ok_or_else(|| {
+            RuntimeEventStoreError::Corrupt(
+                "committed event has no exact transaction stream fence".into(),
+            )
+        })
 }
 
 pub(super) fn node_stream_id(graph_id: &str, node_id: &str) -> String {

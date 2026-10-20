@@ -148,7 +148,10 @@ fn ast_language_extensions(language: &str) -> Vec<&'static str> {
     }
 }
 
-fn run_grep_search_language(lease: &ToolHostLease, input: GrepSearchLanguageInput) -> Result<String, String> {
+fn run_grep_search_language(
+    lease: &ToolHostLease,
+    input: GrepSearchLanguageInput,
+) -> Result<String, String> {
     if input.pattern.trim().is_empty() {
         return Err("ast_grep_search requires a non-empty pattern".to_string());
     }
@@ -496,7 +499,7 @@ fn run_write_file(lease: &ToolHostLease, input: WriteFileInput) -> Result<String
             .resolve(&input.path)
             .map_err(io_to_string)?,
     );
-    create_auto_checkpoint(lease, "edit")?;
+    create_auto_checkpoint(lease, "edit", &[input.path.clone()])?;
     let output = to_pretty_json(
         write_file(lease.path_policy(), &input.path, &input.content).map_err(io_to_string)?,
     );
@@ -514,7 +517,7 @@ fn run_edit_file(lease: &ToolHostLease, input: EditFileInput) -> Result<String, 
             .resolve(&input.path)
             .map_err(io_to_string)?,
     );
-    create_auto_checkpoint(lease, "edit")?;
+    create_auto_checkpoint(lease, "edit", &[input.path.clone()])?;
     let output = to_pretty_json(
         edit_file(
             lease.path_policy(),
@@ -544,7 +547,12 @@ fn run_apply_patch_transaction(
     lease: &ToolHostLease,
     input: MutationApplyInput,
 ) -> Result<String, String> {
-    create_auto_checkpoint(lease, "edit")?;
+    let checkpoint_paths = input
+        .edits
+        .iter()
+        .map(|edit| edit.path.clone())
+        .collect::<Vec<_>>();
+    create_auto_checkpoint(lease, "edit", &checkpoint_paths)?;
     let applied = apply_mutations(lease.path_policy(), input).map_err(io_to_string)?;
     for file in &applied.applied {
         lease.cache().invalidate_scope(&file_cache_scope(
@@ -565,15 +573,68 @@ fn run_checkpoint_create(
     to_pretty_json(checkpoint_create_in(lease.workspace_root(), input).map_err(io_to_string)?)
 }
 
-fn create_auto_checkpoint(lease: &ToolHostLease, tool_name: &str) -> Result<(), String> {
+fn create_auto_checkpoint(
+    lease: &ToolHostLease,
+    tool_name: &str,
+    paths: &[String],
+) -> Result<(), String> {
     if std::env::var("COWD_AUTO_CHECKPOINT").ok().as_deref() != Some("1") {
         return Ok(());
+    }
+    if paths.is_empty() {
+        return Err("automatic checkpoint requires at least one exact file target".into());
+    }
+    let mut targets = paths.to_vec();
+    targets.sort();
+    targets.dedup();
+    for target in &targets {
+        if target.trim() != target || target.is_empty() || target.contains('\\') {
+            return Err(
+                "automatic checkpoint requires canonical workspace-relative file targets".into(),
+            );
+        }
+        let mut relative = PathBuf::new();
+        for component in Path::new(target).components() {
+            match component {
+                std::path::Component::Normal(part) if part != ".cowd" => relative.push(part),
+                _ => {
+                    return Err(
+                        "automatic checkpoint target is not a bounded workspace file".into(),
+                    )
+                }
+            }
+        }
+        if relative.to_str() != Some(target.as_str()) {
+            return Err("automatic checkpoint target has a noncanonical spelling".into());
+        }
+        lease.path_policy().resolve(target).map_err(io_to_string)?;
+        let mut cursor = lease.workspace_root().to_path_buf();
+        for component in relative.components() {
+            cursor.push(component.as_os_str());
+            match std::fs::symlink_metadata(&cursor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err("automatic checkpoint target crosses a symlink".into());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(io_to_string(error)),
+            }
+        }
+        match std::fs::symlink_metadata(lease.workspace_root().join(&relative)) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err("automatic checkpoint target must be a regular file".into());
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(io_to_string(error))
+            }
+            _ => {}
+        }
     }
     checkpoint_create_in(
         lease.workspace_root(),
         CheckpointCreateInput {
             label: Some(format!("auto-before-{tool_name}")),
-            paths: Vec::new(),
+            paths: targets,
         },
     )
     .map(|_| ())
@@ -582,6 +643,563 @@ fn create_auto_checkpoint(lease: &ToolHostLease, tool_name: &str) -> Result<(), 
 
 fn run_checkpoint_list(lease: &ToolHostLease) -> Result<String, String> {
     to_pretty_json(checkpoint_list_in(lease.workspace_root()).map_err(io_to_string)?)
+}
+
+#[cfg(test)]
+mod auto_checkpoint_contract_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    struct StdOwnedWorkspace {
+        path: PathBuf,
+    }
+
+    impl StdOwnedWorkspace {
+        fn new() -> std::io::Result<Self> {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)?
+                .as_nanos();
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cowd-executor-auto-contract-{}-{timestamp}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for StdOwnedWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct CheckpointEnvironment(Option<std::ffi::OsString>);
+
+    impl Drop for CheckpointEnvironment {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("COWD_AUTO_CHECKPOINT", value),
+                None => std::env::remove_var("COWD_AUTO_CHECKPOINT"),
+            }
+        }
+    }
+
+    fn checkpoint_ids(root: &Path) -> BTreeSet<String> {
+        checkpoint_list_in(root)
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .map(|checkpoint| checkpoint.id)
+            .collect()
+    }
+
+    fn new_checkpoint(
+        root: &Path,
+        before: &BTreeSet<String>,
+        targets: &[&str],
+    ) -> CheckpointSummaryForTest {
+        let added = checkpoint_ids(root)
+            .difference(before)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(added.len(), 1);
+        let directory = root.join(".cowd/checkpoints").join(&added[0]);
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(directory.join(".manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["scopes"], json!(targets));
+        assert!(!directory.join("sentinel.env").exists());
+        assert!(!directory.join("src/unrelated.txt").exists());
+        CheckpointSummaryForTest {
+            id: added[0].clone(),
+            directory,
+        }
+    }
+
+    struct CheckpointSummaryForTest {
+        id: String,
+        directory: PathBuf,
+    }
+
+    #[test]
+    fn r1_auto_checkpoint_exact_targets_preserve_restore_and_unknown_boundaries() {
+        const CHILD_ENV: &str = "COWD_R1_AUTO_CHECKPOINT_CONTRACT_CHILD";
+        const CHILD_VALUE: &str = "exact-matrix-v1";
+        const COMPLETION: &str = "COWD_R1_AUTO_CHECKPOINT_CONTRACT_MATRIX_COMPLETE";
+        if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(CHILD_VALUE)) {
+            let test_name = "executor::auto_checkpoint_contract_tests::r1_auto_checkpoint_exact_targets_preserve_restore_and_unknown_boundaries";
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                .env(CHILD_ENV, CHILD_VALUE)
+                .output()
+                .expect("spawn isolated checkpoint contract");
+            {
+                use std::io::Write;
+                let mut stderr = std::io::stderr().lock();
+                let stdout_result = stderr.write_all(&output.stdout);
+                let stderr_result = stderr.write_all(&output.stderr);
+                if stdout_result.is_err() || stderr_result.is_err() {
+                    eprintln!("child diagnostic write failed: stdout={stdout_result:?}, stderr={stderr_result:?}");
+                }
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success()
+                    && stdout.lines().any(|line| line == "running 1 test")
+                    && stdout
+                        .lines()
+                        .any(|line| line.starts_with(&format!("test {test_name} ...")))
+                    && stdout.lines().any(|line| line.trim() == COMPLETION)
+                    && stdout.lines().any(|line| {
+                        line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                    }),
+                "isolated checkpoint contract failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            return;
+        }
+
+        let _lock = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _environment = CheckpointEnvironment(std::env::var_os("COWD_AUTO_CHECKPOINT"));
+        std::env::set_var("COWD_AUTO_CHECKPOINT", "1");
+        let workspace = StdOwnedWorkspace::new().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a"), "alpha\n").unwrap();
+        std::fs::write(root.join("src/b"), "bravo\n").unwrap();
+        std::fs::write(root.join("src/unrelated.txt"), "unrelated\n").unwrap();
+        std::fs::write(root.join("sentinel.env"), "fixture-secret-not-to-be-read\n").unwrap();
+        let lease = crate::ToolHost::builtin("scoped-auto-contract", root).pin_snapshot();
+
+        let purpose_input = json!({"action":"write","path":"src/a","content":"off\n"});
+        let checkpoint_on_resolution = lease.describe_effect_resolution("edit", &purpose_input);
+        assert!(checkpoint_on_resolution
+            .scope_purposes
+            .iter()
+            .any(|entry| entry.purpose
+                == harness_contract::goal::ProofEffectPurpose::AutoCheckpointMaintenance));
+
+        for corruption in ["missing", "json", "directory", "scopes", "unknown"] {
+            let before = checkpoint_ids(root);
+            execute_with_lease(
+                &lease,
+                "edit",
+                &json!({"action":"write","path":"src/a","content":"fault current\n"}),
+            )
+            .unwrap();
+            let checkpoint = new_checkpoint(root, &before, &["src/a"]);
+            let path = checkpoint.directory.join(".manifest.json");
+            let valid = std::fs::read(&path).unwrap();
+            let mut value: Value = serde_json::from_slice(&valid).unwrap();
+            match corruption {
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                "json" => std::fs::write(&path, "{").unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+                "scopes" => {
+                    value.as_object_mut().unwrap().remove("scopes");
+                    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "unknown" => {
+                    value["unknown"] = json!(true);
+                    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            lease.cache().put(
+                lease.workspace_id(),
+                "file:src/a",
+                "read_file",
+                "fault-cache",
+                lease.schema_revision(),
+                "preserve cached read",
+            );
+            let epoch = lease.cache().epoch_token("file:src/a");
+            let backups = root.join(".cowd/restore-backups");
+            let before_backups = if backups.exists() {
+                std::fs::read_dir(&backups)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<BTreeSet<_>>()
+            } else {
+                BTreeSet::new()
+            };
+            for action in ["diff", "restore"] {
+                let error = execute_with_lease(
+                    &lease,
+                    "checkpoint",
+                    &json!({"action":action,"id":checkpoint.id}),
+                )
+                .unwrap_err();
+                assert!(!error.is_empty(), "{corruption}/{action}");
+                match corruption {
+                    "directory" => assert!(error.to_lowercase().contains("directory"), "{error}"),
+                    "missing" => assert!(
+                        error.contains("No such file") || error.contains("not found"),
+                        "{error}"
+                    ),
+                    "scopes" => assert!(
+                        error.contains("missing field") && error.contains("scopes"),
+                        "{error}"
+                    ),
+                    "unknown" => assert!(error.contains("unknown field"), "{error}"),
+                    "json" => assert!(
+                        error.contains("EOF") || error.contains("expected"),
+                        "{error}"
+                    ),
+                    _ => unreachable!(),
+                }
+                assert_eq!(lease.cache().epoch_token("file:src/a"), epoch);
+                assert_eq!(
+                    lease
+                        .cache()
+                        .get(
+                            lease.workspace_id(),
+                            "file:src/a",
+                            "read_file",
+                            "fault-cache",
+                            lease.schema_revision()
+                        )
+                        .as_deref(),
+                    Some("preserve cached read")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("src/a")).unwrap(),
+                    "fault current\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("src/unrelated.txt")).unwrap(),
+                    "unrelated\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("sentinel.env")).unwrap(),
+                    "fixture-secret-not-to-be-read\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(checkpoint.directory.join("src/a")).unwrap(),
+                    "alpha\n"
+                );
+                let after_backups = if backups.exists() {
+                    std::fs::read_dir(&backups)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<BTreeSet<_>>()
+                } else {
+                    BTreeSet::new()
+                };
+                assert_eq!(before_backups, after_backups);
+            }
+            if corruption == "directory" {
+                std::fs::remove_dir(&path).unwrap();
+            }
+            std::fs::write(&path, valid).unwrap();
+            execute_with_lease(
+                &lease,
+                "checkpoint",
+                &json!({"action":"restore","id":checkpoint.id}),
+            )
+            .unwrap();
+            assert_ne!(lease.cache().epoch_token("file:src/a"), epoch);
+            assert_eq!(
+                std::fs::read_to_string(root.join("src/a")).unwrap(),
+                "alpha\n"
+            );
+        }
+        let before = checkpoint_ids(root);
+        execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"write","path":"src/a","content":"changed\n"}),
+        )
+        .unwrap();
+        let checkpoint = new_checkpoint(root, &before, &["src/a"]);
+        assert_eq!(
+            std::fs::read_to_string(checkpoint.directory.join("src/a")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a")).unwrap(),
+            "changed\n"
+        );
+        checkpoint_restore_in(root, CheckpointRestoreInput { id: checkpoint.id }).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a")).unwrap(),
+            "alpha\n"
+        );
+
+        let before = checkpoint_ids(root);
+        execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"replace","path":"src/a","old_string":"alpha","new_string":"omega"}),
+        )
+        .unwrap();
+        let checkpoint = new_checkpoint(root, &before, &["src/a"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a")).unwrap(),
+            "omega\n"
+        );
+        checkpoint_restore_in(root, CheckpointRestoreInput { id: checkpoint.id }).unwrap();
+
+        let before = checkpoint_ids(root);
+        execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"patch","edits":[
+                {"path":"src/b","old_string":"bravo","new_string":"second"},
+                {"path":"src/a","old_string":"alpha","new_string":"first"}
+            ]}),
+        )
+        .unwrap();
+        let checkpoint = new_checkpoint(root, &before, &["src/a", "src/b"]);
+        assert_eq!(
+            std::fs::read_to_string(checkpoint.directory.join("src/a")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkpoint.directory.join("src/b")).unwrap(),
+            "bravo\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/b")).unwrap(),
+            "second\n"
+        );
+        checkpoint_restore_in(root, CheckpointRestoreInput { id: checkpoint.id }).unwrap();
+
+        let before = checkpoint_ids(root);
+        execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"write","path":"src/new","content":"new\n"}),
+        )
+        .unwrap();
+        let checkpoint = new_checkpoint(root, &before, &["src/new"]);
+        assert!(!checkpoint.directory.join("src/new").exists());
+        checkpoint_restore_in(root, CheckpointRestoreInput { id: checkpoint.id }).unwrap();
+        assert!(!root.join("src/new").exists());
+
+        for target in [
+            "",
+            " ",
+            ".",
+            "./src/a",
+            "src//a",
+            "src/../src/a",
+            "../escape",
+            " src/a ",
+            "src\\a",
+            ".cowd/checkpoints/escape",
+            "src",
+        ] {
+            let before = checkpoint_ids(root);
+            assert!(
+                execute_with_lease(
+                    &lease,
+                    "edit",
+                    &json!({"action":"write","path":target,"content":"forbidden"})
+                )
+                .is_err(),
+                "{target}"
+            );
+            assert_eq!(checkpoint_ids(root), before, "{target}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("src/a")).unwrap(),
+                "alpha\n"
+            );
+        }
+        let before = checkpoint_ids(root);
+        assert!(execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"write","path":root.join("src/a"),"content":"absolute"})
+        )
+        .is_err());
+        assert!(execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"write","content":"missing target"})
+        )
+        .is_err());
+        assert!(execute_with_lease(&lease, "edit", &json!({"action":"patch","edits":[]})).is_err());
+        assert!(execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"patch","edits":[
+                {"path":"src/a","old_string":"alpha","new_string":"forbidden"},
+                {"path":"../escape","old_string":"outside","new_string":"forbidden"}
+            ]})
+        )
+        .is_err());
+        assert_eq!(checkpoint_ids(root), before);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/b")).unwrap(),
+            "bravo\n"
+        );
+
+        let before = checkpoint_ids(root);
+        assert!(execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"patch","edits":[
+            {"path":"src/a","old_string":"alpha","new_string":"forbidden"},
+            {"path":"src/b","old_string":"bravo","new_string":"forbidden"}
+        ],"expected_hashes":{"src/b":"sha256:deliberately-stale"}})
+        )
+        .is_err());
+        new_checkpoint(root, &before, &["src/a", "src/b"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/b")).unwrap(),
+            "bravo\n"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = StdOwnedWorkspace::new().unwrap();
+            std::fs::write(outside.path().join("a"), "outside\n").unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.join("outside-link")).unwrap();
+            std::os::unix::fs::symlink(root.join("src/a"), root.join("inside-link")).unwrap();
+            std::os::unix::fs::symlink(root.join("src"), root.join("inside-directory-link"))
+                .unwrap();
+            for target in ["outside-link/a", "inside-link", "inside-directory-link/a"] {
+                let before = checkpoint_ids(root);
+                assert!(execute_with_lease(
+                    &lease,
+                    "edit",
+                    &json!({"action":"write","path":target,"content":"forbidden"})
+                )
+                .is_err());
+                assert_eq!(checkpoint_ids(root), before);
+            }
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("a")).unwrap(),
+                "outside\n"
+            );
+            for target in ["outside-link", "inside-link", "inside-directory-link"] {
+                std::fs::remove_file(root.join(target)).unwrap();
+            }
+        }
+
+        let failed_workspace = StdOwnedWorkspace::new().unwrap();
+        std::fs::write(failed_workspace.path().join("a"), "preimage").unwrap();
+        std::fs::create_dir(failed_workspace.path().join(".cowd")).unwrap();
+        std::fs::write(
+            failed_workspace.path().join(".cowd/checkpoints"),
+            "storage blocker",
+        )
+        .unwrap();
+        let failed_lease =
+            crate::ToolHost::builtin("auto-storage-failure", failed_workspace.path())
+                .pin_snapshot();
+        assert!(execute_with_lease(
+            &failed_lease,
+            "edit",
+            &json!({"action":"write","path":"a","content":"must not write"})
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read_to_string(failed_workspace.path().join("a")).unwrap(),
+            "preimage"
+        );
+
+        let failed_input = json!({"action":"write","path":"a","content":"must not write"});
+        let failed_resolution = failed_lease.describe_effect_resolution("edit", &failed_input);
+        assert!(failed_resolution
+            .scope_purposes
+            .iter()
+            .any(|entry| entry.purpose
+                == harness_contract::goal::ProofEffectPurpose::AutoCheckpointMaintenance));
+        std::fs::remove_file(failed_workspace.path().join(".cowd/checkpoints")).unwrap();
+        let before_retry = checkpoint_ids(failed_workspace.path());
+        execute_with_lease(&failed_lease, "edit", &failed_input).unwrap();
+        let recovered_checkpoint = new_checkpoint(failed_workspace.path(), &before_retry, &["a"]);
+        assert_eq!(
+            std::fs::read_to_string(failed_workspace.path().join("a")).unwrap(),
+            "must not write"
+        );
+        checkpoint_restore_in(
+            failed_workspace.path(),
+            CheckpointRestoreInput {
+                id: recovered_checkpoint.id,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(failed_workspace.path().join("a")).unwrap(),
+            "preimage"
+        );
+        assert_eq!(
+            failed_resolution,
+            failed_lease.describe_effect_resolution("edit", &failed_input)
+        );
+
+        std::env::remove_var("COWD_AUTO_CHECKPOINT");
+        let before = checkpoint_ids(root);
+        assert_eq!(
+            checkpoint_on_resolution,
+            lease.describe_effect_resolution("edit", &purpose_input)
+        );
+        execute_with_lease(
+            &lease,
+            "edit",
+            &json!({"action":"write","path":"src/a","content":"off\n"}),
+        )
+        .unwrap();
+        assert_eq!(checkpoint_ids(root), before);
+        let explicit_resolution = lease.describe_effect_resolution(
+            "checkpoint",
+            &json!({"action":"create","paths":["src/a"]}),
+        );
+        assert!(!explicit_resolution
+            .scope_purposes
+            .iter()
+            .any(|entry| entry.purpose
+                == harness_contract::goal::ProofEffectPurpose::AutoCheckpointMaintenance));
+        let explicit = checkpoint_create_in(
+            root,
+            CheckpointCreateInput {
+                label: Some("explicit-full".into()),
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(Path::new(&explicit.path)
+            .join("src/unrelated.txt")
+            .is_file());
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/unrelated.txt")).unwrap(),
+            "unrelated\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("sentinel.env")).unwrap(),
+            "fixture-secret-not-to-be-read\n"
+        );
+        println!("\n{COMPLETION}");
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -658,7 +1276,10 @@ fn run_glob_search_many(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search_batch(lease: &ToolHostLease, input: GrepSearchBatchInput) -> Result<String, String> {
+fn run_grep_search_batch(
+    lease: &ToolHostLease,
+    input: GrepSearchBatchInput,
+) -> Result<String, String> {
     require_batch_bound("grep_search", input.searches.len())?;
     let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
         let output = run_grep_search(lease, item)?;
@@ -711,7 +1332,11 @@ pub(super) fn file_fingerprint(resolved: &Path, exact: bool) -> String {
     if exact {
         return head + &format!(":{}", full_content_hash(resolved));
     }
-    format!("{}:{}", head, bounded_content_hash(resolved, metadata.len()))
+    format!(
+        "{}:{}",
+        head,
+        bounded_content_hash(resolved, metadata.len())
+    )
 }
 
 pub(super) const FINGERPRINT_EDGE_BYTES: usize = 8 * 1024;
@@ -780,9 +1405,7 @@ pub(crate) fn is_allowed_orchestration_tool(name: &str) -> bool {
     if name == "tool_orchestrate" {
         return false;
     }
-    crate::mvp_tool_specs()
-        .iter()
-        .any(|spec| spec.name == name)
+    crate::mvp_tool_specs().iter().any(|spec| spec.name == name)
 }
 
 #[derive(Debug, Serialize)]
@@ -927,8 +1550,8 @@ fn runtime_parallelism_ceiling() -> usize {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
-    to_pretty_json(execute_web_fetch(&input)?)
+fn run_web_fetch(lease: &ToolHostLease, input: WebFetchInput) -> Result<String, String> {
+    to_pretty_json(execute_web_fetch(lease, &input)?)
 }
 
 fn run_skill_install_plan(
@@ -1216,7 +1839,7 @@ struct GrepSearchBatchInput {
     max_concurrency: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct WebFetchInput {
     url: String,
     prompt: String,
@@ -1538,7 +2161,8 @@ struct StructuredOutputResult {
     structured_output: BTreeMap<String, Value>,
 }
 
-fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
+fn execute_web_fetch(lease: &ToolHostLease, input: &WebFetchInput) -> Result<WebFetchOutput, String> {
+    let operation = lease.begin_local_network_operation(&serde_json::to_value(input).map_err(|error| error.to_string())?, &input.url)?;
     let started = Instant::now();
     let policy = crate::network_policy::NetworkDomainPolicy::from_env();
     let policy_receipt = policy.merge_call_filters(
@@ -1546,6 +2170,9 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
         input.blocked_domains.as_deref(),
     );
     if policy_receipt.denied || policy_receipt.requires_approval {
+        lease.finish_local_network_operation(operation, harness_contract::context::LocalNetworkTerminal::NotStarted {
+            reason_code: "network_policy_before_send".into(),
+        })?;
         return Ok(WebFetchOutput {
             bytes: 0,
             code: 0,
@@ -1561,10 +2188,14 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
             url: input.url.clone(),
         });
     }
-    let client = build_http_client()?;
     let request_url = normalize_fetch_url(&input.url)?;
-    let url_receipt = policy.enforce_url(&request_url)?;
+    let url_receipt = policy.enforce_url_with_filters(
+        &request_url, input.allowed_domains.as_deref(), input.blocked_domains.as_deref(),
+    )?;
     if url_receipt.denied || url_receipt.requires_approval {
+        lease.finish_local_network_operation(operation, harness_contract::context::LocalNetworkTerminal::NotStarted {
+            reason_code: "network_url_policy_before_send".into(),
+        })?;
         return Ok(WebFetchOutput {
             bytes: 0,
             code: 0,
@@ -1580,6 +2211,7 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
             url: input.url.clone(),
         });
     }
+    let client = build_http_client(&policy, input.allowed_domains.clone(), input.blocked_domains.clone())?;
     let response = client
         .get(request_url.clone())
         .send()
@@ -1589,7 +2221,9 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let final_url = response.url().to_string();
     let code = status.as_u16();
     let code_text = status.canonical_reason().unwrap_or("Unknown").to_string();
-    if let Ok(final_receipt) = policy.enforce_url(&final_url) {
+    if let Ok(final_receipt) = policy.enforce_url_with_filters(
+        &final_url, input.allowed_domains.as_deref(), input.blocked_domains.as_deref(),
+    ) {
         if final_receipt.denied || final_receipt.requires_approval {
             return Ok(WebFetchOutput {
                 bytes: 0,
@@ -1609,7 +2243,16 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
         .unwrap_or_default()
         .to_string();
     let body = response.text().map_err(|error| error.to_string())?;
+    drop(client);
     let bytes = body.len();
+    {
+        use sha2::{Digest, Sha256};
+        lease.finish_local_network_operation(operation, harness_contract::context::LocalNetworkTerminal::BodyDone {
+            status: code,
+            body_bytes: bytes as u64,
+            body_sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+        })?;
+    }
     let normalized = normalize_fetched_content(&body, &content_type);
     let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
 
@@ -1624,10 +2267,78 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     })
 }
 
-fn build_http_client() -> Result<Client, String> {
+#[cfg(test)]
+mod effective_fetch_redirect_tests {
+    use super::*;
+
+    struct PrivateNetworkEnv(Option<std::ffi::OsString>);
+
+    impl Drop for PrivateNetworkEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", value),
+                None => std::env::remove_var("COWD_ALLOW_PRIVATE_NETWORK"),
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_filter_refuses_target_before_connecting() {
+        use std::io::{Read, Write};
+        let _lock = crate::test_process_environment_lock().lock().unwrap();
+        let _environment = PrivateNetworkEnv(std::env::var_os("COWD_ALLOW_PRIVATE_NETWORK"));
+        std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", "1");
+        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        origin.set_nonblocking(true).unwrap();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let origin_url = format!("http://{}/redirect", origin.local_addr().unwrap());
+        let target_url = format!("http://localhost:{}/blocked", target.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match origin.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "origin was never contacted");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("origin accept failed: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).unwrap() > 0);
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let client = build_http_client(
+            &crate::network_policy::NetworkDomainPolicy::default(), None, Some(vec!["localhost".into()]),
+        ).unwrap();
+        let result = client.get(origin_url).send();
+        server.join().unwrap();
+        let error = result.expect_err("blocked redirect must not be followed");
+        assert!(error.is_redirect(), "{error}");
+        assert!(matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+}
+
+fn build_http_client(
+    policy: &crate::network_policy::NetworkDomainPolicy,
+    allowed: Option<Vec<String>>,
+    blocked: Option<Vec<String>>,
+) -> Result<Client, String> {
+    let policy = policy.clone();
     Client::builder()
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > 10 {
+                return attempt.error("too many redirects");
+            }
+            match policy.enforce_url_with_filters(attempt.url().as_str(), allowed.as_deref(), blocked.as_deref()) {
+                Ok(receipt) if !receipt.denied && !receipt.requires_approval => attempt.follow(),
+                _ => attempt.error("redirect target refused by effective network policy"),
+            }
+        }))
         .user_agent(
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/131.0 Safari/537.36 Cowd/0.9",

@@ -4,8 +4,8 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -16,10 +16,10 @@ use tokio::sync::RwLock;
 mod context_plane;
 #[path = "evidence_terminal_plane.rs"]
 mod evidence_terminal_plane;
-#[path = "provider_plane.rs"]
-mod provider_plane;
 #[path = "frame_refusal.rs"]
 pub(crate) mod frame_refusal;
+#[path = "provider_plane.rs"]
+mod provider_plane;
 use provider_plane::TurnProviderState;
 #[path = "tool_plane.rs"]
 mod tool_plane;
@@ -76,8 +76,8 @@ use harness_contract::{
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{
-        ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
-        StrategyExperienceSummary, StrategyInput, StrategyWorkloadFingerprint, understand,
+        understand, ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
+        StrategyExperienceSummary, StrategyInput, StrategyWorkloadFingerprint,
     },
     turn::{
         SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId,
@@ -100,8 +100,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::budget_policy::{
-    ProviderOutputBudget, ProviderOutputBudgetInputs, RuntimeBudgetInputs, RuntimeBudgetPlan,
-    clamp_context_budget_ratio_bp,
+    clamp_context_budget_ratio_bp, ProviderOutputBudget, ProviderOutputBudgetInputs,
+    RuntimeBudgetInputs, RuntimeBudgetPlan,
 };
 
 const fn provider_retry_is_fenced(
@@ -518,17 +518,16 @@ impl ProviderTokenReservationSet {
         Ok(())
     }
 }
-use crate::PromptAssembly;
 use crate::compact::{
-    CompactionConfig, apply_compaction_summary, estimate_session_tokens, plan_session_compaction,
+    apply_compaction_summary, estimate_session_tokens, plan_session_compaction, CompactionConfig,
 };
 use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSessionCompactConfig};
 use crate::context_runtime::{
-    CONTEXT_RENDER_FORMATTER_VERSION, ContextAuthority, ContextEnvelope, ContextEnvelopeRequest,
-    ContextIdentity, ContextItem, ContextOmission, ContextProfile, ContextRole,
-    ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
-    PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION, PersistedContextEnvelope, ResumeContextPacket,
-    RuntimeContextFactDecision, RuntimeContextGovernanceReport, ToolTracePacket, ToolTraceStatus,
+    ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
+    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextVisibility, PersistedContextEnvelope, ResumeContextPacket, RuntimeContextFactDecision,
+    RuntimeContextGovernanceReport, ToolTracePacket, ToolTraceStatus,
+    CONTEXT_RENDER_FORMATTER_VERSION, PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION,
 };
 use crate::context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 use crate::fact_extraction::{
@@ -550,13 +549,14 @@ use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::skill::{
-    RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
+    RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
 };
 use crate::tool_invocation::{
-    DEFAULT_OUTPUT_REF_MIN_LINES, ToolFailureKind, ToolInvocationRecord, now_ms,
+    now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
 use crate::usage::UsageTracker;
+use crate::PromptAssembly;
 use crate::{
     HistoryView, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
 };
@@ -2283,43 +2283,12 @@ mod tool_exposure_contract_tests {
             ToolPermissionMode::WorkspaceWrite,
         ] {
             let tools = bootstrap_tool_ids(ceiling);
-            assert!(
-                harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
-                    .iter()
-                    .all(|required| tools.iter().any(|tool| tool == required))
-            );
+            assert!(harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                .iter()
+                .all(|required| tools.iter().any(|tool| tool == required)));
             assert!(tools.iter().any(|tool| tool == "runtime_capabilities"));
             assert!(tools.iter().any(|tool| tool == "context_retrieve"));
         }
-    }
-}
-
-fn fallback_tool_discovery_receipt(
-    mut available_ids: Vec<String>,
-) -> harness_contract::tool::ToolDiscoveryReceipt {
-    use harness_contract::tool::{
-        ToolDescriptorHealth, ToolDescriptorRef, ToolDiscoveryReceipt, ToolPermissionMode,
-    };
-
-    available_ids.sort();
-    available_ids.dedup();
-    let descriptors = available_ids
-        .iter()
-        .map(|id| ToolDescriptorRef {
-            canonical_id: id.clone(),
-            display_name: id.clone(),
-            source: "executor-fallback".to_string(),
-            schema_hash: format!("fallback:{id}"),
-            required_permission: ToolPermissionMode::ReadOnly,
-            permission_source: "executor-fallback".to_string(),
-            health: ToolDescriptorHealth::Healthy,
-        })
-        .collect();
-    ToolDiscoveryReceipt {
-        query: "catalog-fallback".to_string(),
-        catalog_revision: 0,
-        descriptors,
-        activation_candidates: available_ids,
     }
 }
 
@@ -2572,6 +2541,37 @@ struct GeneratedModelReceipt {
     receipt_tokens: u64,
     omitted_tokens: u64,
     complete: bool,
+    presentation_bytes: u64,
+    source: Option<NativeToolSource>,
+    read_body: Option<crate::context_evidence::ReadBodySeal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeToolSource {
+    call: ModelToolCall,
+    execution: crate::CowdExecutionContext,
+    activity_owner: Option<harness_contract::projection::RuntimeActivityBinding>,
+    tool_owner: Option<harness_contract::projection::RuntimeActivityBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeReadAcquisition {
+    seal: crate::context_evidence::ReadAcquisitionSeal,
+    event_id: String,
+    cursor: u64,
+    index_event_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct NativeWireReceipt {
+    context: crate::ProviderRequestEvidenceContext,
+    request_id: String,
+    step_render: Option<harness_contract::step::StepRenderRef>,
+    wire_sha256: String,
+    wire_artifact: harness_contract::context::ArtifactRef,
+    packed_sequence: usize,
+    outcome_sequence: Option<usize>,
+    results: Vec<crate::context_evidence::WireToolResultSeal>,
 }
 
 /// Object-safe asynchronous contract for model-requested Tool execution.
@@ -2582,8 +2582,59 @@ struct GeneratedModelReceipt {
 /// threads.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync + 'static {
+    fn bounded_process_authority(
+        &self,
+        _request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<crate::tool_host::BoundedProcessAuthority, ToolError> {
+        Err(ToolError::new(
+            "bounded process live authority is unsupported by this executor",
+        ))
+    }
+    fn bounded_process_lease(
+        &self,
+        _request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<tools::ToolHostLease, ToolError> {
+        Err(ToolError::new(
+            "bounded process execution is unsupported by this executor",
+        ))
+    }
+
+    fn bounded_process_plane(&self) -> Option<Arc<crate::ToolExecutionPlane>> {
+        None
+    }
+
     fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
         None
+    }
+
+    fn prepare_step_catalog(
+        &self,
+        _ceiling: harness_contract::tool::ToolPermissionMode,
+    ) -> Result<Option<tools::ToolHostLease>, ToolError> {
+        Ok(self.pin_step_catalog())
+    }
+
+    fn tool_discovery_receipt_for_step(
+        &self,
+        lease: &tools::ToolHostLease,
+        ceiling: harness_contract::tool::ToolPermissionMode,
+    ) -> harness_contract::tool::ToolDiscoveryReceipt {
+        let available = self
+            .available_tool_names()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut receipt = lease.catalog_receipt();
+        receipt.descriptors.retain(|descriptor| {
+            available.contains(&descriptor.canonical_id)
+                && ceiling.permits(descriptor.required_permission)
+        });
+        receipt.activation_candidates.retain(|name| {
+            receipt
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.canonical_id == *name)
+        });
+        receipt
     }
 
     async fn recover_step_tool_receipt(
@@ -2729,6 +2780,15 @@ pub trait ToolExecutor: Send + Sync + 'static {
         Vec::new()
     }
 
+    fn durable_tool_effect_parent(
+        &self,
+    ) -> Option<(
+        harness_contract::execution_graph::ExecutionParentBinding,
+        u32,
+    )> {
+        None
+    }
+
     /// Whether this executor is the sole durable intent/receipt owner for the
     /// concrete tool. The conversation plane owns effects by default. A
     /// scoped delegated executor may override this when it must normalize the
@@ -2780,11 +2840,19 @@ pub trait ToolExecutor: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// Production executors override this with a receipt from their pinned
-    /// ToolHost. The fallback is deliberately read-only for small embedded and
-    /// test executors that do not own a catalog.
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
-        fallback_tool_discovery_receipt(self.available_tool_names())
+        match self.pin_step_catalog() {
+            Some(lease) => self.tool_discovery_receipt_for_step(
+                &lease,
+                harness_contract::tool::ToolPermissionMode::DangerFullAccess,
+            ),
+            None => harness_contract::tool::ToolDiscoveryReceipt {
+                query: "catalog-unavailable".into(),
+                catalog_revision: 0,
+                descriptors: Vec::new(),
+                activation_candidates: Vec::new(),
+            },
+        }
     }
 
     fn registered_tool_effect(
@@ -2975,6 +3043,7 @@ pub trait MemoryCallback: Send + Sync {
 pub struct ToolError {
     message: String,
     failure: Option<harness_contract::tool::ToolExecutionFailure>,
+    pre_effect_refusal: Option<crate::execution_core::graph::PreEffectRefusal>,
 }
 
 impl ToolError {
@@ -2983,6 +3052,7 @@ impl ToolError {
         Self {
             message: message.into(),
             failure: None,
+            pre_effect_refusal: None,
         }
     }
 
@@ -2991,12 +3061,34 @@ impl ToolError {
         Self {
             message: failure.message.clone(),
             failure: Some(failure),
+            pre_effect_refusal: None,
         }
     }
 
     #[must_use]
     pub fn failure(&self) -> Option<&harness_contract::tool::ToolExecutionFailure> {
         self.failure.as_ref()
+    }
+
+    pub(crate) fn from_pre_effect_refusal(
+        refusal: crate::execution_core::graph::PreEffectRefusal,
+        message: String,
+    ) -> Self {
+        let mut error = Self::new(message);
+        error.pre_effect_refusal = Some(refusal);
+        error
+    }
+
+    pub(crate) fn pre_effect_refusal_for(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        input: &str,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
+    ) -> Option<&str> {
+        self.pre_effect_refusal
+            .as_ref()?
+            .reason_for(call_id, tool_name, input, binding?)
     }
 
     #[must_use]
@@ -3059,7 +3151,9 @@ impl RuntimeError {
     }
 
     #[must_use]
-    pub const fn context_capacity_failure(&self) -> Option<crate::context_ledger::ContextCapacityFailure> {
+    pub const fn context_capacity_failure(
+        &self,
+    ) -> Option<crate::context_ledger::ContextCapacityFailure> {
         self.context_capacity_failure
     }
 
@@ -3372,6 +3466,7 @@ pub struct ModelStepResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolBatchStepResult {
+    pub(crate) refused_before_dispatch: Vec<(String, String)>,
     pub messages: Vec<ConversationMessage>,
     pub failed: usize,
     pub max_concurrency_observed: usize,
@@ -3603,6 +3698,7 @@ struct SessionProviderWireEvidenceWriter {
     artifacts: Arc<crate::ArtifactStore>,
     session_port: Arc<dyn crate::SessionRuntimeJournalPort>,
     cache_dimensions: Arc<std::sync::Mutex<TurnCacheDimensionsObservation>>,
+    native_wire_receipts: Arc<std::sync::Mutex<Vec<NativeWireReceipt>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3859,6 +3955,7 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         context: &crate::ProviderRequestEvidenceContext,
         evidence: crate::ProviderWireEvidence,
     ) -> Result<(), RuntimeError> {
+        let result_seals = crate::context_evidence::wire_tool_result_seals(&evidence.wire_request);
         let epoch = ProviderAttemptEpoch::new(&context.execution_id, &context.turn_id);
         let request_id = evidence.request_context.request_id.clone();
         let payload = serde_json::to_vec(&serde_json::json!({
@@ -3940,23 +4037,26 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
             id: artifact.selector.clone(),
             label: Some("exact provider wire request".to_string()),
         });
-        if let Err(error) = self.session_port.append_event(&event).await {
-            if let Err(cleanup_error) = self.artifacts.unpin(&artifact, &staging_owner) {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    artifact = %artifact.selector,
-                    "provider evidence staging pin cleanup failed"
-                );
+        let packed_receipt = match self.session_port.append_event(&event).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Err(cleanup_error) = self.artifacts.unpin(&artifact, &staging_owner) {
+                    tracing::warn!(
+                        error = %cleanup_error,
+                        artifact = %artifact.selector,
+                        "provider evidence staging pin cleanup failed"
+                    );
+                }
+                if let Err(cleanup_error) = self.artifacts.delete(&artifact, &visibility_scope) {
+                    tracing::warn!(
+                        error = %cleanup_error,
+                        artifact = %artifact.selector,
+                        "unreferenced provider evidence artifact cleanup failed"
+                    );
+                }
+                return Err(RuntimeError::new(error.to_string()));
             }
-            if let Err(cleanup_error) = self.artifacts.delete(&artifact, &visibility_scope) {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    artifact = %artifact.selector,
-                    "unreferenced provider evidence artifact cleanup failed"
-                );
-            }
-            return Err(RuntimeError::new(error.to_string()));
-        }
+        };
         self.cache_dimensions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3984,6 +4084,30 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
                 artifact = %artifact.selector,
                 "provider evidence retained an extra staging pin"
             );
+        }
+        if let Some(results) = result_seals {
+            let mut receipts = self
+                .native_wire_receipts
+                .lock()
+                .map_err(|_| RuntimeError::new("native wire receipt projection poisoned"))?;
+            if receipts
+                .iter()
+                .any(|receipt| receipt.request_id == evidence.request_context.request_id)
+            {
+                return Err(RuntimeError::new(
+                    "duplicate physical native provider request",
+                ));
+            }
+            receipts.push(NativeWireReceipt {
+                context: context.clone(),
+                request_id: evidence.request_context.request_id.clone(),
+                step_render: evidence.step_render.clone(),
+                wire_sha256: evidence.wire_request.body_sha256.clone(),
+                wire_artifact: artifact,
+                packed_sequence: packed_receipt.sequence,
+                outcome_sequence: None,
+                results,
+            });
         }
         Ok(())
     }
@@ -4033,10 +4157,20 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         } else {
             "usage_unknown"
         });
-        self.session_port
+        let outcome_receipt = self
+            .session_port
             .append_event(&event)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Ok(mut receipts) = self.native_wire_receipts.lock() {
+            if let Some(receipt) = receipts.iter_mut().find(|receipt| {
+                receipt.context == *context && receipt.request_id == outcome.request_id
+            }) {
+                receipt.outcome_sequence = (outcome.terminal_status == "completed"
+                    && outcome.logical_attempt == context.attempt)
+                    .then_some(outcome_receipt.sequence);
+            }
+        }
         self.cache_dimensions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4263,6 +4397,10 @@ pub struct ConversationRuntime<C, T> {
     /// Exact receipts generated in this turn. These contain metadata and
     /// digests only; canonical bytes remain in Session/artifact storage.
     turn_generated_model_receipts: std::sync::Mutex<Vec<GeneratedModelReceipt>>,
+    turn_native_tool_sources: std::sync::Mutex<BTreeMap<String, NativeToolSource>>,
+    turn_native_root_owners:
+        std::sync::Mutex<BTreeMap<String, crate::context_evidence::RootReadOwner>>,
+    native_wire_receipts: Arc<std::sync::Mutex<Vec<NativeWireReceipt>>>,
     /// Generated receipts promoted only after their byte-identical ToolResult
     /// appears in a valid, committed Provider continuation.
     turn_model_observations:
@@ -4542,8 +4680,11 @@ fn initialize_automatic_memory_manager(
         .is_configured()
         .then(|| {
             let registry = Arc::new(
-                crate::ProviderRegistry::new_with_context_windows(feature_config.providers().clone(), feature_config.model_context_windows().clone())
-                    .map_err(|rejected| rejected.diagnostics.errors.join("; "))?,
+                crate::ProviderRegistry::new_with_context_windows(
+                    feature_config.providers().clone(),
+                    feature_config.model_context_windows().clone(),
+                )
+                .map_err(|rejected| rejected.diagnostics.errors.join("; "))?,
             );
             crate::RuntimeMemorySummarizer::new(
                 registry,

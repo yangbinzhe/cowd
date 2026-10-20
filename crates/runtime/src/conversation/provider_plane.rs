@@ -1,7 +1,7 @@
 //! Provider admission, request execution, and governed terminal synthesis.
 
+use super::frame_refusal::{refusal_event_refs, wholly_refused_frame_reason, FrameRefusal};
 use super::*;
-use super::frame_refusal::{FrameRefusal, refusal_event_refs, wholly_refused_frame_reason};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalProviderAnswer {
@@ -33,6 +33,153 @@ const DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 300_000;
 // this percentage of the smallest configured candidate window. It pre-empts the
 // hard "cannot fit" failure through the existing semantic-checkpoint pipeline.
 const PROACTIVE_COMPACTION_PERCENT: usize = 90;
+
+fn closure_goal_binding(goal: &harness_contract::goal::GoalContract) -> Option<serde_json::Value> {
+    let binding = goal.execution_binding.as_ref()?;
+    Some(serde_json::json!({"program_ref":binding.agentic_program_id,"goal":{
+        "status":"known","goal_ref":goal.id,"spec_revision":goal.spec_revision,"spec_digest":goal.spec_digest,
+        "completion":goal.completion,"user_intent_criterion_ref":goal.user_intent_criterion_id,
+        "source_intent_ref":goal.source_intent_ref,"participation_requirement":goal.participation_requirement,
+        "criteria":goal.criteria.iter().map(|criterion| serde_json::json!({
+            "criterion_ref":criterion.id,"status":format!("{:?}",criterion.status).to_lowercase()
+        })).collect::<Vec<_>>(),
+        "required_obligations":goal.obligations.iter().filter(|obligation| obligation.required).collect::<Vec<_>>(),
+        "blockers":goal.blockers,"unresolved":goal.unresolved,"waiting":goal.waiting,
+    }}))
+}
+
+fn final_closure_tool_projection(
+    framing: &serde_json::Value,
+    schemas: Option<&BTreeSet<String>>,
+    exposed: &BTreeSet<String>,
+    discoverable: &BTreeSet<String>,
+    inventory: ProviderContextInventory,
+) -> serde_json::Value {
+    let callable = schemas.map(|names| names.intersection(exposed).cloned().collect::<BTreeSet<_>>());
+    let rungs = framing["remaining"].as_array().into_iter().flatten().map(|entry| {
+        let step = entry["step"].as_str().unwrap_or("unknown");
+        let mutations = crate::host::closure_mutation_tool_ids(&[step.to_string()]);
+        let tools = mutations.iter().map(|tool| {
+            let present = schemas.map(|names| names.contains(tool));
+            let allowed = callable.as_ref().is_some_and(|names| names.contains(tool));
+            let discovery_possible = callable.as_ref().is_some_and(|names| names.contains("tool_search"))
+                && discoverable.contains(tool);
+            serde_json::json!({
+                "tool":tool,
+                "schema_present":present,
+                "status":if schemas.is_none() {"unknown"}
+                    else if allowed {"callable_schema_actor_grant_unverified"}
+                    else if discovery_possible {"discovery_candidate_not_callable"}
+                    else {"unavailable_this_request"},
+                "discovery_tool":if discovery_possible {Some("tool_search")} else {None},
+            })
+        }).collect::<Vec<_>>();
+        serde_json::json!({"step":step,"state_actionability":entry["actionability"],"tools":tools,
+            "mapping_status":if mutations.is_empty() {"unknown"} else {"canonical"}})
+    }).collect::<Vec<_>>();
+    let prerequisite_reads = ["read_ref", "state_inspect", "read_file", "evidence_retrieve"].into_iter()
+        .filter(|tool| callable.as_ref().is_some_and(|names| names.contains(*tool)))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "tool_inventory_status":if schemas.is_some() {"final_adapter_post_crop"} else {"unknown"},
+        "schema_ids":schemas,
+        "callable_ids":callable,
+        "catalog_revision":inventory.catalog_revision,
+        "exposure_revision":inventory.exposure_revision,
+        "schema_fingerprint":inventory.schema_fingerprint,
+        "provider_registry_revision":inventory.provider_registry_revision,
+        "rungs":rungs,
+        "prerequisite_reads":prerequisite_reads,
+        "note":"Native schema presence and current logical exposure are both required for a call. A schema is not an actor, permission or review grant. Reads are prerequisites, not closing mutations. Discovery is an inspection/activation proposal, never proof of future availability; recheck the next actual request. Missing/unknown tools or actor prerequisites cannot be forced. Goal debt and independent review remain unchanged.",
+    })
+}
+
+fn bind_final_closure_tool_context(
+    items: &mut [ContextItem],
+    schemas: Option<&BTreeSet<String>>,
+    exposed: &BTreeSet<String>,
+    discoverable: &BTreeSet<String>,
+    inventory: ProviderContextInventory,
+    expected_binding: Option<&serde_json::Value>,
+) -> bool {
+    let mut goals = BTreeMap::new();
+    for item in items.iter_mut() {
+        if item.source != ContextSourceKind::Task || item.authority != ContextAuthority::System
+            || item.role != ContextRole::Instruction || item.visibility != ContextVisibility::Private {
+            continue;
+        }
+        let Some(suffix) = item.id.strip_prefix("goal-state:") else { continue };
+        let Some(raw) = item.content.strip_prefix("#GoalState ") else { continue };
+        let Ok(mut framing) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
+        if !framing.is_object() { continue; }
+        let binding_known = framing["program_source"]["program_ref"].is_string()
+            && framing["program_source"]["revision"].is_number()
+            && framing["goal"]["status"] == "known"
+            && framing["goal"]["goal_ref"].is_string()
+            && framing["goal"]["spec_revision"].is_number()
+            && framing["goal"]["spec_digest"].is_string()
+            && expected_binding.is_some_and(|expected| {
+                expected["program_ref"] == framing["program_source"]["program_ref"]
+                    && expected["goal"].as_object().is_some_and(|fields| fields.iter()
+                        .all(|(key, value)| framing["goal"].get(key) == Some(value)))
+            });
+        let mut projection = final_closure_tool_projection(&framing, schemas, exposed, discoverable, inventory);
+        projection["state_binding_status"] = serde_json::json!(if binding_known {"bound_packet"} else {"unknown"});
+        framing["final_tool_context"] = projection;
+        if goals.insert(suffix.to_string(), (framing.clone(), binding_known)).is_some() {
+            goals.insert(suffix.to_string(), (serde_json::Value::Null, false));
+        }
+        item.content = format!("#GoalState {framing}");
+        item.token_estimate = ContextItem::new("estimate", item.source, item.role, item.content.clone()).token_estimate;
+    }
+    let supports_required_choice = |framing: &serde_json::Value, known: bool| {
+        framing["execution_role"] == "DelegatedLeaf" || (known && framing["blocked"].is_null()
+            && framing["final_tool_context"]["rungs"].as_array().into_iter().flatten().any(|rung| {
+                (rung["state_actionability"].is_null() || rung["state_actionability"] == "actionable")
+                    && rung["tools"].as_array().into_iter().flatten()
+                        .any(|tool| tool["status"] == "callable_schema_actor_grant_unverified")
+            }))
+    };
+    let mut permits_required_choice = goals.values().all(|(framing, known)| supports_required_choice(framing, *known));
+    for item in items.iter_mut() {
+        if item.source != ContextSourceKind::Task || item.authority != ContextAuthority::Tool
+            || item.role != ContextRole::TaskState || item.visibility != ContextVisibility::Private {
+            continue;
+        }
+        let Some(suffix) = item.id.strip_prefix("owed-action:") else { continue };
+        let parsed = serde_json::from_str::<serde_json::Value>(&item.content).ok();
+        let pair = goals.get(suffix).filter(|(framing, known)| *known && parsed.as_ref().is_some_and(|owed| {
+            owed["program_source"] == framing["program_source"] && owed["goal"] == framing["goal"]
+                && owed["remaining"] == framing["remaining"] && owed["blocked"] == framing["blocked"]
+        }));
+        let mut projection = parsed.filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({"original_packet":item.content}));
+        for key in ["candidate_mutations", "prerequisite_reads", "tool_inventory_status", "final_wire_inventory"] {
+            projection.as_object_mut().expect("owed object").remove(key);
+        }
+        match pair {
+            Some((framing, _)) => {
+                permits_required_choice &= supports_required_choice(framing, true);
+                projection["state_binding_status"] = serde_json::json!("bound_packet");
+                projection["final_tool_context"] = framing["final_tool_context"].clone();
+            }
+            None => {
+                permits_required_choice = false;
+                projection["state_binding_status"] = serde_json::json!("unknown");
+                projection["tool_binding_blocked"] = serde_json::json!({
+                    "reason":"unpaired_or_mismatched_current_goal_state"});
+                projection["final_tool_context"] = serde_json::json!({
+                    "tool_inventory_status":if schemas.is_some() {"final_adapter_post_crop"} else {"unknown"},
+                    "state_binding_status":"unknown"});
+            }
+        }
+        projection["note"] = serde_json::json!("Tool hints use this request's post-crop adapter inventory and the paired Goal observation, not a live business CAS grant. Unpaired or stale observations cannot force a mutation. All original action, permission, independent-review and manifest/Goal CAS checks remain authoritative.");
+        item.content = projection.to_string();
+        item.token_estimate = ContextItem::new("estimate", item.source, item.role, item.content.clone()).token_estimate;
+    }
+    permits_required_choice
+}
+
 
 /// PLAN D1b: turn the liveness verdicts the stream guard recorded into at most one
 /// non-forcing push-forward nudge for the next request.
@@ -298,7 +445,17 @@ where
 
     fn discover_tools_with_metrics(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
         let started = Instant::now();
-        let discovery = self.tool_executor.tool_discovery_receipt();
+        let policy = self.permission_policy.execution_policy_control().snapshot();
+        let ceiling = self
+            .permission_policy
+            .bound_to_snapshot(&policy)
+            .active_mode();
+        let discovery = match self.tool_executor.pin_step_catalog() {
+            Some(lease) => self
+                .tool_executor
+                .tool_discovery_receipt_for_step(&lease, ceiling),
+            None => self.tool_executor.tool_discovery_receipt(),
+        };
         if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
             metrics.observe_catalog_lookup(started.elapsed());
         }
@@ -363,7 +520,8 @@ where
         let started = Instant::now();
         let result = self.api_client.prepare_request_budget(request);
         crate::execution_core::performance::observe_duration(
-            "request_wire_budget_ms", started.elapsed(),
+            "request_wire_budget_ms",
+            started.elapsed(),
         );
         result
     }
@@ -372,15 +530,28 @@ where
         &self,
         execution: Option<&crate::CowdExecutionContext>,
     ) -> Result<Option<harness_contract::goal::GoalContract>, RuntimeError> {
-        let execution_id = execution.map(|context| context.execution_id.as_str())
-            .or_else(|| self.execution_identity.as_ref().and_then(|identity| identity.graph_id()));
-        let Some((execution_id, store)) = execution_id.zip(self.runtime_event_store.as_ref()) else { return Ok(None); };
-        let goal = crate::execution_core::GoalStore::new(Arc::clone(store)).get(&format!("goal:{execution_id}"))
+        let execution_id = execution
+            .map(|context| context.execution_id.as_str())
+            .or_else(|| {
+                self.execution_identity
+                    .as_ref()
+                    .and_then(|identity| identity.graph_id())
+            });
+        let Some((execution_id, store)) = execution_id.zip(self.runtime_event_store.as_ref())
+        else {
+            return Ok(None);
+        };
+        let goal = crate::execution_core::GoalStore::new(Arc::clone(store))
+            .get(&format!("goal:{execution_id}"))
             .map_err(RuntimeError::new)?;
         if let Some(goal) = &goal {
-            if goal.session_id != self.session_id() || goal.execution_binding.as_ref().is_some_and(|binding|
-                binding.root_execution_id != execution_id || binding.session_id != self.session_id()
-                    || execution.is_some_and(|execution| binding.turn_id != execution.turn_id)) {
+            if goal.session_id != self.session_id()
+                || goal.execution_binding.as_ref().is_some_and(|binding| {
+                    binding.root_execution_id != execution_id
+                        || binding.session_id != self.session_id()
+                        || execution.is_some_and(|execution| binding.turn_id != execution.turn_id)
+                })
+            {
                 return Err(RuntimeError::new("step_goal_lineage_mismatch"));
             }
         }
@@ -393,37 +564,117 @@ where
         input: &serde_json::Value,
         parent_step_id: &str,
     ) -> Result<Option<crate::step_snapshot::StepCallBinding>, RuntimeError> {
-        let Some(lease) = self.tool_executor.pin_step_catalog() else { return Ok(None); };
-        let execution = self.cowd_bus.as_ref().and_then(|bus| bus.current_execution_context());
+        let Some(lease) = self.tool_executor.pin_step_catalog() else {
+            return Ok(None);
+        };
+        let execution = self
+            .cowd_bus
+            .as_ref()
+            .and_then(|bus| bus.current_execution_context());
         let goal = self.active_step_goal(execution.as_ref())?;
-        let execution_id = execution.as_ref().map(|context| context.execution_id.clone())
-            .or_else(|| self.execution_identity.as_ref().and_then(|identity| identity.graph_id().map(str::to_string)))
-            .ok_or_else(|| RuntimeError::new("system tool call requires a live parent execution"))?;
-        let turn_id = crate::step_snapshot::admitted_turn_id(execution.as_ref(),
-            self.session_input_stream.active_turn_id().map(|turn| turn.to_string()))?;
-        let definitions = lease.snapshot().catalog.definitions(None).into_iter().filter(|definition| definition.name == tool_name)
-            .map(|definition| crate::ProviderToolDefinition { name: definition.name, description: definition.description, input_schema: definition.input_schema })
+        let execution_id = execution
+            .as_ref()
+            .map(|context| context.execution_id.clone())
+            .or_else(|| {
+                self.execution_identity
+                    .as_ref()
+                    .and_then(|identity| identity.graph_id().map(str::to_string))
+            })
+            .ok_or_else(|| {
+                RuntimeError::new("system tool call requires a live parent execution")
+            })?;
+        let turn_id = crate::step_snapshot::admitted_turn_id(
+            execution.as_ref(),
+            self.session_input_stream
+                .active_turn_id()
+                .map(|turn| turn.to_string()),
+        )?;
+        let definitions = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter(|definition| definition.name == tool_name)
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
             .collect::<Vec<_>>();
-        if definitions.len() != 1 { return Err(RuntimeError::new("system tool contract is unavailable")); }
-        let step = Arc::new(crate::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
-            step_id: uuid::Uuid::new_v4().to_string(), session_id: self.session_id().to_string(), turn_id,
-            execution_id: Some(execution_id), actor_ref: Some("runtime:checkpoint-guard".into()), run_ref: None, attempt: None,
-            epoch: execution.as_ref().map(|context| context.turn_id.clone()), goal_ref: goal.as_ref().map(|goal| goal.id.clone()),
-            program_ref: goal.as_ref().and_then(|goal| goal.execution_binding.as_ref().map(|binding| binding.agentic_program_id.clone())),
-            task_ref: self.execution_identity.as_ref().and_then(|identity| identity.task_id().map(str::to_string)),
-            build_ref: option_env!("COWD_GIT_SHA").unwrap_or("unverified").to_string(),
-        }, lease, &definitions, &serde_json::json!({"source":"runtime_system"}), input,
-            BTreeMap::from([("policy".to_string(), self.permission_policy.execution_policy_control().snapshot().revision.to_string())])
-                .into_iter().chain(goal.as_ref().map(|goal| ("goal_spec_observed".to_string(), format!("{}:{}", goal.spec_revision, goal.spec_digest)))).collect(),
-            chrono::Utc::now().timestamp_millis().saturating_add(3_600_000))?.with_parent(parent_step_id));
-        self.runtime_event_store.as_ref().ok_or_else(|| RuntimeError::new("system tool requires durable origin"))?
+        if definitions.len() != 1 {
+            return Err(RuntimeError::new("system tool contract is unavailable"));
+        }
+        let step = Arc::new(
+            crate::step_snapshot::BoundStep::bind(
+                harness_contract::step::StepIdentity {
+                    step_id: uuid::Uuid::new_v4().to_string(),
+                    session_id: self.session_id().to_string(),
+                    turn_id,
+                    execution_id: Some(execution_id),
+                    actor_ref: Some("runtime:checkpoint-guard".into()),
+                    run_ref: None,
+                    attempt: None,
+                    epoch: execution.as_ref().map(|context| context.turn_id.clone()),
+                    goal_ref: goal.as_ref().map(|goal| goal.id.clone()),
+                    program_ref: goal.as_ref().and_then(|goal| {
+                        goal.execution_binding
+                            .as_ref()
+                            .map(|binding| binding.agentic_program_id.clone())
+                    }),
+                    task_ref: self
+                        .execution_identity
+                        .as_ref()
+                        .and_then(|identity| identity.task_id().map(str::to_string)),
+                    build_ref: option_env!("COWD_GIT_SHA")
+                        .unwrap_or("unverified")
+                        .to_string(),
+                },
+                lease,
+                &definitions,
+                &serde_json::json!({"source":"runtime_system"}),
+                input,
+                BTreeMap::from([(
+                    "policy".to_string(),
+                    self.permission_policy
+                        .execution_policy_control()
+                        .snapshot()
+                        .revision
+                        .to_string(),
+                )])
+                .into_iter()
+                .chain(goal.as_ref().map(|goal| {
+                    (
+                        "goal_spec_observed".to_string(),
+                        format!("{}:{}", goal.spec_revision, goal.spec_digest),
+                    )
+                }))
+                .collect(),
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_add(3_600_000),
+            )?
+            .with_parent(parent_step_id),
+        );
+        self.runtime_event_store
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("system tool requires durable origin"))?
             .append(crate::runtime_event_store::RuntimeEventInput {
-                stream_id: format!("session:{}", self.session_id()), scope: crate::runtime_event_store::RuntimeEventScope::Session,
-                kind: "system.step_bound".to_string(), status: Some("prepared".into()), actor: Some("runtime".into()), refs: vec![],
-                payload: serde_json::to_value(step.snapshot()).map_err(|error| RuntimeError::new(error.to_string()))?,
-            }).map_err(|error| RuntimeError::new(error.to_string()))?;
+                stream_id: format!("session:{}", self.session_id()),
+                scope: crate::runtime_event_store::RuntimeEventScope::Session,
+                kind: "system.step_bound".to_string(),
+                status: Some("prepared".into()),
+                actor: Some("runtime".into()),
+                refs: vec![],
+                payload: serde_json::to_value(step.snapshot())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?,
+            })
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
         let call_id = format!("system:{}:{tool_name}", step.snapshot().identity.step_id);
-        Ok(Some(crate::step_snapshot::StepCallBinding::system(step, parent_step_id, &call_id)))
+        Ok(Some(crate::step_snapshot::StepCallBinding::system(
+            step,
+            parent_step_id,
+            &call_id,
+        )))
     }
 
     fn bind_provider_step(
@@ -432,30 +683,126 @@ where
     ) -> Result<Option<Arc<crate::step_snapshot::BoundStep>>, RuntimeError> {
         let started = Instant::now();
         let result = self.bind_provider_step_inner(request);
-        crate::execution_core::performance::observe_duration("request_step_binding_ms", started.elapsed());
+        crate::execution_core::performance::observe_duration(
+            "request_step_binding_ms",
+            started.elapsed(),
+        );
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn r1_assert_replay_activation_for_test(&self, output: &str) {
+        let catalog = self.tool_executor.tool_discovery_receipt();
+        let historical: harness_contract::tool::ToolDiscoveryReceipt =
+            serde_json::from_str(output).unwrap();
+        assert!(historical.activation_candidates.is_empty());
+        for revision in [catalog.catalog_revision, historical.catalog_revision] {
+            *self.tool_exposure_state.lock().unwrap() = Some(ToolExposureState {
+                catalog_revision: revision,
+                bootstrap: BTreeSet::from(["tool_search".to_string()]),
+                active: BTreeSet::new(),
+                deferred: catalog.activation_candidates.iter().cloned().collect(),
+                reason: "retained replay activation boundary".into(),
+                revision: 1,
+                fallback_full: false,
+            });
+            let activation = self.activate_tool_discovery(output).unwrap();
+            assert!(activation.decisions.is_empty());
+            assert!(self
+                .tool_exposure_state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .active
+                .is_empty());
+        }
+        *self.tool_exposure_state.lock().unwrap() = Some(ToolExposureState {
+            catalog_revision: catalog.catalog_revision,
+            bootstrap: BTreeSet::from(["tool_search".to_string()]),
+            active: BTreeSet::new(),
+            deferred: catalog.activation_candidates.iter().cloned().collect(),
+            reason: "live activation positive control".into(),
+            revision: 1,
+            fallback_full: false,
+        });
+        let mut live = catalog;
+        live.activation_candidates = vec!["read_file".into()];
+        let activation = self
+            .activate_tool_discovery(&serde_json::to_string(&live).unwrap())
+            .unwrap();
+        assert!(activation.activated_ids().any(|name| name == "read_file"));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn r1_dispatch_provider_step_for_test(
+        &mut self,
+        mut request: ApiRequest,
+    ) -> Result<Option<Arc<crate::step_snapshot::BoundStep>>, RuntimeError> {
+        let step = self.bind_provider_step(&mut request)?;
+        let mut stream = self.api_client.stream(request);
+        while let Some(event) = futures::StreamExt::next(&mut stream).await {
+            event?;
+        }
+        Ok(step)
     }
 
     fn bind_provider_step_inner(
         &self,
         request: &mut ApiRequest,
     ) -> Result<Option<Arc<crate::step_snapshot::BoundStep>>, RuntimeError> {
-        let Some(lease) = self.tool_executor.pin_step_catalog() else {
+        let policy = self.permission_policy.execution_policy_control().snapshot();
+        if request
+            .budget
+            .compiled_policy_revision
+            .is_some_and(|revision| revision != policy.revision)
+        {
+            return Err(RuntimeError::new(
+                "context_policy_changed_after_compilation",
+            ));
+        }
+        let ceiling = self
+            .permission_policy
+            .bound_to_snapshot(&policy)
+            .active_mode();
+        let Some(lease) = self
+            .tool_executor
+            .prepare_step_catalog(ceiling)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+        else {
             return Ok(None);
         };
         let advertised = self.api_client.step_tool_definitions().ok_or_else(|| {
             RuntimeError::new("production provider does not expose its actual step tool contracts")
         })?;
-        let execution = self.cowd_bus.as_ref().and_then(|bus| bus.current_execution_context());
-        let goal = self.active_step_goal(execution.as_ref())?;
-        let turn_id = crate::step_snapshot::admitted_turn_id(execution.as_ref(),
-            self.session_input_stream.active_turn_id().map(|turn| turn.to_string()))?;
-        let policy = self.permission_policy.execution_policy_control().snapshot();
-        if request.budget.compiled_policy_revision.is_some_and(|revision| revision != policy.revision) {
-            return Err(RuntimeError::new("context_policy_changed_after_compilation"));
+        let discovery = self
+            .tool_executor
+            .tool_discovery_receipt_for_step(&lease, ceiling);
+        if advertised.iter().any(|definition| {
+            !discovery
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.canonical_id == definition.name)
+        }) {
+            return Err(RuntimeError::new(
+                "agent_tool_inventory_drift: advertised tool is outside actual host exposure",
+            ));
         }
+        let execution = self
+            .cowd_bus
+            .as_ref()
+            .and_then(|bus| bus.current_execution_context());
+        let goal = self.active_step_goal(execution.as_ref())?;
+        let turn_id = crate::step_snapshot::admitted_turn_id(
+            execution.as_ref(),
+            self.session_input_stream
+                .active_turn_id()
+                .map(|turn| turn.to_string()),
+        )?;
         let inventory = self.api_client.context_inventory();
-        if request.budget.compiled_provider_registry_revision
+        if request
+            .budget
+            .compiled_provider_registry_revision
             .is_some_and(|revision| revision != inventory.provider_registry_revision)
         {
             return Err(RuntimeError::new("provider_profile_changed_after_compile"));
@@ -464,22 +811,50 @@ where
             step_id: uuid::Uuid::new_v4().to_string(),
             session_id: self.session_id().to_string(),
             turn_id,
-            execution_id: execution.as_ref().map(|context| context.execution_id.clone()),
-            actor_ref: self.execution_identity.as_ref().map(|identity| identity.principal_id().to_string()),
-            run_ref: self.execution_identity.as_ref().and_then(|identity| identity.agent_run_id().map(str::to_string)),
+            execution_id: execution
+                .as_ref()
+                .map(|context| context.execution_id.clone()),
+            actor_ref: self
+                .execution_identity
+                .as_ref()
+                .map(|identity| identity.principal_id().to_string()),
+            run_ref: self
+                .execution_identity
+                .as_ref()
+                .and_then(|identity| identity.agent_run_id().map(str::to_string)),
             attempt: None,
             epoch: execution.as_ref().map(|context| context.turn_id.clone()),
             goal_ref: goal.as_ref().map(|goal| goal.id.clone()),
-            program_ref: goal.as_ref().and_then(|goal| goal.execution_binding.as_ref().map(|binding| binding.agentic_program_id.clone())),
-            task_ref: self.execution_identity.as_ref().and_then(|identity| identity.task_id().map(str::to_string)),
-            build_ref: option_env!("COWD_GIT_SHA").unwrap_or("unverified").to_string(),
+            program_ref: goal.as_ref().and_then(|goal| {
+                goal.execution_binding
+                    .as_ref()
+                    .map(|binding| binding.agentic_program_id.clone())
+            }),
+            task_ref: self
+                .execution_identity
+                .as_ref()
+                .and_then(|identity| identity.task_id().map(str::to_string)),
+            build_ref: option_env!("COWD_GIT_SHA")
+                .unwrap_or("unverified")
+                .to_string(),
         };
         let mut revisions = std::collections::BTreeMap::from([
             ("policy".to_string(), policy.revision.to_string()),
-            ("provider_registry".to_string(), inventory.provider_registry_revision.to_string()),
-            ("history".to_string(), request.messages.cursor().revision.to_string()),
+            (
+                "provider_registry".to_string(),
+                inventory.provider_registry_revision.to_string(),
+            ),
+            (
+                "history".to_string(),
+                request.messages.cursor().revision.to_string(),
+            ),
         ]);
-        if let Some(goal) = goal { revisions.insert("goal_spec_observed".to_string(), format!("{}:{}", goal.spec_revision, goal.spec_digest)); }
+        if let Some(goal) = goal {
+            revisions.insert(
+                "goal_spec_observed".to_string(),
+                format!("{}:{}", goal.spec_revision, goal.spec_digest),
+            );
+        }
         let request_material = crate::step_snapshot::request_material(request);
         let step = Arc::new(crate::step_snapshot::BoundStep::bind(
             identity,
@@ -488,23 +863,34 @@ where
             &serde_json::json!({"model": request.model, "reasoning_effort": request.reasoning_effort_override}),
             &request_material,
             revisions,
-            chrono::Utc::now().timestamp_millis().saturating_add(3_600_000),
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(3_600_000),
         )?);
         let store = self.runtime_event_store.as_ref().ok_or_else(|| {
-            RuntimeError::new("production step requires durable request binding before provider dispatch")
+            RuntimeError::new(
+                "production step requires durable request binding before provider dispatch",
+            )
         })?;
-        store.append(crate::runtime_event_store::RuntimeEventInput {
-            stream_id: format!("session:{}", self.session_id()),
-            scope: crate::runtime_event_store::RuntimeEventScope::Session,
-            kind: "model.step_bound".to_string(),
-            status: Some("prepared".to_string()),
-            actor: Some("conversation_runtime".to_string()),
-            refs: vec![crate::runtime_event_store::RuntimeEventRef {
-                kind: "step".to_string(),
-                id: step.snapshot().identity.step_id.clone(),
-            }],
-            payload: serde_json::to_value(step.snapshot()).map_err(|error| RuntimeError::new(error.to_string()))?,
-        }).map_err(|error| RuntimeError::new(format!("persist step binding before provider dispatch: {error}")))?;
+        store
+            .append(crate::runtime_event_store::RuntimeEventInput {
+                stream_id: format!("session:{}", self.session_id()),
+                scope: crate::runtime_event_store::RuntimeEventScope::Session,
+                kind: "model.step_bound".to_string(),
+                status: Some("prepared".to_string()),
+                actor: Some("conversation_runtime".to_string()),
+                refs: vec![crate::runtime_event_store::RuntimeEventRef {
+                    kind: "step".to_string(),
+                    id: step.snapshot().identity.step_id.clone(),
+                }],
+                payload: serde_json::to_value(step.snapshot())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?,
+            })
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "persist step binding before provider dispatch: {error}"
+                ))
+            })?;
         request.bound_step = Some(Arc::clone(&step));
         Ok(Some(step))
     }
@@ -794,7 +1180,8 @@ where
                     self.cowd_bus.clone(),
                     self.runtime_event_store.clone(),
                     self.session_id().to_string(),
-                ).with_bound_step(bound_step);
+                )
+                .with_bound_step(bound_step);
                 if let (Some((presentation_id, _, _, _)), Some(attempt_id)) =
                     (presentation, terminal_attempt_id.as_deref())
                 {
@@ -1332,8 +1719,14 @@ where
         items: Vec<ContextItem>,
         clock_stamp: &crate::prompt::RuntimeClockStamp,
     ) -> PromptAssembly {
-        let policy_revision = self.permission_policy.execution_policy_control().snapshot().revision;
-        let mut prompt = self.prepare_reality_context_with_budget_and_items(user_input, budget, items, clock_stamp).await;
+        let policy_revision = self
+            .permission_policy
+            .execution_policy_control()
+            .snapshot()
+            .revision;
+        let mut prompt = self
+            .prepare_reality_context_with_budget_and_items(user_input, budget, items, clock_stamp)
+            .await;
         prompt.context_policy_revision = Some(policy_revision);
         prompt
     }
@@ -1596,8 +1989,17 @@ where
         // A `required` tool choice is invalid (`400 tool_choice requires at
         // least one tool`) when no tool schema is exposed; fail closed to an
         // omitted choice instead of sending an invalid request.
-        let tool_choice_required = one_shot_tool_required && !exposed_tool_ids.is_empty();
-        let tool_choice_required_tool_name = if tool_choice_required {
+        let final_tool_ids = self.api_client.step_tool_definitions().map(|definitions| {
+            definitions.into_iter().map(|definition| definition.name).collect::<BTreeSet<_>>()
+        });
+        let final_callable_ids = final_tool_ids.as_ref().map(|schemas| schemas.intersection(&exposed_tool_ids)
+            .cloned().collect::<BTreeSet<_>>());
+        let mut tool_choice_required = one_shot_tool_required
+            && final_callable_ids.as_ref().is_some_and(|names| !names.is_empty())
+            && one_shot_required_tool_name.as_ref().is_none_or(|name| {
+                final_callable_ids.as_ref().is_some_and(|names| names.contains(name))
+            });
+        let mut tool_choice_required_tool_name = if tool_choice_required {
             one_shot_required_tool_name
         } else {
             None
@@ -1630,6 +2032,17 @@ where
         // applies each model's hard cap, schema and history. If preflight
         // compacts the transcript, this snapshot is rebuilt before dispatch.
         let mut one_shot_context_items = self.take_next_model_context_items();
+        let execution_at_binding = self.cowd_bus.as_ref().and_then(|bus| bus.current_execution_context());
+        let current_goal_binding = self.active_step_goal(execution_at_binding.as_ref())?
+            .as_ref().and_then(closure_goal_binding);
+        let discoverable = exposure.deferred.iter()
+            .filter(|tool| tool_activation_ceiling.as_ref().is_none_or(|ceiling| ceiling.contains(*tool)))
+            .cloned().collect::<BTreeSet<_>>();
+        if !bind_final_closure_tool_context(&mut one_shot_context_items, final_tool_ids.as_ref(),
+            &exposed_tool_ids, &discoverable, inventory, current_goal_binding.as_ref()) {
+            tool_choice_required = false;
+            tool_choice_required_tool_name = None;
+        }
         let context_select_started = Instant::now();
         let mut prompt = self
             .prepare_step_prompt(
@@ -1828,7 +2241,10 @@ where
         while let Some((model, provider_account_key)) =
             self.next_available_provider_candidate(&mut candidates)
         {
-            self.api_client.configure_tool_choice(tool_choice_required, tool_choice_required_tool_name.clone());
+            self.api_client.configure_tool_choice(
+                tool_choice_required,
+                tool_choice_required_tool_name.clone(),
+            );
             let materialized =
                 self.pack_timed_provider_attempt(&prompt, &request_messages, &model, inventory);
             let mut request = match materialized {
@@ -1923,11 +2339,18 @@ where
             let provider_started = Instant::now();
             let stream_started = Instant::now();
             let bound_step = self.bind_provider_step(&mut request)?;
+            let native_context = request.provider_evidence_context.clone();
+            let native_step = bound_step.as_ref().map(|step| step.snapshot().clone());
+            self.native_wire_receipts
+                .lock()
+                .map_err(|_| RuntimeError::new("native wire receipt projection poisoned"))?
+                .clear();
             let reducer = ModelStreamReducer::new(
                 self.cowd_bus.clone(),
                 self.runtime_event_store.clone(),
                 self.session_id().to_string(),
-            ).with_bound_step(bound_step);
+            )
+            .with_bound_step(bound_step);
             token_reservations.mark_dispatched();
             let ApiClientStream {
                 events,
@@ -2100,9 +2523,11 @@ where
             // trip, paid so that no consumer can ever observe an unrepaired
             // frame regardless of what is inserted between here and there.
             for call in &mut calls {
-                if let Ok(repaired) =
-                    self.tool_executor.validate_step_tool_input(call.binding.as_ref(), &call.name, &call.input)
-                {
+                if let Ok(repaired) = self.tool_executor.validate_step_tool_input(
+                    call.binding.as_ref(),
+                    &call.name,
+                    &call.input,
+                ) {
                     if repaired != call.input {
                         // A repair that only closes a cut-off frame is not the
                         // same as one that fixes a quoting mistake: items were
@@ -2128,6 +2553,7 @@ where
                 }
             }
             let requested_tool_call_count = calls.len();
+            self.remember_native_tool_calls(&calls)?;
             let transcript_calls = calls.clone();
             // One shape for "the model asked for something that did not run",
             // shared with the whole-frame branches so a refusal is answered and
@@ -2261,7 +2687,11 @@ where
                                 .collect::<Vec<_>>();
                             names.sort();
                             if names.len() > 20 {
-                                format!("{} (and {} more)", names[..20].join(", "), names.len() - 20)
+                                format!(
+                                    "{} (and {} more)",
+                                    names[..20].join(", "),
+                                    names.len() - 20
+                                )
                             } else if names.is_empty() {
                                 "none".to_string()
                             } else {
@@ -2368,17 +2798,22 @@ where
                             TurnInputCheckpoint::AfterProviderResponse,
                         );
                         return Ok(ModelStepResult {
-                            intent: ModelStepIntent::Replan { reason: replan_reason },
+                            intent: ModelStepIntent::Replan {
+                                reason: replan_reason,
+                            },
                             assistant_message,
                             preflight_tool_results: refusal_results,
                             usage,
                             model: effective_model.clone(),
                             models_used: models_tried.clone(),
                             first_token_latency_ms: first_event_at.map(|first| {
-                                u64::try_from(first.saturating_duration_since(stream_started).as_millis())
-                                    .unwrap_or(u64::MAX)
+                                u64::try_from(
+                                    first.saturating_duration_since(stream_started).as_millis(),
+                                )
+                                .unwrap_or(u64::MAX)
                             }),
-                            active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
+                            active_stream_duration_ms: first_event_at
+                                .map(|first| millis_since(first).max(1)),
                             wall_duration_ms: millis_since(started_at).max(1),
                             early_tool_receipts,
                             early_tool_deferrals,
@@ -2403,7 +2838,9 @@ where
                     if let Some(error) = invalid_arguments.get(&call.id) {
                         rejected_tool_calls.push(FrameRefusal::new(
                             call,
-                            format!("the arguments do not match the exposed tool contract: {error}"),
+                            format!(
+                                "the arguments do not match the exposed tool contract: {error}"
+                            ),
                         ));
                     } else {
                         executable_calls.push(call);
@@ -2556,7 +2993,8 @@ where
                         u64::try_from(first.saturating_duration_since(stream_started).as_millis())
                             .unwrap_or(u64::MAX)
                     }),
-                    active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
+                    active_stream_duration_ms: first_event_at
+                        .map(|first| millis_since(first).max(1)),
                     wall_duration_ms: millis_since(started_at).max(1),
                     early_tool_receipts,
                     early_tool_deferrals,
@@ -2661,7 +3099,14 @@ where
                 if !models_tried.contains(model) {
                     models_tried.push(model.clone());
                 }
-                self.confirm_model_observations(packed_model_observations, model)?;
+                if let Some(context) = native_context.as_ref() {
+                    self.confirm_model_observations(
+                        packed_model_observations,
+                        model,
+                        context,
+                        native_step.as_ref(),
+                    )?;
+                }
             }
             self.consume_active_runtime_inputs_for_next_step(
                 TurnInputCheckpoint::AfterProviderResponse,
@@ -2799,5 +3244,207 @@ mod liveness_stall_context_tests {
                 item.content
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod final_closure_tool_context_tests {
+    use super::*;
+
+    fn names(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn packets() -> Vec<ContextItem> {
+        let framing = serde_json::json!({
+            "program_source":{"program_ref":"program:one","revision":7},
+            "goal":{"status":"known","goal_ref":"goal:one","spec_revision":2,"spec_digest":"digest"},
+            "remaining":[{"step":"register_delivery"}],"blocked":null,"exit_ready":false,
+        });
+        let mut goal = ContextItem::new("goal-state:node:1", ContextSourceKind::Task,
+            ContextRole::Instruction, format!("#GoalState {framing}"));
+        goal.authority = ContextAuthority::System;
+        let mut owed = ContextItem::new("owed-action:node:1", ContextSourceKind::Task,
+            ContextRole::TaskState, framing.to_string());
+        owed.authority = ContextAuthority::Tool;
+        vec![goal, owed]
+    }
+
+    fn value(item: &ContextItem) -> serde_json::Value {
+        serde_json::from_str(item.content.strip_prefix("#GoalState ").unwrap_or(&item.content)).unwrap()
+    }
+
+    fn bind_final_closure_tool_context(
+        items: &mut [ContextItem], schemas: Option<&BTreeSet<String>>, exposed: &BTreeSet<String>,
+        discoverable: &BTreeSet<String>, inventory: ProviderContextInventory,
+    ) -> bool {
+        let expected = value(&packets()[0]);
+        let binding = serde_json::json!({"program_ref":expected["program_source"]["program_ref"],"goal":expected["goal"]});
+        super::bind_final_closure_tool_context(items, schemas, exposed, discoverable, inventory, Some(&binding))
+    }
+
+    #[test]
+    fn present_mutation_uses_final_schemas_and_same_goal_packet() {
+        let mut items = packets();
+        let before = value(&items[0]);
+        let actual = names(&["artifact_commit", "read_ref"]);
+        assert!(bind_final_closure_tool_context(&mut items, Some(&actual), &actual, &names(&[]), ProviderContextInventory::default()));
+        let goal = value(&items[0]);
+        let owed = value(&items[1]);
+        assert_eq!(goal["final_tool_context"], owed["final_tool_context"]);
+        assert_eq!(goal["goal"], before["goal"]);
+        assert_eq!(goal["remaining"], before["remaining"]);
+        assert_eq!(goal["exit_ready"], false);
+        assert_eq!(owed["final_tool_context"]["tool_inventory_status"], "final_adapter_post_crop");
+        assert_eq!(owed["final_tool_context"]["rungs"][0]["tools"][0]["status"], "callable_schema_actor_grant_unverified");
+        assert_eq!(owed["final_tool_context"]["prerequisite_reads"], serde_json::json!(["read_ref"]));
+        assert!(owed.get("candidate_mutations").is_none());
+    }
+
+    #[test]
+    fn final_binding_preserves_unrelated_owed_fields_including_unknown_pairs() {
+        let actual = names(&["artifact_commit"]);
+        for mode in ["paired", "foreign", "blocked", "unknown_goal"] {
+            let mut items = packets();
+            if mode == "blocked" {
+                for item in &mut items {
+                    let mut state = value(item);
+                    state["blocked"] = serde_json::json!({"reason":"original_blocker"});
+                    item.content = if item.id.starts_with("goal-state:") {
+                        format!("#GoalState {state}")
+                    } else {
+                        state.to_string()
+                    };
+                }
+            }
+            let mut owed = value(&items[1]);
+            owed["budget"] = serde_json::json!({"remaining":17});
+            owed["progress"] = serde_json::json!({"completed":3});
+            owed["advisory_routes"] = serde_json::json!([{"optional":"independent_reviewer"}]);
+            if mode == "foreign" {
+                owed["program_source"]["revision"] = serde_json::json!(6);
+            }
+            items[1].content = owed.to_string();
+            if mode == "unknown_goal" {
+                super::bind_final_closure_tool_context(&mut items, Some(&actual), &actual,
+                    &names(&[]), ProviderContextInventory::default(), None);
+            } else {
+                bind_final_closure_tool_context(&mut items, Some(&actual), &actual,
+                    &names(&[]), ProviderContextInventory::default());
+            }
+            let result = value(&items[1]);
+            for key in ["program_source", "goal", "remaining", "blocked", "exit_ready",
+                "budget", "progress", "advisory_routes"] {
+                assert_eq!(result[key], owed[key], "{mode}: {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_schema_and_text_only_cannot_force_tool_choice() {
+        for actual in [names(&["read_ref"]), names(&[])] {
+            let mut items = packets();
+            assert!(!bind_final_closure_tool_context(&mut items, Some(&actual), &actual, &names(&[]), ProviderContextInventory::default()));
+            assert_eq!(value(&items[1])["final_tool_context"]["rungs"][0]["tools"][0]["status"], "unavailable_this_request");
+        }
+    }
+
+    #[test]
+    fn unknown_is_not_empty_or_precompile_present() {
+        let mut items = packets();
+        assert!(!bind_final_closure_tool_context(&mut items, None, &names(&["artifact_commit"]), &names(&[]), ProviderContextInventory::default()));
+        let projection = &value(&items[1])["final_tool_context"];
+        assert_eq!(projection["schema_ids"], serde_json::Value::Null);
+        assert_eq!(projection["tool_inventory_status"], "unknown");
+        assert_eq!(projection["rungs"][0]["tools"][0]["status"], "unknown");
+    }
+
+    #[test]
+    fn discovery_is_prerequisite_then_fresh_request_can_offer_mutation() {
+        let mut items = packets();
+        let search = names(&["tool_search"]);
+        assert!(!bind_final_closure_tool_context(&mut items, Some(&search), &search, &names(&["artifact_commit"]), ProviderContextInventory::default()));
+        assert_eq!(value(&items[1])["final_tool_context"]["rungs"][0]["tools"][0]["status"], "discovery_candidate_not_callable");
+        let activated = names(&["artifact_commit"]);
+        assert!(bind_final_closure_tool_context(&mut items, Some(&activated), &activated, &names(&[]), ProviderContextInventory::default()));
+        assert_eq!(value(&items[1])["final_tool_context"]["rungs"][0]["tools"][0]["status"], "callable_schema_actor_grant_unverified");
+    }
+
+    #[test]
+    fn stable_native_schema_outside_logical_crop_is_not_permission() {
+        let mut items = packets();
+        assert!(!bind_final_closure_tool_context(&mut items, Some(&names(&["artifact_commit", "read_ref"])), &names(&["read_ref"]), &names(&[]), ProviderContextInventory::default()));
+        let tool = &value(&items[1])["final_tool_context"]["rungs"][0]["tools"][0];
+        assert_eq!(tool["schema_present"], true);
+        assert_eq!(tool["status"], "unavailable_this_request");
+    }
+
+    #[test]
+    fn foreign_revision_unpaired_or_blocked_goal_does_not_require_mutation() {
+        let actual = names(&["artifact_commit"]);
+        let mut foreign = packets();
+        let mut owed = value(&foreign[1]);
+        owed["program_source"]["revision"] = serde_json::json!(6);
+        foreign[1].content = owed.to_string();
+        assert!(!bind_final_closure_tool_context(&mut foreign, Some(&actual), &actual, &names(&[]), ProviderContextInventory::default()));
+        assert_eq!(value(&foreign[1])["state_binding_status"], "unknown");
+        let mut blocked = packets();
+        for item in &mut blocked {
+            let mut state = value(item);
+            state["blocked"] = serde_json::json!({"reason":"independent_reviewer_route_unavailable"});
+            item.content = if item.id.starts_with("goal-state:") {format!("#GoalState {state}")} else {state.to_string()};
+        }
+        assert!(!bind_final_closure_tool_context(&mut blocked, Some(&actual), &actual, &names(&[]), ProviderContextInventory::default()));
+        assert_eq!(value(&blocked[1])["blocked"]["reason"], "independent_reviewer_route_unavailable");
+    }
+
+    #[test]
+    fn quoted_workspace_packet_cannot_be_promoted_by_its_id() {
+        let mut items = packets();
+        items[0].source = ContextSourceKind::Workspace;
+        let actual = names(&["artifact_commit"]);
+        assert!(!bind_final_closure_tool_context(&mut items, Some(&actual), &actual, &names(&[]), ProviderContextInventory::default()));
+        assert!(value(&items[0]).get("final_tool_context").is_none());
+    }
+
+    #[test]
+    fn matching_packets_cannot_borrow_a_foreign_or_unknown_active_goal() {
+        let actual = names(&["artifact_commit"]);
+        let mut unknown = packets();
+        assert!(!super::bind_final_closure_tool_context(&mut unknown, Some(&actual), &actual,
+            &names(&[]), ProviderContextInventory::default(), None));
+        assert_eq!(value(&unknown[1])["state_binding_status"], "unknown");
+        let mut foreign = packets();
+        for item in &mut foreign {
+            let mut state = value(item);
+            state["goal"]["spec_digest"] = serde_json::json!("stale-digest");
+            item.content = if item.id.starts_with("goal-state:") {format!("#GoalState {state}")} else {state.to_string()};
+        }
+        assert!(!bind_final_closure_tool_context(&mut foreign, Some(&actual), &actual,
+            &names(&[]), ProviderContextInventory::default()));
+        assert_eq!(value(&foreign[1])["state_binding_status"], "unknown");
+    }
+
+    #[test]
+    fn actor_read_prerequisites_do_not_turn_schema_presence_into_required_review() {
+        let actual = names(&["objective_review", "read_ref"]);
+        let mut items = packets();
+        for item in &mut items {
+            let mut state = value(item);
+            state["remaining"] = serde_json::json!([{"step":"objective_review","actionability":"requires_actor_and_reads"}]);
+            item.content = if item.id.starts_with("goal-state:") {format!("#GoalState {state}")} else {state.to_string()};
+        }
+        assert!(!bind_final_closure_tool_context(&mut items, Some(&actual), &actual,
+            &names(&[]), ProviderContextInventory::default()));
+        assert_eq!(value(&items[1])["final_tool_context"]["rungs"][0]["tools"][0]["schema_present"], true);
+    }
+
+    #[test]
+    fn root_packet_without_owed_cannot_force_missing_mutation_via_generic_flag() {
+        let mut items = packets();
+        items.pop();
+        let reads = names(&["read_ref"]);
+        assert!(!bind_final_closure_tool_context(&mut items, Some(&reads), &reads,
+            &names(&[]), ProviderContextInventory::default()));
     }
 }

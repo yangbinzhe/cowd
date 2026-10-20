@@ -13,6 +13,9 @@ mod tiered;
 mod types;
 
 pub use backend::{SessionStoreBackend, SharedSessionStoreBackend};
+pub use domain::terminal::{
+    public_session_blocks, public_terminal_payload_v1, terminal_public_payload_digest,
+};
 pub use execution_plane::{
     StorageExecutionLane, StorageExecutionLaneStats, StorageExecutionPlaneConfig,
     StorageExecutionPlaneStats,
@@ -33,6 +36,17 @@ pub use types::{
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
     SessionUsageSummary, CONTEXT_INDEX_CARD_SCHEMA_VERSION,
     SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION,
+};
+pub use types::{
+    SessionPresenceMutation, SessionPresenceMutationKind, SessionPresenceMutationResult,
+    SessionReceiptAuthority, SessionReceiptSource, SessionTerminalAckCommand,
+    SessionTerminalAckListQuery, SessionTerminalMessageBinding, SessionTerminalReceiptContext,
+    SessionTerminalReceiptQuery,
+};
+pub use types::{
+    SessionTerminalPublicPayload, SessionTerminalPublicPayloadUnavailableReason,
+    SESSION_TERMINAL_PUBLIC_PAYLOAD_DIGEST_PREFIX_V1, SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1,
+    SESSION_TERMINAL_PUBLIC_PAYLOAD_MAX_BYTES,
 };
 
 pub type Result<T> = crate::error::Result<T>;

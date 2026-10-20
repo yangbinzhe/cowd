@@ -4,6 +4,14 @@ use super::*;
 use harness_contract::agent::AgentReturnPacket;
 
 impl RuntimeServices {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn use_recovery_lane_notifications_for_test(
+        &self,
+        source: tokio::sync::watch::Receiver<u64>,
+    ) -> Result<Arc<std::sync::atomic::AtomicU64>, String> {
+        self.event_reactor
+            .use_lane_notifications_for_test("runtime:agentic-program-wait-resolver:v1", source)
+    }
     /// Reconcile durable Agentic Program root barriers after Program claims
     /// and physical Agent graphs have been recovered. This ordering prevents
     /// a pre-recovery orphan claim from waking a paid root model, while still
@@ -36,7 +44,9 @@ impl RuntimeServices {
             let projection = actions
                 .project(program_id)
                 .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-            if excluded_sessions.contains(&projection.session_id) {
+            if excluded_sessions.contains(&projection.session_id)
+                || actions.recovery_session_is_excluded(&projection.session_id)
+            {
                 continue;
             }
             self.reconcile_agentic_completion_request(program_id)
@@ -1433,6 +1443,33 @@ impl RuntimeServices {
         // Establish every recovery partition before performing any mutation.
         // A corrupt graph cannot be guessed into a healthy Session: fail the
         // ordered pass closed while leaving all durable recovery inputs intact.
+
+        let mut terminal_cursor = None;
+        loop {
+            let page = self
+                .graph_state_store
+                .graph_ids_page_async(terminal_cursor.clone())
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for (graph_id, _) in &page {
+                let graph = self.graph_state_store.load_async(graph_id).await?;
+                if !graph_is_terminal(&graph) {
+                    continue;
+                }
+                let lineage = graph.lineage.as_ref().ok_or_else(|| {
+                    RuntimeServicesError::Invariant(
+                        "terminal lease recovery lineage missing".into(),
+                    )
+                })?;
+                lineage
+                    .validate()
+                    .map_err(|reason| RuntimeServicesError::Invariant(reason.into()))?;
+            }
+            let (graph_id, sequence) = page.last().unwrap();
+            terminal_cursor = Some((*sequence, graph_id.clone()));
+        }
         let graph_ids = self.graph_state_store.nonterminal_graph_ids_async().await?;
         let mut excluded_graph_ids = BTreeSet::new();
         let mut report = ExecutionStartupRecoveryReport {
@@ -1490,6 +1527,86 @@ impl RuntimeServices {
         }
         if !report.errors.is_empty() {
             return Ok(report);
+        }
+
+        let mut terminal_cursor = None;
+        loop {
+            let page = self
+                .graph_state_store
+                .graph_ids_page_async(terminal_cursor.clone())
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for (graph_id, _) in &page {
+                let before = self.graph_state_store.load_async(graph_id).await?;
+                if !graph_is_terminal(&before) {
+                    continue;
+                }
+                let lineage = before.lineage.as_ref().ok_or_else(|| {
+                    RuntimeServicesError::Invariant(
+                        "terminal lease recovery lineage missing".into(),
+                    )
+                })?;
+                if excluded_sessions.contains(&lineage.session_id) {
+                    continue;
+                }
+                match self.graph_host_publications_are_bound(&before) {
+                    Ok(true) => {}
+                    readiness => {
+                        let error = readiness.err().map(|error| error.to_string());
+                        if let Some(error) = &error {
+                            report.errors.push(ExecutionStartupRecoveryError {
+                                graph_id: graph_id.clone(),
+                                error: error.clone(),
+                            });
+                        } else {
+                            report.deferred_graphs = report.deferred_graphs.saturating_add(1);
+                        }
+                        report.records.push(ExecutionStartupRecoveryRecord {
+                            graph_id: graph_id.clone(),
+                            objective: before.objective.clone(),
+                            before_revision: before.revision,
+                            after_revision: before.revision,
+                            before_status: graph_status_label(&before),
+                            after_status: graph_status_label(&before),
+                            action: if error.is_some() {
+                                "host_publication_readiness_failed"
+                            } else {
+                                "deferred_turn_scoped_executor_binding"
+                            }
+                            .into(),
+                            error,
+                        });
+                        continue;
+                    }
+                }
+                let mut recovery_error = None;
+                match self.execution_supervisor.recover_graph(graph_id).await {
+                    Ok(_) => {}
+                    Err(error) => {
+                        let message = error.to_string();
+                        report.errors.push(ExecutionStartupRecoveryError {
+                            graph_id: graph_id.clone(),
+                            error: message.clone(),
+                        });
+                        recovery_error = Some(message);
+                    }
+                }
+                let final_graph = self.graph_state_store.load_async(graph_id).await?;
+                report.records.push(ExecutionStartupRecoveryRecord {
+                    graph_id: graph_id.clone(),
+                    objective: before.objective.clone(),
+                    before_revision: before.revision,
+                    after_revision: final_graph.revision,
+                    before_status: graph_status_label(&before),
+                    after_status: graph_status_label(&final_graph),
+                    action: "terminal_lease_reconciliation".into(),
+                    error: recovery_error,
+                });
+            }
+            let (graph_id, sequence) = page.last().unwrap();
+            terminal_cursor = Some((*sequence, graph_id.clone()));
         }
 
         let managed_invocation_snapshot = self
@@ -1596,6 +1713,36 @@ impl RuntimeServices {
                 });
                 continue;
             }
+            match self.graph_host_publications_are_bound(&before) {
+                Ok(true) => {}
+                readiness => {
+                    let error = readiness.err().map(|error| error.to_string());
+                    if let Some(error) = &error {
+                        report.errors.push(ExecutionStartupRecoveryError {
+                            graph_id: graph_id.clone(),
+                            error: error.clone(),
+                        });
+                    } else {
+                        report.deferred_graphs = report.deferred_graphs.saturating_add(1);
+                    }
+                    report.records.push(ExecutionStartupRecoveryRecord {
+                        graph_id,
+                        objective,
+                        before_revision,
+                        after_revision: before_revision,
+                        before_status: before_status.clone(),
+                        after_status: before_status,
+                        action: if error.is_some() {
+                            "host_publication_readiness_failed"
+                        } else {
+                            "deferred_turn_scoped_executor_binding"
+                        }
+                        .into(),
+                        error,
+                    });
+                    continue;
+                }
+            }
             let had_running = graph_has_status(&before, ExecutionNodeStatus::Running);
             let mut action = "observed".to_string();
             let mut error = None;
@@ -1646,12 +1793,16 @@ impl RuntimeServices {
                     action = "managed_reconciliation_required".to_string();
                     report.blocked_graphs += 1;
                 }
-            } else if had_running {
+            } else {
                 match self.execution_supervisor.recover_graph(&graph_id).await {
                     Ok(recovered) => {
                         if recovered.revision != before_revision {
                             report.recovered_graphs += 1;
-                            action = "recovered_running".to_string();
+                            action = if had_running {
+                                "recovered_running".to_string()
+                            } else {
+                                "reconciled_binding_leases".to_string()
+                            };
                         }
                     }
                     Err(recovery_error) => {
@@ -1665,11 +1816,23 @@ impl RuntimeServices {
                 }
             }
 
-            if error.is_none()
-                && (managed_fences.is_empty() || managed_runnable)
-                && self.graph_executors_are_bound(&before)
+            let current = self.graph_state_store.load_async(&graph_id).await?;
+            let mut executors_bound = false;
+            if error.is_none() && (managed_fences.is_empty() || managed_runnable) {
+                match self.graph_executors_are_bound(&current) {
+                    Ok(bound) => executors_bound = bound,
+                    Err(readiness_error) => {
+                        let message = readiness_error.to_string();
+                        report.errors.push(ExecutionStartupRecoveryError {
+                            graph_id: graph_id.clone(),
+                            error: message.clone(),
+                        });
+                        error = Some(message);
+                    }
+                }
+            }
+            if error.is_none() && (managed_fences.is_empty() || managed_runnable) && executors_bound
             {
-                let current = self.graph_state_store.load_async(&graph_id).await?;
                 if graph_can_advance(&current) {
                     let producers_released = self.execution_supervisor.graph_producers_released();
                     match self.execution_supervisor.notify_graph(&graph_id).await {
@@ -2760,30 +2923,1058 @@ impl RuntimeServices {
 }
 
 impl RuntimeServices {
-    pub(crate) fn graph_executors_are_bound(&self, graph: &ExecutionGraph) -> bool {
-        graph.nodes.iter().all(|node| {
-            let executor = match node.executor_kind.as_str() {
-                "inline_model" => Some(self.model_step_executor.as_ref()),
-                "tool_batch" => Some(self.tool_batch_executor.as_ref()),
-                "cross_plane_connector" => Some(self.cross_plane_connector_executor.as_ref()),
-                _ => None,
+    fn graph_host_publications_are_bound(
+        &self,
+        graph: &ExecutionGraph,
+    ) -> Result<bool, RuntimeServicesError> {
+        let mut publication_bound = true;
+        let mut after = 0;
+        while after < graph.revision {
+            let (next, starts) =
+                self.graph_state_store
+                    .binding_starts_page(&graph.id, after, graph.revision)?;
+            for (node_id, binding, _) in starts {
+                if !self
+                    .commit_service
+                    .binding_requires_host_publication(graph, &node_id, &binding)
+                    .map_err(crate::execution_core::graph::ExecutionRecoveryError::from)?
+                {
+                    continue;
+                }
+                let (ticket, _) = self
+                    .graph_state_store
+                    .binding_start_ticket(graph, &node_id, &binding)?;
+                let bound = match ticket.executor_kind.as_str() {
+                    "inline_model" => self.model_step_executor.is_bound(&ticket),
+                    "tool_batch" => self.tool_batch_executor.is_bound(&ticket),
+                    "cross_plane_connector" => {
+                        self.cross_plane_connector_executor.is_bound(&ticket)
+                    }
+                    "synthesize" => self.synthesize_executor.is_bound(&ticket),
+                    _ => {
+                        return Err(RuntimeServicesError::Invariant(format!(
+                            "Host publication has no scoped executor: {}/{}",
+                            graph.id, node_id,
+                        )))
+                    }
+                };
+                publication_bound &= bound;
+            }
+            if next <= after || next > graph.revision {
+                return Err(RuntimeServicesError::Invariant(
+                    "Host publication start cursor did not advance within graph".into(),
+                ));
+            }
+            after = next;
+        }
+        Ok(publication_bound)
+    }
+
+    pub(crate) fn graph_executors_are_bound(
+        &self,
+        graph: &ExecutionGraph,
+    ) -> Result<bool, RuntimeServicesError> {
+        let publication_bound = self.graph_host_publications_are_bound(graph)?;
+        Ok(graph.nodes.iter().all(|node| {
+            if graph
+                .node_statuses
+                .get(&node.id)
+                .is_some_and(|status| status.is_terminal())
+            {
+                return true;
+            }
+            let ticket = || crate::execution_core::NodeExecutionTicket {
+                graph_id: graph.id.clone(),
+                node_id: node.id.clone(),
+                executor_kind: node.executor_kind.clone(),
+                service_class: graph.service_class,
+                attempt: graph
+                    .recovery_cursor
+                    .node_attempts
+                    .get(&node.id)
+                    .copied()
+                    .unwrap_or(1),
+                idempotency_key: node.idempotency_key.clone(),
+                payload_ref: node.payload_ref.clone(),
             };
-            executor.is_none_or(|executor| {
-                executor.is_bound(&crate::execution_core::NodeExecutionTicket {
-                    graph_id: graph.id.clone(),
-                    node_id: node.id.clone(),
-                    executor_kind: node.executor_kind.clone(),
-                    service_class: graph.service_class,
-                    attempt: graph
-                        .recovery_cursor
-                        .node_attempts
-                        .get(&node.id)
-                        .copied()
-                        .unwrap_or(1),
-                    idempotency_key: node.idempotency_key.clone(),
-                    payload_ref: node.payload_ref.clone(),
-                })
+            match node.executor_kind.as_str() {
+                "inline_model" => self.model_step_executor.is_bound(&ticket()),
+                "tool_batch" => self.tool_batch_executor.is_bound(&ticket()),
+                "cross_plane_connector" => self.cross_plane_connector_executor.is_bound(&ticket()),
+                "synthesize" => self.synthesize_executor.is_bound(&ticket()),
+                _ => true,
+            }
+        }) && publication_bound)
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, Weak};
+    use std::time::Duration;
+
+    use harness_contract::execution_graph::{
+        ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeResult,
+        ExecutionNodeSpec, ExecutionNodeStatus, ExecutionServiceClass,
+    };
+
+    use super::RuntimeServices;
+    use crate::execution_core::graph::executors::{
+        ScopedNodeBackendResolver, SynthesizeBackend, SynthesizeBackendResolver,
+    };
+    use crate::execution_core::graph::{
+        NodeExecutionOutcome, NodeExecutionTicket, NodeExecutorError, ScopedNodeBackend,
+    };
+
+    const SCOPED_KINDS: [&str; 4] = [
+        "inline_model",
+        "tool_batch",
+        "cross_plane_connector",
+        "synthesize",
+    ];
+
+    struct ReadinessBackend {
+        calls: AtomicUsize,
+    }
+
+    impl ReadinessBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
             })
-        })
+        }
+
+        fn complete(&self, ticket: &NodeExecutionTicket) -> NodeExecutionOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            NodeExecutionOutcome::new(completed_result(&ticket.node_id))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScopedNodeBackend for ReadinessBackend {
+        async fn execute(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            Ok(self.complete(ticket))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SynthesizeBackend for ReadinessBackend {
+        async fn synthesize(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, String> {
+            Ok(self.complete(ticket))
+        }
+    }
+
+    struct ExactResolver {
+        ticket: NodeExecutionTicket,
+        backend: Weak<ReadinessBackend>,
+        queries: Arc<Mutex<Vec<NodeExecutionTicket>>>,
+    }
+
+    impl ExactResolver {
+        fn resolve_backend(&self, ticket: &NodeExecutionTicket) -> Option<Arc<ReadinessBackend>> {
+            self.queries.lock().unwrap().push(ticket.clone());
+            if ticket != &self.ticket {
+                return None;
+            }
+            self.backend.upgrade()
+        }
+    }
+
+    impl ScopedNodeBackendResolver for ExactResolver {
+        fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+            self.resolve_backend(ticket)
+                .map(|backend| backend as Arc<dyn ScopedNodeBackend>)
+        }
+    }
+
+    impl SynthesizeBackendResolver for ExactResolver {
+        fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn SynthesizeBackend>> {
+            self.resolve_backend(ticket)
+                .map(|backend| backend as Arc<dyn SynthesizeBackend>)
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, Arc<RuntimeServices>) {
+        let plan = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|ancestor| ancestor.join("plan/2026-10/1016-cowd-future-kernel"))
+            .find(|candidate| candidate.join("design-contract.json").is_file())
+            .expect("readiness fixture requires the execution plan tree");
+        let fixtures = plan.join("evidence/execution/kernel-terminal-20261016/R1-03/fixtures");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("readiness-")
+            .tempdir_in(fixtures)
+            .unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ports = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::new(
+            crate::test_support::session_store(),
+        ));
+        let services = RuntimeServices::test_builder(root.path().join("home"), workspace)
+            .session_ports(ports.clone(), ports.clone(), ports.clone(), ports)
+            .build()
+            .unwrap();
+        (root, services)
+    }
+
+    fn node(kind: &str, identity: &str) -> ExecutionNodeSpec {
+        let node_kind = match kind {
+            "inline_model" => ExecutionNodeKind::InlineModel,
+            "tool_batch" => ExecutionNodeKind::ToolBatch,
+            "cross_plane_connector" => ExecutionNodeKind::SessionDispatch,
+            "synthesize" => ExecutionNodeKind::Synthesize,
+            "agent_task" => ExecutionNodeKind::AgentTask,
+            _ => unreachable!(),
+        };
+        let mut node = ExecutionNodeSpec::new(node_kind, kind, format!("payload:{identity}"));
+        node.id = identity.to_string();
+        node.idempotency_key = format!("idempotency:{identity}");
+        node
+    }
+
+    fn single_node_graph(kind: &str) -> ExecutionGraph {
+        let mut graph = ExecutionGraph::new("readiness exact ticket");
+        graph.id = format!("readiness:{kind}");
+        graph.service_class = ExecutionServiceClass::Background;
+        graph.nodes.push(node(kind, "current"));
+        graph
+            .node_statuses
+            .insert("current".into(), ExecutionNodeStatus::Ready);
+        graph
+            .recovery_cursor
+            .node_attempts
+            .insert("current".into(), 7);
+        graph
+    }
+
+    fn ticket_for(graph: &ExecutionGraph, node_index: usize) -> NodeExecutionTicket {
+        let node = &graph.nodes[node_index];
+        NodeExecutionTicket {
+            graph_id: graph.id.clone(),
+            node_id: node.id.clone(),
+            executor_kind: node.executor_kind.clone(),
+            service_class: graph.service_class,
+            attempt: graph
+                .recovery_cursor
+                .node_attempts
+                .get(&node.id)
+                .copied()
+                .unwrap_or(1),
+            idempotency_key: node.idempotency_key.clone(),
+            payload_ref: node.payload_ref.clone(),
+        }
+    }
+
+    fn bind(
+        services: &RuntimeServices,
+        ticket: NodeExecutionTicket,
+        backend: &Arc<ReadinessBackend>,
+        queries: &Arc<Mutex<Vec<NodeExecutionTicket>>>,
+    ) {
+        let kind = ticket.executor_kind.clone();
+        let resolver = Arc::new(ExactResolver {
+            ticket,
+            backend: Arc::downgrade(backend),
+            queries: Arc::clone(queries),
+        });
+        match kind.as_str() {
+            "inline_model" => services.model_step_executor().install_resolver(resolver),
+            "tool_batch" => services.tool_batch_executor().install_resolver(resolver),
+            "cross_plane_connector" => services
+                .cross_plane_connector_executor()
+                .install_resolver(resolver),
+            "synthesize" => services.synthesize_executor().install_resolver(resolver),
+            _ => unreachable!(),
+        }
+    }
+
+    fn completed_result(node_id: &str) -> ExecutionNodeResult {
+        ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some(format!("readiness-result:{node_id}")),
+            wait_class: None,
+            summary: Some("readiness backend completed".into()),
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: Default::default(),
+            finished_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_nonterminal_scoped_nodes_require_exact_ticket() {
+        for kind in SCOPED_KINDS {
+            let (_root, services) = fixture();
+            let graph = single_node_graph(kind);
+            let expected = NodeExecutionTicket {
+                graph_id: format!("readiness:{kind}"),
+                node_id: "current".into(),
+                executor_kind: kind.into(),
+                service_class: ExecutionServiceClass::Background,
+                attempt: 7,
+                idempotency_key: "idempotency:current".into(),
+                payload_ref: "payload:current".into(),
+            };
+            let backend = ReadinessBackend::new();
+            let queries = Arc::new(Mutex::new(Vec::new()));
+            assert!(
+                !services.graph_executors_are_bound(&graph).unwrap(),
+                "{kind}"
+            );
+            bind(&services, expected.clone(), &backend, &queries);
+            assert!(
+                services.graph_executors_are_bound(&graph).unwrap(),
+                "{kind}"
+            );
+            assert_eq!(queries.lock().unwrap().as_slice(), &[expected]);
+            for field in [
+                "graph",
+                "node",
+                "service",
+                "attempt",
+                "idempotency",
+                "payload",
+            ] {
+                let mut changed = graph.clone();
+                match field {
+                    "graph" => changed.id.push_str(":foreign"),
+                    "node" => changed.nodes[0].id.push_str(":foreign"),
+                    "service" => changed.service_class = ExecutionServiceClass::Foreground,
+                    "attempt" => {
+                        changed
+                            .recovery_cursor
+                            .node_attempts
+                            .insert("current".into(), 8);
+                    }
+                    "idempotency" => changed.nodes[0].idempotency_key.push_str(":foreign"),
+                    "payload" => changed.nodes[0].payload_ref.push_str(":foreign"),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !services.graph_executors_are_bound(&changed).unwrap(),
+                    "{kind}:{field}"
+                );
+            }
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+            services.shutdown_execution().await;
+            services.shutdown_maintenance().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_missing_status_and_waiting_external_are_nonterminal() {
+        for kind in SCOPED_KINDS {
+            let (_root, services) = fixture();
+            let mut graph = single_node_graph(kind);
+            let statuses = [
+                None,
+                Some(ExecutionNodeStatus::Planned),
+                Some(ExecutionNodeStatus::Ready),
+                Some(ExecutionNodeStatus::Running),
+                Some(ExecutionNodeStatus::WaitingInput),
+                Some(ExecutionNodeStatus::WaitingApproval),
+                Some(ExecutionNodeStatus::WaitingExternal),
+                Some(ExecutionNodeStatus::Paused),
+            ];
+            for status in statuses {
+                graph.node_statuses.clear();
+                if let Some(status) = status {
+                    graph.node_statuses.insert("current".into(), status);
+                }
+                assert!(
+                    !services.graph_executors_are_bound(&graph).unwrap(),
+                    "{kind}:{status:?}"
+                );
+            }
+            let backend = ReadinessBackend::new();
+            let queries = Arc::new(Mutex::new(Vec::new()));
+            bind(&services, ticket_for(&graph, 0), &backend, &queries);
+            for status in statuses {
+                graph.node_statuses.clear();
+                if let Some(status) = status {
+                    graph.node_statuses.insert("current".into(), status);
+                }
+                assert!(
+                    services.graph_executors_are_bound(&graph).unwrap(),
+                    "{kind}:{status:?}"
+                );
+            }
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+            services.shutdown_execution().await;
+            services.shutdown_maintenance().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_terminal_predecessors_do_not_require_live_backends() {
+        let (_root, services) = fixture();
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut graph = ExecutionGraph::new("terminal predecessors and a live synthesize");
+        for kind in ["inline_model", "tool_batch", "cross_plane_connector"] {
+            graph.nodes.push(node(kind, kind));
+            graph
+                .node_statuses
+                .insert(kind.into(), ExecutionNodeStatus::Completed);
+        }
+        graph.nodes.push(node("synthesize", "answer"));
+        graph
+            .node_statuses
+            .insert("answer".into(), ExecutionNodeStatus::Ready);
+        assert!(!services.graph_executors_are_bound(&graph).unwrap());
+        let expected = ticket_for(&graph, 3);
+        bind(&services, expected.clone(), &backend, &queries);
+        assert!(services.graph_executors_are_bound(&graph).unwrap());
+        assert_eq!(queries.lock().unwrap().as_slice(), &[expected]);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_terminal_only_graph_needs_no_live_resolver() {
+        let (_root, services) = fixture();
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut graph = ExecutionGraph::new("terminal nodes have no live host requirement");
+        for kind in SCOPED_KINDS {
+            graph.nodes.push(node(kind, kind));
+            bind(
+                &services,
+                ticket_for(&graph, graph.nodes.len() - 1),
+                &backend,
+                &queries,
+            );
+        }
+        drop(backend);
+        for status in [
+            ExecutionNodeStatus::Completed,
+            ExecutionNodeStatus::Blocked,
+            ExecutionNodeStatus::Failed,
+            ExecutionNodeStatus::Cancelled,
+        ] {
+            for node in &graph.nodes {
+                graph.node_statuses.insert(node.id.clone(), status);
+            }
+            assert!(
+                services.graph_executors_are_bound(&graph).unwrap(),
+                "{status:?}"
+            );
+        }
+        assert!(queries.lock().unwrap().is_empty());
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_foreign_or_expired_synthesize_resolver_is_not_bound() {
+        let (_root, services) = fixture();
+        let graph = single_node_graph("synthesize");
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut foreign = ticket_for(&graph, 0);
+        foreign.graph_id.push_str(":another-session-graph");
+        bind(&services, foreign, &backend, &queries);
+        assert!(!services.graph_executors_are_bound(&graph).unwrap());
+        bind(&services, ticket_for(&graph, 0), &backend, &queries);
+        assert!(services.graph_executors_are_bound(&graph).unwrap());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        drop(backend);
+        assert!(!services.graph_executors_are_bound(&graph).unwrap());
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_default_attempt_and_agent_executor_semantics_are_preserved() {
+        let (_root, services) = fixture();
+        let mut graph = single_node_graph("tool_batch");
+        graph.recovery_cursor.node_attempts.clear();
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = ticket_for(&graph, 0);
+        expected.attempt = 1;
+        bind(&services, expected, &backend, &queries);
+        assert!(services.graph_executors_are_bound(&graph).unwrap());
+        assert_eq!(queries.lock().unwrap()[0].attempt, 1);
+        let agent_graph = single_node_graph("agent_task");
+        assert!(services.graph_executors_are_bound(&agent_graph).unwrap());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    fn persist_ready_synthesize(services: &RuntimeServices) -> ExecutionGraph {
+        persist_ready_synthesize_for_session(services, None)
+    }
+
+    fn persist_ready_synthesize_for_session(
+        services: &RuntimeServices,
+        session: Option<&str>,
+    ) -> ExecutionGraph {
+        let mut graph = ExecutionGraph::new("terminal predecessor and recovered synthesize");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        if let Some(session) = session {
+            graph.lineage.as_mut().unwrap().session_id = session.to_string();
+        }
+        graph.nodes = vec![
+            node("tool_batch", "predecessor"),
+            node("synthesize", "answer"),
+        ];
+        if session.is_some() {
+            for node in &mut graph.nodes {
+                node.idempotency_key = format!("{}:{}", graph.id, node.id);
+            }
+        }
+        graph.edges.push(ExecutionEdge {
+            from: "predecessor".into(),
+            to: "answer".into(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        let mut graph = services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "predecessor",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let predecessor = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "predecessor")
+            .unwrap();
+        let binding = crate::execution_core::graph::ExecutionNodeBinding {
+            executor_kind: predecessor.executor_kind.clone(),
+            ticket_idempotency_key: predecessor.idempotency_key.clone(),
+            attempt: 1,
+            resource_lease_refs: Vec::new(),
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        graph = services
+            .commit_service()
+            .bind_and_start_node(&graph, "predecessor", binding)
+            .unwrap()
+            .graph;
+        graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "predecessor",
+                ExecutionNodeStatus::Completed,
+                Some(completed_result("predecessor")),
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "answer",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph
+    }
+
+    async fn assert_original_graph_completed(
+        services: &RuntimeServices,
+        before: &ExecutionGraph,
+        backend: &ReadinessBackend,
+    ) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            services
+                .execution_supervisor()
+                .wait_for_quiescence(&before.id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let after = services.graph_state_store().load(&before.id).unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(
+            after.node_statuses["predecessor"],
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(
+            after.node_statuses["answer"],
+            ExecutionNodeStatus::Completed
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_terminal_predecessor_unbound_synthesize_stays_deferred() {
+        let (_root, services) = fixture();
+        let before = persist_ready_synthesize(&services);
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut foreign = ticket_for(&before, 1);
+        foreign.graph_id.push_str(":foreign");
+        bind(&services, foreign, &backend, &queries);
+        let report = services
+            .recover_execution_graphs_on_startup()
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty());
+        assert_eq!(report.notified_graphs, 0);
+        assert_eq!(report.deferred_graphs, 1);
+        assert!(report.records.iter().any(|record| {
+            record.graph_id == before.id && record.action == "deferred_turn_scoped_executor_binding"
+        }));
+        assert_eq!(
+            services.graph_state_store().load(&before.id).unwrap(),
+            before
+        );
+        services
+            .execution_supervisor()
+            .notify_graph(&before.id)
+            .await
+            .unwrap();
+        assert_eq!(services.release_recovered_producers().await.unwrap(), 0);
+        assert_eq!(
+            services.graph_state_store().load(&before.id).unwrap(),
+            before
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        bind(&services, ticket_for(&before, 1), &backend, &queries);
+        assert!(services.graph_executors_are_bound(&before).unwrap());
+        services
+            .execution_supervisor()
+            .notify_graph(&before.id)
+            .await
+            .unwrap();
+        assert_original_graph_completed(&services, &before, &backend).await;
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_partition_keeps_healthy_graph_live_and_blocks_original_failed_graph() {
+        let (_root, services) = fixture();
+        let healthy =
+            persist_ready_synthesize_for_session(&services, Some("healthy-recovery-session"));
+        let failed =
+            persist_ready_synthesize_for_session(&services, Some("failed-recovery-session"));
+        let healthy_backend = ReadinessBackend::new();
+        let failed_backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        bind(
+            &services,
+            ticket_for(&healthy, 1),
+            &healthy_backend,
+            &queries,
+        );
+        bind(&services, ticket_for(&failed, 1), &failed_backend, &queries);
+        services
+            .execution_supervisor()
+            .notify_graph(&healthy.id)
+            .await
+            .unwrap();
+        services
+            .execution_supervisor()
+            .notify_graph(&failed.id)
+            .await
+            .unwrap();
+        services
+            .install_startup_recovery_exclusions(std::collections::BTreeSet::from([
+                "failed-recovery-session".into(),
+            ]))
+            .unwrap();
+        assert_eq!(
+            services.session_recovery_exclusions(),
+            vec!["failed-recovery-session"]
+        );
+        assert_eq!(services.release_recovered_producers().await.unwrap(), 1);
+        assert_original_graph_completed(&services, &healthy, &healthy_backend).await;
+        let ticket = ticket_for(&healthy, 1);
+        let effect_stream =
+            crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(&ticket);
+        let intent = services
+            .event_store()
+            .event_by_idempotency_key(
+                &effect_stream,
+                &format!("{}:intent", ticket.idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        let receipt = services
+            .event_store()
+            .event_by_idempotency_key(
+                &effect_stream,
+                &format!("{}:receipt", ticket.idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.kind, "execution.effect.intent");
+        assert_eq!(receipt.kind, "execution.effect.receipt");
+        assert!(intent.activity_binding().is_none());
+        assert!(receipt.activity_binding().is_none());
+        assert_eq!(intent.payload, serde_json::to_value(&ticket).unwrap());
+        assert!(
+            matches!(services.commit_service().inspect_execution_effect(&ticket).unwrap(),
+            crate::execution_core::graph::ExecutionEffectState::Completed(outcome)
+            if outcome.result.status == ExecutionNodeStatus::Completed)
+        );
+        let denied = services
+            .execution_supervisor()
+            .notify_graph(&failed.id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(denied, crate::execution_core::graph::ExecutionRunnerError::MutationBlocked(reason)
+            if reason == "session_recovery_quarantined:failed-recovery-session")
+        );
+        let command = harness_contract::execution_graph::ExecutionGraphCommand::Cancel {
+            expected_revision: failed.revision,
+            reason: "must not mutate quarantined graph".into(),
+        };
+        let denied = services
+            .execution_supervisor()
+            .command(&failed.id, command.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(denied, crate::execution_core::graph::ExecutionRunnerError::MutationBlocked(reason)
+            if reason == "session_recovery_quarantined:failed-recovery-session")
+        );
+        let denied = services
+            .commit_service()
+            .apply_command(&failed, &command)
+            .err()
+            .expect("quarantined command must fail");
+        assert!(
+            matches!(denied, crate::execution_core::graph::ExecutionCommitError::EventStore(
+            crate::RuntimeEventStoreError::InvalidTransaction(reason))
+            if reason == "session_recovery_quarantined:failed-recovery-session")
+        );
+        assert_eq!(
+            services.graph_state_store().load(&failed.id).unwrap(),
+            failed
+        );
+        assert_eq!(failed_backend.calls.load(Ordering::SeqCst), 0);
+        let denied = services
+            .install_startup_recovery_exclusions(std::collections::BTreeSet::new())
+            .unwrap_err();
+        assert!(denied
+            .to_string()
+            .contains("startup_recovery_partition_already_released"));
+        assert_eq!(
+            services.session_recovery_exclusions(),
+            vec!["failed-recovery-session"]
+        );
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_partition_keeps_original_governed_root_read_receipt() {
+        use crate::bound_tool_batch::scope_admission_tests::bound_request;
+        use crate::execution_core::graph::ExecutionNodeBinding;
+        use serde_json::json;
+
+        let (root_dir, services) = fixture();
+        let failed =
+            persist_ready_synthesize_for_session(&services, Some("failed-recovery-session"));
+        let workspace = root_dir.path().join("workspace");
+        std::fs::write(workspace.join("partition-proof.txt"), "original bytes").unwrap();
+        let host = tools::ToolHost::builtin("partition-root-read", &workspace);
+        let request = bound_request(&host, "read_file", json!({"path":"partition-proof.txt"}));
+        let mut graph = ExecutionGraph::new("healthy governed root");
+        graph.id = "scope2-graph".into();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "scope2-session".into(),
+            turn_id: "scope2-turn".into(),
+            root_task_id: "scope2-task".into(),
+            task_id: "scope2-task".into(),
+            generation: 1,
+        });
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", "scope2");
+        node.id = "scope2-node".into();
+        graph.nodes.push(node);
+        let mut graph = services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "scope2-node",
+                ExecutionNodeStatus::Ready,
+                None,
+                vec![],
+            )
+            .unwrap()
+            .graph;
+        graph = services
+            .commit_service()
+            .bind_and_start_node(
+                &graph,
+                "scope2-node",
+                ExecutionNodeBinding {
+                    executor_kind: "tool_batch".into(),
+                    ticket_idempotency_key: "scope2-ticket".into(),
+                    attempt: 1,
+                    resource_lease_refs: vec![],
+                    scope_lease_ref: None,
+                    worktree_lease_ref: None,
+                },
+            )
+            .unwrap()
+            .graph;
+        let owner = services
+            .event_store()
+            .latest_for_stream("scope2-graph:node:scope2-node")
+            .unwrap()
+            .unwrap()
+            .activity_binding()
+            .unwrap();
+        let root = crate::CowdExecutionContext {
+            execution_id: graph.id.clone(),
+            session_id: "scope2-session".into(),
+            turn_id: "scope2-turn".into(),
+        };
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(&workspace).unwrap();
+        let effect = &request.compiled_invocation.as_ref().unwrap().effect;
+        let scope = crate::bound_tool_batch::admitted_effect_scope(
+            &request,
+            effect,
+            Some(host.pin_snapshot()),
+            &resolver,
+        )
+        .unwrap();
+        services
+            .install_startup_recovery_exclusions(std::collections::BTreeSet::from([
+                "failed-recovery-session".into(),
+            ]))
+            .unwrap();
+        services
+            .commit_service()
+            .begin_root_read_acquisition(&request, effect, &root, &scope, &owner, 1)
+            .unwrap();
+        let content = std::fs::read_to_string(workspace.join("partition-proof.txt")).unwrap();
+        let outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id:request.tool_use_id.clone(), tool_name:request.tool_name.clone(),
+            status:crate::RuntimeToolExecutionStatus::Executed, category:request.category,
+            output:Some(json!({"type":"text","truncated":false,"file":{
+                "filePath":"partition-proof.txt","content":content,"startLine":1,"numLines":1,"totalLines":1,
+                "sha256":crate::context_evidence::read_sha256(content.as_bytes()),
+                "byteLength":content.len(),"endsWithNewline":false,
+            }}).to_string()), error:None, evidence_ref:"partition-root-read".into(), observed_evidence:vec![],
+        };
+        services
+            .commit_service()
+            .commit_root_read_acquisition(&request, &outcome, effect, &root, &scope)
+            .unwrap();
+        let primary = services
+            .event_store()
+            .event_by_idempotency_key(
+                &format!("execution-effect:{}", request.idempotency_key),
+                &format!("{}:read-receipt", request.idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        let index = services
+            .event_store()
+            .event_by_idempotency_key(
+                "execution-agent-receipts:scope2-graph:scope2-node:1",
+                &format!("agent-tool-receipt:{}", request.idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(primary.kind, "execution.read.receipt");
+        assert_eq!(index.kind, "execution.agent_tool.receipt");
+        assert!(primary.activity_binding().is_none());
+        assert!(index.activity_binding().is_none());
+        assert_eq!(primary.transaction_id, index.transaction_id);
+        assert_eq!(primary.commit_cursor, index.commit_cursor);
+        assert_eq!(primary.payload["replay"]["session_id"], "scope2-session");
+        assert_eq!(
+            primary.payload["root_effect_owner"]["binding"],
+            serde_json::to_value(&owner).unwrap()
+        );
+        assert_eq!(
+            primary.payload["root_effect_owner"],
+            index.payload["root_effect_owner"]
+        );
+        assert!(services
+            .commit_service()
+            .completed_tool_effect(&request, effect)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("partition-proof.txt")).unwrap(),
+            "original bytes"
+        );
+        assert_eq!(
+            services.graph_state_store().load(&failed.id).unwrap(),
+            failed
+        );
+        assert_eq!(
+            services.session_recovery_exclusions(),
+            vec!["failed-recovery-session"]
+        );
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_in_memory_original_graph_uses_persistent_binding_owner() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let before = persist_ready_synthesize(&services);
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        bind(&services, ticket_for(&before, 1), &backend, &queries);
+        services
+            .execution_supervisor()
+            .notify_graph(&before.id)
+            .await
+            .unwrap();
+        assert_original_graph_completed(&services, &before, &backend).await;
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_release_missing_graph_propagates_actual_load_error() {
+        let (_root, services) = fixture();
+        let before = persist_ready_synthesize(&services);
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        bind(&services, ticket_for(&before, 1), &backend, &queries);
+        assert!(services.graph_executors_are_bound(&before).unwrap());
+        assert!(!services.execution_supervisor().graph_producers_released());
+        let missing_graph_id = format!("zzzz-missing-release:{}", before.id);
+        assert!(before.id < missing_graph_id);
+        services
+            .execution_supervisor()
+            .notify_graph(&before.id)
+            .await
+            .unwrap();
+        services
+            .execution_supervisor()
+            .notify_graph(&missing_graph_id)
+            .await
+            .unwrap();
+        let deferred = services
+            .execution_supervisor()
+            .deferred_recovered_graphs()
+            .unwrap();
+        assert_eq!(deferred, vec![before.id.clone(), missing_graph_id.clone()]);
+        let error = services.release_recovered_producers().await.unwrap_err();
+        match error {
+            super::RuntimeServicesError::GraphState(
+                crate::execution_core::graph::ExecutionStateStoreError::NotFound {
+                    graph_id, ..
+                },
+            ) => assert_eq!(graph_id, missing_graph_id),
+            other => panic!("expected original graph load error, got {other:?}"),
+        }
+        assert_eq!(
+            services.graph_state_store().load(&before.id).unwrap(),
+            before
+        );
+        assert!(!services.execution_supervisor().graph_producers_released());
+        assert_eq!(
+            services.execution_supervisor().deferred_recovered_graphs(),
+            Some(deferred)
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(services.execution_supervisor().health().active_drivers, 0);
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_release_closed_supervisor_retains_closed_gate_and_deferred() {
+        let (_root, services) = fixture();
+        let before = persist_ready_synthesize(&services);
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        bind(&services, ticket_for(&before, 1), &backend, &queries);
+        assert!(services.graph_executors_are_bound(&before).unwrap());
+        assert!(!services.execution_supervisor().graph_producers_released());
+        services
+            .execution_supervisor()
+            .notify_graph(&before.id)
+            .await
+            .unwrap();
+        let deferred = services
+            .execution_supervisor()
+            .deferred_recovered_graphs()
+            .unwrap();
+        let shutdown = services.execution_supervisor().shutdown().await;
+        assert_eq!(shutdown.forced_aborts, 0);
+        assert!(shutdown.errors.is_empty());
+        assert!(services.graph_executors_are_bound(&before).unwrap());
+        let error = services.release_recovered_producers().await.unwrap_err();
+        match error {
+            super::RuntimeServicesError::GraphRunner(
+                crate::execution_core::graph::ExecutionRunnerError::SupervisorUnavailable(reason),
+            ) => assert_eq!(reason, "shutdown has started"),
+            other => panic!("expected original supervisor readiness error, got {other:?}"),
+        }
+        assert_eq!(
+            services.graph_state_store().load(&before.id).unwrap(),
+            before
+        );
+        assert!(!services.execution_supervisor().graph_producers_released());
+        assert_eq!(
+            services.execution_supervisor().deferred_recovered_graphs(),
+            Some(deferred)
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(services.execution_supervisor().health().active_drivers, 0);
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn r1_recovery_bound_synthesize_resumes_original_graph() {
+        let (_root, services) = fixture();
+        let before = persist_ready_synthesize(&services);
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        bind(&services, ticket_for(&before, 1), &backend, &queries);
+        let report = services
+            .recover_execution_graphs_on_startup()
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty());
+        assert_eq!(report.notified_graphs, 0);
+        assert_eq!(report.deferred_graphs, 1);
+        assert!(report.records.iter().any(|record| {
+            record.graph_id == before.id && record.action == "queued_for_recovery_release"
+        }));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(services.release_recovered_producers().await.unwrap(), 1);
+        assert_original_graph_completed(&services, &before, &backend).await;
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
     }
 }

@@ -30,6 +30,282 @@ const MAX_MAP_ITEMS: usize = 200;
 const MAX_REPEAT: usize = 25;
 const MAX_TOTAL_CALLS: usize = 400;
 
+pub(crate) fn original_static_file_scopes(
+    tool_id: &str,
+    input: &Value,
+) -> Result<Vec<harness_contract::goal::ProofEffectScopePurpose>, String> {
+    use harness_contract::goal::{ProofEffectPurpose, ProofEffectScopePurpose};
+    use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+    use std::path::{Component, Path};
+
+    let mut scopes = Vec::new();
+    let mut add =
+        |operation: &PermissionOperation, target: Option<String>, purpose: ProofEffectPurpose| {
+            scopes.push(ProofEffectScopePurpose {
+                declared_scope: PermissionScope {
+                    resource: PermissionResource::File,
+                    operation: operation.clone(),
+                    target,
+                },
+                purpose,
+            });
+        };
+    let read = &PermissionOperation::Read;
+    let write = &PermissionOperation::Write;
+    let path = |value: Option<&Value>| {
+        value.and_then(Value::as_str).and_then(|value| {
+            (!value.trim().is_empty()
+                && Path::new(value)
+                    .components()
+                    .any(|component| component != Component::CurDir))
+            .then(|| value.to_string())
+        })
+    };
+    let directory_path = |value: Option<&Value>| {
+        path(value).or_else(|| {
+            value.and_then(Value::as_str).and_then(|value| {
+                (!value.trim().is_empty()
+                    && Path::new(value)
+                        .components()
+                        .all(|component| component == Component::CurDir))
+                .then(|| ".".to_string())
+            })
+        })
+    };
+    match tool_id {
+        "glob_search" | "grep_search" => {
+            let batch_key = if tool_id == "glob_search" {
+                "patterns"
+            } else {
+                "searches"
+            };
+            let requests = input
+                .get(batch_key)
+                .and_then(Value::as_array)
+                .map(|requests| requests.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![input]);
+            for request in requests {
+                let target = if tool_id == "glob_search"
+                    && request
+                        .get("pattern")
+                        .and_then(Value::as_str)
+                        .is_none_or(|pattern| {
+                            pattern.contains('/') || pattern.contains('\\') || pattern == ".."
+                        }) {
+                    None
+                } else {
+                    directory_path(request.get("path"))
+                };
+                add(read, target, ProofEffectPurpose::InputRead);
+            }
+        }
+        "workspace_snapshot" => {
+            if let Some(roots) = input.get("roots").and_then(Value::as_array) {
+                for root in roots {
+                    add(read, directory_path(Some(root)), ProofEffectPurpose::InputRead);
+                }
+            } else {
+                add(read, None, ProofEffectPurpose::InputRead);
+            }
+        }
+        "checkpoint" | "checkpoint_list" | "checkpoint_diff" => {
+            let action = match tool_id {
+                "checkpoint_list" => "list",
+                "checkpoint_diff" => "diff",
+                _ => input
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            };
+            if matches!(action, "diff" | "restore") {
+                if let Some(id) = input.get("id").and_then(Value::as_str) {
+                    if Path::new(id)
+                        .components()
+                        .any(|component| !matches!(component, Component::Normal(_)))
+                    {
+                        return Err("checkpoint id is not a bounded storage child".into());
+                    }
+                }
+            }
+            match action {
+                "list" => add(
+                    read,
+                    Some(".cowd/checkpoints".into()),
+                    ProofEffectPurpose::InputRead,
+                ),
+                "diff" => add(read, None, ProofEffectPurpose::InputRead),
+                "create" => {
+                    if let Some(paths) = input
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .filter(|paths| !paths.is_empty())
+                    {
+                        for target in paths {
+                            add(read, path(Some(target)), ProofEffectPurpose::InputRead);
+                        }
+                    } else {
+                        add(read, None, ProofEffectPurpose::InputRead);
+                    }
+                    add(
+                        write,
+                        Some(".cowd/checkpoints".into()),
+                        ProofEffectPurpose::BusinessEffect,
+                    );
+                }
+                "restore" => {
+                    add(read, None, ProofEffectPurpose::InputRead);
+                    add(write, None, ProofEffectPurpose::BusinessEffect);
+                }
+                _ => return Err("checkpoint action has no proven filesystem envelope".into()),
+            }
+        }
+        "edit" => {
+            let action = input
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match action {
+                "write" | "replace" | "patch" => {
+                    if action == "patch" {
+                        let edits = input
+                            .get("edits")
+                            .and_then(Value::as_array)
+                            .filter(|edits| !edits.is_empty())
+                            .ok_or("edit patch has no proven file targets")?;
+                        for edit in edits {
+                            let target = path(edit.get("path"))
+                                .ok_or("edit patch has an invalid file target")?;
+                            add(read, Some(target), ProofEffectPurpose::InputRead);
+                        }
+                    } else {
+                        let target =
+                            path(input.get("path")).ok_or("edit has no proven file target")?;
+                        add(read, Some(target), ProofEffectPurpose::InputRead);
+                    }
+                    add(
+                        write,
+                        Some(".cowd/checkpoints".into()),
+                        ProofEffectPurpose::AutoCheckpointMaintenance,
+                    );
+                }
+                "notebook" => add(
+                    read,
+                    path(input.get("notebook_path")),
+                    ProofEffectPurpose::InputRead,
+                ),
+                "preview" => {}
+                _ => return Err("edit action has no proven filesystem envelope".into()),
+            }
+        }
+        "vision_analyze" => add(
+            read,
+            path(input.get("image_path")),
+            ProofEffectPurpose::InputRead,
+        ),
+        "lsp" if input.get("action").and_then(Value::as_str) == Some("diagnostics") => {}
+        "lsp" => return Err("LSP registered server root is not a proven lease workspace".into()),
+        "ask" if input.get("message").is_some() => {
+            if let Some(attachments) = input.get("attachments").and_then(Value::as_array) {
+                for attachment in attachments {
+                    add(read, path(Some(attachment)), ProofEffectPurpose::InputRead);
+                }
+            }
+        }
+        "todo_write" => {
+            let target = super::todo_store_path(Path::new("."));
+            let target = target.to_string_lossy().into_owned();
+            add(read, Some(target.clone()), ProofEffectPurpose::InputRead);
+            add(write, Some(target), ProofEffectPurpose::BusinessEffect);
+        }
+        "config" => {
+            if let Some(spec) = input
+                .get("setting")
+                .and_then(Value::as_str)
+                .and_then(|setting| super::supported_config_setting(setting.trim()))
+            {
+                let target = super::config_file_for_scope(spec.scope, Path::new("."))?;
+                let target =
+                    if matches!(spec.scope, super::ConfigScope::Global) && target.is_relative() {
+                        std::env::current_dir()
+                            .map_err(|error| error.to_string())?
+                            .join(target)
+                    } else {
+                        target
+                    }
+                    .to_string_lossy()
+                    .into_owned();
+                add(read, Some(target.clone()), ProofEffectPurpose::InputRead);
+                if input.get("value").is_some_and(|value| !value.is_null()) {
+                    add(write, Some(target), ProofEffectPurpose::BusinessEffect);
+                }
+            }
+        }
+        "plan_mode" => {
+            for target in [
+                super::config_file_for_scope(super::ConfigScope::Settings, Path::new("."))?,
+                super::plan_mode_state_file(Path::new("."))?,
+            ] {
+                let target = target.to_string_lossy().into_owned();
+                add(read, Some(target.clone()), ProofEffectPurpose::InputRead);
+                add(write, Some(target), ProofEffectPurpose::BusinessEffect);
+            }
+        }
+        "skill" => {
+            let action = input
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let store =
+                skill::ManagedSkillStore::default_for_user().map_err(|error| error.to_string())?;
+            let store_root = if store.root().is_relative() {
+                std::env::current_dir()
+                    .map_err(|error| error.to_string())?
+                    .join(store.root())
+            } else {
+                store.root().to_path_buf()
+            }
+            .to_string_lossy()
+            .into_owned();
+            add(
+                read,
+                Some(store_root.clone()),
+                ProofEffectPurpose::InputRead,
+            );
+            if action != "status" && action != "install_plan" {
+                add(write, Some(store_root), ProofEffectPurpose::BusinessEffect);
+            }
+            if matches!(action, "install_plan" | "install_commit") {
+                let source = input
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                if !source.starts_with("https://github.com/") && !source.starts_with("github://") {
+                    add(
+                        read,
+                        path(input.get("source")),
+                        ProofEffectPurpose::InputRead,
+                    );
+                }
+                let temporary = std::env::temp_dir();
+                let temporary = if temporary.is_relative() {
+                    std::env::current_dir()
+                        .map_err(|error| error.to_string())?
+                        .join(temporary)
+                } else {
+                    temporary
+                }
+                .to_string_lossy()
+                .into_owned();
+                add(read, Some(temporary.clone()), ProofEffectPurpose::InputRead);
+                add(write, Some(temporary), ProofEffectPurpose::BusinessEffect);
+            }
+        }
+        _ => {}
+    }
+    Ok(scopes)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OrchestrateInput {
@@ -169,13 +445,8 @@ struct Condition {
 type State = BTreeMap<String, Value>;
 
 pub(crate) fn run_orchestrate(lease: &ToolHostLease, input: &Value) -> Result<String, String> {
-    let parsed: OrchestrateInput = crate::executor::from_value(input)?;
-    if parsed.steps.len() > MAX_STEPS {
-        return Err(format!(
-            "tool_orchestrate supports at most {MAX_STEPS} steps; got {}",
-            parsed.steps.len()
-        ));
-    }
+    let (parsed, calls) = parse_preflight(input)?;
+    lease.orchestration_child_effects(&calls)?;
     let mut state: State = BTreeMap::new();
     let mut total_calls = 0usize;
     let mut calls_trace: Vec<Value> = Vec::new();
@@ -296,36 +567,126 @@ pub fn requested_sub_call_tools(tool_name: &str, input: &Value) -> SubCallAuthor
     if tool_name != "tool_orchestrate" {
         return SubCallAuthorization::NotOrchestration;
     }
-    let parsed: OrchestrateInput = match serde_json::from_value(input.clone()) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            return SubCallAuthorization::Invalid(format!(
-                "tool_orchestrate input is invalid: {error}"
-            ))
-        }
+    let calls = match effect_preflight(input) {
+        Ok(calls) => calls,
+        Err(error) => return SubCallAuthorization::Invalid(error),
     };
-    let mut names = Vec::new();
-    for step in &parsed.steps {
-        match &step.kind {
-            StepKind::Call { tool, .. }
-            | StepKind::Map { tool, .. }
-            | StepKind::When { tool, .. }
-            | StepKind::Repeat { tool, .. } => names.push(tool.clone()),
-            StepKind::Batch { calls, .. } => {
-                names.extend(calls.iter().map(|call| call.tool.clone()));
-            }
-            StepKind::Compute { .. } => names.push("execute_code".to_string()),
-            StepKind::Filter { .. } | StepKind::Collect { .. } => {}
-        }
-    }
-    if let Some(bad) = names.iter().find(|name| name.contains('$')) {
-        return SubCallAuthorization::Invalid(format!(
-            "orchestrated tool name `{bad}` must be a literal, not a $reference"
-        ));
-    }
+    let mut names = calls.into_iter().map(|call| call.tool).collect::<Vec<_>>();
     names.sort();
     names.dedup();
     SubCallAuthorization::Requires(names)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreflightCall {
+    pub step_id: String,
+    pub operation: &'static str,
+    pub tool: String,
+    pub input: Value,
+    pub references: Vec<Vec<String>>,
+    pub maximum_calls: usize,
+}
+
+pub(crate) fn effect_preflight(input: &Value) -> Result<Vec<PreflightCall>, String> {
+    parse_preflight(input).map(|(_, calls)| calls)
+}
+
+fn parse_preflight(input: &Value) -> Result<(OrchestrateInput, Vec<PreflightCall>), String> {
+    let parsed: OrchestrateInput = serde_json::from_value(input.clone())
+        .map_err(|error| format!("tool_orchestrate input is invalid: {error}"))?;
+    if parsed.steps.len() > MAX_STEPS {
+        return Err(format!(
+            "tool_orchestrate supports at most {MAX_STEPS} steps"
+        ));
+    }
+    let mut calls = Vec::new();
+    let mut declared_calls = 0usize;
+    for step in &parsed.steps {
+        let (operation, _) = step_descriptor(&step.kind);
+        let mut append = |tool: &str, input: &Value, maximum_calls: usize, compute: bool| {
+            if tool.contains('$') || !is_allowed_orchestration_tool(tool) {
+                return Err(format!(
+                    "tool_orchestrate cannot dispatch `{tool}`: expected an allowed literal tool"
+                ));
+            }
+            let mut references = Vec::new();
+            let value = if compute { &input["input"] } else { input };
+            let mut path = if compute {
+                vec!["input".to_string()]
+            } else {
+                Vec::new()
+            };
+            transform_value(value, &mut path, &mut |reference, path| {
+                references.push(path.to_vec());
+                Ok(Value::String(reference.to_string()))
+            })?;
+            calls.push(PreflightCall {
+                step_id: step.id.clone(),
+                operation,
+                tool: tool.to_string(),
+                input: input.clone(),
+                references,
+                maximum_calls,
+            });
+            Ok::<(), String>(())
+        };
+        match &step.kind {
+            StepKind::Call { tool, input } | StepKind::When { tool, input, .. } => {
+                append(tool, input, 1, false)?;
+                if matches!(&step.kind, StepKind::Call { .. }) {
+                    declared_calls += 1;
+                }
+            }
+            StepKind::Batch { calls, .. } => {
+                if calls.len() > MAX_MAP_ITEMS {
+                    return Err(format!("batch exceeds the limit of {MAX_MAP_ITEMS}"));
+                }
+                for call in calls {
+                    append(&call.tool, &call.input, 1, false)?;
+                }
+                declared_calls += calls.len();
+            }
+            StepKind::Map { tool, input, .. } => {
+                append(tool, input, MAX_MAP_ITEMS, false)?;
+            }
+            StepKind::Repeat {
+                tool, input, max, ..
+            } => {
+                if *max > MAX_REPEAT {
+                    return Err(format!("repeat exceeds the limit of {MAX_REPEAT}"));
+                }
+                append(tool, input, *max, false)?;
+            }
+            StepKind::Compute {
+                language,
+                code,
+                input,
+            } => {
+                if !matches!(
+                    language.trim().to_ascii_lowercase().as_str(),
+                    "python" | "py" | "javascript" | "js" | "node"
+                ) {
+                    return Err(format!(
+                        "compute supports python or javascript, got `{language}`"
+                    ));
+                }
+                append(
+                    "execute_code",
+                    &json!({"language": language, "code": code, "input": input, "input_files": []}),
+                    1,
+                    true,
+                )?;
+                declared_calls += 1;
+            }
+            StepKind::Filter { .. } | StepKind::Collect { .. } => {}
+        }
+        if declared_calls > MAX_TOTAL_CALLS {
+            return Err(format!(
+                "tool_orchestrate exceeded the total sub-call limit of {MAX_TOTAL_CALLS}"
+            ));
+        }
+    }
+    Ok((parsed, calls))
 }
 
 fn evaluate(
@@ -411,10 +772,11 @@ fn evaluate(
                 ));
             }
             // Bounded parallel fan-out, matching `read_many`/`grep_many`.
-            let results = crate::executor::run_ordered_batch(items.clone(), max_concurrency, |item| {
-                let resolved = resolve_value(input, state, Some(&item))?;
-                call_tool_uncounted(lease, tool, &resolved)
-            });
+            let results =
+                crate::executor::run_ordered_batch(items.clone(), max_concurrency, |item| {
+                    let resolved = resolve_value(input, state, Some(&item))?;
+                    call_tool_uncounted(lease, tool, &resolved)
+                });
             *total_calls += items.len();
             let collect = matches!(on_error, Some(OnError::Collect));
             let mut outputs = Vec::with_capacity(results.len());
@@ -575,10 +937,18 @@ fn run_compute(
         }
     };
     let result = crate::sandbox_exec::execute_code_in_workspace(
-        language,
+        if matches!(
+            language.trim().to_ascii_lowercase().as_str(),
+            "python" | "py"
+        ) {
+            "python"
+        } else {
+            "javascript"
+        },
         &source,
         None,
         lease.workspace_root(),
+        &[],
     );
     if result.exit_code != 0 {
         return Err(format!(
@@ -702,16 +1072,37 @@ fn resolve_ref(expr: &str, state: &State, item: Option<&Value>) -> Result<Value,
 }
 
 fn resolve_value(value: &Value, state: &State, item: Option<&Value>) -> Result<Value, String> {
+    transform_value(value, &mut Vec::new(), &mut |reference, _| {
+        resolve_ref(reference, state, item)
+    })
+}
+
+fn transform_value(
+    value: &Value,
+    path: &mut Vec<String>,
+    reference: &mut impl FnMut(&str, &[String]) -> Result<Value, String>,
+) -> Result<Value, String> {
     match value {
-        Value::String(text) if is_reference(text) => resolve_ref(text, state, item),
+        Value::String(text) if is_reference(text) => reference(text, path),
         Value::Array(items) => items
             .iter()
-            .map(|entry| resolve_value(entry, state, item))
+            .enumerate()
+            .map(|(index, entry)| {
+                path.push(index.to_string());
+                let result = transform_value(entry, path, reference);
+                path.pop();
+                result
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         Value::Object(entries) => entries
             .iter()
-            .map(|(key, entry)| Ok((key.clone(), resolve_value(entry, state, item)?)))
+            .map(|(key, entry)| {
+                path.push(key.clone());
+                let result = transform_value(entry, path, reference);
+                path.pop();
+                Ok((key.clone(), result?))
+            })
             .collect::<Result<Map<String, Value>, String>>()
             .map(Value::Object),
         other => Ok(other.clone()),
@@ -733,6 +1124,77 @@ fn is_reference(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_uses_explicit_empty_project_input_and_cannot_import_live_files() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-bounded-compute-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("live_only_module.py"), "secret=42").unwrap();
+        let lease = crate::ToolHost::builtin("bounded-compute", &root).pin_snapshot();
+        let program = json!({"steps":[{"id":"sum","op":"compute","language":"python","code":"print(sum(_input))","input":[2,3]}]});
+        let preflight = effect_preflight(&program).unwrap();
+        assert_eq!(preflight[0].input["input_files"], json!([]));
+        assert_eq!(
+            run_compute(&lease, "python", "print(sum(_input))", &json!([2, 3])).unwrap(),
+            json!(5)
+        );
+        assert!(run_compute(&lease, "python", "import live_only_module", &json!(null)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn static_scope_purposes_are_assigned_only_by_the_original_producer() {
+        use harness_contract::goal::ProofEffectPurpose;
+        use harness_contract::policy::PermissionOperation;
+
+        for action in ["write", "replace", "patch"] {
+            let input = json!({"action":action,"path":"src/a","edits":[{"path":"src/a"}]});
+            let scopes = original_static_file_scopes("edit", &input).unwrap();
+            assert!(scopes.iter().any(|entry| entry.declared_scope.operation
+                == PermissionOperation::Read
+                && entry.declared_scope.target.as_deref() == Some("src/a")
+                && entry.purpose == ProofEffectPurpose::InputRead));
+            assert_eq!(
+                scopes
+                    .iter()
+                    .filter(|entry| entry.purpose == ProofEffectPurpose::AutoCheckpointMaintenance)
+                    .count(),
+                1
+            );
+        }
+        for (tool, input) in [
+            ("checkpoint", json!({"action":"create","paths":["src/a"]})),
+            ("checkpoint", json!({"action":"restore","id":"snapshot"})),
+            ("checkpoint", json!({"action":"list"})),
+            (
+                "edit",
+                json!({"action":"notebook","notebook_path":".cowd/checkpoints"}),
+            ),
+            (
+                "grep_search",
+                json!({"path":".cowd/checkpoints","pattern":"needle"}),
+            ),
+        ] {
+            let scopes = original_static_file_scopes(tool, &input).unwrap();
+            assert!(!scopes
+                .iter()
+                .any(|entry| entry.purpose == ProofEffectPurpose::AutoCheckpointMaintenance));
+            assert!(scopes.iter().all(|entry| entry.purpose
+                == if entry.declared_scope.operation == PermissionOperation::Read {
+                    ProofEffectPurpose::InputRead
+                } else {
+                    ProofEffectPurpose::BusinessEffect
+                }));
+        }
+        for input in [
+            json!({"action":"write"}),
+            json!({"action":"patch","edits":[]}),
+            json!({"action":"unknown"}),
+        ] {
+            assert!(original_static_file_scopes("edit", &input).is_err());
+        }
+    }
 
     fn state_with(id: &str, value: Value) -> State {
         let mut state = State::new();
@@ -879,5 +1341,362 @@ mod tests {
             requested_sub_call_tools("tool_orchestrate", &json!({"bad": true})),
             SubCallAuthorization::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn original_file_executors_and_their_static_descriptors_agree() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource};
+        let root = std::env::temp_dir().join(format!(
+            "cowd-original-file-owners-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(root.join("tests/b.rs"), "fn needle_test() {}\n").unwrap();
+        std::fs::write(root.join("image.png"), [1u8, 2, 3]).unwrap();
+        let lease = crate::ToolHost::builtin("original-file-owners", &root).pin_snapshot();
+        for (tool, input, target, observed) in [
+            (
+                "glob_search",
+                json!({"path":"src","pattern":"*.rs"}),
+                "src",
+                "a.rs",
+            ),
+            (
+                "glob_search",
+                json!({"patterns":[{"path":"src","pattern":"*.rs"},{"path":"tests","pattern":"*.rs"}]}),
+                "tests",
+                "b.rs",
+            ),
+            (
+                "grep_search",
+                json!({"path":"src","pattern":"needle"}),
+                "src",
+                "needle",
+            ),
+            (
+                "grep_search",
+                json!({"searches":[{"path":"src","pattern":"needle"},{"path":"tests","pattern":"needle"}]}),
+                "tests",
+                "needle_test",
+            ),
+            (
+                "grep_search",
+                json!({"path":"src","pattern":"needle","language":"rust"}),
+                "src",
+                "needle",
+            ),
+            (
+                "workspace_snapshot",
+                json!({"roots":["src","tests"],"include_files":true}),
+                "src",
+                "a.rs",
+            ),
+            (
+                "read_file",
+                json!({"path":"src/a.rs"}),
+                "src/a.rs",
+                "needle",
+            ),
+            (
+                "vision_analyze",
+                json!({"image_path":"image.png","prompt":"describe"}),
+                "image.png",
+                "image_base64",
+            ),
+            (
+                "ask",
+                json!({"message":"attachment","attachments":["src/a.rs"]}),
+                "src/a.rs",
+                "src/a.rs",
+            ),
+        ] {
+            let effect = lease.describe_effect(tool, &input);
+            assert!(
+                effect
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.resource == PermissionResource::File
+                        && scope.operation == PermissionOperation::Read
+                        && scope.target.as_deref() == Some(target)),
+                "{tool}"
+            );
+            assert!(effect
+                .scopes
+                .iter()
+                .filter(|scope| scope.resource == PermissionResource::File)
+                .all(|scope| scope.operation == PermissionOperation::Read));
+            let output = execute_with_lease(&lease, tool, &input).unwrap();
+            assert!(output.contains(observed), "{tool}: {output}");
+            assert_eq!(
+                lease.describe_effect(tool, &input).descriptor_hash,
+                effect.descriptor_hash
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn original_checkpoint_create_diff_restore_and_control_storage_match_the_envelope() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource};
+        let root = std::env::temp_dir().join(format!(
+            "cowd-original-checkpoint-owners-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.txt"), "before").unwrap();
+        std::fs::write(root.join("outside.txt"), "original").unwrap();
+        let lease = crate::ToolHost::builtin("original-checkpoint-owners", &root).pin_snapshot();
+        let create = json!({"action":"create","label":"source-owner","paths":["src"]});
+        let created: Value =
+            serde_json::from_str(&execute_with_lease(&lease, "checkpoint", &create).unwrap())
+                .unwrap();
+        let id = created["id"].as_str().unwrap();
+        assert!(root
+            .join(".cowd/checkpoints")
+            .join(id)
+            .join("src/a.txt")
+            .is_file());
+        assert!(!root
+            .join(".cowd/checkpoints")
+            .join(id)
+            .join("outside.txt")
+            .exists());
+        for (operation, target) in [
+            (PermissionOperation::Read, "src"),
+            (PermissionOperation::Write, ".cowd/checkpoints"),
+        ] {
+            assert!(lease
+                .describe_effect("checkpoint", &create)
+                .scopes
+                .iter()
+                .any(|scope| scope.resource == PermissionResource::File
+                    && scope.operation == operation
+                    && scope.target.as_deref() == Some(target)));
+        }
+        std::fs::write(root.join("src/a.txt"), "after").unwrap();
+        std::fs::write(root.join("src/new.txt"), "remove on restore").unwrap();
+        std::fs::write(root.join("outside.txt"), "retained").unwrap();
+        let diff = json!({"action":"diff","id":id});
+        let difference: Value =
+            serde_json::from_str(&execute_with_lease(&lease, "checkpoint", &diff).unwrap())
+                .unwrap();
+        assert_eq!(difference["changedFiles"], json!(["src/a.txt"]));
+        assert_eq!(difference["addedFiles"], json!(["src/new.txt"]));
+        let list = json!({"action":"list"});
+        assert!(execute_with_lease(&lease, "checkpoint", &list)
+            .unwrap()
+            .contains(id));
+        for input in [&diff, &list] {
+            assert!(lease
+                .describe_effect("checkpoint", input)
+                .scopes
+                .iter()
+                .filter(|scope| scope.resource == PermissionResource::File)
+                .all(|scope| scope.operation == PermissionOperation::Read));
+        }
+        let restore = json!({"action":"restore","id":id});
+        let effect = lease.describe_effect("checkpoint", &restore);
+        for operation in [PermissionOperation::Read, PermissionOperation::Write] {
+            assert!(effect
+                .scopes
+                .iter()
+                .any(|scope| scope.resource == PermissionResource::File
+                    && scope.operation == operation
+                    && scope.target.is_none()));
+        }
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::Tool));
+        execute_with_lease(&lease, "checkpoint", &restore).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.txt")).unwrap(),
+            "before"
+        );
+        assert!(!root.join("src/new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("outside.txt")).unwrap(),
+            "retained"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn original_settings_and_todo_paths_are_derived_from_the_executable_owners() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource};
+        let root = std::env::temp_dir().join(format!(
+            "cowd-original-settings-owners-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let lease = crate::ToolHost::builtin("original-settings-owners", &root).pin_snapshot();
+        let read = lease.describe_effect("config", &json!({"setting":"model"}));
+        assert!(read
+            .scopes
+            .iter()
+            .filter(|scope| scope.resource == PermissionResource::File)
+            .all(|scope| scope.operation == PermissionOperation::Read));
+        execute_with_lease(
+            &lease,
+            "config",
+            &json!({"setting":"model","value":"fixture-model"}),
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(root.join(".cowd/config.local.yaml"))
+                .unwrap()
+                .contains("fixture-model")
+        );
+        let plan = json!({"action":"enter"});
+        let effect = lease.describe_effect("plan_mode", &plan);
+        for target in [
+            "./.cowd/config.local.yaml",
+            "./.cowd/tool-state/plan-mode.json",
+        ] {
+            for operation in [PermissionOperation::Read, PermissionOperation::Write] {
+                assert!(effect
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.resource == PermissionResource::File
+                        && scope.operation == operation
+                        && scope.target.as_deref() == Some(target)));
+            }
+        }
+        execute_with_lease(&lease, "plan_mode", &plan).unwrap();
+        assert!(root.join(".cowd/tool-state/plan-mode.json").is_file());
+        execute_with_lease(&lease, "plan_mode", &json!({"action":"exit"})).unwrap();
+        assert!(!root.join(".cowd/tool-state/plan-mode.json").exists());
+        let target = super::super::todo_store_path(std::path::Path::new("."))
+            .to_string_lossy()
+            .into_owned();
+        let todo = lease.describe_effect("todo_write", &json!({"path":"decoy","todos":[]}));
+        for operation in [PermissionOperation::Read, PermissionOperation::Write] {
+            assert!(todo
+                .scopes
+                .iter()
+                .any(|scope| scope.resource == PermissionResource::File
+                    && scope.operation == operation
+                    && scope.target.as_deref() == Some(target.as_str())));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_preflight_preserves_all_original_operations_occurrences_and_reference_rules() {
+        let program = json!({"steps":[
+            {"id":"first","op":"call","tool":"edit","input":{"action":"write","path":"a","content":"$prior.text"},"depends_on":["ignored"]},
+            {"id":"batch","op":"batch","on_error":"collect","calls":[
+                {"tool":"edit","as":"one","input":{"action":"write","path":"b","content":"literal"}},
+                {"tool":"edit","as":"two","input":{"action":"write","path":"c","content":"literal"}}
+            ]},
+            {"id":"map","op":"map","over":"$prior.list","tool":"read_file","input":{"path":"$item.path"},"field":"file"},
+            {"id":"filter","op":"filter","over":"$map","field":"x","equals":true},
+            {"id":"collect","op":"collect","over":"$filter","agg":"count"},
+            {"id":"compute","op":"compute","language":"python","code":"$this_is_literal_source","input":{"nested":["$collect"]}},
+            {"id":"when","op":"when","if":{"ref":"$collect","equals":0},"tool":"web_search","input":{"query":"$prior.query"}},
+            {"id":"repeat","op":"repeat","max":0,"while":{"ref":"$collect","equals":0},"tool":"edit","input":{"action":"write","path":"never","content":"literal"}}
+        ],"return":"$collect","max_concurrency":2});
+        let calls = effect_preflight(&program).unwrap();
+        assert_eq!(calls.len(), 7);
+        assert_eq!(
+            calls.iter().map(|call| call.operation).collect::<Vec<_>>(),
+            vec!["call", "batch", "batch", "map", "compute", "when", "repeat"]
+        );
+        assert_eq!(calls[0].references, vec![vec!["content".to_string()]]);
+        assert_eq!(calls[1].input["path"], "b");
+        assert_eq!(calls[2].input["path"], "c");
+        assert_eq!(calls[3].references, vec![vec!["path".to_string()]]);
+        assert_eq!(
+            calls[4].references,
+            vec![vec![
+                "input".to_string(),
+                "nested".to_string(),
+                "0".to_string()
+            ]]
+        );
+        assert_eq!(calls[6].maximum_calls, 0);
+        assert_eq!(
+            requested_sub_call_tools("tool_orchestrate", &program),
+            SubCallAuthorization::Requires(vec![
+                "edit".into(),
+                "execute_code".into(),
+                "read_file".into(),
+                "web_search".into()
+            ])
+        );
+        let constants = json!({"steps":[{"id":"literal","op":"call","tool":"edit","input":{"action":"write","path":"$HOME/x","content":["$(date)", "$$item", {"$item.key":"literal"}]}}]});
+        assert!(effect_preflight(&constants).unwrap()[0]
+            .references
+            .is_empty());
+    }
+
+    #[test]
+    fn shared_preflight_checks_declared_bounds_and_original_dispatch_vocabulary() {
+        let call = json!({"id":"read","op":"call","tool":"read_file","input":{"path":"a"}});
+        assert!(effect_preflight(&json!({"steps":vec![call.clone(); MAX_STEPS]})).is_ok());
+        assert!(effect_preflight(&json!({"steps":vec![call; MAX_STEPS + 1]})).is_err());
+        let entry = json!({"tool":"read_file","input":{"path":"a"}});
+        for count in [MAX_MAP_ITEMS, MAX_MAP_ITEMS + 1] {
+            let result = effect_preflight(
+                &json!({"steps":[{"id":"batch","op":"batch","calls":vec![entry.clone();count]}]}),
+            );
+            assert_eq!(result.is_ok(), count == MAX_MAP_ITEMS);
+        }
+        let batch = json!({"id":"batch","op":"batch","calls":vec![entry;MAX_MAP_ITEMS]});
+        assert!(effect_preflight(&json!({"steps":[batch.clone(), batch.clone()]})).is_ok());
+        assert!(effect_preflight(&json!({"steps":[batch.clone(), batch.clone(), batch]})).is_err());
+        for max in [MAX_REPEAT, MAX_REPEAT + 1] {
+            let result = effect_preflight(
+                &json!({"steps":[{"id":"repeat","op":"repeat","max":max,"while":{"ref":"$r","present":true},"tool":"read_file","input":{"path":"a"}}]}),
+            );
+            assert_eq!(result.is_ok(), max == MAX_REPEAT);
+        }
+        for tool in crate::mvp_tool_specs() {
+            let program =
+                json!({"steps":[{"id":"literal","op":"call","tool":tool.name,"input":{}}]});
+            assert_eq!(
+                effect_preflight(&program).is_ok(),
+                tool.name != "tool_orchestrate",
+                "{}",
+                tool.name
+            );
+        }
+        for program in [
+            json!({"steps":[],"invented":true}),
+            json!({"steps":[{"id":"bad","op":"unknown"}]}),
+            json!({"steps":[{"id":"bad","op":"compute","language":"bash","code":"pwd"}]}),
+            json!({"steps":[{"id":"bad","op":"call","tool":"web-fetch","input":{}}]}),
+            json!({"steps":[{"id":"bad","op":"call","tool":"tool_orchestrate","input":{"steps":[]}}]}),
+        ] {
+            assert!(effect_preflight(&program).is_err());
+        }
+    }
+
+    #[test]
+    fn dynamic_cardinality_keeps_original_runtime_limits_before_dispatch() {
+        let lease = crate::ToolHost::builtin("map-bounds", std::env::temp_dir()).pin_snapshot();
+        let mut state = State::new();
+        state.insert("items".into(), json!(vec!["a"; MAX_MAP_ITEMS + 1]));
+        let map: StepKind = serde_json::from_value(
+            json!({"op":"map","over":"$items","tool":"read_file","input":{"path":"$item"}}),
+        )
+        .unwrap();
+        let mut calls = 0;
+        assert!(evaluate(&lease, &map, &state, &mut calls, None)
+            .unwrap_err()
+            .contains("over the limit"));
+        assert_eq!(calls, 0);
+        state.insert("items".into(), json!(["a", "b"]));
+        calls = MAX_TOTAL_CALLS - 1;
+        assert!(evaluate(&lease, &map, &state, &mut calls, None)
+            .unwrap_err()
+            .contains("total sub-call limit"));
+        assert_eq!(calls, MAX_TOTAL_CALLS - 1);
+        calls = MAX_TOTAL_CALLS;
+        assert!(bump(&mut calls).is_err());
+        let conditional = json!({"id":"r","op":"repeat","max":MAX_REPEAT,"while":{"ref":"$items","present":false},"tool":"read_file","input":{"path":"a"}});
+        assert!(effect_preflight(&json!({"steps":vec![conditional; MAX_STEPS]})).is_ok());
     }
 }

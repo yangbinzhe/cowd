@@ -6,6 +6,7 @@
 mod catalog;
 mod digest;
 mod error;
+mod frame_source_binding;
 mod identity;
 mod invocation;
 mod manifest;
@@ -15,6 +16,7 @@ mod transport;
 
 pub use catalog::*;
 pub use error::*;
+pub use frame_source_binding::*;
 pub use identity::*;
 pub use invocation::*;
 pub use manifest::*;

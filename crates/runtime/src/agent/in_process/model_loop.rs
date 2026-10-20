@@ -1,5 +1,114 @@
 use super::*;
 
+pub(super) fn activate_native_tools(
+    host: Arc<dyn RuntimeExecutionHost>,
+    packet: &AgentTaskPacket,
+    bounded_resource_lease: bool,
+) -> Result<
+    (
+        Arc<dyn RuntimeExecutionHost>,
+        Vec<crate::ProviderToolDefinition>,
+        BTreeSet<String>,
+    ),
+    String,
+> {
+    let requested = packet
+        .allowed_tools
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let names = requested.iter().cloned().collect::<Vec<_>>();
+    let lease = host.pin_step_catalog();
+    let metadata = lease.as_ref().map(tools::ToolHostLease::catalog_receipt);
+    let mut projected_names = requested.clone();
+    projected_names.insert("tool_search".into());
+    let projection = lease
+        .as_ref()
+        .zip(metadata.as_ref())
+        .map(|(lease, metadata)| {
+            crate::tool_host::DelegatedCatalogProjection::new(lease, metadata, &projected_names)
+        });
+    let definitions = projection
+        .as_ref()
+        .map(|projection| {
+            projection
+                .definitions()
+                .filter(|definition| requested.contains(&definition.name))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let exposed = host.delegated_tool_definitions(&names);
+    if definitions.iter().any(|definition| {
+        !exposed.iter().any(|actual| {
+            actual.name == definition.name
+                && actual.input_schema == definition.input_schema
+                && actual.description == definition.description
+        })
+    }) {
+        return Err("agent_tool_inventory_drift: host exposure differs from catalog".into());
+    }
+    let allowed = definitions
+        .iter()
+        .filter(|definition| {
+            projection.as_ref().is_some_and(|projection| {
+                projection
+                    .discover(
+                        definition,
+                        &requested,
+                        packet.permission_ceiling,
+                        bounded_resource_lease.then_some(packet.resource_scopes.as_slice()),
+                    )
+                    .is_some()
+            })
+        })
+        .map(|definition| definition.name.clone())
+        .collect::<BTreeSet<_>>();
+    let unavailable = requested
+        .difference(&allowed)
+        .filter(|tool| !matches!(tool.as_str(), "context_retrieve" | "evidence_retrieve"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unavailable.is_empty() {
+        return Err(format!(
+            "agent_tool_inventory_drift: admitted Tool contracts are unavailable or no longer bounded on the active host: {}",
+            unavailable.join(", "),
+        ));
+    }
+    let mut definitions = definitions
+        .into_iter()
+        .filter(|definition| allowed.contains(&definition.name))
+        .collect::<Vec<_>>();
+    if !allowed.contains("tool_search") {
+        let bootstrap = BTreeSet::from(["tool_search".to_string()]);
+        if let Some(projection) = &projection {
+            if let Some(definition) = projection
+                .definitions()
+                .find(|definition| definition.name == "tool_search")
+            {
+                let exposed = host.delegated_tool_definitions(&["tool_search".into()]);
+                if projection
+                    .discover(
+                        definition,
+                        &bootstrap,
+                        packet.permission_ceiling,
+                        bounded_resource_lease.then_some(packet.resource_scopes.as_slice()),
+                    )
+                    .is_some()
+                    && exposed.iter().any(|actual| {
+                        actual.input_schema == definition.input_schema
+                            && actual.description == definition.description
+                            && actual.name == definition.name
+                    })
+                {
+                    definitions.push(definition.clone());
+                }
+            }
+        }
+    }
+    Ok((host, definitions, allowed))
+}
+
 #[async_trait]
 impl AgentRuntimeBackend for InProcessAgentWorker {
     fn kind(&self) -> AgentBackendKind {
@@ -78,36 +187,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .parent_execution
             .as_ref()
             .map(|parent| parent.execution_id.clone());
-        let packet_allowed_tools = packet
-            .allowed_tools
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let bounded_resource_lease = packet.team_id().is_some()
             || packet.agentic_binding.is_some()
             || binding.evaluation.is_some();
-        let requested_tool_names = packet_allowed_tools.iter().cloned().collect::<Vec<_>>();
-        let tool_definitions = host.delegated_tool_definitions(&requested_tool_names);
-        let allowed_tools = tool_definitions
-            .iter()
-            .map(|definition| definition.name.clone())
-            .filter(|tool| packet_allowed_tools.contains(tool))
-            .filter(|tool| {
-                !bounded_resource_lease
-                    || delegated_tool_supports_bounded_scope(host.as_ref(), tool)
-            })
-            .collect::<BTreeSet<_>>();
-        let unavailable_tools = packet_allowed_tools
-            .difference(&allowed_tools)
-            .filter(|tool| !matches!(tool.as_str(), "context_retrieve" | "evidence_retrieve"))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unavailable_tools.is_empty() {
-            return Err(format!(
-                "agent_tool_inventory_drift: admitted Tool contracts are unavailable or no longer bounded on the active host: {}",
-                unavailable_tools.join(", ")
-            ));
-        }
+        let (host, tool_definitions, allowed_tools) =
+            activate_native_tools(host, &packet, bounded_resource_lease)?;
         let tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
         let memory_context = memory::MemoryTurnContext::new(
             packet.session_id(),
@@ -134,7 +218,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             })?;
         let commit_service = crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(
             services.event_store(),
-        ));
+        ))
+        .with_artifact_store(Arc::clone(services.artifact_store()));
         let durable_agent_receipts = commit_service
             .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
             .map_err(|error| {
@@ -156,11 +241,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .into_iter()
             .map(scoped_receipt_from_durable)
             .collect::<Vec<_>>();
-        let recovered_sequence = durable_receipts
-            .iter()
-            .map(|receipt| receipt.sequence)
-            .max()
-            .unwrap_or(0);
+        let recovered_sequence = commit_service
+            .delegated_observation_high_water(packet.graph_id(), packet.node_id(), packet.attempt)
+            .map_err(|error| error.to_string())?;
         let provider_model_obligations = packet
             .required_acceptance
             .evidence_obligations
@@ -593,7 +676,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 "durable Team work requires a progress-bearing continuation",
             );
             if checkpoint.requires_tool_action {
-                runtime.require_next_model_tool_action(checkpoint.tool_ids.clone());
+                if let Err(error) = runtime.require_next_model_tool_action(checkpoint.tool_ids.clone()) {
+                    let error = format!("in-process agent checkpoint control failed: {error}");
+                    services.fail_agent_live_execution(packet.run_id(), error.clone());
+                    drop(runtime);
+                    drop(child_execution_scope);
+                    drop(active_run_cleanup);
+                    return Err(error);
+                }
             }
             let continuation = runtime
                 .submit_turn(&checkpoint.prompt, &SharedPrompter::none())
@@ -618,6 +708,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                         "agent.autonomy.checkpoint_failed",
                         &format!("bounded collaboration continuation failed: {error}"),
                     );
+                    if runtime.conversation_control_available().is_err() {
+                        let error = format!("in-process agent continuation failed: {error}");
+                        services.fail_agent_live_execution(packet.run_id(), error.clone());
+                        drop(runtime);
+                        drop(child_execution_scope);
+                        drop(active_run_cleanup);
+                        return Err(error);
+                    }
                     // The next bounded round reloads the durable Team state
                     // and may receive a fresh action template (for example
                     // after a concurrent bid advanced the work revision).

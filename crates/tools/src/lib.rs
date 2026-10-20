@@ -296,7 +296,10 @@ impl ToolCatalog {
             .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
-                description: model_facing_description(tool.description.as_deref(), &tool.input_schema),
+                description: model_facing_description(
+                    tool.description.as_deref(),
+                    &tool.input_schema,
+                ),
                 input_schema: tool.input_schema.clone(),
             });
         let plugin = self
@@ -337,7 +340,10 @@ impl ToolCatalog {
             .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .map(|tool| KernelToolDefinition {
                 name: tool.name.clone(),
-                description: model_facing_description(tool.description.as_deref(), &tool.input_schema),
+                description: model_facing_description(
+                    tool.description.as_deref(),
+                    &tool.input_schema,
+                ),
                 input_schema: tool.input_schema.clone(),
                 required_permission: kernel_permission_mode(tool.required_permission),
             });
@@ -516,8 +522,11 @@ impl ToolCatalog {
             .filter(|tool| !tool.name.starts_with("mcp__"))
             .map(|tool| SearchableToolSpec {
                 name: tool.name.clone(),
-                description: model_facing_description(tool.description.as_deref(), &tool.input_schema)
-                    .unwrap_or_default(),
+                description: model_facing_description(
+                    tool.description.as_deref(),
+                    &tool.input_schema,
+                )
+                .unwrap_or_default(),
             });
         let plugin = self.plugin_tools.iter().map(|tool| SearchableToolSpec {
             name: tool.definition().name.clone(),
@@ -626,6 +635,7 @@ pub mod pdf_extract;
 pub mod permissions;
 #[path = "execution/sandbox_exec.rs"]
 pub mod sandbox_exec;
+pub use sandbox_exec::{CompletedToolExecution, PreparedToolExecution, ToolExecutionCancellation};
 #[path = "search/mod.rs"]
 pub(crate) mod search;
 #[path = "policy/stale_branch.rs"]
@@ -642,6 +652,18 @@ mod input_contract_tests {
     use super::*;
     use harness_contract::tool_input_contract::admissible_field_names;
 
+    #[test]
+    fn bounded_opaque_capabilities_are_owned_send_and_cancellation_is_shared() {
+        fn assert_send<Value: Send>() {}
+        fn assert_shared<Value: Send + Sync + Clone>() {}
+        assert_send::<PreparedToolExecution>();
+        assert_send::<CompletedToolExecution>();
+        assert_shared::<ToolExecutionCancellation>();
+        let cancellation = ToolExecutionCancellation::new();
+        let shared = cancellation.clone();
+        shared.cancel();
+    }
+
     /// Every model-facing definition must restate its own required fields. Until
     /// it did, a tool could be perfectly callable and still be uncallable in
     /// practice: one live run needed seventeen rejected `artifact_publish` calls
@@ -650,7 +672,11 @@ mod input_contract_tests {
     fn every_model_facing_definition_restates_its_own_requirements() {
         let catalog = ToolCatalog::builtin();
         let definitions = catalog.definitions(None);
-        assert!(definitions.len() > 20, "expected the builtin surface, got {}", definitions.len());
+        assert!(
+            definitions.len() > 20,
+            "expected the builtin surface, got {}",
+            definitions.len()
+        );
         for definition in &definitions {
             let description = definition.description.clone().unwrap_or_default();
             let required = definition
@@ -708,7 +734,10 @@ mod input_contract_tests {
         });
         let description = model_facing_description(Some("publish something"), &schema)
             .expect("a tagged schema is summarizable");
-        assert!(description.contains("\"file\" | \"message_block\""), "{description}");
+        assert!(
+            description.contains("\"file\" | \"message_block\""),
+            "{description}"
+        );
     }
 
     /// The tools array is part of the prompt prefix. A description that varies
@@ -722,7 +751,11 @@ mod input_contract_tests {
         assert_eq!(first.len(), second.len());
         for (left, right) in first.iter().zip(second.iter()) {
             assert_eq!(left.name, right.name);
-            assert_eq!(left.description, right.description, "`{}` is not stable", left.name);
+            assert_eq!(
+                left.description, right.description,
+                "`{}` is not stable",
+                left.name
+            );
         }
     }
 
@@ -757,7 +790,9 @@ mod input_contract_tests {
             .find(|spec| spec.name == "bash")
             .expect("bash is searchable");
         assert!(
-            submitted.description.contains("Input contract (from the schema):"),
+            submitted
+                .description
+                .contains("Input contract (from the schema):"),
             "tool_search would advertise a description without the contract"
         );
     }

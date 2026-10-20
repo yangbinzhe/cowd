@@ -121,13 +121,17 @@ impl RuntimeEventScope {
 
 #[derive(Debug, Error)]
 pub enum RuntimeEventStoreError {
+    #[error("HistoryBudgetExceeded: {0}")]
+    HistoryBudgetExceeded(String),
     #[error("runtime event scope `{0}` is unknown or requires migration")]
     UnknownScope(String),
     #[error("runtime event store is corrupt: {0}")]
     Corrupt(String),
     #[error("runtime event transaction `{transaction_id}` conflicts with its committed hash")]
     TransactionConflict { transaction_id: String },
-    #[error("runtime stream `{stream_id}` revision mismatch: expected {expected}, actual {actual}")]
+    #[error(
+        "runtime stream `{stream_id}` revision mismatch: expected {expected}, actual {actual}"
+    )]
     StaleRevision {
         stream_id: String,
         expected: u64,
@@ -146,6 +150,30 @@ pub enum RuntimeEventStoreError {
 }
 
 pub type RuntimeEventStoreResult<T> = Result<T, RuntimeEventStoreError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum PreparedContentRoot {
+    Absent,
+    Canonical,
+    Checkpoint,
+    Terminal,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PreparedReconciliationReport {
+    pub examined: u64,
+    pub retired_records: u64,
+    pub referenced_canonical: u64,
+    pub referenced_checkpoint: u64,
+    pub referenced_terminal: u64,
+    pub retained_other_pin_or_changed: u64,
+    pub blocked: u64,
+    pub released_attempts: u64,
+    pub inventory_pass_complete: bool,
+    pub attempt_pass_complete: bool,
+    pub eligible_prepared_reconciled: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEventRef {
@@ -481,6 +509,13 @@ pub struct RuntimeSessionOutboxHealth {
     pub suppressed: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSourceMutationFence {
+    pub incarnation: String,
+    pub mutation_epoch: u64,
+}
+
 /// Latest durable state for one rebuildable Runtime projection.
 ///
 /// `source_cursor` is the projection fence: writers may only move it forward.
@@ -503,7 +538,70 @@ pub struct RuntimeProjectionCheckpoint {
 /// backend without pulling a database driver into the Runtime dependency tree.
 /// Every method preserves event transaction, revision, lease, and outbox
 /// semantics; a backend must not provide a partial implementation.
+#[derive(Debug, Clone)]
+pub enum RuntimeBoundedEventLookup {
+    Absent,
+    Deferred { required_bytes: usize },
+    Record { record: Box<RuntimeEventRecord>, encoded_bytes: usize },
+}
+
 pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
+    fn bounded_event_by_idempotency_key(
+        &self,
+        stream: &str,
+        key: &str,
+        through: u64,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<RuntimeBoundedEventLookup> {
+        let _ = (stream, key, through, max_bytes);
+        Err(RuntimeEventStoreError::Corrupt("bounded exact source lookup unsupported".into()))
+    }
+
+    fn source_mutation_fence(&self) -> RuntimeEventStoreResult<RuntimeSourceMutationFence> {
+        Err(RuntimeEventStoreError::Corrupt("source mutation fence unsupported".into()))
+    }
+
+    fn compare_and_put_projection_checkpoint_fenced(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &serde_json::Value,
+        updated_at_ms: u64,
+        source_fence: &RuntimeSourceMutationFence,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        let _ = (projection_id, source_cursor, expected_revision, payload, updated_at_ms, source_fence);
+        Err(RuntimeEventStoreError::Corrupt("atomic source-fenced checkpoint unsupported".into()))
+    }
+
+    fn recent_event_lines(
+        &self,
+        stream_id: &str,
+        references: &[RuntimeEventRef],
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<harness_contract::mission::MissionControlEventLine>, String>;
+    fn prepared_content_root(
+        &self,
+        origin: &crate::PreparedArtifactOrigin,
+        artifact: &harness_contract::context::ArtifactRef,
+    ) -> RuntimeEventStoreResult<PreparedContentRoot> {
+        let _ = (origin, artifact);
+        Err(RuntimeEventStoreError::Corrupt(
+            "prepared root probe unsupported".into(),
+        ))
+    }
+    fn transaction_stream_revision_exact(
+        &self,
+        transaction_id: &str,
+        stream_id: &str,
+    ) -> RuntimeEventStoreResult<Option<CommittedStreamRevision>> {
+        let _ = (transaction_id, stream_id);
+        Err(RuntimeEventStoreError::Corrupt(
+            "exact transaction stream probe unsupported".into(),
+        ))
+    }
     fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String>;
     fn append_transaction(
         &self,
@@ -550,50 +648,7 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         max_commits: usize,
         max_events: usize,
         max_bytes: usize,
-    ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
-        let batches = self.events_after_cursor(cursor, max_commits)?;
-        let mut scanned_through_cursor = cursor;
-        let mut scanned_commits = 0_usize;
-        let mut matched_events = 0_usize;
-        let mut matched_bytes = 0_usize;
-        let mut filtered = Vec::new();
-        for batch in batches {
-            let events = batch
-                .events
-                .into_iter()
-                .filter(|event| interest.matches(event))
-                .collect::<Vec<_>>();
-            if events.is_empty() {
-                scanned_through_cursor = batch.commit_cursor;
-                scanned_commits = scanned_commits.saturating_add(1);
-                continue;
-            }
-            let batch_bytes = events.iter().fold(0_usize, |total, event| {
-                total.saturating_add(serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
-            });
-            if !filtered.is_empty()
-                && (matched_events.saturating_add(events.len()) > max_events.max(1)
-                    || matched_bytes.saturating_add(batch_bytes) > max_bytes.max(1))
-            {
-                break;
-            }
-            matched_events = matched_events.saturating_add(events.len());
-            matched_bytes = matched_bytes.saturating_add(batch_bytes);
-            filtered.push(CommittedEventBatch {
-                commit_cursor: batch.commit_cursor,
-                transaction_id: batch.transaction_id,
-                events,
-            });
-            scanned_through_cursor = batch.commit_cursor;
-            scanned_commits = scanned_commits.saturating_add(1);
-        }
-        Ok(RuntimeProjectionScanPage {
-            scanned_through_cursor,
-            scanned_commits,
-            matched_events,
-            batches: filtered,
-        })
-    }
+    ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage>;
     fn background_projection_capacity_hint(&self) -> usize {
         1
     }
@@ -639,9 +694,16 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;
     fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64>;
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String>;
-    /// Read a stable sequence interval without OFFSET. PostgreSQL overrides
-    /// this with an indexed query; simple test backends may use the bounded
-    /// default implementation.
+    fn position_page(
+        &self,
+        scope: RuntimeEventScope,
+        identity: &str,
+        kind: Option<&str>,
+        after: Option<(u64, u32)>,
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
     fn list_stream_after(
         &self,
         stream_id: &str,
@@ -649,26 +711,20 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         through_sequence: u64,
         max_events: usize,
         max_bytes: usize,
-    ) -> Result<Vec<DurableRuntimeEvent>, String> {
-        let mut bytes = 0usize;
-        let mut selected = Vec::new();
-        for event in self
-            .list_stream(stream_id)?
-            .into_iter()
-            .filter(|event| event.sequence > after_sequence && event.sequence <= through_sequence)
-        {
-            let event_bytes = serde_json::to_vec(&event).map_or(0, |value| value.len());
-            if !selected.is_empty()
-                && (selected.len() >= max_events.max(1)
-                    || bytes.saturating_add(event_bytes) > max_bytes.max(1))
-            {
-                break;
-            }
-            bytes = bytes.saturating_add(event_bytes);
-            selected.push(event);
-        }
-        Ok(selected)
-    }
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn list_stream_before(
+        &self,
+        stream_id: &str,
+        through_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn count_stream_kinds(
+        &self,
+        stream_id: &str,
+        kinds: &[&str],
+        through_sequence: u64,
+    ) -> Result<u64, String>;
     /// Return one newest-first page without materialising the whole stream.
     ///
     /// Administrative timelines (for example the cross-plane audit ledger)
@@ -771,10 +827,14 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>>;
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String>;
     fn durable_commit_cursor(&self) -> RuntimeEventStoreResult<u64> {
-        let events = self.all_events(1).map_err(|error| {
-            RuntimeEventStoreError::Io(std::io::Error::other(error))
-        })?;
-        Ok(events.into_iter().map(|event| event.commit_cursor).max().unwrap_or_default())
+        let events = self
+            .all_events(1)
+            .map_err(|error| RuntimeEventStoreError::Io(std::io::Error::other(error)))?;
+        Ok(events
+            .into_iter()
+            .map(|event| event.commit_cursor)
+            .max()
+            .unwrap_or_default())
     }
     fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String>;
     fn latest_for_stream_kind(
@@ -804,6 +864,12 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     /// True while this Session still owns a Runtime terminal that has not
     /// reached the durable `materialized` state.
     fn has_unsettled_session_terminals(&self, session_id: &str) -> RuntimeEventStoreResult<bool>;
+    fn session_terminal_for_execution(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>>;
     fn materialized_session_terminals_after(
         &self,
         session_id: &str,

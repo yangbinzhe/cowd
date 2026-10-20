@@ -2,6 +2,249 @@
 
 use super::*;
 
+fn receipt_ack_from_row(
+    row: &Row,
+) -> session::SessionResult<harness_contract::live::SessionMessageAck> {
+    Ok(harness_contract::live::SessionMessageAck {
+        session_id: row.try_get(0).map_err(postgres_error)?,
+        message_id: row.try_get(1).map_err(postgres_error)?,
+        client_id: row.try_get(2).map_err(postgres_error)?,
+        runtime_commit_cursor: harness_contract::live::ReceiptCursor::parse(
+            &row.try_get::<_, i64>(3)
+                .map_err(postgres_error)?
+                .to_string(),
+        )
+        .map_err(|_| lifecycle::receipt_conflict())?,
+        content_digest: row.try_get(4).map_err(postgres_error)?,
+        received_at_ms: i64_to_u64(row.try_get(5).map_err(postgres_error)?, "receipt time")?,
+    })
+}
+
+fn receipt_context_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    query: &session::SessionTerminalReceiptQuery,
+    presence: &SessionPresenceProjection,
+    now: u64,
+    lock: bool,
+) -> session::SessionResult<session::SessionTerminalReceiptContext> {
+    use harness_contract::live::{
+        SessionMessageReceiptContext, SessionMessageReceiptUnavailableReason as Unavailable,
+    };
+    let authority = &query.authority;
+    lifecycle::receipt_attachment_current(presence, authority, now)?;
+    let sql = if lock {
+        "SELECT sequence,terminal_runtime_commit_cursor,terminal_content_digest,octet_length(content_json),
+            CASE WHEN octet_length(content_json)<=8388608 THEN content_json END
+         FROM session_messages WHERE session_id=$1 AND stable_message_id=$2 FOR UPDATE"
+    } else {
+        "SELECT sequence,terminal_runtime_commit_cursor,terminal_content_digest,octet_length(content_json),
+            CASE WHEN octet_length(content_json)<=8388608 THEN content_json END
+         FROM session_messages WHERE session_id=$1 AND stable_message_id=$2"
+    };
+    let row = transaction
+        .query_opt(sql, &[&authority.session_id, &query.message_id])
+        .map_err(postgres_error)?
+        .ok_or_else(|| session::SessionError::NotFound("message".into()))?;
+    let unavailable = |reason: Unavailable| session::SessionTerminalReceiptContext {
+        context: SessionMessageReceiptContext::Unavailable { reason },
+        input: None,
+    };
+    let cursor: Option<i64> = row.try_get(1).map_err(postgres_error)?;
+    let digest: Option<String> = row.try_get(2).map_err(postgres_error)?;
+    let (Some(cursor), Some(digest)) = (cursor, digest) else {
+        return Ok(unavailable(Unavailable::UnboundOrInvalidated));
+    };
+    let raw: Option<String> = row.try_get(4).map_err(postgres_error)?;
+    let Some(raw) = raw else {
+        return Ok(unavailable(Unavailable::PayloadTooLarge));
+    };
+    let Ok(payload) = session::public_terminal_payload_v1(&raw) else {
+        return Ok(unavailable(Unavailable::InvalidPublicPayload));
+    };
+    if digest != payload.content_digest {
+        return Ok(unavailable(Unavailable::BindingMismatch));
+    }
+    let inputs = transaction.query(
+        "SELECT request_id FROM session_runtime_outbox WHERE session_id=$1 AND runtime_commit_cursor=$2 AND status='completed' ORDER BY request_id LIMIT 2",
+        &[&authority.session_id,&cursor],
+    ).map_err(postgres_error)?;
+    if inputs.len() != 1 {
+        return Ok(unavailable(Unavailable::AmbiguousTerminalInput));
+    }
+    let request_id: String = inputs[0].try_get(0).map_err(postgres_error)?;
+    let input =
+        runtime_outbox_tx(transaction, &request_id)?.ok_or_else(lifecycle::receipt_conflict)?;
+    if query.message_id != format!("assistant:{}", input.message_id)
+        || input.turn_id.is_empty()
+        || input.session_generation == 0
+        || input.runtime_commit_cursor != Some(i64_to_u64(cursor, "receipt cursor")?)
+    {
+        return Ok(unavailable(Unavailable::TerminalInputMismatch));
+    }
+    if let Some(source) = &authority.receipt_source {
+        if source.turn_id != input.turn_id {
+            return Err(lifecycle::receipt_conflict());
+        }
+    }
+    let receipt = transaction.query_opt(
+        "SELECT session_id,message_id,client_id,runtime_commit_cursor,content_digest,received_at_ms
+         FROM session_terminal_message_acks WHERE session_id=$1 AND message_id=$2
+           AND runtime_commit_cursor=$3 AND content_digest=$4 AND client_id=$5 AND principal_id=$6",
+        &[&authority.session_id,&query.message_id,&cursor,&digest,&authority.client_id,&authority.principal_id],
+    ).map_err(postgres_error)?.as_ref().map(receipt_ack_from_row).transpose()?;
+    let context = SessionMessageReceiptContext::Available {
+        payload_kind: harness_contract::live::SessionPublicPayloadKind::SessionPublicV1,
+        payload_json: payload.payload_json,
+        session_id: authority.session_id.clone(),
+        message_id: query.message_id.clone(),
+        client_id: authority.client_id.clone(),
+        message_sequence: row
+            .try_get::<_, i64>(0)
+            .map_err(postgres_error)?
+            .to_string(),
+        runtime_commit_cursor: harness_contract::live::ReceiptCursor::parse(&cursor.to_string())
+            .map_err(|_| lifecycle::receipt_conflict())?,
+        content_digest: digest,
+        receipt,
+        session_source: harness_contract::live::SessionReceiptSessionObservation {
+            request_id: input.request_id.clone(),
+            turn_id: input.turn_id.clone(),
+            session_generation: input.session_generation.to_string(),
+            input_sequence: input.sequence.to_string(),
+            presence_revision: presence.revision.to_string(),
+            observed_at_ms: now,
+        },
+        outbox_observation:
+            harness_contract::live::SessionReceiptOutboxObservation::RuntimeOutboxUnknown,
+    };
+    Ok(session::SessionTerminalReceiptContext {
+        context,
+        input: Some(input),
+    })
+}
+
+impl PostgresSessionStore {
+    pub fn get_terminal_message_receipt_context(
+        &self,
+        query: &session::SessionTerminalReceiptQuery,
+    ) -> session::SessionResult<session::SessionTerminalReceiptContext> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        transaction
+            .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .map_err(postgres_error)?;
+        let presence =
+            lifecycle::receipt_presence_tx(&mut transaction, &query.authority.session_id, false)?
+                .ok_or_else(lifecycle::receipt_conflict)?;
+        let now = lifecycle::receipt_clock_tx(&mut transaction)?;
+        let result = receipt_context_tx(&mut transaction, query, &presence, now, false)?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(result)
+    }
+
+    pub fn record_terminal_message_ack(
+        &self,
+        command: &session::SessionTerminalAckCommand,
+    ) -> session::SessionResult<harness_contract::live::SessionMessageAck> {
+        let query = &command.query;
+        let authority = &query.authority;
+        let cursor = to_u64_i64(command.binding.runtime_commit_cursor, "receipt cursor")?;
+        if cursor <= 0 {
+            return Err(session::SessionError::InvalidArgument(
+                "invalid receipt cursor".into(),
+            ));
+        }
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        lifecycle::receipt_parent_tx(&mut transaction, &authority.session_id)?;
+        let presence =
+            lifecycle::receipt_presence_tx(&mut transaction, &authority.session_id, true)?
+                .ok_or_else(lifecycle::receipt_conflict)?;
+        transaction.query_opt("SELECT stable_message_id FROM session_messages WHERE session_id=$1 AND stable_message_id=$2 FOR UPDATE",
+            &[&authority.session_id,&query.message_id]).map_err(postgres_error)?.ok_or_else(|| session::SessionError::NotFound("message".into()))?;
+        let now = lifecycle::receipt_clock_tx(&mut transaction)?;
+        let context = receipt_context_tx(&mut transaction, query, &presence, now, true)?;
+        let harness_contract::live::SessionMessageReceiptContext::Available {
+            runtime_commit_cursor,
+            content_digest,
+            ..
+        } = context.context
+        else {
+            return Err(lifecycle::receipt_conflict());
+        };
+        if runtime_commit_cursor
+            .value()
+            .map_err(|_| lifecycle::receipt_conflict())?
+            != command.binding.runtime_commit_cursor
+            || content_digest != command.binding.content_digest
+        {
+            return Err(lifecycle::receipt_conflict());
+        }
+        transaction.execute(
+            "INSERT INTO session_terminal_message_acks(session_id,message_id,runtime_commit_cursor,client_id,principal_id,content_digest,received_at_ms)
+             VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+            &[&authority.session_id,&query.message_id,&cursor,&authority.client_id,&authority.principal_id,&content_digest,&to_u64_i64(now,"receipt time")?],
+        ).map_err(postgres_error)?;
+        let row = transaction.query_one(
+            "SELECT session_id,message_id,client_id,runtime_commit_cursor,content_digest,received_at_ms,principal_id
+             FROM session_terminal_message_acks WHERE session_id=$1 AND message_id=$2 AND runtime_commit_cursor=$3 AND client_id=$4",
+            &[&authority.session_id,&query.message_id,&cursor,&authority.client_id],
+        ).map_err(postgres_error)?;
+        let receipt = receipt_ack_from_row(&row)?;
+        if receipt.content_digest != content_digest
+            || row.try_get::<_, String>(6).map_err(postgres_error)? != authority.principal_id
+        {
+            return Err(lifecycle::receipt_conflict());
+        }
+        transaction.commit().map_err(postgres_error)?;
+        Ok(receipt)
+    }
+
+    pub fn list_terminal_message_acks(
+        &self,
+        query: &session::SessionTerminalAckListQuery,
+    ) -> session::SessionResult<Vec<harness_contract::live::SessionMessageAckHistory>> {
+        if !(1..=100).contains(&query.limit) {
+            return Err(session::SessionError::InvalidArgument(
+                "receipt history limit must be 1..100".into(),
+            ));
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        transaction
+            .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .map_err(postgres_error)?;
+        let presence =
+            lifecycle::receipt_presence_tx(&mut transaction, &query.authority.session_id, false)?
+                .ok_or_else(lifecycle::receipt_conflict)?;
+        let now = lifecycle::receipt_clock_tx(&mut transaction)?;
+        lifecycle::receipt_attachment_current(&presence, &query.authority, now)?;
+        let rows = transaction.query(
+            "SELECT session_id,message_id,client_id,runtime_commit_cursor,content_digest,received_at_ms
+             FROM session_terminal_message_acks WHERE session_id=$1 AND client_id=$2 AND principal_id=$3
+               AND runtime_commit_cursor>$4 ORDER BY runtime_commit_cursor,message_id LIMIT $5",
+            &[&query.authority.session_id,&query.authority.client_id,&query.authority.principal_id,
+              &to_u64_i64(query.after_cursor,"history cursor")?,&to_i64(query.limit,"history limit")?],
+        ).map_err(postgres_error)?;
+        let result = rows
+            .iter()
+            .map(|row| {
+                receipt_ack_from_row(row).map(|receipt| {
+                    harness_contract::live::SessionMessageAckHistory::Historical { receipt }
+                })
+            })
+            .collect::<session::SessionResult<Vec<_>>>()?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(result)
+    }
+}
+
 impl PostgresSessionStore {
     pub fn insert_message(&self, message: &SessionMessage) -> session::SessionResult<()> {
         let sequence = to_i64(message.sequence, "message sequence")?;
@@ -933,6 +1176,12 @@ impl PostgresSessionStore {
                 &request.terminal_message_id,
                 &request.messages,
             )?;
+            verify_terminal_message_binding_tx(
+                &mut transaction,
+                &request.session_id,
+                &request.terminal_message_id,
+                request.runtime_commit_cursor,
+            )?;
             transaction.commit().map_err(postgres_error)?;
             return Ok(SessionTerminalTranscriptReceipt {
                 messages,
@@ -1093,6 +1342,7 @@ impl PostgresSessionStore {
             &request.session_id,
             &request.messages,
             request.created_at_ms,
+            request.runtime_commit_cursor,
         )?;
         let terminal_status = SessionRuntimeInputStatus::Completed.as_str();
         let changed = transaction

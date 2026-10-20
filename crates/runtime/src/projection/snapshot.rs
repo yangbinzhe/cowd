@@ -10,23 +10,82 @@ pub async fn snapshot(
     // stores. Concurrent commits may be replayed once, but cannot be skipped
     // by advertising a cursor newer than the state observed below.
     validate_context(services, context)?;
+    let mut budget = history::RequestBudget::default();
+    budget.enable_incremental();
+    budget.capture_source_fence(services)?;
     let cursor = services.event_store().durable_commit_cursor()?;
     let graph = services
         .execution_supervisor()
         .graph_projection(execution_id)
         .await?;
+    let scope = ExecutionProjectionScope::load_budgeted(
+        services,
+        execution_id,
+        &graph,
+        context.detail_scope == ProjectionDetailScope::Full,
+        cursor,
+        &mut budget,
+    )?;
+    validate_projection_scope(&scope, context)?;
     let cache_key = ExecutionProjectionCacheKey::new(execution_id, graph.revision, cursor, context);
+    let (running, draining) = execution_activity(services, &graph, &scope);
+    let proof_deferred = running || draining;
     if let Some(mut projection) = services.cached_execution_projection(&cache_key) {
-        projection.live = services.execution_live(execution_id);
+        if !proof_deferred
+            && budget.cached_source_current(services, execution_id, cursor)?
+            && !projection.health.iter().any(|entity| entity.kind == "history_verification" && entity.status.as_deref() == Some("incomplete"))
+            && !projection
+            .terminal_axes
+            .execution
+            .evidence_refs
+            .iter()
+            .any(|reference| super::settlement::local_reference(reference))
+        {
+            projection.live = services.execution_live(execution_id);
+            return Ok(projection);
+        }
+    }
+    let mut projection = snapshot_with_graph(
+        services,
+        execution_id,
+        context,
+        graph,
+        cursor,
+        &mut budget,
+        scope,
+    )
+    .await?;
+    budget.require_captured_source(services)?;
+    projection.cursor = cursor;
+    if budget.is_incomplete() {
+        let committed = budget.has_pending_checkpoints();
+        budget.publish(services)?;
+        for entity in &mut projection.health {
+            if entity.kind == "history_verification" {
+                if let Some(detail) = entity.detail.as_mut() {
+                    detail["new_prefix_committed"] = serde_json::json!(committed);
+                }
+            }
+        }
         return Ok(projection);
     }
-    let mut projection = snapshot_with_graph(services, execution_id, context, graph).await?;
-    projection.cursor = cursor;
     // A concurrent graph commit can be observed after the frozen source
     // cursor. Return the coherent snapshot, but do not cache it under an older
     // cursor; the next read/delta will reconcile against the newer revision.
-    if projection.graph.commit_cursor <= cursor {
-        services.cache_execution_projection(cache_key, projection.clone());
+    if projection.graph.commit_cursor <= projection.cursor
+        && projection.terminal_axes.source_cursor <= projection.cursor
+        && !projection.terminal_axes.source_race
+    {
+        budget.publish(services)?;
+        let materialized_key = ExecutionProjectionCacheKey::new(
+            execution_id,
+            projection.graph.revision,
+            projection.cursor,
+            context,
+        );
+        if !proof_deferred {
+            services.cache_execution_projection(materialized_key, projection.clone());
+        }
     }
     Ok(projection)
 }
@@ -36,64 +95,99 @@ async fn snapshot_with_graph(
     execution_id: &str,
     context: &ProjectionQueryContext,
     graph: harness_contract::execution_graph::ExecutionGraphProjection,
+    through: u64,
+    budget: &mut history::RequestBudget,
+    scope: ExecutionProjectionScope,
+) -> Result<ExecutionProjection, RuntimeServicesError> {
+    validate_projection_scope(&scope, context)?;
+    let facts = history::load_scope_budgeted(services, &scope, through, false, budget)?;
+    let commands = available_commands(services, execution_id, context).await?;
+    materialize_snapshot(
+        services,
+        execution_id,
+        context,
+        graph,
+        scope,
+        facts,
+        through,
+        commands,
+        budget,
+    )
+}
+
+pub(super) fn materialize_snapshot(
+    services: &RuntimeServices,
+    execution_id: &str,
+    context: &ProjectionQueryContext,
+    graph: harness_contract::execution_graph::ExecutionGraphProjection,
+    scope: ExecutionProjectionScope,
+    facts: BTreeMap<String, history::HistoryState>,
+    through: u64,
+    commands: Vec<ProjectionCommandAvailability>,
+    budget: &mut history::RequestBudget,
 ) -> Result<ExecutionProjection, RuntimeServicesError> {
     let full = context.detail_scope == ProjectionDetailScope::Full;
-    let scope = ExecutionProjectionScope::load(services, execution_id, &graph, full)?;
     let session_id = scope.session_id.clone();
-    validate_projection_scope(&scope, context)?;
-    let activity_events = activity::execution_events(services, &scope);
     let mut health = vec![execution_health_entity(execution_id, &graph, full)];
-    health.extend(activity_binding_health_entities(&activity_events, full));
-    let strategy = strategy_entity(services, &scope, execution_id, full, context);
-    let usage = related_event_entities(services, &scope, "usage", full, |event| {
-        // Model, tool and agent node outcomes all carry canonical
-        // `ExecutionUsage` in their committed node result. Exposing the
-        // execution-node events here lets consumers aggregate a root graph
-        // and its durable lineage without scraping session prose timelines.
-        event.scope == RuntimeEventScope::Tool
-            || event.scope == RuntimeEventScope::ExecutionNode
-            || event.kind.contains("usage")
-    });
-    let context_entities = related_event_entities(services, &scope, "context", full, |event| {
-        event.kind.contains("context") || event.kind.contains("memory")
-    });
-    let evidence = related_event_entities(services, &scope, "evidence", full, |event| {
-        event.kind != crate::execution_core::OUTCOME_EVENT_KIND
-            && !event.kind.starts_with("resource.admission.")
-            && !is_strategy_event(&event.kind)
-            && (!event.refs.is_empty() || event.kind.contains("evidence"))
-    });
-    let admissions = related_event_entities(services, &scope, "admission", full, |event| {
-        event.kind.starts_with("resource.admission.")
-    });
-    let outcomes = related_event_entities(services, &scope, "outcome", full, |event| {
-        event.kind == crate::execution_core::OUTCOME_EVENT_KIND
-    });
-    let recovery = related_event_entities(services, &scope, "recovery", full, |event| {
-        event.scope == RuntimeEventScope::Recovery || event.kind.contains("recovery")
-    });
+    if facts.values().any(|state| state.incomplete) {
+        let mut incomplete = execution_health_entity(execution_id, &graph, false);
+        incomplete.id = format!("history-verification:{execution_id}");
+        incomplete.kind = "history_verification".into();
+        incomplete.status = Some("incomplete".into());
+        incomplete.summary = Some("Canonical history verification is incomplete; no terminal proof is available".into());
+        incomplete.detail = Some(serde_json::json!({
+            "new_prefix_committed": false,
+            "sources": facts.iter().map(|(identity, state)| (identity.clone(), state.progress())).collect::<BTreeMap<_, _>>(),
+        }));
+        health.push(incomplete);
+    }
+    health.extend(
+        facts
+            .values()
+            .flat_map(|state| state.health.values().cloned())
+            .map(|mut entity| {
+                if !full {
+                    entity.detail = None;
+                }
+                entity
+            }),
+    );
+    let strategy = strategy_entity_from_events(
+        services,
+        &scope,
+        execution_id,
+        full,
+        context,
+        facts
+            .get(execution_id)
+            .map_or_else(Vec::new, |state| state.strategy.clone()),
+    );
+    let usage = related_event_entities(&facts, "usage", full);
+    let context_entities = related_event_entities(&facts, "context", full);
+    let evidence = related_event_entities(&facts, "evidence", full);
+    let admissions = related_event_entities(&facts, "admission", full);
+    let outcomes = related_event_entities(&facts, "outcome", full);
+    let recovery = related_event_entities(&facts, "recovery", full);
+    let terminal_axes = execution_terminal_axes(services, &graph, &scope, &facts, through, budget)?;
     let graph = if full {
         graph
     } else {
         summary_graph_projection(graph)
     };
-    let (activities, activity_relations) = activity::project_execution_activities_from_events(
-        services,
-        &scope,
-        &graph,
-        activity_events,
-        full,
-    );
+    let (activities, activity_relations) =
+        activity::project_execution_activities_from_history(services, &scope, &graph, &facts, full);
     let delivery_envelope = graph.delivery_envelope.clone();
     let terminal_presentation = graph.terminal_presentation.clone();
-    let cancellation_receipt =
-        latest_cancellation_receipt(services, session_id.as_deref(), execution_id);
+    let cancellation_receipt = facts
+        .get(execution_id)
+        .and_then(|state| state.cancellation.clone());
     let concurrency = execution_concurrency(services, &graph, &scope);
     let mut projection = ExecutionProjection {
+        terminal_axes,
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: execution_id.to_string(),
         revision: graph.revision,
-        cursor: graph.commit_cursor,
+        cursor: through,
         detail_scope: context.detail_scope,
         authorization_revision: context.authorization_revision,
         redaction_revision: redaction_revision(context),
@@ -125,11 +219,13 @@ async fn snapshot_with_graph(
         delivery_envelope,
         terminal_presentation,
         cancellation_receipt,
-        available_commands: available_commands(services, execution_id, context).await?,
+        available_commands: commands,
     };
     if !full {
-        bound_summary_projection_collections(&mut projection);
+        bound_summary_projection_collections(&mut projection)?;
     }
+    validate_context(services, context)?;
+    history::check_bytes(&projection)?;
     Ok(projection)
 }
 
@@ -191,7 +287,9 @@ fn bounded_summary_text(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn bound_summary_projection_collections(projection: &mut ExecutionProjection) {
+fn bound_summary_projection_collections(
+    projection: &mut ExecutionProjection,
+) -> Result<(), RuntimeServicesError> {
     for entities in [
         &mut projection.goals,
         &mut projection.approvals,
@@ -204,7 +302,7 @@ fn bound_summary_projection_collections(projection: &mut ExecutionProjection) {
         &mut projection.health,
         &mut projection.recovery,
     ] {
-        bound_summary_entities(entities);
+        bound_summary_entities(entities)?;
     }
     // Agent, Team and relation identities are the control-plane purpose of a
     // Summary projection and therefore remain complete. Their human text and
@@ -218,20 +316,22 @@ fn bound_summary_projection_collections(projection: &mut ExecutionProjection) {
             bound_summary_entity(entity);
         }
     }
+    Ok(())
 }
 
-fn bound_summary_entities(entities: &mut Vec<ProjectionEntity>) {
+fn bound_summary_entities(
+    entities: &mut Vec<ProjectionEntity>,
+) -> Result<(), RuntimeServicesError> {
+    if entities.len() > SUMMARY_ENTITY_LIMIT {
+        return Err(crate::RuntimeEventStoreError::HistoryBudgetExceeded(
+            "summary entity population".into(),
+        )
+        .into());
+    }
     for entity in entities.iter_mut() {
         bound_summary_entity(entity);
     }
-    if entities.len() > SUMMARY_ENTITY_LIMIT {
-        entities.sort_by(|left, right| {
-            left.revision
-                .cmp(&right.revision)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        entities.drain(..entities.len() - SUMMARY_ENTITY_LIMIT);
-    }
+    Ok(())
 }
 
 fn bound_summary_entity(entity: &mut ProjectionEntity) {
@@ -339,72 +439,15 @@ fn accumulate_concurrency_counts(
     }
 }
 
-fn latest_cancellation_receipt(
-    services: &RuntimeServices,
-    session_id: Option<&str>,
-    execution_id: &str,
-) -> Option<harness_contract::turn::CancellationReceipt> {
-    let session_id = session_id?.trim();
-    if session_id.is_empty() || execution_id.trim().is_empty() {
-        return None;
-    }
-    const PAGE_SIZE: usize = 256;
-    let reader = services.event_reader();
-    let mut after = None;
-    let mut latest = None;
-    loop {
-        let page = reader
-            .session_timeline_events(session_id, after, PAGE_SIZE)
-            .ok()?;
-        if page.is_empty() {
-            break;
-        }
-        for event in &page {
-            if event.kind != "session.cancellation_committed"
-                || event
-                    .payload
-                    .get("execution_id")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(execution_id)
-            {
-                continue;
-            }
-            let mut receipt =
-                serde_json::from_value::<harness_contract::turn::CancellationReceipt>(
-                    event.payload.clone(),
-                )
-                .ok()?;
-            receipt.journal_sequence = event.commit_cursor;
-            receipt.projection_revision = event.sequence;
-            latest = Some(receipt);
-        }
-        after = page
-            .last()
-            .map(|event| (event.commit_cursor, event.transaction_index));
-        if page.len() < PAGE_SIZE {
-            break;
-        }
-    }
-    latest
-}
-
-pub(super) fn strategy_entity(
+pub(super) fn strategy_entity_from_events(
     services: &RuntimeServices,
     scope: &ExecutionProjectionScope,
     root_execution_id: &str,
     full: bool,
     context: &ProjectionQueryContext,
+    mut events: Vec<crate::DurableRuntimeEvent>,
 ) -> Option<StrategyDecisionProjection> {
     let session_id = scope.session_id.as_deref()?;
-    let mut events = [
-        "runtime.strategy.selected",
-        "runtime.strategy.downgraded",
-        "runtime.strategy.early_stopped",
-        "runtime.strategy.outcome",
-    ]
-    .into_iter()
-    .flat_map(|kind| activity::events_for_root_execution_kind(services, root_execution_id, kind))
-    .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
     let selected = events.iter().rev().find(|event| {
         event.kind == "runtime.strategy.selected"
@@ -1054,23 +1097,28 @@ pub(super) fn contains_absolute_path(value: &str) -> bool {
 }
 
 pub(super) fn related_event_entities(
-    services: &RuntimeServices,
-    scope: &ExecutionProjectionScope,
+    facts: &BTreeMap<String, history::HistoryState>,
     kind: &str,
     full: bool,
-    predicate: impl Fn(&crate::DurableRuntimeEvent) -> bool,
 ) -> Vec<ProjectionEntity> {
     let mut entities = BTreeMap::<String, ProjectionEntity>::new();
-    for entity in super::activity::execution_events(services, scope)
-        .into_iter()
-        .filter(|event| scope.contains_event(event) && predicate(event))
-        .map(|event| entity_from_runtime_event(kind, event, full))
-    {
-        let replace = entities
-            .get(&entity.id)
-            .is_none_or(|current| current.revision <= entity.revision);
-        if replace {
-            entities.insert(entity.id.clone(), entity);
+    for state in facts.values() {
+        let categories = if full {
+            &state.entities_full
+        } else {
+            &state.entities_summary
+        };
+        for entity in categories
+            .get(kind)
+            .into_iter()
+            .flat_map(|entities| entities.values())
+        {
+            if entities
+                .get(&entity.id)
+                .is_none_or(|current| current.revision <= entity.revision)
+            {
+                entities.insert(entity.id.clone(), entity.clone());
+            }
         }
     }
     entities.into_values().collect()

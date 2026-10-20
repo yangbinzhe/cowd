@@ -16,7 +16,7 @@ use harness_contract::mission::{
 };
 use harness_contract::reality::EvidenceRef;
 use harness_contract::task::{TaskOrigin, TaskRouteHint};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::{
     ApprovalDecisionCommand, CreateMissionScheduleRequest, ExecutionGraphHost,
@@ -77,12 +77,12 @@ impl MissionRuntimePort {
         selected_mission_id: Option<String>,
     ) -> Result<MissionControlProjection, String> {
         self.mission().ensure_default_mission()?;
-        Ok(MissionControlRuntime::projection(
+        MissionControlRuntime::projection(
             &self.services,
             sessions,
             active_session_id,
             selected_mission_id,
-        ))
+        )
     }
 
     #[must_use]
@@ -93,12 +93,41 @@ impl MissionRuntimePort {
         selected_mission_id: Option<String>,
     ) -> Result<MissionControlProjection, String> {
         self.mission().ensure_default_mission()?;
-        Ok(MissionControlRuntime::summary_projection(
+        MissionControlRuntime::summary_projection(
             &self.services,
             sessions,
             active_session_id,
             selected_mission_id,
-        ))
+        )
+    }
+
+    pub fn durable_commit_cursor(&self) -> Result<u64, String> {
+        self.services
+            .event_store()
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn control_directory_revision(&self) -> Result<String, String> {
+        MissionControlRuntime::directory_revision(&self.services)
+    }
+
+    pub fn control_projection_through(
+        &self,
+        sessions: Vec<MissionControlSessionNode>,
+        active_session_id: Option<String>,
+        selected_mission_id: Option<String>,
+        include_execution_details: bool,
+        through_cursor: u64,
+    ) -> Result<MissionControlProjection, String> {
+        MissionControlRuntime::projection_through(
+            &self.services,
+            sessions,
+            active_session_id,
+            selected_mission_id,
+            include_execution_details,
+            through_cursor,
+        )
     }
 
     /// Return sessions that contribute to at least one Task.

@@ -408,6 +408,26 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
     values.extend(runtime_projection_definitions()?);
+    values.push(platform_definition::<
+        cowd_app_protocol::SessionTerminalReceiptReadInputV1,
+        harness_contract::live::SessionMessageReceiptContext,
+    >(
+        super::core_platform_operations::SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+        "session.read",
+        "session.terminal_receipt.read",
+        OperationKindV1::Query,
+        OperationDelegationV1::User,
+    )?);
+    values.push(platform_definition::<
+        cowd_app_protocol::SessionTerminalReceiptAckInputV1,
+        harness_contract::live::SessionMessageAck,
+    >(
+        super::core_platform_operations::SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+        "session.read",
+        "session.terminal_receipt.ack",
+        OperationKindV1::Command,
+        OperationDelegationV1::User,
+    )?);
     sort_and_validate_definitions(&mut values)?;
     Ok(values)
 }
@@ -420,13 +440,30 @@ fn sort_and_validate_definitions(
             .operation_id
             .cmp(&right.descriptor.operation_id)
     });
+    let expected = super::matrix_app_reality::MATRIX_APP_OPERATIONS
+        .iter()
+        .map(|operation| format!("{CORE_PREFIX}{operation}"))
+        .chain(
+            super::core_platform_operations::PLATFORM_OPERATION_IDS
+                .iter()
+                .map(|operation| operation.to_string()),
+        )
+        .collect::<Vec<_>>();
+    validate_definition_ids(values, &expected)
+}
+
+fn validate_definition_ids(
+    values: &[CoreMatrixOperationDefinition],
+    expected: &[String],
+) -> Result<(), CoreMatrixCatalogError> {
+    let expected_ids = expected.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let ids = values
         .iter()
         .map(|value| value.descriptor.operation_id.as_str())
         .collect::<BTreeSet<_>>();
-    if values.len() != 60 || ids.len() != 60 {
+    if expected_ids.len() != expected.len() || ids.len() != values.len() || ids != expected_ids {
         return Err(CoreMatrixCatalogError::Invalid(
-            "authority must contain exactly 60 unique operations".to_string(),
+            "authority must match the unique closed dispatcher operation set".to_string(),
         ));
     }
     Ok(())
@@ -501,7 +538,13 @@ fn platform_definition<I: JsonSchema, O: JsonSchema>(
             120_000
         },
         maximum_request_bytes: 1024 * 1024,
-        maximum_response_bytes: 4 * 1024 * 1024,
+        maximum_response_bytes: if operation_id
+            == super::core_platform_operations::SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID
+        {
+            16 * 1024 * 1024 + 64 * 1024
+        } else {
+            4 * 1024 * 1024
+        },
         maximum_frame_bytes: 1024 * 1024,
         streaming: false,
         replay_window_seconds: None,
@@ -1013,9 +1056,25 @@ mod tests {
 
     #[test]
     fn frozen_core_business_operation_contract_matches_authority() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("contracts/core-operations/v1");
+        let root = std::env::var_os("COWD_CORE_OPERATION_EXPORT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("contracts/core-operations/v1")
+            });
+        if std::env::var_os("COWD_UPDATE_CORE_OPERATION_CONTRACT").is_some()
+            && std::env::var_os("COWD_CORE_OPERATION_EXPORT_ROOT").is_none()
+        {
+            panic!("canonical export requires a private COWD_CORE_OPERATION_EXPORT_ROOT");
+        }
+        if std::env::var_os("COWD_UPDATE_CORE_OPERATION_CONTRACT").is_some() {
+            assert!(
+                !root.exists(),
+                "canonical export root must be fresh and private"
+            );
+            assert!(root.is_absolute(), "canonical export root must be absolute");
+        }
         let schema_root = root.join("schemas");
         let authority = definitions().expect("authority");
         let by_id = authority
@@ -1145,7 +1204,7 @@ mod tests {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        assert_eq!(authority.len(), 60);
+        assert_eq!(authority.len(), 62);
         assert_eq!(dispatcher_ids.len(), 42);
         assert_eq!(authority_ids, dispatcher_ids);
         let platform_authority_ids = authority
@@ -1157,7 +1216,7 @@ mod tests {
             super::super::core_platform_operations::PLATFORM_OPERATION_IDS
                 .into_iter()
                 .collect::<BTreeSet<_>>();
-        assert_eq!(platform_dispatcher_ids.len(), 18);
+        assert_eq!(platform_dispatcher_ids.len(), 20);
         assert_eq!(platform_authority_ids, platform_dispatcher_ids);
         assert!(platform_dispatcher_ids
             .iter()
@@ -1166,6 +1225,40 @@ mod tests {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
+        let expected = authority
+            .iter()
+            .map(|definition| definition.descriptor.operation_id.clone())
+            .collect::<Vec<_>>();
+        let mut reordered = authority.clone();
+        reordered.reverse();
+        sort_and_validate_definitions(&mut reordered).expect("canonical ordering");
+        assert_eq!(reordered, authority);
+        assert!(validate_definition_ids(&authority[1..], &expected).is_err());
+        let mut duplicate = authority.clone();
+        duplicate.push(authority[0].clone());
+        assert!(validate_definition_ids(&duplicate, &expected).is_err());
+        let mut unknown = authority.clone();
+        unknown[0].descriptor.operation_id = "core.unknown".into();
+        assert!(validate_definition_ids(&unknown, &expected).is_err());
+        unknown.push(authority[0].clone());
+        assert!(validate_definition_ids(&unknown, &expected).is_err());
+        for duplicated_id in [
+            "core.matrix.entity.get_with_revision",
+            super::super::core_platform_operations::SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+        ] {
+            assert!(expected.iter().any(|operation| operation == duplicated_id));
+            let mut invalid_expected = expected.clone();
+            invalid_expected.extend([duplicated_id.into(), duplicated_id.into()]);
+            assert_eq!(invalid_expected.len(), expected.len() + 2);
+            assert_eq!(
+                invalid_expected.iter().collect::<BTreeSet<_>>(),
+                expected.iter().collect::<BTreeSet<_>>()
+            );
+            assert!(validate_definition_ids(&authority, &invalid_expected).is_err());
+        }
+        let mut collision = expected.clone();
+        collision[1] = collision[0].clone();
+        assert!(validate_definition_ids(&authority, &collision).is_err());
         for definition in authority {
             definition.descriptor.validate().expect("descriptor");
             assert!(definition.input_schema.is_object());

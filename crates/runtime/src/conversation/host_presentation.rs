@@ -2,6 +2,492 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "host_presentation_recovery_tests.rs"]
+mod recovery_tests;
+
+fn synthesize_message_value(message: &ConversationMessage) -> serde_json::Value {
+    serde_json::json!({"role":message.role.role_str(),"blocks":message.blocks,"usage":message.usage})
+}
+
+fn synthesize_prefix_digest(messages: &[ConversationMessage]) -> Result<String, String> {
+    if messages.len() > 16384 {
+        return Err("Synthesize original prefix message budget exceeded".into());
+    }
+    let mut hasher = Sha256::new();
+    let mut total = 0usize;
+    for message in messages {
+        let bytes = serde_json::to_vec(&synthesize_message_value(message))
+            .map_err(|error| error.to_string())?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or("Synthesize prefix byte overflow")?;
+        if total > 8 * 1024 * 1024 {
+            return Err("Synthesize original prefix byte budget exceeded".into());
+        }
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn synthesize_terminal_text(message: &ConversationMessage) -> Option<&str> {
+    if message.role.role_str() != "assistant" {
+        return None;
+    }
+    match message.blocks.as_slice() {
+        [ContentBlock::Text { text }] if !text.trim().is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+fn synthesize_publication_message(
+    value: &serde_json::Value,
+) -> Result<ConversationMessage, String> {
+    let fields = value
+        .as_object()
+        .ok_or("Synthesize message is not an object")?;
+    if fields.len() != 3
+        || value["role"] != "assistant"
+        || !value["usage"].is_null()
+        || !fields.contains_key("usage")
+    {
+        return Err(
+            "Synthesize publication requires one assistant message without provider usage".into(),
+        );
+    }
+    let message = ConversationMessage::assistant(
+        serde_json::from_value(value["blocks"].clone()).map_err(|error| error.to_string())?,
+    );
+    if synthesize_terminal_text(&message).is_none() || synthesize_message_value(&message) != *value
+    {
+        return Err("Synthesize publication requires exact nonempty Text".into());
+    }
+    Ok(message)
+}
+
+fn inherit_synthesize_sources(
+    mut outcome: NodeExecutionOutcome,
+    source_revisions: &BTreeMap<String, u64>,
+) -> Result<NodeExecutionOutcome, String> {
+    for (stream_id, revision) in source_revisions {
+        pin_synthesize_source(&mut outcome.source_revisions, stream_id.clone(), *revision)?;
+    }
+    Ok(outcome)
+}
+
+fn pin_synthesize_source(
+    sources: &mut BTreeMap<String, u64>,
+    stream_id: String,
+    revision: u64,
+) -> Result<(), String> {
+    if sources
+        .get(&stream_id)
+        .is_some_and(|original| *original != revision)
+    {
+        return Err("Synthesize decision source conflicts with original producer read-set".into());
+    }
+    sources.insert(stream_id, revision);
+    Ok(())
+}
+
+fn freeze_synthesize_goal_sources(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    goal_id: &str,
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut sources = BTreeMap::new();
+    let state_goal = services
+        .goal_store()
+        .projection(goal_id)
+        .map_err(|error| format!("load original Synthesize Goal source: {error}"))?
+        .ok_or("Synthesize original Goal source missing")?;
+    if state_goal.goal.session_id != session_id {
+        return Err("Synthesize Goal source crosses original Session".into());
+    }
+    pin_synthesize_source(
+        &mut sources,
+        format!("goal:{goal_id}"),
+        state_goal.stream_revision,
+    )?;
+    if let Some(binding) = state_goal.goal.execution_binding.as_ref() {
+        let revision = services
+            .agent_action_service()
+            .program_revision(&binding.agentic_program_id)
+            .map_err(|error| error.to_string())?;
+        pin_synthesize_source(
+            &mut sources,
+            format!("agentic-program:{}", binding.agentic_program_id),
+            revision,
+        )?;
+    }
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let revision = services
+        .agent_action_service()
+        .program_revision(&program_id)
+        .map_err(|error| error.to_string())?;
+    pin_synthesize_source(
+        &mut sources,
+        format!("agentic-program:{program_id}"),
+        revision,
+    )?;
+    let program = services
+        .agent_action_service()
+        .project_if_exists(&program_id)
+        .map_err(|error| error.to_string())?;
+    let Some(program) = program else {
+        if revision != 0 {
+            return Err("Synthesize Program source disappeared before Goal decision".into());
+        }
+        return Ok(sources);
+    };
+    if program.revision != revision
+        || program.program_id != program_id
+        || program.objective_id != objective_id
+        || program.session_id != session_id
+        || program.turn_id != turn_id
+    {
+        return Err("Synthesize Program source changed before Goal decision".into());
+    }
+    if let Some(root_execution_id) = program.root_execution_id.as_deref() {
+        let actual_goal_id = format!("goal:{root_execution_id}");
+        if actual_goal_id != goal_id {
+            let actual_goal = services
+                .goal_store()
+                .projection(&actual_goal_id)
+                .map_err(|error| error.to_string())?;
+            if actual_goal
+                .as_ref()
+                .is_some_and(|goal| goal.goal.session_id != session_id)
+            {
+                return Err("Synthesize Program Goal source crosses original Session".into());
+            }
+            pin_synthesize_source(
+                &mut sources,
+                format!("goal:{actual_goal_id}"),
+                actual_goal.map_or(0, |goal| goal.stream_revision),
+            )?;
+        }
+    }
+    Ok(sources)
+}
+
+fn is_synthesize_terminal_completion(completion: GoalCompletion) -> bool {
+    matches!(
+        completion,
+        GoalCompletion::Satisfied
+            | GoalCompletion::Partial
+            | GoalCompletion::Blocked
+            | GoalCompletion::Failed
+            | GoalCompletion::Cancelled
+    )
+}
+
+fn validate_synthesize_publication(
+    ticket: &NodeExecutionTicket,
+    original: &NodeExecutionTicket,
+    messages: &[serde_json::Value],
+    completion: Option<GoalCompletion>,
+    outcome: &NodeExecutionOutcome,
+) -> Result<Option<(String, GoalCompletion)>, String> {
+    if ticket != original
+        || ticket.executor_kind != "synthesize"
+        || outcome.result.status != ExecutionNodeStatus::Completed
+    {
+        return Err("Synthesize publication original ticket/result mismatch".into());
+    }
+    if messages.is_empty() && completion.is_none() {
+        if outcome.replan.is_none()
+            || outcome.delivery_envelope.is_some()
+            || outcome.terminal_presentation.is_some()
+        {
+            return Err("Synthesize empty publication has no original nonterminal replan".into());
+        }
+        return Ok(None);
+    }
+    let completion = completion
+        .filter(|completion| is_synthesize_terminal_completion(*completion))
+        .ok_or("Synthesize original terminal completion missing")?;
+    if messages.len() != 1 || outcome.replan.is_some() {
+        return Err("Synthesize terminal publication shape/replan mismatch".into());
+    }
+    let message = synthesize_publication_message(&messages[0])?;
+    let answer =
+        synthesize_terminal_text(&message).ok_or("Synthesize original terminal missing")?;
+    let expected = format!(
+        "turn-result:{}:{:x}",
+        ticket.graph_id,
+        Sha256::digest(answer.as_bytes())
+    );
+    if outcome.result.result_ref.as_deref() != Some(expected.as_str()) {
+        return Err("Synthesize publication does not match original result digest".into());
+    }
+    Ok(Some((answer.to_string(), completion)))
+}
+
+fn apply_synthesize_publication(
+    session: &mut Session,
+    session_id: &str,
+    prefix_count: u64,
+    prefix_sha256: &str,
+    messages: &[serde_json::Value],
+) -> Result<(), String> {
+    if session.session_id != session_id || messages.len() != 1 {
+        return Err("Synthesize publication Session/message mismatch".into());
+    }
+    let pending = synthesize_publication_message(&messages[0])?;
+    let prefix_count = usize::try_from(prefix_count).map_err(|_| "Synthesize prefix overflow")?;
+    if prefix_count > 16384 || session.message_count() < prefix_count {
+        return Err("Synthesize original Session prefix missing".into());
+    }
+    let prefix = session
+        .messages()
+        .take(prefix_count)
+        .cloned()
+        .collect::<Vec<_>>();
+    if synthesize_prefix_digest(&prefix)? != prefix_sha256 {
+        return Err("Synthesize original Session prefix changed".into());
+    }
+    let final_text =
+        synthesize_terminal_text(&pending).ok_or("Synthesize original terminal missing")?;
+    if prefix.last().is_some_and(|message| {
+        message.role.role_str() == "assistant"
+            && message.blocks.iter().any(|block| {
+                matches!(block,
+            ContentBlock::Text { text } if text == final_text)
+            })
+    }) {
+        return Ok(());
+    }
+    if let Some(published) = session.message(prefix_count) {
+        if published != &pending {
+            return Err("Synthesize published terminal segment diverged".into());
+        }
+    } else {
+        session.extend_messages([pending]);
+    }
+    Ok(())
+}
+
+fn committed_synthesize_terminal_claims(
+    store: &crate::RuntimeEventStore,
+    ticket: &NodeExecutionTicket,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<Vec<String>, String> {
+    let identity = crate::authorization_negotiator::ControlledRecoveryTerminalRecord {
+        recovery_scope: format!("turn:{turn_id}"),
+        session_id: session_id.into(),
+        turn_id: turn_id.into(),
+        execution_id: ticket.graph_id.clone(),
+        fingerprints: Vec::new(),
+    };
+    let expected = crate::authorization_negotiator::controlled_recovery_terminal_event(&identity)?;
+    let event = store
+        .event_by_idempotency_key(
+            &expected.event.stream_id,
+            expected
+                .idempotency_key
+                .as_deref()
+                .ok_or("Synthesize claim record key missing")?,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("Synthesize original controlled-recovery terminal record missing")?;
+    let record: crate::authorization_negotiator::ControlledRecoveryTerminalRecord =
+        serde_json::from_value(event.payload.clone()).map_err(|error| error.to_string())?;
+    let mut identity = identity;
+    identity.fingerprints = record.fingerprints.clone();
+    if serde_json::to_value(&identity).map_err(|error| error.to_string())? != event.payload {
+        return Err("Synthesize controlled-recovery terminal identity mismatch".into());
+    }
+    let receipt = store
+        .event_by_idempotency_key(
+            &crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(ticket),
+            &format!("{}:receipt", ticket.idempotency_key),
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("Synthesize original effect receipt missing")?;
+    if event.kind != expected.event.kind
+        || event.scope != expected.event.scope
+        || event.status != expected.event.status
+        || event.actor != expected.event.actor
+        || event.refs != expected.event.refs
+        || event.schema_version != expected.schema_version
+        || event.transaction_id != receipt.transaction_id
+        || event.commit_cursor != receipt.commit_cursor
+    {
+        return Err(
+            "Synthesize controlled-recovery terminal is not in original atomic result".into(),
+        );
+    }
+    Ok(record.fingerprints)
+}
+
+fn validate_synthesize_terminal_row(
+    store: &crate::RuntimeEventStore,
+    ticket: &NodeExecutionTicket,
+    session_id: &str,
+    turn_id: &str,
+    row: &crate::runtime_event_store::RuntimeSessionOutboxRecord,
+    fingerprints: &[String],
+) -> Result<(), String> {
+    let request_id = row
+        .request_id
+        .as_deref()
+        .ok_or("Synthesize original terminal request missing")?;
+    let event = store
+        .event_by_idempotency_key(
+            &format!("session-terminal:{request_id}"),
+            &ticket.idempotency_key,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("Synthesize original terminal request event missing")?;
+    let receipt = store
+        .event_by_idempotency_key(
+            &crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(ticket),
+            &format!("{}:receipt", ticket.idempotency_key),
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("Synthesize original terminal effect receipt missing")?;
+    let terminal: crate::runtime_event_store::SessionTerminalInput =
+        serde_json::from_value(event.payload.clone()).map_err(|error| error.to_string())?;
+    crate::runtime_event_store::validate_runtime_fenced_terminal(&terminal)
+        .map_err(|error| error.to_string())?;
+    if event.kind != "runtime.session.terminal_requested"
+        || event.scope != crate::RuntimeEventScope::SessionInput
+        || event.schema_version != 1
+        || event.actor.as_deref() != Some("SynthesizeNodeExecutor")
+        || event.transaction_id != receipt.transaction_id
+        || event.commit_cursor != receipt.commit_cursor
+        || row.commit_cursor != event.commit_cursor
+        || row.session_id != session_id
+        || row.execution_id.as_deref() != Some(ticket.graph_id.as_str())
+        || row.turn_id.as_deref() != Some(turn_id)
+        || terminal.terminal_id != row.terminal_id
+        || terminal.message_id != row.message_id
+        || terminal.session_id != row.session_id
+        || terminal.execution_id != row.execution_id
+        || terminal.turn_id != row.turn_id
+        || terminal.request_id != row.request_id
+        || terminal.payload_ref != row.payload_ref
+        || terminal.controlled_recovery_claim_fingerprints.as_slice() != fingerprints
+    {
+        return Err("Synthesize original terminal outbox/claim transaction mismatch".into());
+    }
+    Ok(())
+}
+
+fn unknown_recovered_terminal_telemetry() -> crate::RunModelTelemetry {
+    crate::RunModelTelemetry {
+        model: None,
+        models_used: Vec::new(),
+        first_token_latency_ms: None,
+        active_stream_duration_ms: None,
+        wall_duration_ms: 0,
+        output_chars: 0,
+        output_chunks: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_create_tokens: 0,
+        cache_read_tokens: 0,
+        cache_dimensions_known: false,
+        total_tokens: 0,
+        usage_source: "unknown_recovered".into(),
+        wall_chars_per_second: None,
+        wall_tokens_per_second: None,
+        active_chars_per_second: None,
+        active_tokens_per_second: None,
+        chars_per_second: None,
+        tokens_per_second: None,
+    }
+}
+
+fn validate_recovered_terminal_usage(telemetry: &crate::RunModelTelemetry) -> Result<(), String> {
+    for count in [
+        telemetry.input_tokens,
+        telemetry.output_tokens,
+        telemetry.cache_create_tokens,
+        telemetry.cache_read_tokens,
+    ] {
+        u32::try_from(count)
+            .map_err(|_| "Synthesize recovered usage exceeds original TokenUsage width")?;
+    }
+    Ok(())
+}
+
+impl<C, T> TurnSynthesizeBackend<C, T>
+where
+    C: ApiClient + Send + Sync + 'static,
+    T: ToolExecutor,
+{
+    async fn stage_terminal_publication(
+        &self,
+        ticket: &NodeExecutionTicket,
+        outcome: &mut NodeExecutionOutcome,
+    ) -> Result<(), String> {
+        let (session_id, turn_id, messages, completion) = {
+            let state = self.state.lock().await;
+            if outcome.replan.is_some() {
+                (
+                    state.session_id.clone(),
+                    state.turn_id.clone(),
+                    Vec::new(),
+                    None,
+                )
+            } else {
+                if !terminal_commit_owned_by(
+                    state.terminal_commit_owner.as_ref(),
+                    &ticket.node_id,
+                    ticket.attempt,
+                ) {
+                    return Err("Synthesize terminal has no original staging owner".into());
+                }
+                let answer = state
+                    .committed_terminal_answer
+                    .as_ref()
+                    .ok_or("Synthesize terminal has no original answer")?;
+                let message = ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: answer.clone(),
+                }]);
+                (
+                    state.session_id.clone(),
+                    state.turn_id.clone(),
+                    vec![synthesize_message_value(&message)],
+                    state.committed_terminal_completion,
+                )
+            }
+        };
+        validate_synthesize_publication(ticket, ticket, &messages, completion, outcome)?;
+        let snapshot = self.runtime.lock().await.session_snapshot().await;
+        if snapshot.session_id != session_id {
+            return Err("Synthesize staging Runtime Session mismatch".into());
+        }
+        let prefix = snapshot.materialize_messages();
+        let prefix_sha256 = synthesize_prefix_digest(&prefix)?;
+        let prefix_count = prefix.len() as u64;
+        let commits = self.services.commit_service().clone();
+        let original = ticket.clone();
+        let event = tokio::task::spawn_blocking(move || {
+            commits.prepare_synthesize_transcript(
+                &original,
+                &session_id,
+                &turn_id,
+                prefix_count,
+                prefix_sha256,
+                messages,
+                completion,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        crate::ExecutionCommitService::attach_host_transcript(outcome, event)
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn should_reconcile_agentic_terminal(
     role: crate::TurnExecutionRole,
     completion: harness_contract::goal::GoalCompletion,
@@ -46,6 +532,9 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 )
             })?;
             if let Some(assessment) = self.capability_gaps.get(&call.id) {
+                if let Some(observation) = self.physical_owner.binding_observation(self.ticket) {
+                    observation.refuse(&call.id, "authorization_gap_before_host_dispatch".into());
+                }
                 return Ok(capability_gap_outcome(
                     call,
                     task.safety_category,
@@ -83,6 +572,9 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             let timeout_secs = task.safety_category.default_timeout_secs();
             let session_id = self.session_id.to_string();
             let node_id = self.ticket.node_id.clone();
+            let observation = self.physical_owner.binding_observation(self.ticket);
+            let leaf_observation = observation.clone();
+            let retained_request = request.clone();
             use sha2::Digest;
             let invocation_id = format!(
                 "leaf:{:x}",
@@ -108,11 +600,21 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                                         &commit_service,
                                         &request,
                                         effect.as_ref(),
+                                        leaf_observation.as_deref(),
                                     )
                                     .await
                                 },
                             )
                             .await;
+                        if let Err(error) = &execution {
+                            if let Some(observation) = &observation {
+                                match error {
+                                    crate::ToolExecutionPlaneError::Admission(_) => observation
+                                        .refuse(&retained_request.tool_use_id, error.to_string()),
+                                    _ => observation.uncertain(&retained_request),
+                                }
+                            }
+                        }
                         // Both reads and writes have durable leaf receipts now.
                         drop(admission);
                         execution.map_err(|error| NodeExecutorError::Poll {
@@ -127,7 +629,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
     }
 
     fn classify_output(&self, output: &Self::Output) -> Result<(), String> {
-        if output.status == crate::RuntimeToolExecutionStatus::Executed {
+        if !output.model_feedback_is_error() {
             Ok(())
         } else {
             Err(output.error.clone().unwrap_or_else(|| {
@@ -166,7 +668,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
         )
         .with_governed_plan(self.plan_id, self.plan_revision);
         let record = match receipt.outcome.status {
-            crate::RuntimeToolExecutionStatus::Executed => {
+            crate::RuntimeToolExecutionStatus::Executed if !receipt.outcome.model_feedback_is_error() => {
                 started.completed(summary, receipt.completed_at_ms)
             }
             crate::RuntimeToolExecutionStatus::BlockedPermission => started.failed(
@@ -184,7 +686,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(task.tool_call_id.clone(), record);
-        let terminal = if receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed {
+        let terminal = if !receipt.outcome.model_feedback_is_error() {
             crate::GovernedToolTaskTerminal::Succeeded(receipt.outcome.clone())
         } else {
             crate::GovernedToolTaskTerminal::FailedOutput {
@@ -222,6 +724,11 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     host_tool_terminal_reason(terminal),
                 ),
             };
+            if let Some(reason) = terminal.undispatched_reason() {
+                if let Some(observation) = self.physical_owner.binding_observation(self.ticket) {
+                    observation.refuse(&call.id, reason);
+                }
+            }
             // Executed leaf receipts were committed while their physical
             // owner still held admission, including the early-model path.
             Ok(outcome)
@@ -266,7 +773,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
         let (summary, exit_code) = receipt.map_or_else(
             || (host_tool_terminal_reason(terminal), Some(1)),
             |outcome| {
-                let failed = outcome.status != crate::RuntimeToolExecutionStatus::Executed;
+                let failed = outcome.model_feedback_is_error();
                 (
                     outcome
                         .output
@@ -299,11 +806,11 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             .with_governed_plan(self.plan_id, self.plan_revision)
         });
         let ended_at_ms = crate::tool_invocation::now_ms();
-        let record = match receipt.map(|outcome| &outcome.status) {
-            Some(crate::RuntimeToolExecutionStatus::Executed) => {
+        let record = match receipt {
+            Some(outcome) if !outcome.model_feedback_is_error() => {
                 started.completed(&summary, ended_at_ms)
             }
-            Some(crate::RuntimeToolExecutionStatus::BlockedPermission) => {
+            Some(outcome) if outcome.status == crate::RuntimeToolExecutionStatus::BlockedPermission => {
                 started.failed(ToolFailureKind::PermissionDenied, &summary, ended_at_ms)
             }
             _ => started.failed(
@@ -373,6 +880,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
                     })
                     .collect(),
                 invocations: rejected_tool_invocations(
+                    session_id,
                     calls,
                     crate::ToolSafetyCategory::Destructive,
                     None,
@@ -402,6 +910,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
                 )),
             );
             invocation_records.extend(rejected_tool_invocations(
+                session_id,
                 std::slice::from_ref(call),
                 crate::ToolSafetyCategory::Destructive,
                 None,
@@ -444,6 +953,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
                 )),
             );
             invocation_records.extend(rejected_tool_invocations(
+                session_id,
                 std::slice::from_ref(call),
                 task.safety_category,
                 Some(plan.plan_id.as_str()),
@@ -987,14 +1497,12 @@ fn claim_continuation_budget(state: &mut TurnGraphState, stage: &str) -> bool {
     false
 }
 
-#[async_trait]
-impl<C, T> crate::execution_core::graph::executors::SynthesizeBackend
-    for TurnSynthesizeBackend<C, T>
+impl<C, T> TurnSynthesizeBackend<C, T>
 where
     C: ApiClient + Send + Sync + 'static,
     T: ToolExecutor,
 {
-    async fn synthesize(
+    async fn synthesize_original(
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, String> {
@@ -1143,6 +1651,12 @@ where
                 | harness_contract::outcome::DeliveryStatus::Denied
                 | harness_contract::outcome::DeliveryStatus::Unavailable => GoalCompletion::Partial,
             };
+        }
+        if !is_synthesize_terminal_completion(completion) {
+            return Err(
+                "Synthesize requires immutable Goal completion, not open or resumable waiting"
+                    .into(),
+            );
         }
         let presentation_id = format!("presentation:{}:{}", ticket.graph_id, envelope.revision);
         let attempt_id = format!("{}:attempt:{}", presentation_id, ticket.attempt);
@@ -1550,13 +2064,14 @@ where
         // Program is what says whether the work is finished. Both claims now reach
         // the same check; the checks themselves are unchanged and still bounded, so
         // a genuinely finished or genuinely blocked Program falls straight through.
-        if should_reconcile_agentic_terminal(
+        let reconcile_agentic = should_reconcile_agentic_terminal(
             execution_role,
             completion,
             terminal_override
                 .as_ref()
                 .map(|(completion, _)| *completion),
-        ) {
+        );
+        if reconcile_agentic {
             // First make any durable Program completion request visible to the
             // authoritative GoalStore. The gap check must observe that verdict;
             // checking first can miss a request that has not yet been reduced.
@@ -1564,6 +2079,15 @@ where
                 .drive_agentic_objective_completion(&session_id, &turn_id, &ticket.graph_id)
                 .await?;
             observe_stage!("objective_completion_driven");
+        }
+        let source_revisions = freeze_synthesize_goal_sources(
+            self.services.as_ref(),
+            &session_id,
+            &turn_id,
+            &goal_id,
+        )?;
+        outcome = inherit_synthesize_sources(outcome, &source_revisions)?;
+        if reconcile_agentic {
             // A success presentation while a real completion gap remains means the
             // root finished too early. Do not fail the turn: return the root to
             // continue (bounded) with the gap disclosed, so it can classify
@@ -1603,9 +2127,11 @@ where
                             gap = %gap,
                             "the model concluded repeatedly without acting; presenting the honest terminal instead of spending the remaining budget"
                         );
-                        return Ok(self
-                            .honest_partial_terminal(ticket, &gap, idle_answers)
-                            .await);
+                        return inherit_synthesize_sources(
+                            self.honest_partial_terminal(ticket, &gap, idle_answers)
+                                .await,
+                            &source_revisions,
+                        );
                     }
                 }
                 let continue_gap = {
@@ -1631,18 +2157,21 @@ where
                         "inline_model",
                         "inline_model",
                     );
-                    return Ok(NodeExecutionOutcome::new(completed_result(
-                        Some(format!("{}:completion-gap-continuation", ticket.graph_id)),
-                        ExecutionUsage::default(),
-                    ))
-                    .with_replan(ExecutionGraphReplan {
-                        nodes: vec![next.clone()],
-                        edges: dynamic_edges(&ticket.node_id, &[next]),
-                        reason: format!(
-                            "Objective completion gap remains; continue working before presenting success: {gap}"
-                        ),
-                        framework_authored: true,
-                    }));
+                    return inherit_synthesize_sources(
+                        NodeExecutionOutcome::new(completed_result(
+                            Some(format!("{}:completion-gap-continuation", ticket.graph_id)),
+                            ExecutionUsage::default(),
+                        ))
+                        .with_replan(ExecutionGraphReplan {
+                            nodes: vec![next.clone()],
+                            edges: dynamic_edges(&ticket.node_id, &[next]),
+                            reason: format!(
+                                "Objective completion gap remains; continue working before presenting success: {gap}"
+                            ),
+                            framework_authored: true,
+                        }),
+                        &source_revisions,
+                    );
                 }
             }
             // A success presentation while Program-owned rungs remain also
@@ -1780,19 +2309,22 @@ where
                             "inline_model",
                             "inline_model",
                         );
-                        return Ok(NodeExecutionOutcome::new(completed_result(
-                            Some(format!("{}:closure-rung-continuation", ticket.graph_id)),
-                            ExecutionUsage::default(),
-                        ))
-                        .with_replan(ExecutionGraphReplan {
-                            nodes: vec![next.clone()],
-                            edges: dynamic_edges(&ticket.node_id, &[next]),
-                            reason: format!(
-                                "Program-owned rungs remain; continue working before presenting success: {}",
-                                outstanding.join(", ")
-                            ),
-                            framework_authored: true,
-                        }));
+                        return inherit_synthesize_sources(
+                            NodeExecutionOutcome::new(completed_result(
+                                Some(format!("{}:closure-rung-continuation", ticket.graph_id)),
+                                ExecutionUsage::default(),
+                            ))
+                            .with_replan(ExecutionGraphReplan {
+                                nodes: vec![next.clone()],
+                                edges: dynamic_edges(&ticket.node_id, &[next]),
+                                reason: format!(
+                                    "Program-owned rungs remain; continue working before presenting success: {}",
+                                    outstanding.join(", ")
+                                ),
+                                framework_authored: true,
+                            }),
+                            &source_revisions,
+                        );
                     }
                 }
             }
@@ -1958,30 +2490,30 @@ where
                 "token_usage": terminal_usage,
             }))
             .map_err(|error| format!("encode terminal artifact: {error}"))?;
-            let terminal_artifact = self
-                .services
-                .artifact_store()
-                .write_bytes(
-                    harness_contract::context::ArtifactWriteDescriptor {
-                        media_type: "application/vnd.cowd.session-terminal+json".to_string(),
-                        visibility_scope: format!("session:{}", ingress.session_id),
-                        expected_bytes: Some(terminal_payload.len() as u64),
-                        original_name: Some(format!("{}.json", terminal_id.replace(':', "-"))),
-                    },
+            let staging_owner = format!("prepared:terminal:{terminal_id}");
+            let artifacts = Arc::clone(self.services.artifact_store());
+            let scope = format!("session:{}", ingress.session_id);
+            let prepared_owner = staging_owner.clone();
+            let prepared_origin = crate::PreparedArtifactOrigin::TerminalBody {
+                terminal_id: terminal_id.clone(),
+                session_id: ingress.session_id.clone(),
+                execution_id: ticket.graph_id.clone(),
+                turn_id: ingress.turn_id.clone(),
+                event_stream: format!("session-terminal:{}", ingress.request_id),
+                event_key: ticket.idempotency_key.clone(),
+            };
+            let terminal_artifact = tokio::task::spawn_blocking(move || {
+                artifacts.write_pre_pinned_with_media_blocking(
+                    &scope,
+                    &prepared_owner,
+                    "application/vnd.cowd.session-terminal+json",
                     &terminal_payload,
+                    &prepared_origin,
                 )
-                .await
-                .map_err(|error| format!("persist terminal artifact: {error}"))?;
-            let staging_owner = format!("staging:{terminal_id}");
-            self.services
-                .artifact_store()
-                .pin(
-                    &terminal_artifact,
-                    &staging_owner,
-                    crate::tool_invocation_now_ms()
-                        .saturating_add(crate::ARTIFACT_STAGING_PIN_TTL_MS),
-                )
-                .map_err(|error| format!("pin terminal artifact: {error}"))?;
+            })
+            .await
+            .map_err(|_| "terminal artifact preparation task failed".to_string())?
+            .map_err(|error| format!("persist permanently pinned terminal artifact: {error}"))?;
             let payload_ref = crate::encode_session_terminal_artifact_ref(&terminal_artifact)?;
             self.state.lock().await.pending_terminal_artifact = Some(PendingTerminalArtifact {
                 artifact: terminal_artifact,
@@ -2034,101 +2566,195 @@ where
         observe_stage!("complete");
         Ok(outcome)
     }
+}
+
+#[async_trait]
+impl<C, T> crate::execution_core::graph::executors::SynthesizeBackend
+    for TurnSynthesizeBackend<C, T>
+where
+    C: ApiClient + Send + Sync + 'static,
+    T: ToolExecutor,
+{
+    async fn synthesize(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, String> {
+        let mut outcome = self.synthesize_original(ticket).await?;
+        self.stage_terminal_publication(ticket, &mut outcome)
+            .await?;
+        Ok(outcome)
+    }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), String> {
-        let owns_terminal_commit = {
+        let commits = self.services.commit_service().clone();
+        let original = ticket.clone();
+        let store = self.services.event_store().clone();
+        let (document, outcome, committed_claims, original_terminal, original_objective) =
+            tokio::task::spawn_blocking(move || {
+                let document = commits
+                    .committed_host_transcript(&original)
+                    .map_err(|error| error.to_string())?;
+                let crate::execution_core::graph::ExecutionEffectState::Completed(outcome) =
+                    commits
+                        .inspect_execution_effect(&original)
+                        .map_err(|error| error.to_string())?
+                else {
+                    return Err("Synthesize original atomic effect is missing".to_string());
+                };
+                let (claims, terminal) = if document.terminal_completion.is_some() {
+                    let claims = committed_synthesize_terminal_claims(
+                        &store,
+                        &original,
+                        &document.session_id,
+                        &document.turn_id,
+                    )?;
+                    let terminal = store
+                        .session_terminal_for_execution(
+                            &document.session_id,
+                            &original.graph_id,
+                            &document.turn_id,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if let Some(row) = terminal.as_ref() {
+                        validate_synthesize_terminal_row(
+                            &store,
+                            &original,
+                            &document.session_id,
+                            &document.turn_id,
+                            row,
+                            &claims,
+                        )?;
+                    }
+                    (claims, terminal)
+                } else {
+                    (Vec::new(), None)
+                };
+                let graph = crate::ExecutionGraphStateStore::new(store.clone())
+                    .load(&original.graph_id)
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>((document, outcome, claims, terminal, graph.objective))
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+        let terminal = validate_synthesize_publication(
+            ticket,
+            &document.ticket,
+            &document.messages,
+            document.terminal_completion,
+            &outcome,
+        )?;
+        if document.root_control_team_count.is_some() {
+            return Err("Synthesize publication cannot carry root-control metadata".into());
+        }
+        {
             let state = self.state.lock().await;
-            terminal_commit_owned_by(
+            if state.session_id != document.session_id || state.turn_id != document.turn_id {
+                return Err("Synthesize publication belongs to another Session/turn".into());
+            }
+        }
+        let Some((final_answer, terminal_completion)) = terminal else {
+            return Ok(());
+        };
+        let mut runtime = self.runtime.lock().await;
+        if runtime.session_id() != document.session_id {
+            return Err("Synthesize Runtime Session mismatch".into());
+        }
+        let (recovering, already_finalized) = {
+            let state = self.state.lock().await;
+            let owns = terminal_commit_owned_by(
                 state.terminal_commit_owner.as_ref(),
                 &ticket.node_id,
                 ticket.attempt,
-            )
+            );
+            if state.terminal_commit_owner.is_some() && !owns {
+                return Err("Synthesize publication conflicts with another active terminal".into());
+            }
+            if owns
+                && (state.committed_terminal_answer.as_ref() != Some(&final_answer)
+                    || state.committed_terminal_completion != Some(terminal_completion))
+            {
+                return Err("Synthesize cached terminal diverges from original publication".into());
+            }
+            if state.summary.as_ref().is_some_and(|summary| {
+                summary.final_answer != final_answer
+                    || summary.terminal_completion != terminal_completion
+            }) {
+                return Err(
+                    "Synthesize finalized summary diverges from original publication".into(),
+                );
+            }
+            (!owns, state.summary.is_some())
         };
-        if !owns_terminal_commit {
-            // Synthesize also owns the final-input barrier. When new durable
-            // input wins that barrier it commits a replan, not a terminal
-            // presentation. Runner still invokes `after_commit` for the
-            // committed node transition, so this hook must be a no-op.
+        if !already_finalized {
+            let strategy = runtime
+                .active_turn_strategy()
+                .ok_or("Synthesize finalization requires its original admitted strategy")?;
+            if strategy.session_ref != document.session_id
+                || strategy.turn_ref != document.turn_id
+                || strategy.execution_graph_ref.as_deref() != Some(ticket.graph_id.as_str())
+            {
+                return Err(
+                    "Synthesize finalization strategy crosses original Session/turn/graph".into(),
+                );
+            }
+        }
+        let recovered_telemetry = recovering.then(|| {
+            self.services
+                .execution_model_usage_snapshot(&ticket.graph_id)
+                .and_then(|snapshot| snapshot.own)
+                .unwrap_or_else(unknown_recovered_terminal_telemetry)
+        });
+        if let Some(telemetry) = recovered_telemetry.as_ref() {
+            validate_recovered_terminal_usage(telemetry)?;
+        }
+        {
+            let mut validation = runtime.session_snapshot().await;
+            apply_synthesize_publication(
+                &mut validation,
+                &document.session_id,
+                document.prefix_count,
+                &document.prefix_sha256,
+                &document.messages,
+            )?;
+        }
+        {
+            let state = self.state.lock().await;
+            if let Some(pending) = state.pending_terminal_artifact.as_ref() {
+                let terminal = original_terminal
+                    .as_ref()
+                    .ok_or("Synthesize staged terminal pin has no original outbox row")?;
+                let artifact = crate::decode_session_terminal_artifact_ref(&terminal.payload_ref)?;
+                if pending.artifact != artifact || pending.durable_owner != terminal.terminal_id {
+                    return Err(
+                        "Synthesize staged terminal pin diverges from original outbox".into(),
+                    );
+                }
+                self.services
+                    .artifact_store()
+                    .pin(
+                        &pending.artifact,
+                        &pending.durable_owner,
+                        crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "promote original terminal artifact pin {}: {error}",
+                            pending.staging_owner
+                        )
+                    })?;
+            }
+        }
+        if already_finalized {
+            let mut session = runtime.session_mut_async().await;
+            apply_synthesize_publication(
+                &mut session,
+                &document.session_id,
+                document.prefix_count,
+                &document.prefix_sha256,
+                &document.messages,
+            )?;
             return Ok(());
         }
-        let committed_recovery_claims = std::mem::take(
-            &mut self
-                .state
-                .lock()
-                .await
-                .pending_controlled_recovery_claim_fingerprints,
-        );
-        if !committed_recovery_claims.is_empty() {
-            let acknowledged = self
-                .runtime
-                .lock()
-                .await
-                .authorization_negotiator()
-                .acknowledge_controlled_recovery_terminals(&committed_recovery_claims);
-            if acknowledged != committed_recovery_claims.len() {
-                tracing::warn!(
-                    acknowledged,
-                    expected = committed_recovery_claims.len(),
-                    "durable turn terminal found missing controlled recovery hot claims"
-                );
-            }
-        }
-        let pending_terminal_artifact = self.state.lock().await.pending_terminal_artifact.take();
-        if let Some(pending) = pending_terminal_artifact {
-            if let Err(error) = self.services.artifact_store().pin(
-                &pending.artifact,
-                &pending.durable_owner,
-                crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
-            ) {
-                // The graph event is already committed. Preserve the staged
-                // object permanently rather than allowing a referenced
-                // terminal artifact to expire before reconciliation.
-                let _ = self.services.artifact_store().pin(
-                    &pending.artifact,
-                    &pending.staging_owner,
-                    crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
-                );
-                return Err(format!("promote committed terminal artifact pin: {error}"));
-            }
-            if let Err(error) = self
-                .services
-                .artifact_store()
-                .unpin(&pending.artifact, &pending.staging_owner)
-            {
-                tracing::warn!(
-                    error = %error,
-                    artifact = %pending.artifact.selector,
-                    "committed terminal artifact retained an extra staging pin"
-                );
-            }
-        }
-        let (
-            terminal_override,
-            committed_terminal_answer,
-            committed_terminal_completion,
-            defer_post_turn_memory_maintenance,
-        ) = {
-            let state = self.state.lock().await;
-            (
-                state.terminal_override.clone(),
-                state.committed_terminal_answer.clone(),
-                state.committed_terminal_completion,
-                state.ingress.is_some(),
-            )
-        };
-        let terminal_completion = committed_terminal_completion.unwrap_or_else(|| {
-            terminal_override
-                .as_ref()
-                .map(|(completion, _)| *completion)
-                .unwrap_or(GoalCompletion::Satisfied)
-        });
-        let final_answer = committed_terminal_answer.ok_or_else(|| {
-            "terminal presentation committed without a cached user-visible answer".to_string()
-        })?;
-        // `after_commit` has committed only the Runtime graph transition. The
-        // Session transcript/outbox transaction has not committed yet, so it
-        // must not publish a terminal-delivery committed fact. Gateway's
-        // durable outbox bridge is the single authority for that event.
         let (
             content,
             assistant_messages,
@@ -2145,12 +2771,25 @@ where
             write_attempt_paths,
             max_tool_concurrency_observed,
             parallel_tool_batches,
+            defer_memory,
         ) = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             (
-                state.content.clone(),
-                std::mem::take(&mut state.assistant_messages),
-                std::mem::take(&mut state.tool_results),
+                if recovering {
+                    original_objective
+                } else {
+                    state.content.clone()
+                },
+                if recovering {
+                    vec![synthesize_publication_message(&document.messages[0])?]
+                } else {
+                    state.assistant_messages.clone()
+                },
+                if recovering {
+                    Vec::new()
+                } else {
+                    state.tool_results.clone()
+                },
                 state.iterations,
                 state.model.clone(),
                 state.models_used.clone(),
@@ -2160,15 +2799,13 @@ where
                 state.output_tokens,
                 state.wall_duration_ms,
                 state.duplicate_tool_calls,
-                std::mem::take(&mut state.write_attempt_paths),
+                state.write_attempt_paths.clone(),
                 state.max_tool_concurrency_observed,
                 state.parallel_tool_batches,
+                state.ingress.is_some(),
             )
         };
-        let summary = self
-            .runtime
-            .lock()
-            .await
+        let summary = runtime
             .finalize_graph_turn(
                 &content,
                 final_answer,
@@ -2187,20 +2824,33 @@ where
                 max_tool_concurrency_observed,
                 parallel_tool_batches,
                 terminal_completion,
-                defer_post_turn_memory_maintenance,
+                defer_memory,
+                recovered_telemetry,
             )
             .await
             .map_err(|error| error.to_string())?;
         {
+            let mut session = runtime.session_mut_async().await;
+            apply_synthesize_publication(
+                &mut session,
+                &document.session_id,
+                document.prefix_count,
+                &document.prefix_sha256,
+                &document.messages,
+            )?;
+        }
+        {
             let mut state = self.state.lock().await;
-            // The breaker's scope is the turn that owns the root presentation. A
-            // delegated Agent's graph turn is inside that turn and shares its ledger
-            // key, so clearing here for a delegated role resets a breaker the root
-            // turn is still relying on: one live run cleared the same ledger 48
-            // times inside one turn and refused the same failing call 62 times
-            // without ever closing the loop. `state.turn_id` is the same id the
-            // guard keys on (`host.rs:644` begins the input stream's active turn
-            // from the same `turn_ref` this state stores).
+            if !committed_claims.is_empty() {
+                runtime
+                    .authorization_negotiator()
+                    .acknowledge_controlled_recovery_terminals(&committed_claims);
+            }
+            state.pending_controlled_recovery_claim_fingerprints.clear();
+            state.pending_terminal_artifact = None;
+            state.assistant_messages.clear();
+            state.tool_results.clear();
+            state.write_attempt_paths.clear();
             crate::repetition_guard::clear_breakers_for_role(
                 &crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id),
                 state.execution_role.owns_root_presentation(),
@@ -2213,7 +2863,6 @@ where
         }
         Ok(())
     }
-
     async fn after_abort(&self, ticket: &NodeExecutionTicket, reason: &str) -> Result<(), String> {
         let presentation = {
             let mut state = self.state.lock().await;
@@ -2458,16 +3107,23 @@ fn consecutive_answer_stop_bound() -> Result<Option<u64>, String> {
     match std::env::var("COWD_CONSECUTIVE_ANSWER_STOP") {
         Ok(value) => consecutive_answer_stop_bound_from(Some(&value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(format!("invalid operator no-action resource limit: {error}")),
+        Err(error) => Err(format!(
+            "invalid operator no-action resource limit: {error}"
+        )),
     }
 }
 
 fn consecutive_answer_stop_bound_from(raw: Option<&str>) -> Result<Option<u64>, String> {
     match raw {
         None => Ok(None),
-        Some(value) => value.trim().parse::<u64>()
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
             .map(|limit| (limit > 0).then_some(limit))
-            .map_err(|_| "COWD_CONSECUTIVE_ANSWER_STOP must be an explicit nonnegative resource limit".to_string()),
+            .map_err(|_| {
+                "COWD_CONSECUTIVE_ANSWER_STOP must be an explicit nonnegative resource limit"
+                    .to_string()
+            }),
     }
 }
 
@@ -2475,13 +3131,22 @@ fn completion_gap_continuation_bound() -> Result<Option<u64>, String> {
     match std::env::var("COWD_COMPLETION_GAP_CONTINUATIONS") {
         Ok(value) => parse_continuation_resource_limit(&value).map(Some),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(format!("invalid operator continuation resource limit: {error}")),
+        Err(error) => Err(format!(
+            "invalid operator continuation resource limit: {error}"
+        )),
     }
 }
 
 fn parse_continuation_resource_limit(value: &str) -> Result<u64, String> {
-    value.trim().parse::<u64>().ok().filter(|limit| *limit > 0)
-        .ok_or_else(|| "COWD_COMPLETION_GAP_CONTINUATIONS must be an explicit positive resource limit".to_string())
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            "COWD_COMPLETION_GAP_CONTINUATIONS must be an explicit positive resource limit"
+                .to_string()
+        })
 }
 
 /// Resolve terminal ownership before emitting a Goal event. Agent-first
@@ -2944,9 +3609,18 @@ mod terminal_usage_tests {
     #[test]
     fn consecutive_answer_stop_requires_an_explicit_resource_limit_and_preserves_zero_disable() {
         assert_eq!(consecutive_answer_stop_bound_from(None).unwrap(), None);
-        assert_eq!(consecutive_answer_stop_bound_from(Some("5")).unwrap(), Some(5));
-        assert_eq!(consecutive_answer_stop_bound_from(Some(" 2 ")).unwrap(), Some(2));
-        assert_eq!(consecutive_answer_stop_bound_from(Some("1000")).unwrap(), Some(1000));
+        assert_eq!(
+            consecutive_answer_stop_bound_from(Some("5")).unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            consecutive_answer_stop_bound_from(Some(" 2 ")).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            consecutive_answer_stop_bound_from(Some("1000")).unwrap(),
+            Some(1000)
+        );
         assert_eq!(consecutive_answer_stop_bound_from(Some("0")).unwrap(), None);
         for value in ["", "abc", "-1", "18446744073709551616"] {
             assert!(consecutive_answer_stop_bound_from(Some(value)).is_err());
@@ -3435,7 +4109,7 @@ pub(super) fn replace_latest_assistant_text(
 pub(super) fn early_tool_receipt_message(
     receipt: &crate::conversation::EarlyToolExecutionReceipt,
 ) -> ConversationMessage {
-    let is_error = receipt.outcome.status != crate::RuntimeToolExecutionStatus::Executed;
+    let is_error = receipt.outcome.model_feedback_is_error();
     let output = receipt
         .outcome
         .output

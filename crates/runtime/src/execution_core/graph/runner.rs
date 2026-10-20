@@ -5,18 +5,20 @@ use std::time::Duration;
 
 use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
 use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError, ExecutionNodeResult,
-    ExecutionNodeStatus, validate_execution_graph,
+    validate_execution_graph, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
+    ExecutionNodeResult, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, futures::OwnedNotified, oneshot};
+use tokio::sync::{futures::OwnedNotified, oneshot, Mutex, Notify, OwnedMutexGuard};
 
 use super::commit_service::{
     ExecutionCommitError, ExecutionCommitService, ExecutionEffectState, ExecutionTerminalCommit,
 };
-use super::events::ExecutionNodeBinding;
+use super::events::{ExecutionBindingLeaseClosure, ExecutionNodeBinding};
 use super::recovery::{ExecutionGraphRecovery, ExecutionRecoveryError};
+
+use super::PHYSICAL_CLOSURE_BUDGET;
 use super::registry::{
     NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor,
     NodeExecutorError, NodeExecutorRegistry,
@@ -54,6 +56,8 @@ pub enum ExecutionRunnerError {
     Resource { node_id: String, reason: String },
     #[error("execution resource admission deferred for node `{node_id}`: {reason}")]
     ResourceDeferred { node_id: String, reason: String },
+    #[error("unadmitted execution graph `{graph_id}` changed during resource preparation")]
+    AdmissionRaced { graph_id: String },
     #[error("execution node `{node_id}` exceeded its durable deadline `{deadline_at_ms}`")]
     DeadlineExceeded {
         node_id: String,
@@ -101,6 +105,8 @@ struct ActiveNode {
     effect_state: ExecutionEffectState,
     effect_receipt_required: bool,
     _resources: NodeResourceGuards,
+    callback_gate: Arc<Mutex<()>>,
+    no_dispatch: Option<Arc<super::executors::agent_tool::NoDispatchObservation>>,
 }
 
 struct PendingTerminalCommit {
@@ -137,10 +143,19 @@ struct NodeResourceGuards {
     resource: Option<ExecutionResourceLease>,
     scope: Option<ScopeLockLease>,
     worktree: Option<WorktreeLease>,
+    original_binding: Option<ExecutionNodeBinding>,
+    admission_pending: bool,
+    release_blocked: bool,
+    callback_completed: bool,
+    drain_completed: bool,
+    owner_fence: Option<super::resources::BindingOwnerFence>,
 }
 
 impl NodeResourceGuards {
     fn binding(&self, ticket: &NodeExecutionTicket) -> ExecutionNodeBinding {
+        if let Some(binding) = &self.original_binding {
+            return binding.clone();
+        }
         ExecutionNodeBinding {
             executor_kind: ticket.executor_kind.clone(),
             ticket_idempotency_key: ticket.idempotency_key.clone(),
@@ -148,9 +163,12 @@ impl NodeResourceGuards {
             resource_lease_refs: self
                 .resource
                 .as_ref()
-                .map(|resource| vec![resource.id().to_string()])
+                .map(|resource| vec![resource.projection_reference()])
                 .unwrap_or_default(),
-            scope_lease_ref: self.scope.as_ref().map(|lease| lease.id().to_string()),
+            scope_lease_ref: self
+                .scope
+                .as_ref()
+                .map(|lease| lease.projection_reference()),
             worktree_lease_ref: self
                 .worktree
                 .as_ref()
@@ -167,7 +185,9 @@ impl NodeResourceGuards {
 
 impl Drop for NodeResourceGuards {
     fn drop(&mut self) {
-        self.release_worktree();
+        if !self.admission_pending {
+            self.release_worktree();
+        }
     }
 }
 
@@ -350,8 +370,51 @@ impl ExecutionGraphRunner {
         &self,
         graph_id: &str,
     ) -> Result<ExecutionGraph, ExecutionRecoveryError> {
+        let retained = self
+            .active
+            .lock()
+            .await
+            .iter()
+            .filter(|((active_graph, _), _)| active_graph == graph_id)
+            .map(|((_, node_id), active)| {
+                (node_id.clone(), active._resources.binding(&active.ticket))
+            })
+            .collect::<Vec<_>>();
+        let graph = self.state_store.load_async(graph_id).await?;
+        for (node_id, binding) in &retained {
+            if self
+                .commit_service
+                .binding_callback_kind(&graph, node_id, binding)?
+                .is_none()
+            {
+                return Err(ExecutionRecoveryError::LeaseReconciliation(
+                    "original in-process execution owner is live".into(),
+                ));
+            }
+        }
+        for (node_id, binding) in retained {
+            self.take_bound_active_node(graph_id, &node_id, Some(&binding))
+                .await
+                .map_err(|error| ExecutionRecoveryError::LeaseReconciliation(error.to_string()))?;
+        }
+        if self
+            .active
+            .lock()
+            .await
+            .keys()
+            .any(|(active_graph, _)| active_graph == graph_id)
+        {
+            return Err(ExecutionRecoveryError::LeaseReconciliation(
+                "original in-process execution owner remains retained".into(),
+            ));
+        }
         ExecutionGraphRecovery::new(&self.state_store, &self.commit_service, &self.registry)
-            .recover(graph_id)
+            .recover_with_leases(
+                graph_id,
+                &self.scope_locks,
+                &self.worktree_leases,
+                &self.workspace_id,
+            )
             .await
     }
 
@@ -469,7 +532,15 @@ impl ExecutionGraphRunner {
                 .into_iter()
                 .take(64usize.saturating_sub(active_nodes.len()))
                 .collect::<Vec<_>>();
-            let prepared = self.prepare_ready_wave(graph_id, ready).await?;
+            let prepared = match self.prepare_ready_wave(graph_id, ready).await {
+                Ok(prepared) => prepared,
+                Err(ExecutionRunnerError::ResourceDeferred { .. }) if active_nodes.is_empty() => {
+                    self.wait_for_resource_change().await;
+                    continue;
+                }
+                Err(ExecutionRunnerError::ResourceDeferred { .. }) => Vec::new(),
+                Err(error) => return Err(error),
+            };
             for prepared in prepared {
                 let node_id = prepared.node.id.clone();
                 if !in_flight.insert(node_id.clone()) {
@@ -534,15 +605,15 @@ impl ExecutionGraphRunner {
                 .await?;
         }
         graph = self.advance_dependencies(graph).await?;
-        let ready = graph
-            .nodes
-            .iter()
-            .filter(|node| {
-                graph.node_statuses[&node.id] == ExecutionNodeStatus::Ready
-                    && !in_flight.contains(&node.id)
-            })
-            .cloned()
-            .collect();
+        let mut ready = Vec::new();
+        for node in &graph.nodes {
+            if graph.node_statuses[&node.id] == ExecutionNodeStatus::Ready
+                && !in_flight.contains(&node.id)
+                && self.dependency_publications_ready(&graph, node)?
+            {
+                ready.push(node.clone());
+            }
+        }
         Ok(ExecutionGraphPumpSnapshot {
             ready,
             report: report(&graph),
@@ -623,6 +694,25 @@ impl ExecutionGraphRunner {
         graph_id: &str,
         nodes: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
     ) -> Result<Vec<ExecutionPreparedPumpNode>, ExecutionRunnerError> {
+        for _retry in 0..8 {
+            match self.prepare_ready_wave_once(graph_id, nodes.clone()).await {
+                Err(ExecutionRunnerError::AdmissionRaced { .. }) => {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        Err(ExecutionRunnerError::ResourceDeferred {
+            node_id: graph_id.into(),
+            reason: "fresh unadmitted graph changed during bounded preparation".into(),
+        })
+    }
+
+    async fn prepare_ready_wave_once(
+        &self,
+        graph_id: &str,
+        nodes: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
+    ) -> Result<Vec<ExecutionPreparedPumpNode>, ExecutionRunnerError> {
         if nodes.is_empty() {
             return Ok(Vec::new());
         }
@@ -648,6 +738,27 @@ impl ExecutionGraphRunner {
         let mut prepared = Vec::with_capacity(nodes.len());
         let mut output = Vec::with_capacity(nodes.len());
         for node in nodes {
+            if graph.node_statuses.get(&node.id) != Some(&ExecutionNodeStatus::Ready)
+                || !self.dependency_publications_ready(&graph, &node)?
+            {
+                continue;
+            }
+            if self
+                .active
+                .lock()
+                .await
+                .contains_key(&(graph_id.to_string(), node.id.clone()))
+            {
+                output.push(ExecutionPreparedPumpNode {
+                    binding: None,
+                    startup_error: Some(ExecutionRunnerError::ResourceDeferred {
+                        node_id: node.id.clone(),
+                        reason: "original physical/lease owner still retained".into(),
+                    }),
+                    node,
+                });
+                continue;
+            }
             let deadline_at_ms = match execution_deadline_at_ms(&node) {
                 Ok(value) => value,
                 Err(error) => {
@@ -670,7 +781,7 @@ impl ExecutionGraphRunner {
                 });
                 continue;
             }
-            let resources = match self
+            let mut resources = match self
                 .acquire_node_resources(graph.as_ref(), &node, deadline_at_ms, Some(Duration::ZERO))
                 .await
             {
@@ -713,13 +824,23 @@ impl ExecutionGraphRunner {
                 });
                 continue;
             };
-            let attempt = graph
-                .recovery_cursor
-                .node_attempts
-                .get(&node.id)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
+            let attempt = match ExecutionNodeBinding::next_attempt(&graph, &node.id) {
+                Ok(attempt) => attempt,
+                Err(reason) => {
+                    self.record_resource_terminal(
+                        resource_kind.as_ref(),
+                        resource_queue_wait,
+                        resource_started,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
+                    );
+                    self.discard_unpolled_wave(&prepared);
+                    return Err(NodeExecutorError::Invalid {
+                        node_id: node.id,
+                        reason,
+                    }
+                    .into());
+                }
+            };
             let ticket = match executor
                 .start(NodeExecutionContext {
                     graph: Arc::clone(&graph),
@@ -736,24 +857,85 @@ impl ExecutionGraphRunner {
                         resource_started,
                         crate::execution_core::graph::ResourceResultClass::Failed,
                     );
-                    output.push(ExecutionPreparedPumpNode {
-                        binding: None,
-                        node,
-                        startup_error: Some(error.into()),
-                    });
-                    continue;
+                    self.discard_unpolled_wave(&prepared);
+                    return Err(error.into());
                 }
             };
+            if let Err(reason) =
+                ExecutionNodeBinding::validate_ticket(&ticket, &graph, &node, attempt)
+            {
+                self.record_resource_terminal(
+                    resource_kind.as_ref(),
+                    resource_queue_wait,
+                    resource_started,
+                    crate::execution_core::graph::ResourceResultClass::Failed,
+                );
+                self.discard_unpolled_wave(&prepared);
+                return Err(NodeExecutorError::Invalid {
+                    node_id: node.id,
+                    reason,
+                }
+                .into());
+            }
             let leaf_effect_owner = node.kind
                 == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
                 && node.executor_kind == "tool_batch";
-            let effect_state = if leaf_effect_owner {
-                ExecutionEffectState::Fresh
-            } else {
-                self.commit_service.inspect_execution_effect(&ticket)?
+            let effect_state = match self
+                .commit_service
+                .validate_fresh_node_admission(&graph, &node, &ticket)
+            {
+                Ok(()) => ExecutionEffectState::Fresh,
+                Err(error) => {
+                    self.record_resource_terminal(
+                        resource_kind.as_ref(),
+                        resource_queue_wait,
+                        resource_started,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
+                    );
+                    self.discard_unpolled_wave(&prepared);
+                    return Err(error.into());
+                }
             };
             let effect_receipt_required =
                 !leaf_effect_owner && matches!(effect_state, ExecutionEffectState::Fresh);
+            let binding = resources.binding(&ticket);
+            if ExecutionBindingLeaseClosure::required(&binding) {
+                let key = ExecutionBindingLeaseClosure::fence_key(&graph, &node.id, &binding);
+                resources.original_binding = Some(binding.clone());
+                let mut admission_error = None;
+                let owner = self.scope_locks.acquire_binding_owner(&key, || {
+                    self.commit_service
+                        .validate_unadmitted_binding_start(&graph, &node, &ticket)
+                        .map_err(|error| {
+                            let reason = error.to_string();
+                            admission_error = Some(error);
+                            reason
+                        })
+                });
+                resources.owner_fence = Some(match owner {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        self.discard_unpolled_wave(&prepared);
+                        if matches!(
+                            admission_error.as_ref(),
+                            Some(ExecutionCommitError::EventStore(
+                                crate::RuntimeEventStoreError::StaleRevision { .. }
+                            ))
+                        ) {
+                            return Err(ExecutionRunnerError::AdmissionRaced {
+                                graph_id: graph_id.into(),
+                            });
+                        }
+                        if let Some(error) = admission_error {
+                            return Err(error.into());
+                        }
+                        return Err(ExecutionRunnerError::Resource {
+                            node_id: node.id.clone(),
+                            reason: error.to_string(),
+                        });
+                    }
+                });
+            }
             prepared.push(PreparedNodeStart {
                 node,
                 executor,
@@ -796,9 +978,29 @@ impl ExecutionGraphRunner {
                 .filter(|start| start.effect_receipt_required)
                 .map(|start| start.ticket.clone())
                 .collect::<Vec<_>>();
+            let mut observations = Vec::with_capacity(admitted.len());
+            for start in &admitted {
+                match self.registry.observe_builtin_binding(&start.ticket) {
+                    Ok(observation) => observations.push(observation),
+                    Err(error) => {
+                        for (original, observation) in admitted.iter().zip(&observations) {
+                            if let Some(observation) = observation {
+                                self.registry.rollback_unadmitted_builtin_binding(
+                                    &original.ticket,
+                                    observation,
+                                    &self.commit_service,
+                                )?;
+                            }
+                        }
+                        self.discard_unpolled_wave(&admitted);
+                        return Err(error.into());
+                    }
+                }
+            }
             {
                 let mut active = self.active.lock().await;
-                for start in admitted.drain(..) {
+                for (mut start, no_dispatch) in admitted.drain(..).zip(observations) {
+                    start.resources.admission_pending = true;
                     output.push(ExecutionPreparedPumpNode {
                         binding: bindings.get(&start.node.id).cloned(),
                         node: start.node.clone(),
@@ -815,6 +1017,8 @@ impl ExecutionGraphRunner {
                             effect_state: start.effect_state,
                             effect_receipt_required: start.effect_receipt_required,
                             _resources: start.resources,
+                            callback_gate: Arc::new(Mutex::new(())),
+                            no_dispatch,
                         },
                     );
                 }
@@ -824,40 +1028,92 @@ impl ExecutionGraphRunner {
                 .bind_and_start_nodes_async(current.as_ref().clone(), bindings, effect_tickets)
                 .await
             {
-                let mut active = self.active.lock().await;
-                let failed = output
+                let starts = self
+                    .active
+                    .lock()
+                    .await
                     .iter()
-                    .filter(|item| item.startup_error.is_none())
-                    .map(|item| item.node.id.clone())
+                    .filter(|((id, node), _)| {
+                        id == graph_id
+                            && output
+                                .iter()
+                                .any(|item| item.startup_error.is_none() && &item.node.id == node)
+                    })
+                    .map(|(_, active)| {
+                        (
+                            active.ticket.clone(),
+                            active._resources.binding(&active.ticket),
+                        )
+                    })
                     .collect::<Vec<_>>();
-                let mut aborted = Vec::with_capacity(failed.len());
-                for node_id in failed {
-                    if let Some(start) = active.remove(&(graph_id.to_string(), node_id)) {
-                        aborted.push(start);
+                let states = starts
+                    .iter()
+                    .map(|(ticket, binding)| {
+                        self.commit_service
+                            .binding_start_was_admitted(graph_id, ticket, binding)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if states.is_empty()
+                    || states.iter().any(|value| *value) && states.iter().any(|value| !*value)
+                {
+                    return Err(ExecutionRunnerError::Driver("atomic start response has inconsistent canonical admission; original owners retained".into()));
+                }
+                if states.iter().all(|value| !*value) {
+                    let mut active = self.active.lock().await;
+                    for (ticket, binding) in &starts {
+                        let original = active
+                            .get(&(graph_id.to_string(), ticket.node_id.clone()))
+                            .filter(|original| {
+                                original.ticket == *ticket
+                                    && original._resources.binding(ticket) == *binding
+                            })
+                            .ok_or_else(|| {
+                                ExecutionRunnerError::Driver(
+                                    "unadmitted rollback original owner changed".into(),
+                                )
+                            })?;
+                        if let Some(observation) = original.no_dispatch.as_ref() {
+                            self.registry.rollback_unadmitted_builtin_binding(
+                                ticket,
+                                observation,
+                                &self.commit_service,
+                            )?;
+                        }
                     }
+                    let aborted = starts
+                        .iter()
+                        .filter_map(|(ticket, _)| {
+                            active.remove(&(graph_id.to_string(), ticket.node_id.clone()))
+                        })
+                        .collect::<Vec<_>>();
+                    drop(active);
+                    drop(coordination);
+                    for mut start in aborted {
+                        start._resources.admission_pending = false;
+                        self.record_resource_terminal(
+                            start.resource_kind.as_ref(),
+                            start.resource_queue_wait,
+                            start.resource_started,
+                            crate::execution_core::graph::ResourceResultClass::Failed,
+                        );
+                    }
+                    if matches!(&error, ExecutionCommitError::EventStore(
+                        crate::RuntimeEventStoreError::StaleRevision { stream_id, .. }
+                    ) if stream_id == graph_id)
+                    {
+                        return Err(ExecutionRunnerError::AdmissionRaced {
+                            graph_id: graph_id.into(),
+                        });
+                    }
+                    return Err(error.into());
                 }
-                drop(active);
-                drop(coordination);
-                for start in aborted {
-                    let _ = start
-                        .executor
-                        .cancel_bounded(&start.ticket, Duration::from_secs(5))
-                        .await;
-                    self.record_resource_terminal(
-                        start.resource_kind.as_ref(),
-                        start.resource_queue_wait,
-                        start.resource_started,
-                        crate::execution_core::graph::ResourceResultClass::Failed,
-                    );
-                }
-                return Err(error.into());
             }
         }
         drop(coordination);
         for start in superseded {
             let _ = start
                 .executor
-                .cancel_bounded(&start.ticket, Duration::from_secs(5))
+                .cancel_bounded(&start.ticket, PHYSICAL_CLOSURE_BUDGET)
                 .await;
             self.record_resource_terminal(
                 start.resource_kind.as_ref(),
@@ -874,6 +1130,17 @@ impl ExecutionGraphRunner {
             });
         }
         Ok(output)
+    }
+
+    fn discard_unpolled_wave(&self, prepared: &[PreparedNodeStart]) {
+        for start in prepared {
+            self.record_resource_terminal(
+                start.resource_kind.as_ref(),
+                start.resource_queue_wait,
+                start.resource_started,
+                crate::execution_core::graph::ResourceResultClass::Failed,
+            );
+        }
     }
 
     pub(crate) async fn execute_prepared_pump_node(
@@ -901,6 +1168,46 @@ impl ExecutionGraphRunner {
             .await
     }
 
+    #[cfg(test)]
+    async fn drop_injected_empty_bound_owner(
+        &self,
+        graph_id: &str,
+        node: &str,
+        binding: Option<&ExecutionNodeBinding>,
+        error: &ExecutionCommitError,
+    ) -> Result<bool, ExecutionRunnerError> {
+        if !matches!(error,ExecutionCommitError::InvalidCommand(reason) if reason=="450 original leaf completed before Graph result append fault")
+        {
+            return Ok(false);
+        }
+        let graph = self.state_store.load_async(graph_id).await?;
+        if !super::executors::agent_tool::is_bound_agent_tool_graph(&graph)
+            || graph.node_statuses.get(node) != Some(&ExecutionNodeStatus::Running)
+        {
+            return Err(ExecutionRunnerError::Driver(
+                "test crash injection lost original bound Running identity".into(),
+            ));
+        }
+        let mut active = self.active.lock().await;
+        let key = (graph_id.to_string(), node.to_string());
+        let Some(owner) = active.get(&key) else {
+            return Ok(false);
+        };
+        let actual = owner._resources.binding(&owner.ticket);
+        if Some(&actual) != binding
+            || !actual.resource_lease_refs.is_empty()
+            || actual.scope_lease_ref.is_some()
+            || actual.worktree_lease_ref.is_some()
+            || owner._resources.callback_completed
+        {
+            return Err(ExecutionRunnerError::Driver(
+                "test crash injection cannot drop nonempty or closed owner".into(),
+            ));
+        }
+        drop(active.remove(&key));
+        Ok(true)
+    }
+
     async fn active_binding_matches(
         &self,
         graph_id: &str,
@@ -916,24 +1223,399 @@ impl ExecutionGraphRunner {
             == expected_binding
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) async fn active_binding_for_ticket_for_test(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Option<ExecutionNodeBinding> {
+        self.active
+            .lock()
+            .await
+            .get(&(ticket.graph_id.clone(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket)
+            .map(|active| active._resources.binding(&active.ticket))
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) async fn reject_stale_binding_for_test(
+        &self,
+        graph: &str,
+        node: &str,
+        binding: &ExecutionNodeBinding,
+    ) -> Result<(), ExecutionRunnerError> {
+        self.isolate_node_failure(
+            graph,
+            node,
+            Some(binding),
+            "late recovery owner probe".into(),
+        )
+        .await
+    }
+
+    async fn binding_callback_gate(
+        &self,
+        graph_id: &str,
+        ticket: &NodeExecutionTicket,
+    ) -> Option<Arc<Mutex<()>>> {
+        self.active
+            .lock()
+            .await
+            .get(&(graph_id.to_string(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket)
+            .map(|active| active.callback_gate.clone())
+    }
+
+    async fn cancel_and_drain_locked(
+        &self,
+        graph_id: &str,
+        executor: &Arc<dyn NodeExecutor>,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<(), ExecutionRunnerError> {
+        if self
+            .active
+            .lock()
+            .await
+            .get(&(graph_id.to_string(), ticket.node_id.clone()))
+            .is_some_and(|active| active.ticket == *ticket && active._resources.drain_completed)
+        {
+            return Ok(());
+        }
+        if executor.cancellation_requires_quiescence(ticket) {
+            executor
+                .cancel_bounded(ticket, PHYSICAL_CLOSURE_BUDGET)
+                .await?;
+        } else {
+            tokio::time::timeout(
+                PHYSICAL_CLOSURE_BUDGET,
+                executor.cancel_bounded(ticket, PHYSICAL_CLOSURE_BUDGET),
+            )
+            .await
+            .map_err(|_| NodeExecutorError::Cancel {
+                node_id: ticket.node_id.clone(),
+                reason: "original cancellation budget expired; drain unconfirmed".into(),
+            })??;
+        }
+        if executor.cancellation_requires_quiescence(ticket) {
+            use futures::FutureExt;
+            match executor.cancel(ticket).now_or_never() {
+                Some(Ok(())) => {}
+                Some(Err(error)) => return Err(error.into()),
+                None => {
+                    return Err(NodeExecutorError::Cancel {
+                        node_id: ticket.node_id.clone(),
+                        reason: "bounded cancellation returned without physical quiescence".into(),
+                    }
+                    .into())
+                }
+            }
+        }
+        if let Some(active) = self
+            .active
+            .lock()
+            .await
+            .get_mut(&(graph_id.to_string(), ticket.node_id.clone()))
+        {
+            if active.ticket == *ticket {
+                active._resources.drain_completed = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn active_cancel_observed(
+        &self,
+        graph_id: &str,
+        executor: &Arc<dyn NodeExecutor>,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<(), ExecutionRunnerError> {
+        let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
+            return Ok(());
+        };
+        let _owner = gate.lock().await;
+        let graph = self.state_store.load_async(graph_id).await?;
+        let binding = self
+            .active
+            .lock()
+            .await
+            .get(&(graph_id.to_string(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket)
+            .map(|active| active._resources.binding(ticket));
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        if self
+            .commit_service
+            .binding_callback_kind(&graph, &ticket.node_id, &binding)?
+            == Some(false)
+        {
+            return self
+                .complete_callback_locked(graph_id, executor, ticket, None)
+                .await;
+        }
+        self.cancel_and_drain_locked(graph_id, executor, ticket)
+            .await
+    }
+
+    async fn complete_callback_locked(
+        &self,
+        graph_id: &str,
+        executor: &Arc<dyn NodeExecutor>,
+        ticket: &NodeExecutionTicket,
+        requested_abort: Option<&str>,
+    ) -> Result<(), ExecutionRunnerError> {
+        let state = self
+            .active
+            .lock()
+            .await
+            .get(&(graph_id.to_string(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket)
+            .map(|active| {
+                (
+                    active._resources.binding(ticket),
+                    active._resources.callback_completed,
+                    active.no_dispatch.clone(),
+                )
+            });
+        let Some((binding, completed, observation)) = state else {
+            return Ok(());
+        };
+        if completed {
+            return Ok(());
+        }
+        let graph = self.state_store.load_async(graph_id).await?;
+        let Some(abort) =
+            self.commit_service
+                .binding_callback_kind(&graph, &ticket.node_id, &binding)?
+        else {
+            if requested_abort.is_some() {
+                return Ok(());
+            }
+            return Err(ExecutionRunnerError::Driver(
+                "callback has no canonical original outcome or retirement".into(),
+            ));
+        };
+        let result = if abort {
+            self.cancel_and_drain_locked(graph_id, executor, ticket)
+                .await?;
+            executor
+                .after_abort(
+                    ticket,
+                    requested_abort.unwrap_or("canonical_binding_retirement"),
+                )
+                .await
+        } else {
+            run_after_commit_observed(executor, ticket).await
+        };
+        let result = match result {
+            Ok(()) => {
+                let mut changes = self.state_store.subscribe_commits();
+                let observed = tokio::time::timeout(PHYSICAL_CLOSURE_BUDGET, async {
+                    loop {
+                        let current = self.state_store.load_async(graph_id).await?;
+                        if self
+                            .commit_service
+                            .binding_physical_sources_with_witness(
+                                &current,
+                                &ticket.node_id,
+                                &binding,
+                                observation
+                                    .as_ref()
+                                    .and_then(|observation| observation.witness())
+                                    .as_ref(),
+                            )?
+                            .is_some()
+                        {
+                            return Ok::<(), ExecutionRunnerError>(());
+                        }
+                        changes.changed().await.map_err(|_| {
+                            ExecutionRunnerError::Driver(
+                                "physical source stream closed before quiescence".into(),
+                            )
+                        })?;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    #[cfg(test)]
+                    eprintln!(
+                        "OWN834_PHYSICAL_CLOSURE_UNPROVED {}",
+                        self.commit_service.physical_closure_diagnostic(
+                            &graph, &ticket.node_id, &binding,
+                        ),
+                    );
+                    ExecutionRunnerError::Driver(
+                        "physical closure unconfirmed within original cancellation budget".into(),
+                    )
+                })?;
+                observed
+            }
+            Err(error) => Err(error.into()),
+        };
+        if let Some(active) = self
+            .active
+            .lock()
+            .await
+            .get_mut(&(graph_id.to_string(), ticket.node_id.clone()))
+        {
+            if active.ticket == *ticket {
+                active._resources.callback_completed = result.is_ok();
+                active._resources.release_blocked = result.is_err();
+            }
+        }
+        result
+    }
+
+    async fn active_after_abort_observed(
+        &self,
+        graph_id: &str,
+        executor: &Arc<dyn NodeExecutor>,
+        ticket: &NodeExecutionTicket,
+        reason: &str,
+    ) -> Result<(), ExecutionRunnerError> {
+        let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
+            return Ok(());
+        };
+        let _owner = gate.lock().await;
+        self.complete_callback_locked(graph_id, executor, ticket, Some(reason))
+            .await
+    }
+
+    async fn active_after_commit_observed(
+        &self,
+        graph_id: &str,
+        executor: &Arc<dyn NodeExecutor>,
+        ticket: &NodeExecutionTicket,
+        abort_publication: bool,
+    ) -> Result<(), ExecutionRunnerError> {
+        let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
+            return Ok(());
+        };
+        let _owner = gate.lock().await;
+        self.complete_callback_locked(
+            graph_id,
+            executor,
+            ticket,
+            abort_publication.then_some("canonical_deadline_after_atomic_commit"),
+        )
+        .await
+    }
+
+    fn close_active_binding_leases(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        finished: &mut ActiveNode,
+    ) -> Result<(), ExecutionRunnerError> {
+        if finished._resources.release_blocked || !finished._resources.callback_completed {
+            return Err(ExecutionRunnerError::Driver(
+                "original callback has not positively completed; binding release blocked".into(),
+            ));
+        }
+        let binding = finished._resources.binding(&finished.ticket);
+        if !ExecutionBindingLeaseClosure::required(&binding) {
+            return Ok(());
+        }
+        for retry in 0..8 {
+            let graph = self.state_store.load(graph_id)?;
+            let position = self
+                .state_store
+                .binding_start_position(&graph, node_id, &binding)?
+                .ok_or_else(|| {
+                    ExecutionRunnerError::Driver("original lease start missing".into())
+                })?;
+            let resources = &mut finished._resources;
+            let owner = resources.owner_fence.as_mut().ok_or_else(|| {
+                ExecutionRunnerError::Driver("original binding owner capability missing".into())
+            })?;
+            let released = owner
+                .release_original(
+                    &graph,
+                    node_id,
+                    &binding,
+                    position,
+                    &mut resources.resource,
+                    &mut resources.scope,
+                    &mut resources.worktree,
+                    &self.worktree_leases,
+                )
+                .map_err(ExecutionRunnerError::Driver)?;
+            if self
+                .state_store
+                .binding_lease_closure(&graph, node_id, &binding, position)?
+            {
+                self.registry.forget_builtin_binding(&finished.ticket);
+                return Ok(());
+            }
+            match self
+                .commit_service
+                .commit_binding_lease_closure_with_witness(
+                    &graph,
+                    &released,
+                    finished
+                        .no_dispatch
+                        .as_ref()
+                        .and_then(|observation| observation.witness())
+                        .as_ref(),
+                ) {
+                Ok(_) => {
+                    self.registry.forget_builtin_binding(&finished.ticket);
+                    return Ok(());
+                }
+                Err(ExecutionCommitError::EventStore(
+                    crate::RuntimeEventStoreError::StaleRevision { .. },
+                )) if retry < 7 => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(ExecutionRunnerError::Driver(
+            "lease release commit retry exhausted".into(),
+        ))
+    }
+
     async fn take_bound_active_node(
         &self,
         graph_id: &str,
         node_id: &str,
         expected_binding: Option<&ExecutionNodeBinding>,
-    ) -> Option<ActiveNode> {
+    ) -> Result<Option<ActiveNode>, ExecutionRunnerError> {
         let key = (graph_id.to_string(), node_id.to_string());
+        let owner = self
+            .active
+            .lock()
+            .await
+            .get(&key)
+            .filter(|active| {
+                Some(active._resources.binding(&active.ticket)).as_ref() == expected_binding
+            })
+            .map(|active| {
+                (
+                    active.callback_gate.clone(),
+                    active.executor.clone(),
+                    active.ticket.clone(),
+                )
+            });
+        let Some((gate, executor, ticket)) = owner else {
+            return Ok(None);
+        };
+        let _owner = gate.lock().await;
+        self.complete_callback_locked(graph_id, &executor, &ticket, None)
+            .await?;
+        let _coordination = self.graph_coordination(graph_id).await;
         let mut active = self.active.lock().await;
         if active
             .get(&key)
             .map(|active| active._resources.binding(&active.ticket))
             .as_ref()
-            == expected_binding
+            != expected_binding
         {
-            active.remove(&key)
-        } else {
-            None
+            return Ok(None);
         }
+        let Some(finished) = active.get_mut(&key) else {
+            return Ok(None);
+        };
+        self.close_active_binding_leases(graph_id, node_id, finished)?;
+        drop(finished._resources.owner_fence.take());
+        Ok(active.remove(&key))
     }
 
     async fn commit_terminal_wave(
@@ -1102,44 +1784,24 @@ impl ExecutionGraphRunner {
             .as_ref()
             .is_some_and(|failure| failure.kind == "execution_deadline_exceeded");
         if let Err(error) = validate_outcome(&node_id, &outcome) {
-            let aborted = self
-                .active
-                .lock()
-                .await
-                .get(&(graph_id.to_string(), node_id.clone()))
-                .filter(|active| {
-                    Some(active._resources.binding(&active.ticket)).as_ref()
-                        == expected_binding.as_ref()
-                })
-                .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
-            if let Some((executor, ticket)) = aborted {
-                let _ = executor
-                    .after_abort(&ticket, "executor_outcome_validation_failed")
-                    .await;
-            }
-            self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                .await;
+            self.isolate_node_failure(
+                graph_id,
+                &node_id,
+                expected_binding.as_ref(),
+                error.to_string(),
+            )
+            .await?;
             return Err(error);
         }
         if let Some(replan) = outcome.replan.as_ref() {
             if let Err(error) = self.registry.validate_nodes(&replan.nodes) {
-                let aborted = self
-                    .active
-                    .lock()
-                    .await
-                    .get(&(graph_id.to_string(), node_id.clone()))
-                    .filter(|active| {
-                        Some(active._resources.binding(&active.ticket)).as_ref()
-                            == expected_binding.as_ref()
-                    })
-                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
-                if let Some((executor, ticket)) = aborted {
-                    let _ = executor
-                        .after_abort(&ticket, "executor_replan_validation_failed")
-                        .await;
-                }
-                self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                    .await;
+                self.isolate_node_failure(
+                    graph_id,
+                    &node_id,
+                    expected_binding.as_ref(),
+                    error.to_string(),
+                )
+                .await?;
                 return Err(error.into());
             }
         }
@@ -1188,44 +1850,47 @@ impl ExecutionGraphRunner {
             match disposition {
                 TerminalCommitDisposition::Committed => {
                     durable_progress.notify_one();
-                    let after_commit = run_after_commit_observed(&executor, &ticket).await;
+                    self.active_after_commit_observed(
+                        graph_id,
+                        &executor,
+                        &ticket,
+                        deadline_terminal,
+                    )
+                    .await?;
                     if deadline_terminal {
                         executor.cancellation_finalized(&ticket);
                     }
                     self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                        .await;
-                    after_commit?;
+                        .await?;
                     return Ok(());
                 }
                 TerminalCommitDisposition::Superseded => {
-                    executor
-                        .after_abort(&ticket, "graph_command_superseded_before_terminal_wave")
-                        .await?;
+                    self.active_after_abort_observed(
+                        graph_id,
+                        &executor,
+                        &ticket,
+                        "graph_command_superseded_before_terminal_wave",
+                    )
+                    .await?;
                     self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                        .await;
+                        .await?;
                     return Ok(());
                 }
                 TerminalCommitDisposition::Failed(reason) => {
-                    let _ = executor
-                        .after_abort(&ticket, "terminal_wave_commit_failed")
-                        .await;
+                    self.active_after_abort_observed(
+                        graph_id,
+                        &executor,
+                        &ticket,
+                        "terminal_wave_commit_failed",
+                    )
+                    .await?;
                     self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                        .await;
+                        .await?;
                     return Err(ExecutionRunnerError::Driver(reason));
                 }
             }
         }
-        if let Some((executor, ticket, true)) = active_wave.as_ref() {
-            if let Err(error) = self
-                .commit_service
-                .commit_execution_effect(ticket, &outcome)
-            {
-                let _ = executor
-                    .after_abort(ticket, "effect_receipt_commit_failed")
-                    .await;
-                return Err(error.into());
-            }
-        }
+
         // Commit terminal graph truth before waking the pump or publishing
         // process-local executor output.
         let committed_executor = {
@@ -1244,52 +1909,41 @@ impl ExecutionGraphRunner {
                     .map(|(executor, ticket, _)| (Arc::clone(executor), ticket.clone()));
                 drop(_coordination);
                 if let Some((executor, ticket)) = aborted {
-                    executor
-                        .after_abort(&ticket, "graph_command_superseded_before_commit")
-                        .await?;
+                    self.active_after_abort_observed(
+                        graph_id,
+                        &executor,
+                        &ticket,
+                        "graph_command_superseded_before_commit",
+                    )
+                    .await?;
                 }
                 self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                    .await;
+                    .await?;
                 return Ok(());
             }
-            if let Some(envelope) = outcome.delivery_envelope.clone() {
-                current.delivery_envelope = Some(envelope);
-            }
-            if let Some(presentation) = outcome.terminal_presentation.clone() {
-                current.terminal_presentation = Some(presentation);
-            }
+            let (_, ticket, _) = active_wave.as_ref().ok_or_else(|| {
+                ExecutionRunnerError::Driver("atomic outcome binding missing".into())
+            })?;
+            let outcome_sources = self
+                .commit_service
+                .execution_outcome_sources(&current, ticket, &outcome)?;
             // A concurrent writer can advance this graph stream between the
-            // load and the commit. The node outcome is already durable, so
-            // re-load and retry the same transition instead of failing the whole
+            // load and the atomic outcome commit. Keep the captured outcome and
+            // its original source fences while retrying instead of failing the whole
             // execution driver with a raw `revision mismatch`.
             const MAX_TRANSITION_ATTEMPTS: usize = 8;
             let mut attempt = 0;
             let transition = loop {
                 attempt += 1;
-                let result = if let Some(replan) = outcome.replan.clone() {
-                    self.commit_service
-                        .transition_node_with_replan_async(
-                            current.clone(),
-                            node_id.clone(),
-                            outcome.result.clone(),
-                            outcome.domain_events.clone(),
-                            replan.nodes,
-                            replan.edges,
-                            replan.reason,
-                            replan.framework_authored,
-                        )
-                        .await
-                } else {
-                    self.commit_service
-                        .transition_node_async(
-                            current.clone(),
-                            node_id.clone(),
-                            outcome.result.status,
-                            Some(outcome.result.clone()),
-                            outcome.domain_events.clone(),
-                        )
-                        .await
-                };
+                let result = self
+                    .commit_service
+                    .transition_execution_outcome_async(
+                        current.clone(),
+                        ticket.clone(),
+                        outcome.clone(),
+                        outcome_sources.clone(),
+                    )
+                    .await;
                 match result {
                     Ok(receipt) => break Ok(receipt),
                     Err(ExecutionCommitError::EventStore(
@@ -1321,6 +1975,18 @@ impl ExecutionGraphRunner {
                 }
             };
             if let Err(error) = transition {
+                #[cfg(test)]
+                if self
+                    .drop_injected_empty_bound_owner(
+                        graph_id,
+                        &node_id,
+                        expected_binding.as_ref(),
+                        &error,
+                    )
+                    .await?
+                {
+                    return Err(error.into());
+                }
                 let aborted = self
                     .active
                     .lock()
@@ -1333,12 +1999,16 @@ impl ExecutionGraphRunner {
                     .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
                 drop(_coordination);
                 if let Some((executor, ticket)) = aborted {
-                    let _ = executor
-                        .after_abort(&ticket, "graph_transition_commit_failed")
-                        .await;
+                    self.active_after_abort_observed(
+                        graph_id,
+                        &executor,
+                        &ticket,
+                        "graph_transition_commit_failed",
+                    )
+                    .await?;
                 }
                 self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                    .await;
+                    .await?;
                 return Err(error.into());
             }
             self.active
@@ -1354,16 +2024,16 @@ impl ExecutionGraphRunner {
         self.converge_after_terminal_commit(graph_id).await?;
         durable_progress.notify_one();
         if let Some((executor, ticket)) = committed_executor {
-            let after_commit = run_after_commit_observed(&executor, &ticket).await;
+            self.active_after_commit_observed(graph_id, &executor, &ticket, deadline_terminal)
+                .await?;
             if deadline_terminal {
                 executor.cancellation_finalized(&ticket);
             }
             self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                .await;
-            after_commit?;
+                .await?;
         } else {
             self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                .await;
+                .await?;
         }
         Ok(())
     }
@@ -1387,11 +2057,10 @@ impl ExecutionGraphRunner {
                     })
                     .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
                 if let Some((executor, ticket)) = running {
-                    executor
-                        .cancel_bounded(&ticket, Duration::from_secs(5))
+                    self.active_cancel_observed(graph_id, &executor, &ticket)
                         .await?;
                     self.take_bound_active_node(graph_id, &node_id, expected_binding)
-                        .await;
+                        .await?;
                 }
                 Ok(None)
             }
@@ -1443,7 +2112,6 @@ impl ExecutionGraphRunner {
                     waiter.await;
                 }
                 let result = failed_result(&error);
-                let terminal_status = result.status;
                 let _coordination = self.graph_coordination_without_command(graph_id).await;
                 let current = self.state_store.load_async(graph_id).await?;
                 if !self
@@ -1456,22 +2124,53 @@ impl ExecutionGraphRunner {
                 {
                     return Ok(None);
                 }
-                if current.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running) {
+                let transitioned =
+                    current.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running);
+                if transitioned {
+                    let ticket = self
+                        .active
+                        .lock()
+                        .await
+                        .get(&(graph_id.to_string(), node_id.clone()))
+                        .map(|active| active.ticket.clone())
+                        .ok_or_else(|| {
+                            ExecutionRunnerError::Driver(
+                                "failed Running node lost original ticket".into(),
+                            )
+                        })?;
                     self.commit_service
-                        .transition_node_async(
+                        .transition_execution_outcome_async(
                             current,
-                            node_id.clone(),
-                            terminal_status,
-                            Some(result),
-                            Vec::new(),
+                            ticket,
+                            NodeExecutionOutcome::new(result),
+                            BTreeMap::new(),
                         )
                         .await?;
-                    drop(_coordination);
+                }
+                drop(_coordination);
+                if transitioned {
                     self.converge_after_terminal_commit(graph_id).await?;
                     durable_progress.notify_one();
                 }
+                let pending = self
+                    .active
+                    .lock()
+                    .await
+                    .get(&(graph_id.to_string(), node_id.clone()))
+                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+                if let Some((executor, ticket)) = pending {
+                    self.active_cancel_observed(graph_id, &executor, &ticket)
+                        .await?;
+                    self.active_after_abort_observed(
+                        graph_id,
+                        &executor,
+                        &ticket,
+                        "executor_failure_before_resource_release",
+                    )
+                    .await?;
+                }
                 self.take_bound_active_node(graph_id, &node_id, expected_binding)
-                    .await;
+                    .await?;
                 // A Pause/Cancel command may have superseded the executor while
                 // it returned. The command's durable graph state remains truth.
                 Ok(None)
@@ -1509,13 +2208,22 @@ impl ExecutionGraphRunner {
         let Some(prepared) = prepared else {
             return Err(ExecutionRunnerError::CommandSuperseded { node_id: node.id });
         };
-        let (executor, ticket, resource_kind, resource_queue_wait, resource_started, effect_state) = (
+        let (
+            executor,
+            ticket,
+            resource_kind,
+            resource_queue_wait,
+            resource_started,
+            effect_state,
+            no_dispatch,
+        ) = (
             Arc::clone(&prepared.executor),
             prepared.ticket.clone(),
             prepared.resource_kind.clone(),
             prepared.resource_queue_wait,
             prepared.resource_started,
             prepared.effect_state.clone(),
+            prepared.no_dispatch.clone(),
         );
         drop(active);
         if let Some(waiter) = self.command_intent_waiter(graph_id) {
@@ -1530,14 +2238,17 @@ impl ExecutionGraphRunner {
             });
         }
         match effect_state {
-            ExecutionEffectState::Completed(outcome) => {
+            ExecutionEffectState::Completed(_) => {
                 self.record_resource_terminal(
                     resource_kind.as_ref(),
                     resource_queue_wait,
                     resource_started,
                     crate::execution_core::graph::ResourceResultClass::Cancelled,
                 );
-                return Ok((ticket.node_id.clone(), outcome));
+                return Err(NodeExecutorError::Uncertain {
+                    node_id: ticket.node_id.clone(),
+                    reason: "Completed effect must reconcile its original committed attempt, never enter fresh execution".into(),
+                }.into());
             }
             ExecutionEffectState::Uncertain => {
                 self.record_resource_terminal(
@@ -1564,11 +2275,9 @@ impl ExecutionGraphRunner {
                 outcome = executor.poll_or_await(&ticket) => outcome,
                 () = tokio::time::sleep(remaining) => {
                     if executor.cancellation_requires_quiescence(&ticket) {
-                        executor
-                            .cancel_bounded(&ticket, Duration::from_secs(5))
-                            .await?;
+                        self.active_cancel_observed(graph_id,&executor,&ticket).await?;
                     } else {
-                    match tokio::time::timeout(Duration::from_secs(5), executor.cancel_bounded(&ticket, Duration::from_secs(5))).await {
+                    match tokio::time::timeout(PHYSICAL_CLOSURE_BUDGET, executor.cancel_bounded(&ticket, PHYSICAL_CLOSURE_BUDGET)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => tracing::warn!(
                             graph_id = ticket.graph_id,
@@ -1619,20 +2328,27 @@ impl ExecutionGraphRunner {
                 ),
             );
         }
-        let mut outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = executor
-                    .after_abort(&ticket, "executor_poll_failed_after_preview")
-                    .await;
-                return Err(error.into());
+        let mut outcome = outcome.map_err(ExecutionRunnerError::from)?;
+        if let Some(observation) = no_dispatch {
+            observation
+                .finalize_duration(&ticket, &mut outcome, node_duration_ms)
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?;
+        } else if outcome.no_dispatch.is_some() {
+            return Err(NodeExecutorError::Invalid {
+                node_id: ticket.node_id.clone(),
+                reason: "NoDispatch duration has no original active observation".into(),
             }
-        };
-        outcome.result.usage.duration_ms = outcome
-            .result
-            .usage
-            .duration_ms
-            .max(node_duration_ms.max(1));
+            .into());
+        } else {
+            outcome.result.usage.duration_ms = outcome
+                .result
+                .usage
+                .duration_ms
+                .max(node_duration_ms.max(1));
+        }
         Ok((ticket.node_id.clone(), outcome))
     }
 
@@ -1696,6 +2412,12 @@ impl ExecutionGraphRunner {
                     resource: None,
                     scope: None,
                     worktree: None,
+                    original_binding: None,
+                    admission_pending: false,
+                    release_blocked: true,
+                    callback_completed: false,
+                    drain_completed: false,
+                    owner_fence: None,
                 });
             }
             // InlineModel owns Provider admission in ConversationRuntime.
@@ -1869,6 +2591,12 @@ impl ExecutionGraphRunner {
             resource,
             scope,
             worktree,
+            original_binding: None,
+            admission_pending: false,
+            release_blocked: true,
+            callback_completed: false,
+            drain_completed: false,
+            owner_fence: None,
         })
     }
 
@@ -1889,8 +2617,7 @@ impl ExecutionGraphRunner {
             })
             .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
         if let Some((executor, ticket)) = running.as_ref() {
-            executor
-                .cancel_bounded(ticket, Duration::from_secs(5))
+            self.active_cancel_observed(graph_id, &executor, ticket)
                 .await?;
         }
         let _coordination = self.graph_coordination_without_command(graph_id).await;
@@ -1911,19 +2638,33 @@ impl ExecutionGraphRunner {
             return Ok(());
         }
         let outcome = deadline_exceeded_outcome(node_id, deadline_at_ms);
-        self.commit_service
-            .transition_node_async(
-                current,
-                node_id.to_string(),
-                outcome.result.status,
-                Some(outcome.result),
-                Vec::new(),
-            )
-            .await?;
+        if current.node_statuses.get(node_id) == Some(&ExecutionNodeStatus::Running) {
+            let ticket = running
+                .as_ref()
+                .map(|(_, ticket)| ticket.clone())
+                .ok_or_else(|| {
+                    ExecutionRunnerError::Driver(
+                        "deadline Running node lost original ticket".into(),
+                    )
+                })?;
+            self.commit_service
+                .transition_execution_outcome_async(current, ticket, outcome, BTreeMap::new())
+                .await?;
+        } else {
+            self.commit_service
+                .transition_node_async(
+                    current,
+                    node_id.to_string(),
+                    outcome.result.status,
+                    Some(outcome.result),
+                    Vec::new(),
+                )
+                .await?;
+        }
         drop(_coordination);
         if let Some(finished) = self
             .take_bound_active_node(graph_id, node_id, expected_binding)
-            .await
+            .await?
         {
             finished.executor.cancellation_finalized(&finished.ticket);
         }
@@ -2034,12 +2775,15 @@ impl ExecutionGraphRunner {
             });
         }
         if let Some((executor, ticket, _)) = running.as_ref() {
-            executor
-                .cancel_bounded(ticket, Duration::from_secs(5))
+            self.active_cancel_observed(graph_id, &executor, ticket)
                 .await?;
-            executor
-                .after_abort(ticket, "node_execution_isolated_failure")
-                .await?;
+            self.active_after_abort_observed(
+                graph_id,
+                &executor,
+                ticket,
+                "node_execution_isolated_failure",
+            )
+            .await?;
         }
         let _coordination = self.graph_coordination_without_command(graph_id).await;
         let current = self.state_store.load_async(graph_id).await?;
@@ -2067,7 +2811,7 @@ impl ExecutionGraphRunner {
             )
         ) {
             drop(_coordination);
-            self.release_isolated_node(&key, expected_binding).await;
+            self.release_isolated_node(&key, expected_binding).await?;
             return Ok(());
         }
         // A failed start, executor panic, or node-local failure is a failure of
@@ -2091,17 +2835,36 @@ impl ExecutionGraphRunner {
             usage: Default::default(),
             finished_at_ms: now_ms(),
         };
-        self.commit_service
-            .transition_node_async(
-                current,
-                node_id.to_string(),
-                terminal_status,
-                Some(result),
-                Vec::new(),
-            )
-            .await?;
+        if status == Some(ExecutionNodeStatus::Running) {
+            let ticket = running
+                .as_ref()
+                .map(|(_, ticket, _)| ticket.clone())
+                .ok_or_else(|| {
+                    ExecutionRunnerError::Driver(
+                        "isolated Running node lost original ticket".into(),
+                    )
+                })?;
+            self.commit_service
+                .transition_execution_outcome_async(
+                    current,
+                    ticket,
+                    NodeExecutionOutcome::new(result),
+                    BTreeMap::new(),
+                )
+                .await?;
+        } else {
+            self.commit_service
+                .transition_node_async(
+                    current,
+                    node_id.to_string(),
+                    terminal_status,
+                    Some(result),
+                    Vec::new(),
+                )
+                .await?;
+        }
         drop(_coordination);
-        self.release_isolated_node(&key, expected_binding).await;
+        self.release_isolated_node(&key, expected_binding).await?;
         Ok(())
     }
 
@@ -2109,21 +2872,11 @@ impl ExecutionGraphRunner {
         &self,
         key: &(String, String),
         expected_binding: Option<&ExecutionNodeBinding>,
-    ) {
-        let finished = {
-            let mut active = self.active.lock().await;
-            if active
-                .get(key)
-                .map(|active| active._resources.binding(&active.ticket))
-                .as_ref()
-                == expected_binding
-            {
-                active.remove(key)
-            } else {
-                None
-            }
-        };
-        if let Some(finished) = finished {
+    ) -> Result<(), ExecutionRunnerError> {
+        if let Some(finished) = self
+            .take_bound_active_node(&key.0, &key.1, expected_binding)
+            .await?
+        {
             self.record_resource_terminal(
                 finished.resource_kind.as_ref(),
                 finished.resource_queue_wait,
@@ -2132,6 +2885,7 @@ impl ExecutionGraphRunner {
             );
             finished.executor.cancellation_finalized(&finished.ticket);
         }
+        Ok(())
     }
 
     pub(crate) async fn command(
@@ -2201,8 +2955,8 @@ impl ExecutionGraphRunner {
                     | ExecutionGraphCommand::CancelNode { .. }
             ) {
                 for (node_id, executor, ticket) in cancellation_finalizer.active() {
-                    if let Err(error) = executor
-                        .cancel_bounded(ticket, Duration::from_secs(5))
+                    if let Err(error) = self
+                        .active_cancel_observed(graph_id, executor, ticket)
                         .await
                     {
                         cancellation_errors.push((node_id.clone(), error));
@@ -2212,14 +2966,9 @@ impl ExecutionGraphRunner {
 
             let coordination = self.graph_coordination(graph_id).await;
             let current = self.state_store.load_async(graph_id).await?;
-            if let Some((_, error)) = cancellation_errors.into_iter().find(|(node_id, _)| {
-                current
-                    .node_statuses
-                    .get(node_id)
-                    .is_some_and(|status| !status.is_terminal())
-            }) {
+            if let Some((_, error)) = cancellation_errors.into_iter().next() {
                 drop(coordination);
-                return Err(ExecutionRunnerError::Executor(error));
+                return Err(error);
             }
             // The intent gate prevents node transitions while cancellation is
             // in flight. Re-validating the original caller revision here is
@@ -2236,22 +2985,32 @@ impl ExecutionGraphRunner {
                 .commit_service
                 .apply_command_async(current, command.clone())
                 .await;
+            drop(coordination);
             if result.is_ok() {
                 let node_ids = cancellation_finalizer
                     .active()
                     .iter()
                     .map(|(node_id, _, _)| node_id.clone())
                     .collect::<Vec<_>>();
-                let mut active = self.active.lock().await;
                 for node_id in node_ids {
-                    active.remove(&(graph_id.to_string(), node_id));
+                    let binding = self
+                        .active
+                        .lock()
+                        .await
+                        .get(&(graph_id.to_string(), node_id.clone()))
+                        .map(|active| active._resources.binding(&active.ticket));
+                    self.take_bound_active_node(graph_id, &node_id, binding.as_ref())
+                        .await?;
                 }
-                drop(active);
             }
             drop(intent);
-            drop(coordination);
             drop(cancellation_finalizer);
-            return result.map(|receipt| receipt.graph).map_err(Into::into);
+            result?;
+            return self
+                .state_store
+                .load_async(graph_id)
+                .await
+                .map_err(Into::into);
         }
 
         let coordination = self.graph_coordination_without_command(graph_id).await;
@@ -2278,6 +3037,63 @@ impl ExecutionGraphRunner {
             .map_err(ExecutionRunnerError::from)
     }
 
+    fn published_dependency_predecessors<'graph>(
+        &self,
+        graph: &'graph ExecutionGraph,
+        node: &'graph harness_contract::execution_graph::ExecutionNodeSpec,
+    ) -> Result<Vec<DependencyPredecessor<'graph>>, ExecutionRunnerError> {
+        let mut predecessors = dependency_predecessors(graph, node);
+        let edges = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind.is_dependency() && edge.to == node.id);
+        for (predecessor, edge) in predecessors.iter_mut().zip(edges) {
+            let attempt = graph
+                .recovery_cursor
+                .node_attempts
+                .get(&edge.from)
+                .copied()
+                .unwrap_or(0);
+            if !predecessor.status.is_terminal() || attempt == 0 {
+                continue;
+            }
+            let binding = self
+                .state_store
+                .current_binding(graph, &edge.from, attempt)?;
+            if !ExecutionBindingLeaseClosure::required(&binding) {
+                continue;
+            }
+            let start = self
+                .state_store
+                .binding_start_position(graph, &edge.from, &binding)?
+                .ok_or_else(|| {
+                    ExecutionRunnerError::Driver("dependency original binding start missing".into())
+                })?;
+            if !self
+                .state_store
+                .binding_lease_closure(graph, &edge.from, &binding, start)?
+            {
+                predecessor.status = ExecutionNodeStatus::Running;
+                predecessor.result = None;
+            }
+        }
+        Ok(predecessors)
+    }
+
+    fn dependency_publications_ready(
+        &self,
+        graph: &ExecutionGraph,
+        node: &harness_contract::execution_graph::ExecutionNodeSpec,
+    ) -> Result<bool, ExecutionRunnerError> {
+        let predecessors = self.published_dependency_predecessors(graph, node)?;
+        let policy = node
+            .work
+            .as_ref()
+            .map(|work| work.dependency.clone())
+            .unwrap_or_default();
+        Ok(dependency_target(&policy, &predecessors) == Some(ExecutionNodeStatus::Ready))
+    }
+
     async fn advance_dependencies(
         &self,
         graph: ExecutionGraph,
@@ -2295,9 +3111,10 @@ impl ExecutionGraphRunner {
                 .collect::<Vec<_>>();
             for node_id in planned {
                 let node = graph.nodes.iter().find(|node| node.id == node_id);
-                let predecessors = node
-                    .map(|node| dependency_predecessors(&graph, node))
-                    .unwrap_or_default();
+                let predecessors = match node {
+                    Some(node) => self.published_dependency_predecessors(&graph, node)?,
+                    None => Vec::new(),
+                };
                 let dependency = node
                     .and_then(|node| node.work.as_ref())
                     .map(|work| work.dependency.clone())
@@ -2623,12 +3440,12 @@ async fn execute_node_under_ceiling(
             );
             if executor.cancellation_requires_quiescence(ticket) {
                 executor
-                    .cancel_bounded(ticket, Duration::from_secs(5))
+                    .cancel_bounded(ticket, PHYSICAL_CLOSURE_BUDGET)
                     .await?;
             } else {
                 let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    executor.cancel_bounded(ticket, Duration::from_secs(5)),
+                    PHYSICAL_CLOSURE_BUDGET,
+                    executor.cancel_bounded(ticket, PHYSICAL_CLOSURE_BUDGET),
                 )
                 .await;
             }
@@ -2829,7 +3646,7 @@ pub(crate) fn validate_worktree_path(
     Ok(canonical_candidate)
 }
 
-fn validate_outcome(
+pub(super) fn validate_outcome(
     node_id: &str,
     outcome: &NodeExecutionOutcome,
 ) -> Result<(), ExecutionRunnerError> {
@@ -2863,6 +3680,34 @@ fn executor_error_node_id(error: &NodeExecutorError) -> &str {
         | NodeExecutorError::Recover { node_id, .. }
         | NodeExecutorError::Uncertain { node_id, .. } => node_id,
     }
+}
+
+pub(super) fn outcome_aborts_publication(node_id: &str, result: &ExecutionNodeResult) -> bool {
+    if !result.evidence_refs.is_empty() {
+        return false;
+    }
+    let Some(failure) = result.failure.as_ref().filter(|failure| !failure.retryable) else {
+        return false;
+    };
+    if failure.kind == "execution_deadline_exceeded" {
+        return result.status == ExecutionNodeStatus::Cancelled
+            && result
+                .result_ref
+                .as_ref()
+                .and_then(|reference| {
+                    reference.strip_prefix(&format!("execution-deadline:{node_id}:"))
+                })
+                .and_then(|deadline| deadline.parse::<u64>().ok())
+                .is_some();
+    }
+    matches!(
+        result.status,
+        ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked
+    ) && result.result_ref.is_none()
+        && matches!(
+            failure.kind.as_str(),
+            "executor_error" | "effect_completion_uncertain" | "node_execution_isolated_failure"
+        )
 }
 
 fn failed_result(error: &NodeExecutorError) -> ExecutionNodeResult {
@@ -2921,6 +3766,390 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
+mod nodispatch_duration_617_tests {
+    use super::super::executors::{
+        ScopedNodeBackend, ScopedNodeBackendResolver, ScopedNodeExecutor,
+    };
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RefusedBackend617 {
+        owner: Weak<ScopedNodeExecutor>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ScopedNodeBackend for RefusedBackend617 {
+        async fn execute(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let owner = self.owner.upgrade().unwrap();
+            owner
+                .binding_observation(ticket)
+                .unwrap()
+                .refuse("denied-617", "original pre-effect scope refusal".into());
+            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: None,
+                wait_class: None,
+                summary: Some("original refused batch".into()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            }))
+        }
+    }
+
+    struct Resolver617(Arc<RefusedBackend617>);
+
+    impl ScopedNodeBackendResolver for Resolver617 {
+        fn resolve(&self, _: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+            Some(self.0.clone())
+        }
+    }
+
+    struct TamperedExecutor617 {
+        inner: Arc<dyn NodeExecutor>,
+        drop_witness: bool,
+        observed: Option<Arc<std::sync::Mutex<Option<NodeExecutionOutcome>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for TamperedExecutor617 {
+        fn kind(&self) -> &str {
+            self.inner.kind()
+        }
+
+        fn supports_resumable_pause(&self) -> bool {
+            self.inner.supports_resumable_pause()
+        }
+
+        fn validate(
+            &self,
+            node: &harness_contract::execution_graph::ExecutionNodeSpec,
+        ) -> Result<(), NodeExecutorError> {
+            self.inner.validate(node)
+        }
+
+        async fn start(
+            &self,
+            context: NodeExecutionContext,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            self.inner.start(context).await
+        }
+
+        async fn poll_or_await(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            let mut outcome = self.inner.poll_or_await(ticket).await?;
+            if let Some(observed) = &self.observed {
+                *observed.lock().unwrap() = Some(outcome.clone());
+                return Ok(outcome);
+            }
+            if self.drop_witness {
+                outcome.no_dispatch = None;
+            } else {
+                outcome.result.summary = Some("tampered after original seal".into());
+            }
+            Ok(outcome)
+        }
+
+        async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            self.inner.after_commit(ticket).await
+        }
+
+        async fn after_abort(&self, ticket: &NodeExecutionTicket, reason: &str) -> Result<(), NodeExecutorError> {
+            self.inner.after_abort(ticket, reason).await
+        }
+
+        async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            self.inner.cancel(ticket).await
+        }
+
+        async fn cancel_bounded(
+            &self,
+            ticket: &NodeExecutionTicket,
+            budget: std::time::Duration,
+        ) -> Result<(), NodeExecutorError> {
+            self.inner.cancel_bounded(ticket, budget).await
+        }
+
+        fn cancellation_requires_quiescence(&self, ticket: &NodeExecutionTicket) -> bool {
+            self.inner.cancellation_requires_quiescence(ticket)
+        }
+
+        fn cancellation_finalized(&self, ticket: &NodeExecutionTicket) {
+            self.inner.cancellation_finalized(ticket)
+        }
+
+        async fn recover(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            self.inner.recover(ticket).await
+        }
+
+        async fn drain_physical_execution(&self) {
+            self.inner.drain_physical_execution().await
+        }
+    }
+
+    #[derive(Default)]
+    struct LifecycleProbe660 {
+        budgets: std::sync::Mutex<Vec<std::time::Duration>>,
+        finalized: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for LifecycleProbe660 {
+        fn kind(&self) -> &str { "lifecycle-660" }
+
+        fn supports_resumable_pause(&self) -> bool { false }
+
+        fn validate(&self, _: &harness_contract::execution_graph::ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+            Ok(())
+        }
+
+        async fn start(&self, _: NodeExecutionContext) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            unreachable!()
+        }
+
+        async fn poll_or_await(&self, _: &NodeExecutionTicket) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            unreachable!()
+        }
+
+        async fn cancel(&self, _: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            panic!("bounded cancellation must not fall back to unbounded cancellation")
+        }
+
+        async fn cancel_bounded(&self, _: &NodeExecutionTicket, budget: std::time::Duration) -> Result<(), NodeExecutorError> {
+            self.budgets.lock().unwrap().push(budget);
+            Ok(())
+        }
+
+        fn cancellation_requires_quiescence(&self, _: &NodeExecutionTicket) -> bool { true }
+
+        fn cancellation_finalized(&self, _: &NodeExecutionTicket) {
+            self.finalized.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn recover(&self, ticket: &NodeExecutionTicket) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            Err(NodeExecutorError::Recover { node_id: ticket.node_id.clone(), reason: "original recovery result".into() })
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_660_duration_observer_forwards_original_lifecycle_contract() {
+        let inner = Arc::new(LifecycleProbe660::default());
+        let wrapper = TamperedExecutor617 {
+            inner: inner.clone(), drop_witness: false,
+            observed: Some(Arc::new(std::sync::Mutex::new(None))),
+        };
+        let ticket = NodeExecutionTicket {
+            graph_id: "graph-660".into(), node_id: "node-660".into(),
+            executor_kind: "lifecycle-660".into(), service_class: Default::default(),
+            attempt: 1, idempotency_key: "attempt-660".into(), payload_ref: "payload-660".into(),
+        };
+        assert_eq!(wrapper.kind(), inner.kind());
+        assert!(!wrapper.supports_resumable_pause());
+        assert!(wrapper.cancellation_requires_quiescence(&ticket));
+        let budget = std::time::Duration::from_millis(37);
+        wrapper.cancel_bounded(&ticket, budget).await.unwrap();
+        assert_eq!(*inner.budgets.lock().unwrap(), vec![budget]);
+        assert_eq!(inner.finalized.load(Ordering::SeqCst), 0);
+        wrapper.cancellation_finalized(&ticket);
+        assert_eq!(inner.finalized.load(Ordering::SeqCst), 1);
+        assert_eq!(wrapper.recover(&ticket).await, inner.recover(&ticket).await);
+    }
+
+    async fn original_prepared617() -> (
+        tempfile::TempDir,
+        Arc<crate::RuntimeServices>,
+        ExecutionGraphRunner,
+        String,
+        ExecutionPreparedPumpNode,
+        Arc<RefusedBackend617>,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let backend = Arc::new(RefusedBackend617 {
+            owner: Arc::downgrade(services.tool_batch_executor()),
+            calls: AtomicUsize::new(0),
+        });
+        services
+            .tool_batch_executor()
+            .install_resolver(Arc::new(Resolver617(backend.clone())));
+        let runner = ExecutionGraphRunner::new(
+            services.executor_registry().clone(),
+            services.graph_state_store().clone(),
+            services.commit_service().clone(),
+            Arc::new(ExecutionResourceManager::new([])),
+            Arc::new(ScopeLockManager::persistent(workspace.path().join("scopes")).unwrap()),
+            Arc::new(WorktreeLeaseManager::open(workspace.path().join("leases.json")).unwrap()),
+            "duration-617",
+            workspace.path(),
+        );
+        let mut graph = ExecutionGraph::new("original refused batch duration");
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-617".into(),
+            turn_id: "turn-617".into(),
+            root_task_id: "task-617".into(),
+            task_id: "task-617".into(),
+            generation: 1,
+        });
+        let payload = crate::step_snapshot::encode_persisted_tool_batch(&serde_json::json!({
+            "session_id":"session-617", "step_snapshots":{},
+            "calls":[{"id":"denied-617","name":"read_file","input":"{}","depends_on":[]}]
+        }))
+        .unwrap();
+        graph
+            .nodes
+            .push(harness_contract::execution_graph::ExecutionNodeSpec::new(
+                harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+                "tool_batch",
+                payload,
+            ));
+        let registered = runner.register(graph).await.unwrap();
+        let snapshot = runner
+            .pump_snapshot(&registered.id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.ready.len(), 1);
+        let mut prepared = runner
+            .prepare_ready_wave(&registered.id, snapshot.ready)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 1);
+        (
+            workspace,
+            services,
+            runner,
+            registered.id,
+            prepared.remove(0),
+            backend,
+        )
+    }
+
+    #[tokio::test]
+    async fn r1_617_real_runner_duration_commits_original_refusal_and_rejects_old_seal() {
+        let (_workspace, services, runner, graph_id, prepared, backend) =
+            original_prepared617().await;
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let mut active = runner.active.lock().await;
+        let original = active
+            .get_mut(&(graph_id.clone(), prepared.node.id.clone()))
+            .unwrap();
+        let ticket = original.ticket.clone();
+        let observation = original.no_dispatch.clone().unwrap();
+        original.executor = Arc::new(TamperedExecutor617 {
+            inner: original.executor.clone(),
+            drop_witness: false,
+            observed: Some(observed.clone()),
+        });
+        drop(active);
+        runner
+            .execute_prepared_pump_node(&graph_id, prepared, Arc::new(Notify::new()))
+            .await
+            .unwrap();
+        let sealed = observed.lock().unwrap().take().unwrap();
+        let old_witness = sealed.no_dispatch.clone().unwrap();
+        old_witness
+            .authenticate(&ticket, Some(&sealed.result))
+            .unwrap();
+        assert_eq!(sealed.result.usage.duration_ms, 0);
+        let graph = services.graph_state_store().load(&graph_id).unwrap();
+        let committed = &graph.node_results[&ticket.node_id];
+        assert_eq!(committed.status, ExecutionNodeStatus::Completed);
+        assert!(committed.usage.duration_ms >= 1);
+        let mut expected = sealed.result;
+        expected.usage.duration_ms = committed.usage.duration_ms;
+        assert_eq!(*committed, expected);
+        observation
+            .witness()
+            .unwrap()
+            .authenticate(&ticket, Some(committed))
+            .unwrap();
+        assert!(old_witness.authenticate(&ticket, Some(committed)).is_err());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert!(!runner
+            .active
+            .lock()
+            .await
+            .contains_key(&(graph_id, ticket.node_id)));
+        runner.drain_physical_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_617_real_runner_rejects_post_seal_tampering_or_lost_witness_before_commit() {
+        for mode in ["summary", "lost-witness", "missing-observation"] {
+            let (_workspace, services, runner, graph_id, prepared, backend) =
+                original_prepared617().await;
+            let mut active = runner.active.lock().await;
+            let original = active
+                .get_mut(&(graph_id.clone(), prepared.node.id.clone()))
+                .unwrap();
+            let ticket = original.ticket.clone();
+            let observation = original.no_dispatch.clone().unwrap();
+            if mode == "missing-observation" {
+                original.no_dispatch = None;
+            } else {
+                original.executor = Arc::new(TamperedExecutor617 {
+                    inner: original.executor.clone(),
+                    drop_witness: mode == "lost-witness",
+                    observed: None,
+                });
+            }
+            drop(active);
+            let before = services.event_store().durable_commit_cursor().unwrap();
+            let error = runner
+                .start_and_execute_node(&graph_id, prepared.node, prepared.binding.as_ref())
+                .await
+                .unwrap_err();
+            if mode == "missing-observation" {
+                assert!(matches!(error,
+                    ExecutionRunnerError::Executor(NodeExecutorError::Invalid { reason, .. })
+                        if reason == "NoDispatch duration has no original active observation"));
+            } else {
+                let expected = if mode == "lost-witness" {
+                    "NoDispatch duration lost original witness"
+                } else {
+                    "NoDispatch sealed result mismatch"
+                };
+                assert!(matches!(error,
+                    ExecutionRunnerError::Executor(NodeExecutorError::Poll { reason, .. })
+                        if reason == expected));
+            }
+            assert_eq!(
+                services.event_store().durable_commit_cursor().unwrap(),
+                before
+            );
+            let graph = services.graph_state_store().load(&graph_id).unwrap();
+            assert_eq!(
+                graph.node_statuses[&ticket.node_id],
+                ExecutionNodeStatus::Running
+            );
+            assert!(!graph.node_results.contains_key(&ticket.node_id));
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            let original = services
+                .tool_batch_executor()
+                .poll_or_await(&ticket)
+                .await
+                .unwrap();
+            observation
+                .witness()
+                .unwrap()
+                .authenticate(&ticket, Some(&original.result))
+                .unwrap();
+            runner.drain_physical_execution().await;
+        }
+    }
+}
+
+#[cfg(test)]
 mod dependency_policy_tests {
     use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
     use harness_contract::context::{
@@ -2938,8 +4167,8 @@ mod dependency_policy_tests {
     };
 
     use super::{
-        DependencyPredecessor, dependency_predecessors, dependency_target,
-        quorum_tail_cancellations, verified_predecessor_status,
+        dependency_predecessors, dependency_target, quorum_tail_cancellations,
+        verified_predecessor_status, DependencyPredecessor,
     };
 
     fn predecessor(status: ExecutionNodeStatus) -> DependencyPredecessor<'static> {

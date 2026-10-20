@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use harness_contract::{
     agent_action::{
-        AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, MessagePublishInput,
-        ObjectiveCompleteRequestInput, program_id_for_objective, root_objective_id,
+        program_id_for_objective, root_objective_id, AgentAction, AgentActionEnvelope,
+        AgentActorBinding, AgentActorKind, MessagePublishInput, ObjectiveCompleteRequestInput,
     },
     execution_graph::{
         ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeResult,
@@ -27,6 +27,8 @@ use session::{
 };
 use session_postgres::PostgresSessionStore;
 
+#[path = "../test-support/current_terminal_fixture.rs"]
+mod current_terminal_fixture;
 #[path = "../../storage/test-support/postgres_scope.rs"]
 mod postgres_scope;
 use postgres_scope::PostgresTestScope;
@@ -114,13 +116,11 @@ async fn real_independently_reviewed_satisfied_a_survives_postgres_adapter_resta
             .unwrap(),
         b"Source-backed findings for independent review"
     );
-    assert!(
-        witnessed
-            .program
-            .tasks
-            .values()
-            .all(|task| task.active_attempts.is_empty())
-    );
+    assert!(witnessed
+        .program
+        .tasks
+        .values()
+        .all(|task| task.active_attempts.is_empty()));
     let stream = format!("agentic-program:{}", witnessed.program.program_id);
     let before = events.list_stream(&stream).unwrap();
     witnessed.services.shutdown_maintenance().await;
@@ -144,11 +144,13 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
             .env("COWD_COMPLETION_REOPEN_BOUND", "1")
             .output()
             .unwrap();
+        if !output.status.success() {
+            own823n_historical_issuer_restart::emit_child_failure_diagnostics(&output);
+        }
         assert!(
             output.status.success(),
-            "isolated business recovery failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "isolated business recovery failed: {}",
+            output.status
         );
         return;
     }
@@ -201,7 +203,7 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         )
         .unwrap();
     let claimed = session_store
-        .claim_session_runtime_outbox("session-worker", 101, 10_000, 1)
+        .claim_session_runtime_outbox("session-worker", 101, 10_000, 1, &[])
         .unwrap()
         .remove(0);
     let claim_token = claimed.claim_token.clone().unwrap();
@@ -308,13 +310,11 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         rejected.status,
         harness_contract::agent_action::AgentActionStatus::Rejected
     );
-    assert!(
-        events
-            .list_stream(&format!("agentic-program:{program_id}"))
-            .unwrap()
-            .iter()
-            .any(|event| event.kind == "agentic.completion_rejected")
-    );
+    assert!(events
+        .list_stream(&format!("agentic-program:{program_id}"))
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "agentic.completion_rejected"));
     let result = first
         .artifact_store()
         .write_bytes(
@@ -432,7 +432,7 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         graph.node_statuses["terminal"],
         ExecutionNodeStatus::Running
     );
-    let terminal = SessionTerminalInput {
+    let mut terminal = SessionTerminalInput {
         terminal_id: "terminal:pg-business".into(),
         message_id: "message:pg-business".into(),
         session_id: session_id.into(),
@@ -445,8 +445,17 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         input_claim_token: Some(claim_token.clone()),
         input_claim_revision: Some(claim_epoch),
         controlled_recovery_claim_fingerprints: vec![],
-        payload_ref: "artifact://terminal".into(),
+        payload_ref: String::new(),
     };
+    let terminal_artifacts = Arc::clone(second.artifact_store());
+    let mut payload = current_terminal_fixture::current_payload(
+        &terminal.terminal_id,
+        &ingress.message_id,
+        running.sequence,
+        "The Goal is blocked: independent review is missing.",
+    );
+    payload["goal_completion"] = serde_json::json!("blocked");
+    current_terminal_fixture::publish(&events, &terminal_artifacts, &mut terminal, &payload).await;
     let terminal_event = RuntimeTransactionEventInput {
         event: RuntimeEventInput {
             stream_id: "session-terminal:request:pg-business".into(),
@@ -460,6 +469,10 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         idempotency_key: Some(terminal.terminal_id.clone()),
         schema_version: 1,
     };
+    assert_eq!(
+        terminal_event.event.payload,
+        serde_json::to_value(&terminal).unwrap()
+    );
     let completed = ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
         result_ref: Some("result:terminal".into()),
@@ -471,32 +484,91 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         finished_at_ms: 1,
     };
     let database = fixture.reconnect();
+    let namespace: String = database
+        .checkout_critical()
+        .unwrap()
+        .query_one("SELECT current_schema()", &[])
+        .unwrap()
+        .get(0);
+    assert!(namespace
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
+    let sequence = format!("\"{namespace}\".v3_reject_business_terminal_hit");
     database
         .checkout_critical()
         .unwrap()
-        .batch_execute(
-            "ALTER TABLE runtime_events ADD CONSTRAINT v3_reject_business_terminal CHECK (kind <> 'runtime.session.terminal_requested')",
-        )
+        .batch_execute(&format!(
+            "CREATE SEQUENCE {sequence} START WITH 1 INCREMENT BY 1 MINVALUE 1 NO CYCLE CACHE 1"
+        ))
         .unwrap();
-    assert!(
-        second
-            .commit_service()
-            .transition_node(
-                &graph,
-                "terminal",
-                ExecutionNodeStatus::Completed,
-                Some(completed.clone()),
-                vec![terminal_event.clone()],
-            )
-            .is_err()
-    );
-    assert_eq!(events.stream_revision(root_id).unwrap(), graph.revision);
-    assert!(
-        events
-            .session_terminal(&terminal.terminal_id)
+    let assert_witness = |called| {
+        let row = database
+            .checkout_critical()
             .unwrap()
-            .is_none()
+            .query_one(
+                &format!("SELECT last_value, is_called FROM {sequence}"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, bool>(1)), (1, called));
+    };
+    assert_witness(false);
+    database
+        .checkout_critical()
+        .unwrap()
+        .batch_execute(&format!(
+            "ALTER TABLE \"{namespace}\".runtime_events ADD CONSTRAINT v3_reject_business_terminal CHECK (CASE WHEN kind = 'runtime.session.terminal_requested' THEN nextval('{sequence}'::regclass) = 0 ELSE TRUE END)"
+        ))
+        .unwrap();
+    assert_witness(false);
+    let error = second
+        .commit_service()
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Completed,
+            Some(completed.clone()),
+            vec![terminal_event.clone()],
+        )
+        .err()
+        .expect("PostgreSQL constraint must reject B");
+    assert!(
+        matches!(
+            &error,
+            runtime::execution_core::graph::ExecutionCommitError::EventStore(
+                runtime::RuntimeEventStoreError::Storage(_)
+            )
+        ),
+        "{error:?}"
     );
+    assert_witness(true);
+    assert_eq!(events.stream_revision(root_id).unwrap(), graph.revision);
+    assert_eq!(
+        events
+            .stream_revision("session-terminal:request:pg-business")
+            .unwrap(),
+        0
+    );
+    assert!(events
+        .list_stream("session-terminal:request:pg-business")
+        .unwrap()
+        .is_empty());
+    let unchanged_graph = second.graph_state_store().load(root_id).unwrap();
+    assert_eq!(unchanged_graph.revision, graph.revision);
+    assert_eq!(
+        unchanged_graph.node_statuses["terminal"],
+        ExecutionNodeStatus::Running
+    );
+    let unchanged_program = events
+        .list_stream(&format!("agentic-program:{program_id}"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(unchanged_program, program_a);
+    assert!(events
+        .session_terminal(&terminal.terminal_id)
+        .unwrap()
+        .is_none());
     assert_eq!(
         events
             .list_stream(&format!("goal:{goal_id}"))
@@ -604,6 +676,9 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
     drop(session_store);
 
     let events = connect(&fixture);
+    events
+        .bind_artifact_store(Arc::clone(&terminal_artifacts))
+        .unwrap();
     let first_claim = events
         .claim_session_terminals("lost-worker", 100, 10, 1)
         .unwrap()
@@ -611,22 +686,23 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
     drop(events);
 
     let reopened = connect(&fixture);
+    reopened
+        .bind_artifact_store(Arc::clone(&terminal_artifacts))
+        .unwrap();
     let second_claim = reopened
         .claim_session_terminals("recovery-worker", 111, 10, 1)
         .unwrap()
         .remove(0);
     assert_eq!(second_claim.message_id, first_claim.message_id);
     assert_eq!(second_claim.commit_cursor, first_claim.commit_cursor);
-    assert!(
-        reopened
-            .ack_session_terminal(
-                &first_claim.terminal_id,
-                "lost-worker",
-                first_claim.revision,
-                112
-            )
-            .is_err()
-    );
+    assert!(reopened
+        .ack_session_terminal(
+            &first_claim.terminal_id,
+            "lost-worker",
+            first_claim.revision,
+            112
+        )
+        .is_err());
     let materialized = reopened
         .ack_session_terminal(
             &second_claim.terminal_id,
@@ -646,3 +722,6 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         a_cursor
     );
 }
+
+#[path = "support/own823n_historical_issuer_restart.rs"]
+mod own823n_historical_issuer_restart;

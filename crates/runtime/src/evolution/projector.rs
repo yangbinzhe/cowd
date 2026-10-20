@@ -342,16 +342,29 @@ impl EvolutionSignalProjector {
                 Err(error) => last_error = Some(error),
             }
         }
-        self.dead_letter(
-            event,
-            source_cursor,
-            last_error
-                .as_deref()
-                .unwrap_or("unknown projection failure"),
-        )
+        let error = last_error.unwrap_or_else(|| "unknown projection failure".to_string());
+        self.dead_letter(event, source_cursor, &error)?;
+        if event.kind == "goal.observation" {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn project_source(&self, event: &DurableRuntimeEvent) -> Result<bool, String> {
+        let resolved;
+        let event = if event.kind == "goal.observation" {
+            if event.scope != RuntimeEventScope::Goal {
+                return Err("goal observation source has invalid scope".into());
+            }
+            let observation = self.event_store.resolve_observation_record(event)?;
+            resolved = DurableRuntimeEvent {
+                payload: serde_json::json!({"observation":observation}),
+                ..event.clone()
+            };
+            &resolved
+        } else {
+            event
+        };
         let signal = if event.kind == OUTCOME_EVENT_KIND {
             outcome_signal(event)?
         } else if event.kind == "agent.run_evaluated" {
@@ -568,6 +581,18 @@ impl EvolutionSignalProjector {
             return Ok(());
         }
         for _ in 0..32 {
+            let expected_revision = self
+                .event_store
+                .stream_revision(PROJECTOR_STREAM)
+                .map_err(|error| error.to_string())?;
+            if self
+                .event_store
+                .event_by_idempotency_key(PROJECTOR_STREAM, &key)
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Ok(());
+            }
             let mut index = self.failure_index()?;
             let head = self
                 .failure_catalog_page(&index, index.head_page)?
@@ -575,6 +600,22 @@ impl EvolutionSignalProjector {
                 .get(index.head_offset)
                 .cloned();
             if head.as_deref() != Some(source.event_id.as_str()) {
+                if self
+                    .event_store
+                    .event_by_idempotency_key(PROJECTOR_STREAM, &key)
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                if self
+                    .event_store
+                    .stream_revision(PROJECTOR_STREAM)
+                    .map_err(|error| error.to_string())?
+                    != expected_revision
+                {
+                    continue;
+                }
                 if head.is_none() {
                     return Ok(());
                 }
@@ -590,10 +631,6 @@ impl EvolutionSignalProjector {
                 index.head_page = index.head_page.saturating_add(1);
                 index.head_offset = 0;
             }
-            let expected_revision = self
-                .event_store
-                .stream_revision(PROJECTOR_STREAM)
-                .map_err(|error| error.to_string())?;
             match self.event_store.append_batch_if_revision(
                 PROJECTOR_STREAM,
                 expected_revision,
@@ -637,8 +674,20 @@ impl EvolutionSignalProjector {
                 ],
             ) {
                 Ok(_) => return Ok(()),
-                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    if self
+                        .event_store
+                        .event_by_idempotency_key(PROJECTOR_STREAM, &key)
+                        .map_err(|lookup_error| lookup_error.to_string())?
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                    if matches!(error, crate::RuntimeEventStoreError::StaleRevision { .. }) {
+                        continue;
+                    }
+                    return Err(error.to_string());
+                }
             }
         }
         Err("projector failure index remained contended during recovery".to_string())
@@ -878,6 +927,18 @@ impl EvolutionSignalProjector {
             return Ok(());
         }
         for _ in 0..32 {
+            let expected_revision = self
+                .event_store
+                .stream_revision(PROJECTOR_STREAM)
+                .map_err(|store_error| store_error.to_string())?;
+            if self
+                .event_store
+                .event_by_idempotency_key(PROJECTOR_STREAM, &key)
+                .map_err(|store_error| store_error.to_string())?
+                .is_some()
+            {
+                return Ok(());
+            }
             let mut index = self.failure_index()?;
             index.unresolved_count = index.unresolved_count.saturating_add(1);
             let frozen_page = if index.tail_source_event_ids.len() >= FAILURE_CATALOG_PAGE_SIZE {
@@ -895,10 +956,6 @@ impl EvolutionSignalProjector {
                 index.head_page = index.tail_page;
                 index.head_offset = index.tail_source_event_ids.len().saturating_sub(1);
             }
-            let expected_revision = self
-                .event_store
-                .stream_revision(PROJECTOR_STREAM)
-                .map_err(|store_error| store_error.to_string())?;
             let mut expected_streams = vec![ExpectedStreamRevision {
                 stream_id: PROJECTOR_STREAM.to_string(),
                 expected_revision,
@@ -962,8 +1019,20 @@ impl EvolutionSignalProjector {
                     events,
                 }) {
                 Ok(_) => return Ok(()),
-                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    if self
+                        .event_store
+                        .event_by_idempotency_key(PROJECTOR_STREAM, &key)
+                        .map_err(|lookup_error| lookup_error.to_string())?
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                    if matches!(error, crate::RuntimeEventStoreError::StaleRevision { .. }) {
+                        continue;
+                    }
+                    return Err(error.to_string());
+                }
             }
         }
         Err("projector failure index remained contended during dead letter".to_string())
@@ -1078,7 +1147,20 @@ fn signal_from_source_event(event: &DurableRuntimeEvent) -> Option<EvolutionSign
             .actor
             .clone()
             .unwrap_or_else(|| scope_owner(event.scope).to_string()),
-        session_id: ref_id(event, "session"),
+        session_id: if event.kind == "goal.observation" {
+            event
+                .payload
+                .get("observation")
+                .and_then(|value| {
+                    serde_json::from_value::<harness_contract::goal::RuntimeObservation>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .map(|observation| observation.identity.session_id)
+        } else {
+            ref_id(event, "session")
+        },
         agent_id: ref_id(event, "agent_run").or_else(|| ref_id(event, "agent")),
         team_id: ref_id(event, "team_run").or_else(|| ref_id(event, "team")),
         run_id: ref_id(event, "run"),
@@ -1141,26 +1223,11 @@ fn classify_source_event(
             ))
         }
         "goal.observation" => {
-            let observation = event.payload.get("observation")?;
-            let failed = observation
-                .get("result_class")
-                .and_then(serde_json::Value::as_str)
-                == Some("failed")
-                || observation
-                    .get("failure_class")
-                    .is_some_and(|value| !value.is_null());
-            let tool_calls = observation
-                .pointer("/cost_delta/tool_calls")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default();
-            let information_gain = observation
-                .pointer("/information_gain/new_evidence")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default()
-                + observation
-                    .pointer("/information_gain/resolved_unknowns")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
+            let observation: harness_contract::goal::RuntimeObservation =
+                serde_json::from_value(event.payload.get("observation")?.clone()).ok()?;
+            let failed = observation.failed();
+            let tool_calls = observation.cost_delta.tool_calls;
+            let verified_gain = observation.has_verified_gain();
             if failed {
                 Some((
                     EvolutionSignalType::AgentFailurePattern,
@@ -1169,7 +1236,7 @@ fn classify_source_event(
                     "Cluster attributable failures and run a frozen recovery scenario.".to_string(),
                     true,
                 ))
-            } else if tool_calls > 0 && information_gain == 0 {
+            } else if tool_calls > 0 && !verified_gain {
                 Some((
                     EvolutionSignalType::LowNoveltyToolLoop,
                     EvolutionSignalSeverity::Warning,
@@ -1274,14 +1341,752 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::runtime_event_store::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct ObservationWorkerFaults {
+        replacement: Option<DurableRuntimeEvent>,
+        lose_dead_letter: bool,
+        lose_recovery: bool,
+        stale_dead_letter: bool,
+        stale_recovery: bool,
+        fail_checkpoint: bool,
+    }
+
+    #[derive(Debug)]
+    struct ObservationWorkerBackend {
+        inner: EphemeralRuntimeEventStore,
+        faults: Mutex<ObservationWorkerFaults>,
+    }
+
+    impl ObservationWorkerBackend {
+        fn replace(&self, event: &mut DurableRuntimeEvent) {
+            if let Some(replacement) = self.faults.lock().unwrap().replacement.as_ref() {
+                if replacement.event_id == event.event_id {
+                    *event = replacement.clone();
+                }
+            }
+        }
+    }
+
+    macro_rules! forward_observation_worker_ports {
+        ($(fn $name:ident(&self $(, $argument:ident: $kind:ty)*) -> $result:ty;)*) => {
+            $(fn $name(&self $(, $argument: $kind)*) -> $result {
+                self.inner.$name($($argument),*)
+            })*
+        };
+    }
+
+    impl RuntimeEventStoreBackend for ObservationWorkerBackend {
+        fn append_transaction(
+            &self,
+            request: AppendTransactionRequest,
+        ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+            let dead_letter = request
+                .events
+                .iter()
+                .any(|input| input.event.kind == FAILED_KIND);
+            let receipt = self.inner.append_transaction(request)?;
+            if dead_letter && std::mem::take(&mut self.faults.lock().unwrap().stale_dead_letter) {
+                return Err(crate::RuntimeEventStoreError::StaleRevision {
+                    stream_id: PROJECTOR_STREAM.into(),
+                    expected: 0,
+                    actual: 1,
+                });
+            }
+            if dead_letter && std::mem::take(&mut self.faults.lock().unwrap().lose_dead_letter) {
+                return Err(crate::RuntimeEventStoreError::Corrupt(
+                    "lost dead-letter acknowledgement".into(),
+                ));
+            }
+            Ok(receipt)
+        }
+
+        fn append_batch_if_revision(
+            &self,
+            stream_id: String,
+            expected_revision: u64,
+            transaction_id: String,
+            events: Vec<RuntimeTransactionEventInput>,
+        ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+            let recovery = events
+                .iter()
+                .any(|input| input.event.kind == RECOVERED_KIND);
+            let receipt = self.inner.append_batch_if_revision(
+                stream_id,
+                expected_revision,
+                transaction_id,
+                events,
+            )?;
+            if recovery && std::mem::take(&mut self.faults.lock().unwrap().stale_recovery) {
+                return Err(crate::RuntimeEventStoreError::StaleRevision {
+                    stream_id: PROJECTOR_STREAM.into(),
+                    expected: 0,
+                    actual: 1,
+                });
+            }
+            if recovery && std::mem::take(&mut self.faults.lock().unwrap().lose_recovery) {
+                return Err(crate::RuntimeEventStoreError::Corrupt(
+                    "lost recovery acknowledgement".into(),
+                ));
+            }
+            Ok(receipt)
+        }
+
+        fn events_after_cursor(
+            &self,
+            cursor: u64,
+            max_commits: usize,
+        ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>> {
+            let mut batches = self.inner.events_after_cursor(cursor, max_commits)?;
+            for batch in &mut batches {
+                for event in &mut batch.events {
+                    self.replace(event);
+                }
+            }
+            Ok(batches)
+        }
+
+        fn projection_scan_page(
+            &self,
+            cursor: u64,
+            interest: &RuntimeProjectionInterest,
+            max_commits: usize,
+            max_events: usize,
+            max_bytes: usize,
+        ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
+            let mut page = self.inner.projection_scan_page(
+                cursor,
+                interest,
+                max_commits,
+                max_events,
+                max_bytes,
+            )?;
+            for batch in &mut page.batches {
+                for event in &mut batch.events {
+                    self.replace(event);
+                }
+            }
+            Ok(page)
+        }
+
+        fn put_projection_checkpoint(
+            &self,
+            projection_id: &str,
+            source_cursor: u64,
+            payload: &serde_json::Value,
+            updated_at_ms: u64,
+        ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+            if projection_id == PROJECTOR_ID
+                && std::mem::take(&mut self.faults.lock().unwrap().fail_checkpoint)
+            {
+                return Err(crate::RuntimeEventStoreError::Corrupt(
+                    "checkpoint write interrupted".into(),
+                ));
+            }
+            self.inner.put_projection_checkpoint(
+                projection_id,
+                source_cursor,
+                payload,
+                updated_at_ms,
+            )
+        }
+
+        forward_observation_worker_ports! {
+            fn recent_event_lines(&self, stream_id: &str, references: &[RuntimeEventRef], through_cursor: u64, max_events: usize, max_bytes: usize) -> Result<Vec<harness_contract::mission::MissionControlEventLine>, String>;
+            fn background_projection_capacity_hint(&self) -> usize;
+            fn prepared_content_root(&self, origin: &crate::PreparedArtifactOrigin, artifact: &harness_contract::context::ArtifactRef) -> RuntimeEventStoreResult<PreparedContentRoot>;
+            fn transaction_stream_revision_exact(&self, transaction_id: &str, stream_id: &str) -> RuntimeEventStoreResult<Option<CommittedStreamRevision>>;
+            fn append(&self, input: RuntimeEventInput) -> Result<crate::DurableRuntimeEvent, String>;
+            fn append_transaction_with_terminal(&self, request: AppendTransactionRequest, terminal: SessionTerminalInput) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+            fn consume_verified_decision_lease(&self, lease_id: &str, principal_id: &str, review_id: &str, action: &str, scope: &str, evidence_digest: &str, credential_epoch: u64, consumed_at_ms: u64) -> RuntimeEventStoreResult<()>;
+            fn append_transaction_with_verified_decision_lease(&self, request: AppendTransactionRequest, lease: &crate::VerifiedDecisionLease) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+            fn projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<Option<RuntimeProjectionCheckpoint>>;
+            fn projection_checkpoints_with_prefix(&self, prefix: &str) -> RuntimeEventStoreResult<Vec<RuntimeProjectionCheckpoint>>;
+            fn compare_and_put_projection_checkpoint(&self, projection_id: &str, source_cursor: u64, expected_revision: u64, payload: &serde_json::Value, updated_at_ms: u64) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint>;
+            fn compare_and_repair_projection_checkpoint(&self, projection_id: &str, source_cursor: u64, expected_revision: u64, payload: &serde_json::Value, updated_at_ms: u64) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint>;
+            fn delete_projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<bool>;
+            fn event_by_idempotency_key(&self, stream_id: &str, idempotency_key: &str) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;
+            fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64>;
+            fn list_stream(&self, stream_id: &str) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn count_stream_kinds(&self, stream_id: &str, kinds: &[&str], through_sequence: u64) -> Result<u64, String>;
+            fn list_stream_page_desc(&self, stream_id: &str, limit: usize, offset: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn stream_event_count(&self, stream_id: &str) -> Result<usize, String>;
+            fn execution_events_for_session(&self, session_id: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn events_for_root_execution(&self, root_execution_id: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn events_for_root_execution_kind(&self, root_execution_id: &str, kind: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn events_for_activity(&self, activity_id: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn list_scope(&self, scope: RuntimeEventScope, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn list_scope_page_asc(&self, scope: RuntimeEventScope, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn list_scope_stream_prefix_page_asc(&self, scope: RuntimeEventScope, stream_prefix: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn list_scope_kind_page_asc(&self, scope: RuntimeEventScope, kind: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn stream_ids_for_scope(&self, scope: RuntimeEventScope) -> RuntimeEventStoreResult<Vec<String>>;
+            fn stream_ids_for_scope_kind_at_sequence(&self, scope: RuntimeEventScope, kind: &str, sequence: u64) -> RuntimeEventStoreResult<Vec<String>>;
+            fn stream_ids_for_scope_kind_at_sequence_page(&self, scope: RuntimeEventScope, kind: &str, sequence: u64, after: Option<(u64, String)>, limit: usize) -> RuntimeEventStoreResult<Vec<(String, u64)>>;
+            fn latest_stream_statuses_for_scope_kind_at_sequence(&self, scope: RuntimeEventScope, kind: &str, sequence: u64) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>>;
+            fn all_events(&self, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String>;
+            fn durable_commit_cursor(&self) -> RuntimeEventStoreResult<u64>;
+            fn latest_for_stream(&self, stream_id: &str) -> Result<Option<crate::DurableRuntimeEvent>, String>;
+            fn latest_for_stream_kind(&self, stream_id: &str, kind: &str) -> Result<Option<crate::DurableRuntimeEvent>, String>;
+            fn enqueue_session_terminal(&self, terminal_id: &str, message_id: &str, session_id: &str, commit_cursor: u64, payload_ref: &str) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+            fn claim_session_terminals(&self, worker_id: &str, now_ms: u64, lease_ms: u64, limit: usize) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>>;
+            fn session_terminal(&self, terminal_id: &str) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>>;
+            fn has_unsettled_session_terminals(&self, session_id: &str) -> RuntimeEventStoreResult<bool>;
+            fn session_terminal_for_execution(&self, session_id: &str, execution_id: &str, turn_id: &str) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>>;
+            fn materialized_session_terminals_after(&self, session_id: &str, after_commit_cursor: u64, limit: usize) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>>;
+            fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth>;
+            fn blocked_session_terminals(&self, limit: usize) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>>;
+            fn retry_session_terminal(&self, terminal_id: &str, actor: &str, reason: &str, now_ms: u64) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+            fn adopt_session_terminal_fence(&self, request: &RuntimeSessionTerminalFenceAdoption) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+            fn ack_session_terminal(&self, terminal_id: &str, worker_id: &str, expected_revision: u64, now_ms: u64) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+            fn suppress_session_terminal(&self, terminal_id: &str, worker_id: &str, expected_revision: u64, reason: &str, now_ms: u64) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+            fn fail_session_terminal(&self, terminal_id: &str, worker_id: &str, expected_revision: u64, class: RuntimeSessionOutboxFailureClass, error: &str, retry_at_ms: u64, max_attempts: u32, now_ms: u64) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+            fn position_page(&self, scope: RuntimeEventScope, identity: &str, kind: Option<&str>, after: Option<(u64, u32)>, through_cursor: u64, max_events: usize, max_bytes: usize) -> Result<Vec<DurableRuntimeEvent>, String>;
+            fn list_stream_after(&self, stream_id: &str, after_sequence: u64, through_sequence: u64, max_events: usize, max_bytes: usize) -> Result<Vec<DurableRuntimeEvent>, String>;
+            fn list_stream_before(&self, stream_id: &str, through_sequence: u64, max_events: usize, max_bytes: usize) -> Result<Vec<DurableRuntimeEvent>, String>;
+        }
+    }
+
+    struct ObservationWorkerFixture {
+        events: Arc<RuntimeEventStore>,
+        discovery: Arc<EvolutionDiscoveryService>,
+        backend: Arc<ObservationWorkerBackend>,
+        source: DurableRuntimeEvent,
+        blob: Option<(std::path::PathBuf, Vec<u8>)>,
+    }
+
+    impl ObservationWorkerFixture {
+        fn new(
+            large: bool,
+            result: &str,
+            tool_calls: u64,
+            failure: Option<&str>,
+            gain: bool,
+        ) -> Self {
+            let root = std::path::PathBuf::from(
+                std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
+                    .expect("explicit private plan fixture root"),
+            )
+            .join(format!("observation-worker-{}", uuid::Uuid::new_v4()));
+            assert!(
+                root.is_absolute()
+                    && root.starts_with(
+                        "/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel"
+                    )
+            );
+            let backend = Arc::new(ObservationWorkerBackend {
+                inner: EphemeralRuntimeEventStore::new(),
+                faults: Mutex::new(ObservationWorkerFaults::default()),
+            });
+            let events = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
+            let artifact_root = root.join("artifacts");
+            events
+                .bind_artifact_store(Arc::new(
+                    crate::ArtifactStore::for_test(
+                        artifact_root.clone(),
+                        crate::ArtifactStoreConfig {
+                            compact_threshold_bytes: 1024,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            let goals = crate::execution_core::GoalStore::new(events.clone());
+            let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+                "id":"worker-goal","session_id":"worker-session","objective":"worker oracle",
+                "criteria":[{"id":"checked","statement":"result checked","status":"open"}],"constraints":[],"phase":"execution","evidence_refs":[],"unresolved":[],"blockers":[],
+                "scope":"internal","spec_revision":1,"spec_digest":"worker-spec","completion":"open","revision":1,"user_sequence":1
+            })).unwrap();
+            goals.create(goal).unwrap();
+            let observation: harness_contract::goal::RuntimeObservation = serde_json::from_value(serde_json::json!({
+                "identity":{"workspace_id":"workspace","session_id":"worker-session","graph_id":"worker-graph","goal_id":"worker-goal","node_id":"worker-node"},
+                "kind":"tool_progress","source":"runtime.tool_batch","source_revision":1,
+                "freshness":{"observed_at_ms":1,"policy_revision":"goal-observation-v2"},
+                "summary":if large {"private worker body ".repeat(2048)} else {"private worker body".into()},
+                "fingerprint":"worker-fingerprint","result_class":result,"failure_class":failure,
+                "cost_delta":harness_contract::goal::CostDelta {tool_calls,..Default::default()},
+                "information_gain":{"distinguishing_evidence_refs":if gain {vec!["observed:worker"]} else {vec![]},"resolved_unknown_refs":[],"provenance":"observed"}
+            })).unwrap();
+            goals.record_observation(observation).unwrap();
+            let source = events
+                .latest_for_stream("goal:worker-goal")
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.kind, "goal.observation");
+            assert_eq!(
+                source.payload["observation_body"]["body"]["kind"],
+                if large { "artifact_ref" } else { "inline" }
+            );
+            let blob = if large {
+                let artifact: crate::ArtifactRef = serde_json::from_value(
+                    source.payload["observation_body"]["body"]["artifact"].clone(),
+                )
+                .unwrap();
+                let digest = artifact
+                    .sha256
+                    .strip_prefix("sha256:")
+                    .unwrap_or(&artifact.sha256);
+                let directory = artifact_root
+                    .join("objects")
+                    .join(&digest[..2])
+                    .join(digest);
+                let paths = std::fs::read_dir(directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                assert_eq!(paths.len(), 1);
+                Some((paths[0].clone(), std::fs::read(&paths[0]).unwrap()))
+            } else {
+                None
+            };
+            let discovery = Arc::new(EvolutionDiscoveryService::new(events.clone()));
+            Self {
+                events,
+                discovery,
+                backend,
+                source,
+                blob,
+            }
+        }
+
+        fn projector(&self) -> EvolutionSignalProjector {
+            EvolutionSignalProjector::new(self.events.clone(), self.discovery.clone())
+        }
+
+        fn assert_counts(&self, failed: usize, recovered: usize, unresolved: u64, signals: usize) {
+            assert_eq!(
+                self.events
+                    .replay_scope_kind(RuntimeEventScope::Evolution, FAILED_KIND)
+                    .unwrap()
+                    .len(),
+                failed
+            );
+            assert_eq!(
+                self.events
+                    .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)
+                    .unwrap()
+                    .len(),
+                recovered
+            );
+            assert_eq!(
+                self.projector().failure_index().unwrap().unresolved_count,
+                unresolved
+            );
+            assert_eq!(self.discovery.list_signals().unwrap().len(), signals);
+            assert_eq!(self.discovery.list_cases(100).unwrap().len(), signals);
+            assert!(self.discovery.list_proposals().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn r1_event_replay_observation_failure_keeps_worker_checkpoint() {
+        for (large, fault) in [false, true].into_iter().flat_map(|large| {
+            [
+                "schema",
+                "legacy_schema",
+                "event_scope",
+                "observation_schema",
+                "content_schema",
+                "body",
+                "typed_body",
+                "missing_ref",
+                "ref_scope",
+                "ref_hash",
+                "ref_bytes",
+                "classifier",
+                "scope",
+                "missing_blob",
+                "truncated_blob",
+                "flipped_blob",
+            ]
+            .into_iter()
+            .filter(move |fault| large || !(fault.contains("ref") || fault.ends_with("blob")))
+            .map(move |fault| (large, fault))
+        }) {
+            let fixture = ObservationWorkerFixture::new(large, "failed", 1, Some("tool"), false);
+            let projector = fixture.projector();
+            let checkpoint = fixture.events.projection_checkpoint(PROJECTOR_ID).unwrap();
+            let mut corrupt = fixture.source.clone();
+            match fault {
+                "schema" => corrupt.schema_version = 999,
+                "legacy_schema" => corrupt.schema_version = 1,
+                "event_scope" => corrupt.scope = RuntimeEventScope::Session,
+                "observation_schema" => {
+                    corrupt.payload["observation_schema"] = serde_json::json!(999)
+                }
+                "content_schema" => {
+                    corrupt.payload["observation_body"]["content_schema"] = serde_json::json!(999)
+                }
+                "body" => {
+                    corrupt
+                        .payload
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("observation_body");
+                }
+                "typed_body" => {
+                    let mut value = fixture
+                        .events
+                        .resolve_observation_record(&fixture.source)
+                        .unwrap();
+                    value["kind"] = serde_json::json!("not_a_current_observation_kind");
+                    let bytes = serde_json::to_vec(&value).unwrap();
+                    corrupt.payload["observation_body"] = serde_json::json!({"content_schema":2,"sha256":format!("sha256:{:x}",Sha256::digest(&bytes)),"bytes":bytes.len(),"body":{"kind":"inline","value":value}});
+                }
+                "missing_ref" => {
+                    corrupt.payload["observation_body"]["body"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("artifact");
+                }
+                "ref_scope" => {
+                    corrupt.payload["observation_body"]["body"]["artifact"]["visibility_scope"] =
+                        serde_json::json!("session:foreign")
+                }
+                "ref_hash" => {
+                    corrupt.payload["observation_body"]["body"]["artifact"]["sha256"] =
+                        serde_json::json!("sha256:bad")
+                }
+                "ref_bytes" => {
+                    corrupt.payload["observation_body"]["body"]["artifact"]["bytes"] =
+                        serde_json::json!(1)
+                }
+                "classifier" => {
+                    corrupt.payload["classifier"]["tool_calls"] = serde_json::json!(999)
+                }
+                "scope" => corrupt.payload["session_id"] = serde_json::json!("foreign-session"),
+                "missing_blob" => std::fs::remove_file(&fixture.blob.as_ref().unwrap().0).unwrap(),
+                "truncated_blob" => {
+                    std::fs::write(&fixture.blob.as_ref().unwrap().0, b"{").unwrap()
+                }
+                "flipped_blob" => {
+                    let (path, bytes) = fixture.blob.as_ref().unwrap();
+                    let mut changed = bytes.clone();
+                    changed[0] ^= 1;
+                    std::fs::write(path, changed).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            fixture.backend.faults.lock().unwrap().replacement = Some(corrupt);
+            for _ in 0..2 {
+                assert!(projector.run_once(128).is_err(), "{fault}");
+                assert_eq!(
+                    fixture.events.projection_checkpoint(PROJECTOR_ID).unwrap(),
+                    checkpoint,
+                    "{fault}"
+                );
+                fixture.assert_counts(1, 0, 1, 0);
+            }
+            assert!(fixture.projector().run_once(128).is_err(), "{fault}");
+            fixture.assert_counts(1, 0, 1, 0);
+            let failure = fixture
+                .events
+                .event_by_idempotency_key(
+                    PROJECTOR_STREAM,
+                    &format!("dead-letter:{}", fixture.source.event_id),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(failure.payload["source_event_id"], fixture.source.event_id);
+            assert_eq!(failure.payload["source_kind"], "goal.observation");
+            assert_eq!(
+                failure.payload["source_cursor"],
+                fixture.source.commit_cursor
+            );
+            assert_eq!(failure.payload["attempts"], MAX_SOURCE_RETRIES);
+            if fault.ends_with("blob") {
+                let (path, bytes) = fixture.blob.as_ref().unwrap();
+                std::fs::write(path, bytes).unwrap();
+                fixture.backend.faults.lock().unwrap().replacement = None;
+                fixture.projector().run_once(128).unwrap();
+                fixture.assert_counts(1, 1, 0, 1);
+                fixture.projector().run_once(128).unwrap();
+                fixture.assert_counts(1, 1, 0, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn r1_event_replay_observation_repair_resumes_exactly_once() {
+        for (result, tools, failure, gain, expected_signals) in [
+            ("failed", 1, Some("tool"), false, 1),
+            ("partial", 1, Some("tool"), false, 1),
+            ("succeeded", 1, None, false, 1),
+            ("succeeded", 1, None, true, 0),
+            ("informational", 0, None, false, 0),
+        ] {
+            for (large, stale) in [(false, false), (true, false), (false, true), (true, true)] {
+                let fixture = ObservationWorkerFixture::new(large, result, tools, failure, gain);
+                let projector = fixture.projector();
+                let mut corrupt = fixture.source.clone();
+                corrupt.payload["classifier"]["tool_calls"] = serde_json::json!(999);
+                {
+                    let mut faults = fixture.backend.faults.lock().unwrap();
+                    faults.replacement = Some(corrupt);
+                    faults.lose_dead_letter = !stale;
+                    faults.stale_dead_letter = stale;
+                }
+                assert!(projector.run_once(128).is_err());
+                assert!(projector.run_once(128).is_err());
+                fixture.assert_counts(1, 0, 1, 0);
+                {
+                    let mut faults = fixture.backend.faults.lock().unwrap();
+                    faults.replacement = None;
+                    faults.lose_recovery = !stale;
+                    faults.stale_recovery = stale;
+                    faults.fail_checkpoint = true;
+                }
+                assert!(projector.run_once(128).is_err());
+                fixture.assert_counts(1, 1, 0, expected_signals);
+                assert_eq!(projector.cursor().unwrap(), 0);
+                for _ in 0..3 {
+                    fixture.projector().run_once(128).unwrap();
+                    fixture.assert_counts(1, 1, 0, expected_signals);
+                }
+                assert!(fixture.projector().cursor().unwrap() >= fixture.source.commit_cursor);
+                let recovered = fixture
+                    .events
+                    .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)
+                    .unwrap();
+                assert_eq!(
+                    recovered[0].payload["source_event_id"],
+                    fixture.source.event_id
+                );
+                assert_eq!(recovered[0].payload["projected"], expected_signals == 1);
+                if expected_signals == 1 {
+                    let signals = fixture.discovery.list_signals().unwrap();
+                    assert_eq!(
+                        signals[0].signal_type,
+                        if result == "succeeded" {
+                            EvolutionSignalType::LowNoveltyToolLoop
+                        } else {
+                            EvolutionSignalType::AgentFailurePattern
+                        }
+                    );
+                    assert_eq!(signals[0].severity, EvolutionSignalSeverity::Warning);
+                    assert_eq!(
+                        signals[0].source.session_id.as_deref(),
+                        Some("worker-session")
+                    );
+                    assert_eq!(
+                        signals[0].source.owner,
+                        fixture.source.actor.clone().unwrap()
+                    );
+                    assert_eq!(
+                        signals[0].evidence_refs,
+                        vec![EvidenceRef::observed(
+                            "runtime_event",
+                            fixture.source.event_id.clone()
+                        )
+                        .with_source("goal.observation")]
+                    );
+                    assert_eq!(signals[0].scope.affected_subject, "goal:worker-goal");
+                    assert_eq!(
+                        signals[0].scope.config_definition_revision,
+                        "event-schema-v2"
+                    );
+                    assert!(signals[0].immediate_task_can_continue);
+                    let cases = fixture.discovery.list_cases(100).unwrap();
+                    assert_eq!(cases[0].state, crate::EvolutionCaseState::Open);
+                    assert_eq!(cases[0].recurrence_count, 1);
+                    assert_eq!(cases[0].critical_count, 0);
+                    assert_eq!(cases[0].signal_ids, vec![signals[0].signal_id.clone()]);
+                    assert_eq!(cases[0].evidence_refs, signals[0].evidence_refs);
+                    assert_eq!(cases[0].key.affected_subject, "goal:worker-goal");
+                    assert!(!signals[0].summary.contains("private worker body"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r1_event_replay_observation_failure_stops_same_commit_successor() {
+        let fixture = ObservationWorkerFixture::new(false, "failed", 1, Some("tool"), false);
+        let goals = crate::execution_core::GoalStore::new(fixture.events.clone());
+        let mut observation: harness_contract::goal::RuntimeObservation = serde_json::from_value(
+            fixture
+                .events
+                .resolve_observation_record(&fixture.source)
+                .unwrap(),
+        )
+        .unwrap();
+        observation.source_revision = 2;
+        observation.fingerprint = "second-worker-source".into();
+        let input = goals
+            .observation_event(&observation, "same-commit-observation".into())
+            .unwrap();
+        let revision = fixture.events.stream_revision("goal:worker-goal").unwrap();
+        fixture.events.append_batch_if_revision("goal:worker-goal",revision,"same-commit-source",vec![
+            input,
+            RuntimeTransactionEventInput {
+                event:RuntimeEventInput {stream_id:"goal:worker-goal".into(),scope:RuntimeEventScope::Goal,kind:"goal.intervention".into(),
+                    status:Some("replan".into()),actor:Some("runtime.intervention_policy".into()),refs:vec![],
+                    payload:serde_json::json!({"intervention":{"reason":"repeated low novelty reads"}})},
+                idempotency_key:Some("same-commit-successor".into()),schema_version:1,
+            },
+        ]).unwrap();
+        let source = fixture
+            .events
+            .event_by_idempotency_key("goal:worker-goal", "same-commit-observation")
+            .unwrap()
+            .unwrap();
+        let successor = fixture
+            .events
+            .event_by_idempotency_key("goal:worker-goal", "same-commit-successor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.commit_cursor, successor.commit_cursor);
+        assert!(source.transaction_index < successor.transaction_index);
+        let mut corrupt = source.clone();
+        corrupt.schema_version = 999;
+        fixture.backend.faults.lock().unwrap().replacement = Some(corrupt);
+        for _ in 0..2 {
+            assert!(fixture.projector().run_once(128).is_err());
+            assert_eq!(fixture.projector().cursor().unwrap(), 0);
+            fixture.assert_counts(1, 0, 1, 1);
+            let signals = fixture.discovery.list_signals().unwrap();
+            assert_eq!(signals[0].evidence_refs[0].id, fixture.source.event_id);
+            assert_eq!(
+                fixture
+                    .events
+                    .event_by_idempotency_key("goal:worker-goal", "same-commit-observation")
+                    .unwrap()
+                    .unwrap(),
+                source
+            );
+        }
+        fixture.backend.faults.lock().unwrap().replacement = None;
+        for _ in 0..3 {
+            fixture.projector().run_once(128).unwrap();
+        }
+        assert_eq!(fixture.discovery.list_signals().unwrap().len(), 3);
+        assert_eq!(fixture.discovery.list_cases(100).unwrap().len(), 2);
+        assert_eq!(
+            fixture
+                .projector()
+                .failure_index()
+                .unwrap()
+                .unresolved_count,
+            0
+        );
+        assert_eq!(
+            fixture
+                .events
+                .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn r1_event_replay_non_observation_dead_letter_keeps_existing_governance() {
+        let fixture = ObservationWorkerFixture::new(false, "informational", 0, None, false);
+        let source = fixture
+            .events
+            .append(RuntimeEventInput {
+                stream_id: "session:worker-session".into(),
+                scope: RuntimeEventScope::Tool,
+                kind: "tool.invocation.failed".into(),
+                status: Some("failed".into()),
+                actor: Some("fixture.tool".into()),
+                refs: vec![],
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        fixture.projector().run_once(128).unwrap();
+        assert!(fixture.projector().cursor().unwrap() >= source.commit_cursor);
+        fixture.assert_counts(1, 0, 1, 0);
+        let failure = fixture
+            .events
+            .event_by_idempotency_key(
+                PROJECTOR_STREAM,
+                &format!("dead-letter:{}", source.event_id),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.payload["source_kind"], "tool.invocation.failed");
+    }
+
     use harness_contract::{
         outcome::{
-            OUTCOME_SCHEMA_REVISION, OutcomeIdentity, OutcomeObservation, OutcomeQuality,
-            OutcomeTiming, OutcomeUsage, RuntimeIdentity, StrategyIdentity,
+            OutcomeIdentity, OutcomeObservation, OutcomeQuality, OutcomeTiming, OutcomeUsage,
+            RuntimeIdentity, StrategyIdentity, OUTCOME_SCHEMA_REVISION,
         },
         reality::EvidenceCompleteness,
         strategy::ExecutionCandidateKind,
     };
+
+    #[test]
+    fn r1_event_replay_observation_ref_preserves_evolution_classification() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
+                .expect("explicit private plan fixture root"),
+        )
+        .join(format!("evolution-ref-{}", uuid::Uuid::new_v4()));
+        assert!(
+            root.is_absolute()
+                && root
+                    .starts_with("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel")
+        );
+        let events = Arc::new(RuntimeEventStore::for_test());
+        events
+            .bind_artifact_store(Arc::new(crate::ArtifactStore::for_test_default(root)))
+            .unwrap();
+        let discovery = Arc::new(EvolutionDiscoveryService::new(events.clone()));
+        let projector = EvolutionSignalProjector::new(events.clone(), discovery.clone());
+        for (index, result, gain) in [(0, "failed", 0), (1, "succeeded", 0), (2, "succeeded", 1)] {
+            let observation: harness_contract::goal::RuntimeObservation = serde_json::from_value(serde_json::json!({
+                "identity":{"workspace_id":"workspace","session_id":"ref-session","graph_id":"ref-graph","goal_id":"ref-goal"},
+                "kind":"tool_progress","source":"current-source","source_revision":index+1,"freshness":{"observed_at_ms":index+1,"policy_revision":"accepted-current"},
+                "summary":"private large body ".repeat(2048),"fingerprint":format!("current-{index}"),"result_class":result,
+                "failure_class":if result == "failed" {Some(harness_contract::goal::ObservationFailureClass::Tool)} else {None},
+                "cost_delta":harness_contract::goal::CostDelta {tool_calls:3,..Default::default()},"information_gain":harness_contract::goal::InformationGain {distinguishing_evidence_refs:if gain > 0 {vec!["observed:current".into()]} else {Vec::new()},resolved_unknown_refs:Vec::new(),provenance:harness_contract::core::MeasureProvenance::Observed}
+            })).unwrap();
+            let value = serde_json::to_value(observation).unwrap();
+            let classifier = RuntimeEventStore::classify_observation(&value).unwrap();
+            let body = events
+                .prepare_content(
+                    "session:ref-session",
+                    &format!("observation-{index}"),
+                    &value,
+                    &crate::artifact::PreparedArtifactOrigin::EventBody {
+                        stream_id: "goal:ref-goal".into(),
+                        idempotency_key: format!("observation-{index}"),
+                        kind: "goal.observation".into(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(body["body"]["kind"], "artifact_ref");
+            events.append_batch_if_revision("goal:ref-goal",index,format!("observation-{index}"),vec![RuntimeTransactionEventInput {
+                event:RuntimeEventInput {stream_id:"goal:ref-goal".into(),scope:RuntimeEventScope::Goal,kind:"goal.observation".into(),status:None,actor:Some("runtime.goal_store".into()),refs:vec![RuntimeEventRef {kind:"session".into(),id:"ref-session".into()}],
+                    payload:serde_json::json!({"observation_schema":2,"session_id":"ref-session","goal_source":{"stream_id":"goal:ref-goal","sequence":index},"classifier":classifier,"observation_body":body})},
+                idempotency_key:Some(format!("observation-{index}")),schema_version:2,
+            }]).unwrap();
+            let event = events.latest_for_stream("goal:ref-goal").unwrap().unwrap();
+            let expected = DurableRuntimeEvent {
+                payload: serde_json::json!({"observation":value}),
+                ..event.clone()
+            };
+            assert_eq!(
+                projector.project_source(&event).unwrap(),
+                classify_source_event(&expected).is_some()
+            );
+            assert_eq!(events.resolve_observation_record(&event).unwrap(), value);
+            assert!(projector.project_source(&event).is_ok());
+            let mut corrupt = event;
+            corrupt.payload["classifier"]["tool_calls"] = serde_json::json!(999);
+            assert!(projector.project_source(&corrupt).is_err());
+        }
+        let signals = discovery.list_signals().unwrap();
+        assert_eq!(signals.len(), 2);
+        assert!(signals
+            .iter()
+            .all(|signal| !signal.summary.contains("private large body")));
+    }
 
     #[test]
     fn tool_experience_is_runtime_bound_private_preview_free_and_replay_safe() {
@@ -1748,27 +2553,29 @@ mod tests {
         assert_eq!(health.source_cursor, health.latest_commit_cursor);
         assert_eq!(health.lag_commits, 0);
 
-        events
-            .append(RuntimeEventInput {
-                stream_id: "goal:goal-2".to_string(),
-                scope: RuntimeEventScope::Goal,
-                kind: "goal.observation".to_string(),
-                status: Some("failed".to_string()),
-                actor: Some("runtime.goal".to_string()),
-                refs: Vec::new(),
-                payload: serde_json::json!({
-                    "observation": {
-                        "result_class": "failed",
-                        "failure_class": "provider_unavailable",
-                        "cost_delta": {"tool_calls": 0},
-                        "information_gain": {
-                            "new_evidence": 0,
-                            "resolved_unknowns": 0
-                        }
-                    }
-                }),
-            })
-            .expect("second source event");
+        let observation: harness_contract::goal::RuntimeObservation = serde_json::from_value(serde_json::json!({
+            "identity":{"workspace_id":"workspace","session_id":"session-2","graph_id":"graph-2","goal_id":"goal-2"},
+            "kind":"tool_progress","source":"current-provider","source_revision":1,"freshness":{"observed_at_ms":1,"policy_revision":"accepted-current"},
+            "summary":"typed failure","fingerprint":"failure-2","result_class":"failed"
+        })).unwrap();
+        let value = serde_json::to_value(observation).unwrap();
+        let body = events
+            .prepare_content(
+                "session:session-2",
+                "failure-2",
+                &value,
+                &crate::artifact::PreparedArtifactOrigin::EventBody {
+                    stream_id: "goal:goal-2".into(),
+                    idempotency_key: "failure-2".into(),
+                    kind: "goal.observation".into(),
+                },
+            )
+            .unwrap();
+        events.append_batch_if_revision("goal:goal-2",0,"failure-2",vec![RuntimeTransactionEventInput {
+            event:RuntimeEventInput {stream_id:"goal:goal-2".into(),scope:RuntimeEventScope::Goal,kind:"goal.observation".into(),status:Some("failed".into()),actor:Some("runtime.goal".into()),refs:Vec::new(),
+                payload:serde_json::json!({"observation_schema":2,"session_id":"session-2","goal_source":{"stream_id":"goal:goal-2","sequence":0},"classifier":RuntimeEventStore::classify_observation(&value).unwrap(),"observation_body":body})},
+            idempotency_key:Some("failure-2".into()),schema_version:2,
+        }]).expect("second current-schema source event");
         assert_eq!(projector.run_once(1).expect("second pass"), 1);
         assert_eq!(discovery.list_signals().expect("signals").len(), 2);
         assert!(discovery.list_proposals().expect("proposals").is_empty());
@@ -1885,12 +2692,10 @@ mod tests {
                 .source_cursor,
             commit_cursor
         );
-        assert!(
-            events
-                .list_stream(PROJECTOR_STREAM)
-                .expect("projector stream")
-                .is_empty()
-        );
+        assert!(events
+            .list_stream(PROJECTOR_STREAM)
+            .expect("projector stream")
+            .is_empty());
         assert_eq!(projector.run_once(64).expect("idempotent pass"), 0);
     }
 
@@ -1919,12 +2724,10 @@ mod tests {
 
         assert_eq!(projector.run_once(64).expect("bootstrap"), 0);
         assert_eq!(discovery.list_cases(25).expect("cases").len(), 1);
-        assert!(
-            events
-                .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
-                .expect("checkpoint")
-                .is_some()
-        );
+        assert!(events
+            .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
+            .expect("checkpoint")
+            .is_some());
         assert_eq!(projector.run_once(64).expect("idempotent restart"), 0);
         assert_eq!(discovery.case_index().expect("case index").total_cases, 1);
     }
@@ -1964,12 +2767,10 @@ mod tests {
             .expect("valid legacy signal");
 
         projector.run_once(64).expect("bounded bootstrap");
-        assert!(
-            discovery
-                .signal("valid-after-malformed")
-                .expect("canonical signal lookup")
-                .is_some()
-        );
+        assert!(discovery
+            .signal("valid-after-malformed")
+            .expect("canonical signal lookup")
+            .is_some());
         let checkpoint = events
             .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
             .expect("checkpoint read")
@@ -1992,13 +2793,11 @@ mod tests {
         let cases = discovery.list_cases(25).expect("cases");
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].state, crate::EvolutionCaseState::Ready);
-        assert!(
-            events
-                .list_scope(RuntimeEventScope::Evolution, 1_000)
-                .expect("events")
-                .iter()
-                .all(|event| !event.kind.contains("stable"))
-        );
+        assert!(events
+            .list_scope(RuntimeEventScope::Evolution, 1_000)
+            .expect("events")
+            .iter()
+            .all(|event| !event.kind.contains("stable")));
     }
 
     #[test]

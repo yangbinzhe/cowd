@@ -25,6 +25,15 @@ use super::{
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_RECEIPT_CONTEXT
+                .template(),
+            get(get_terminal_message_receipt_context),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_MESSAGES_BY_MESSAGE_ID_ACK.template(),
+            post(record_terminal_message_ack),
+        )
+        .route(
             surface::gateway_api::paths::API_SESSIONS_BY_ID_MESSAGES.template(),
             get(get_session_messages).post(send_message),
         )
@@ -104,6 +113,255 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+pub(super) fn receipt_store_error(
+    error: session::SessionError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match error {
+        session::SessionError::NotFound(_) => StatusCode::NOT_FOUND,
+        session::SessionError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        session::SessionError::StaleExecutionFence(_)
+        | session::SessionError::IdempotencyConflict { .. } => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: "receipt context or authority is unavailable".into(),
+        }),
+    )
+}
+
+pub(super) fn receipt_authority(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    session_id: &str,
+    headers: &HeaderMap,
+    require_client: bool,
+) -> Result<session::SessionReceiptAuthority, (StatusCode, Json<ErrorResponse>)> {
+    let invalid = || {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid receipt observer/client selector".into(),
+            }),
+        )
+    };
+    if headers.get_all("x-cowd-observer-id").iter().count() != 1
+        || headers.get_all("x-cowd-client-id").iter().count() > 1
+    {
+        return Err(invalid());
+    }
+    let observer = headers
+        .get("x-cowd-observer-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| super::validated_session_observer_id(Some(value)))
+        .ok_or_else(invalid)?;
+    let client_id = match headers.get("x-cowd-client-id") {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| invalid())?;
+            if uuid::Uuid::parse_str(value).is_err() {
+                return Err(invalid());
+            }
+            value.to_string()
+        }
+        None if require_client => return Err(invalid()),
+        None => String::new(),
+    };
+    if principal
+        .0
+        .claims()
+        .expires_at_ms
+        .is_some_and(|deadline| current_time_ms() >= deadline)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "receipt credential expired".into(),
+            }),
+        ));
+    }
+    super::projection_stream_principal_current(&state.config_home, principal).map_err(|error| {
+        (
+            if error.contains("authority unavailable") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            },
+            Json(ErrorResponse {
+                error: "receipt authorization authority unavailable".into(),
+            }),
+        )
+    })?;
+    Ok(session::SessionReceiptAuthority {
+        session_id: session_id.into(),
+        actor_id: super::surface_actor_id(principal, observer),
+        principal_id: principal.0.claims().principal_id.to_string(),
+        client_id,
+        credential_expires_at_ms: principal.0.claims().expires_at_ms,
+        receipt_source: None,
+    })
+}
+
+fn receipt_response(
+    result: Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)>,
+) -> axum::response::Response {
+    let mut response = match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+async fn get_terminal_message_receipt_context(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, message_id)): Path<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let result = async {
+        authorize_session_access(&state, &principal, &id, SessionAccess::Read)
+            .await
+            .map_err(|error| {
+                if error.0.is_server_error() {
+                    receipt_store_error(session::SessionError::Store(
+                        "session authority unavailable".into(),
+                    ))
+                } else {
+                    error
+                }
+            })?;
+        let authority = receipt_authority(&state, &principal, &id, &headers, true)?;
+        let mut result = state
+            .services
+            .session
+            .get_terminal_message_receipt_context(session::SessionTerminalReceiptQuery {
+                authority,
+                message_id,
+            })
+            .await
+            .map_err(receipt_store_error)?;
+        if let (
+            harness_contract::live::SessionMessageReceiptContext::Available {
+                outbox_observation,
+                ..
+            },
+            Some(input),
+            Some(runtime),
+        ) = (
+            &mut result.context,
+            result.input.as_ref(),
+            state.services.runtime.as_ref(),
+        ) {
+            let port = runtime.runtime_services().session_terminal_delivery();
+            let terminal_id = format!("turn-terminal:{}", input.request_id);
+            let lookup = terminal_id.clone();
+            let record = tokio::task::spawn_blocking(move || port.get(&lookup))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            if let Some(record) = record.filter(|record| {
+                record.terminal_id == terminal_id
+                    && record.session_id == input.session_id
+                    && record.message_id == format!("assistant:{}", input.message_id)
+                    && Some(record.commit_cursor) == input.runtime_commit_cursor
+                    && record.request_id.as_deref() == Some(input.request_id.as_str())
+                    && record.turn_id.as_deref() == Some(input.turn_id.as_str())
+                    && record.session_generation == Some(input.session_generation)
+                    && record.input_sequence == u64::try_from(input.sequence).ok()
+            }) {
+                *outbox_observation =
+                    harness_contract::live::SessionReceiptOutboxObservation::RuntimeOutbox {
+                        terminal_id: record.terminal_id,
+                        revision: record.revision.to_string(),
+                        status: record.status,
+                        materialized_at_ms: record.materialized_at_ms,
+                        runtime_commit_cursor: harness_contract::live::ReceiptCursor::parse(
+                            &record.commit_cursor.to_string(),
+                        )
+                        .map_err(|_| {
+                            receipt_store_error(session::SessionError::Store(
+                                "outbox cursor unavailable".into(),
+                            ))
+                        })?,
+                        execution_id: record.execution_id,
+                        turn_id: input.turn_id.clone(),
+                        request_id: input.request_id.clone(),
+                    };
+            }
+        }
+        serde_json::to_value(result.context).map_err(|_| {
+            receipt_store_error(session::SessionError::Store(
+                "receipt encoding failed".into(),
+            ))
+        })
+    }
+    .await;
+    receipt_response(result)
+}
+
+async fn record_terminal_message_ack(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, message_id)): Path<(String, String)>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
+    body: Result<
+        Json<harness_contract::live::SessionMessageAckRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> axum::response::Response {
+    let result = async {
+        authorize_session_access(&state, &principal, &id, SessionAccess::Read)
+            .await
+            .map_err(|error| {
+                if error.0.is_server_error() {
+                    receipt_store_error(session::SessionError::Store(
+                        "session authority unavailable".into(),
+                    ))
+                } else {
+                    error
+                }
+            })?;
+        let authority = receipt_authority(&state, &principal, &id, &headers, true)?;
+        let Json(body) = body.map_err(|_| {
+            receipt_store_error(session::SessionError::InvalidArgument(
+                "invalid receipt body".into(),
+            ))
+        })?;
+        let cursor = body.validate().map_err(|_| {
+            receipt_store_error(session::SessionError::InvalidArgument(
+                "invalid receipt tuple".into(),
+            ))
+        })?;
+        let receipt = state
+            .services
+            .session
+            .record_terminal_message_ack(session::SessionTerminalAckCommand {
+                query: session::SessionTerminalReceiptQuery {
+                    authority,
+                    message_id,
+                },
+                binding: session::SessionTerminalMessageBinding {
+                    runtime_commit_cursor: cursor,
+                    content_digest: body.content_digest,
+                },
+            })
+            .await
+            .map_err(receipt_store_error)?;
+        serde_json::to_value(receipt).map_err(|_| {
+            receipt_store_error(session::SessionError::Store(
+                "receipt encoding failed".into(),
+            ))
+        })
+    }
+    .await;
+    receipt_response(result)
 }
 
 pub(super) fn task_resume_context_packet(
@@ -721,19 +979,12 @@ async fn get_session_messages(
         let messages: Vec<serde_json::Value> = db_messages
             .iter()
             .map(|m| -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-                let blocks: Vec<serde_json::Value> =
-                    serde_json::from_str(&m.content_json).map_err(|error| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!(
-                                    "durable message `{}` at sequence {} has malformed content: {error}",
-                                    m.stable_message_id, m.sequence
-                                ),
-                            }),
-                        )
-                    })?;
-                let blocks = public_session_blocks(blocks);
+                let payload = session::public_terminal_payload_v1(&m.content_json).map_err(|_| {
+                    (StatusCode::SERVICE_UNAVAILABLE,Json(ErrorResponse { error:"public message payload unavailable".into() }))
+                })?;
+                let blocks: Vec<serde_json::Value> = serde_json::from_str(&payload.payload_json).map_err(|_| {
+                    (StatusCode::SERVICE_UNAVAILABLE,Json(ErrorResponse { error:"public message payload unavailable".into() }))
+                })?;
                 let mut val = serde_json::json!({
                     "id": m.stable_message_id,
                     "session_id": m.session_id,
@@ -806,10 +1057,7 @@ async fn get_session_messages(
 }
 
 pub(super) fn public_session_blocks(blocks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
-    blocks
-        .into_iter()
-        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) != Some("thinking"))
-        .collect()
+    session::public_session_blocks(blocks).unwrap_or_default()
 }
 
 pub(super) async fn cleanup_revoked_session_stream_authority(
@@ -822,13 +1070,13 @@ pub(super) async fn cleanup_revoked_session_stream_authority(
         let detached = state
             .services
             .session
-            .detach_session_value(session_id, actor_id)
+            .revoke_receipt_actor(session_id, actor_id)
             .await;
-        if detached.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        if let Err(error) = detached {
             tracing::warn!(
                 session_id,
                 actor_id,
-                result = %detached,
+                error = %error,
                 "revoked session stream attachment cleanup was not confirmed"
             );
         }
@@ -866,18 +1114,32 @@ pub(super) async fn replay_materialized_terminal_events(
     let delivery = runtime.runtime_services().session_terminal_delivery();
     let session_id = session_id.to_string();
     let lookup_session_id = session_id.clone();
-    let records = tokio::task::spawn_blocking(move || {
+    let records = match tokio::task::spawn_blocking(move || {
         delivery.materialized_after(&lookup_session_id, after_cursor, limit)
     })
     .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or_default();
-    let timeline = runtime
+    {
+        Ok(Ok(records)) => records,
+        _ => {
+            return ReplayTerminalPage {
+                requires_resync: true,
+                ..ReplayTerminalPage::default()
+            }
+        }
+    };
+    let timeline = match runtime
         .runtime_services()
         .event_reader()
         .session_timeline_events(session_id.as_str(), Some((after_cursor, u32::MAX)), limit)
-        .unwrap_or_default();
+    {
+        Ok(events) => events,
+        Err(_) => {
+            return ReplayTerminalPage {
+                requires_resync: true,
+                ..ReplayTerminalPage::default()
+            }
+        }
+    };
     let record_count = records.len().max(timeline.len());
     let mut last_cursor = None;
     let mut ordered_events = Vec::with_capacity(records.len().saturating_add(timeline.len()));
@@ -1034,8 +1296,663 @@ fn terminal_committed_stream_payload_from_decoded(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    pub(crate) struct ReceiptRouteFixture {
+        pub(crate) state: Arc<AppState>,
+        pub(crate) store: Arc<session::UnifiedSessionStore>,
+        pub(crate) commit: session::SessionTerminalTranscriptCommit,
+        pub(crate) client_id: String,
+    }
+
+    impl ReceiptRouteFixture {
+        pub(crate) async fn new() -> Self {
+            let state = super::super::tests::test_state();
+            let store = state
+                .services
+                .session
+                .terminal_receipt_test_store()
+                .unwrap();
+            let id = format!("receipt-route-{}", uuid::Uuid::new_v4());
+            let principal = AuthenticatedPrincipal(super::super::test_human_principal());
+            store
+                .create_session(&session::SessionRecord {
+                    session_id: id.clone(),
+                    platform: "test".into(),
+                    chat_id: id.clone(),
+                    user_id: None,
+                    model: None,
+                    created_at: "2026-10-17T00:00:00Z".into(),
+                    last_activity: "2026-10-17T00:00:00Z".into(),
+                    message_count: 0,
+                    reset_policy: "manual".into(),
+                    metadata_json: Some(
+                        serde_json::json!({"owner_principal_id":principal.0.claims().principal_id})
+                            .to_string(),
+                    ),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    status: "active".into(),
+                })
+                .await
+                .unwrap();
+            let request = session::SessionRuntimeOutboxRequest {
+                request_id: format!("input-{id}"),
+                input_id: format!("input-{id}"),
+                turn_id: format!("turn-{id}"),
+                message_id: format!("message-{id}"),
+                session_generation: 1,
+                decision: InputRoutingDecision::StartNewTurn,
+                target_turn_id: None,
+                classification_json: None,
+                task_route_hint: None,
+                created_at_ms: 100,
+                runtime_options_json: None,
+            };
+            store
+                .append_ingress_with_runtime_outbox(
+                    &id,
+                    "user",
+                    Some(r#"[{"type":"text","text":"request"}]"#),
+                    100,
+                    &request,
+                )
+                .await
+                .unwrap();
+            let claimed = store
+                .claim_session_runtime_outbox("receipt-fixture", 101, 10000, 1, &[])
+                .await
+                .unwrap()
+                .remove(0);
+            let token = claimed.claim_token.clone().unwrap();
+            let running = store
+                .mark_session_runtime_outbox_running(
+                    &request.request_id,
+                    "receipt-fixture",
+                    1,
+                    &token,
+                    claimed.revision,
+                    102,
+                )
+                .await
+                .unwrap();
+            let runtime = state.services.runtime.as_ref().unwrap().runtime_services();
+            let stream = format!("receipt-fixture:{id}");
+            let terminal_id = format!("turn-terminal:{}", request.request_id);
+            let message_id = format!("assistant:{}", request.message_id);
+            let topology = state.services.selected_storage.as_ref().unwrap();
+            let mut terminal = runtime::SessionTerminalInput {
+                terminal_id: terminal_id.clone(),
+                message_id: message_id.clone(),
+                session_id: id.clone(),
+                execution_id: Some(format!("execution-{id}")),
+                turn_id: Some(request.turn_id.clone()),
+                request_id: Some(request.request_id.clone()),
+                session_generation: Some(1),
+                input_sequence: Some(running.sequence as u64),
+                input_claim_owner: Some("receipt-fixture".into()),
+                input_claim_token: Some(token.clone()),
+                input_claim_revision: running.claim_fence_epoch,
+                controlled_recovery_claim_fingerprints: vec![],
+                payload_ref: String::new(),
+            };
+            let mut payload = crate::current_terminal_fixture::current_payload(
+                &terminal_id,
+                &request.message_id,
+                running.sequence,
+                "answer",
+            );
+            payload["goal_completion"] = serde_json::json!("satisfied");
+            payload["transcript"] = serde_json::json!([{"role":"assistant","blocks":[
+                {"type":"thinking","thinking":"sealed-secret","signature":"sealed-signature"},
+                {"type":"reasoning_summary","text":"checked"},{"type":"text","text":"answer"}
+            ]}]);
+            crate::current_terminal_fixture::publish(
+                &topology.runtime_event_store,
+                runtime.artifact_store(),
+                &mut terminal,
+                &payload,
+            )
+            .await;
+            let transaction = topology
+                .runtime_event_store
+                .append_transaction_with_terminal(
+                    runtime::AppendTransactionRequest {
+                        transaction_id: format!("receipt-fixture:{id}"),
+                        expected_streams: vec![runtime::ExpectedStreamRevision {
+                            stream_id: stream.clone(),
+                            expected_revision: 0,
+                        }],
+                        events: vec![runtime::RuntimeTransactionEventInput {
+                            event: runtime::RuntimeEventInput {
+                                stream_id: stream,
+                                scope: runtime::RuntimeEventScope::Evolution,
+                                kind: "receipt.fixture".into(),
+                                status: Some("committed".into()),
+                                actor: Some("test-fixture".into()),
+                                refs: vec![],
+                                payload: serde_json::json!({"fixture":true}),
+                            },
+                            idempotency_key: None,
+                            schema_version: 1,
+                        }],
+                    },
+                    terminal,
+                )
+                .unwrap();
+            let commit = session::SessionTerminalTranscriptCommit {
+                terminal_message_id:message_id.clone(),ingress_message_id:request.message_id,session_id:id.clone(),turn_id:request.turn_id,
+                messages:vec![session::SessionMessage { stable_message_id:message_id,session_id:id.clone(),sequence:0,role:"assistant".into(),
+                    content_json:r#"[{"type":"thinking","thinking":"sealed-secret","signature":"sealed-signature"},{"type":"reasoning_summary","text":"checked"},{"type":"text","text":"answer"}]"#.into(),
+                    blocks_count:3,tool_use_id:None,tool_name:None,token_usage_json:None,created_at_ms:0 }],
+                runtime_commit_cursor:transaction.commit_cursor,consumed_input_sequence:running.sequence,created_at_ms:103,
+                fence:session::SessionTerminalExecutionFence { request_id:request.request_id,input_sequence:running.sequence,session_generation:1,
+                    claim_owner:"receipt-fixture".into(),claim_token:token,claim_fence_epoch:running.claim_fence_epoch.unwrap() },
+            };
+            store
+                .commit_terminal_transcript_if_fenced(&commit)
+                .await
+                .unwrap();
+            let mut fixture = Self {
+                state,
+                store,
+                commit,
+                client_id: String::new(),
+            };
+            let (status,body,_) = fixture.call("POST",&format!("/api/sessions/{id}/attach"),Some(serde_json::json!({"surface":"test","role":"reader","receipt_protocol":"session-public-v1"}))).await;
+            assert_eq!(status, StatusCode::OK);
+            fixture.client_id = body["receipt_attachment"]["client_id"]
+                .as_str()
+                .unwrap()
+                .into();
+            fixture
+        }
+
+        pub(crate) async fn call(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, serde_json::Value, HeaderMap) {
+            self.call_selected("receipt-tab", &self.client_id, method, path, body)
+                .await
+        }
+
+        pub(crate) async fn call_selected(
+            &self,
+            observer: &str,
+            client: &str,
+            method: &str,
+            path: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, serde_json::Value, HeaderMap) {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-cowd-observer-id", observer);
+            if !client.is_empty() {
+                request = request.header("x-cowd-client-id", client);
+            }
+            let body = match body {
+                Some(value) => {
+                    request = request.header("content-type", "application/json");
+                    Body::from(value.to_string())
+                }
+                None => Body::empty(),
+            };
+            let response = super::super::api_router(self.state.clone())
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap();
+            let value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"non_json_response":true}));
+            (status, value, headers)
+        }
+
+        pub(crate) fn path(&self, suffix: &str) -> String {
+            format!(
+                "/api/sessions/{}/messages/{}/{}",
+                self.commit.session_id, self.commit.terminal_message_id, suffix
+            )
+        }
+
+        pub(crate) fn ack(&self) -> serde_json::Value {
+            serde_json::json!({"runtime_commit_cursor":self.commit.runtime_commit_cursor.to_string(),
+                "content_digest":session::public_terminal_payload_v1(&self.commit.messages[0].content_json).unwrap().content_digest})
+        }
+
+        async fn receipt_count(&self) -> usize {
+            let principal = AuthenticatedPrincipal(super::super::test_human_principal());
+            self.store
+                .list_terminal_message_acks(session::SessionTerminalAckListQuery {
+                    authority: session::SessionReceiptAuthority {
+                        session_id: self.commit.session_id.clone(),
+                        actor_id: super::super::surface_actor_id(&principal, "receipt-tab"),
+                        principal_id: principal.0.claims().principal_id.clone(),
+                        client_id: self.client_id.clone(),
+                        credential_expires_at_ms: None,
+                        receipt_source: None,
+                    },
+                    after_cursor: 0,
+                    limit: 100,
+                })
+                .await
+                .unwrap()
+                .len()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn r1_message_ack_requires_exact_attachment_not_writer_lease() {
+        let fixture = ReceiptRouteFixture::new().await;
+        let lease = fixture
+            .state
+            .session_lease_registry
+            .as_ref()
+            .unwrap()
+            .acquire(&fixture.commit.session_id, "another-writer", "exclusive")
+            .await;
+        assert_eq!(lease["ok"], true);
+        let (status, _, _) = fixture
+            .call("POST", &fixture.path("ack"), Some(fixture.ack()))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fixture.receipt_count().await, 1);
+        let (status, _, _) = fixture
+            .call(
+                "POST",
+                &format!("/api/sessions/{}/messages", fixture.commit.session_id),
+                Some(serde_json::json!({"content":"must not write"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn r1_message_ack_authenticated_context_is_public_and_no_store() {
+        let fixture = ReceiptRouteFixture::new().await;
+        for path in [
+            fixture.path("receipt-context"),
+            format!("/api/sessions/{}/messages", fixture.commit.session_id),
+        ] {
+            let (status, value, headers) = fixture.call("GET", &path, None).await;
+            assert_eq!(status, StatusCode::OK);
+            if path.ends_with("receipt-context") {
+                assert_eq!(headers["cache-control"], "no-store");
+                assert_eq!(value["status"], "available");
+            }
+            let wire = value.to_string();
+            assert!(!wire.contains("sealed-secret"));
+            assert!(!wire.contains("sealed-signature"));
+            assert!(wire.contains("checked"));
+            assert!(wire.contains("answer"));
+        }
+        assert_eq!(fixture.receipt_count().await, 0);
+        let mut corrupted = fixture
+            .store
+            .get_message_by_stable_id(
+                &fixture.commit.session_id,
+                &fixture.commit.terminal_message_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        corrupted.content_json = "[sealed-secret-malformed".into();
+        fixture.store.insert_message(&corrupted).await.unwrap();
+        let (status, value, headers) = fixture
+            .call("GET", &fixture.path("receipt-context"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "unavailable");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert!(value["payload_json"].is_null());
+        assert!(!value.to_string().contains("sealed-secret"));
+        let (status, value, _) = fixture
+            .call(
+                "GET",
+                &format!("/api/sessions/{}/messages", fixture.commit.session_id),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!value.to_string().contains("sealed-secret"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn r1_message_ack_missing_foreign_expired_authority_never_writes() {
+        let mut fixture = ReceiptRouteFixture::new().await;
+        let original = fixture.client_id.clone();
+        for client in [String::new(), uuid::Uuid::new_v4().to_string()] {
+            fixture.client_id = client;
+            let (status, _, headers) = fixture
+                .call("POST", &fixture.path("ack"), Some(fixture.ack()))
+                .await;
+            assert!(matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+            ));
+            assert_eq!(headers["cache-control"], "no-store");
+        }
+        fixture.client_id = original;
+        assert_eq!(fixture.receipt_count().await, 0);
+        let authenticated = super::super::test_human_principal();
+        for expired in [false, true] {
+            let mut claims = authenticated.claims().clone();
+            if expired {
+                claims.expires_at_ms = Some(1);
+            } else {
+                claims.principal_id = "foreign-reader".into();
+                claims.scopes.clear();
+                claims.capabilities.clear();
+            }
+            let principal = runtime::VerifiedPrincipal::from_test_claims(claims);
+            let app = router()
+                .layer(Extension(AuthenticatedPrincipal(principal)))
+                .with_state(fixture.state.clone());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(fixture.path("ack"))
+                        .header("x-cowd-observer-id", "receipt-tab")
+                        .header("x-cowd-client-id", &fixture.client_id)
+                        .header("content-type", "application/json")
+                        .body(Body::from(fixture.ack().to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if expired {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+        assert_eq!(fixture.receipt_count().await, 0);
+        let principal = AuthenticatedPrincipal(super::super::test_human_principal());
+        fixture
+            .state
+            .services
+            .session
+            .revoke_receipt_actor(
+                &fixture.commit.session_id,
+                &super::super::surface_actor_id(&principal, "receipt-tab"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .call("POST", &fixture.path("ack"), Some(fixture.ack()))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        Arc::get_mut(&mut fixture.state).unwrap().auth_token = Some("required-auth-token".into());
+        let (status, _, headers) = fixture
+            .call("POST", &fixture.path("ack"), Some(fixture.ack()))
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            headers
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn r1_message_ack_reads_and_subscription_ack_have_no_receipt_effect() {
+        let fixture = ReceiptRouteFixture::new().await;
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .call("GET", &fixture.path("receipt-context"), None)
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            fixture
+                .call(
+                    "GET",
+                    &format!("/api/sessions/{}/messages", fixture.commit.session_id),
+                    None
+                )
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(fixture.receipt_count().await, 0);
+        let (status,subscription,_) = fixture.call("POST","/api/runtime/live-subscriptions",Some(serde_json::json!({
+            "surface_instance":"receipt-tab","idempotency_key":format!("live:{}",fixture.commit.session_id),
+            "selector":{"sources":[{"kind":"session","id":fixture.commit.session_id,"cursor":0}]}
+        }))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status,_,_) = fixture.call("PATCH",&format!("/api/runtime/live-subscriptions/{}",subscription["id"].as_str().unwrap()),Some(serde_json::json!({
+            "expected_revision":subscription["revision"],"idempotency_key":format!("checkpoint:{}",fixture.commit.session_id),
+            "selector":{"sources":[{"kind":"session","id":fixture.commit.session_id,"cursor":1}]}
+        }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fixture.receipt_count().await, 0);
+        let runtime = fixture
+            .state
+            .services
+            .runtime
+            .as_ref()
+            .unwrap()
+            .runtime_services();
+        let port = runtime.session_terminal_delivery();
+        let before = fixture
+            .state
+            .services
+            .selected_storage
+            .as_ref()
+            .unwrap()
+            .runtime_event_store
+            .durable_commit_cursor()
+            .unwrap();
+        let claimed = port
+            .claim("receipt-test", 200, 10000, 10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.session_id == fixture.commit.session_id)
+            .unwrap();
+        port.acknowledge(&claimed.terminal_id, "receipt-test", claimed.revision, 201)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .services
+                .selected_storage
+                .as_ref()
+                .unwrap()
+                .runtime_event_store
+                .durable_commit_cursor()
+                .unwrap(),
+            before
+        );
+        assert_eq!(fixture.receipt_count().await, 0);
+        assert_eq!(
+            fixture
+                .call("POST", &fixture.path("ack"), Some(fixture.ack()))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(fixture.receipt_count().await, 1);
+    }
+
+    #[test]
+    fn r1_message_ack_wire_is_closed_and_cursor_is_lossless() {
+        for value in ["9007199254740993", "9223372036854775807"] {
+            let body = serde_json::json!({"runtime_commit_cursor":value,"content_digest":"digest"});
+            let decoded: harness_contract::live::SessionMessageAckRequest =
+                serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), body);
+        }
+        for cursor in [
+            serde_json::json!(1),
+            serde_json::json!("0"),
+            serde_json::json!("01"),
+            serde_json::json!("9223372036854775808"),
+        ] {
+            assert!(
+                serde_json::from_value::<harness_contract::live::SessionMessageAckRequest>(
+                    serde_json::json!({"runtime_commit_cursor":cursor,"content_digest":"x"})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn r1_outcome_axes_receipt_overlay_is_fresh_at_an_unchanged_runtime_cursor() {
+        let fixture = ReceiptRouteFixture::new().await;
+        let before = fixture
+            .state
+            .services
+            .selected_storage
+            .as_ref()
+            .unwrap()
+            .runtime_event_store
+            .durable_commit_cursor()
+            .unwrap();
+        let initial = fixture
+            .call("GET", &fixture.path("receipt-context"), None)
+            .await
+            .1;
+        assert!(initial["receipt"].is_null());
+        assert_eq!(
+            fixture
+                .call("POST", &fixture.path("ack"), Some(fixture.ack()))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert!(!fixture
+            .call("GET", &fixture.path("receipt-context"), None)
+            .await
+            .1["receipt"]
+            .is_null());
+        let (status,grant,_) = fixture.call_selected("second-tab","","POST",&format!("/api/sessions/{}/attach",fixture.commit.session_id),Some(serde_json::json!({"surface":"test","role":"reader","receipt_protocol":"session-public-v1"}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let client = grant["receipt_attachment"]["client_id"].as_str().unwrap();
+        let (status, second, _) = fixture
+            .call_selected(
+                "second-tab",
+                client,
+                "GET",
+                &fixture.path("receipt-context"),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(second["receipt"].is_null());
+        assert_eq!(second["client_id"], client);
+        let mut message = fixture
+            .store
+            .get_message_by_stable_id(
+                &fixture.commit.session_id,
+                &fixture.commit.terminal_message_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        message.content_json = "[]".into();
+        fixture.store.insert_message(&message).await.unwrap();
+        assert_eq!(
+            fixture
+                .call("GET", &fixture.path("receipt-context"), None)
+                .await
+                .1["status"],
+            "unavailable"
+        );
+        assert_eq!(fixture.receipt_count().await, 1);
+        assert_eq!(
+            fixture
+                .state
+                .services
+                .selected_storage
+                .as_ref()
+                .unwrap()
+                .runtime_event_store
+                .durable_commit_cursor()
+                .unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn r1_outcome_axes_outbox_and_session_observations_are_not_cross_store_atomic() {
+        let fixture = ReceiptRouteFixture::new().await;
+        let runtime = fixture
+            .state
+            .services
+            .runtime
+            .as_ref()
+            .unwrap()
+            .runtime_services();
+        let port = runtime.session_terminal_delivery();
+        let claimed = port
+            .claim("receipt-test", 200, 10000, 10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.session_id == fixture.commit.session_id)
+            .unwrap();
+        let (status, context, _) = fixture
+            .call("GET", &fixture.path("receipt-context"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(context["status"], "available");
+        assert_eq!(context["outbox_observation"]["status"], "claimed");
+        assert_eq!(
+            fixture
+                .call("POST", &fixture.path("ack"), Some(fixture.ack()))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        port.acknowledge(&claimed.terminal_id, "receipt-test", claimed.revision, 201)
+            .unwrap();
+        let mut message = fixture
+            .store
+            .get_message_by_stable_id(
+                &fixture.commit.session_id,
+                &fixture.commit.terminal_message_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        message.content_json = "[]".into();
+        fixture.store.insert_message(&message).await.unwrap();
+        assert_eq!(
+            fixture
+                .call("GET", &fixture.path("receipt-context"), None)
+                .await
+                .1["status"],
+            "unavailable"
+        );
+    }
 
     #[test]
     fn durable_history_projects_public_summary_and_drops_private_provider_transcript() {

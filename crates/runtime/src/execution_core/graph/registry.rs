@@ -65,6 +65,10 @@ pub struct NodeExecutionOutcome {
     /// through the public execution outcome API.
     #[serde(skip)]
     pub(crate) domain_events: Vec<crate::runtime_event_store::RuntimeTransactionEventInput>,
+    #[serde(skip)]
+    pub(crate) source_revisions: BTreeMap<String, u64>,
+    #[serde(skip)]
+    pub(crate) no_dispatch: Option<super::executors::agent_tool::NoDispatchWitness>,
     pub replan: Option<ExecutionGraphReplan>,
 }
 
@@ -90,6 +94,8 @@ impl NodeExecutionOutcome {
             delivery_envelope: None,
             terminal_presentation: None,
             domain_events: Vec::new(),
+            source_revisions: BTreeMap::new(),
+            no_dispatch: None,
             replan: None,
         }
     }
@@ -167,12 +173,98 @@ pub trait NodeExecutor: Send + Sync {
 #[derive(Default)]
 pub struct NodeExecutorRegistry {
     executors: RwLock<BTreeMap<String, Arc<dyn NodeExecutor>>>,
+    builtin_tool_batch: RwLock<Option<std::sync::Weak<super::executors::ScopedNodeExecutor>>>,
 }
 
 impl NodeExecutorRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn install_builtin_tool_batch(
+        &self,
+        owner: &Arc<super::executors::ScopedNodeExecutor>,
+    ) -> Result<(), NodeExecutorError> {
+        let registered = self
+            .get("tool_batch")
+            .ok_or_else(|| NodeExecutorError::Unavailable {
+                executor_kind: "tool_batch".into(),
+                node_id: String::new(),
+            })?;
+        let expected: Arc<dyn NodeExecutor> = owner.clone();
+        if !Arc::ptr_eq(&registered, &expected) {
+            return Err(NodeExecutorError::Invalid {
+                node_id: String::new(),
+                reason: "builtin ToolBatch owner mismatch".into(),
+            });
+        }
+        let mut slot = self
+            .builtin_tool_batch
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return Err(NodeExecutorError::DuplicateExecutor(
+                "builtin tool_batch owner".into(),
+            ));
+        }
+        *slot = Some(Arc::downgrade(owner));
+        Ok(())
+    }
+
+    fn builtin_tool_batch(&self) -> Option<Arc<super::executors::ScopedNodeExecutor>> {
+        let owner = self
+            .builtin_tool_batch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()?
+            .upgrade()?;
+        let expected: Arc<dyn NodeExecutor> = owner.clone();
+        self.get("tool_batch")
+            .filter(|registered| Arc::ptr_eq(registered, &expected))?;
+        Some(owner)
+    }
+
+    pub(super) fn observe_builtin_binding(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<Option<Arc<super::executors::agent_tool::NoDispatchObservation>>, NodeExecutorError>
+    {
+        if ticket.executor_kind != "tool_batch"
+            || super::executors::agent_tool::no_dispatch_calls(ticket).is_err()
+        {
+            return Ok(None);
+        }
+        self.builtin_tool_batch()
+            .map(|owner| owner.observe_binding(ticket))
+            .transpose()
+    }
+
+    pub(super) fn rollback_unadmitted_builtin_binding(
+        &self,
+        ticket: &NodeExecutionTicket,
+        observation: &Arc<super::executors::agent_tool::NoDispatchObservation>,
+        commits: &super::commit_service::ExecutionCommitService,
+    ) -> Result<(), NodeExecutorError> {
+        commits
+            .validate_unadmitted_binding_rollback(ticket)
+            .map_err(|error| NodeExecutorError::Invalid {
+                node_id: ticket.node_id.clone(),
+                reason: error.to_string(),
+            })?;
+        let owner = self
+            .builtin_tool_batch()
+            .ok_or_else(|| NodeExecutorError::Unavailable {
+                executor_kind: ticket.executor_kind.clone(),
+                node_id: ticket.node_id.clone(),
+            })?;
+        owner.rollback_unadmitted_binding(ticket, observation)
+    }
+
+    pub(super) fn forget_builtin_binding(&self, ticket: &NodeExecutionTicket) {
+        if let Some(owner) = self.builtin_tool_batch() {
+            owner.forget_closed_binding(ticket);
+        }
     }
 
     pub fn register(&self, executor: Arc<dyn NodeExecutor>) -> Result<(), NodeExecutorError> {

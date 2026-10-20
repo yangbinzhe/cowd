@@ -388,7 +388,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
     ];
     definitions.push(RuntimeToolDefinition {
         name: "artifact_publish".into(),
-        description: Some("Purpose: CONTENT IDENTITY only - turn an explicit byte source into an immutable content_ref, sha256 and bytes. It registers no deliverable, carries no kind/title, and is not a submission step. To attach a deliverable use artifact_commit; to hand work in use task_submit. Publish an explicit file snapshot (hash from read_file), stored Session text block (digest from context_retrieve), or authorized artifact. Every variant of this tool names its own required fields below; `sha256` must come from a real read_file or context_retrieve return value in this session.".into()),
+        description: Some("Purpose: CONTENT IDENTITY only - turn an explicit byte source into an immutable content_ref, sha256 and bytes. It registers no deliverable, carries no kind/title, and is not a submission step. To attach a deliverable use artifact_commit; to hand work in use task_submit. Publish an explicit file snapshot (hash from read_file), stored Session text block (digest from context_retrieve), or authorized artifact. Every variant of this tool names its own required fields below; `sha256` must come from a real read_file or context_retrieve return value in this session. If this tool is deferred, call tool_search with query artifact_publish and use the returned native schema. This content publication works before any Agentic Program or Team exists; it does not itself register or accept a result.".into()),
         input_schema: model_object_input_schema::<harness_contract::content_publication::ArtifactPublishInput>(),
         required_permission: ToolPermissionMode::ReadOnly,
         effect_resolver: runtime_effect_resolver("runtime.readonly"),
@@ -602,7 +602,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ArtifactCommitInput>(
             action::ARTIFACT_COMMIT_TOOL_ID,
-            "Purpose: DELIVERABLE REGISTRATION - bind a body as a typed, titled artifact in the collaboration graph. It is the one outlet that records kind and title; artifact_publish only produces the content_ref it may consume. Attach a deliverable body in one of three ways. Preferred and easiest: content_ref=message://current selects this whole response's substantive body, so you never count blocks. Or content_ref=artifact_publish:... for a file you published. Or content_ref=current_message_block:<zero-based-index> to pick exactly one Text block; an out-of-range index never falls back to another paragraph. For this tool the body travels as `content_ref`, never as a JSON field.",
+            "Purpose: DELIVERABLE REGISTRATION - bind a body as a typed, titled artifact in the collaboration graph. It is the one outlet that records kind and title; artifact_publish only produces the content_ref it may consume. Attach a deliverable body in one of three ways. Preferred and easiest: content_ref=message://current selects this whole response's substantive body, so you never count blocks. For an existing file, discover artifact_publish with tool_search when deferred, publish the explicit file snapshot with its real read_file hash, then copy the returned artifact:// content_ref here. Never construct a selector from a file hash. Root registration needs no pre-existing Team or Task. Or content_ref=current_message_block:<zero-based-index> to pick exactly one Text block; an out-of-range index never falls back to another paragraph. For this tool the body travels as `content_ref`, never as a JSON field.",
         ),
         agent_action_definition::<action::ObjectiveUpdateInput>(
             action::OBJECTIVE_UPDATE_TOOL_ID,
@@ -622,7 +622,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ObjectiveCompleteRequestInput>(
             action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
-            "Request Objective verification using a committed final artifact, evidence references and explicit Objective-level blockers. result_refs must name at least one reviewed artifact reference returned by artifact_commit. Accepted Task limitations remain visible disclosures and are not repeated as blockers. The Supervisor verifies terminal invariants without re-litigating independent Task accept verdicts.",
+            "Request Objective verification using result_refs, evidence references and explicit Objective-level blockers. result_refs may name Program-committed artifact references, valid governed tool:// receipts, artifact:// content selectors, or original graph approval references. Each result remains subject to current Goal independent review, manifest validation and CAS; a supported reference shape alone does not prove satisfaction. file:// paths are not supported result_refs. Accepted Task limitations remain visible disclosures and are not repeated as blockers. The Supervisor verifies terminal invariants without re-litigating independent Task accept verdicts. For Root-authored results, first register the real file or response body using artifact_commit. A distinct Runtime-bound reviewer must read and review the current result; use an existing Team, or explicitly choose a minimal reviewer-only Team with a read-capable Agent and a purpose=exploration Task naming the criterion and result refs. Do not ask that Agent to reproduce the deliverable or invent a report. No Team, Task, review or acceptance is created automatically by completion.",
         ),
     ]
 }
@@ -739,7 +739,12 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
 pub(crate) fn runtime_effect_resolver(resolver_id: &str) -> ToolEffectResolverSpec {
     ToolEffectResolverSpec {
         resolver_id: resolver_id.to_string(),
-        resolver_version: 1,
+        resolver_version: if matches!(resolver_id, "runtime.agent_action" | "runtime.private_note")
+        {
+            2
+        } else {
+            1
+        },
     }
 }
 
@@ -791,28 +796,78 @@ mod tests {
     fn advertised_examples_satisfy_the_pinned_syntactic_contract() {
         let mut definitions = runtime_capability_tool_definitions();
         definitions.extend(mcp_wrapper_tool_definitions());
-        let catalog = GatewayToolRegistry::builtin().with_runtime_tools(definitions).unwrap();
+        let catalog = GatewayToolRegistry::builtin()
+            .with_runtime_tools(definitions)
+            .unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let host = tools::ToolHost::new("example-contract-fixture", workspace.path(), tools::ToolHostSnapshot::new(
-            Arc::new(catalog), Arc::new(tools::lsp_client::LspRegistry::default()), None,
-        ));
+        let host = tools::ToolHost::new(
+            "example-contract-fixture",
+            workspace.path(),
+            tools::ToolHostSnapshot::new(
+                Arc::new(catalog),
+                Arc::new(tools::lsp_client::LspRegistry::default()),
+                None,
+            ),
+        );
         let lease = host.pin_snapshot();
-        let unavailable = lease.catalog_receipt().descriptors.into_iter().filter(|descriptor|
-            descriptor.health == harness_contract::tool::ToolDescriptorHealth::Unavailable)
-            .map(|descriptor| descriptor.canonical_id).collect::<std::collections::BTreeSet<_>>();
-        let advertised = lease.snapshot().catalog.definitions(None).into_iter().filter(|definition| !unavailable.contains(&definition.name)).map(|definition| runtime::ProviderToolDefinition {
-            name: definition.name, description: definition.description, input_schema: definition.input_schema,
-        }).collect::<Vec<_>>();
-        runtime::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
-            step_id: "step:all-registered-tools".into(), session_id: "session:fixture".into(), turn_id: "turn:fixture".into(),
-            execution_id: None, actor_ref: Some("fixture".into()), run_ref: None, attempt: None, epoch: None,
-            goal_ref: None, program_ref: None, task_ref: None, build_ref: "isolated-test-fixture".into(),
-        }, lease.clone(), &advertised, &json!({}), &json!({}), Default::default(), i64::MAX).unwrap();
-        let failures = lease.snapshot().catalog.definitions(None).into_iter().filter_map(|definition| {
-            let example = harness_contract::tool_input_contract::input_example(&definition.input_schema)?;
-            lease.validate_input(&definition.name, &example).err()
-                .map(|error| format!("{}: {error}; example={example}", definition.name))
-        }).collect::<Vec<_>>();
+        let unavailable = lease
+            .catalog_receipt()
+            .descriptors
+            .into_iter()
+            .filter(|descriptor| {
+                descriptor.health == harness_contract::tool::ToolDescriptorHealth::Unavailable
+            })
+            .map(|descriptor| descriptor.canonical_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let advertised = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter(|definition| !unavailable.contains(&definition.name))
+            .map(|definition| runtime::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect::<Vec<_>>();
+        runtime::step_snapshot::BoundStep::bind(
+            harness_contract::step::StepIdentity {
+                step_id: "step:all-registered-tools".into(),
+                session_id: "session:fixture".into(),
+                turn_id: "turn:fixture".into(),
+                execution_id: None,
+                actor_ref: Some("fixture".into()),
+                run_ref: None,
+                attempt: None,
+                epoch: None,
+                goal_ref: None,
+                program_ref: None,
+                task_ref: None,
+                build_ref: "isolated-test-fixture".into(),
+            },
+            lease.clone(),
+            &advertised,
+            &json!({}),
+            &json!({}),
+            Default::default(),
+            i64::MAX,
+        )
+        .unwrap();
+        let failures = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter_map(|definition| {
+                let example =
+                    harness_contract::tool_input_contract::input_example(&definition.input_schema)?;
+                lease
+                    .validate_input(&definition.name, &example)
+                    .err()
+                    .map(|error| format!("{}: {error}; example={example}", definition.name))
+            })
+            .collect::<Vec<_>>();
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
@@ -890,6 +945,19 @@ mod tests {
             .as_deref()
             .is_some_and(|description| description.contains("not MCP resources")));
 
+        for tool in &tools {
+            assert_eq!(
+                tool.effect_resolver.resolver_version,
+                if matches!(
+                    tool.effect_resolver.resolver_id.as_str(),
+                    "runtime.agent_action" | "runtime.private_note"
+                ) {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
         for action_id in harness_contract::agent_action::AGENT_ACTION_TOOL_IDS {
             let action = tools
                 .iter()
@@ -897,6 +965,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing Agent action `{action_id}`"));
             assert_eq!(action.required_permission, ToolPermissionMode::ReadOnly);
             assert_eq!(action.effect_resolver.resolver_id, "runtime.agent_action");
+            assert_eq!(action.effect_resolver.resolver_version, 2);
             assert_eq!(action.input_schema["additionalProperties"], false);
             assert!(action.input_schema["properties"]["expected_revision"].is_null());
         }
@@ -981,6 +1050,14 @@ mod tests {
 
         assert!(publish.contains("CONTENT IDENTITY"), "{publish}");
         assert!(commit.contains("DELIVERABLE REGISTRATION"), "{commit}");
+        assert!(publish.contains("tool_search"), "{publish}");
+        assert!(publish.contains("before any Agentic Program or Team exists"), "{publish}");
+        assert!(commit.contains("returned artifact:// content_ref"), "{commit}");
+        assert!(!commit.contains("content_ref=artifact_publish:"), "{commit}");
+        let complete = description("objective_complete_request");
+        assert!(complete.contains("distinct Runtime-bound reviewer"), "{complete}");
+        assert!(complete.contains("purpose=exploration"), "{complete}");
+        assert!(complete.contains("created automatically"), "{complete}");
         // publish must not claim the deliverable role, and commit must not claim
         // to be the content primitive.
         assert!(!publish.contains("DELIVERABLE REGISTRATION"), "{publish}");
@@ -999,6 +1076,35 @@ mod tests {
 
     /// The contract is attached where definitions leave the catalog, not where
     /// they are authored, so it has to be checked at the exit a model reads.
+    #[test]
+    fn objective_completion_description_matches_governed_result_contract_662() {
+        let catalog = tools::ToolCatalog::builtin()
+            .extend_runtime_tools(runtime_capability_tool_definitions())
+            .expect("runtime capability tools register");
+        let description = catalog
+            .definitions(None)
+            .into_iter()
+            .find(|tool| tool.name == "objective_complete_request")
+            .and_then(|tool| tool.description)
+            .expect("Objective completion description is exposed");
+        for required in [
+            "Program-committed artifact references",
+            "valid governed tool:// receipts",
+            "artifact:// content selectors",
+            "original graph approval references",
+            "current Goal independent review",
+            "manifest validation and CAS",
+            "supported reference shape alone does not prove satisfaction",
+            "file:// paths are not supported result_refs",
+        ] {
+            assert!(description.contains(required), "{required}: {description}");
+        }
+        assert!(!description.contains(
+            "result_refs must name at least one reviewed artifact reference returned by artifact_commit"
+        ));
+        assert!(!description.contains("synthetic final report"));
+    }
+
     #[test]
     fn injected_tools_reach_the_model_with_their_input_contract() {
         let mut catalog = tools::ToolCatalog::builtin();

@@ -53,6 +53,7 @@ mod tests {
     }
 
     include!("tests/agentic_and_evidence.rs");
+    include!("tests/content_publication_823c.rs");
     include!("tests/authorization.rs");
     include!("tests/context_retrieval.rs");
     include!("tests/receipts.rs");

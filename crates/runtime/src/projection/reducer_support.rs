@@ -1,5 +1,343 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "own818_tests.rs"]
+mod own818_tests;
+
+pub(super) fn execution_activity(
+    services: &RuntimeServices,
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+    scope: &ExecutionProjectionScope,
+) -> (bool, bool) {
+    let draining = scope.programs.iter().any(|program| {
+        !matches!(
+            program.status,
+            crate::AgenticProgramStatus::Verified
+                | crate::AgenticProgramStatus::Partial
+                | crate::AgenticProgramStatus::Blocked
+                | crate::AgenticProgramStatus::Failed
+                | crate::AgenticProgramStatus::Cancelled
+        ) || program.tasks.values().any(|task| {
+            !task.active_attempts.is_empty() || task.pending_retirement.is_some()
+        }) || !services.agent_runtime().running_agentic_members(&program.program_id).is_empty()
+    });
+    let running = std::iter::once(graph)
+        .chain(scope.descendant_graphs.iter())
+        .any(|graph| graph.nodes.iter().any(|node| !node.status.is_terminal()));
+    (running, draining)
+}
+
+pub(super) fn execution_terminal_axes(
+    services: &RuntimeServices,
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+    scope: &ExecutionProjectionScope,
+    facts: &BTreeMap<String, history::HistoryState>,
+    through: u64,
+    budget: &mut history::RequestBudget,
+) -> Result<harness_contract::projection::ExecutionTerminalAxes, RuntimeServicesError> {
+    budget.charge(0, 0)?;
+    use harness_contract::projection::{
+        ExecutionTerminalAxes, TerminalEffectSettlement, TerminalExecutionPhase,
+    };
+    let start = through;
+    let mut axes = ExecutionTerminalAxes::default();
+    if facts.values().any(|state| state.incomplete) {
+        axes.execution.phase = TerminalExecutionPhase::Unknown;
+        axes.execution.settlement = TerminalEffectSettlement::Unknown;
+        axes.execution.coverage_complete = false;
+        axes.source_cursor = services.event_store().durable_commit_cursor()?;
+        axes.source_race = axes.source_cursor != through;
+        return Ok(axes);
+    }
+    let programs = &scope.programs;
+    let roots = programs
+        .iter()
+        .filter(|program| {
+            program.root_execution_id.as_deref() == Some(graph.graph_id.as_str())
+                && Some(program.session_id.as_str()) == scope.session_id.as_deref()
+                && Some(program.turn_id.as_str()) == scope.turn_id.as_deref()
+        })
+        .collect::<Vec<_>>();
+    let goal_id = if roots.len() == 1 {
+        Some(roots[0].objective_id.clone())
+    } else if roots.is_empty() {
+        Some(format!("goal:{}", graph.graph_id))
+    } else {
+        None
+    };
+    if let Some(goal_id) = goal_id {
+        if let Some(projection) = services
+            .goal_store()
+            .projection(&goal_id)
+            .map_err(RuntimeServicesError::Invariant)?
+        {
+            let goal = projection.goal;
+            let binding_matches =
+                goal.execution_binding
+                    .as_ref()
+                    .map_or(roots.is_empty(), |binding| {
+                        binding.root_execution_id == graph.graph_id
+                            && Some(binding.session_id.as_str()) == scope.session_id.as_deref()
+                            && Some(binding.turn_id.as_str()) == scope.turn_id.as_deref()
+                            && roots.first().is_none_or(|program| {
+                                binding.agentic_program_id == program.program_id
+                            })
+                    });
+            if binding_matches && Some(goal.session_id.as_str()) == scope.session_id.as_deref() {
+                axes.outcome.goal_id = Some(goal.id);
+                axes.outcome.goal_revision = Some(goal.revision);
+                if let Some(terminal) = goal.terminal.filter(|terminal| {
+                    !terminal.terminal_fence.is_empty()
+                        && terminal.authority_revision > 0
+                        && match terminal.kind {
+                            harness_contract::goal::ObjectiveTerminalKind::Satisfied => {
+                                goal.completion == harness_contract::goal::GoalCompletion::Satisfied
+                            }
+                            harness_contract::goal::ObjectiveTerminalKind::PartiallySatisfied => {
+                                goal.completion == harness_contract::goal::GoalCompletion::Partial
+                            }
+                            harness_contract::goal::ObjectiveTerminalKind::Blocked => {
+                                goal.completion == harness_contract::goal::GoalCompletion::Blocked
+                            }
+                            harness_contract::goal::ObjectiveTerminalKind::Failed => {
+                                goal.completion == harness_contract::goal::GoalCompletion::Failed
+                            }
+                            harness_contract::goal::ObjectiveTerminalKind::Cancelled => {
+                                goal.completion == harness_contract::goal::GoalCompletion::Cancelled
+                            }
+                        }
+                }) {
+                    axes.outcome.outcome = Some(terminal.kind);
+                    axes.outcome.terminal_fence = Some(terminal.terminal_fence);
+                }
+            }
+        }
+    }
+    let (running, draining) = execution_activity(services, graph, scope);
+    axes.execution.phase = if draining {
+        TerminalExecutionPhase::Draining
+    } else if running {
+        TerminalExecutionPhase::Running
+    } else {
+        TerminalExecutionPhase::Draining
+    };
+    let mut missing_receipt = false;
+    for graph in std::iter::once(graph).chain(scope.descendant_graphs.iter()) {
+        let state = facts.get(&graph.graph_id).ok_or_else(|| {
+            RuntimeServicesError::Invariant("execution history coverage missing".into())
+        })?;
+        if state.through != through
+            || state.effects_checked_through != Some(through)
+            || state
+                .graph_state
+                .as_ref()
+                .is_none_or(|state| state.id != graph.graph_id || state.revision != graph.revision)
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "execution history source cut mismatch".into(),
+            ));
+        }
+        axes.execution
+            .evidence_refs
+            .extend(state.effect_evidence_refs.iter().cloned());
+        missing_receipt |= state.effect_missing_receipt;
+    }
+    let closure = if running || draining {
+        super::settlement::ClosureRead::default()
+    } else {
+        super::settlement::read(services, facts, through, budget)?
+    };
+    axes.execution
+        .evidence_refs
+        .extend(closure.refs.iter().cloned());
+    axes.execution.evidence_refs.sort();
+    axes.execution.evidence_refs.dedup();
+    let graph_covered = std::iter::once(graph)
+        .chain(scope.descendant_graphs.iter())
+        .all(|graph| !graph.nodes.is_empty());
+    axes.execution.coverage_complete = graph_covered
+        && closure.complete
+        && !missing_receipt
+        && !running
+        && !draining
+        && !closure.busy;
+    axes.execution.settlement = if missing_receipt || closure.busy {
+        TerminalEffectSettlement::Unsettled
+    } else if axes.execution.coverage_complete && !running && !draining {
+        TerminalEffectSettlement::ProvenSettled
+    } else {
+        TerminalEffectSettlement::Unknown
+    };
+    if !running
+        && !draining
+        && axes.execution.coverage_complete
+        && !closure.busy
+        && axes.outcome.terminal_fence.is_some()
+    {
+        axes.execution.phase = TerminalExecutionPhase::Terminal;
+    }
+    axes.delivery.runtime_terminal_ref = graph.terminal_result_ref.clone();
+    let local_race = !super::settlement::unchanged(services, &closure, budget)?;
+    if local_race {
+        axes.execution.coverage_complete = false;
+        axes.execution.phase = TerminalExecutionPhase::Unknown;
+        axes.execution.settlement = TerminalEffectSettlement::Unknown;
+    }
+    axes.source_cursor = services.event_store().durable_commit_cursor()?;
+    axes.source_race = start != axes.source_cursor;
+    if axes.source_race {
+        axes.outcome = Default::default();
+        axes.execution.coverage_complete = false;
+        axes.execution.phase = TerminalExecutionPhase::Unknown;
+        axes.execution.settlement = TerminalEffectSettlement::Unknown;
+    }
+    Ok(axes)
+}
+
+pub(super) fn validate_history_effects(
+    services: &RuntimeServices,
+    facts: &history::HistoryState,
+    through: u64,
+    budget: &mut history::RequestBudget,
+) -> Result<(Vec<String>, bool), RuntimeServicesError> {
+    let mut references = Vec::new();
+    let mut missing = false;
+    for (slot, (node_id, binding)) in &facts.bindings {
+        let (validated, pending) = validate_history_effect_binding(
+            services, facts, slot, node_id, binding, through, budget)?;
+        references.extend(validated);
+        missing |= pending;
+    }
+    Ok((references, missing))
+}
+
+pub(super) fn validate_history_effect_binding(
+    services: &RuntimeServices,
+    facts: &history::HistoryState,
+    slot: &String,
+    node_id: &String,
+    binding: &crate::execution_core::graph::ExecutionNodeBinding,
+    through: u64,
+    budget: &mut history::RequestBudget,
+) -> Result<(Vec<String>, bool), RuntimeServicesError> {
+    let mut evidence_refs = Vec::new();
+    let mut missing_receipt = false;
+    let ticket = facts.start_tickets.get(slot).ok_or_else(|| {
+        RuntimeServicesError::Invariant("execution start ticket provenance missing".into())
+    })?;
+    let spec = facts.start_specs.get(slot).ok_or_else(|| {
+        RuntimeServicesError::Invariant("execution start spec provenance missing".into())
+    })?;
+    binding
+        .validate_identity(spec)
+        .map_err(RuntimeServicesError::Invariant)?;
+    if ticket.node_id != *node_id
+        || spec.id != *node_id
+        || ticket.attempt != binding.attempt
+        || ticket.idempotency_key != binding.ticket_idempotency_key
+        || ticket.executor_kind != binding.executor_kind
+        || ticket.payload_ref != spec.payload_ref
+        || facts
+            .graph_state
+            .as_ref()
+            .is_none_or(|graph| graph.id != ticket.graph_id)
+        || slot
+            != &format!(
+                "{node_id}:{}:{}",
+                binding.attempt, binding.ticket_idempotency_key
+            )
+        || facts
+            .start_positions
+            .get(slot)
+            .is_none_or(|position| position.0 > through)
+    {
+        return Err(RuntimeServicesError::Invariant(
+            "execution start provenance identity mismatch".into(),
+        ));
+    }
+    let delegated_stream = format!(
+        "execution-agent-receipts:{}:{}:{}",
+        ticket.graph_id, node_id, binding.attempt
+    );
+    let delegated_head = budget.stream_head(services, &delegated_stream, through)?;
+    if delegated_head > 0 {
+        evidence_refs.push(delegated_stream.clone());
+    }
+    if facts.source_fence.is_some() && facts.source_fence == budget.request_source {
+        if let Some(proof) = facts.effect_proofs.get(slot) {
+            if proof.identity == history::effect_proof_identity(facts, slot)?
+                && proof.through <= through
+                && (proof.through == through || (proof.receipt_present && !proof.missing_receipt))
+            {
+                let mut references = proof.references.clone();
+                references.retain(|reference| reference != &delegated_stream);
+                if delegated_head > 0 {
+                    references.push(delegated_stream);
+                }
+                return Ok((references, proof.missing_receipt));
+            }
+        }
+    }
+    let effect_stream =
+        crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(ticket);
+    let intent = budget.canonical_record(
+        services,
+        &effect_stream,
+        &format!("{}:intent", binding.ticket_idempotency_key),
+        through,
+    )?;
+    let receipt = budget.canonical_record(
+        services,
+        &effect_stream,
+        &format!("{}:receipt", binding.ticket_idempotency_key),
+        through,
+    )?;
+    let outcome = crate::execution_core::graph::ExecutionNodeBinding::validate_effect_records(
+        ticket,
+        intent.as_deref(),
+        receipt.as_deref(),
+        through,
+    )
+    .map_err(RuntimeServicesError::Invariant)?;
+    let leaf_effect_owner = spec.kind
+        == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
+        && spec.executor_kind == "tool_batch";
+    if let Some(intent) = intent.as_ref() {
+        let original: crate::execution_core::graph::NodeExecutionTicket =
+            serde_json::from_value(intent.payload.clone()).map_err(|_| {
+                RuntimeServicesError::Invariant("invalid original effect ticket".into())
+            })?;
+        let original_slot = format!(
+            "{}:{}:{}",
+            original.node_id, original.attempt, original.idempotency_key
+        );
+        if facts.start_tickets.get(&original_slot) != Some(&original) {
+            return Err(RuntimeServicesError::Invariant(
+                "effect intent has no matching historical start".into(),
+            ));
+        }
+        if facts
+            .start_positions
+            .get(&original_slot)
+            .is_none_or(|position| *position > (intent.commit_cursor, intent.transaction_index))
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "effect intent precedes original start".into(),
+            ));
+        }
+        evidence_refs.push(effect_stream);
+        missing_receipt |= outcome.is_none();
+    } else if !leaf_effect_owner {
+        return Err(RuntimeServicesError::Invariant(
+            "required execution effect intent missing".into(),
+        ));
+    }
+    evidence_refs.extend(binding.resource_lease_refs.iter().cloned());
+    evidence_refs.extend(binding.scope_lease_ref.iter().cloned());
+    evidence_refs.extend(binding.worktree_lease_ref.iter().cloned());
+    Ok((evidence_refs, missing_receipt))
+}
+
 pub(super) fn execution_health_entity(
     execution_id: &str,
     graph: &harness_contract::execution_graph::ExecutionGraphProjection,
@@ -138,6 +476,7 @@ pub(super) fn validate_mission_scope(
 /// projection is assembled. This prevents a workspace-wide query from
 /// accidentally becoming an execution-wide response.
 pub(super) struct ExecutionProjectionScope {
+    pub(super) programs: Vec<std::sync::Arc<crate::AgenticProgramProjection>>,
     pub(super) session_id: Option<String>,
     pub(super) mission_id: Option<String>,
     pub(super) task_id: Option<String>,
@@ -166,6 +505,25 @@ impl ExecutionProjectionScope {
         execution_id: &str,
         graph: &harness_contract::execution_graph::ExecutionGraphProjection,
         full: bool,
+    ) -> Result<Self, RuntimeServicesError> {
+        let through = services.event_store().durable_commit_cursor()?;
+        Self::load_budgeted(
+            services,
+            execution_id,
+            graph,
+            full,
+            through,
+            &mut history::RequestBudget::default(),
+        )
+    }
+
+    pub(super) fn load_budgeted(
+        services: &RuntimeServices,
+        execution_id: &str,
+        graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+        full: bool,
+        through: u64,
+        budget: &mut history::RequestBudget,
     ) -> Result<Self, RuntimeServicesError> {
         let (execution_ids, child_executions, node_ids, descendant_graphs) =
             execution_lineage(services, execution_id, graph)?;
@@ -259,7 +617,8 @@ impl ExecutionProjectionScope {
                 )));
             }
         }
-        let agentic_programs = agentic_programs_for_executions(services, &execution_ids)?;
+        let agentic_programs =
+            agentic_programs_for_executions(services, &execution_ids, through, budget)?;
         let agentic_collaboration = agentic_collaboration_projection(&agentic_programs);
         let collaboration = collaboration_entities(agent_snapshots, &agentic_programs, full);
         let agents = collaboration.agents;
@@ -339,6 +698,7 @@ impl ExecutionProjectionScope {
         entity_ids.extend(relation_ids);
         entity_ids.extend(approval_ids);
         Ok(Self {
+            programs: agentic_programs,
             session_id,
             mission_id,
             task_id,
@@ -397,7 +757,7 @@ struct CollaborationEntities {
 
 fn collaboration_entities(
     agent_snapshots: Vec<crate::AgentRunSnapshot>,
-    programs: &[crate::AgenticProgramProjection],
+    programs: &[std::sync::Arc<crate::AgenticProgramProjection>],
     full: bool,
 ) -> CollaborationEntities {
     let physical_agent_ids = agent_snapshots
@@ -431,7 +791,7 @@ fn collaboration_entities(
 }
 
 fn agentic_collaboration_projection(
-    programs: &[crate::AgenticProgramProjection],
+    programs: &[std::sync::Arc<crate::AgenticProgramProjection>],
 ) -> harness_contract::projection::AgenticCollaborationProjectionV1 {
     use harness_contract::projection::*;
 
@@ -797,35 +1157,191 @@ fn agentic_collaboration_projection(
 fn agentic_programs_for_executions(
     services: &RuntimeServices,
     execution_ids: &BTreeSet<String>,
-) -> Result<Vec<crate::AgenticProgramProjection>, RuntimeServicesError> {
+    through: u64,
+    budget: &mut history::RequestBudget,
+) -> Result<Vec<std::sync::Arc<crate::AgenticProgramProjection>>, RuntimeServicesError> {
     let action_service = services.agent_action_service();
-    let mut programs = services
-        .event_store()
-        .stream_ids_for_scope(RuntimeEventScope::Program)
-        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?
-        .into_iter()
-        .filter_map(|stream| {
-            stream
-                .strip_prefix("agentic-program:")
-                .map(ToOwned::to_owned)
-        })
-        .map(|program_id| {
-            action_service
-                .project_if_exists(&program_id)
-                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .filter(|program| {
-            program
-                .root_execution_id
-                .as_ref()
-                .is_some_and(|execution_id| execution_ids.contains(execution_id))
-        })
-        .collect::<Vec<_>>();
-    programs.sort_by(|left, right| left.program_id.cmp(&right.program_id));
+    let mut openings = BTreeMap::new();
+    for root in execution_ids {
+        let mut after = None;
+        loop {
+            budget.charge(1, root.len())?;
+            let (records, bytes) = budget.page_limits();
+            let page = services
+                .event_store()
+                .position_page(
+                    RuntimeEventScope::ExecutionGraph,
+                    root,
+                    Some("agentic.program_opened"),
+                    after,
+                    through,
+                    records,
+                    bytes,
+                )
+                .map_err(history::error)?;
+            if page.is_empty() {
+                break;
+            }
+            for event in page {
+                budget.charge_record(&event)?;
+                budget.remember_record(&event, through)?;
+                let position = (event.commit_cursor, event.transaction_index);
+                if event.commit_cursor > through
+                    || after.is_some_and(|after| position <= after)
+                    || event.scope != RuntimeEventScope::Program
+                    || event.kind != "agentic.program_opened"
+                    || event.sequence != 1
+                    || event.schema_version != 1
+                    || event.payload["root_execution_id"].as_str() != Some(root.as_str())
+                {
+                    return Err(RuntimeServicesError::Invariant(
+                        "bounded Program discovery identity mismatch".into(),
+                    ));
+                }
+                after = Some(position);
+                let id = event
+                    .stream_id
+                    .strip_prefix("agentic-program:")
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        RuntimeServicesError::Invariant(
+                            "bounded Program stream identity missing".into(),
+                        )
+                    })?
+                    .to_owned();
+                if let Some(previous) = openings.insert(id, event.clone()) {
+                    if previous != event {
+                        return Err(RuntimeServicesError::Invariant(
+                            "conflicting Program opening".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut programs = Vec::new();
+    for (id, opened) in openings {
+        let stream = format!("agentic-program:{id}");
+        let observed_head = budget.stream_head(services, &stream, through)?;
+        if observed_head < 1 {
+            return Err(RuntimeServicesError::Invariant(
+                "discovered Program disappeared".into(),
+            ));
+        }
+        let mut head = observed_head;
+        while head > 1 {
+            let page = budget.canonical_stream_page(services, &stream, head - 1, head, through)?;
+            if page.len() != 1 || page[0].stream_id != stream || page[0].sequence != head {
+                return Err(RuntimeServicesError::Invariant(
+                    "bounded Program head identity mismatch".into(),
+                ));
+            }
+            let last = &page[0];
+            if last.commit_cursor > through {
+                head -= 1;
+                continue;
+            }
+            if last.scope != RuntimeEventScope::Program || last.schema_version != 1 {
+                return Err(RuntimeServicesError::Invariant(
+                    "bounded Program head source mismatch".into(),
+                ));
+            }
+            break;
+        }
+        let root = opened.payload["root_execution_id"]
+            .as_str()
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant("Program opening has no original root".into())
+            })?;
+        let goal = bounded_program_goal(services, &format!("goal:{root}"), through, budget)?;
+        let projection = action_service.project_snapshot_bounded(
+            &id,
+            head,
+            &opened,
+            goal.as_ref(),
+            |after, head| {
+                let page = budget.canonical_stream_page(services, &stream, after, head, through)?;
+                page.into_iter()
+                    .map(|event| {
+                        if event.commit_cursor > through {
+                            return Err(RuntimeServicesError::Invariant(
+                                "bounded Program tail is outside source cut".into(),
+                            ));
+                        }
+                        Ok(event.as_ref().clone())
+                    })
+                    .collect()
+            },
+            |error| RuntimeServicesError::Invariant(error.to_string()),
+        )?;
+        if projection
+            .root_execution_id
+            .as_ref()
+            .is_none_or(|root| !execution_ids.contains(root))
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "bounded Program escaped execution scope".into(),
+            ));
+        }
+        programs.push(projection);
+    }
     Ok(programs)
+}
+
+fn bounded_program_goal(
+    services: &RuntimeServices,
+    goal_id: &str,
+    through: u64,
+    budget: &mut history::RequestBudget,
+) -> Result<Option<harness_contract::goal::GoalContract>, RuntimeServicesError> {
+    let stream = format!("goal:{goal_id}");
+    let mut before = budget.stream_head(services, &stream, through)?;
+    while before > 0 {
+        budget.charge(1, 0)?;
+        let (_, bytes) = budget.page_limits();
+        let page = services
+            .event_store()
+            .list_stream_before(&stream, before, 1, bytes)
+            .map_err(history::error)?;
+        if page.len() != 1 {
+            return Err(RuntimeServicesError::Invariant(
+                "bounded Program Goal gap".into(),
+            ));
+        }
+        for event in page {
+            budget.charge(1, 0)?;
+            budget.charge_value(&event)?;
+            if event.stream_id != stream || event.sequence != before {
+                return Err(RuntimeServicesError::Invariant(
+                    "bounded Program Goal sequence mismatch".into(),
+                ));
+            }
+            before -= 1;
+            if event.commit_cursor > through {
+                continue;
+            }
+            if event.scope != RuntimeEventScope::Goal
+                || (event.kind != "goal.observation" && event.schema_version != 1)
+                || (event.kind == "goal.observation" && event.payload.get("goal").is_some())
+            {
+                return Err(RuntimeServicesError::Invariant(
+                    "bounded Program Goal source mismatch".into(),
+                ));
+            }
+            if let Some(value) = event.payload.get("goal") {
+                let goal: harness_contract::goal::GoalContract =
+                    serde_json::from_value(value.clone())
+                        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                if goal.id != goal_id {
+                    return Err(RuntimeServicesError::Invariant(
+                        "bounded Program original Goal mismatch".into(),
+                    ));
+                }
+                return Ok(Some(goal));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn agent_task_matches_projection_scope(
@@ -1055,6 +1571,7 @@ mod tests {
 
     fn scope() -> ExecutionProjectionScope {
         ExecutionProjectionScope {
+            programs: Vec::new(),
             session_id: Some("session-1".to_string()),
             mission_id: Some("mission-1".to_string()),
             task_id: Some("task-1".to_string()),
@@ -1128,5 +1645,653 @@ mod tests {
             Some("task-1"),
             Some("task-other"),
         ));
+    }
+}
+
+#[cfg(test)]
+mod bounded_program_reader_429_tests {
+    use super::*;
+    use harness_contract::agent_action::{
+        AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, TeamCreateInput,
+    };
+
+    fn seed_program(services: &RuntimeServices, program: &str, root: &str) {
+        let service = crate::AgentActionService::new(services.event_store().clone());
+        let envelope = AgentActionEnvelope {
+            action_id: format!("{program}:team"),
+            actor: AgentActorBinding {
+                objective_id: format!("custom-objective:{program}"),
+                program_id: program.into(),
+                session_id: "session-429".into(),
+                turn_id: "turn-429".into(),
+                root_execution_id: Some(root.into()),
+                required_team_count: 0,
+                exact_team_count: None,
+                objective_summary: "bounded Program read source".into(),
+                model_lease: "test".into(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: Vec::new(),
+                actor_id: "root-429".into(),
+                kind: AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+            expected_revision: None,
+            action: AgentAction::TeamCreate(TeamCreateInput {
+                name: "Original producer".into(),
+                mission: "Bounded complete read".into(),
+                objective: None,
+            }),
+        };
+        service.apply(&envelope).unwrap();
+        assert_eq!(service.project(program).unwrap().teams.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn r1_429_program_original_open_custom_objective_cold_hot_and_foreign() {
+        let services = RuntimeServices::in_memory().unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        seed_program(&services, "descendant-429", "child-429");
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:foreign-corrupt-429".into(),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.program_opened".into(),
+                status: None,
+                actor: None,
+                refs: vec![crate::RuntimeEventRef {
+                    kind: "execution_graph".into(),
+                    id: "foreign-429".into(),
+                }],
+                payload: serde_json::json!({"root_execution_id":"foreign-429"}),
+            })
+            .unwrap();
+        let roots = BTreeSet::from(["root-429".into(), "child-429".into()]);
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        let mut budget = history::RequestBudget::default();
+        let cold =
+            agentic_programs_for_executions(&services, &roots, through, &mut budget).unwrap();
+        let hot = agentic_programs_for_executions(&services, &roots, through, &mut budget).unwrap();
+        assert_eq!(
+            cold.iter()
+                .map(|program| program.program_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["descendant-429", "owned-429"]
+        );
+        assert_eq!(cold[0].objective_id, "custom-objective:descendant-429");
+        assert_eq!(cold[1].teams.len(), 1);
+        assert_eq!(cold, hot);
+        assert!(std::sync::Arc::ptr_eq(&cold[0], &hot[0]));
+        assert!(std::sync::Arc::ptr_eq(&cold[1], &hot[1]));
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429_goal_before_program_is_not_missing_index_assumption() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+            "id":"goal:root-429","session_id":"session-429","objective":"Original Goal",
+            "criteria":[{"id":"criterion","statement":"Preserve original source","status":"open"}],
+            "phase":"open","scope":"internal","completion":"open","revision":1,"user_sequence":1,
+            "spec_revision":1,"spec_digest":"429-original",
+            "execution_binding":{"objective_id":"custom-objective:owned-429","session_id":"session-429",
+                "turn_id":"turn-429","root_execution_id":"root-429","agentic_program_id":"owned-429"}
+        })).unwrap();
+        services.goal_store().create(goal).unwrap();
+        let roots = BTreeSet::from(["root-429".into()]);
+        let before = services.event_store().durable_commit_cursor().unwrap();
+        assert!(agentic_programs_for_executions(
+            &services,
+            &roots,
+            before,
+            &mut history::RequestBudget::default()
+        )
+        .unwrap()
+        .is_empty());
+        seed_program(&services, "owned-429", "root-429");
+        let after = services.event_store().durable_commit_cursor().unwrap();
+        let programs = agentic_programs_for_executions(
+            &services,
+            &roots,
+            after,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].program_id, "owned-429");
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429_program_hot_cache_cannot_bypass_exhausted_budget_or_write_checkpoint() {
+        let services = RuntimeServices::in_memory().unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        let roots = BTreeSet::from(["root-429".into()]);
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        let checkpoint = format!(
+            "runtime:agentic-read-model:v1:{:x}",
+            sha2::Sha256::digest(b"owned-429")
+        );
+        let before = serde_json::to_value(
+            services
+                .event_store()
+                .projection_checkpoint(&checkpoint)
+                .unwrap(),
+        )
+        .unwrap();
+        agentic_programs_for_executions(
+            &services,
+            &roots,
+            through,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        let mut exhausted = history::RequestBudget::default();
+        exhausted.charge(256, 1024 * 1024).unwrap();
+        assert!(matches!(
+            agentic_programs_for_executions(&services, &roots, through, &mut exhausted),
+            Err(RuntimeServicesError::EventStore(
+                crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+            ))
+        ));
+        assert_eq!(
+            before,
+            serde_json::to_value(
+                services
+                    .event_store()
+                    .projection_checkpoint(&checkpoint)
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429b_program_old_cut_is_readable_and_foreign_ref_still_rejects() {
+        let services = RuntimeServices::in_memory().unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        let roots = BTreeSet::from(["root-429".into()]);
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:owned-429".into(),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.diagnostic".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"tail":"after cut"}),
+            })
+            .unwrap();
+        let old = agentic_programs_for_executions(
+            &services,
+            &roots,
+            through,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].revision, 2);
+        assert_eq!(old[0].teams.len(), 1);
+        services.event_store().append(crate::RuntimeEventInput {
+            stream_id: "agentic-program:foreign-ref-429".into(), scope: RuntimeEventScope::Program,
+            kind: "agentic.program_opened".into(), status: None, actor: None,
+            refs: vec![crate::RuntimeEventRef { kind: "execution_graph".into(), id: "root-429".into() }],
+            payload: serde_json::json!({"root_execution_id":"foreign-429","objective_id":"foreign"}),
+        }).unwrap();
+        let now = services.event_store().durable_commit_cursor().unwrap();
+        let error = agentic_programs_for_executions(
+            &services,
+            &roots,
+            now,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("bounded Program discovery identity mismatch"));
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429_program_actual_oversized_journal_is_budget_error() {
+        let services = RuntimeServices::in_memory().unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:owned-429".into(),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.diagnostic".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"padding":"x".repeat(1024 * 1024)}),
+            })
+            .unwrap();
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        assert!(matches!(
+            agentic_programs_for_executions(
+                &services,
+                &BTreeSet::from(["root-429".into()]),
+                through,
+                &mut history::RequestBudget::default()
+            ),
+            Err(RuntimeServicesError::EventStore(
+                crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+            ))
+        ));
+        services.shutdown_execution().await;
+    }
+
+    fn seed_goal_429b(services: &RuntimeServices) -> harness_contract::goal::GoalContract {
+        let goal = serde_json::from_value(serde_json::json!({
+            "id":"goal:root-429","session_id":"session-429","objective":"Original Goal",
+            "criteria":[{"id":"criterion","statement":"Preserve original source","status":"open"}],
+            "phase":"open","scope":"internal","completion":"open","revision":1,"user_sequence":1,
+            "spec_revision":1,"spec_digest":"429-original",
+            "execution_binding":{"objective_id":"custom-objective:owned-429","session_id":"session-429",
+                "turn_id":"turn-429","root_execution_id":"root-429","agentic_program_id":"owned-429"}
+        })).unwrap();
+        services.goal_store().create(goal).unwrap()
+    }
+
+    #[tokio::test]
+    async fn r1_429b_program_and_goal_old_cut_preserve_newer_cache_and_source_race_unknown() {
+        use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage};
+        use harness_contract::projection::{TerminalEffectSettlement, TerminalExecutionPhase};
+        let services = RuntimeServices::in_memory().unwrap();
+        let mut graph = ExecutionGraph::new("Real old-cut source race");
+        graph.id = "root-429".into();
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: "session-429".into(),
+            turn_id: "turn-429".into(),
+            root_task_id: "task-429".into(),
+            task_id: "task-429".into(),
+            generation: 1,
+        });
+        services.commit_service().register_graph(graph).unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        let original_goal = seed_goal_429b(&services);
+        let roots = BTreeSet::from(["root-429".into()]);
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        let graph = services.graph_state_store().projection("root-429").unwrap();
+        let mut scope = ExecutionProjectionScope::load_budgeted(
+            &services,
+            "root-429",
+            &graph,
+            false,
+            through,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        let original_program = scope.programs[0].clone();
+        let mut control_budget = history::RequestBudget::default();
+        let control_facts =
+            history::load_scope_budgeted(&services, &scope, through, false, &mut control_budget)
+                .unwrap();
+        let control_axes = execution_terminal_axes(
+            &services,
+            &graph,
+            &scope,
+            &control_facts,
+            through,
+            &mut control_budget,
+        )
+        .unwrap();
+        assert!(!control_axes.source_race);
+        assert_eq!(
+            control_axes.execution.phase,
+            TerminalExecutionPhase::Draining
+        );
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:owned-429".into(),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.diagnostic".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"tail":"legitimate later journal event"}),
+            })
+            .unwrap();
+        services
+            .goal_store()
+            .revise(
+                &original_goal.id,
+                original_goal.revision,
+                2,
+                "Actual concurrent Goal amendment",
+                |goal| {
+                    goal.objective = "Amended after cut".into();
+                    vec!["objective".into()]
+                },
+            )
+            .unwrap();
+        let live_cut = services.event_store().durable_commit_cursor().unwrap();
+        let live = agentic_programs_for_executions(
+            &services,
+            &roots,
+            live_cut,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(live[0].revision, original_program.revision + 1);
+        let checkpoint = format!(
+            "runtime:agentic-read-model:v1:{:x}",
+            sha2::Sha256::digest(b"owned-429")
+        );
+        let checkpoint_before = serde_json::to_value(
+            services
+                .event_store()
+                .projection_checkpoint(&checkpoint)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut old_budget = history::RequestBudget::default();
+        let old =
+            agentic_programs_for_executions(&services, &roots, through, &mut old_budget).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].as_ref(), original_program.as_ref());
+        let old_goal = bounded_program_goal(&services, &original_goal.id, through, &mut old_budget)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_goal, original_goal);
+        let live_again = agentic_programs_for_executions(
+            &services,
+            &roots,
+            live_cut,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&live[0], &live_again[0]));
+        scope.programs = old;
+        let facts =
+            history::load_scope_budgeted(&services, &scope, through, false, &mut old_budget)
+                .unwrap();
+        let axes =
+            execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut old_budget)
+                .unwrap();
+        assert!(axes.source_race);
+        assert!(axes.source_cursor > through);
+        assert_eq!(axes.execution.phase, TerminalExecutionPhase::Unknown);
+        assert_eq!(axes.execution.settlement, TerminalEffectSettlement::Unknown);
+        assert!(!axes.execution.coverage_complete);
+        assert!(axes.outcome.terminal_fence.is_none());
+        assert_eq!(
+            checkpoint_before,
+            serde_json::to_value(
+                services
+                    .event_store()
+                    .projection_checkpoint(&checkpoint)
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429b_goal_created_after_cut_is_absent_only_at_old_cut() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        let goal = seed_goal_429b(&services);
+        assert!(bounded_program_goal(
+            &services,
+            &goal.id,
+            through,
+            &mut history::RequestBudget::default()
+        )
+        .unwrap()
+        .is_none());
+        let now = services.event_store().durable_commit_cursor().unwrap();
+        assert_eq!(
+            bounded_program_goal(
+                &services,
+                &goal.id,
+                now,
+                &mut history::RequestBudget::default()
+            )
+            .unwrap(),
+            Some(goal)
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429b_future_walk_is_charged_and_bounded_without_checkpoint_write() {
+        let services = RuntimeServices::in_memory().unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        for sequence in 0..20 {
+            services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: "agentic-program:owned-429".into(),
+                    scope: RuntimeEventScope::Program,
+                    kind: "agentic.diagnostic".into(),
+                    status: None,
+                    actor: None,
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"sequence":sequence}),
+                })
+                .unwrap();
+        }
+        let roots = BTreeSet::from(["root-429".into()]);
+        let old = agentic_programs_for_executions(
+            &services,
+            &roots,
+            through,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(old[0].revision, 2);
+        let checkpoint = format!(
+            "runtime:agentic-read-model:v1:{:x}",
+            sha2::Sha256::digest(b"owned-429")
+        );
+        let before = serde_json::to_value(
+            services
+                .event_store()
+                .projection_checkpoint(&checkpoint)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut budget = history::RequestBudget::default();
+        budget.charge(250, 0).unwrap();
+        assert!(matches!(
+            agentic_programs_for_executions(&services, &roots, through, &mut budget),
+            Err(RuntimeServicesError::EventStore(
+                crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+            ))
+        ));
+        assert!(matches!(
+            budget.charge(0, 0),
+            Err(RuntimeServicesError::EventStore(
+                crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
+            ))
+        ));
+        assert_eq!(
+            before,
+            serde_json::to_value(
+                services
+                    .event_store()
+                    .projection_checkpoint(&checkpoint)
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429b_goal_cut_identity_schema_and_owner_remain_strict() {
+        for mutation in ["identity", "schema", "owner"] {
+            let services = RuntimeServices::in_memory().unwrap();
+            seed_program(&services, "owned-429", "root-429");
+            let mut goal = seed_goal_429b(&services);
+            let roots = BTreeSet::from(["root-429".into()]);
+            let through = services.event_store().durable_commit_cursor().unwrap();
+            assert_eq!(
+                agentic_programs_for_executions(
+                    &services,
+                    &roots,
+                    through,
+                    &mut history::RequestBudget::default()
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            if mutation == "identity" {
+                goal.id = "foreign-goal-429b".into();
+            }
+            if mutation == "owner" {
+                goal.execution_binding.as_mut().unwrap().agentic_program_id =
+                    "foreign-program-429b".into();
+            }
+            let stream = "goal:goal:root-429";
+            let head = services.event_store().stream_revision(stream).unwrap();
+            services
+                .event_store()
+                .append_batch_if_revision(
+                    stream.to_owned(),
+                    head,
+                    format!("429b-bad-goal-{mutation}"),
+                    vec![crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: stream.into(),
+                            scope: RuntimeEventScope::Goal,
+                            kind: "goal.revised".into(),
+                            status: None,
+                            actor: None,
+                            refs: Vec::new(),
+                            payload: serde_json::json!({"goal":goal}),
+                        },
+                        idempotency_key: Some(format!("429b-bad-goal-{mutation}")),
+                        schema_version: if mutation == "schema" { 2 } else { 1 },
+                    }],
+                )
+                .unwrap();
+            assert_eq!(
+                agentic_programs_for_executions(
+                    &services,
+                    &roots,
+                    through,
+                    &mut history::RequestBudget::default()
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            let now = services.event_store().durable_commit_cursor().unwrap();
+            let error = agentic_programs_for_executions(
+                &services,
+                &roots,
+                now,
+                &mut history::RequestBudget::default(),
+            )
+            .unwrap_err();
+            let expected = match mutation {
+                "identity" => "bounded Program original Goal mismatch",
+                "schema" => "bounded Program Goal source mismatch",
+                _ => "bounded Program Goal binding mismatch",
+            };
+            assert!(error.to_string().contains(expected), "{mutation}: {error}");
+            services.shutdown_execution().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_429b_program_cut_schema_remains_strict_after_future_skip() {
+        let services = RuntimeServices::in_memory().unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        let roots = BTreeSet::from(["root-429".into()]);
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        let stream = "agentic-program:owned-429";
+        let head = services.event_store().stream_revision(stream).unwrap();
+        services
+            .event_store()
+            .append_batch_if_revision(
+                stream.to_owned(),
+                head,
+                "429b-future-schema",
+                vec![crate::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: stream.into(),
+                        scope: RuntimeEventScope::Program,
+                        kind: "agentic.diagnostic".into(),
+                        status: None,
+                        actor: None,
+                        refs: Vec::new(),
+                        payload: serde_json::json!({"schema":"future"}),
+                    },
+                    idempotency_key: Some("429b-future-schema".into()),
+                    schema_version: 2,
+                }],
+            )
+            .unwrap();
+        let old = agentic_programs_for_executions(
+            &services,
+            &roots,
+            through,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(old[0].revision, head);
+        let now = services.event_store().durable_commit_cursor().unwrap();
+        let error = agentic_programs_for_executions(
+            &services,
+            &roots,
+            now,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("bounded Program head source mismatch"));
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
+    async fn r1_429_program_cold_multiple_pages_preserves_complete_journal() {
+        let services = RuntimeServices::in_memory().unwrap();
+        seed_program(&services, "owned-429", "root-429");
+        for sequence in 0..119 {
+            services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: "agentic-program:owned-429".into(),
+                    scope: RuntimeEventScope::Program,
+                    kind: "agentic.diagnostic".into(),
+                    status: None,
+                    actor: None,
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"sequence":sequence}),
+                })
+                .unwrap();
+        }
+        let through = services.event_store().durable_commit_cursor().unwrap();
+        let head = services
+            .event_store()
+            .stream_revision("agentic-program:owned-429")
+            .unwrap();
+        let programs = agentic_programs_for_executions(
+            &services,
+            &BTreeSet::from(["root-429".into()]),
+            through,
+            &mut history::RequestBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(head, 121);
+        assert_eq!(programs[0].revision, head);
+        assert_eq!(programs[0].teams.len(), 1);
+        services.shutdown_execution().await;
     }
 }

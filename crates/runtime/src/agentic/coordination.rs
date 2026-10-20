@@ -261,7 +261,7 @@ pub(crate) mod tests {
                 vec!["read".to_string()],
             )
         };
-        let process_catalog = process.as_ref().map(|_| {
+        let process_catalog = Some({
             let actions = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
                 .iter()
                 .map(|name| tools::RuntimeToolDefinition {
@@ -271,7 +271,7 @@ pub(crate) mod tests {
                     required_permission: harness_contract::policy::PermissionMode::ReadOnly,
                     effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
                         resolver_id: "runtime.agent_action".into(),
-                        resolver_version: 1,
+                        resolver_version: 2,
                     },
                 })
                 .collect();
@@ -630,14 +630,12 @@ pub(crate) mod tests {
                 .unwrap()
                 .settled
         );
-        assert!(
-            fixture
-                .services
-                .recover_agentic_programs_on_startup()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture
+            .services
+            .recover_agentic_programs_on_startup()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -667,14 +665,12 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            fixture
-                .services
-                .recover_agentic_programs_on_startup()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture
+            .services
+            .recover_agentic_programs_on_startup()
+            .await
+            .unwrap()
+            .is_empty());
         let projection = fixture
             .services
             .agent_action_service()
@@ -707,13 +703,11 @@ pub(crate) mod tests {
             workers.spawn(async move {
                 let applied = services.submit_agent_action(&request).await.unwrap();
                 assert_eq!(applied.status, AgentActionStatus::Applied);
-                assert!(
-                    services
-                        .dispatch_agentic_followups(&request, context(&request))
-                        .await
-                        .unwrap()
-                        .is_empty()
-                );
+                assert!(services
+                    .dispatch_agentic_followups(&request, context(&request))
+                    .await
+                    .unwrap()
+                    .is_empty());
             });
         }
         while let Some(result) = workers.join_next().await {
@@ -726,11 +720,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(projection.coordination_requests().len(), 1);
         assert_eq!(projection.tasks[&fixture.task_ref].active_attempts.len(), 1);
-        assert!(
-            projection.tasks[&fixture.task_ref]
-                .active_attempts
-                .contains_key(fixture.packet.graph_id())
-        );
+        assert!(projection.tasks[&fixture.task_ref]
+            .active_attempts
+            .contains_key(fixture.packet.graph_id()));
         fixture
             .services
             .settle_abandoned_agentic_attempt(&fixture.packet, "fixture previous worker exited")
@@ -814,11 +806,9 @@ pub(crate) mod tests {
         let private = actions.project("coord-program").unwrap();
         let revision = private.coordination_requests()[0].1.revision;
         assert!(private.agent_is_active_in(&foreign_member, &foreign_team));
-        assert!(
-            private
-                .coordination_team_id_for(&foreign_member, revision)
-                .is_none()
-        );
+        assert!(private
+            .coordination_team_id_for(&foreign_member, revision)
+            .is_none());
         // Even an explicit recipient cannot read a different private Team's Topic.
         let mut request = fixture.request.clone();
         request.action_id = "private-cross-team-recipient".into();
@@ -828,11 +818,9 @@ pub(crate) mod tests {
         let observation = actions.apply(&request).unwrap();
         if observation.status == AgentActionStatus::Applied {
             let projection = actions.project("coord-program").unwrap();
-            assert!(
-                projection
-                    .coordination_team_id_for(&foreign_member, projection.revision)
-                    .is_none()
-            );
+            assert!(projection
+                .coordination_team_id_for(&foreign_member, projection.revision)
+                .is_none());
         }
         let program_topic = format!("topic:{}", private.program_id);
         request.action_id = "public-cross-team-request".into();
@@ -848,14 +836,12 @@ pub(crate) mod tests {
             projection.coordination_team_id_for(&foreign_member, projection.revision),
             Some(foreign_team.as_str())
         );
-        assert!(
-            projection
-                .coordination_team_id_for(
-                    &fixture.packet.agentic_binding.as_ref().unwrap().agent_id,
-                    projection.revision
-                )
-                .is_none()
-        );
+        assert!(projection
+            .coordination_team_id_for(
+                &fixture.packet.agentic_binding.as_ref().unwrap().agent_id,
+                projection.revision
+            )
+            .is_none());
     }
 
     #[tokio::test]
@@ -941,25 +927,21 @@ pub(crate) mod tests {
             Some("primary-execution")
         );
         assert_eq!(failed.tasks[&fixture.task_ref].failed_attempts, 0);
-        assert!(
-            failed.coordination_requests()[0]
-                .1
-                .coordination
-                .as_ref()
-                .unwrap()
-                .reason
-                .as_deref()
-                .unwrap()
-                .contains("failed before replying")
-        );
-        assert!(
-            fixture
-                .services
-                .dispatch_ready_agentic_work("coord-program")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(failed.coordination_requests()[0]
+            .1
+            .coordination
+            .as_ref()
+            .unwrap()
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("failed before replying"));
+        assert!(fixture
+            .services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap()
+            .is_empty());
         // A fresh Task epoch invalidates an otherwise unhandled old request.
         let mut release = fixture.request.clone();
         release.action_id = "primary-release".into();
@@ -988,14 +970,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn coordination_missing_graph_recovers_same_registered_attempt() {
         let fixture = fixture(true).await;
-        assert!(
-            fixture
-                .services
-                .recover_agentic_programs_on_startup()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture
+            .services
+            .recover_agentic_programs_on_startup()
+            .await
+            .unwrap()
+            .is_empty());
         let projection = fixture
             .services
             .agent_action_service()
@@ -1020,30 +1000,24 @@ pub(crate) mod tests {
         }
         let projection = actions.project("coord-program").unwrap();
         assert_eq!(projection.coordination_requests().len(), 1);
-        assert!(
-            fixture
-                .services
-                .dispatch_ready_agentic_work("coord-program")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            projection
-                .coordination_team_id_for(
-                    &fixture.request.actor.actor_id,
-                    projection.coordination_requests()[0].1.revision
-                )
-                .is_none()
-        );
-        assert!(
-            projection
-                .coordination_team_id_for(
-                    "foreign-agent",
-                    projection.coordination_requests()[0].1.revision
-                )
-                .is_none()
-        );
+        assert!(fixture
+            .services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(projection
+            .coordination_team_id_for(
+                &fixture.request.actor.actor_id,
+                projection.coordination_requests()[0].1.revision
+            )
+            .is_none());
+        assert!(projection
+            .coordination_team_id_for(
+                "foreign-agent",
+                projection.coordination_requests()[0].1.revision
+            )
+            .is_none());
         let mut changed = fixture.request.clone();
         changed.action_id = "new-evidence".into();
         if let AgentAction::MessagePublish(input) = &mut changed.action {
@@ -1117,14 +1091,12 @@ pub(crate) mod tests {
                 .unwrap()
                 .settled
         );
-        assert!(
-            fixture
-                .services
-                .dispatch_ready_agentic_work("coord-program")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture
+            .services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
 

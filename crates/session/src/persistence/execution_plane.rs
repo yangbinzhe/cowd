@@ -310,6 +310,49 @@ impl Scheduler {
         Ok(())
     }
 
+    fn try_admit_read(&self, job: QueuedJob) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| {
+            SessionError::Store("session storage scheduler is poisoned".to_string())
+        })?;
+        if !state.accepting {
+            return Err(SessionError::StoragePlaneShutdown);
+        }
+        let lane = StorageExecutionLane::InteractiveRead;
+        let id = job.id;
+        let status = Arc::clone(&job.state);
+        self.counters
+            .lane(lane)
+            .submitted
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .lane(lane)
+            .queued
+            .fetch_add(1, Ordering::AcqRel);
+        state.queues[lane.index()].push_back(job);
+        self.schedule_locked(&mut state);
+        if status.load(Ordering::Acquire) == JOB_GRANTED {
+            return Ok(());
+        }
+        if let Some(position) = state.queues[lane.index()]
+            .iter()
+            .position(|job| job.id == id)
+        {
+            state.queues[lane.index()].remove(position);
+            self.counters
+                .lane(lane)
+                .queued
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        self.counters
+            .lane(lane)
+            .submitted
+            .fetch_sub(1, Ordering::Relaxed);
+        status.store(JOB_RELEASED, Ordering::Release);
+        Err(SessionError::Store(
+            "session storage immediate read admission unavailable; retry".into(),
+        ))
+    }
+
     fn cancel(&self, id: u64, lane: StorageExecutionLane, write: bool, status: &AtomicU8) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -522,6 +565,43 @@ impl StorageExecutionPlane {
             scheduler: Arc::new(Scheduler::new(config, backend, Arc::clone(&counters))),
             counters,
         }
+    }
+
+    pub(crate) fn execute_blocking_read<T, F>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(SessionError::StoragePlaneShutdown);
+        }
+        let lane = StorageExecutionLane::InteractiveRead;
+        let id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
+        let queued_at = Instant::now();
+        let status = Arc::new(AtomicU8::new(JOB_QUEUED));
+        let (grant, mut granted) = oneshot::channel();
+        let mut ticket = QueuedTicket {
+            id,
+            lane,
+            write: false,
+            queued_at,
+            status: Arc::clone(&status),
+            scheduler: Arc::clone(&self.scheduler),
+        };
+        if let Err(error) = self.scheduler.try_admit_read(QueuedJob {
+            id,
+            lane,
+            write: false,
+            queued_at,
+            state: status,
+            grant,
+        }) {
+            ticket.disarm();
+            return Err(error);
+        }
+        granted.try_recv().map_err(|_| {
+            SessionError::Store("session storage immediate read grant missing".into())
+        })?;
+        execute_started_job(operation, ticket.start()?, Arc::clone(&self.counters), lane)
     }
 
     pub(crate) async fn execute<T, F>(
@@ -818,6 +898,189 @@ mod tests {
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    #[test]
+    fn blocking_read_uses_original_capacity_and_preserves_backend_errors() {
+        let plane = plane(1, 3);
+        let result = plane.execute_blocking_read(|| {
+            let stats = plane.stats();
+            assert_eq!(stats.interactive_read.active, 1);
+            assert_eq!(stats.queued, 0);
+            let busy = plane.execute_blocking_read(|| Ok(()));
+            assert!(matches!(busy, Err(SessionError::Store(message)) if message.contains("immediate read admission unavailable")));
+            assert_eq!(plane.stats().queue_rejected, 0);
+            assert_eq!(plane.stats().queued, 0);
+            Ok(17)
+        });
+        assert_eq!(result.unwrap(), 17);
+        let error = plane
+            .execute_blocking_read(|| {
+                Err::<(), _>(SessionError::NotFound("original receipt".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, SessionError::NotFound(value) if value == "original receipt"));
+        let stats = plane.stats();
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.interactive_read.submitted, 2);
+        assert_eq!(stats.interactive_read.completed, 1);
+        assert_eq!(stats.interactive_read.failed, 1);
+        assert_eq!(stats.interactive_read.queue_rejected, 0);
+    }
+
+    #[test]
+    fn blocking_read_panic_releases_original_raii_capacity() {
+        let plane = plane(1, 1);
+        let error = plane
+            .execute_blocking_read(|| -> Result<()> { panic!("blocking original backend panic") })
+            .unwrap_err();
+        assert!(matches!(error, SessionError::StorageWorkerPanic));
+        assert_eq!(plane.execute_blocking_read(|| Ok(23)).unwrap(), 23);
+        let stats = plane.stats();
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.interactive_read.panicked, 1);
+        assert_eq!(stats.interactive_read.failed, 1);
+        assert_eq!(stats.interactive_read.completed, 1);
+    }
+
+    #[test]
+    fn blocking_read_does_not_overtake_admitted_lane_work() {
+        for lane in StorageExecutionLane::ALL {
+            let plane = plane(1, 3);
+            for _ in 0..INTERACTIVE_BURST_LIMIT {
+                plane.execute_blocking_read(|| Ok(())).unwrap();
+            }
+            let mut queued_ticket = None;
+            let mut queued_grant = None;
+            plane
+                .execute_blocking_read(|| {
+                    let id = plane.next_job_id.fetch_add(1, Ordering::Relaxed);
+                    let queued_at = Instant::now();
+                    let status = Arc::new(AtomicU8::new(JOB_QUEUED));
+                    let (grant, granted) = oneshot::channel();
+                    let write = lane == StorageExecutionLane::InteractiveWrite;
+                    queued_ticket = Some(QueuedTicket {
+                        id,
+                        lane,
+                        write,
+                        queued_at,
+                        status: Arc::clone(&status),
+                        scheduler: Arc::clone(&plane.scheduler),
+                    });
+                    queued_grant = Some(granted);
+                    plane
+                        .scheduler
+                        .enqueue(QueuedJob {
+                            id,
+                            lane,
+                            write,
+                            queued_at,
+                            state: status,
+                            grant,
+                        })
+                        .unwrap();
+                    assert!(matches!(
+                        plane.execute_blocking_read(|| Ok(())),
+                        Err(SessionError::Store(_))
+                    ));
+                    assert_eq!(plane.stats().lane(lane).queued, 1);
+                    Ok(())
+                })
+                .unwrap();
+            queued_grant.as_mut().unwrap().try_recv().unwrap();
+            assert!(matches!(
+                plane.execute_blocking_read(|| Ok(())),
+                Err(SessionError::Store(_))
+            ));
+            let capacity = queued_ticket.as_mut().unwrap().start().unwrap();
+            execute_started_job(|| Ok(()), capacity, Arc::clone(&plane.counters), lane).unwrap();
+            plane.execute_blocking_read(|| Ok(())).unwrap();
+            assert_eq!(plane.stats().active, 0);
+            assert_eq!(plane.stats().queued, 0);
+            assert_eq!(plane.stats().queue_rejected, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_read_uses_reserved_slot_without_bypassing_background_limit() {
+        let plane = Arc::new(plane(3, 1));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let plane = Arc::clone(&plane);
+            let release = Arc::clone(&release);
+            tasks.push(tokio::spawn(async move {
+                plane
+                    .execute(StorageExecutionLane::Background, false, move || {
+                        while !release.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        wait_until(|| {
+            let stats = plane.stats();
+            stats.background.active == 2 && stats.background.queued == 1
+        })
+        .await;
+        plane
+            .execute_blocking_read(|| {
+                let stats = plane.stats();
+                assert_eq!(stats.active, 3);
+                assert_eq!(stats.background.active, 2);
+                assert_eq!(stats.background.queued, 1);
+                assert_eq!(stats.interactive_read.active, 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(plane.stats().queue_rejected, 0);
+        release.store(true, Ordering::Release);
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(plane.stats().queued, 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_read_participates_in_shutdown_and_drain() {
+        let plane = Arc::new(plane(1, 1));
+        let (started, active) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker_plane = Arc::clone(&plane);
+        let worker = std::thread::spawn(move || {
+            worker_plane.execute_blocking_read(|| {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(29)
+            })
+        });
+        active.recv_timeout(Duration::from_secs(2)).unwrap();
+        let drain = plane.shutdown_and_drain(Duration::from_millis(5)).await;
+        assert!(matches!(
+            drain,
+            Err(SessionError::StorageDrainTimeout {
+                active: 1,
+                queued: 0
+            })
+        ));
+        assert!(matches!(
+            plane.execute_blocking_read(|| Ok(())),
+            Err(SessionError::StoragePlaneShutdown)
+        ));
+        release.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), 29);
+        let stats = plane
+            .shutdown_and_drain(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(stats.drained);
+        assert_eq!(stats.interactive_read.completed, 1);
+        assert_eq!(stats.active, 0);
     }
 
     #[tokio::test]

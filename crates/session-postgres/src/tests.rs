@@ -5,16 +5,962 @@ use postgres_scope::PostgresTestScope;
 
 use super::*;
 
+#[path = "../test-support/terminal_receipt_scenario.rs"]
+mod terminal_receipt_scenario;
+
+#[test]
+#[ignore = "requires a parent-owned isolated PostgreSQL producer allocation"]
+fn r1_real_client_receipt_scenario_step() {
+    terminal_receipt_scenario::run().unwrap();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL for the original private fixture"]
+fn r1_message_ack_real_client_scenario_rejects_foreign_or_replayed_steps() {
+    terminal_receipt_scenario::safety_selftest().unwrap();
+}
+
+#[test]
+fn r1_receipt_source_app_generation_is_content_addressed_not_decimal() {
+    let authority = session::SessionReceiptAuthority {
+        session_id: "session".into(),
+        actor_id: "actor".into(),
+        principal_id: "principal".into(),
+        client_id: "client".into(),
+        credential_expires_at_ms: None,
+        receipt_source: None,
+    };
+    let source = session::SessionReceiptSource {
+        principal_id: "principal".into(),
+        tenant_id: "tenant".into(),
+        workspace_id: "workspace".into(),
+        app_id: "app".into(),
+        app_generation: format!("sha256:{}", "ab".repeat(32)),
+        profile_revision: "1".into(),
+        credential_epoch: "2".into(),
+        frame_nonce: "nonce".into(),
+        transport_id: "port".into(),
+        attachment_revision: "3".into(),
+        expires_at_ms: 1000,
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        execution_id: "execution".into(),
+        root_task_id: "root".into(),
+        lineage_generation: "4".into(),
+        purpose: "terminal_receipt".into(),
+    };
+    assert!(lifecycle::validate_receipt_source(&source, &authority, 999).is_ok());
+    let mut uppercase = source.clone();
+    uppercase.app_generation = format!("sha256:{}", "AB".repeat(32));
+    assert!(lifecycle::validate_receipt_source(&uppercase, &authority, 999).is_ok());
+    for generation in [
+        "1".to_string(),
+        "arbitrary".into(),
+        "sha256:".into(),
+        "ab".repeat(32),
+        format!("sha256:{}", "gg".repeat(32)),
+        format!("sha256:{} ", "ab".repeat(32)),
+        format!("sha256:{}", "a".repeat(63)),
+    ] {
+        let mut invalid = source.clone();
+        invalid.app_generation = generation;
+        assert!(lifecycle::validate_receipt_source(&invalid, &authority, 999).is_err());
+    }
+    for index in 0..4 {
+        for invalid_revision in ["0", "01", "-1", "9223372036854775808", "sha256:abcd", " 1"] {
+            let mut invalid = source.clone();
+            let field = match index {
+                0 => &mut invalid.profile_revision,
+                1 => &mut invalid.credential_epoch,
+                2 => &mut invalid.attachment_revision,
+                _ => &mut invalid.lineage_generation,
+            };
+            *field = invalid_revision.into();
+            assert!(lifecycle::validate_receipt_source(&invalid, &authority, 999).is_err());
+        }
+    }
+    assert!(lifecycle::validate_receipt_source(&source, &authority, 1000).is_err());
+    let mut foreign = authority.clone();
+    foreign.session_id = "foreign".into();
+    assert!(lifecycle::validate_receipt_source(&source, &foreign, 999).is_err());
+    foreign = authority.clone();
+    foreign.principal_id = "foreign".into();
+    assert!(lifecycle::validate_receipt_source(&source, &foreign, 999).is_err());
+    let mut wrong_purpose = source;
+    wrong_purpose.purpose = "other".into();
+    assert!(lifecycle::validate_receipt_source(&wrong_purpose, &authority, 999).is_err());
+}
+
+struct TerminalReceiptFixture {
+    scope: PostgresTestScope,
+    store: PostgresSessionStore,
+    commit: SessionTerminalTranscriptCommit,
+    authority: session::SessionReceiptAuthority,
+}
+
+impl TerminalReceiptFixture {
+    fn new() -> Self {
+        Self::create(true)
+    }
+
+    fn pending() -> Self {
+        Self::create(false)
+    }
+
+    fn create(commit_terminal: bool) -> Self {
+        let scope = PostgresTestScope::new();
+        let store = real_store(&scope);
+        let session_id = unique_id("r1-receipt");
+        store.create_session(&session(&session_id)).unwrap();
+        let request = runtime_request(
+            &unique_id("receipt-input"),
+            1,
+            InputRoutingDecision::StartNewTurn,
+            None,
+            100,
+        );
+        append_runtime_input(&store, &session_id, &request);
+        let claimed = store
+            .claim_session_runtime_outbox("receipt-worker", 101, 10000, 1, &[])
+            .unwrap()
+            .remove(0);
+        let token = claimed.claim_token.clone().unwrap();
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &request.request_id,
+                "receipt-worker",
+                1,
+                &token,
+                claimed.revision,
+                102,
+            )
+            .unwrap();
+        let message = SessionMessage {
+            stable_message_id: format!("assistant:{}",request.message_id),session_id:session_id.clone(),sequence:0,
+            role:"assistant".into(),content_json:r#"[{"type":"thinking","thinking":"sealed-private","signature":"sealed-signature"},{"type":"text","text":"public answer"}]"#.into(),
+            blocks_count:2,tool_use_id:None,tool_name:None,token_usage_json:None,created_at_ms:0,
+        };
+        let commit = SessionTerminalTranscriptCommit {
+            terminal_message_id: message.stable_message_id.clone(),
+            ingress_message_id: request.message_id,
+            session_id: session_id.clone(),
+            turn_id: request.turn_id,
+            messages: vec![message],
+            runtime_commit_cursor: 9007199254740993,
+            consumed_input_sequence: running.sequence,
+            created_at_ms: 103,
+            fence: session::SessionTerminalExecutionFence {
+                request_id: request.request_id,
+                input_sequence: running.sequence,
+                session_generation: 1,
+                claim_owner: "receipt-worker".into(),
+                claim_token: token,
+                claim_fence_epoch: running.claim_fence_epoch.unwrap(),
+            },
+        };
+        if commit_terminal {
+            store.commit_terminal_transcript_if_fenced(&commit).unwrap();
+        }
+        let mut authority = session::SessionReceiptAuthority {
+            session_id,
+            actor_id: "principal:receipt-user:surface:receipt-tab".into(),
+            principal_id: "receipt-user".into(),
+            client_id: String::new(),
+            credential_expires_at_ms: None,
+            receipt_source: None,
+        };
+        let grant = store
+            .mutate_session_presence_if_revision(&session::SessionPresenceMutation {
+                authority: authority.clone(),
+                expected_revision: None,
+                kind: session::SessionPresenceMutationKind::AttachOrReaffirm {
+                    actor: session::SessionActor {
+                        id: authority.actor_id.clone(),
+                        surface: "test".into(),
+                        role: Some("reader".into()),
+                    },
+                    candidate_client_id: "00000000-0000-4000-8000-000000000001".into(),
+                    ttl_ms: 3600000,
+                },
+            })
+            .unwrap()
+            .unwrap();
+        authority.client_id = grant.attachment.unwrap().client_id.unwrap();
+        Self {
+            scope,
+            store,
+            commit,
+            authority,
+        }
+    }
+
+    fn query(&self) -> session::SessionTerminalReceiptQuery {
+        session::SessionTerminalReceiptQuery {
+            authority: self.authority.clone(),
+            message_id: self.commit.terminal_message_id.clone(),
+        }
+    }
+
+    fn command(&self) -> session::SessionTerminalAckCommand {
+        session::SessionTerminalAckCommand {
+            query: self.query(),
+            binding: session::SessionTerminalMessageBinding {
+                runtime_commit_cursor: self.commit.runtime_commit_cursor,
+                content_digest: session::public_terminal_payload_v1(
+                    &self.commit.messages[0].content_json,
+                )
+                .unwrap()
+                .content_digest,
+            },
+        }
+    }
+
+    fn history(&self) -> Vec<harness_contract::live::SessionMessageAck> {
+        self.store
+            .list_terminal_message_acks(&session::SessionTerminalAckListQuery {
+                authority: self.authority.clone(),
+                after_cursor: 0,
+                limit: 100,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|entry| match entry {
+                harness_contract::live::SessionMessageAckHistory::Historical { receipt } => receipt,
+            })
+            .collect()
+    }
+
+    fn rewrite(&self, raw: &str) {
+        let mut connection = self.store.executor.checkout_critical().unwrap();
+        connection
+            .execute(
+                "UPDATE session_messages SET content_json=$2 WHERE stable_message_id=$1",
+                &[&self.commit.terminal_message_id, &raw],
+            )
+            .unwrap();
+    }
+
+    fn assert_unavailable(&self) {
+        assert!(matches!(
+            self.store
+                .get_terminal_message_receipt_context(&self.query())
+                .unwrap()
+                .context,
+            harness_contract::live::SessionMessageReceiptContext::Unavailable { .. }
+        ));
+        assert!(self
+            .store
+            .record_terminal_message_ack(&self.command())
+            .is_err());
+    }
+}
+
+#[test]
+fn r1_message_ack_clean_baseline_has_only_current_schema() {
+    assert_eq!(SESSION_MIGRATIONS.len(), 1);
+    assert_eq!(SESSION_MIGRATIONS[0].id, "session.current-baseline");
+    let ddl = SESSION_MIGRATIONS[0].statements.join("\n");
+    for required in [
+        "session_terminal_binding_pair",
+        "session_terminal_message_identity",
+        "session_terminal_message_acks",
+        "REFERENCES session_messages(session_id, stable_message_id)",
+        "existing session message cannot acquire terminal binding",
+        "claim_fence_epoch",
+        "session_runtime_claim_fence_epoch_positive",
+        "application_receipt_json",
+        "input_id TEXT NOT NULL",
+        "session_presence_projection",
+        "idx_session_records_casefold_status_model",
+        "idx_session_runtime_outbox_target_turn",
+    ] {
+        assert!(
+            ddl.contains(required),
+            "missing current constraint: {required}"
+        );
+    }
+    for forbidden in [
+        "ALTER TABLE",
+        "DELETE FROM session_events",
+        "session_mission_outbox",
+        "cowd_session_usage_json_for_legacy_cast",
+    ] {
+        assert!(
+            !ddl.contains(forbidden),
+            "obsolete baseline path: {forbidden}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn postgres_v23_preserves_existing_records_and_indexes_casefolded_listing() {
+fn r1_message_ack_exact_idempotent_and_restart_durable() {
+    let fixture = TerminalReceiptFixture::new();
+    let receipt = fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    assert_eq!(
+        receipt.runtime_commit_cursor.value().unwrap(),
+        9007199254740993
+    );
+    let reopened = real_store(&fixture.scope);
+    assert_eq!(
+        reopened
+            .record_terminal_message_ack(&fixture.command())
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(fixture.history(), vec![receipt]);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_wrong_tuple_never_writes_or_overwrites() {
+    let fixture = TerminalReceiptFixture::new();
+    let mut command = fixture.command();
+    command.binding.runtime_commit_cursor += 1;
+    assert!(fixture.store.record_terminal_message_ack(&command).is_err());
+    command = fixture.command();
+    command.binding.content_digest = format!("session-public-v1:sha256:{}", "0".repeat(64));
+    assert!(fixture.store.record_terminal_message_ack(&command).is_err());
+    assert!(fixture.history().is_empty());
+    let received = fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    assert!(fixture.store.record_terminal_message_ack(&command).is_err());
+    assert_eq!(fixture.history(), vec![received]);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_raw_rewrite_invalidates_even_when_p1_is_equal() {
+    let fixture = TerminalReceiptFixture::new();
+    let original =
+        session::public_terminal_payload_v1(&fixture.commit.messages[0].content_json).unwrap();
+    fixture.rewrite(&format!(" {} ", fixture.commit.messages[0].content_json));
+    assert_eq!(
+        session::public_terminal_payload_v1(&format!(
+            " {} ",
+            fixture.commit.messages[0].content_json
+        ))
+        .unwrap(),
+        original
+    );
+    fixture.assert_unavailable();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_historical_fact_survives_binding_invalidation() {
+    let fixture = TerminalReceiptFixture::new();
+    let received = fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    fixture.rewrite(r#"[{"type":"text","text":"edited"}]"#);
+    fixture.assert_unavailable();
+    assert_eq!(fixture.history(), vec![received]);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_a_b_a_and_completed_replay_never_resurrect() {
+    let fixture = TerminalReceiptFixture::new();
+    let received = fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    fixture.rewrite(r#"[{"type":"text","text":"B"}]"#);
+    assert!(fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&fixture.commit)
+        .is_err());
+    fixture.rewrite(&fixture.commit.messages[0].content_json);
+    assert!(
+        !fixture
+            .store
+            .commit_terminal_transcript_if_fenced(&fixture.commit)
+            .unwrap()
+            .inserted
+    );
+    fixture.assert_unavailable();
+    assert_eq!(fixture.history(), vec![received]);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_existing_rows_cannot_acquire_or_replace_binding() {
+    let fixture = TerminalReceiptFixture::new();
+    let mut connection = fixture.store.executor.checkout_critical().unwrap();
+    assert!(connection.execute("UPDATE session_messages SET terminal_runtime_commit_cursor=terminal_runtime_commit_cursor+1 WHERE stable_message_id=$1",&[&fixture.commit.terminal_message_id]).is_err());
+    connection.execute("UPDATE session_messages SET terminal_runtime_commit_cursor=NULL,terminal_content_digest=NULL WHERE stable_message_id=$1",&[&fixture.commit.terminal_message_id]).unwrap();
+    assert!(connection.execute("UPDATE session_messages SET terminal_runtime_commit_cursor=$2,terminal_content_digest=$3 WHERE stable_message_id=$1",
+        &[&fixture.commit.terminal_message_id,&to_u64_i64(fixture.commit.runtime_commit_cursor,"cursor").unwrap(),&fixture.command().binding.content_digest]).is_err());
+    drop(connection);
+    fixture.assert_unavailable();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_usage_only_preserves_current_binding_and_history() {
+    let fixture = TerminalReceiptFixture::new();
+    let received = fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    let mut connection = fixture.store.executor.checkout_critical().unwrap();
+    connection.execute("UPDATE session_messages SET token_usage_json='{\"output_tokens\":2}',blocks_count=99,created_at_ms=created_at_ms+1 WHERE stable_message_id=$1",&[&fixture.commit.terminal_message_id]).unwrap();
+    drop(connection);
+    assert_eq!(
+        fixture
+            .store
+            .record_terminal_message_ack(&fixture.command())
+            .unwrap(),
+        received
+    );
+    assert!(fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&fixture.commit)
+        .is_err());
+    assert_eq!(fixture.history(), vec![received]);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_replay_checks_raw_and_public_binding_without_backfill() {
+    let fixture = TerminalReceiptFixture::new();
+    let replay = fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&fixture.commit)
+        .unwrap();
+    assert!(!replay.inserted);
+    fixture.rewrite(&format!(" {}", fixture.commit.messages[0].content_json));
+    assert!(fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&fixture.commit)
+        .is_err());
+    fixture.rewrite(&fixture.commit.messages[0].content_json);
+    fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&fixture.commit)
+        .unwrap();
+    fixture.assert_unavailable();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_attachment_mutations_cannot_bypass_tagged_cas() {
+    let fixture = TerminalReceiptFixture::new();
+    let current = fixture
+        .store
+        .get_session_presence_projection(&fixture.authority.session_id)
+        .unwrap()
+        .unwrap();
+    let mut forged = current.clone();
+    forged.attachments_json = "[]".into();
+    assert!(fixture
+        .store
+        .upsert_session_presence_projection(&forged)
+        .is_err());
+    assert!(fixture
+        .store
+        .compare_and_upsert_session_presence_projection(&forged, Some(current.revision))
+        .is_err());
+    assert!(fixture
+        .store
+        .delete_session_presence_projection(&fixture.authority.session_id)
+        .is_err());
+    assert_eq!(
+        fixture
+            .store
+            .get_session_presence_projection(&fixture.authority.session_id)
+            .unwrap()
+            .unwrap()
+            .attachments_json,
+        current.attachments_json
+    );
+    fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_attachment_pg_cas_and_ttl_are_linearized() {
+    let fixture = TerminalReceiptFixture::new();
+    let current = fixture
+        .store
+        .get_session_presence_projection(&fixture.authority.session_id)
+        .unwrap()
+        .unwrap();
+    let command = session::SessionPresenceMutation {
+        authority: fixture.authority.clone(),
+        expected_revision: Some(current.revision),
+        kind: session::SessionPresenceMutationKind::Detach,
+    };
+    let left = real_store(&fixture.scope);
+    let right = real_store(&fixture.scope);
+    let barrier = Arc::new(Barrier::new(2));
+    let gate = barrier.clone();
+    let other = command.clone();
+    let worker = std::thread::spawn(move || {
+        gate.wait();
+        left.mutate_session_presence_if_revision(&other)
+            .unwrap()
+            .is_some()
+    });
+    barrier.wait();
+    let won = right
+        .mutate_session_presence_if_revision(&command)
+        .unwrap()
+        .is_some();
+    assert_ne!(won, worker.join().unwrap());
+    assert!(fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .is_err());
+    let expired = TerminalReceiptFixture::new();
+    let mut connection = expired.store.executor.checkout_critical().unwrap();
+    connection.execute("UPDATE session_presence_projection SET attachments_json=jsonb_set(attachments_json,'{0,client_expires_at_ms}','0') WHERE session_id=$1",&[&expired.authority.session_id]).unwrap();
+    drop(connection);
+    assert!(expired
+        .store
+        .record_terminal_message_ack(&expired.command())
+        .is_err());
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_terminal_binding_and_input_commit_roll_back_together() {
+    let fixture = TerminalReceiptFixture::pending();
+    let mut connection = fixture.store.executor.checkout_critical().unwrap();
+    let events_before: i64 = connection
+        .query_one(
+            "SELECT COUNT(*) FROM session_events WHERE session_id=$1",
+            &[&fixture.authority.session_id],
+        )
+        .unwrap()
+        .get(0);
+    connection.batch_execute("CREATE FUNCTION r1_reject_receipt_final() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'r1-final-fault-hit'; END $$; CREATE TRIGGER r1_receipt_final_fault BEFORE INSERT ON session_messages FOR EACH ROW WHEN (NEW.role='assistant') EXECUTE FUNCTION r1_reject_receipt_final()").unwrap();
+    let error = fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&fixture.commit)
+        .unwrap_err();
+    assert!(error.to_string().contains("r1-final-fault-hit"));
+    assert!(fixture
+        .store
+        .get_message_by_stable_id(
+            &fixture.authority.session_id,
+            &fixture.commit.terminal_message_id
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        fixture
+            .store
+            .get_session_runtime_outbox(&fixture.commit.fence.request_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionRuntimeInputStatus::Running
+    );
+    let events_after_failure: i64 = connection
+        .query_one(
+            "SELECT COUNT(*) FROM session_events WHERE session_id=$1",
+            &[&fixture.authority.session_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(events_after_failure, events_before);
+    connection.batch_execute("DROP TRIGGER r1_receipt_final_fault ON session_messages; DROP FUNCTION r1_reject_receipt_final()").unwrap();
+    let mut oversized = fixture.commit.clone();
+    oversized.messages[0].content_json = serde_json::json!([{"type":"text","text":"x".repeat(session::SESSION_TERMINAL_PUBLIC_PAYLOAD_MAX_BYTES)}]).to_string();
+    assert!(fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&oversized)
+        .is_err());
+    assert!(fixture
+        .store
+        .get_message_by_stable_id(
+            &fixture.authority.session_id,
+            &fixture.commit.terminal_message_id
+        )
+        .unwrap()
+        .is_none());
+    let events_after_oversized: i64 = connection
+        .query_one(
+            "SELECT COUNT(*) FROM session_events WHERE session_id=$1",
+            &[&fixture.authority.session_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(events_after_oversized, events_before);
+    assert_eq!(
+        fixture
+            .store
+            .get_session_runtime_outbox(&fixture.commit.fence.request_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionRuntimeInputStatus::Running
+    );
+    fixture
+        .store
+        .commit_terminal_transcript_if_fenced(&fixture.commit)
+        .unwrap();
+    let events_after_commit: i64 = connection
+        .query_one(
+            "SELECT COUNT(*) FROM session_events WHERE session_id=$1",
+            &[&fixture.authority.session_id],
+        )
+        .unwrap()
+        .get(0);
+    assert!(events_after_commit > events_before);
+    fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_old_catalog_is_rejected_without_data_changes() {
+    let scope = PostgresTestScope::new();
+    let executor = scope.reconnect();
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("CREATE TABLE session_records(session_id TEXT PRIMARY KEY, payload TEXT NOT NULL); INSERT INTO session_records VALUES('old','immutable old bytes'); CREATE TABLE cowd_schema_migrations(id TEXT PRIMARY KEY,domain TEXT NOT NULL,checksum TEXT NOT NULL); INSERT INTO cowd_schema_migrations VALUES('session.0023.casefolded-list-filter','session','original-checksum')").unwrap();
+    let before: String = connection
+        .query_one(
+            "SELECT row_to_json(record)::text FROM session_records record",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let catalog_before: String = connection
+        .query_one(
+            "SELECT row_to_json(record)::text FROM cowd_schema_migrations record",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    drop(connection);
+    assert!(PostgresSessionStore::new(executor.clone()).is_err());
+    let mut connection = executor.checkout_online_read().unwrap();
+    let current: String = connection
+        .query_one(
+            "SELECT row_to_json(record)::text FROM session_records record",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let catalog: String = connection
+        .query_one(
+            "SELECT row_to_json(record)::text FROM cowd_schema_migrations record",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(current, before);
+    assert_eq!(catalog, catalog_before);
+    assert!(!connection
+        .query_one(
+            "SELECT to_regclass('session_terminal_message_acks') IS NOT NULL",
+            &[]
+        )
+        .unwrap()
+        .get::<_, bool>(0));
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn r1_message_ack_authorized_delete_and_archive_do_not_resurrect_receipts() {
+    let fixture = TerminalReceiptFixture::new();
+    fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    let root = std::path::PathBuf::from("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel/evidence/execution/kernel-terminal-20261016/R1-04/fixtures").join(unique_id("archive"));
+    let unified = session::UnifiedSessionStore::from_backend(Arc::new(real_store(&fixture.scope)));
+    let tiered = session::TieredSessionStore::new(
+        unified,
+        session::TieredSessionStoreConfig {
+            archive_path: root.clone(),
+            ..Default::default()
+        },
+    );
+    tiered
+        .archive_session(&fixture.authority.session_id)
+        .await
+        .unwrap();
+    assert!(fixture.history().is_empty());
+    tiered
+        .restore_session(&fixture.authority.session_id)
+        .await
+        .unwrap();
+    fixture.assert_unavailable();
+    let messages = fixture
+        .store
+        .get_all_messages(&fixture.authority.session_id)
+        .unwrap();
+    fixture
+        .store
+        .delete_messages_from(&fixture.authority.session_id, 0)
+        .unwrap();
+    let encoded = serde_json::to_vec(&messages).unwrap();
+    let mut legacy = u32::try_from(encoded.len()).unwrap().to_le_bytes().to_vec();
+    legacy.push((encoded.len().min(15) as u8) << 4);
+    if encoded.len() >= 15 {
+        let mut extra = encoded.len() - 15;
+        while extra >= 255 {
+            legacy.push(255);
+            extra -= 255;
+        }
+        legacy.push(extra as u8);
+    }
+    legacy.extend_from_slice(&encoded);
+    std::fs::write(
+        root.join(format!("{}.lz4", fixture.authority.session_id)),
+        legacy,
+    )
+    .unwrap();
+    tiered
+        .restore_session(&fixture.authority.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .get_all_messages(&fixture.authority.session_id)
+            .unwrap(),
+        messages
+    );
+    fixture.assert_unavailable();
+    assert!(fixture.history().is_empty());
+    fixture
+        .store
+        .delete_session(&fixture.authority.session_id)
+        .unwrap();
+    let mut connection = fixture.store.executor.checkout_online_read().unwrap();
+    assert_eq!(
+        connection
+            .query_one(
+                "SELECT count(*) FROM session_terminal_message_acks WHERE session_id=$1",
+                &[&fixture.authority.session_id]
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_both_branch_copy_paths_drop_bindings() {
+    let fixture = TerminalReceiptFixture::new();
+    let received = fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    let target = unique_id("copy-target");
+    fixture.store.create_session(&session(&target)).unwrap();
+    fixture
+        .store
+        .copy_session_messages_at_cutoff(&fixture.authority.session_id, &target, 2)
+        .unwrap();
+    let other = unique_id("branch-target");
+    fixture
+        .store
+        .branch_session_at_cutoff(&SessionBranchRequest {
+            operation_id: unique_id("receipt-branch"),
+            source_session_id: fixture.authority.session_id.clone(),
+            source_message_count: 2,
+            target: session(&other),
+            source_event_json: "{}".into(),
+            target_event_json: "{}".into(),
+            created_at_ms: 200,
+        })
+        .unwrap();
+    let mut connection = fixture.store.executor.checkout_online_read().unwrap();
+    for target in [target, other] {
+        let row = connection.query_one("SELECT count(*),count(terminal_runtime_commit_cursor),count(terminal_content_digest) FROM session_messages WHERE session_id=$1",&[&target]).unwrap();
+        assert_eq!(row.get::<_, i64>(0), 2);
+        assert_eq!(row.get::<_, i64>(1), 0);
+        assert_eq!(row.get::<_, i64>(2), 0);
+        assert_eq!(
+            connection
+                .query_one(
+                    "SELECT count(*) FROM session_terminal_message_acks WHERE session_id=$1",
+                    &[&target]
+                )
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+    }
+    drop(connection);
+    assert_eq!(fixture.history(), vec![received]);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_detach_rewrite_delete_races_have_one_order() {
+    for mutation in ["rewrite", "detach", "expiry", "delete"] {
+        let fixture = TerminalReceiptFixture::new();
+        let mut blocker = fixture.store.executor.checkout_critical().unwrap();
+        let mut transaction = blocker.transaction().unwrap();
+        transaction
+            .query_one(
+                "SELECT session_id FROM session_records WHERE session_id=$1 FOR UPDATE",
+                &[&fixture.authority.session_id],
+            )
+            .unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let other_gate = gate.clone();
+        let store = real_store(&fixture.scope);
+        let command = fixture.command();
+        let worker = std::thread::spawn(move || {
+            other_gate.wait();
+            store.record_terminal_message_ack(&command)
+        });
+        gate.wait();
+        match mutation {
+            "rewrite" => {
+                transaction
+                    .execute(
+                        "UPDATE session_messages SET content_json='[]' WHERE stable_message_id=$1",
+                        &[&fixture.commit.terminal_message_id],
+                    )
+                    .unwrap();
+            }
+            "detach" => {
+                transaction.execute("UPDATE session_presence_projection SET attachments_json='[]'::jsonb,revision=revision+1 WHERE session_id=$1",&[&fixture.authority.session_id]).unwrap();
+            }
+            "expiry" => {
+                transaction.execute("UPDATE session_presence_projection SET attachments_json=jsonb_set(attachments_json,'{0,client_expires_at_ms}','0') WHERE session_id=$1",&[&fixture.authority.session_id]).unwrap();
+            }
+            _ => {
+                transaction
+                    .execute(
+                        "DELETE FROM session_records WHERE session_id=$1",
+                        &[&fixture.authority.session_id],
+                    )
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        assert!(worker.join().unwrap().is_err());
+        let row = blocker
+            .query_one(
+                "SELECT count(*) FROM session_terminal_message_acks WHERE session_id=$1",
+                &[&fixture.authority.session_id],
+            )
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 0);
+    }
+    let fixture = TerminalReceiptFixture::new();
+    let received = fixture
+        .store
+        .record_terminal_message_ack(&fixture.command())
+        .unwrap();
+    fixture.rewrite("[]");
+    assert_eq!(fixture.history(), vec![received]);
+    fixture.assert_unavailable();
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r1_message_ack_frame_source_fields_survive_receipt_presence_cas() {
+    let fixture = TerminalReceiptFixture::new();
+    let current = fixture
+        .store
+        .get_session_presence_projection(&fixture.authority.session_id)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .mutate_session_presence_if_revision(&session::SessionPresenceMutation {
+            authority: fixture.authority.clone(),
+            expected_revision: Some(current.revision),
+            kind: session::SessionPresenceMutationKind::Detach,
+        })
+        .unwrap()
+        .unwrap();
+    let mut authority = fixture.authority.clone();
+    authority.client_id.clear();
+    authority.receipt_source = Some(session::SessionReceiptSource {
+        principal_id: authority.principal_id.clone(),
+        tenant_id: "tenant".into(),
+        workspace_id: "workspace".into(),
+        app_id: "app".into(),
+        app_generation: format!("sha256:{}", "ab".repeat(32)),
+        profile_revision: "1".into(),
+        credential_epoch: "1".into(),
+        frame_nonce: "frame".into(),
+        transport_id: "port".into(),
+        attachment_revision: "1".into(),
+        expires_at_ms: i64::MAX as u64,
+        session_id: authority.session_id.clone(),
+        turn_id: fixture.commit.turn_id.clone(),
+        execution_id: "root-execution".into(),
+        root_task_id: "root-task".into(),
+        lineage_generation: "1".into(),
+        purpose: "terminal_receipt".into(),
+    });
+    let grant = fixture
+        .store
+        .mutate_session_presence_if_revision(&session::SessionPresenceMutation {
+            authority: authority.clone(),
+            expected_revision: Some(current.revision + 1),
+            kind: session::SessionPresenceMutationKind::AttachOrReaffirm {
+                actor: session::SessionActor {
+                    id: authority.actor_id.clone(),
+                    surface: "frame".into(),
+                    role: Some("reader".into()),
+                },
+                candidate_client_id: "00000000-0000-4000-8000-000000000002".into(),
+                ttl_ms: 3600000,
+            },
+        })
+        .unwrap()
+        .unwrap();
+    authority.client_id = grant.attachment.unwrap().client_id.unwrap();
+    let reopened = real_store(&fixture.scope);
+    let mut query = fixture.query();
+    query.authority = authority.clone();
+    assert!(matches!(
+        reopened
+            .get_terminal_message_receipt_context(&query)
+            .unwrap()
+            .context,
+        harness_contract::live::SessionMessageReceiptContext::Available { .. }
+    ));
+    query.authority.receipt_source.as_mut().unwrap().frame_nonce = "foreign".into();
+    assert!(reopened
+        .get_terminal_message_receipt_context(&query)
+        .is_err());
+    let mut legacy = grant.projection;
+    legacy.revision += 1;
+    reopened
+        .upsert_session_presence_projection(&legacy)
+        .unwrap();
+    assert!(
+        serde_json::from_str::<Vec<session::SessionAttachment>>(&legacy.attachments_json).unwrap()
+            [0]
+        .receipt_source
+        .is_some()
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_current_schema_preserves_records_and_indexes_casefolded_listing() {
     let fixture = PostgresTestScope::new();
     let executor = fixture.reconnect();
-    prepare_legacy_session_usage_for_migration(&executor).unwrap();
-    executor
-        .apply_migrations(SESSION_DOMAIN, &SESSION_MIGRATIONS[..22])
-        .unwrap();
-    let old = PostgresSessionStore { executor };
+    let old = PostgresSessionStore::new(executor).unwrap();
     let mut record = session("preserved-v22");
     record.status = "Active".into();
     record.model = Some("FAST".into());
@@ -440,60 +1386,42 @@ fn postgres_activation_index_and_manifest_repair_preserve_session_contract() {
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place() {
+fn current_postgres_claim_fence_epoch_survives_same_schema_restart() {
     let fixture = PostgresTestScope::new();
     let store = real_store(&fixture);
-    clear_isolated_store(&store);
     store
-        .create_session(&session("claim-fence-migration"))
-        .expect("create migration Session");
+        .create_session(&session("claim-fence-restart"))
+        .unwrap();
     let request = runtime_request(
-        "claim-fence-migration",
+        "claim-fence-restart",
         1,
         InputRoutingDecision::StartNewTurn,
         None,
         100,
     );
-    append_runtime_input(&store, "claim-fence-migration", &request);
+    append_runtime_input(&store, "claim-fence-restart", &request);
     let claimed = store
-        .claim_session_runtime_outbox("migration-worker", 101, 1_000, 1)
-        .expect("claim pre-migration input")
+        .claim_session_runtime_outbox("worker", 101, 1000, 1, &[])
+        .unwrap()
         .remove(0);
-    let token = claimed.claim_token.clone().expect("pre-migration token");
     let running = store
         .mark_session_runtime_outbox_running(
             &request.request_id,
-            "migration-worker",
+            "worker",
             1,
-            &token,
+            claimed.claim_token.as_deref().unwrap(),
             claimed.revision,
             102,
         )
-        .expect("mark pre-migration input running");
-    let expected_epoch = running.revision;
-
-    let mut connection = store
-        .executor()
-        .checkout_critical()
-        .expect("checkout migration database");
-    connection
-        .batch_execute(
-            "ALTER TABLE session_runtime_outbox
-                     DROP CONSTRAINT IF EXISTS session_runtime_claim_fence_epoch_positive;
-                 ALTER TABLE session_runtime_outbox DROP COLUMN claim_fence_epoch;
-                 DELETE FROM cowd_schema_migrations
-                  WHERE id='session.0010.terminal-claim-fence-epoch';",
-        )
-        .expect("restore the version-9 outbox schema");
-    drop(connection);
+        .unwrap();
     drop(store);
-
-    let migrated = real_store(&fixture)
+    let reopened = real_store(&fixture)
         .get_session_runtime_outbox(&request.request_id)
-        .expect("read migrated input")
-        .expect("migrated input remains");
-    assert_eq!(migrated.status, SessionRuntimeInputStatus::Running);
-    assert_eq!(migrated.claim_fence_epoch, Some(expected_epoch));
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.claim_fence_epoch, running.claim_fence_epoch);
+    assert_eq!(reopened.claim_token, running.claim_token);
+    assert_eq!(reopened.status, SessionRuntimeInputStatus::Running);
 }
 
 #[test]
@@ -509,7 +1437,7 @@ fn postgres_fenced_terminal_commit_preserves_atomic_identity_contract() {
     let request = runtime_request(&id, 1, InputRoutingDecision::StartNewTurn, None, 100);
     append_runtime_input(&store, &session_id, &request);
     let claimed = store
-        .claim_session_runtime_outbox("runtime-worker", 101, 1_000, 1)
+        .claim_session_runtime_outbox("runtime-worker", 101, 1_000, 1, &[])
         .expect("claim input")
         .remove(0);
     let token = claimed.claim_token.clone().expect("claim token");
@@ -646,7 +1574,7 @@ fn postgres_fenced_terminal_commit_preserves_atomic_identity_contract() {
         runtime_request(&stale_id, 1, InputRoutingDecision::StartNewTurn, None, 200);
     append_runtime_input(&store, &stale_session, &stale_request);
     let stale_claim = store
-        .claim_session_runtime_outbox("runtime-worker-old", 201, 50, 1)
+        .claim_session_runtime_outbox("runtime-worker-old", 201, 50, 1, &[])
         .expect("claim stale input")
         .remove(0);
     let stale_token = stale_claim.claim_token.clone().expect("stale token");
@@ -692,7 +1620,7 @@ fn postgres_fenced_terminal_commit_preserves_atomic_identity_contract() {
         },
     };
     let reclaimed = store
-        .claim_session_runtime_outbox("runtime-worker-new", 251, 1_000, 1)
+        .claim_session_runtime_outbox("runtime-worker-new", 251, 1_000, 1, &[])
         .expect("reclaim expired input")
         .remove(0);
     assert_ne!(reclaimed.claim_token.as_deref(), Some(stale_token.as_str()));
@@ -734,7 +1662,7 @@ fn postgres_terminal_commit_and_generation_advance_share_one_lock_order() {
     let request = runtime_request(&id, 1, InputRoutingDecision::StartNewTurn, None, 100);
     append_runtime_input(&store, &session_id, &request);
     let claimed = store
-        .claim_session_runtime_outbox("runtime-worker", 101, 1_000, 1)
+        .claim_session_runtime_outbox("runtime-worker", 101, 1_000, 1, &[])
         .expect("claim lock-order input")
         .remove(0);
     let token = claimed.claim_token.clone().expect("claim token");
@@ -1030,6 +1958,10 @@ fn postgres_presence_projection_is_mutable_and_does_not_append_history() {
         },
         attached_at_ms: 100,
         last_seen_ms: 100,
+        client_id: None,
+        client_expires_at_ms: None,
+        receipt_protocol: None,
+        receipt_source: None,
     };
     store
         .upsert_session_presence_projection(&SessionPresenceProjection {
@@ -1487,7 +2419,7 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
     );
 
     let claimed = store
-        .claim_session_runtime_outbox("worker-a", 200, 1_000, 10)
+        .claim_session_runtime_outbox("worker-a", 200, 1_000, 10, &[])
         .expect("claim session heads");
     assert_eq!(claimed.len(), 2, "one head per Session may be claimed");
     assert!(
@@ -1561,7 +2493,7 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
     assert_eq!(completed.terminal_at_ms, Some(203));
 
     let next = store
-        .claim_session_runtime_outbox("worker-b", 204, 1_000, 10)
+        .claim_session_runtime_outbox("worker-b", 204, 1_000, 10, &[])
         .expect("claim released Session head");
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].input_id, second.input_id);
@@ -1582,7 +2514,7 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
     assert_eq!(requeued.status, SessionRuntimeInputStatus::Reclassified);
     assert_eq!(requeued.decision, InputRoutingDecision::StartNewTurn);
     let reclaimed = store
-        .claim_session_runtime_outbox("worker-c", 206, 1_000, 10)
+        .claim_session_runtime_outbox("worker-c", 206, 1_000, 10, &[])
         .expect("reclaim reclassified input");
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].input_id, second.input_id);
@@ -1780,7 +2712,7 @@ fn postgres_runtime_failure_retry_and_terminal_statuses_are_real() {
         .expect("append explicit message and durable input atomically");
     assert_eq!(queued.status, SessionRuntimeInputStatus::Queued);
     let claimed = store
-        .claim_session_runtime_outbox("failure-worker", 20, 100, 1)
+        .claim_session_runtime_outbox("failure-worker", 20, 100, 1, &[])
         .expect("claim failure input")
         .pop()
         .expect("failure input claimed");
@@ -1811,11 +2743,11 @@ fn postgres_runtime_failure_retry_and_terminal_statuses_are_real() {
     assert_eq!(queued.status, SessionRuntimeInputStatus::Queued);
     assert!(queued.claim_token.is_none());
     assert!(store
-        .claim_session_runtime_outbox("early-worker", 29, 100, 1)
+        .claim_session_runtime_outbox("early-worker", 29, 100, 1, &[])
         .expect("early claim")
         .is_empty());
     let claimed = store
-        .claim_session_runtime_outbox("blocked-worker", 30, 100, 1)
+        .claim_session_runtime_outbox("blocked-worker", 30, 100, 1, &[])
         .expect("claim retry")
         .pop()
         .expect("retry claimed");
@@ -1846,7 +2778,7 @@ fn postgres_runtime_failure_retry_and_terminal_statuses_are_real() {
         )
         .expect("release blocked input");
     let claimed = store
-        .claim_session_runtime_outbox("permanent-worker", 33, 100, 1)
+        .claim_session_runtime_outbox("permanent-worker", 33, 100, 1, &[])
         .expect("claim released input")
         .pop()
         .expect("released input claimed");
@@ -1883,111 +2815,68 @@ fn postgres_runtime_failure_retry_and_terminal_statuses_are_real() {
 }
 
 #[test]
-fn published_v8_migration_remains_immutable() {
-    let migration = SESSION_MIGRATIONS
-        .iter()
-        .find(|migration| migration.version == 8)
-        .expect("v8 migration exists");
-    assert_eq!(
-        migration.checksum(),
-        "f4499390d69f7d7591f4b1e9941412160b751a4da1f04cb3af74530da9247985"
-    );
-    assert!(!migration
-        .statements
-        .iter()
-        .any(|statement| statement.contains("idx_session_runtime_outbox_target_turn")));
-
-    let target_turn_index = SESSION_MIGRATIONS
-        .iter()
-        .find(|migration| migration.version == 19)
-        .expect("v19 migration exists");
-    assert!(target_turn_index
-        .statements
-        .iter()
-        .any(|statement| statement.contains("idx_session_runtime_outbox_target_turn")));
+fn current_session_baseline_retains_input_and_target_turn_fences() {
+    let ddl = SESSION_MIGRATIONS[0].statements.join("\n");
+    for required in [
+        "idx_session_runtime_outbox_input_id",
+        "idx_session_runtime_outbox_target_turn",
+        "session_generation",
+        "input_generation",
+        "claim_fence_epoch",
+        "application_receipt_json",
+        "idx_session_runtime_outbox_session_head",
+    ] {
+        assert!(
+            ddl.contains(required),
+            "missing current input fence {required}"
+        );
+    }
 }
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn postgres_v8_migrates_legacy_runtime_rows_in_place() {
+fn postgres_current_baseline_initialization_is_atomic() {
     let fixture = PostgresTestScope::new();
     let executor = fixture.reconnect();
-    let mut client = executor
-        .checkout_critical()
-        .expect("legacy migration fixture");
-    client
-        .batch_execute(
-            "CREATE TABLE session_records(
-                     session_id TEXT PRIMARY KEY,
-                     updated_at_ms BIGINT NOT NULL DEFAULT 0
-                 );
-                 CREATE TABLE session_runtime_outbox(
-                     request_id TEXT PRIMARY KEY,
-                     session_id TEXT NOT NULL REFERENCES session_records(session_id),
-                     sequence BIGINT NOT NULL,
-                     status TEXT NOT NULL,
-                     next_attempt_at_ms BIGINT NOT NULL,
-                     claim_expires_at_ms BIGINT,
-                     updated_at_ms BIGINT NOT NULL DEFAULT 0
-                 );
-                 CREATE TABLE session_recovery_manifest(
-                     session_id TEXT PRIMARY KEY,
-                     in_flight_turn BOOLEAN NOT NULL DEFAULT FALSE,
-                     manifest_revision BIGINT NOT NULL DEFAULT 0
-                 );
-                 CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
-                     target_session_id TEXT,bump_history BOOLEAN
-                 ) RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
-                 INSERT INTO session_records(session_id) VALUES('legacy');
-                 INSERT INTO session_recovery_manifest(session_id) VALUES('legacy');
-                 INSERT INTO session_runtime_outbox(
-                     request_id,session_id,sequence,status,next_attempt_at_ms
-                 ) VALUES
-                     ('pending','legacy',0,'pending',0),
-                     ('retry','legacy',1,'retry_scheduled',0),
-                     ('done','legacy',2,'materialized',0),
-                     ('blocked','legacy',3,'blocked_materialization',0);",
-        )
-        .expect("seed legacy schema");
-    let migration = SESSION_MIGRATIONS
-        .iter()
-        .find(|migration| migration.version == 8)
-        .expect("v8 migration exists");
-    assert_eq!(migration.version, 8);
-    for statement in migration.statements {
-        client
-            .batch_execute(statement)
-            .unwrap_or_else(|error| panic!("v8 statement failed: {statement}: {error}"));
-    }
-    let admission = client
+    let failing = PostgresMigrationSpec {
+        id: "session.atomic-negative",
+        domain: SESSION_DOMAIN,
+        version: 1,
+        description: "atomic baseline failure fixture",
+        statements: &[
+            "CREATE TABLE baseline_fault_marker(identity TEXT)",
+            "SELECT 1/0",
+        ],
+    };
+    assert!(executor
+        .apply_migrations(SESSION_DOMAIN, &[failing])
+        .is_err());
+    let mut connection = executor.checkout_online_read().unwrap();
+    assert!(!connection
         .query_one(
-            "SELECT input_generation,input_admission_open
-                   FROM session_records WHERE session_id='legacy'",
-            &[],
+            "SELECT to_regclass('baseline_fault_marker') IS NOT NULL",
+            &[]
         )
-        .expect("load migrated admission");
-    assert_eq!(admission.get::<_, i64>(0), 1);
-    assert!(admission.get::<_, bool>(1));
-    let rows = client
-        .query(
-            "SELECT request_id,input_id,status,session_generation,decision
-                   FROM session_runtime_outbox ORDER BY sequence",
-            &[],
-        )
-        .expect("load migrated rows");
-    let expected = [
-        ("pending", "queued"),
-        ("retry", "queued"),
-        ("done", "completed"),
-        ("blocked", "blocked"),
-    ];
-    for (row, (request_id, status)) in rows.iter().zip(expected) {
-        assert_eq!(row.get::<_, String>(0), request_id);
-        assert_eq!(row.get::<_, String>(1), request_id);
-        assert_eq!(row.get::<_, String>(2), status);
-        assert_eq!(row.get::<_, i64>(3), 1);
-        assert_eq!(row.get::<_, String>(4), "start_new_turn");
-    }
+        .unwrap()
+        .get::<_, bool>(0));
+    assert_eq!(
+        connection
+            .query_one(
+                "SELECT COUNT(*) FROM cowd_schema_migrations WHERE domain='session'",
+                &[]
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    drop(connection);
+    let store = real_store(&fixture);
+    store.create_session(&session("baseline-restart")).unwrap();
+    drop(store);
+    assert!(real_store(&fixture)
+        .get_session("baseline-restart")
+        .unwrap()
+        .is_some());
 }
 
 #[test]

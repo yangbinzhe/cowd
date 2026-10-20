@@ -67,6 +67,14 @@ pub struct SessionAttachment {
     pub actor: SessionActor,
     pub attached_at_ms: u64,
     pub last_seen_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_source: Option<crate::SessionReceiptSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +128,217 @@ impl Default for SessionPresenceLedger {
 }
 
 impl SessionPresenceLedger {
+    pub async fn resolve_frame_source(
+        &self,
+        session_id: &str,
+        transport_id: &str,
+    ) -> crate::SessionResult<(crate::SessionReceiptAuthority, crate::SessionReceiptSource)> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| crate::SessionError::Store("durable presence unavailable".into()))?;
+        let projection = store
+            .get_session_presence_projection(session_id)
+            .await?
+            .ok_or_else(|| crate::SessionError::NotFound("frame attachment".into()))?;
+        let attachments: Vec<SessionAttachment> =
+            serde_json::from_str(&projection.attachments_json)?;
+        let mut matches = attachments.into_iter().filter(|attachment| {
+            attachment
+                .receipt_source
+                .as_ref()
+                .is_some_and(|source| source.transport_id == transport_id)
+        });
+        let attachment = matches
+            .next()
+            .ok_or_else(|| crate::SessionError::NotFound("frame attachment".into()))?;
+        if matches.next().is_some() {
+            return Err(crate::SessionError::InvalidArgument(
+                "ambiguous frame attachment".into(),
+            ));
+        }
+        let source = attachment
+            .receipt_source
+            .clone()
+            .ok_or_else(|| crate::SessionError::InvalidArgument("frame source missing".into()))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| crate::SessionError::Store("clock unavailable".into()))?
+            .as_millis() as u64;
+        if source.session_id != session_id
+            || source.expires_at_ms <= now
+            || attachment
+                .client_expires_at_ms
+                .is_none_or(|expiry| expiry <= now)
+            || attachment.receipt_protocol.as_deref()
+                != Some(crate::SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1)
+        {
+            return Err(crate::SessionError::StaleExecutionFence(
+                "frame source expired".into(),
+            ));
+        }
+        let authority = crate::SessionReceiptAuthority {
+            session_id: session_id.into(),
+            actor_id: attachment.actor.id,
+            principal_id: source.principal_id.clone(),
+            client_id: attachment.client_id.ok_or_else(|| {
+                crate::SessionError::InvalidArgument("frame client missing".into())
+            })?,
+            credential_expires_at_ms: Some(source.expires_at_ms),
+            receipt_source: Some(source.clone()),
+        };
+        Ok((authority, source))
+    }
+
+    pub async fn receipt_selector_required(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> crate::SessionResult<bool> {
+        let attachments = if let Some(store) = &self.store {
+            store
+                .get_session_presence_projection(session_id)
+                .await?
+                .map(|projection| {
+                    serde_json::from_str::<Vec<SessionAttachment>>(&projection.attachments_json)
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            self.sessions
+                .read()
+                .await
+                .get(session_id)
+                .map(|entry| entry.attachments.values().cloned().collect())
+                .unwrap_or_default()
+        };
+        Ok(attachments.iter().any(|attachment| {
+            attachment.actor.id == actor_id
+                && (attachment.receipt_protocol.is_some()
+                    || attachment.client_id.is_some()
+                    || attachment.receipt_source.is_some()
+                    || attachment.client_expires_at_ms.is_some())
+        }))
+    }
+    pub async fn attach_with_receipt_binding(
+        &self,
+        mut authority: crate::SessionReceiptAuthority,
+        actor: SessionActor,
+    ) -> crate::SessionResult<crate::SessionPresenceMutationResult> {
+        validate_actor(&actor).map_err(crate::SessionError::InvalidArgument)?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| crate::SessionError::Store("durable presence unavailable".into()))?;
+        let session_id = validate_session_id(&authority.session_id)
+            .map_err(crate::SessionError::InvalidArgument)?;
+        authority.session_id = session_id.clone();
+        let mutation_lock = self.mutation_lock_for(&session_id).await;
+        let _mutation = mutation_lock.lock().await;
+        let previous = store.get_session_presence_projection(&session_id).await?;
+        if authority.client_id.is_empty() {
+            if let Some(source) = authority.receipt_source.as_mut() {
+                source.attachment_revision = previous
+                    .as_ref()
+                    .map_or(Some(1), |projection| projection.revision.checked_add(1))
+                    .ok_or_else(|| {
+                        crate::SessionError::InvalidArgument("presence revision overflow".into())
+                    })?
+                    .to_string();
+            }
+        }
+        let command = crate::SessionPresenceMutation {
+            expected_revision: previous.map(|projection| projection.revision),
+            authority,
+            kind: crate::SessionPresenceMutationKind::AttachOrReaffirm {
+                actor,
+                candidate_client_id: uuid::Uuid::new_v4().to_string(),
+                ttl_ms: self.presence_ttl_ms,
+            },
+        };
+        let result = store.mutate_session_presence_if_revision(command).await;
+        self.sessions.write().await.remove(&session_id);
+        result?.ok_or_else(|| {
+            crate::SessionError::StaleExecutionFence(
+                "presence changed; retry from fresh selection".into(),
+            )
+        })
+    }
+
+    pub async fn detach_with_receipt_binding(
+        &self,
+        authority: crate::SessionReceiptAuthority,
+    ) -> crate::SessionResult<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| crate::SessionError::Store("durable presence unavailable".into()))?;
+        let session_id = authority.session_id.clone();
+        let mutation_lock = self.mutation_lock_for(&session_id).await;
+        let _mutation = mutation_lock.lock().await;
+        let previous = store.get_session_presence_projection(&session_id).await?;
+        let result = store
+            .mutate_session_presence_if_revision(crate::SessionPresenceMutation {
+                expected_revision: previous.map(|projection| projection.revision),
+                authority,
+                kind: crate::SessionPresenceMutationKind::Detach,
+            })
+            .await;
+        self.sessions.write().await.remove(&session_id);
+        result?.ok_or_else(|| {
+            crate::SessionError::StaleExecutionFence(
+                "presence changed; retry from fresh selection".into(),
+            )
+        })?;
+        Ok(())
+    }
+
+    pub async fn revoke_receipt_actor(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> crate::SessionResult<()> {
+        let Some(store) = self.store.as_ref() else {
+            return self
+                .detach(session_id, actor_id)
+                .await
+                .map(|_| ())
+                .map_err(crate::SessionError::Other);
+        };
+        let mutation_lock = self.mutation_lock_for(session_id).await;
+        let _mutation = mutation_lock.lock().await;
+        let previous = store.get_session_presence_projection(session_id).await?;
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        let attachments: Vec<SessionAttachment> = serde_json::from_str(&previous.attachments_json)?;
+        if !attachments
+            .iter()
+            .any(|attachment| attachment.actor.id == actor_id)
+        {
+            return Ok(());
+        }
+        let result = store
+            .mutate_session_presence_if_revision(crate::SessionPresenceMutation {
+                authority: crate::SessionReceiptAuthority {
+                    session_id: session_id.into(),
+                    actor_id: actor_id.into(),
+                    principal_id: String::new(),
+                    client_id: String::new(),
+                    credential_expires_at_ms: None,
+                    receipt_source: None,
+                },
+                expected_revision: Some(previous.revision),
+                kind: crate::SessionPresenceMutationKind::RevokeExactActor,
+            })
+            .await;
+        self.sessions.write().await.remove(session_id);
+        result?.ok_or_else(|| {
+            crate::SessionError::StaleExecutionFence("presence changed during exact revoke".into())
+        })?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -157,7 +376,25 @@ impl SessionPresenceLedger {
         let mutation_lock = self.mutation_lock_for(&session_id).await;
         let _mutation = mutation_lock.lock().await;
         self.ensure_loaded_locked(&session_id).await?;
-
+        if let Some(store) = &self.store {
+            if let Some(projection) = store
+                .get_session_presence_projection(&session_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let attachments: Vec<SessionAttachment> =
+                    serde_json::from_str(&projection.attachments_json)
+                        .map_err(|_| "invalid durable presence")?;
+                if attachments.iter().any(|attachment| {
+                    attachment.actor.id == actor.id
+                        && (attachment.receipt_protocol.is_some()
+                            || attachment.client_id.is_some()
+                            || attachment.receipt_source.is_some())
+                }) {
+                    return Err("tagged attachment requires its exact receipt selector".into());
+                }
+            }
+        }
         let mut sessions = self.sessions.write().await;
         let previous = sessions.get(&session_id).cloned();
         let entry = sessions.entry(session_id.clone()).or_insert_with(|| {
@@ -174,6 +411,13 @@ impl SessionPresenceLedger {
 
         let now = current_epoch_ms();
         let expired = prune_expired_attachments(entry, now, self.presence_ttl_ms);
+        if entry.attachments.get(&actor.id).is_some_and(|attachment| {
+            attachment.receipt_protocol.is_some()
+                || attachment.client_id.is_some()
+                || attachment.receipt_source.is_some()
+        }) {
+            return Err("tagged attachment requires its exact receipt selector".into());
+        }
         if let Some(existing) = entry.attachments.get_mut(&actor.id) {
             if existing.actor.surface == actor.surface
                 && existing.actor.role == actor.role
@@ -231,6 +475,10 @@ impl SessionPresenceLedger {
                 actor: actor.clone(),
                 attached_at_ms,
                 last_seen_ms: now,
+                client_id: None,
+                client_expires_at_ms: None,
+                receipt_protocol: None,
+                receipt_source: None,
             },
         );
         entry.state = SessionLifecycleState::Attached;
@@ -282,6 +530,13 @@ impl SessionPresenceLedger {
             .entry(session_id.clone())
             .or_insert_with(SessionLifecycleEntry::default);
         let expired = prune_expired_attachments(entry, current_epoch_ms(), self.presence_ttl_ms);
+        if entry.attachments.get(actor_id).is_some_and(|attachment| {
+            attachment.receipt_protocol.is_some()
+                || attachment.client_id.is_some()
+                || attachment.receipt_source.is_some()
+        }) {
+            return Err("tagged detach requires its exact receipt selector".into());
+        }
         let actor = entry
             .attachments
             .remove(actor_id)
@@ -447,7 +702,7 @@ impl SessionPresenceLedger {
         let sessions = self.sessions.read().await;
         sessions
             .get(session_id)
-            .map(|entry| snapshot_from_entry(session_id, entry))
+            .map(|entry| redacted_snapshot(snapshot_from_entry(session_id, entry)))
     }
 
     pub async fn snapshots(&self) -> Vec<SessionLifecycleSnapshot> {
@@ -461,7 +716,7 @@ impl SessionPresenceLedger {
         let sessions = self.sessions.read().await;
         let mut snapshots: Vec<_> = sessions
             .iter()
-            .map(|(session_id, entry)| snapshot_from_entry(session_id, entry))
+            .map(|(session_id, entry)| redacted_snapshot(snapshot_from_entry(session_id, entry)))
             .collect();
         snapshots.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         snapshots
@@ -543,6 +798,58 @@ impl SessionPresenceLedger {
         let mutation_lock = self.mutation_lock_for(&session_id).await;
         let _mutation = mutation_lock.lock().await;
         self.ensure_loaded_locked(&session_id).await?;
+        if let Some(store) = &self.store {
+            if let Some(mut projection) = store
+                .get_session_presence_projection(&session_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let attachments: Vec<SessionAttachment> =
+                    serde_json::from_str(&projection.attachments_json)
+                        .map_err(|_| "invalid durable presence")?;
+                let mut changed = false;
+                for attachment in attachments
+                    .into_iter()
+                    .filter(|attachment| {
+                        attachment
+                            .client_expires_at_ms
+                            .is_some_and(|deadline| deadline <= current_epoch_ms())
+                    })
+                    .take(128)
+                {
+                    let result = store
+                        .mutate_session_presence_if_revision(crate::SessionPresenceMutation {
+                            authority: crate::SessionReceiptAuthority {
+                                session_id: session_id.clone(),
+                                actor_id: attachment.actor.id,
+                                principal_id: String::new(),
+                                client_id: String::new(),
+                                credential_expires_at_ms: None,
+                                receipt_source: None,
+                            },
+                            expected_revision: Some(projection.revision),
+                            kind: crate::SessionPresenceMutationKind::Expire,
+                        })
+                        .await;
+                    match result {
+                        Ok(Some(result)) => {
+                            projection = result.projection;
+                            changed = true;
+                        }
+                        Ok(None) => {
+                            self.sessions.write().await.remove(&session_id);
+                            return Err("presence changed during expiry".into());
+                        }
+                        Err(crate::SessionError::StaleExecutionFence(_)) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                if changed {
+                    self.sessions.write().await.remove(&session_id);
+                    self.ensure_loaded_locked(&session_id).await?;
+                }
+            }
+        }
 
         let mut sessions = self.sessions.write().await;
         let previous = sessions.get(&session_id).cloned();
@@ -653,15 +960,66 @@ fn snapshot_from_entry(
     }
 }
 
+fn redacted_snapshot(mut snapshot: SessionLifecycleSnapshot) -> SessionLifecycleSnapshot {
+    for attachment in &mut snapshot.attachments {
+        attachment.client_id = None;
+        attachment.client_expires_at_ms = None;
+        attachment.receipt_protocol = None;
+        attachment.receipt_source = None;
+    }
+    snapshot
+}
+
+#[cfg(test)]
+mod receipt_presence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn r1_message_ack_attachment_grant_is_only_a_committed_result() {
+        let ledger = SessionPresenceLedger::new();
+        let actor = SessionActor {
+            id: "principal:test:surface:one".into(),
+            surface: "tui".into(),
+            role: Some("reader".into()),
+        };
+        let authority = crate::SessionReceiptAuthority {
+            session_id: "session".into(),
+            actor_id: actor.id.clone(),
+            principal_id: "test".into(),
+            client_id: String::new(),
+            credential_expires_at_ms: None,
+            receipt_source: None,
+        };
+        assert!(ledger
+            .attach_with_receipt_binding(authority, actor.clone())
+            .await
+            .is_err());
+        ledger.attach("session", actor.clone()).await.unwrap();
+        let snapshot = ledger.snapshot("session").await.unwrap();
+        assert_eq!(snapshot.attachments.len(), 1);
+        assert!(snapshot.attachments[0].client_id.is_none());
+        let mut tagged = snapshot;
+        tagged.attachments[0].client_id = Some("not-public".into());
+        tagged.attachments[0].receipt_protocol =
+            Some(crate::SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1.into());
+        tagged.attachments[0].client_expires_at_ms = Some(u64::MAX);
+        let redacted = serde_json::to_string(&redacted_snapshot(tagged)).unwrap();
+        assert!(!redacted.contains("not-public"));
+        assert!(!redacted.contains("receipt_protocol"));
+        assert!(!redacted.contains("client_expires_at_ms"));
+    }
+}
+
 fn prune_expired_attachments(
     entry: &mut SessionLifecycleEntry,
     now_ms: u64,
     presence_ttl_ms: u64,
 ) -> bool {
     let before = entry.attachments.len();
-    entry
-        .attachments
-        .retain(|_, attachment| now_ms.saturating_sub(attachment.last_seen_ms) < presence_ttl_ms);
+    entry.attachments.retain(|_, attachment| {
+        attachment.receipt_protocol.is_some()
+            || now_ms.saturating_sub(attachment.last_seen_ms) < presence_ttl_ms
+    });
     if entry.attachments.len() == before {
         return false;
     }

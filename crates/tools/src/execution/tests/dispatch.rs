@@ -1,5 +1,173 @@
 // Canonical dispatch, filesystem, search, cache, and mutation coverage.
 use super::super::executor::is_allowed_orchestration_tool;
+
+fn bounded_process_authorization_283(
+    lease: &crate::ToolHostLease,
+    input: &serde_json::Value,
+) -> harness_contract::tool::ToolExecutionAuthorization {
+    let descriptor = lease.describe_effect("execute_code", input);
+    harness_contract::tool::ToolExecutionAuthorization {
+        request_id: "p4-bounded-call".into(),
+        tool_id: "execute_code".into(),
+        descriptor_hash: descriptor.descriptor_hash.clone(),
+        policy_revision: 1,
+        scope: descriptor.scopes[0].clone(),
+        authorization_lease: harness_contract::policy::AuthorizationLease {
+            lease_id: "p4-fixture-issued-lease".into(),
+            principal_id: "p4-tools-test".into(),
+            parent_lease_id: None,
+            capability: "execute_code".into(),
+            scopes: descriptor.scopes.clone(),
+            ceiling: descriptor.required_permission,
+            issued_at_ms: 0,
+            expires_at_ms: u64::MAX,
+            max_uses: 1,
+            remaining_uses: 1,
+            idempotency_key: "p4-bounded-call".into(),
+            policy_revision: 1,
+            effect_descriptor_hash: descriptor.descriptor_hash,
+            signature: "p4-owned-test-authority".into(),
+            status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+        },
+        timeout_lease: "timeout:30".into(),
+        idempotency_key: Some("p4-bounded-call".into()),
+    }
+}
+
+#[test]
+fn execute_code_finite_inputs_real_host_and_missing_import_283() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = temp_path("bounded-process-283");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("source.py"), "VALUE = 7\n").unwrap();
+    fs::write(
+        root.join("test_source.py"),
+        "from source import VALUE\nassert VALUE == 7\nprint('bounded-real-inputs-283')\n",
+    )
+    .unwrap();
+    fs::write(root.join("unlisted.py"), "VALUE = 'must not be visible'\n").unwrap();
+    let host = crate::ToolHost::builtin("p4-tools-bounded", &root)
+        .with_authorization_lease_verifier(Arc::new(|lease| {
+            lease.principal_id == "p4-tools-test" && lease.signature == "p4-owned-test-authority"
+        }));
+    let lease = host.pin_snapshot();
+    let input = json!({"language":"python", "code":"exec(open('/project/test_source.py').read())",
+        "input_files":["source.py","test_source.py"], "timeout_ms":5000});
+    let descriptor = lease.describe_effect("execute_code", &input);
+    assert!(descriptor.spawns_process);
+    assert_eq!(
+        descriptor.effect_kind,
+        harness_contract::tool::ToolEffectKind::Process
+    );
+    let output = lease
+        .execute(
+            &bounded_process_authorization_283(&lease, &input),
+            "execute_code",
+            &input,
+        )
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(body["exit_code"], 0);
+    assert!(body["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("bounded-real-inputs-283"));
+    let missing =
+        json!({"language":"python", "code":"import unlisted", "input_files":[], "timeout_ms":5000});
+    let output = lease
+        .execute(
+            &bounded_process_authorization_283(&lease, &missing),
+            "execute_code",
+            &missing,
+        )
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_ne!(body["exit_code"], 0);
+    assert!(body["stderr"].as_str().unwrap().contains("unlisted"));
+    assert_eq!(
+        fs::read_to_string(root.join("source.py")).unwrap(),
+        "VALUE = 7\n"
+    );
+    make_tree_writable_for_test(&root);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn execute_code_schema_and_fixed_limits_fail_before_execution_283() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = temp_path("bounded-process-input-negative-283");
+    fs::create_dir_all(&root).unwrap();
+    let host = crate::ToolHost::builtin("p4-tools-bounded-negative", &root)
+        .with_authorization_lease_verifier(Arc::new(|lease| {
+            lease.principal_id == "p4-tools-test" && lease.signature == "p4-owned-test-authority"
+        }));
+    let lease = host.pin_snapshot();
+    let binding_for = |input: &serde_json::Value| {
+        let canonical = |domain, value| {
+            harness_contract::step::canonical_digest(domain, value)
+                .unwrap()
+                .strip_prefix("sha256:")
+                .unwrap()
+                .to_string()
+        };
+        harness_contract::context::ToolExecutionBinding {
+            call_key: "p4-bounded-call".into(),
+            tool_use_id: "p4-bounded-call".into(),
+            input_sha256: canonical(
+                harness_contract::context::TOOL_EXECUTION_INPUT_DOMAIN,
+                input,
+            ),
+            descriptor_sha256: canonical(
+                harness_contract::context::TOOL_EXECUTION_DESCRIPTOR_DOMAIN,
+                &serde_json::to_value(lease.describe_effect("execute_code", input)).unwrap(),
+            ),
+            authority_sha256: "a".repeat(64),
+        }
+    };
+    let valid = json!({"language":"python","code":"pass","input_files":[]});
+    let positive = lease.prepare_bounded_process(&bounded_process_authorization_283(&lease, &valid),
+        &valid, binding_for(&valid)).expect("the exact fixture authority and canonical binding must prepare before the negative matrix");
+    drop(positive);
+    let reformatted = harness_contract::step::parse_strict_json(
+        "{ \"input_files\": [], \"code\": \"pass\", \"language\": \"python\" }",
+    )
+    .unwrap();
+    assert_eq!(binding_for(&valid), binding_for(&reformatted));
+    let changed = json!({"language":"python","code":"print('changed')","input_files":[]});
+    assert_ne!(
+        binding_for(&valid).input_sha256,
+        binding_for(&changed).input_sha256
+    );
+    assert!(harness_contract::step::parse_strict_json(
+        r#"{"language":"python","language":"bash","code":"pass","input_files":[]}"#
+    )
+    .is_err());
+    for input in [
+        json!({"language":"python","code":"print('must not execute')"}),
+        json!({"language":"python","code":"pass","input_files":[],"unrecognized":true}),
+        json!({"language":"ruby","code":"pass","input_files":[]}),
+        json!({"language":"python","code":"pass","input_files":["../outside.py"]}),
+        json!({"language":"python","code":"pass","input_files":["source.py","source.py"]}),
+        json!({"language":"python","code":"x".repeat(65537),"input_files":[]}),
+        json!({"language":"python","code":"pass","input_files":(0..65).map(|index|format!("{index}.py")).collect::<Vec<_>>()}),
+        json!({"language":"python","code":"pass","input_files":[],"timeout_ms":120001}),
+    ] {
+        let authorization = bounded_process_authorization_283(&lease, &input);
+        assert!(
+            lease
+                .prepare_bounded_process(&authorization, &input, binding_for(&input))
+                .is_err(),
+            "invalid bounded input must never fall back to live workspace"
+        );
+    }
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn vision_analyze_prepares_png_payload_end_to_end() {
     let _guard = env_lock();
@@ -276,7 +444,9 @@ fn runtime_tools_extend_registry_definitions_permissions_and_search() {
     assert!(
         output["activation_candidates"]
             .as_array()
-            .is_none_or(|candidates| candidates.iter().all(|candidate| candidate != "mcp__demo__echo")),
+            .is_none_or(|candidates| candidates
+                .iter()
+                .all(|candidate| candidate != "mcp__demo__echo")),
         "an MCP tool must not be advertised as an activation candidate: {output}"
     );
     assert_eq!(output["catalog_revision"], 1);
@@ -1280,7 +1450,8 @@ fn auto_checkpoint_can_guard_mutations_when_enabled() {
         &json!({ "action": "write", "path": "src/lib.rs", "content": "omega\n" }),
     )
     .expect("write should create checkpoint first");
-    let checkpoints = execute_tool("checkpoint", &json!({"action": "list"})).expect("list checkpoints");
+    let checkpoints =
+        execute_tool("checkpoint", &json!({"action": "list"})).expect("list checkpoints");
     let value: serde_json::Value = serde_json::from_str(&checkpoints).expect("json");
     let labels = value["checkpoints"]
         .as_array()
@@ -1428,8 +1599,12 @@ fn checkpoint_tools_create_diff_and_restore_workspace_files() {
     fs::write(&file, "omega\n").expect("mutate file");
     fs::write(root.join("src/new.rs"), "new\n").expect("add file");
     fs::remove_file(&file).expect("delete file");
-    let diff = execute_in_workspace(&root, "checkpoint", &json!({"action": "diff", "id": checkpoint_id}))
-        .expect("checkpoint diff should succeed");
+    let diff = execute_in_workspace(
+        &root,
+        "checkpoint",
+        &json!({"action": "diff", "id": checkpoint_id}),
+    )
+    .expect("checkpoint diff should succeed");
     let diff_value: serde_json::Value = serde_json::from_str(&diff).expect("json");
     assert_eq!(diff_value["type"], "checkpoint");
     assert!(diff_value["deletedFiles"]
@@ -1444,13 +1619,17 @@ fn checkpoint_tools_create_diff_and_restore_workspace_files() {
         .any(|file| file.as_str() == Some("src/new.rs")));
 
     let checkpoint_id = created_value["id"].as_str().expect("checkpoint id");
-    execute_in_workspace(&root, "checkpoint", &json!({"action": "restore", "id": checkpoint_id}))
-        .expect("checkpoint restore should succeed");
+    execute_in_workspace(
+        &root,
+        "checkpoint",
+        &json!({"action": "restore", "id": checkpoint_id}),
+    )
+    .expect("checkpoint restore should succeed");
     assert_eq!(fs::read_to_string(&file).expect("read restored"), "alpha\n");
     assert!(!root.join("src/new.rs").exists());
 
-    let listed =
-        execute_in_workspace(&root, "checkpoint", &json!({"action": "list"})).expect("checkpoint list");
+    let listed = execute_in_workspace(&root, "checkpoint", &json!({"action": "list"}))
+        .expect("checkpoint list");
     let listed_value: serde_json::Value = serde_json::from_str(&listed).expect("json");
     assert_eq!(listed_value["type"], "checkpoint");
     assert!(!listed_value["checkpoints"]
@@ -1932,15 +2111,16 @@ fn tool_orchestrate_supports_filter_when_and_repeat() {
     let _ = fs::remove_dir_all(&root);
 }
 
-
 #[test]
 fn background_selector_is_not_rejected_as_unknown_field() {
     // Regression (family merge): the merged `background` schema requires
     // `action`, while the per-action handlers deny unknown fields. Dispatch
     // must strip `action` before parsing, for both actions.
     for action in ["status", "kill"] {
-        let result =
-            execute_tool("background", &json!({ "action": action, "jobId": "missing-job" }));
+        let result = execute_tool(
+            "background",
+            &json!({ "action": action, "jobId": "missing-job" }),
+        );
         let rendered = format!("{result:?}");
         assert!(
             !rendered.contains("unknown field"),
@@ -1976,7 +2156,9 @@ fn glob_search_accepts_multiple_patterns_in_one_call() {
     let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
     assert_eq!(parsed["count"], json!(2), "{parsed}");
     assert!(
-        parsed["results"].as_array().is_some_and(|rows| rows.len() == 2),
+        parsed["results"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2),
         "{parsed}"
     );
 }
@@ -2021,7 +2203,9 @@ fn execution_capability_matrix_is_complete() {
     // The shared test host is built from the process cwd; pin the cwd to the
     // crate root under the env lock so the matrix is not order-dependent when
     // cargo runs tests in parallel.
-    let _guard = env_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")).expect("chdir to crate root");
     let mut failures: Vec<String> = Vec::new();
@@ -2088,7 +2272,7 @@ fn execution_capability_matrix_is_complete() {
         "compute_reduction",
         execute_tool(
             "execute_code",
-            &json!({ "language": "python", "code": "print(1 + 1)" }),
+            &json!({ "language": "python", "code": "print(1 + 1)", "input_files": [] }),
         ),
     );
 

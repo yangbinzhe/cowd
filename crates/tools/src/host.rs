@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::lsp_client::LspRegistry;
 use crate::path_policy::WorkspacePathPolicy;
 use crate::tool_cache::{ToolCache, ToolCacheStats};
-use crate::tool_orchestrator::resolve_registered_tool_effect;
+use crate::tool_orchestrator::{resolve_registered_tool_effect_resolution, ToolEffectResolution};
 use crate::ToolCatalog;
 
 /// Immutable implementation snapshot pinned for one request.
@@ -147,10 +147,15 @@ impl ToolHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let revision = self.revision();
         let snapshot = guard.clone();
+        drop(guard);
+        let path_policy = Arc::new(WorkspacePathPolicy::new(&self.workspace_root));
+        let bounded_root = bounded_workspace_directory(path_policy.workspace_root());
         ToolHostLease {
+            local_network_trace: None,
             workspace_id: self.workspace_id.clone(),
             workspace_root: self.workspace_root.clone(),
-            path_policy: Arc::new(WorkspacePathPolicy::new(&self.workspace_root)),
+            path_policy,
+            bounded_root,
             revision,
             snapshot,
             cache: Arc::clone(&self.cache),
@@ -186,12 +191,36 @@ impl ToolHost {
     }
 }
 
+fn bounded_workspace_directory(root: &Path) -> Option<Arc<std::fs::File>> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+        openat2(
+            rustix::fs::CWD,
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .ok()
+        .map(std::fs::File::from)
+        .map(Arc::new)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        None
+    }
+}
+
 /// Request-scoped immutable view. Production search and execute APIs require it.
 #[derive(Clone)]
 pub struct ToolHostLease {
+    local_network_trace: Option<Arc<std::sync::Mutex<local_network::LocalNetworkTrace>>>,
     workspace_id: String,
     workspace_root: PathBuf,
     path_policy: Arc<WorkspacePathPolicy>,
+    bounded_root: Option<Arc<std::fs::File>>,
     revision: u64,
     snapshot: Arc<ToolHostSnapshot>,
     cache: Arc<ToolCache>,
@@ -211,6 +240,9 @@ impl std::fmt::Debug for ToolHostLease {
             .finish_non_exhaustive()
     }
 }
+
+#[path = "local_network.rs"]
+mod local_network;
 
 impl ToolHostLease {
     pub(crate) fn read_cache_authority_digest(&self) -> Option<&str> {
@@ -348,30 +380,136 @@ impl ToolHostLease {
 
     #[must_use]
     pub fn describe_effect(&self, tool_id: &str, input: &Value) -> ToolEffectDescriptor {
+        self.describe_effect_resolution(tool_id, input).descriptor
+    }
+
+    #[must_use]
+    pub fn describe_effect_resolution(&self, tool_id: &str, input: &Value) -> ToolEffectResolution {
         let canonical_id = self
             .snapshot
             .catalog
             .canonical_name(tool_id)
             .unwrap_or_else(|| tool_id.to_string());
-        let mut permission = self
+        let permission = self
             .snapshot
             .catalog
             .required_permission(&canonical_id)
             .unwrap_or(ToolPermissionMode::DangerFullAccess);
-        let mut resolver = self.snapshot.catalog.effect_resolver(&canonical_id);
-        if canonical_id == "tool_orchestrate" {
-            // The orchestration effect is the strictest effect among its
-            // sub-calls. The resolver cannot see the catalog, so escalate here
-            // and let `builtin.orchestrate` shape the descriptor. Unparseable
-            // input fails closed to DangerFullAccess.
-            permission =
-                orchestration_escalated_permission(&self.snapshot.catalog, input, permission);
-            resolver = harness_contract::tool::ToolEffectResolverSpec {
-                resolver_id: "builtin.orchestrate".to_string(),
-                resolver_version: 1,
-            };
+        let resolver = self.snapshot.catalog.effect_resolver(&canonical_id);
+        if canonical_id == "lsp" && resolver.resolver_id == "builtin.readonly_process" {
+            let roots = input
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| self.snapshot.lsp.find_server_for_path(path))
+                .and_then(|server| server.root_path)
+                .and_then(|root| std::path::PathBuf::from(root).canonicalize().ok())
+                .map(|root| {
+                    let target =
+                        if self.workspace_root().canonicalize().ok().as_ref() == Some(&root) {
+                            None
+                        } else {
+                            Some(root.to_string_lossy().into_owned())
+                        };
+                    vec![target]
+                });
+            return crate::tool_orchestrator::resolve_lsp_tool_effect_resolution(
+                &resolver, input, permission, roots,
+            );
         }
-        resolve_registered_tool_effect(&resolver, &canonical_id, input, permission)
+        if canonical_id == "tool_orchestrate" {
+            let preflight = crate::executor::orchestrate::effect_preflight(input);
+            let effects = preflight
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|calls| self.orchestration_child_effects(calls));
+            let floor = preflight
+                .as_ref()
+                .map(|calls| {
+                    calls.iter().fold(permission, |floor, call| {
+                        crate::tool_orchestrator::stricter_permission(
+                            floor,
+                            self.snapshot
+                                .catalog
+                                .required_permission(&call.tool)
+                                .unwrap_or(ToolPermissionMode::DangerFullAccess),
+                        )
+                    })
+                })
+                .unwrap_or(ToolPermissionMode::DangerFullAccess);
+            let unresolved = effects.is_err();
+            let children = effects.unwrap_or_default();
+            let mut fingerprints = preflight
+                .as_ref()
+                .ok()
+                .into_iter()
+                .flatten()
+                .zip(&children)
+                .map(|(call, child)| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        call.step_id,
+                        call.operation,
+                        call.maximum_calls,
+                        child.descriptor.descriptor_hash
+                    )
+                })
+                .collect::<Vec<_>>();
+            fingerprints.push(self.snapshot.descriptor_set_hash.clone());
+            fingerprints.push(self.workspace_root().to_string_lossy().into_owned());
+            return crate::tool_orchestrator::resolve_composite_tool_effect_resolution(
+                &resolver,
+                input,
+                floor,
+                &children,
+                &fingerprints,
+                unresolved,
+            );
+        }
+        resolve_registered_tool_effect_resolution(&resolver, &canonical_id, input, permission)
+    }
+
+    pub(crate) fn orchestration_child_effects(
+        &self,
+        calls: &[crate::executor::orchestrate::PreflightCall],
+    ) -> Result<Vec<ToolEffectResolution>, String> {
+        calls
+            .iter()
+            .map(|call| {
+                if !crate::executor::is_allowed_orchestration_tool(&call.tool)
+                    || !self.snapshot.catalog.contains(&call.tool)
+                {
+                    return Err(format!(
+                        "tool_orchestrate cannot dispatch pinned child `{}`",
+                        call.tool
+                    ));
+                }
+                let resolver = self.snapshot.catalog.effect_resolver(&call.tool);
+                let permission = self
+                    .snapshot
+                    .catalog
+                    .required_permission(&call.tool)
+                    .ok_or_else(|| format!("missing pinned permission for `{}`", call.tool))?;
+                let effect = if call.references.is_empty() {
+                    self.describe_effect_resolution(&call.tool, &call.input)
+                } else {
+                    crate::tool_orchestrator::resolve_orchestration_child_effect_resolution(
+                        &resolver,
+                        &call.tool,
+                        &call.input,
+                        permission,
+                        &call.references,
+                    )?
+                };
+                if effect.descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Unknown
+                {
+                    return Err(format!(
+                        "tool_orchestrate cannot prove complete effects for `{}` at {} ({})",
+                        call.tool, call.step_id, call.operation
+                    ));
+                }
+                Ok(effect)
+            })
+            .collect()
     }
 
     /// Validate model-supplied input against the exact Tool definition pinned
@@ -459,6 +597,83 @@ impl ToolHostLease {
             .dispatch_sync(&canonical_id, value)
     }
 
+    pub fn prepare_bounded_process(
+        &self,
+        authorization: &ToolExecutionAuthorization,
+        input: &Value,
+        binding: harness_contract::context::ToolExecutionBinding,
+    ) -> Result<crate::PreparedToolExecution, ToolHostError> {
+        self.validate_input("execute_code", input)?;
+        self.validate_authorization(authorization, "execute_code", input)?;
+        if self
+            .workspace_root()
+            .canonicalize()
+            .map_err(|error| ToolHostError::Execution(error.to_string()))?
+            != self.path_policy.workspace_root()
+        {
+            return Err(ToolHostError::Execution(
+                "bounded_original_workspace_changed".into(),
+            ));
+        }
+        let root = self.bounded_root.as_ref().ok_or_else(|| {
+            ToolHostError::Execution("bounded_original_workspace_unavailable".into())
+        })?;
+        let descriptor = self.describe_effect("execute_code", input);
+        let descriptor_value = serde_json::to_value(&descriptor)
+            .map_err(|error| ToolHostError::Execution(error.to_string()))?;
+        let descriptor_digest = harness_contract::step::canonical_digest(
+            harness_contract::context::TOOL_EXECUTION_DESCRIPTOR_DOMAIN,
+            &descriptor_value,
+        )
+        .map_err(|error| ToolHostError::Execution(error.to_string()))?;
+        let descriptor_sha256 = descriptor_digest
+            .strip_prefix("sha256:")
+            .ok_or_else(|| ToolHostError::Execution("bounded_descriptor_digest_invalid".into()))?;
+        if binding.descriptor_sha256 != descriptor_sha256
+            || authorization
+                .idempotency_key
+                .as_deref()
+                .is_some_and(|key| key != binding.call_key)
+        {
+            return Err(ToolHostError::Execution(
+                "bounded_process_binding_mismatch".into(),
+            ));
+        }
+        let seconds = authorization
+            .timeout_lease
+            .strip_prefix("timeout:")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ToolHostError::Execution("bounded_authorization_timeout_invalid".into())
+            })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| ToolHostError::Execution(error.to_string()))?
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let remaining = authorization
+            .authorization_lease
+            .expires_at_ms
+            .saturating_sub(now);
+        let ceiling = std::time::Duration::from_millis(
+            seconds.saturating_mul(1000).min(remaining).min(120000),
+        );
+        if ceiling.is_zero() {
+            return Err(ToolHostError::Execution(
+                "bounded_authorization_expired".into(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + ceiling;
+        crate::sandbox_exec::prepare(
+            self.path_policy.workspace_root(),
+            input,
+            binding,
+            Some(root.as_ref()),
+        )
+        .map(|prepared| prepared.restrict_deadline(deadline))
+    }
+
     /// Unified asynchronous entry (T4): bash runs on the tokio runtime with
     /// bounded capture and progress samples; every other tool falls back to
     /// the validated blocking path inside `spawn_blocking`.
@@ -495,9 +710,11 @@ impl ToolHostLease {
                 let lease = self.for_authorized_read_cache(authorization)?;
                 let canonical = canonical_id.clone();
                 let value = value.clone();
-                return tokio::task::spawn_blocking(move || lease.dispatch_sync(&canonical, &value))
-                    .await
-                    .map_err(|error| ToolHostError::Execution(error.to_string()))?;
+                return tokio::task::spawn_blocking(move || {
+                    lease.dispatch_sync(&canonical, &value)
+                })
+                .await
+                .map_err(|error| ToolHostError::Execution(error.to_string()))?;
             }
             let mut bash_value = value.clone();
             if shell.is_some() {
@@ -505,8 +722,8 @@ impl ToolHostLease {
                     object.remove("shell");
                 }
             }
-            let bash_input: crate::bash::BashCommandInput =
-                serde_json::from_value(bash_value).map_err(|error| {
+            let bash_input: crate::bash::BashCommandInput = serde_json::from_value(bash_value)
+                .map_err(|error| {
                     ToolHostError::Execution(format!("invalid bash input: {error}"))
                 })?;
             let output = crate::bash::execute_bash_async_in_workspace(
@@ -558,6 +775,14 @@ impl ToolHostLease {
             });
         }
         let effective = self.describe_effect(&canonical_id, input);
+        if canonical_id == "tool_orchestrate" {
+            crate::executor::orchestrate::effect_preflight(input)
+                .and_then(|calls| self.orchestration_child_effects(&calls))
+                .map_err(|reason| ToolHostError::InputContract {
+                    tool: canonical_id.clone(),
+                    reason,
+                })?;
+        }
         let lease = &authorization.authorization_lease;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -923,9 +1148,13 @@ fn declared_type_guidance(expected: &Value, value: &Value) -> String {
         _ => return String::new(),
     };
     let received = json_type_name(value);
-    let quoted_container = value.is_string() && declared.split(" or ").any(|kind| {
-        matches!(kind, "array" | "object" | "integer" | "number" | "boolean" | "null")
-    });
+    let quoted_container = value.is_string()
+        && declared.split(" or ").any(|kind| {
+            matches!(
+                kind,
+                "array" | "object" | "integer" | "number" | "boolean" | "null"
+            )
+        });
     format!(
         " (declared type: {declared}; received: {received}; send a {declared} value{})",
         if quoted_container {
@@ -984,14 +1213,23 @@ fn resource_demand_for_effect(effect: &ToolEffectDescriptor) -> ResourceDemand {
         .scopes
         .iter()
         .filter_map(|scope| {
-            scope.target.clone().map(|key| ResourceScopeDemand {
-                key,
-                access: if scope.operation == harness_contract::policy::PermissionOperation::Read {
-                    ResourceAccess::Read
-                } else {
-                    ResourceAccess::Write
-                },
-            })
+            scope
+                .target
+                .clone()
+                .or_else(|| {
+                    (scope.resource == harness_contract::policy::PermissionResource::File)
+                        .then(|| ".".to_string())
+                })
+                .map(|key| ResourceScopeDemand {
+                    key,
+                    access: if scope.operation
+                        == harness_contract::policy::PermissionOperation::Read
+                    {
+                        ResourceAccess::Read
+                    } else {
+                        ResourceAccess::Write
+                    },
+                })
         })
         .collect::<Vec<_>>();
     scopes.sort_by(|left, right| left.key.cmp(&right.key));
@@ -1029,27 +1267,6 @@ fn parse_mcp_runtime_id(tool_id: &str) -> Option<(&str, &str)> {
             Some((server, tool))
         }
         _ => None,
-    }
-}
-
-/// Strictest catalog permission among the tools an orchestration input will
-/// dispatch, folding in the orchestration tool's own catalog floor. Failures to
-/// parse the input fail closed to `DangerFullAccess`.
-fn orchestration_escalated_permission(
-    catalog: &ToolCatalog,
-    input: &Value,
-    floor: ToolPermissionMode,
-) -> ToolPermissionMode {
-    match crate::requested_sub_call_tools("tool_orchestrate", input) {
-        crate::SubCallAuthorization::Requires(names) => names.iter().fold(floor, |acc, name| {
-            let sub = catalog
-                .required_permission(name)
-                .unwrap_or(ToolPermissionMode::DangerFullAccess);
-            crate::tool_orchestrator::stricter_permission(acc, sub)
-        }),
-        crate::SubCallAuthorization::NotOrchestration | crate::SubCallAuthorization::Invalid(_) => {
-            ToolPermissionMode::DangerFullAccess
-        }
     }
 }
 
@@ -1174,6 +1391,226 @@ mod tests {
             timeout_lease: "timeout-lease".to_string(),
             idempotency_key,
         }
+    }
+
+    #[test]
+    fn bounded_host_preserves_original_unknown_grant_and_intersects_timeout() {
+        use harness_contract::context::{
+            ArtifactRef, ToolExecutionBinding, ToolExecutionStopReason, ToolExecutionTerminal,
+        };
+        use sha2::{Digest, Sha256};
+        let root = std::env::temp_dir().join(format!("cowd-bounded-host-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let lease = test_host("bounded-host", &root).pin_snapshot();
+        let input = json!({"language":"python","code":"import time; time.sleep(600)","input_files":[],"timeout_ms":120000});
+        let effect = lease.describe_effect("execute_code", &input);
+        assert_eq!(
+            effect.effect_kind,
+            harness_contract::tool::ToolEffectKind::Process
+        );
+        assert_eq!(effect.idempotency, ToolIdempotency::Unknown);
+        let mut grant = authorization(&effect, None);
+        grant.timeout_lease = "timeout:1".into();
+        let binding = ToolExecutionBinding {
+            call_key: "original-process-call".into(),
+            tool_use_id: "original-process-tool".into(),
+            input_sha256: harness_contract::step::canonical_digest(
+                harness_contract::context::TOOL_EXECUTION_INPUT_DOMAIN,
+                &input,
+            )
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_owned(),
+            descriptor_sha256: harness_contract::step::canonical_digest(
+                harness_contract::context::TOOL_EXECUTION_DESCRIPTOR_DOMAIN,
+                &serde_json::to_value(&effect).unwrap(),
+            )
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_owned(),
+            authority_sha256: "a".repeat(64),
+        };
+        assert_eq!(effect.descriptor_hash.len(), 16);
+        assert_eq!(binding.descriptor_sha256.len(), 64);
+        let mut old_binding = binding.clone();
+        old_binding.descriptor_sha256 = effect.descriptor_hash.clone();
+        assert!(lease
+            .prepare_bounded_process(&grant, &input, old_binding)
+            .is_err());
+        let mut changed_descriptor = serde_json::to_value(&effect).unwrap();
+        changed_descriptor["spawns_process"] = json!(false);
+        assert_eq!(
+            changed_descriptor["descriptor_hash"],
+            effect.descriptor_hash
+        );
+        let mut changed_binding = binding.clone();
+        changed_binding.descriptor_sha256 = harness_contract::step::canonical_digest(
+            harness_contract::context::TOOL_EXECUTION_DESCRIPTOR_DOMAIN,
+            &changed_descriptor,
+        )
+        .unwrap()
+        .strip_prefix("sha256:")
+        .unwrap()
+        .to_owned();
+        assert_ne!(changed_binding.descriptor_sha256, binding.descriptor_sha256);
+        assert!(lease
+            .prepare_bounded_process(&grant, &input, changed_binding)
+            .is_err());
+        for index in 0..effect.scopes.len() {
+            let mut incomplete = grant.clone();
+            incomplete.authorization_lease.scopes.remove(index);
+            assert!(lease
+                .prepare_bounded_process(&incomplete, &input, binding.clone())
+                .is_err());
+        }
+        let mut missing_timeout = grant.clone();
+        missing_timeout.timeout_lease = "invented".into();
+        assert!(lease
+            .prepare_bounded_process(&missing_timeout, &input, binding.clone())
+            .is_err());
+        let prepared = lease
+            .prepare_bounded_process(&grant, &input, binding.clone())
+            .unwrap();
+        let source = ArtifactRef::durable(
+            "artifact://bounded-host-unit",
+            format!(
+                "sha256:{:x}",
+                Sha256::digest(prepared.source_bundle_bytes())
+            ),
+            prepared.source_bundle_bytes().len() as u64,
+            "application/octet-stream",
+            "test",
+        );
+        let admission = prepared.admission(&source).unwrap();
+        assert_eq!(admission.binding, binding);
+        let completed = prepared.run(admission, &crate::ToolExecutionCancellation::new());
+        assert!(
+            matches!(
+                completed.terminal(),
+                ToolExecutionTerminal::Settled {
+                    stop_reason: ToolExecutionStopReason::Timeout,
+                    ..
+                }
+            ),
+            "{:?}",
+            completed.terminal()
+        );
+        assert_eq!(
+            completed.admission().binding.input_sha256,
+            binding.input_sha256
+        );
+        assert!(grant.idempotency_key.is_none());
+        assert_eq!(input["timeout_ms"], 120000);
+        let backup = root.with_extension("original");
+        std::fs::rename(&root, &backup).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(lease
+            .prepare_bounded_process(&grant, &input, binding.clone())
+            .is_err());
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(&backup, &root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn typed_resolution_is_canonical_but_never_shrinks_authorization() {
+        use harness_contract::goal::{ProofEffectPurpose, ProofEffectScope};
+
+        let lease = test_host("typed-resolution", "/tmp/typed-resolution").pin_snapshot();
+        for (tool, input) in [
+            (
+                "edit",
+                json!({"action":"write","path":"src/a","content":"literal"}),
+            ),
+            (
+                "edit",
+                json!({"action":"patch","edits":[{"path":"src/a","old_string":"old","new_string":"new"}]}),
+            ),
+            (
+                "tool_orchestrate",
+                json!({"steps":[{"id":"write","op":"call","tool":"edit","input":{"action":"write","path":"src/a","content":"literal"}}]}),
+            ),
+        ] {
+            let resolution = lease.describe_effect_resolution(tool, &input);
+            assert_eq!(resolution.descriptor, lease.describe_effect(tool, &input));
+            assert_eq!(
+                lease
+                    .prepare_governed_invocation("typed-call", tool, &input, &[])
+                    .effect,
+                resolution.descriptor
+            );
+            let admitted = ProofEffectScope {
+                version: 2,
+                descriptor_hash: resolution.descriptor.descriptor_hash.clone(),
+                complete: false,
+                targets: Vec::new(),
+                scope_purposes: resolution.scope_purposes.clone(),
+            };
+            admitted
+                .validate_purpose_mapping(&resolution.descriptor)
+                .unwrap();
+            assert!(admitted
+                .scope_purposes
+                .iter()
+                .any(|entry| entry.purpose == ProofEffectPurpose::AutoCheckpointMaintenance));
+            let authorized = authorization(&resolution.descriptor, Some("typed-idempotency"));
+            lease
+                .validate_authorization(&authorized, tool, &input)
+                .unwrap();
+            for removed in 0..resolution.descriptor.scopes.len() {
+                let mut incomplete = authorized.clone();
+                incomplete.authorization_lease.scopes.remove(removed);
+                assert_eq!(
+                    lease
+                        .validate_authorization(&incomplete, tool, &input)
+                        .unwrap_err(),
+                    ToolHostError::ScopeNotAuthorized
+                );
+            }
+            let mut forged = admitted.clone();
+            let entry = forged
+                .scope_purposes
+                .iter_mut()
+                .find(|entry| {
+                    entry.purpose == ProofEffectPurpose::BusinessEffect
+                        && entry.declared_scope.resource
+                            == harness_contract::policy::PermissionResource::File
+                        && entry.declared_scope.operation
+                            == harness_contract::policy::PermissionOperation::Write
+                })
+                .unwrap();
+            entry.purpose = ProofEffectPurpose::AutoCheckpointMaintenance;
+            forged
+                .validate_purpose_mapping(&resolution.descriptor)
+                .unwrap();
+            assert_ne!(
+                forged.scope_purposes,
+                lease
+                    .describe_effect_resolution(tool, &input)
+                    .scope_purposes
+            );
+            assert_eq!(
+                forged.descriptor_hash,
+                resolution.descriptor.descriptor_hash
+            );
+        }
+        let query = json!({"query":"runtime"});
+        assert_eq!(
+            lease.describe_effect_resolution("web_search", &query),
+            lease.describe_effect_resolution("web-search", &query)
+        );
+        let explicit = lease
+            .describe_effect_resolution("checkpoint", &json!({"action":"create","paths":["src"]}));
+        assert!(explicit
+            .scope_purposes
+            .iter()
+            .any(|entry| entry.purpose == ProofEffectPurpose::BusinessEffect));
+        assert!(!explicit
+            .scope_purposes
+            .iter()
+            .any(|entry| entry.purpose == ProofEffectPurpose::AutoCheckpointMaintenance));
     }
 
     #[test]
@@ -1302,13 +1739,18 @@ mod tests {
         let lease = host.pin_snapshot();
         let descriptor = lease.describe_effect(
             "edit",
-            &json!({"path": "/tmp/tool-host-test", "content": "x"}),
+            &json!({"action": "write", "path": "/tmp/tool-host-test", "content": "x"}),
         );
+        assert_eq!(
+            descriptor.effect_kind,
+            harness_contract::tool::ToolEffectKind::Write
+        );
+        assert_eq!(descriptor.idempotency, ToolIdempotency::IdempotentWithKey);
         let error = lease
             .execute(
                 &authorization(&descriptor, None),
                 "edit",
-                &json!({"path": "/tmp/tool-host-test", "content": "x"}),
+                &json!({"action": "write", "path": "/tmp/tool-host-test", "content": "x"}),
             )
             .expect_err("write without idempotency key must fail");
         assert_eq!(error, ToolHostError::MissingIdempotencyKey);
@@ -1467,7 +1909,7 @@ mod tests {
         let writes = lease.describe_effect(
             "tool_orchestrate",
             &serde_json::json!({
-                "steps": [{"id": "w", "op": "call", "tool": "edit", "input": {"path": "x", "content": "y"}}]
+                "steps": [{"id": "w", "op": "call", "tool": "edit", "input": {"action": "write", "path": "x", "content": "y"}}]
             }),
         );
         assert_eq!(writes.effect_kind, ToolEffectKind::Write);
@@ -1482,5 +1924,732 @@ mod tests {
             invalid.required_permission,
             ToolPermissionMode::DangerFullAccess
         );
+    }
+
+    fn mixed_program(prompt: bool) -> Value {
+        let mut program = json!({"steps":[
+            {"id":"write","op":"call","tool":"edit","input":{"action":"write","path":"held.txt","content":"real prefix"}},
+            {"id":"tail","op":"call","tool":"web_fetch","depends_on":["write"],"input":{"url":"https://example.invalid/r1-no-network-dispatched"}}
+        ]});
+        if prompt {
+            program["steps"][1]["input"]["prompt"] = json!("summarize");
+        }
+        program
+    }
+
+    #[test]
+    fn r1_composite_effect_static_metadata_and_authorization_are_complete() {
+        use harness_contract::policy::{EffectExternality, PermissionResource};
+        use harness_contract::tool::{ToolApprovalClass, ToolEffectKind};
+        let host = test_host("composite-scopes", "/tmp/composite-scopes");
+        let lease = host.pin_snapshot();
+        let original = mixed_program(false);
+        let valid = mixed_program(true);
+        let effect = lease.describe_effect("tool_orchestrate", &original);
+        assert_eq!(
+            crate::requested_sub_call_tools("tool_orchestrate", &original),
+            crate::SubCallAuthorization::Requires(vec!["edit".into(), "web_fetch".into()])
+        );
+        assert_eq!(effect.scopes.len(), 4);
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::File
+                && scope.target.as_deref() == Some("held.txt")));
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::Network
+                && scope.target.as_deref()
+                    == Some("https://example.invalid/r1-no-network-dispatched")));
+        assert_eq!(effect.effect_kind, ToolEffectKind::Write);
+        assert_eq!(
+            effect.required_permission,
+            ToolPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(effect.approval_class, ToolApprovalClass::Policy);
+        assert_eq!(effect.idempotency, ToolIdempotency::Unknown);
+        assert!(effect.uses_network && !effect.spawns_process);
+        assert!(!effect.mutates_packages && !effect.mutates_system);
+        assert_eq!(
+            effect.assessment.externality,
+            EffectExternality::NetworkRead
+        );
+        let valid_effect = lease.describe_effect("tool_orchestrate", &valid);
+        assert_eq!(effect.scopes, valid_effect.scopes);
+        assert_ne!(effect.descriptor_hash, valid_effect.descriptor_hash);
+        lease
+            .validate_input("web_fetch", &valid["steps"][1]["input"])
+            .unwrap();
+        assert!(lease
+            .validate_input("web_fetch", &original["steps"][1]["input"])
+            .is_err());
+        let invocation =
+            lease.prepare_governed_invocation("mixed", "tool_orchestrate", &original, &[]);
+        assert_eq!(invocation.resource_demand.network_slots, 1);
+        assert_eq!(invocation.resource_demand.scopes.len(), 4);
+        let auth = authorization(&effect, Some("mixed-key"));
+        lease
+            .validate_authorization(&auth, "tool_orchestrate", &original)
+            .unwrap();
+        for index in 0..effect.scopes.len() {
+            let mut missing = auth.clone();
+            missing.authorization_lease.scopes.remove(index);
+            assert_eq!(
+                lease
+                    .validate_authorization(&missing, "tool_orchestrate", &original)
+                    .unwrap_err(),
+                ToolHostError::ScopeNotAuthorized
+            );
+        }
+        let mut readonly = auth.clone();
+        readonly.authorization_lease.ceiling = ToolPermissionMode::ReadOnly;
+        assert!(matches!(
+            lease.validate_authorization(&readonly, "tool_orchestrate", &original),
+            Err(ToolHostError::LeasePermissionDenied { .. })
+        ));
+        for status in [
+            harness_contract::policy::AuthorizationLeaseStatus::Expired,
+            harness_contract::policy::AuthorizationLeaseStatus::Revoked,
+        ] {
+            let mut inactive = auth.clone();
+            inactive.authorization_lease.status = status;
+            assert!(matches!(
+                lease.validate_authorization(&inactive, "tool_orchestrate", &original),
+                Err(ToolHostError::InactiveLease { .. })
+            ));
+        }
+        let mut expired = auth.clone();
+        expired.authorization_lease.expires_at_ms = 1;
+        assert!(matches!(
+            lease.validate_authorization(&expired, "tool_orchestrate", &original),
+            Err(ToolHostError::InactiveLease { .. })
+        ));
+        let mut forged = auth.clone();
+        forged.authorization_lease.signature = "forged".into();
+        assert_eq!(
+            lease
+                .validate_authorization(&forged, "tool_orchestrate", &original)
+                .unwrap_err(),
+            ToolHostError::InvalidLeaseSignature
+        );
+        let mut wrong_key = auth.clone();
+        wrong_key.idempotency_key = Some("other-key".into());
+        assert_eq!(
+            lease
+                .validate_authorization(&wrong_key, "tool_orchestrate", &original)
+                .unwrap_err(),
+            ToolHostError::LeaseIdempotencyMismatch
+        );
+        let mut wrong_hash = auth.clone();
+        wrong_hash.descriptor_hash = "wrong".into();
+        wrong_hash.authorization_lease.effect_descriptor_hash = "wrong".into();
+        assert!(matches!(
+            lease.validate_authorization(&wrong_hash, "tool_orchestrate", &original),
+            Err(ToolHostError::EffectEscalated { .. })
+        ));
+        for changed in [
+            {
+                let mut changed = original.clone();
+                changed["steps"][0]["input"]["path"] = json!("other.txt");
+                changed
+            },
+            {
+                let mut changed = original.clone();
+                changed["steps"][0]["input"]["content"] = json!("different");
+                changed
+            },
+            {
+                let mut changed = original.clone();
+                changed["steps"][1]["input"]["url"] = json!("https://other.invalid");
+                changed
+            },
+        ] {
+            assert!(matches!(
+                lease.validate_authorization(&auth, "tool_orchestrate", &changed),
+                Err(ToolHostError::EffectEscalated { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn original_static_discovery_network_and_write_preserve_every_signed_dimension() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource};
+        let lease =
+            test_host("static-family-frontier", "/tmp/static-family-frontier").pin_snapshot();
+        for (tool, input, read_targets) in [
+            (
+                "glob_search",
+                json!({"path":"src","pattern":"*.rs"}),
+                vec!["src"],
+            ),
+            (
+                "glob_search",
+                json!({"patterns":[{"path":"src","pattern":"*.rs"},{"path":"tests","pattern":"*.rs"}]}),
+                vec!["src", "tests"],
+            ),
+            (
+                "grep_search",
+                json!({"path":"src","pattern":"needle"}),
+                vec!["src"],
+            ),
+            (
+                "grep_search",
+                json!({"searches":[{"path":"src","pattern":"needle"},{"path":"tests","pattern":"needle"}]}),
+                vec!["src", "tests"],
+            ),
+            (
+                "workspace_snapshot",
+                json!({"roots":["src","tests"]}),
+                vec!["src", "tests"],
+            ),
+        ] {
+            let program = json!({"steps":[
+                {"id":"discover","op":"call","tool":tool,"input":input},
+                {"id":"remote","op":"call","tool":"web_fetch","input":{"url":"https://example.invalid","prompt":"summarize"}},
+                {"id":"write","op":"call","tool":"edit","input":{"action":"write","path":"out.txt","content":"x"}}
+            ]});
+            let effect = lease.describe_effect("tool_orchestrate", &program);
+            assert_eq!(
+                effect.effect_kind,
+                harness_contract::tool::ToolEffectKind::Write
+            );
+            assert!(effect.uses_network && !effect.spawns_process);
+            // Static discovery inputs keep their precise signed read frontier;
+            // only an escaping pattern or unknown input widens to the workspace.
+            for target in &read_targets {
+                assert!(
+                    effect.scopes.iter().any(|scope| scope.resource
+                        == PermissionResource::File
+                        && scope.operation == PermissionOperation::Read
+                        && scope.target.as_deref() == Some(*target)),
+                    "{tool}: read {target}"
+                );
+            }
+            for (resource, operation, target) in [
+                (
+                    PermissionResource::File,
+                    PermissionOperation::Read,
+                    Some("src"),
+                ),
+                (
+                    PermissionResource::File,
+                    PermissionOperation::Write,
+                    Some("out.txt"),
+                ),
+                (
+                    PermissionResource::File,
+                    PermissionOperation::Write,
+                    Some(".cowd/checkpoints"),
+                ),
+                (
+                    PermissionResource::Network,
+                    PermissionOperation::Call,
+                    Some("https://example.invalid"),
+                ),
+            ] {
+                assert!(
+                    effect.scopes.iter().any(|scope| scope.resource == resource
+                        && scope.operation == operation
+                        && scope.target.as_deref() == target),
+                    "{tool}: {resource:?}/{operation:?}/{target:?}"
+                );
+            }
+            assert!(effect
+                .scopes
+                .iter()
+                .any(|scope| scope.resource == PermissionResource::Tool));
+            let auth = authorization(&effect, None);
+            lease
+                .validate_authorization(&auth, "tool_orchestrate", &program)
+                .unwrap();
+            for index in 0..effect.scopes.len() {
+                let mut missing = auth.clone();
+                missing.authorization_lease.scopes.remove(index);
+                assert_eq!(
+                    lease
+                        .validate_authorization(&missing, "tool_orchestrate", &program)
+                        .unwrap_err(),
+                    ToolHostError::ScopeNotAuthorized
+                );
+            }
+            let mut changed = program.clone();
+            changed["steps"][2]["input"]["path"] = json!("different.txt");
+            assert_ne!(
+                effect.descriptor_hash,
+                lease
+                    .describe_effect("tool_orchestrate", &changed)
+                    .descriptor_hash
+            );
+        }
+    }
+
+    #[test]
+    fn original_static_and_dynamic_discovery_share_the_workspace_file_envelope() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource};
+        let lease = test_host("coherent-discovery", "/tmp/coherent-discovery").pin_snapshot();
+        for (tool, literal, dynamic) in [
+            (
+                "glob_search",
+                json!({"pattern":"*.rs"}),
+                json!({"path":"$prior.root","pattern":"*.rs"}),
+            ),
+            (
+                "grep_search",
+                json!({"pattern":"needle"}),
+                json!({"path":"$prior.root","pattern":"needle"}),
+            ),
+            (
+                "workspace_snapshot",
+                json!({}),
+                json!({"roots":"$prior.roots"}),
+            ),
+        ] {
+            let static_effect = lease.describe_effect(tool, &literal);
+            let program =
+                json!({"steps":[{"id":"discover","op":"call","tool":tool,"input":dynamic}]});
+            let dynamic_effect = lease.describe_effect("tool_orchestrate", &program);
+            for effect in [&static_effect, &dynamic_effect] {
+                let files = effect
+                    .scopes
+                    .iter()
+                    .filter(|scope| scope.resource == PermissionResource::File)
+                    .collect::<Vec<_>>();
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].operation, PermissionOperation::Read);
+                assert_eq!(files[0].target, None);
+                assert!(!effect.uses_network && !effect.spawns_process);
+                assert!(effect
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.resource == PermissionResource::Tool));
+            }
+            assert_ne!(
+                static_effect.descriptor_hash,
+                dynamic_effect.descriptor_hash
+            );
+            let demand = resource_demand_for_effect(&static_effect);
+            assert!(demand
+                .scopes
+                .iter()
+                .any(|scope| scope.key == "." && scope.access == ResourceAccess::Read));
+        }
+    }
+
+    #[test]
+    fn original_lsp_root_not_the_query_path_bounds_the_file_effect() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource};
+        let root =
+            std::env::temp_dir().join(format!("cowd-lsp-footprint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lease = test_host("lsp-footprint", &root).pin_snapshot();
+        lease.snapshot().lsp.register_command(
+            "rust",
+            root.to_str(),
+            vec![],
+            vec!["not-executed".into()],
+        );
+        let input = json!({"action":"hover","path":"src/a.rs","line":0,"character":0});
+        let effect = lease.describe_effect("lsp", &input);
+        assert!(effect.spawns_process && !effect.uses_network);
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::File
+                && scope.operation == PermissionOperation::Read
+                && scope.target.is_none()));
+        assert!(!effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::File
+                && scope.target.as_deref() == Some("src/a.rs")));
+        let program = json!({"steps":[{"id":"lsp","op":"call","tool":"lsp","input":input}]});
+        let files = effect
+            .scopes
+            .iter()
+            .find(|scope| scope.resource == PermissionResource::File)
+            .unwrap();
+        assert!(lease
+            .describe_effect("tool_orchestrate", &program)
+            .scopes
+            .contains(files));
+        let diagnostics =
+            lease.describe_effect("lsp", &json!({"action":"diagnostics","path":"src/a.rs"}));
+        assert!(!diagnostics.spawns_process);
+        assert!(diagnostics
+            .scopes
+            .iter()
+            .all(|scope| scope.resource != PermissionResource::File));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r1_composite_effect_dynamic_inputs_cannot_claim_exact_scope() {
+        use harness_contract::policy::{DataClassification, PermissionResource};
+        use harness_contract::tool::ToolEffectKind;
+        let root =
+            std::env::temp_dir().join(format!("cowd-dynamic-envelope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = test_host("dynamic-envelope", &root);
+        let lease = host.pin_snapshot();
+        for input in [
+            json!({"action":"write","path":"fixed.txt","content":"$prior.content"}),
+            json!({"action":"write","path":"fixed.txt","content":{"nested":["$item.content"]}}),
+        ] {
+            let program = json!({"steps":[{"id":"data","op":"map","over":"$prior.items","tool":"edit","input":input}]});
+            let effect = lease.describe_effect("tool_orchestrate", &program);
+            assert_eq!(effect.effect_kind, ToolEffectKind::Write);
+            assert!(effect
+                .scopes
+                .iter()
+                .any(|scope| scope.resource == PermissionResource::File
+                    && scope.target.as_deref() == Some("fixed.txt")));
+            assert_eq!(
+                effect.assessment.data_sensitivity,
+                DataClassification::Secret
+            );
+            lease
+                .validate_authorization(&authorization(&effect, None), "tool_orchestrate", &program)
+                .unwrap();
+        }
+        for input in [
+            json!({"action":"write","path":"$item.path","content":"x"}),
+            json!({"action":"$prior.action","path":"fixed.txt","content":"x"}),
+            json!("$prior.input"),
+        ] {
+            let program = json!({"steps":[{"id":"bounded","op":"map","over":"$prior.items","tool":"edit","input":input}]});
+            let effect = lease.describe_effect("tool_orchestrate", &program);
+            assert_eq!(effect.effect_kind, ToolEffectKind::Write);
+            assert!(effect
+                .scopes
+                .iter()
+                .all(|scope| scope.resource == PermissionResource::File));
+            assert_eq!(
+                effect
+                    .scopes
+                    .iter()
+                    .filter(|scope| scope.target.is_none())
+                    .count(),
+                2
+            );
+            assert_eq!(effect.scopes.len(), 3);
+            assert_eq!(
+                effect.assessment.data_sensitivity,
+                DataClassification::Secret
+            );
+            let mut exact_only = authorization(&effect, None);
+            for scope in &mut exact_only.authorization_lease.scopes {
+                scope.target = Some("fixed.txt".into());
+            }
+            assert_eq!(
+                lease
+                    .validate_authorization(&exact_only, "tool_orchestrate", &program)
+                    .unwrap_err(),
+                ToolHostError::ScopeNotAuthorized
+            );
+        }
+        for (tool, input) in [
+            ("bash", json!({"command":"$prior.command"})),
+            (
+                "web_fetch",
+                json!({"url":"$prior.url","prompt":"summarize"}),
+            ),
+            ("mcp", json!({"action":"$item.action","server":"server"})),
+        ] {
+            let program = json!({"steps":[
+                {"id":"prefix","op":"call","tool":"edit","input":{"action":"write","path":"must-not-exist","content":"x"}},
+                {"id":"unbounded","op":"call","tool":tool,"input":input}
+            ]});
+            let effect = lease.describe_effect("tool_orchestrate", &program);
+            assert_eq!(effect.effect_kind, ToolEffectKind::Unknown);
+            assert!(effect.scopes.iter().all(|scope| scope.target.is_none()));
+            assert!(matches!(
+                lease.validate_authorization(
+                    &authorization(&effect, None),
+                    "tool_orchestrate",
+                    &program
+                ),
+                Err(ToolHostError::InputContract { .. })
+            ));
+            assert!(
+                crate::executor::orchestrate::run_orchestrate(&lease, &program)
+                    .unwrap_err()
+                    .contains("cannot prove")
+            );
+            assert!(!root.join("must-not-exist").exists());
+        }
+        for literal in ["$(date)", "$HOME/x", "$$item.path"] {
+            let program = json!({"steps":[{"id":"literal","op":"call","tool":"edit","input":{"action":"write","path":literal,"content":"x"}}]});
+            let effect = lease.describe_effect("tool_orchestrate", &program);
+            assert!(effect
+                .scopes
+                .iter()
+                .any(|scope| scope.resource == PermissionResource::File
+                    && scope.target.as_deref() == Some(literal)));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composite_repeated_targets_skipped_effects_compute_and_safety_survive() {
+        use harness_contract::policy::{
+            DataClassification, PermissionOperation, PermissionResource,
+        };
+        use harness_contract::tool::ToolApprovalClass;
+        let lease = test_host("potential-scopes", "/tmp/potential-scopes").pin_snapshot();
+        let program = json!({"steps":[
+            {"id":"edits","op":"batch","calls":[
+                {"tool":"edit","input":{"action":"write","path":"b","content":"x"}},
+                {"tool":"edit","input":{"action":"write","path":"a","content":"x"}},
+                {"tool":"edit","input":{"action":"write","path":"a","content":"x"}}
+            ]},
+            {"id":"skip","op":"when","if":{"ref":"$edits","present":false},"tool":"web_fetch","input":{"url":"https://skipped.invalid","prompt":"x"}},
+            {"id":"zero","op":"repeat","max":0,"while":{"ref":"$edits","present":true},"tool":"edit","input":{"action":"write","path":".env","content":"x"}},
+            {"id":"reduce","op":"compute","language":"python","code":"print(_input)","input":"$edits"}
+        ]});
+        let effect = lease.describe_effect("tool_orchestrate", &program);
+        assert_eq!(
+            effect
+                .scopes
+                .iter()
+                .filter(|scope| scope.resource == PermissionResource::File
+                    && scope.operation == PermissionOperation::Write)
+                .count(),
+            4
+        );
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.target.as_deref() == Some("https://skipped.invalid")));
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::Shell
+                && scope.operation == PermissionOperation::Execute));
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::File
+                && scope.operation == PermissionOperation::Read
+                && scope.target.is_none()));
+        assert!(effect.uses_network && effect.spawns_process);
+        assert_eq!(
+            effect.assessment.data_sensitivity,
+            DataClassification::Secret
+        );
+        let preview = json!({"steps":[{"id":"p","op":"call","tool":"edit","input":{"action":"preview","edits":[{"path":"a"}]}}]});
+        assert_eq!(
+            lease
+                .describe_effect("tool_orchestrate", &preview)
+                .required_permission,
+            ToolPermissionMode::WorkspaceWrite
+        );
+        let dangerous = json!({"steps":[{"id":"p","op":"call","tool":"bash","input":{"command":"sudo npm install package"}}]});
+        let effect = lease.describe_effect("tool_orchestrate", &dangerous);
+        assert_eq!(effect.approval_class, ToolApprovalClass::Administrator);
+        assert!(effect.spawns_process && effect.mutates_packages && effect.mutates_system);
+        let network = json!({"steps":[{"id":"p","op":"call","tool":"web_fetch","input":{"url":"https://read.invalid","prompt":"x"}}]});
+        let effect = lease.describe_effect("tool_orchestrate", &network);
+        assert_eq!(effect.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(effect.approval_class, ToolApprovalClass::Policy);
+        assert!(effect.uses_network);
+    }
+
+    #[test]
+    fn composite_real_file_prefix_and_failed_tail_keep_original_error_trace() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root =
+            std::env::temp_dir().join(format!("cowd-composite-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lease = test_host("real-partial", &root).pin_snapshot();
+        let program = mixed_program(false);
+        let effect = lease.describe_effect("tool_orchestrate", &program);
+        let error = lease
+            .execute(
+                &authorization(&effect, Some("partial-key")),
+                "tool_orchestrate",
+                &program,
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            std::fs::read_to_string(root.join("held.txt")).unwrap(),
+            "real prefix"
+        );
+        assert!(error.contains("prompt") && error.contains("tail") && error.contains("trace:"));
+        assert!(error.contains("\"status\":\"error\"") && error.contains("\"status\":\"ok\""));
+        let collect_program = json!({"steps":[{"id":"batch","op":"batch","on_error":"collect","calls":[
+            {"tool":"read_file","as":"found","input":{"path":"held.txt"}},
+            {"tool":"read_file","as":"missing","input":{"path":"missing.txt"}}
+        ]}]});
+        let effect = lease.describe_effect("tool_orchestrate", &collect_program);
+        let output = lease
+            .execute(
+                &authorization(&effect, None),
+                "tool_orchestrate",
+                &collect_program,
+            )
+            .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["steps"]["batch"]["found"]["ok"], true);
+        assert_eq!(output["steps"]["batch"]["missing"]["ok"], false);
+        assert!(output["steps"]["batch"]["missing"]["error"].is_string());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composite_original_dynamic_map_flow_and_data_write_keep_their_bounded_envelope() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use harness_contract::policy::PermissionResource;
+        let root =
+            std::env::temp_dir().join(format!("cowd-composite-map-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::fs::write(root.join("b.txt"), "gamma").unwrap();
+        let lease = test_host("original-dynamic-map", &root).pin_snapshot();
+        let program = json!({"steps":[
+            {"id":"g","op":"call","tool":"glob_search","input":{"pattern":"*.txt"}},
+            {"id":"files","op":"map","over":"$g.filenames","tool":"read_file","input":{"path":"$item"},"field":"file"},
+            {"id":"gamma","op":"filter","over":"$files","field":"content","contains":"gamma"},
+            {"id":"count","op":"collect","over":"$gamma","agg":"count"},
+            {"id":"branch","op":"when","if":{"ref":"$count","equals":1},"tool":"read_file","input":{"path":"b.txt"}},
+            {"id":"looped","op":"repeat","max":3,"while":{"ref":"$count","equals":1},"tool":"read_file","input":{"path":"a.txt"}},
+            {"id":"data_write","op":"call","tool":"edit","input":{"action":"write","path":"summary.txt","content":"$branch.file.content"}},
+            {"id":"skip","op":"when","if":{"ref":"$count","equals":0},"tool":"edit","input":{"action":"write","path":"skipped.txt","content":"never"}},
+            {"id":"zero","op":"repeat","max":0,"while":{"ref":"$count","equals":1},"tool":"edit","input":{"action":"write","path":"zero.txt","content":"never"}}
+        ],"return":"$count"});
+        let effect = lease.describe_effect("tool_orchestrate", &program);
+        assert!(effect
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == PermissionResource::File && scope.target.is_none()));
+        let output = lease
+            .execute(
+                &authorization(&effect, Some("dynamic-key")),
+                "tool_orchestrate",
+                &program,
+            )
+            .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["result"], 1);
+        assert_eq!(output["steps"]["gamma"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("summary.txt")).unwrap(),
+            "gamma"
+        );
+        assert!(!root.join("skipped.txt").exists() && !root.join("zero.txt").exists());
+        let map_collect = json!({"steps":[
+            {"id":"g","op":"call","tool":"glob_search","input":{"pattern":"*.txt"}},
+            {"id":"mapped","op":"map","over":"$g.filenames","tool":"read_file","input":{"path":"missing.txt"},"on_error":"collect"}
+        ]});
+        let effect = lease.describe_effect("tool_orchestrate", &map_collect);
+        let output = lease
+            .execute(
+                &authorization(&effect, None),
+                "tool_orchestrate",
+                &map_collect,
+            )
+            .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        let receipts = output["steps"]["mapped"].as_array().unwrap();
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt["ok"] == false && receipt["error"].is_string()));
+        std::fs::write(root.join("action.txt"), "write").unwrap();
+        std::fs::write(root.join("target.txt"), "produced.txt").unwrap();
+        let dynamic_control = json!({"steps":[
+            {"id":"action","op":"call","tool":"read_file","input":{"path":"action.txt"}},
+            {"id":"target","op":"call","tool":"read_file","input":{"path":"target.txt"}},
+            {"id":"write","op":"call","tool":"edit","input":{"action":"$action.file.content","path":"$target.file.content","content":"bounded"}}
+        ]});
+        let effect = lease.describe_effect("tool_orchestrate", &dynamic_control);
+        lease
+            .execute(
+                &authorization(&effect, Some("control-key")),
+                "tool_orchestrate",
+                &dynamic_control,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("produced.txt")).unwrap(),
+            "bounded"
+        );
+        let escaped = format!("cowd-escape-{}", uuid::Uuid::new_v4());
+        std::fs::write(root.join("target.txt"), format!("../{escaped}")).unwrap();
+        assert!(lease
+            .execute(
+                &authorization(&effect, Some("control-key")),
+                "tool_orchestrate",
+                &dynamic_control
+            )
+            .is_err());
+        assert!(!root.parent().unwrap().join(escaped).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composite_pins_catalog_and_rejects_non_dispatchable_children() {
+        use harness_contract::tool::{ToolEffectKind, ToolEffectResolverSpec};
+        let host = test_host("pinned-children", "/tmp/pinned-children");
+        let before = host.pin_snapshot();
+        let program = mixed_program(true);
+        let effect = before.describe_effect("tool_orchestrate", &program);
+        let catalog = ToolCatalog::builtin()
+            .with_runtime_tools(vec![crate::RuntimeToolDefinition {
+                name: "runtime_only".into(),
+                description: Some("not an orchestration builtin".into()),
+                input_schema: json!({"type":"object"}),
+                required_permission: crate::permissions::PermissionMode::ReadOnly,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "runtime.readonly".into(),
+                    resolver_version: 9,
+                },
+            }])
+            .unwrap();
+        host.replace_snapshot(ToolHostSnapshot::new(
+            Arc::new(catalog),
+            Arc::new(LspRegistry::new()),
+            None,
+        ));
+        let after = host.pin_snapshot();
+        assert_eq!(before.describe_effect("tool_orchestrate", &program), effect);
+        assert_ne!(
+            after
+                .describe_effect("tool_orchestrate", &program)
+                .descriptor_hash,
+            effect.descriptor_hash
+        );
+        let auth = authorization(&effect, Some("pin-key"));
+        before
+            .validate_authorization(&auth, "tool_orchestrate", &program)
+            .unwrap();
+        assert!(matches!(
+            after.validate_authorization(&auth, "tool_orchestrate", &program),
+            Err(ToolHostError::EffectEscalated { .. })
+        ));
+        for tool in [
+            "runtime_only",
+            "unknown",
+            "tool_orchestrate",
+            "web-fetch",
+            "$prior.tool",
+        ] {
+            let program = json!({"steps":[{"id":"bad","op":"call","tool":tool,"input":{}}]});
+            let effect = after.describe_effect("tool_orchestrate", &program);
+            assert_eq!(effect.effect_kind, ToolEffectKind::Unknown);
+            assert!(matches!(
+                after.validate_authorization(
+                    &authorization(&effect, None),
+                    "tool_orchestrate",
+                    &program
+                ),
+                Err(ToolHostError::InputContract { .. })
+            ));
+        }
     }
 }

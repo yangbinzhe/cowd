@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "content_digest": {
+      "type": "string"
+    },
+    "message_id": {
+      "type": "string"
+    },
+    "message_sequence": {
+      "type": "string"
+    },
+    "runtime_commit_cursor": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "message_id",
+    "message_sequence",
+    "runtime_commit_cursor",
+    "content_digest"
+  ],
+  "title": "SessionTerminalReceiptAckInputV1",
+  "type": "object"
+}

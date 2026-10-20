@@ -89,6 +89,40 @@ impl NetworkDomainPolicy {
         self.enforce_domain(&host, false)
     }
 
+    pub fn enforce_url_with_filters(
+        &self,
+        url: &str,
+        call_allowed: Option<&[String]>,
+        call_blocked: Option<&[String]>,
+    ) -> Result<NetworkPolicyReceipt, String> {
+        let mut receipt = self.enforce_url(url)?;
+        if receipt.denied {
+            return Ok(receipt);
+        }
+        let parsed = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+        let host = parsed.host_str().ok_or("network target has no host")?;
+        let blocked = call_blocked.map(|domains| domains.iter().map(|domain| normalize_domain(domain)).collect::<BTreeSet<_>>());
+        let allowed = call_allowed.map(|domains| domains.iter().map(|domain| normalize_domain(domain)).collect::<BTreeSet<_>>());
+        let field = if blocked.as_ref().is_some_and(|domains| host_matches_any(host, domains)) {
+            Some("blocked_domains")
+        } else if allowed.as_ref().is_some_and(|domains| !host_matches_any(host, domains)) {
+            Some("allowed_domains")
+        } else {
+            None
+        };
+        if let Some(field) = field {
+            receipt.denied = true;
+            receipt.requires_approval = false;
+            receipt.violations.push(NetworkViolation {
+                field: field.into(),
+                domain: host.into(),
+                reason: "target is excluded by this call's network filters".into(),
+                action_taken: "blocked".into(),
+            });
+        }
+        Ok(receipt)
+    }
+
     /// Enforce the policy against a domain plus per-call domain filters.
     pub fn enforce_domain(
         &self,
@@ -307,6 +341,26 @@ fn is_private_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_url_filters_narrow_without_widening_global_policy() {
+        let global = NetworkDomainPolicy::default();
+        let blocked = vec!["HTTPS://EXAMPLE.INVALID/".to_string()];
+        let allowed = vec!["docs.rs".to_string()];
+        assert!(global.enforce_url_with_filters("https://example.invalid", None, Some(&blocked)).unwrap().denied);
+        assert!(global.enforce_url_with_filters("https://sub.example.invalid", None, Some(&blocked)).unwrap().denied);
+        assert!(!global.enforce_url_with_filters("https://sub.docs.rs", Some(&allowed), None).unwrap().denied);
+        assert!(global.enforce_url_with_filters("https://example.invalid", Some(&allowed), None).unwrap().denied);
+        assert!(global.enforce_url_with_filters("https://docs.rs", Some(&[]), None).unwrap().denied);
+        let restricted = NetworkDomainPolicy {
+            mode: NetworkDomainMode::Allow,
+            allow: vec!["docs.rs".into()],
+            block: vec!["blocked.docs.rs".into()],
+        };
+        assert!(restricted.enforce_url_with_filters("https://example.invalid", Some(&["example.invalid".into()]), None).unwrap().denied);
+        assert!(restricted.enforce_url_with_filters("https://blocked.docs.rs", Some(&allowed), None).unwrap().denied);
+        assert!(!global.enforce_url_with_filters("https://example.invalid", None, None).unwrap().denied);
+    }
 
     fn policy(mode: NetworkDomainMode, allow: &[&str], block: &[&str]) -> NetworkDomainPolicy {
         NetworkDomainPolicy {

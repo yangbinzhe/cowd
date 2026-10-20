@@ -158,6 +158,21 @@ pub(crate) const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "runtime canonical node usage",
         "harness-eval",
     ),
+    count_metric(
+        "provider_input_tokens",
+        "runtime provider wire usage",
+        "harness-eval",
+    ),
+    count_metric(
+        "provider_output_tokens",
+        "runtime provider wire usage",
+        "harness-eval",
+    ),
+    count_metric(
+        "provider_output_tokens_per_second",
+        "runtime provider integer output tokens per service second",
+        "harness-eval",
+    ),
     rate_metric(
         "wall_tokens_per_second",
         "runtime provider telemetry",

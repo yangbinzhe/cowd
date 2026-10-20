@@ -254,11 +254,17 @@ fn observed_acceptance_heap_bytes(
         .chain(&acceptance.unresolved_obligation_ids)
         .map(String::len)
         .sum::<usize>();
+    bytes = bytes.saturating_add(acceptance.observed_evidence.capacity().saturating_mul(
+        std::mem::size_of::<harness_contract::context::ObservedEvidence>(),
+    ));
     for evidence in &acceptance.observed_evidence {
         bytes = bytes
             .saturating_add(evidence.obligation_id.len())
             .saturating_add(evidence.tool_name.len());
         bytes = bytes.saturating_add(match &evidence.target {
+            harness_contract::context::EvidenceTargetIdentity::ToolExecution { execution } => {
+                tool_execution_heap_bytes(execution)
+            }
             harness_contract::context::EvidenceTargetIdentity::Workspace { scope } => scope
                 .path
                 .workspace_id
@@ -273,6 +279,19 @@ fn observed_acceptance_heap_bytes(
                         .as_ref()
                         .map_or(0, String::len),
                 ),
+            harness_contract::context::EvidenceTargetIdentity::LocalNetwork { operation } => {
+                operation.binding.call_key.len()
+                    + operation.binding.tool_use_id.len() + 192
+                    + operation.operations.iter().map(|operation| {
+                        operation.endpoint.len() + operation.input_sha256.len()
+                            + match &operation.terminal {
+                                harness_contract::context::LocalNetworkTerminal::BodyDone { body_sha256, .. } => body_sha256.len(),
+                                harness_contract::context::LocalNetworkTerminal::NotStarted { reason_code }
+                                | harness_contract::context::LocalNetworkTerminal::Unknown { reason_code } => reason_code.len(),
+                            }
+                            + std::mem::size_of::<harness_contract::context::LocalNetworkOperation>()
+                    }).sum::<usize>()
+            }
             harness_contract::context::EvidenceTargetIdentity::Network { endpoint } => {
                 endpoint.len()
             }
@@ -300,8 +319,109 @@ fn observed_acceptance_heap_bytes(
     bytes
 }
 
+fn tool_execution_heap_bytes(execution: &harness_contract::context::ToolExecutionFact) -> usize {
+    use harness_contract::context::ToolExecutionTerminal;
+    let admission = &execution.admission;
+    let binding = &admission.binding;
+    let mut bytes = binding
+        .call_key
+        .capacity()
+        .saturating_add(binding.tool_use_id.capacity())
+        .saturating_add(binding.input_sha256.capacity())
+        .saturating_add(binding.descriptor_sha256.capacity())
+        .saturating_add(binding.authority_sha256.capacity())
+        .saturating_add(admission.code_sha256.capacity())
+        .saturating_add(execution.stdout_sha256.capacity())
+        .saturating_add(execution.stderr_sha256.capacity())
+        .saturating_add(
+            admission
+                .inputs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<
+                    harness_contract::context::ToolExecutionInput,
+                >()),
+        );
+    for input in &admission.inputs {
+        bytes = bytes
+            .saturating_add(input.relative_path.capacity())
+            .saturating_add(input.sha256.capacity());
+    }
+    for artifact in [&admission.source_bundle, &execution.body] {
+        bytes = bytes
+            .saturating_add(artifact.selector.capacity())
+            .saturating_add(artifact.sha256.capacity())
+            .saturating_add(artifact.media_type.capacity())
+            .saturating_add(artifact.visibility_scope.capacity());
+    }
+    bytes.saturating_add(match &execution.terminal {
+        ToolExecutionTerminal::NotStarted { reason_code }
+        | ToolExecutionTerminal::Unknown { reason_code } => reason_code.capacity(),
+        ToolExecutionTerminal::Settled { closure, .. } => closure.backend.capacity(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_process_heap_accounts_inputs_artifact_refs_and_terminal_without_body_283() {
+        let observation = crate::path_identity::untrusted_process_observation_283();
+        let harness_contract::context::EvidenceTargetIdentity::ToolExecution { mut execution } =
+            observation.target
+        else {
+            panic!("negative DTO target")
+        };
+        let before = super::tool_execution_heap_bytes(&execution);
+        execution.body.bytes = u64::MAX;
+        execution.stdout_bytes = u64::MAX;
+        assert_eq!(super::tool_execution_heap_bytes(&execution), before);
+        execution.admission.inputs[0].relative_path.reserve(4096);
+        execution.body.selector.reserve(4096);
+        execution.admission.source_bundle.selector.reserve(4096);
+        assert!(super::tool_execution_heap_bytes(&execution) >= before + 3 * 4096);
+        let mut second = execution.admission.inputs[0].clone();
+        second.relative_path = "another.py".into();
+        execution.admission.inputs.push(second);
+        assert!(super::tool_execution_heap_bytes(&execution) > before + 19 + 64);
+        execution.terminal = harness_contract::context::ToolExecutionTerminal::Unknown {
+            reason_code: "x".repeat(128),
+        };
+        assert!(super::tool_execution_heap_bytes(&execution) >= 128);
+        execution.terminal = harness_contract::context::ToolExecutionTerminal::NotStarted {
+            reason_code: String::new(),
+        };
+        let empty_reason = super::tool_execution_heap_bytes(&execution);
+        execution.terminal = harness_contract::context::ToolExecutionTerminal::NotStarted {
+            reason_code: "reason".repeat(512),
+        };
+        assert_eq!(
+            super::tool_execution_heap_bytes(&execution),
+            empty_reason + 6 * 512
+        );
+        let mut backend = String::new();
+        backend.reserve(4096);
+        let capacity = backend.capacity();
+        execution.terminal = harness_contract::context::ToolExecutionTerminal::Settled {
+            exit_code: None,
+            signal: None,
+            stop_reason: harness_contract::context::ToolExecutionStopReason::Cancelled,
+            closure: harness_contract::context::ToolProcessClosure {
+                backend,
+                namespace_inode: 0,
+                init_host_pid: 0,
+                init_start_ticks: 0,
+                all_children_reaped: false,
+                init_reaped: false,
+                kernel_hardening_applied: false,
+                network_disabled: false,
+                project_read_only: false,
+                status_channel_protected: false,
+            },
+        };
+        assert_eq!(
+            super::tool_execution_heap_bytes(&execution),
+            empty_reason + capacity
+        );
+    }
     use std::sync::RwLock as StdRwLock;
 
     use harness_contract::execution_graph::{

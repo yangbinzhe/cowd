@@ -154,6 +154,35 @@ struct CoreBridgeRequestDependencies {
     app_state: Arc<OnceLock<Arc<AppState>>>,
 }
 
+impl CoreBridgeRequestDependencies {
+    async fn revalidate_source(
+        &self,
+        envelope: &AppInvocationEnvelopeV1,
+        app_id: &str,
+        originating_operation: &str,
+        operation: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), BridgeFailure> {
+        if !core_platform_operations::supports(operation) {
+            return Ok(());
+        }
+        let state = self
+            .app_state
+            .get()
+            .ok_or_else(|| BridgeFailure::internal("Gateway state unavailable"))?;
+        core_platform_operations::validate_frame_operation(
+            state,
+            envelope,
+            app_id,
+            originating_operation,
+            operation,
+            payload,
+        )
+        .await
+        .map_err(|detail| BridgeFailure::new(AppErrorCodeV1::OperationNotGranted, detail, false))
+    }
+}
+
 pub(crate) struct CoreBridgeServer {
     path: PathBuf,
     cancellation: CancellationToken,
@@ -365,6 +394,131 @@ async fn route_request(
     let payload = envelope.payload.clone();
     let operation_for_dispatch = operation_id.clone();
 
+    dependencies
+        .revalidate_source(
+            envelope,
+            &app_id.0,
+            &originating_app_operation_id,
+            &operation_id,
+            &payload,
+        )
+        .await?;
+
+    if operation_id == core_platform_operations::SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID {
+        let key = envelope.idempotency_key.clone().ok_or_else(|| {
+            BridgeFailure::new(
+                AppErrorCodeV1::IdempotencyConflict,
+                "explicit ACK idempotency key required",
+                false,
+            )
+        })?;
+        let state = dependencies
+            .app_state
+            .get()
+            .ok_or_else(|| BridgeFailure::internal("Gateway state unavailable"))?;
+        let authority = core_platform_operations::frame_authority_fingerprint(
+            state,
+            envelope,
+            &app_id.0,
+            &originating_app_operation_id,
+            &operation_id,
+        )
+        .await
+        .map_err(|detail| BridgeFailure::new(AppErrorCodeV1::OperationNotGranted, detail, false))?;
+        let digest = payload_digest(
+            &binding.registration,
+            &originating_app_operation_id,
+            &operation_id,
+            None,
+            &serde_json::json!({"authority":authority,"payload":payload}),
+        )?;
+        let cache_key = format!(
+            "session-ack:{}:{key}:{:x}",
+            app_id.0,
+            Sha256::digest(
+                serde_json::to_vec(&authority)
+                    .map_err(|error| BridgeFailure::internal(error.to_string()))?
+            )
+        );
+        let cached = {
+            let cache = dependencies.commands.lock().await;
+            match cache.get(&cache_key) {
+                Some(CachedCommand::Completed(existing, receipt)) if *existing == digest => {
+                    Some(receipt.clone())
+                }
+                Some(_) => {
+                    return Err(BridgeFailure::new(
+                        AppErrorCodeV1::IdempotencyConflict,
+                        "ACK key belongs to a different exact tuple",
+                        false,
+                    ))
+                }
+                None => None,
+            }
+        };
+        if let Some(mut receipt) = cached {
+            dependencies
+                .revalidate_source(
+                    envelope,
+                    &app_id.0,
+                    &originating_app_operation_id,
+                    &operation_id,
+                    &payload,
+                )
+                .await?;
+            receipt.request_id = request_id;
+            receipt.replayed = true;
+            return json_response(StatusCode::OK, &receipt);
+        }
+        let output = dispatch_with_deadline(
+            Arc::clone(&dependencies.store),
+            Arc::clone(&dependencies.app_state),
+            app_id.0.clone(),
+            originating_app_operation_id.clone(),
+            envelope,
+            operation_id.clone(),
+            payload.clone(),
+            timeout_ms,
+        )
+        .await?;
+        let receipt = DurableReceiptV1 {
+            schema_version: 1,
+            request_id,
+            receipt_id: format!("session-ack:{:x}", Sha256::digest(key.as_bytes())),
+            idempotency_key: key,
+            status: ReceiptStatusV1::Completed,
+            result_revision: None,
+            replayed: false,
+            payload_digest: digest.clone(),
+            payload: output,
+        };
+        receipt
+            .validate()
+            .map_err(|error| BridgeFailure::internal(error.to_string()))?;
+        let mut cache = dependencies.commands.lock().await;
+        if cache.len() >= 4096 {
+            if let Some(completed) = cache.iter().find_map(|(key, value)| {
+                matches!(value, CachedCommand::Completed(_, _)).then(|| key.clone())
+            }) {
+                cache.remove(&completed);
+            }
+        }
+        if cache.len() < 4096 {
+            cache.insert(cache_key, CachedCommand::Completed(digest, receipt.clone()));
+        }
+        drop(cache);
+        dependencies
+            .revalidate_source(
+                envelope,
+                &app_id.0,
+                &originating_app_operation_id,
+                &operation_id,
+                &payload,
+            )
+            .await?;
+        return json_response(StatusCode::OK, &receipt);
+    }
+
     if descriptor.kind == OperationKindV1::Command {
         let key = envelope.idempotency_key.clone().ok_or_else(|| {
             BridgeFailure::new(
@@ -373,20 +527,61 @@ async fn route_request(
                 false,
             )
         })?;
+        let authority = if core_platform_operations::supports(&operation_id) {
+            let state = dependencies
+                .app_state
+                .get()
+                .ok_or_else(|| BridgeFailure::internal("Gateway state unavailable"))?;
+            core_platform_operations::frame_authority_fingerprint(
+                state,
+                envelope,
+                &app_id.0,
+                &originating_app_operation_id,
+                &operation_id,
+            )
+            .await
+            .map_err(|detail| {
+                BridgeFailure::new(AppErrorCodeV1::OperationNotGranted, detail, false)
+            })?
+        } else {
+            serde_json::json!({"principal": envelope.principal, "execution": envelope.execution})
+        };
+        let authority_payload = serde_json::json!({"authority": authority, "payload": payload});
         let digest = payload_digest(
             &binding.registration,
             &originating_app_operation_id,
             &operation_id,
             envelope.expected_revision.as_deref(),
-            &payload,
+            &authority_payload,
         )?;
-        let cache_key = format!("{}:{key}", binding.registration.app_id.0);
+        let request_identity = serde_json::to_vec(&(
+            &authority,
+            &originating_app_operation_id,
+            &binding.registration.app_id,
+            &binding.registration.generation,
+        ))
+        .map_err(|error| BridgeFailure::internal(error.to_string()))?;
+        let cache_key = format!(
+            "{}:{key}:{:x}",
+            binding.registration.app_id.0,
+            Sha256::digest(request_identity)
+        );
         {
             let mut cache = dependencies.commands.lock().await;
             match cache.get(&cache_key) {
                 Some(CachedCommand::Completed(existing, receipt)) if existing == &digest => {
                     let mut replayed = receipt.clone();
                     replayed.replayed = true;
+                    drop(cache);
+                    dependencies
+                        .revalidate_source(
+                            envelope,
+                            &app_id.0,
+                            &originating_app_operation_id,
+                            &operation_id,
+                            &payload,
+                        )
+                        .await?;
                     return json_response(StatusCode::OK, &replayed);
                 }
                 Some(CachedCommand::Running(existing)) if existing == &digest => {
@@ -449,6 +644,15 @@ async fn route_request(
                     .lock()
                     .await
                     .insert(cache_key, CachedCommand::Completed(digest, receipt.clone()));
+                dependencies
+                    .revalidate_source(
+                        envelope,
+                        &app_id.0,
+                        &originating_app_operation_id,
+                        &operation_id,
+                        &payload,
+                    )
+                    .await?;
                 return json_response(StatusCode::OK, &receipt);
             }
             DurableCommandState::Unknown => {

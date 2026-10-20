@@ -134,6 +134,8 @@ pub struct ObjectiveReviewRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectiveReviewVerification {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_set: Option<ProofInputSet>,
     /// Current external result sources resolved by Runtime, never model input.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub result_source_revisions: BTreeMap<String, u64>,
@@ -153,6 +155,131 @@ pub struct ObjectiveReviewVerification {
     pub reviewer_execution_id: String,
     pub producer_execution_ids: Vec<String>,
     pub reads: Vec<ObjectiveResultReadProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofInputSet {
+    pub version: u32,
+    pub condition_ref: Option<String>,
+    pub result_refs: Vec<String>,
+    pub auxiliary_refs: Vec<String>,
+    pub required_obligation_refs: Vec<String>,
+    pub task_refs: Vec<String>,
+    pub artifact_refs: Vec<String>,
+    pub packet_digests: BTreeMap<String, String>,
+    pub material_events: Vec<ProofInputEvent>,
+    pub source_revisions: BTreeMap<String, u64>,
+    pub required_scopes: Vec<ProofEffectTarget>,
+    pub required_scope_complete: bool,
+    pub acceptance_policy_digest: String,
+    pub semantic_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofInputEvent {
+    pub stream_id: String,
+    pub sequence: u64,
+    pub event_id: String,
+    pub payload_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofEffectPurpose {
+    InputRead,
+    BusinessEffect,
+    AutoCheckpointMaintenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofEffectScopePurpose {
+    pub declared_scope: crate::policy::PermissionScope,
+    pub purpose: ProofEffectPurpose,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofEffectScope {
+    #[serde(deserialize_with = "deserialize_effect_scope_version")]
+    pub version: u32,
+    pub descriptor_hash: String,
+    pub complete: bool,
+    pub targets: Vec<ProofEffectTarget>,
+    pub scope_purposes: Vec<ProofEffectScopePurpose>,
+}
+
+impl ProofEffectScope {
+    pub fn validate_purpose_mapping(
+        &self,
+        descriptor: &crate::tool::ToolEffectDescriptor,
+    ) -> Result<(), String> {
+        use crate::policy::{PermissionOperation, PermissionResource};
+
+        if self.version != 2
+            || self.descriptor_hash.trim().is_empty()
+            || self.descriptor_hash != descriptor.descriptor_hash
+        {
+            return Err("effect scope version or descriptor identity mismatch".into());
+        }
+        if self.scope_purposes.len() != descriptor.scopes.len() {
+            return Err("effect purpose mapping does not cover the complete descriptor".into());
+        }
+        for (index, entry) in self.scope_purposes.iter().enumerate() {
+            if !descriptor.scopes.contains(&entry.declared_scope)
+                || self.scope_purposes[..index]
+                    .iter()
+                    .any(|prior| prior.declared_scope == entry.declared_scope)
+            {
+                return Err("effect purpose mapping contains an extra or duplicate scope".into());
+            }
+            match entry.purpose {
+                ProofEffectPurpose::InputRead
+                    if entry.declared_scope.operation != PermissionOperation::Read =>
+                {
+                    return Err("input-read purpose requires a read operation".into());
+                }
+                ProofEffectPurpose::AutoCheckpointMaintenance
+                    if entry.declared_scope.resource != PermissionResource::File
+                        || entry.declared_scope.operation != PermissionOperation::Write =>
+                {
+                    return Err("automatic checkpoint purpose requires a file write".into());
+                }
+                _ => {}
+            }
+        }
+        if descriptor.scopes.iter().any(|declared| {
+            !self
+                .scope_purposes
+                .iter()
+                .any(|entry| &entry.declared_scope == declared)
+        }) {
+            return Err("effect purpose mapping omits a declared scope".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofEffectTarget {
+    pub path: crate::context::WorkspacePathIdentity,
+    pub declared_scope: crate::policy::PermissionScope,
+    pub access_mode: crate::context::WorkspaceAccessMode,
+    pub coverage: crate::context::EvidenceCoverageKind,
+    pub exact: bool,
+    pub physical_identity: Option<String>,
+    pub alias_checked: bool,
+}
+
+fn deserialize_effect_scope_version<'de, Decoder>(decoder: Decoder) -> Result<u32, Decoder::Error>
+where
+    Decoder: serde::Deserializer<'de>,
+{
+    let version = u32::deserialize(decoder)?;
+    if version != 2 {
+        return Err(serde::de::Error::custom(
+            "unsupported effect scope provenance version",
+        ));
+    }
+    Ok(version)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +797,231 @@ pub struct RuntimeInterventionTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effect_scope_v2_requires_complete_typed_purpose_mapping() {
+        use crate::policy::{
+            EffectAssessment, PermissionOperation, PermissionResource, PermissionScope,
+        };
+        use crate::tool::{
+            ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+            ToolPermissionMode,
+        };
+
+        let read = PermissionScope {
+            resource: PermissionResource::File,
+            operation: PermissionOperation::Read,
+            target: Some("src/input".into()),
+        };
+        let write = PermissionScope {
+            resource: PermissionResource::File,
+            operation: PermissionOperation::Write,
+            target: Some("src/output".into()),
+        };
+        let maintenance = PermissionScope {
+            resource: PermissionResource::File,
+            operation: PermissionOperation::Write,
+            target: Some(".cowd/checkpoints".into()),
+        };
+        let descriptor = ToolEffectDescriptor {
+            tool_id: "edit".into(),
+            descriptor_hash: "original-descriptor".into(),
+            effect_kind: ToolEffectKind::Write,
+            idempotency: ToolIdempotency::IdempotentWithKey,
+            scopes: vec![read.clone(), write.clone(), maintenance.clone()],
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: EffectAssessment::default(),
+        };
+        let scope = ProofEffectScope {
+            version: 2,
+            descriptor_hash: descriptor.descriptor_hash.clone(),
+            complete: false,
+            targets: Vec::new(),
+            scope_purposes: vec![
+                ProofEffectScopePurpose {
+                    declared_scope: read,
+                    purpose: ProofEffectPurpose::InputRead,
+                },
+                ProofEffectScopePurpose {
+                    declared_scope: write,
+                    purpose: ProofEffectPurpose::BusinessEffect,
+                },
+                ProofEffectScopePurpose {
+                    declared_scope: maintenance,
+                    purpose: ProofEffectPurpose::AutoCheckpointMaintenance,
+                },
+            ],
+        };
+        scope.validate_purpose_mapping(&descriptor).unwrap();
+        let serialized = serde_json::to_value(&scope).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ProofEffectScope>(serialized.clone()).unwrap(),
+            scope
+        );
+        assert!(!scope.complete);
+        assert!(scope.targets.is_empty());
+
+        for mutation in [
+            "missing",
+            "duplicate",
+            "extra",
+            "wrong",
+            "read-write",
+            "maintenance-read",
+            "maintenance-tool",
+            "hash",
+            "empty-hash",
+            "version",
+        ] {
+            let mut invalid = scope.clone();
+            match mutation {
+                "missing" => {
+                    invalid.scope_purposes.pop();
+                }
+                "duplicate" => invalid.scope_purposes[1] = invalid.scope_purposes[0].clone(),
+                "extra" => invalid
+                    .scope_purposes
+                    .push(invalid.scope_purposes[0].clone()),
+                "wrong" => {
+                    invalid.scope_purposes[0].declared_scope.target = Some("elsewhere".into())
+                }
+                "read-write" => invalid.scope_purposes[1].purpose = ProofEffectPurpose::InputRead,
+                "maintenance-read" => {
+                    invalid.scope_purposes[0].purpose =
+                        ProofEffectPurpose::AutoCheckpointMaintenance
+                }
+                "maintenance-tool" => {
+                    invalid.scope_purposes[2].declared_scope.resource = PermissionResource::Tool
+                }
+                "hash" => invalid.descriptor_hash = "another-descriptor".into(),
+                "empty-hash" => invalid.descriptor_hash.clear(),
+                "version" => invalid.version = 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                invalid.validate_purpose_mapping(&descriptor).is_err(),
+                "{mutation}"
+            );
+        }
+        for mutation in ["missing", "null", "unknown-purpose"] {
+            let mut invalid = serialized.clone();
+            match mutation {
+                "missing" => {
+                    invalid.as_object_mut().unwrap().remove("scope_purposes");
+                }
+                "null" => invalid["scope_purposes"] = serde_json::Value::Null,
+                "unknown-purpose" => {
+                    invalid["scope_purposes"][0]["purpose"] = serde_json::json!("inferred")
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::from_value::<ProofEffectScope>(invalid).is_err(),
+                "{mutation}"
+            );
+        }
+        for version in [0, 1, 3, u32::MAX] {
+            let mut invalid = serialized.clone();
+            invalid["version"] = serde_json::json!(version);
+            assert!(serde_json::from_value::<ProofEffectScope>(invalid).is_err());
+        }
+        assert!(serde_json::from_str::<ProofEffectScope>("null").is_err());
+        assert!(serde_json::from_str::<ProofEffectScope>("{").is_err());
+
+        let mut business_read = scope.clone();
+        business_read.scope_purposes[0].purpose = ProofEffectPurpose::BusinessEffect;
+        business_read.validate_purpose_mapping(&descriptor).unwrap();
+        let mut forged_maintenance = scope.clone();
+        let mut nonfile_descriptor = descriptor.clone();
+        nonfile_descriptor.scopes[2].resource = PermissionResource::Tool;
+        forged_maintenance.scope_purposes[2].declared_scope = nonfile_descriptor.scopes[2].clone();
+        assert!(forged_maintenance
+            .validate_purpose_mapping(&nonfile_descriptor)
+            .is_err());
+        let mut unknown = descriptor.clone();
+        unknown.effect_kind = ToolEffectKind::Unknown;
+        scope.validate_purpose_mapping(&unknown).unwrap();
+
+        for declared_scope in [
+            PermissionScope {
+                resource: PermissionResource::Shell,
+                operation: PermissionOperation::Execute,
+                target: None,
+            },
+            PermissionScope {
+                resource: PermissionResource::Network,
+                operation: PermissionOperation::Call,
+                target: Some("https://example.invalid".into()),
+            },
+            PermissionScope {
+                resource: PermissionResource::File,
+                operation: PermissionOperation::Write,
+                target: None,
+            },
+        ] {
+            let mut incomplete_descriptor = unknown.clone();
+            incomplete_descriptor.scopes = vec![declared_scope.clone()];
+            let incomplete = ProofEffectScope {
+                version: 2,
+                descriptor_hash: incomplete_descriptor.descriptor_hash.clone(),
+                complete: false,
+                targets: Vec::new(),
+                scope_purposes: vec![ProofEffectScopePurpose {
+                    declared_scope,
+                    purpose: ProofEffectPurpose::BusinessEffect,
+                }],
+            };
+            incomplete
+                .validate_purpose_mapping(&incomplete_descriptor)
+                .unwrap();
+            assert!(!incomplete.complete);
+            assert_eq!(incomplete_descriptor.effect_kind, ToolEffectKind::Unknown);
+        }
+    }
+
+    #[test]
+    fn proof_input_versions_preserve_history_without_upgrading_authority() {
+        let inputs = ProofInputSet {
+            version: 2,
+            condition_ref: None,
+            result_refs: Vec::new(),
+            auxiliary_refs: Vec::new(),
+            required_obligation_refs: Vec::new(),
+            task_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            packet_digests: BTreeMap::new(),
+            material_events: Vec::new(),
+            source_revisions: BTreeMap::new(),
+            required_scopes: Vec::new(),
+            required_scope_complete: false,
+            acceptance_policy_digest: String::new(),
+            semantic_digest: String::new(),
+        };
+        let mut value = serde_json::to_value(inputs).unwrap();
+        for version in [0, 1, 2, u32::MAX] {
+            value["version"] = serde_json::json!(version);
+            let decoded: ProofInputSet = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(decoded.version, version);
+            assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(4294967296_u64),
+            serde_json::json!("2"),
+            serde_json::Value::Null,
+            serde_json::json!(2.0),
+        ] {
+            value["version"] = invalid;
+            assert!(serde_json::from_value::<ProofInputSet>(value.clone()).is_err());
+        }
+        value.as_object_mut().unwrap().remove("version");
+        assert!(serde_json::from_value::<ProofInputSet>(value).is_err());
+    }
 
     #[test]
     fn goal_contract_roundtrips_revisioned_acceptance() {

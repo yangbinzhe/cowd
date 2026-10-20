@@ -1,6 +1,6 @@
 {
   "initial": {
-    "schema_version": 4,
+    "schema_version": 5,
     "execution_id": "execution-golden",
     "revision": 1,
     "cursor": 1,
@@ -110,11 +110,31 @@
         "available": true,
         "reason": null
       }
-    ]
+    ],
+    "terminal_axes": {
+      "outcome": {
+        "goal_id": null,
+        "goal_revision": null,
+        "outcome": null,
+        "terminal_fence": null
+      },
+      "execution": {
+        "phase": "unknown",
+        "settlement": "unknown",
+        "evidence_refs": [],
+        "coverage_complete": false
+      },
+      "delivery": {
+        "runtime_terminal_ref": null,
+        "session_client_evidence": "requires_fresh_context"
+      },
+      "source_cursor": 0,
+      "source_race": false
+    }
   },
   "delta": {
-    "schema_version": 4,
-    "reducer_version": 4,
+    "schema_version": 5,
+    "reducer_version": 5,
     "execution_id": "execution-golden",
     "from_revision": 1,
     "target_revision": 2,
@@ -143,7 +163,10 @@
       },
       {
         "op": "replace_graph_topology",
-        "node_ids": ["node-a", "node-b"],
+        "node_ids": [
+          "node-a",
+          "node-b"
+        ],
         "edges": [
           {
             "from": "node-a",
@@ -231,7 +254,11 @@
               "execution_id": "execution-golden"
             },
             "kind": "execution",
-            "visibility": ["narrative", "operational", "audit"],
+            "visibility": [
+              "narrative",
+              "operational",
+              "audit"
+            ],
             "causal_parent_ids": [],
             "dependency_ids": [],
             "status": "completed",
@@ -241,8 +268,12 @@
             "sequence": 1,
             "commit_cursor": 2,
             "public_summary": "verify projection reducer",
-            "artifact_refs": ["result:node-a"],
-            "evidence_refs": ["evidence:node-a"]
+            "artifact_refs": [
+              "result:node-a"
+            ],
+            "evidence_refs": [
+              "evidence:node-a"
+            ]
           }
         ],
         "relations": []
@@ -261,9 +292,15 @@
             "execution_id": "execution-golden"
           },
           "kind": "tool",
-          "visibility": ["narrative", "operational", "audit"],
+          "visibility": [
+            "narrative",
+            "operational",
+            "audit"
+          ],
           "parent_activity_id": "activity:execution:execution-golden",
-          "causal_parent_ids": ["activity:execution:execution-golden"],
+          "causal_parent_ids": [
+            "activity:execution:execution-golden"
+          ],
           "dependency_ids": [],
           "tool_call_id": "node-a",
           "status": "completed",
@@ -273,8 +310,12 @@
           "sequence": 2,
           "commit_cursor": 2,
           "public_summary": "read projected evidence",
-          "artifact_refs": ["result:node-a"],
-          "evidence_refs": ["evidence:node-a"]
+          "artifact_refs": [
+            "result:node-a"
+          ],
+          "evidence_refs": [
+            "evidence:node-a"
+          ]
         }
       },
       {
@@ -300,7 +341,9 @@
           "revision": 2,
           "status": "materialized",
           "summary": "resource.admission.granted",
-          "evidence_refs": ["execution-golden"],
+          "evidence_refs": [
+            "execution-golden"
+          ],
           "payload": {
             "type": "admission",
             "value": {
@@ -313,11 +356,15 @@
               "queue_age_ms": 8,
               "wait_reason": null,
               "blocker": null,
-              "resource_demands": ["provider_slot:1"],
+              "resource_demands": [
+                "provider_slot:1"
+              ],
               "normalized_scope": "graph:execution-golden",
               "accepted_at_ms": 20,
               "policy_revision": 3,
-              "refs": ["execution_graph:execution-golden"]
+              "refs": [
+                "execution_graph:execution-golden"
+              ]
             }
           }
         }
@@ -331,7 +378,9 @@
           "revision": 2,
           "status": "completed",
           "summary": "runtime.outcome.recorded.v1",
-          "evidence_refs": ["evidence:node-a"],
+          "evidence_refs": [
+            "evidence:node-a"
+          ],
           "payload": {
             "type": "outcome",
             "value": {
@@ -382,7 +431,9 @@
           "revision": 2,
           "status": "supported",
           "summary": "tool result is durably supported",
-          "evidence_refs": ["evidence:node-a"],
+          "evidence_refs": [
+            "evidence:node-a"
+          ],
           "payload": {
             "type": "evidence",
             "value": {
@@ -417,12 +468,35 @@
       {
         "op": "advance_cursor",
         "cursor": 2
+      },
+      {
+        "op": "replace_terminal_axes",
+        "terminal_axes": {
+          "outcome": {
+            "goal_id": null,
+            "goal_revision": null,
+            "outcome": null,
+            "terminal_fence": null
+          },
+          "execution": {
+            "phase": "draining",
+            "settlement": "unknown",
+            "evidence_refs": [],
+            "coverage_complete": false
+          },
+          "delivery": {
+            "runtime_terminal_ref": null,
+            "session_client_evidence": "requires_fresh_context"
+          },
+          "source_cursor": 2,
+          "source_race": false
+        }
       }
     ],
     "resync_reason": null
   },
   "expected": {
-    "schema_version": 4,
+    "schema_version": 5,
     "execution_id": "execution-golden",
     "revision": 2,
     "cursor": 2,
@@ -514,7 +588,11 @@
           "execution_id": "execution-golden"
         },
         "kind": "execution",
-        "visibility": ["narrative", "operational", "audit"],
+        "visibility": [
+          "narrative",
+          "operational",
+          "audit"
+        ],
         "causal_parent_ids": [],
         "dependency_ids": [],
         "status": "completed",
@@ -524,8 +602,12 @@
         "sequence": 1,
         "commit_cursor": 2,
         "public_summary": "verify projection reducer",
-        "artifact_refs": ["result:node-a"],
-        "evidence_refs": ["evidence:node-a"]
+        "artifact_refs": [
+          "result:node-a"
+        ],
+        "evidence_refs": [
+          "evidence:node-a"
+        ]
       },
       {
         "schema_version": 1,
@@ -539,9 +621,15 @@
           "execution_id": "execution-golden"
         },
         "kind": "tool",
-        "visibility": ["narrative", "operational", "audit"],
+        "visibility": [
+          "narrative",
+          "operational",
+          "audit"
+        ],
         "parent_activity_id": "activity:execution:execution-golden",
-        "causal_parent_ids": ["activity:execution:execution-golden"],
+        "causal_parent_ids": [
+          "activity:execution:execution-golden"
+        ],
         "dependency_ids": [],
         "tool_call_id": "node-a",
         "status": "completed",
@@ -551,8 +639,12 @@
         "sequence": 2,
         "commit_cursor": 2,
         "public_summary": "read projected evidence",
-        "artifact_refs": ["result:node-a"],
-        "evidence_refs": ["evidence:node-a"]
+        "artifact_refs": [
+          "result:node-a"
+        ],
+        "evidence_refs": [
+          "evidence:node-a"
+        ]
       }
     ],
     "activity_relations": [
@@ -576,7 +668,9 @@
         "revision": 2,
         "status": "materialized",
         "summary": "resource.admission.granted",
-        "evidence_refs": ["execution-golden"],
+        "evidence_refs": [
+          "execution-golden"
+        ],
         "payload": {
           "type": "admission",
           "value": {
@@ -589,11 +683,15 @@
             "queue_age_ms": 8,
             "wait_reason": null,
             "blocker": null,
-            "resource_demands": ["provider_slot:1"],
+            "resource_demands": [
+              "provider_slot:1"
+            ],
             "normalized_scope": "graph:execution-golden",
             "accepted_at_ms": 20,
             "policy_revision": 3,
-            "refs": ["execution_graph:execution-golden"]
+            "refs": [
+              "execution_graph:execution-golden"
+            ]
           }
         }
       }
@@ -605,7 +703,9 @@
         "revision": 2,
         "status": "completed",
         "summary": "runtime.outcome.recorded.v1",
-        "evidence_refs": ["evidence:node-a"],
+        "evidence_refs": [
+          "evidence:node-a"
+        ],
         "payload": {
           "type": "outcome",
           "value": {
@@ -657,7 +757,9 @@
         "revision": 2,
         "status": "supported",
         "summary": "tool result is durably supported",
-        "evidence_refs": ["evidence:node-a"],
+        "evidence_refs": [
+          "evidence:node-a"
+        ],
         "payload": {
           "type": "evidence",
           "value": {
@@ -679,6 +781,26 @@
     "health": [],
     "recovery": [],
     "live": null,
-    "available_commands": []
+    "available_commands": [],
+    "terminal_axes": {
+      "outcome": {
+        "goal_id": null,
+        "goal_revision": null,
+        "outcome": null,
+        "terminal_fence": null
+      },
+      "execution": {
+        "phase": "draining",
+        "settlement": "unknown",
+        "evidence_refs": [],
+        "coverage_complete": false
+      },
+      "delivery": {
+        "runtime_terminal_ref": null,
+        "session_client_evidence": "requires_fresh_context"
+      },
+      "source_cursor": 2,
+      "source_race": false
+    }
   }
 }

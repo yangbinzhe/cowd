@@ -2,6 +2,18 @@
 
 use super::*;
 
+fn unreclaimed_turn_error<Summary>(
+    result: Result<Summary, RuntimeError>,
+    owner: &str,
+) -> RuntimeError {
+    match result {
+        Err(error) => error,
+        Ok(_) => RuntimeError::new(format!(
+            "{owner} Runtime turn completed without reclaiming its conversation runtime",
+        )),
+    }
+}
+
 /// Whether the provider tool schema must stay byte-stable across steps.
 ///
 /// Delegated leaves already use a stable schema (their tool set is fixed). The
@@ -283,8 +295,26 @@ where
     pub(crate) fn require_next_model_tool_action(
         &self,
         tool_ids: impl IntoIterator<Item = String>,
-    ) {
-        self.runtime_ref().require_next_model_tool_action(tool_ids);
+    ) -> Result<(), RuntimeError> {
+        self.control_runtime()?.require_next_model_tool_action(tool_ids);
+        Ok(())
+    }
+
+    pub(crate) fn conversation_control_available(&self) -> Result<(), RuntimeError> {
+        self.control_runtime().map(|_| ())
+    }
+
+    fn control_runtime(
+        &self,
+    ) -> Result<&crate::ConversationRuntime<ProviderRuntimeClient, T>, RuntimeError> {
+        if self.poisoned {
+            return Err(RuntimeError::new(
+                "conversation runtime was not reclaimed; Host control is refused",
+            ));
+        }
+        self.runtime.as_ref().ok_or_else(|| RuntimeError::new(
+            "conversation runtime is unavailable while its turn owner holds it; Host control is refused",
+        ))
     }
 
     pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
@@ -608,6 +638,7 @@ where
         };
         self.inflight_turn = None;
         let (runtime, result) = completion.map_err(|error| {
+            self.poisoned = true;
             RuntimeError::new(format!(
                 "submitted Runtime turn ended before recovery: {error}"
             ))
@@ -624,6 +655,7 @@ where
                 );
                 self.runtime = None;
                 self.poisoned = true;
+                return Err(unreclaimed_turn_error(result, "submitted"));
             }
         }
         result
@@ -643,7 +675,8 @@ where
             receiver.await
         };
         self.inflight_turn = None;
-        let (runtime, _result) = completion.map_err(|error| {
+        let (runtime, result) = completion.map_err(|error| {
+            self.poisoned = true;
             RuntimeError::new(format!(
                 "interrupted Runtime turn ended before recovery: {error}"
             ))
@@ -656,6 +689,7 @@ where
                 1,
             );
             self.poisoned = true;
+            return Err(unreclaimed_turn_error(result, "interrupted"));
         }
         Ok(())
     }
@@ -682,3 +716,7 @@ where
             .expect("runtime should exist while standard runtime host is alive")
     }
 }
+
+#[cfg(test)]
+#[path = "own834_host_control_tests.rs"]
+mod own834_host_control_tests;

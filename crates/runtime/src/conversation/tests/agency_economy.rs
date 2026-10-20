@@ -244,7 +244,7 @@ async fn r1_one_intent_submit_keeps_same_attempt_authority() {
             .apply(&self_review)
             .unwrap();
         assert_eq!(review.status, AgentActionStatus::Rejected);
-        assert_eq!(review.error.unwrap().code, "self_review_forbidden");
+        assert_eq!(review.error.unwrap().code, "unsupported_review_inputs");
         let after = fixture
             .services
             .agent_action_service()
@@ -269,6 +269,51 @@ async fn r1_one_intent_submit_keeps_same_attempt_authority() {
             task.artifact_refs[0]
         );
     }
+    let producer = Arc::new(Mutex::new(None::<AgentActorBinding>));
+    let setup_producer = Arc::clone(&producer);
+    crate::agentic::execution::reviewed_goal_fixture::with_native_task_review_setup(
+        Default::default(),
+        move |_, _, submission, input| {
+            *setup_producer.lock().unwrap() = Some(submission.actor);
+            Box::pin(async move { input })
+        },
+        move |services, review, proof| {
+            Box::pin(async move {
+                assert_eq!(proof.verification.input_set.as_ref().unwrap().version, 2);
+                let producer = producer.lock().unwrap().take().unwrap();
+                assert_ne!(producer.execution_id, review.actor.execution_id);
+                let program = services
+                    .agent_action_service()
+                    .project(&producer.program_id)
+                    .unwrap();
+                let AgentAction::TaskReview(input) = &review.action else {
+                    panic!("expected an independently verified Task review");
+                };
+                let task = &program.tasks[&input.task_ref];
+                assert_eq!(task.status, crate::AgenticTaskStatus::Submitted);
+                assert_eq!(task.claimant.as_deref(), Some(producer.actor_id.as_str()));
+                let before = program.revision;
+                let rejected = services
+                    .independent_result_review(&producer, &program, &task.artifact_refs, None)
+                    .await
+                    .err()
+                    .expect("valid original producer must not independently review its result");
+                assert_eq!(
+                    rejected,
+                    "review producer and reviewer must be different physical executions"
+                );
+                assert_eq!(
+                    services
+                        .agent_action_service()
+                        .project(&producer.program_id)
+                        .unwrap()
+                        .revision,
+                    before
+                );
+            })
+        },
+    )
+    .await;
 }
 
 fn r1_assert_no_absolute_economy(output: &str) {
@@ -524,6 +569,9 @@ struct R1VersionedSourceReader {
 
 #[async_trait::async_trait]
 impl ToolExecutor for R1VersionedSourceReader {
+    fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+        RootPresentationRecoveryReader.tool_discovery_receipt()
+    }
     async fn execute_output(
         &self,
         name: &str,

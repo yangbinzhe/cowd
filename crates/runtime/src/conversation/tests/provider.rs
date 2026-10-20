@@ -260,6 +260,7 @@ async fn outcome_append_failure_leaves_packed_attempt_unknown() {
         ),
         session_port: Arc::new(FailOutcomePort),
         cache_dimensions: Arc::clone(&tracker),
+        native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let context = crate::ProviderRequestEvidenceContext {
         session_id: "session-fail".to_string(),
@@ -529,6 +530,7 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
         cache_dimensions: Arc::new(std::sync::Mutex::new(
             super::TurnCacheDimensionsObservation::default(),
         )),
+        native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let epoch = super::ProviderAttemptEpoch::new("execution-evidence", "turn-evidence").unwrap();
     writer
@@ -786,8 +788,7 @@ fn exact_evidence_mode_expands_tool_delivery_without_bypassing_context_ceiling()
         "exact evidence may raise the turn's TOTAL lease so several whole files fit"
     );
     assert!(
-        exact.tool_result_budget.per_tool_max_tokens
-            < exact.tool_result_budget.max_total_tokens,
+        exact.tool_result_budget.per_tool_max_tokens < exact.tool_result_budget.max_total_tokens,
         "a single result must no longer be granted the whole lease: {} vs {}",
         exact.tool_result_budget.per_tool_max_tokens,
         exact.tool_result_budget.max_total_tokens
@@ -881,6 +882,7 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
             &raw_ref,
             &receipt,
             false,
+            output,
         )
         .expect("generated receipt");
     assert!(runtime.turn_model_observations().is_empty());
@@ -914,13 +916,26 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
     assert_eq!(candidates.len(), 1);
     assert!(runtime.turn_model_observations().is_empty());
     runtime
-        .confirm_model_observations(candidates, "qwen3.8-max-effective")
-        .expect("valid response commit promotion");
+        .confirm_model_observations(
+            candidates,
+            "qwen3.8-max-effective",
+            &crate::ProviderRequestEvidenceContext {
+                session_id: runtime.session_id().into(),
+                execution_id: "unobserved-execution".into(),
+                turn_id: "unobserved-turn".into(),
+                request_sequence: 2,
+                request_compiler_cache_hit: false,
+                budget: request.budget.clone(),
+                attempt: 1,
+            },
+            None,
+        )
+        .expect("missing physical wire remains an honest observation gap");
     let promoted = runtime.turn_model_observations();
-    assert_eq!(promoted.len(), 1);
-    assert_eq!(promoted[0].provider_invocation_id, "tool-call-1");
-    assert_eq!(promoted[0].model, "qwen3.8-max-effective");
-    assert!(promoted[0].complete);
+    assert!(
+        promoted.is_empty(),
+        "packed bytes and a helper call cannot attest a real provider continuation"
+    );
 
     let mut corrupted = request;
     corrupted.messages = vec![ConversationMessage::tool_result(
@@ -997,6 +1012,7 @@ async fn runtime_prefetch_receipt_survives_first_provider_node_and_is_turn_isola
             &raw_ref,
             &receipt,
             false,
+            output,
         )
         .expect("generated prefetch receipt");
     runtime
@@ -1037,13 +1053,10 @@ async fn runtime_prefetch_receipt_survives_first_provider_node_and_is_turn_isola
         .await
         .expect("same-turn valid redelivery must commit");
     let observations = runtime.turn_model_observations();
-    assert_eq!(observations.len(), 1);
-    assert_eq!(
-        observations[0].provider_invocation_id,
-        "runtime-focus-verify-0-0"
+    assert!(
+        observations.is_empty(),
+        "mock API has no original physical acquisition or durable wire evidence"
     );
-    assert_eq!(observations[0].model, "qwen3.8-max");
-    assert!(observations[0].complete);
     let requests = requests.lock().expect("requests");
     assert_eq!(requests.len(), 2);
     assert!(requests
@@ -2032,7 +2045,7 @@ async fn stale_session_execution_fence(
         .await
         .unwrap();
     let claimed = store
-        .claim_session_runtime_outbox("fence-worker", now, 60_000, 1)
+        .claim_session_runtime_outbox("fence-worker", now, 60_000, 1, &[])
         .await
         .unwrap()
         .remove(0);
@@ -2575,7 +2588,10 @@ async fn one_shot_reasoning_effort_is_request_local_and_survives_fallback() {
 struct ContextBudgetFixtureApi;
 
 impl ApiClient for ContextBudgetFixtureApi {
-    fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+    fn stream(
+        &mut self,
+        _: ApiRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         Box::pin(futures::stream::empty())
     }
 }
@@ -2585,25 +2601,48 @@ async fn rendered_capacity_refusal_precedes_reservation_and_stream_dispatch() {
     struct RefusingBudgetApi(Arc<AtomicUsize>);
     impl ApiClient for RefusingBudgetApi {
         fn prepare_request_budget(&self, _: &mut ApiRequest) -> Result<(), RuntimeError> {
-            Err(RuntimeError::context_capacity(crate::context_ledger::ContextCapacityFailure::RenderOverflow, "fixture full wire does not fit"))
+            Err(RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                "fixture full wire does not fit",
+            ))
         }
-        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn stream(
+            &mut self,
+            _: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(futures::stream::empty())
         }
     }
     let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
-    let guard = registry.install("precharge-session", "precharge-fixture", 1_000_000).unwrap();
+    let guard = registry
+        .install("precharge-session", "precharge-fixture", 1_000_000)
+        .unwrap();
     let lease = guard.lease();
     let before = lease.snapshot().unwrap();
     let dispatches = Arc::new(AtomicUsize::new(0));
-    let mut runtime = ConversationRuntime::new(Session::new(), RefusingBudgetApi(dispatches.clone()),
-        StaticToolExecutor::new(), PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()])
-        .without_memory().with_model_context_window(128_000).with_evaluation_provider_token_lease(lease.clone());
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        RefusingBudgetApi(dispatches.clone()),
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_model_context_window(128_000)
+    .with_evaluation_provider_token_lease(lease.clone());
     runtime.set_active_model("private-fixture");
-    runtime.begin_turn_strategy("precharge-turn", "concise answer").unwrap();
-    let error = runtime.execute_model_step("concise answer", true).await.unwrap_err();
-    assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::RenderOverflow));
+    runtime
+        .begin_turn_strategy("precharge-turn", "concise answer")
+        .unwrap();
+    let error = runtime
+        .execute_model_step("concise answer", true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.context_capacity_failure(),
+        Some(crate::context_ledger::ContextCapacityFailure::RenderOverflow)
+    );
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     assert_eq!(lease.snapshot().unwrap(), before);
 }
@@ -2615,29 +2654,57 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
         requests: Arc<std::sync::Mutex<Vec<(bool, Option<String>)>>>,
     }
     impl ApiClient for ChoiceApi {
-        fn configure_tool_choice(&mut self, required: bool, name: Option<String>) { self.pending = (required, name); }
-        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn configure_tool_choice(&mut self, required: bool, name: Option<String>) {
+            self.pending = (required, name);
+        }
+        fn stream(
+            &mut self,
+            _: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             let mut requests = self.requests.lock().unwrap();
             requests.push(std::mem::take(&mut self.pending));
             let first = requests.len() == 1;
             drop(requests);
             let events = if first {
-                vec![Err(RuntimeError::with_provider_context_window_limit("fixture limit 32768", Some(32_768)))]
+                vec![Err(RuntimeError::with_provider_context_window_limit(
+                    "fixture limit 32768",
+                    Some(32_768),
+                ))]
             } else {
-                vec![Ok(AssistantEvent::ToolUse { id: "read-after-calibration".into(), name: "read_file".into(), input: r#"{"path":"source.txt"}"#.into() }), Ok(AssistantEvent::MessageStop)]
+                vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "read-after-calibration".into(),
+                        name: "read_file".into(),
+                        input: r#"{"path":"source.txt"}"#.into(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]
             };
             Box::pin(futures::stream::iter(events))
         }
     }
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut runtime = ConversationRuntime::new(Session::new(), ChoiceApi { pending: (false, None), requests: requests.clone() },
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        ChoiceApi {
+            pending: (false, None),
+            requests: requests.clone(),
+        },
         StaticToolExecutor::new().register("read_file", |_| Ok("not dispatched".into())),
-        PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()])
-        .without_memory().with_model_context_window(128_000);
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_model_context_window(128_000);
     runtime.set_active_model("private-fixture");
-    runtime.begin_turn_strategy("choice-turn", "read the source").unwrap();
+    runtime
+        .begin_turn_strategy("choice-turn", "read the source")
+        .unwrap();
     runtime.require_next_model_tool_call();
-    runtime.execute_model_step("read the source", true).await.unwrap();
+    runtime
+        .execute_model_step("read the source", true)
+        .await
+        .unwrap();
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|(required, _)| *required));
@@ -2645,34 +2712,85 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
 
 #[test]
 fn stale_context_policy_is_refused_instead_of_relabelled_as_current() {
-    let runtime = ConversationRuntime::new(Session::new(), ContextBudgetFixtureApi, StaticToolExecutor::new(),
-        PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()]).without_memory().with_model_context_window(128_000);
+    let runtime = ConversationRuntime::new(
+        Session::new(),
+        ContextBudgetFixtureApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_model_context_window(128_000);
     let mut prompt = PromptAssembly::new(vec!["private context".into()]);
-    prompt.context_policy_revision = Some(runtime.permission_policy.execution_policy_control().snapshot().revision.saturating_add(1));
-    let error = runtime.pack_provider_attempt(&prompt, &Vec::new().into(), "fixture", ProviderContextInventory::default()).unwrap_err();
-    assert!(error.to_string().contains("context_policy_changed_during_compilation"));
+    prompt.context_policy_revision = Some(
+        runtime
+            .permission_policy
+            .execution_policy_control()
+            .snapshot()
+            .revision
+            .saturating_add(1),
+    );
+    let error = runtime
+        .pack_provider_attempt(
+            &prompt,
+            &Vec::new().into(),
+            "fixture",
+            ProviderContextInventory::default(),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("context_policy_changed_during_compilation"));
     let required = PromptAssembly::new(vec!["must preserve this requirement ".repeat(30_000)]);
-    let error = runtime.pack_provider_attempt(&required, &Vec::new().into(), "fixture", ProviderContextInventory::default()).unwrap_err();
-    assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::RequiredOverflow));
+    let error = runtime
+        .pack_provider_attempt(
+            &required,
+            &Vec::new().into(),
+            "fixture",
+            ProviderContextInventory::default(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.context_capacity_failure(),
+        Some(crate::context_ledger::ContextCapacityFailure::RequiredOverflow)
+    );
 }
 
 #[tokio::test]
 async fn a_second_provider_overflow_exits_after_one_calibrated_recompile() {
     struct OverflowApi(Arc<AtomicUsize>);
     impl ApiClient for OverflowApi {
-        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn stream(
+            &mut self,
+            _: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
-            Box::pin(futures::stream::iter(vec![Err(RuntimeError::with_provider_context_window_limit(
-                "fixture still over context", Some(if first { 32_768 } else { 16_384 }),
-            ))]))
+            Box::pin(futures::stream::iter(vec![Err(
+                RuntimeError::with_provider_context_window_limit(
+                    "fixture still over context",
+                    Some(if first { 32_768 } else { 16_384 }),
+                ),
+            )]))
         }
     }
     let attempts = Arc::new(AtomicUsize::new(0));
-    let mut runtime = ConversationRuntime::new(Session::new(), OverflowApi(attempts.clone()), StaticToolExecutor::new(),
-        PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()]).without_memory().with_model_context_window(128_000);
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        OverflowApi(attempts.clone()),
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_model_context_window(128_000);
     runtime.set_active_model("private-fixture");
-    runtime.begin_turn_strategy("overflow-turn", "concise answer").unwrap();
-    assert!(runtime.execute_model_step("concise answer", true).await.is_err());
+    runtime
+        .begin_turn_strategy("overflow-turn", "concise answer")
+        .unwrap();
+    assert!(runtime
+        .execute_model_step("concise answer", true)
+        .await
+        .is_err());
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
@@ -2680,38 +2798,87 @@ async fn a_second_provider_overflow_exits_after_one_calibrated_recompile() {
 async fn selected_navigation_checks_durable_source_before_injecting_any_summary() {
     let store = Arc::new(crate::test_support::session_store());
     let session_id = "source-bound-navigation";
-    store.create_session(&session::SessionRecord {
-        session_id: session_id.into(), platform: "test".into(), chat_id: "navigation-fixture".into(),
-        user_id: None, model: None, created_at: "2026-10-16T00:00:00Z".into(),
-        last_activity: "2026-10-16T00:00:00Z".into(), message_count: 0,
-        reset_policy: "manual".into(), metadata_json: None, input_tokens: 0, output_tokens: 0, status: "active".into(),
-    }).await.unwrap();
-    store.insert_message(&session::SessionMessage {
-        stable_message_id: "immutable-deployment-result".into(), session_id: session_id.into(), sequence: 0,
-        role: "user".into(), content_json: r#"[{"type":"text","text":"deployment failed, retain the obligation"}]"#.into(),
-        blocks_count: 1, tool_use_id: None, tool_name: None, token_usage_json: None, created_at_ms: 1,
-    }).await.unwrap();
-    store.reconcile_session_context_index(session_id, 16, 4, 1).await.unwrap();
-    let page = store.page_in_session_context(session_id, 512).await.unwrap().unwrap();
-    let hot = Arc::new(crate::execution_core::hot_state::RuntimeHotStatePlane::new(Default::default()));
+    store
+        .create_session(&session::SessionRecord {
+            session_id: session_id.into(),
+            platform: "test".into(),
+            chat_id: "navigation-fixture".into(),
+            user_id: None,
+            model: None,
+            created_at: "2026-10-16T00:00:00Z".into(),
+            last_activity: "2026-10-16T00:00:00Z".into(),
+            message_count: 0,
+            reset_policy: "manual".into(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            status: "active".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .insert_message(&session::SessionMessage {
+            stable_message_id: "immutable-deployment-result".into(),
+            session_id: session_id.into(),
+            sequence: 0,
+            role: "user".into(),
+            content_json: r#"[{"type":"text","text":"deployment failed, retain the obligation"}]"#
+                .into(),
+            blocks_count: 1,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: None,
+            created_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .reconcile_session_context_index(session_id, 16, 4, 1)
+        .await
+        .unwrap();
+    let page = store
+        .page_in_session_context(session_id, 512)
+        .await
+        .unwrap()
+        .unwrap();
+    let hot = Arc::new(crate::execution_core::hot_state::RuntimeHotStatePlane::new(
+        Default::default(),
+    ));
     for corruption in ["none", "summary", "source"] {
         hot.sessions().update(session_id, |snapshot| {
             snapshot.context_manifest = Some(page.manifest.clone());
             snapshot.context_cards = page.context_cards.clone();
-            if corruption == "summary" { snapshot.context_cards[0].summary = "deployment accepted every write without evidence".into(); }
-            if corruption == "source" { snapshot.context_cards[0].source_digest = "corrupt-digest".into(); }
+            if corruption == "summary" {
+                snapshot.context_cards[0].summary =
+                    "deployment accepted every write without evidence".into();
+            }
+            if corruption == "source" {
+                snapshot.context_cards[0].source_digest = "corrupt-digest".into();
+            }
         });
         let mut session = Session::new();
         session.session_id = session_id.into();
-        let runtime = ConversationRuntime::new(session, ContextBudgetFixtureApi, StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()])
-            .without_memory().with_hot_state(hot.clone()).with_session_history_reader(Arc::new(store.history_reader()));
+        let runtime = ConversationRuntime::new(
+            session,
+            ContextBudgetFixtureApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".into()],
+        )
+        .without_memory()
+        .with_hot_state(hot.clone())
+        .with_session_history_reader(Arc::new(store.history_reader()));
         let items = runtime.runtime_session_context_items("deployment").await;
         if corruption == "none" {
             assert!(!items.is_empty());
-            assert!(items.iter().any(|item| item.content.contains("deployment failed")));
+            assert!(items
+                .iter()
+                .any(|item| item.content.contains("deployment failed")));
         } else {
-            assert!(items.is_empty(), "corrupt {corruption} must not enter even an orientation packet: {items:?}");
+            assert!(
+                items.is_empty(),
+                "corrupt {corruption} must not enter even an orientation packet: {items:?}"
+            );
         }
     }
 }
@@ -2835,11 +3002,7 @@ async fn clean_terminal_does_not_retry_after_its_provider_attempt() {
     runtime.set_active_model("private-model");
 
     let error = runtime
-        .execute_clean_terminal_synthesis(
-            "give a concise answer",
-            "checked evidence",
-            Vec::new(),
-        )
+        .execute_clean_terminal_synthesis("give a concise answer", "checked evidence", Vec::new())
         .await
         .expect_err("clean terminal must not retry after its provider attempt");
     assert!(error.to_string().contains("maximum context length"));
@@ -3804,9 +3967,14 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
     let event_store = Arc::new(RuntimeEventStore::for_test());
     let mut session = Session::new();
     session.session_id = "parallel-network-session".into();
-    crate::test_support::register_running_root(Arc::clone(&event_store), &crate::CowdExecutionContext {
-        execution_id: "parallel-network-execution".into(), session_id: session.session_id.clone(), turn_id: "parallel-network-turn".into(),
-    });
+    crate::test_support::register_running_root(
+        Arc::clone(&event_store),
+        &crate::CowdExecutionContext {
+            execution_id: "parallel-network-execution".into(),
+            session_id: session.session_id.clone(),
+            turn_id: "parallel-network-turn".into(),
+        },
+    );
     let bus = CowdEventBus::new();
     let _scope = bus.enter_execution(crate::CowdExecutionContext {
         execution_id: "parallel-network-execution".to_string(),
@@ -4129,7 +4297,10 @@ fn explicit_team_obligation_is_durable_and_recoverable() {
     .without_memory()
     .with_runtime_event_store(Arc::clone(&store));
     runtime
-        .begin_turn_strategy("provider-turn", "必须启动两个 Team 分别审查三个独立域并综合")
+        .begin_turn_strategy(
+            "provider-turn",
+            "必须启动两个 Team 分别审查三个独立域并综合",
+        )
         .expect("admit team strategy");
     runtime
         .bind_turn_strategy_execution("provider-turn", "provider-graph")
@@ -4292,4 +4463,1384 @@ fn a_single_exact_evidence_result_cannot_exceed_the_ceiling() {
         "a whole source file must still fit one call, got {}",
         raised.tool_result_budget.per_tool_max_tokens
     );
+}
+
+mod r1_native_real_wire {
+    use super::*;
+    use crate::context_evidence::{
+        decode_read_acquisition, decode_read_delivery, read_payload_digest, read_sha256,
+        ReadDeliveryMaterial, ReadDeliveryRecipient, ReadDeliveryTransport, ReadExtent,
+        NATIVE_DELIVERY_KIND, READ_ACQUISITION_FIELD,
+    };
+    use crate::runtime_event_store::{DurableRuntimeEvent, RuntimeEventInput};
+    use harness_contract::execution::ExecutionIdentity;
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+        ExecutionNodeStatus,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct WireServer {
+        endpoint: String,
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
+        disconnect: Arc<AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for WireServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl WireServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let disconnect = Arc::new(AtomicBool::new(false));
+            let disconnected = disconnect.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let bytes = tokio::time::timeout(Duration::from_secs(10), async {
+                        let mut bytes = Vec::new();
+                        loop {
+                            let mut buffer = [0_u8; 8192];
+                            let count = socket.read(&mut buffer).await.unwrap();
+                            assert!(count > 0 && bytes.len() < 4 * 1024 * 1024);
+                            bytes.extend_from_slice(&buffer[..count]);
+                            if let Some(offset) =
+                                bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                            {
+                                let headers = String::from_utf8_lossy(&bytes[..offset]);
+                                let length = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().unwrap())
+                                    })
+                                    .unwrap();
+                                if bytes.len() >= offset + 4 + length {
+                                    break bytes[offset + 4..offset + 4 + length].to_vec();
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let ordinal = {
+                        let mut requests = captured.lock().unwrap();
+                        requests.push(bytes);
+                        requests.len()
+                    };
+                    if disconnected.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let delta = if ordinal == 1 {
+                        serde_json::json!({"role":"assistant","tool_calls":[{
+                            "index":0,"id":"native-read","type":"function",
+                            "function":{"name":"read_file","arguments":
+                                serde_json::json!({"path":"target.txt","complete":true}).to_string()}
+                        }]})
+                    } else {
+                        serde_json::json!({"role":"assistant","content":"The supplied read result was received."})
+                    };
+                    let chunk = |delta, finish_reason| {
+                        serde_json::json!({
+                            "id":"native-loopback","object":"chat.completion.chunk",
+                            "model":"native-wire-model","choices":[{
+                                "index":0,"delta":delta,"finish_reason":finish_reason
+                            }]
+                        })
+                    };
+                    let response = format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        chunk(delta, serde_json::Value::Null),
+                        chunk(
+                            serde_json::json!({}),
+                            serde_json::json!(if ordinal == 1 { "tool_calls" } else { "stop" })
+                        )
+                    );
+                    socket.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(), response,
+                    ).as_bytes()).await.unwrap();
+                }
+            });
+            Self {
+                endpoint,
+                requests,
+                disconnect,
+                task,
+            }
+        }
+    }
+
+    struct FallibleSessionJournal {
+        inner: Arc<dyn crate::SessionRuntimeJournalPort>,
+        reject_packed: AtomicBool,
+        reject_outcome: AtomicBool,
+        reject_continuation_outcomes: AtomicBool,
+        outcomes_seen: AtomicUsize,
+        rejected: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::SessionRuntimeJournalPort for FallibleSessionJournal {
+        async fn append_event(
+            &self,
+            event: &crate::RuntimeSessionEvent,
+        ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+            let delayed_outcome = event.kind
+                == crate::RuntimeSessionEventKind::ProviderAttemptOutcome
+                && self.outcomes_seen.fetch_add(1, Ordering::SeqCst) > 0
+                && self.reject_continuation_outcomes.load(Ordering::SeqCst);
+            if (event.kind == crate::RuntimeSessionEventKind::ProviderRequestPacked
+                && self.reject_packed.load(Ordering::SeqCst))
+                || (event.kind == crate::RuntimeSessionEventKind::ProviderAttemptOutcome
+                    && self.reject_outcome.load(Ordering::SeqCst))
+                || delayed_outcome
+            {
+                self.rejected.fetch_add(1, Ordering::SeqCst);
+                return Err(session::SessionError::Store(
+                    "native real-wire journal fault".into(),
+                ));
+            }
+            self.inner.append_event(event).await
+        }
+
+        async fn append_context_envelope_if_absent(
+            &self,
+            record: &crate::RuntimeContextEnvelopeRecord,
+        ) -> Result<Option<crate::RuntimeSessionEventReceipt>, session::SessionError> {
+            self.inner.append_context_envelope_if_absent(record).await
+        }
+
+        async fn append_compaction_bundle_if_absent(
+            &self,
+            events: &[crate::RuntimeSessionEvent],
+            checkpoint_id: &str,
+        ) -> Result<bool, session::SessionError> {
+            self.inner
+                .append_compaction_bundle_if_absent(events, checkpoint_id)
+                .await
+        }
+    }
+
+    struct GovernedReadExecutor {
+        host: tools::ToolHost,
+        requests: Mutex<Vec<crate::RuntimeToolExecutionRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for GovernedReadExecutor {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            Some(self.host.pin_snapshot())
+        }
+
+        fn delegated_tool_effect_descriptor(
+            &self,
+            name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            Some(self.host.pin_snapshot().describe_effect(name, input))
+        }
+
+        async fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            self.requests.lock().unwrap().push(request.clone());
+            let binding = request.step_binding.as_ref().unwrap();
+            let step = binding.resolve(Some(self.host.pin_snapshot())).unwrap();
+            let input = serde_json::from_str(&request.input).unwrap();
+            let result = step
+                .lease()
+                .execute_async(
+                    request.authorization.as_ref().unwrap(),
+                    &request.tool_name,
+                    &input,
+                )
+                .await;
+            let (status, output, error) = match result {
+                Ok(output) => (
+                    crate::RuntimeToolExecutionStatus::Executed,
+                    Some(output),
+                    None,
+                ),
+                Err(error) => (
+                    crate::RuntimeToolExecutionStatus::Failed,
+                    None,
+                    Some(error.to_string()),
+                ),
+            };
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status,
+                category: request.category,
+                output,
+                error,
+                evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+                observed_evidence: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for GovernedReadExecutor {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            Some(self.host.pin_snapshot())
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec!["read_file".into()]
+        }
+
+        fn registered_tool_effect(
+            &self,
+            name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            Some(self.host.pin_snapshot().describe_effect(name, input))
+        }
+
+        async fn execute_output(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+            Err(crate::ToolError::new(
+                "real-wire fixture requires original bound authorization",
+            ))
+        }
+    }
+
+    type NativeRuntime = ConversationRuntime<crate::ProviderRuntimeClient, GovernedReadExecutor>;
+
+    struct NativeFixture {
+        runtime: NativeRuntime,
+        store: Arc<RuntimeEventStore>,
+        sessions: Arc<session::UnifiedSessionStore>,
+        journal: Arc<FallibleSessionJournal>,
+        server: WireServer,
+        bus: CowdEventBus,
+        owner: harness_contract::projection::RuntimeActivityBinding,
+        execution: crate::CowdExecutionContext,
+        registry: Arc<crate::ProviderRegistry>,
+        _workspace: tempfile::TempDir,
+    }
+
+    impl NativeFixture {
+        async fn new(body: Option<&str>, recipient: &str) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            if let Some(body) = body {
+                fs::write(workspace.path().join("target.txt"), body).unwrap();
+            }
+            let session = Session::new().with_workspace_root(workspace.path());
+            let session_id = session.session_id.clone();
+            let turn_id = format!("native-turn-{session_id}");
+            let graph_id = format!("native-graph-{session_id}");
+            let task_id = format!("native-task-{session_id}");
+            let store = Arc::new(RuntimeEventStore::for_test());
+            let commits = crate::execution_core::graph::ExecutionCommitService::new(store.clone());
+            let mut graph =
+                ExecutionGraph::new("Read the supplied current source and report its facts");
+            graph.id = graph_id.clone();
+            graph.lineage = Some(ExecutionGraphLineage {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                root_task_id: task_id.clone(),
+                task_id: task_id.clone(),
+                generation: 1,
+            });
+            let mut model_node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                "native-root-model",
+            );
+            model_node.id = format!("{graph_id}:model-owner");
+            let model_node_id = model_node.id.clone();
+            graph.nodes.push(model_node);
+            let mut graph = commits.register_graph(graph).unwrap().graph;
+            graph = commits
+                .transition_node(
+                    &graph,
+                    &model_node_id,
+                    ExecutionNodeStatus::Ready,
+                    None,
+                    Vec::new(),
+                )
+                .unwrap()
+                .graph;
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == model_node_id)
+                .unwrap();
+            let binding = crate::execution_core::graph::ExecutionNodeBinding {
+                executor_kind: node.executor_kind.clone(),
+                ticket_idempotency_key: node.idempotency_key.clone(),
+                attempt: 1,
+                resource_lease_refs: vec![],
+                scope_lease_ref: None,
+                worktree_lease_ref: None,
+            };
+            graph = commits
+                .bind_and_start_node(&graph, &model_node_id, binding)
+                .unwrap()
+                .graph;
+            assert_eq!(
+                graph.node_statuses[&model_node_id],
+                ExecutionNodeStatus::Running
+            );
+            let task_identity = ExecutionIdentity::for_task_graph(
+                "native-root-reader",
+                "native-wire-workspace",
+                "native-mission",
+                &task_id,
+                &session_id,
+                &turn_id,
+                &graph_id,
+            )
+            .unwrap();
+            let identity = match recipient {
+                "none" => None,
+                "task_graph" => Some(task_identity),
+                _ => panic!("unknown recipient"),
+            };
+            let owner = store
+                .latest_for_stream(&format!("{graph_id}:node:{model_node_id}"))
+                .unwrap()
+                .unwrap()
+                .activity_binding()
+                .unwrap();
+            assert_eq!(owner.node_id.as_deref(), Some(model_node_id.as_str()));
+            owner.validate().unwrap();
+            let execution = crate::CowdExecutionContext {
+                execution_id: graph_id.clone(),
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let bus = CowdEventBus::new();
+            let sessions = Arc::new(crate::test_support::session_store());
+            sessions
+                .create_session(&session::SessionRecord {
+                    session_id: session_id.clone(),
+                    platform: "test".into(),
+                    chat_id: "native-loopback".into(),
+                    user_id: None,
+                    model: Some("native-wire-model".into()),
+                    created_at: "2026-10-17T00:00:00Z".into(),
+                    last_activity: "2026-10-17T00:00:00Z".into(),
+                    message_count: 0,
+                    reset_policy: "manual".into(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    status: "active".into(),
+                })
+                .await
+                .unwrap();
+            let journal = Arc::new(FallibleSessionJournal {
+                inner: crate::session_runtime_port::TestSessionPortAdapter::new(sessions.clone()),
+                reject_packed: AtomicBool::new(false),
+                reject_outcome: AtomicBool::new(false),
+                rejected: AtomicUsize::new(0),
+                reject_continuation_outcomes: AtomicBool::new(false),
+                outcomes_seen: AtomicUsize::new(0),
+            });
+            let server = WireServer::start().await;
+            let registry = Arc::new(
+                crate::ProviderRegistry::new(crate::config::ProvidersConfig {
+                    providers: std::collections::HashMap::from([(
+                        "native-loopback".into(),
+                        crate::config::ProviderConfig {
+                            name: "native-loopback".into(),
+                            base_url: server.endpoint.clone(),
+                            api_key: "local-fixture-secret".into(),
+                            models: vec!["native-wire-model".into()],
+                            protocol: Some("completions".into()),
+                            parallel_tool_calls: Default::default(),
+                            early_tool_start: Default::default(),
+                        },
+                    )]),
+                })
+                .unwrap(),
+            );
+            let host = tools::ToolHost::builtin("native-wire-workspace", workspace.path())
+                .with_authorization_lease_verifier(Arc::new(
+                    crate::AuthorizationNegotiator::verify_lease_signature,
+                ));
+            let definitions = host
+                .pin_snapshot()
+                .snapshot()
+                .catalog
+                .definitions(None)
+                .into_iter()
+                .filter(|definition| definition.name == "read_file")
+                .map(|definition| crate::ProviderToolDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    input_schema: definition.input_schema,
+                })
+                .collect();
+            let client = crate::ProviderRuntimeClient::new(
+                registry.clone(),
+                "native-wire-model".into(),
+                definitions,
+            )
+            .unwrap();
+            let executor = GovernedReadExecutor {
+                host,
+                requests: Mutex::new(Vec::new()),
+            };
+            let mut runtime = ConversationRuntime::new(
+                session,
+                client,
+                executor,
+                PermissionPolicy::new(PermissionMode::ReadOnly),
+                SystemPromptBuilder::new().build(),
+            )
+            .without_memory()
+            .with_runtime_event_store(store.clone())
+            .with_session_journal_port(journal.clone())
+            .with_artifact_store(Arc::new(crate::ArtifactStore::for_test_default(
+                workspace.path().join("artifacts"),
+            )))
+            .with_cowd_event_bus(bus.clone())
+            .with_checkpoint_identity("native-wire-workspace", identity);
+            runtime.set_active_model("native-wire-model");
+            runtime = runtime.with_model_context_window(262_144);
+            runtime
+                .session_input_stream()
+                .set_active_turn(Some(harness_contract::turn::TurnId::from_string(&turn_id)));
+            Self {
+                runtime,
+                store,
+                sessions,
+                journal,
+                server,
+                bus,
+                owner,
+                execution,
+                registry,
+                _workspace: workspace,
+            }
+        }
+
+        async fn run_root_host(mut self, defer_confirmation: bool) -> (Self, ModelToolCall) {
+            let fixture_graph_id = self.execution.execution_id.clone();
+            assert!(self.bus.current_execution_context().is_none());
+            assert!(self.bus.current_activity_binding().is_none());
+            self.journal
+                .reject_continuation_outcomes
+                .store(defer_confirmation, Ordering::SeqCst);
+            let ports =
+                crate::session_runtime_port::TestSessionPortAdapter::new(self.sessions.clone());
+            let services = crate::RuntimeServices::test_builder(
+                self._workspace.path().join("runtime-home"),
+                self._workspace.path(),
+            )
+            .runtime_event_store(self.store.clone())
+            .artifact_store(self.runtime.artifact_store.as_ref().unwrap().clone())
+            .provider_registry(self.registry.clone())
+            .tool_execution_host(self.runtime.tool_executor.clone())
+            .session_ports(ports.clone(), ports.clone(), self.journal.clone(), ports)
+            .build()
+            .unwrap();
+            services.publish_session_execution_policy(
+                self.runtime.session_id().to_string(),
+                self.runtime.permission_policy.execution_policy_control(),
+            );
+            let spec = services
+                .task_runtime_port()
+                .bind_task_spec(
+                    self.runtime.session_id(),
+                    Some(harness_contract::policy::PermissionMode::ReadOnly),
+                    harness_contract::task::TaskSpec::new(
+                        "Read target.txt and report the current facts",
+                    ),
+                )
+                .unwrap();
+            services
+                .task_runtime_port()
+                .create(harness_contract::task::TaskCreateCommand {
+                    task_id: self.owner.task_id.clone(),
+                    mission_id: services.mission_runtime().default_mission_id().to_string(),
+                    kind: harness_contract::task::TaskKind::Root,
+                    origin: harness_contract::task::TaskOrigin::User,
+                    origin_session_id: self.execution.session_id.clone(),
+                    origin_turn_id: self.execution.turn_id.clone(),
+                    root_task_id: self.owner.root_task_id.clone(),
+                    parent_task_id: None,
+                    predecessor_task_id: None,
+                    mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                    mission_assigned_by: "runtime.native-wire-test".into(),
+                    spec,
+                    evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                        "test_input",
+                        self.execution.turn_id.clone(),
+                    )],
+                })
+                .unwrap();
+            let identity = self.runtime.execution_identity.as_ref().map(|_| {
+                ExecutionIdentity::for_task_graph(
+                    "native-root-reader",
+                    services.workspace_key(),
+                    services.mission_runtime().default_mission_id(),
+                    &self.owner.task_id,
+                    &self.execution.session_id,
+                    &self.execution.turn_id,
+                    &self.execution.execution_id,
+                )
+                .unwrap()
+            });
+            self.runtime
+                .require_next_model_tool_action(["read_file".to_string()]);
+            let runtime = self
+                .runtime
+                .with_checkpoint_identity(services.workspace_key(), identity);
+            let lineage = ExecutionGraphLineage {
+                session_id: self.execution.session_id.clone(),
+                turn_id: self.execution.turn_id.clone(),
+                root_task_id: self.owner.root_task_id.clone(),
+                task_id: self.owner.task_id.clone(),
+                generation: 1,
+            };
+            services
+                .release_recovered_producers()
+                .await
+                .expect("release fresh native-wire Runtime producers");
+            let (runtime, result) = tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::submit_owned_conversation_turn(
+                    runtime,
+                    services.clone(),
+                    "Read target.txt and report the current facts",
+                    &crate::SharedPrompter::none(),
+                    lineage.clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            self.runtime = runtime;
+            result.unwrap();
+            let source = self
+                .runtime
+                .turn_native_tool_sources
+                .lock()
+                .unwrap()
+                .get("native-read")
+                .unwrap()
+                .clone();
+            let call = source.call.clone();
+            self.execution = source.execution;
+            self.owner = source
+                .activity_owner
+                .expect("actual Host model ticket source");
+            assert_ne!(self.execution.execution_id, fixture_graph_id);
+            let graph = services
+                .graph_state_store()
+                .load(&self.execution.execution_id)
+                .unwrap();
+            assert_eq!(graph.lineage.as_ref(), Some(&lineage));
+            assert!(graph.parent_execution.is_none());
+            assert_eq!(self.owner.root_execution_id, graph.id);
+            let node_id = self
+                .owner
+                .node_id
+                .as_ref()
+                .expect("original Host model node");
+            let original = self
+                .store
+                .event_by_idempotency_key(
+                    &format!("{}:node:{node_id}", graph.id),
+                    &format!("{}:{node_id}:{}", graph.id, self.owner.revision),
+                )
+                .unwrap()
+                .expect("actual durable model start, not fixture root");
+            assert_eq!(original.activity_binding().as_ref(), Some(&self.owner));
+            assert_eq!(original.payload["to"], "running");
+            assert!(self.bus.current_execution_context().is_none());
+            assert!(self.bus.current_activity_binding().is_none());
+            assert!(!self.bus.has_live_telemetry_observer());
+            assert!(services.active_execution_bus(&graph.id).is_none());
+            if let Some(identity) = self.runtime.execution_identity.as_ref() {
+                assert_eq!(identity.graph_id(), Some(graph.id.as_str()));
+                assert_eq!(identity.task_id(), Some(lineage.task_id.as_str()));
+            }
+            assert!(call.binding.is_some());
+            assert!(self
+                .runtime
+                .tool_executor
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.tool_use_id == call.id
+                    && request
+                        .parent_execution
+                        .as_ref()
+                        .is_some_and(|parent| parent.execution_id == self.execution.execution_id)));
+            services.shutdown_execution().await;
+            services.shutdown_maintenance().await;
+            self.journal
+                .reject_continuation_outcomes
+                .store(false, Ordering::SeqCst);
+            if defer_confirmation {
+                assert!(self.materials().is_empty());
+                assert!(self.runtime.turn_model_observations().is_empty());
+                assert!(self.journal.rejected.load(Ordering::SeqCst) > 0);
+            }
+            (self, call)
+        }
+
+        async fn continue_model(
+            &mut self,
+        ) -> Result<crate::conversation::ModelStepResult, RuntimeError> {
+            let _scope = self
+                .bus
+                .enter_execution_with_activity(self.execution.clone(), Some(self.owner.clone()));
+            if self.runtime.active_turn_strategy().is_none() {
+                self.runtime
+                    .begin_turn_strategy(
+                        &self.execution.turn_id,
+                        "Read target.txt and report the current facts",
+                    )
+                    .unwrap();
+            }
+            self.runtime.require_next_model_final_response();
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                self.runtime
+                    .execute_model_step("Report the current facts", false),
+            )
+            .await
+            .unwrap()
+        }
+
+        fn materials(&self) -> Vec<DurableRuntimeEvent> {
+            self.store
+                .list_stream(&format!("session:{}", self.runtime.session_id()))
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == NATIVE_DELIVERY_KIND)
+                .collect()
+        }
+
+        fn acquisition(&self, call: &ModelToolCall) -> DurableRuntimeEvent {
+            let key = call.binding.as_ref().unwrap().effect_idempotency_key();
+            let event = self
+                .store
+                .event_by_idempotency_key(
+                    &format!("execution-effect:{key}"),
+                    &format!("{key}:read-receipt"),
+                )
+                .unwrap()
+                .expect("original governed primary receipt");
+            let requests = self.runtime.tool_executor.requests.lock().unwrap();
+            let request = requests
+                .iter()
+                .find(|request| request.tool_use_id == call.id)
+                .unwrap();
+            assert_eq!(request.idempotency_key, key);
+            assert!(request.compiled_invocation.is_some());
+            if !event.payload[READ_ACQUISITION_FIELD].is_null() {
+                let scope: harness_contract::goal::ProofEffectScope =
+                    serde_json::from_value(event.payload["resolved_effect_scope"].clone()).unwrap();
+                let descriptor = &request.compiled_invocation.as_ref().unwrap().effect;
+                assert_eq!(scope.version, 2);
+                assert!(scope.complete);
+                scope.validate_purpose_mapping(descriptor).unwrap();
+                assert!(scope
+                    .scope_purposes
+                    .iter()
+                    .any(|entry| entry.purpose
+                        == harness_contract::goal::ProofEffectPurpose::InputRead));
+                let mut omitted = scope.clone();
+                omitted.scope_purposes.clear();
+                assert!(omitted.validate_purpose_mapping(descriptor).is_err());
+                for version in [0, 1, 99] {
+                    let mut unknown = serde_json::to_value(&scope).unwrap();
+                    unknown["version"] = version.into();
+                    assert!(
+                        serde_json::from_value::<harness_contract::goal::ProofEffectScope>(unknown)
+                            .is_err()
+                    );
+                }
+                let mut missing_mapping = serde_json::to_value(&scope).unwrap();
+                missing_mapping
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("scope_purposes");
+                assert!(
+                    serde_json::from_value::<harness_contract::goal::ProofEffectScope>(
+                        missing_mapping
+                    )
+                    .is_err()
+                );
+                let mut duplicate = scope.clone();
+                duplicate
+                    .scope_purposes
+                    .push(scope.scope_purposes[0].clone());
+                assert!(duplicate.validate_purpose_mapping(descriptor).is_err());
+                let seal = decode_read_acquisition(&event.payload[READ_ACQUISITION_FIELD]).unwrap();
+                let parent = request
+                    .parent_execution
+                    .as_ref()
+                    .expect("parent is issued by the original Host ticket");
+                assert_eq!(seal.graph_id, parent.execution_id);
+                assert_eq!(seal.node_id, parent.node_id);
+                assert_eq!(Some(seal.attempt), request.parent_execution_attempt);
+                assert_eq!(seal.step, call.binding.as_ref().unwrap().snapshot.identity);
+                let index = self
+                    .store
+                    .event_by_idempotency_key(&seal.index_stream, &seal.index_key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(index.transaction_id, event.transaction_id);
+                assert_eq!(
+                    index.payload["resolved_effect_scope"],
+                    event.payload["resolved_effect_scope"]
+                );
+            }
+            event
+        }
+
+        async fn assert_actual_wire(&self, material: &ReadDeliveryMaterial) {
+            let ReadDeliveryTransport::NativeProviderContinuation {
+                request_id,
+                wire_body_sha256,
+                wire_artifact,
+                packed_sequence,
+                outcome_sequence,
+                step_render,
+                raw_ref,
+                ..
+            } = &material.transport
+            else {
+                panic!("must be Native wire transport")
+            };
+            let bytes = self
+                .runtime
+                .artifact_store
+                .as_ref()
+                .unwrap()
+                .read(
+                    wire_artifact,
+                    &format!("session:{}", self.runtime.session_id()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let wire = &artifact["provider_request"]["wire_request"]["body"];
+            let canonical = serde_json::to_vec(wire).unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&canonical)),
+                *wire_body_sha256
+            );
+            assert!(self
+                .server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|sent| sent == &canonical));
+            assert!(!String::from_utf8(bytes)
+                .unwrap()
+                .contains("local-fixture-secret"));
+            let presentation = wire["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == material.tool_invocation_id
+                })
+                .expect("actual ToolResult position, not a JSON substring")["content"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                read_sha256(presentation.as_bytes()),
+                material.presentation_sha256
+            );
+            assert_eq!(presentation.len() as u64, material.presentation_bytes);
+            let packed = self
+                .sessions
+                .session_domain_events_page(self.runtime.session_id(), 0, 4096)
+                .await
+                .unwrap();
+            let packed_event = packed
+                .events
+                .iter()
+                .find(|event| event.sequence == *packed_sequence)
+                .unwrap();
+            assert_eq!(packed_event.kind, "context.provider_request_packed");
+            assert_eq!(packed_event.payload["request_id"], *request_id);
+            assert_eq!(packed_event.payload["body_sha256"], *wire_body_sha256);
+            assert_eq!(
+                packed_event.payload["step_render"]["step_id"],
+                step_render.step_id
+            );
+            assert_ne!(step_render.step_id, material.acquisition.step.step_id);
+            assert!(self
+                .store
+                .list_stream(&format!("session:{}", self.runtime.session_id()))
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "model.step_bound"
+                    && event.payload["identity"]
+                        == serde_json::to_value(&material.acquisition.step).unwrap()));
+            let outcome = packed
+                .events
+                .iter()
+                .find(|event| event.sequence == *outcome_sequence)
+                .unwrap();
+            assert_eq!(outcome.kind, "context.provider_attempt_outcome");
+            assert_eq!(outcome.payload["request_id"], *request_id);
+            assert_eq!(outcome.payload["terminal_status"], "completed");
+            assert!(outcome_sequence > packed_sequence);
+            let raw = self.runtime.existing_evidence_access(raw_ref).unwrap();
+            let original = self
+                .runtime
+                .artifact_store
+                .as_ref()
+                .unwrap()
+                .resolve(&raw.retrieval_selector)
+                .unwrap();
+            let original_bytes = self
+                .runtime
+                .artifact_store
+                .as_ref()
+                .unwrap()
+                .read(&original, &raw.visibility_scope, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_sha256(&original_bytes),
+                material.acquisition.body.output_sha256
+            );
+            assert_eq!(
+                original_bytes.len() as u64,
+                material.acquisition.body.output_bytes
+            );
+            let original_output: serde_json::Value =
+                serde_json::from_slice(&original_bytes).unwrap();
+            assert_eq!(
+                original_output["file"]["sha256"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("sha256:"),
+                material
+                    .acquisition
+                    .body
+                    .source_sha256
+                    .trim_start_matches("sha256:")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_read_delivery_native_complete_and_preview_keep_original_identity() {
+        let large = (0..12_000)
+            .map(|index| format!("source row {index:05}: exact retained native body\n"))
+            .collect::<String>();
+        for (body, omitted) in [
+            ("alpha\r\nbeta\r\n", false),
+            ("last line without newline", false),
+            ("", false),
+            (large.as_str(), true),
+        ] {
+            let fixture = NativeFixture::new(Some(body), "none").await;
+            let (mut fixture, call) = fixture.run_root_host(false).await;
+            let primary = fixture.acquisition(&call);
+            let seal = decode_read_acquisition(&primary.payload[READ_ACQUISITION_FIELD]).unwrap();
+            assert_eq!(seal.body.source_sha256, read_sha256(body.as_bytes()));
+            assert_eq!(seal.body.source_bytes, body.len() as u64);
+            let index = fixture
+                .store
+                .event_by_idempotency_key(&seal.index_stream, &seal.index_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(index.transaction_id, primary.transaction_id);
+            assert_eq!(
+                index.payload[READ_ACQUISITION_FIELD],
+                primary.payload[READ_ACQUISITION_FIELD]
+            );
+            let events = fixture.materials();
+            assert_eq!(events.len(), 1);
+            let material = decode_read_delivery(&events[0].payload).unwrap();
+            assert!(matches!(
+                material.recipient,
+                ReadDeliveryRecipient::Root { identity: None, .. }
+            ));
+            assert_eq!(material.acquisition, seal);
+            assert_eq!(material.acquisition_event_id, primary.event_id);
+            assert_eq!(material.acquisition_cursor, primary.commit_cursor);
+            assert_eq!(material.index_event_id, index.event_id);
+            assert_eq!(material.body_omitted, omitted);
+            assert_eq!(material.delivered_extent.is_none(), omitted);
+            assert!(events[0].commit_cursor > primary.commit_cursor);
+            fixture.assert_actual_wire(&material).await;
+            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            fixture.continue_model().await.unwrap();
+            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            assert!(fixture
+                .materials()
+                .iter()
+                .all(|event| event.payload["acquisition_cursor"] == primary.commit_cursor));
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_read_delivery_native_failed_wire_or_confirmation_cannot_promote() {
+        for (recipient, fault) in ["none", "task_graph"].into_iter().flat_map(|recipient| {
+            [
+                "packed",
+                "outcome",
+                "disconnect",
+                "confirmation",
+                "cas",
+                "failed_read",
+                "cancel",
+            ]
+            .into_iter()
+            .map(move |fault| (recipient, fault))
+        }) {
+            let fixture = NativeFixture::new(
+                (fault != "failed_read").then_some("original source\n"),
+                recipient,
+            )
+            .await;
+            let (mut fixture, call) = fixture.run_root_host(true).await;
+            let primary = fixture.acquisition(&call);
+            if fault != "failed_read" {
+                decode_read_acquisition(&primary.payload[READ_ACQUISITION_FIELD]).unwrap();
+            }
+            let before = fixture.server.requests.lock().unwrap().len();
+            let rejected_before = fixture.journal.rejected.load(Ordering::SeqCst);
+            match fault {
+                "packed" => fixture.journal.reject_packed.store(true, Ordering::SeqCst),
+                "outcome" => fixture.journal.reject_outcome.store(true, Ordering::SeqCst),
+                "disconnect" => fixture.server.disconnect.store(true, Ordering::SeqCst),
+                "cancel" => fixture.runtime.cancellation_token.cancel(),
+                _ => {}
+            }
+            let raced = Arc::new(AtomicUsize::new(0));
+            let result = match fault {
+                "confirmation" => {
+                    super::super::context_plane::with_native_delivery_confirmation_failure(
+                        fixture.continue_model(),
+                    )
+                    .await
+                }
+                "cas" => {
+                    let store = fixture.store.clone();
+                    let stream_id = format!("session:{}", fixture.runtime.session_id());
+                    let raced = raced.clone();
+                    let race: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        raced.fetch_add(1, Ordering::SeqCst);
+                        store
+                            .append(RuntimeEventInput {
+                                stream_id: stream_id.clone(),
+                                scope: RuntimeEventScope::Session,
+                                kind: "test.native_confirmation_competing_append".into(),
+                                status: None,
+                                actor: None,
+                                refs: Vec::new(),
+                                payload: serde_json::json!({"competing_append":true}),
+                            })
+                            .unwrap();
+                    });
+                    super::super::context_plane::with_native_delivery_confirmation_source_race(
+                        race,
+                        fixture.continue_model(),
+                    )
+                    .await
+                }
+                _ => fixture.continue_model().await,
+            };
+            if matches!(fault, "failed_read" | "outcome") {
+                result.unwrap();
+                if fault == "failed_read" {
+                    let primary = fixture.acquisition(&call);
+                    assert!(primary.payload[READ_ACQUISITION_FIELD].is_null());
+                } else {
+                    assert!(fixture
+                        .runtime
+                        .native_wire_receipts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|wire| !wire.results.is_empty() && wire.outcome_sequence.is_none()));
+                    assert!(fixture.server.requests.lock().unwrap().len() > before);
+                }
+            } else {
+                let error = result.expect_err(fault);
+                if fault == "confirmation" {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Runtime confirmation append failure"),
+                        "{error}"
+                    );
+                }
+                if fault == "cas" {
+                    assert_eq!(raced.load(Ordering::SeqCst), 1);
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Native delivery confirmation unknown"),
+                        "{error}"
+                    );
+                }
+            }
+            assert!(fixture.materials().is_empty(), "{fault}");
+            assert!(
+                fixture.runtime.turn_model_observations().is_empty(),
+                "{fault}"
+            );
+            if matches!(fault, "packed" | "cancel") {
+                assert_eq!(
+                    fixture.server.requests.lock().unwrap().len(),
+                    before,
+                    "{fault}"
+                );
+            }
+            if matches!(fault, "packed" | "outcome") {
+                assert!(fixture.journal.rejected.load(Ordering::SeqCst) > rejected_before);
+            }
+            if matches!(fault, "confirmation" | "cas") {
+                let events = fixture
+                    .sessions
+                    .session_domain_events_page(fixture.runtime.session_id(), 0, 4096)
+                    .await
+                    .unwrap();
+                assert!(
+                    events
+                        .events
+                        .iter()
+                        .filter(|event| event.kind == "context.provider_attempt_outcome"
+                            && event.payload["terminal_status"] == "completed")
+                        .count()
+                        >= 2
+                );
+                assert!(fixture.server.requests.lock().unwrap().len() >= 2);
+                assert_eq!(
+                    fixture
+                        .runtime
+                        .native_wire_receipts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|wire| !wire.results.is_empty() && wire.outcome_sequence.is_some())
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_read_delivery_root_none_and_task_graph_use_original_owner() {
+        let large = (0..12_000)
+            .map(|index| format!("root row {index:05}: original unabridged body\n"))
+            .collect::<String>();
+        let bodies = [
+            ("root original content\r\nsecond line\n", false),
+            (large.as_str(), true),
+        ];
+        for (recipient, (body, omitted)) in ["none", "task_graph"]
+            .into_iter()
+            .flat_map(|recipient| bodies.into_iter().map(move |body| (recipient, body)))
+        {
+            let fixture = NativeFixture::new(Some(body), recipient).await;
+            let (fixture, call) = fixture.run_root_host(false).await;
+            let primary = fixture.acquisition(&call);
+            let events = fixture.materials();
+            assert_eq!(events.len(), 1, "{recipient}");
+            let material = decode_read_delivery(&events[0].payload).unwrap();
+            let ReadDeliveryRecipient::Root { owner, identity } = &material.recipient else {
+                panic!("Root must not acquire an imaginary AgentRun")
+            };
+            assert_eq!(material.acquisition.graph_id, material.execution_id);
+            let index = fixture
+                .store
+                .event_by_idempotency_key(
+                    &material.acquisition.index_stream,
+                    &material.acquisition.index_key,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(index.transaction_id, primary.transaction_id);
+            assert_eq!(
+                index.payload[READ_ACQUISITION_FIELD],
+                primary.payload[READ_ACQUISITION_FIELD]
+            );
+            assert_eq!(identity.is_none(), recipient == "none");
+            if let Some(identity) = identity {
+                assert_eq!(
+                    identity.kind(),
+                    harness_contract::execution::ExecutionIdentityKind::TaskGraph
+                );
+                assert!(identity.node_id().is_none());
+                assert!(identity.agent_run_id().is_none());
+                assert_eq!(
+                    identity,
+                    fixture.runtime.execution_identity.as_ref().unwrap()
+                );
+            }
+            let original = fixture
+                .store
+                .list_stream_after(
+                    &owner.stream_id,
+                    owner.sequence - 1,
+                    owner.sequence,
+                    1,
+                    4 * 1024 * 1024,
+                )
+                .unwrap();
+            assert_eq!(original.len(), 1);
+            let original = &original[0];
+            assert_eq!(original.kind, "tool.invocation.completed");
+            assert_eq!(original.event_id, owner.event_id);
+            assert_eq!(read_payload_digest(&original.payload), owner.payload_digest);
+            assert_eq!(original.activity_binding().as_ref(), Some(&owner.binding));
+            assert_eq!(
+                owner.binding.parent_activity_id.as_deref(),
+                Some(fixture.owner.activity_id.as_str())
+            );
+            assert!(owner.binding.agent_run_id.is_none());
+            assert!(owner.binding.node_id.is_none());
+            assert_eq!(
+                owner.binding.tool_call_id.as_deref(),
+                Some(call.id.as_str())
+            );
+            assert!(original.commit_cursor > primary.commit_cursor);
+            assert!(events[0].commit_cursor > original.commit_cursor);
+            assert_eq!(
+                material.acquisition.step,
+                call.binding.as_ref().unwrap().snapshot.identity
+            );
+            assert_eq!(material.acquisition_event_id, primary.event_id);
+            assert_eq!(material.body_omitted, omitted);
+            assert_eq!(material.delivered_extent.is_none(), omitted);
+            assert_eq!(
+                material.acquisition.body.source_sha256,
+                read_sha256(body.as_bytes())
+            );
+            assert_eq!(material.acquisition.body.source_bytes, body.len() as u64);
+            assert!(matches!(
+                material.acquisition.body.extent,
+                ReadExtent::FileLines {
+                    source_omitted: false,
+                    ..
+                }
+            ));
+            fixture.assert_actual_wire(&material).await;
+            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_read_delivery_root_foreign_owner_step_or_ticket_cannot_promote() {
+        for recipient in ["none", "task_graph"] {
+            for foreign in [
+                "owner_event",
+                "owner_digest",
+                "owner_root",
+                "owner_tool",
+                "owner_session",
+                "source_step",
+                "source_turn",
+                "source_tool",
+                "source_root",
+                "ticket",
+                "live_owner",
+                "live_revision",
+                "live_node",
+                "live_activity",
+                "missing_source",
+            ] {
+                let fixture = NativeFixture::new(Some("root target content\n"), recipient).await;
+                let (mut fixture, call) = fixture.run_root_host(true).await;
+                let primary = fixture.acquisition(&call);
+                decode_read_acquisition(&primary.payload[READ_ACQUISITION_FIELD]).unwrap();
+                let key = call.binding.as_ref().unwrap().effect_idempotency_key();
+                let saved_receipts = fixture
+                    .runtime
+                    .turn_generated_model_receipts
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let saved_sources = fixture
+                    .runtime
+                    .turn_native_tool_sources
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let saved_owners = fixture
+                    .runtime
+                    .turn_native_root_owners
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let saved_live_owner = fixture.owner.clone();
+                match foreign {
+                    "owner_event" | "owner_digest" | "owner_root" | "owner_tool"
+                    | "owner_session" => {
+                        let mut owners = fixture.runtime.turn_native_root_owners.lock().unwrap();
+                        let owner = owners
+                            .get_mut(&key)
+                            .expect("original Runtime owner was captured");
+                        match foreign {
+                            "owner_event" => owner.event_id = primary.event_id.clone(),
+                            "owner_digest" => owner.payload_digest = "0".repeat(64),
+                            "owner_root" => owner.binding.root_execution_id = "foreign-root".into(),
+                            "owner_session" => owner.binding.session_id = "foreign-session".into(),
+                            _ => owner.binding.tool_call_id = Some("foreign-read".into()),
+                        }
+                    }
+                    "source_step" | "source_turn" | "source_tool" | "source_root" | "ticket" => {
+                        let mut sources = fixture.runtime.turn_native_tool_sources.lock().unwrap();
+                        let source = sources.get_mut(&call.id).unwrap();
+                        let binding = source.call.binding.as_mut().unwrap();
+                        match foreign {
+                            "source_step" => {
+                                Arc::make_mut(&mut binding.snapshot).identity.step_id =
+                                    "foreign-step".into()
+                            }
+                            "source_turn" => {
+                                Arc::make_mut(&mut binding.snapshot).identity.turn_id =
+                                    "foreign-turn".into()
+                            }
+                            "source_tool" => source.call.name = "read_ref".into(),
+                            "source_root" => source.execution.execution_id = "foreign-root".into(),
+                            _ => binding.origin.call_id = "foreign-ticket-call".into(),
+                        }
+                        let changed = source.clone();
+                        fixture
+                            .runtime
+                            .turn_generated_model_receipts
+                            .lock()
+                            .unwrap()[0]
+                            .source = Some(changed);
+                    }
+                    "live_owner" => fixture.owner.fence += 1,
+                    "live_revision" => fixture.owner.revision += 1,
+                    "live_node" => fixture.owner.node_id = Some("foreign-live-node".into()),
+                    "live_activity" => fixture.owner.activity_id = "foreign-live-activity".into(),
+                    "missing_source" => {
+                        fixture
+                            .runtime
+                            .turn_generated_model_receipts
+                            .lock()
+                            .unwrap()[0]
+                            .source = None
+                    }
+                    _ => unreachable!(),
+                }
+                fixture.continue_model().await.unwrap();
+                assert!(fixture.materials().is_empty(), "{recipient}/{foreign}");
+                assert!(
+                    fixture.runtime.turn_model_observations().is_empty(),
+                    "{recipient}/{foreign}"
+                );
+                assert!(fixture.server.requests.lock().unwrap().len() >= 2);
+                assert_eq!(fixture.acquisition(&call).payload, primary.payload);
+                assert!(
+                    fixture
+                        .runtime
+                        .native_wire_receipts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|wire| !wire.results.is_empty() && wire.outcome_sequence.is_some()),
+                    "actual continuation must succeed before identity rejection"
+                );
+                *fixture
+                    .runtime
+                    .turn_generated_model_receipts
+                    .lock()
+                    .unwrap() = saved_receipts;
+                *fixture.runtime.turn_native_tool_sources.lock().unwrap() = saved_sources;
+                *fixture.runtime.turn_native_root_owners.lock().unwrap() = saved_owners;
+                fixture.owner = saved_live_owner;
+                fixture.continue_model().await.unwrap();
+                let accepted = fixture.materials();
+                assert_eq!(accepted.len(), 1, "positive control {recipient}/{foreign}");
+                let material = decode_read_delivery(&accepted[0].payload).unwrap();
+                assert_eq!(material.acquisition_cursor, primary.commit_cursor);
+                assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+                fixture.assert_actual_wire(&material).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn own836_native_writer_rejects_foreign_original_node_and_input() {
+        let fixture = NativeFixture::new(Some("actual native source\n"), "task_graph").await;
+        let (fixture, call) = fixture.run_root_host(false).await;
+        let _scope = fixture
+            .bus
+            .enter_execution_with_activity(fixture.execution.clone(), Some(fixture.owner.clone()));
+        let input_hash = crate::tool_invocation::stable_hash(&call.input);
+        let owner = fixture
+            .runtime
+            .native_tool_activity_owner(&call.id, &call.name, &input_hash)
+            .unwrap()
+            .expect("real model-node tool source");
+        assert_eq!(
+            owner.parent_activity_id.as_deref(),
+            Some(fixture.owner.activity_id.as_str())
+        );
+        assert!(fixture
+            .runtime
+            .native_tool_activity_owner(&call.id, &call.name, "foreign-input")
+            .is_err());
+        let original = fixture
+            .runtime
+            .turn_native_tool_sources
+            .lock()
+            .unwrap()
+            .get(&call.id)
+            .unwrap()
+            .clone();
+        fixture
+            .runtime
+            .turn_native_tool_sources
+            .lock()
+            .unwrap()
+            .get_mut(&call.id)
+            .unwrap()
+            .activity_owner
+            .as_mut()
+            .unwrap()
+            .node_id = Some("foreign-original-node".into());
+        assert!(fixture
+            .runtime
+            .native_tool_activity_owner(&call.id, &call.name, &input_hash)
+            .is_err());
+        fixture
+            .runtime
+            .turn_native_tool_sources
+            .lock()
+            .unwrap()
+            .insert(call.id.clone(), original);
+        assert_eq!(
+            fixture
+                .runtime
+                .native_tool_activity_owner(&call.id, &call.name, &input_hash)
+                .unwrap(),
+            Some(owner)
+        );
+    }
 }

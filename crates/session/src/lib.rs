@@ -28,6 +28,7 @@ pub use lifecycle::{
 };
 pub use persistence::{
     build_context_index_cards, context_index_card_digest, context_index_source_digest,
+    public_session_blocks, public_terminal_payload_v1, terminal_public_payload_digest,
     ActiveSessionProjection, CompressionAlgo, ContextIndexCard, ContextIndexCoverage,
     OutboxFailureClass, OutboxStatus, SessionActivationManifest, SessionBranchRequest,
     SessionBranchResult, SessionContextDiscoveryPage, SessionContextPage, SessionDiscoveryFilter,
@@ -38,10 +39,18 @@ pub use persistence::{
     SessionProjectionRecoveryState, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
     SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
     SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot, SessionStoreBackend,
-    SessionTerminalExecutionFence, SessionTerminalTranscriptCommit,
+    SessionTerminalExecutionFence, SessionTerminalPublicPayload,
+    SessionTerminalPublicPayloadUnavailableReason, SessionTerminalTranscriptCommit,
     SessionTerminalTranscriptReceipt, SessionUsageBucket, SessionUsageSummary,
     SharedSessionStoreBackend, StorageExecutionLane, StorageExecutionLaneStats,
     StorageExecutionPlaneConfig, StorageExecutionPlaneStats, StorageTier, TieredSessionStore,
     TieredSessionStoreConfig, UnifiedSessionStore, CONTEXT_INDEX_CARD_SCHEMA_VERSION,
-    SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION,
+    SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION, SESSION_TERMINAL_PUBLIC_PAYLOAD_DIGEST_PREFIX_V1,
+    SESSION_TERMINAL_PUBLIC_PAYLOAD_KIND_V1, SESSION_TERMINAL_PUBLIC_PAYLOAD_MAX_BYTES,
+};
+pub use persistence::{
+    SessionPresenceMutation, SessionPresenceMutationKind, SessionPresenceMutationResult,
+    SessionReceiptAuthority, SessionReceiptSource, SessionTerminalAckCommand,
+    SessionTerminalAckListQuery, SessionTerminalMessageBinding, SessionTerminalReceiptContext,
+    SessionTerminalReceiptQuery,
 };

@@ -56,7 +56,24 @@ pub(crate) const RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID: &str =
 pub(crate) const RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID: &str =
     "core.runtime.execution_projection.changes";
 
-pub(crate) const PLATFORM_OPERATION_IDS: [&str; 18] = [
+pub(crate) const SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID: &str =
+    "core.session.terminal_receipt.read";
+pub(crate) const SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID: &str =
+    "core.session.terminal_receipt.ack";
+
+fn frame_scoped_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID
+            | SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID
+            | RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID
+            | RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID
+    )
+}
+
+pub(crate) const PLATFORM_OPERATION_IDS: [&str; 20] = [
+    SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+    SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
     ACTION_PLAN_OPERATION_ID,
     SURFACE_OUTBOX_LIST_OPERATION_ID,
     RUNTIME_START_GOAL_OPERATION_ID,
@@ -77,7 +94,9 @@ pub(crate) const PLATFORM_OPERATION_IDS: [&str; 18] = [
     RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
 ];
 
-pub(crate) const BUSINESS_OPERATION_IDS: [&str; 14] = [
+pub(crate) const BUSINESS_OPERATION_IDS: [&str; 16] = [
+    SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+    SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
     RUNTIME_START_GOAL_OPERATION_ID,
     RUNTIME_START_STRUCTURED_TASK_OPERATION_ID,
     RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID,
@@ -103,6 +122,8 @@ const REQUEST_PRINCIPAL_LIMIT: usize = 4096;
 
 #[derive(Clone)]
 struct CoreBoundPrincipal {
+    frame_reference: Option<String>,
+    receipt_ack_intent: Option<cowd_app_protocol::SessionTerminalReceiptAckInputV1>,
     principal: runtime::VerifiedPrincipal,
     producer_id: String,
     workspace_id: String,
@@ -159,6 +180,8 @@ impl CorePlatformBindings {
         principals.insert(
             request_id.to_owned(),
             CoreBoundPrincipal {
+                frame_reference: None,
+                receipt_ack_intent: None,
                 principal: principal.clone(),
                 producer_id,
                 workspace_id: workspace_id.to_owned(),
@@ -175,6 +198,7 @@ impl CorePlatformBindings {
         envelope: &AppInvocationEnvelopeV1,
         app_id: &str,
         manifest: &cowd_app_protocol::AppManifestV1,
+        frame_reference: Option<&str>,
     ) -> Result<(), String> {
         let authority = crate::services::core_matrix_catalog::definitions()
             .map_err(|error| error.to_string())?
@@ -223,6 +247,25 @@ impl CorePlatformBindings {
                 },
             );
         }
+        let requires_frame = envelope.operation_id.ends_with(".terminal_receipt.read")
+            || envelope.operation_id.ends_with(".terminal_receipt.ack")
+            || envelope
+                .payload
+                .get("execution_id")
+                .is_some_and(|value| !value.is_null());
+        if requires_frame && frame_reference.is_none() {
+            return Err("current Host frame source is required".into());
+        }
+        let receipt_ack_intent = if envelope.operation_id.ends_with(".terminal_receipt.ack") {
+            Some(
+                serde_json::from_value::<cowd_app_protocol::SessionTerminalReceiptAckInputV1>(
+                    envelope.payload.clone(),
+                )
+                .map_err(|_| "invalid explicit receipt ACK intent")?,
+            )
+        } else {
+            None
+        };
         self.insert_bound_principal(
             principal,
             &envelope.request_id,
@@ -231,6 +274,14 @@ impl CorePlatformBindings {
             format!("app:{app_id}"),
             allowed_core_operations,
         );
+        let mut requests = self
+            .request_principals
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bound) = requests.get_mut(&envelope.request_id) {
+            bound.frame_reference = frame_reference.map(str::to_string);
+            bound.receipt_ack_intent = receipt_ack_intent;
+        }
         Ok(())
     }
 
@@ -258,6 +309,8 @@ impl CorePlatformBindings {
         principals.insert(
             request_id.to_owned(),
             CoreBoundPrincipal {
+                frame_reference: None,
+                receipt_ack_intent: None,
                 principal: principal.clone(),
                 producer_id,
                 workspace_id: workspace_id.to_owned(),
@@ -1017,6 +1070,12 @@ fn validate_typed_input(operation_id: &str, payload: &Value) -> Result<Value, St
                 .map_err(|error| format!("invalid `{operation_id}` input: {error}"))?;
             Ok(Value::Null)
         }
+        SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID => {
+            typed!(cowd_app_protocol::SessionTerminalReceiptReadInputV1)
+        }
+        SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID => {
+            typed!(cowd_app_protocol::SessionTerminalReceiptAckInputV1)
+        }
         RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID => {
             typed!(RuntimeExecutionProjectionSnapshotInput)
         }
@@ -1042,6 +1101,15 @@ async fn dispatch_bound_host_operation(
         operation_id,
     )?;
     let payload = validate_typed_input(operation_id, payload)?;
+    validate_frame_operation(
+        state,
+        envelope,
+        app_id,
+        originating_app_operation_id,
+        operation_id,
+        &payload,
+    )
+    .await?;
     if operation_id != RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID
         && envelope.expected_revision.is_some()
     {
@@ -1050,6 +1118,9 @@ async fn dispatch_bound_host_operation(
         ));
     }
     match operation_id {
+        SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID | SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID => {
+            terminal_receipt_operation(state, &binding, app_id, operation_id, &payload).await
+        }
         RUNTIME_START_GOAL_OPERATION_ID => encode(
             start_goal(
                 state,
@@ -1157,6 +1228,382 @@ async fn dispatch_bound_host_operation(
     }
 }
 
+pub(crate) async fn frame_authority_fingerprint(
+    state: &AppState,
+    envelope: &AppInvocationEnvelopeV1,
+    app_id: &str,
+    originating_app_operation_id: &str,
+    operation_id: &str,
+) -> Result<Value, String> {
+    if !frame_scoped_operation(operation_id) {
+        return Ok(
+            serde_json::json!({"principal": envelope.principal, "execution": envelope.execution}),
+        );
+    }
+    let binding = state.services.core_platform_bindings.resolve(
+        envelope,
+        app_id,
+        originating_app_operation_id,
+        operation_id,
+    )?;
+    let (authority, source) = current_frame(state, &binding).await?;
+    Ok(
+        serde_json::json!({"principal": envelope.principal, "execution": envelope.execution,
+        "source": source, "client_id": authority.client_id, "actor_id": authority.actor_id}),
+    )
+}
+
+pub(crate) async fn validate_frame_operation(
+    state: &AppState,
+    envelope: &AppInvocationEnvelopeV1,
+    app_id: &str,
+    originating_app_operation_id: &str,
+    operation_id: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    if !frame_scoped_operation(operation_id) {
+        return Ok(());
+    }
+    let binding = state.services.core_platform_bindings.resolve(
+        envelope,
+        app_id,
+        originating_app_operation_id,
+        operation_id,
+    )?;
+    let reference = binding
+        .frame_reference
+        .as_deref()
+        .ok_or("Host frame source required")?;
+    let principal = crate::api_routes::AuthenticatedPrincipal(binding.principal.clone());
+    let (authority, source) = resolve_host_frame(state, &principal, app_id, reference).await?;
+    if matches!(
+        operation_id,
+        RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID
+            | RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID
+    ) && payload.get("execution_id").and_then(Value::as_str)
+        != Some(source.execution_id.as_str())
+    {
+        return Err("execution is outside the exact frame source".into());
+    }
+    if operation_id == SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID {
+        let input: cowd_app_protocol::SessionTerminalReceiptAckInputV1 =
+            serde_json::from_value(payload.clone()).map_err(json_error)?;
+        if binding.receipt_ack_intent.as_ref() != Some(&input) {
+            return Err("Core ACK differs from explicit signed APP ACK intent".into());
+        }
+        let context = state
+            .services
+            .session
+            .get_terminal_message_receipt_context(session::SessionTerminalReceiptQuery {
+                authority,
+                message_id: input.message_id.clone(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        match context.context {
+            harness_contract::live::SessionMessageReceiptContext::Available {
+                message_sequence,
+                runtime_commit_cursor,
+                content_digest,
+                ..
+            } if message_sequence == input.message_sequence
+                && runtime_commit_cursor.value()?.to_string() == input.runtime_commit_cursor
+                && content_digest == input.content_digest => {}
+            _ => return Err("cached ACK is no longer currently eligible".into()),
+        }
+    }
+    Ok(())
+}
+
+fn frame_session_id(reference: &str) -> Result<String, String> {
+    let (encoded, nonce) = reference.split_once('.').ok_or("invalid frame reference")?;
+    uuid::Uuid::parse_str(nonce).map_err(|_| "invalid frame nonce")?;
+    if encoded.is_empty() || encoded.len() > 512 || encoded.len() % 2 != 0 {
+        return Err("invalid frame session selector".into());
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).map_err(|_| "invalid frame encoding")?;
+            u8::from_str_radix(text, 16).map_err(|_| "invalid frame encoding")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    String::from_utf8(bytes).map_err(|_| "invalid frame session encoding".into())
+}
+
+pub(crate) async fn resolve_host_frame(
+    state: &AppState,
+    principal: &crate::api_routes::AuthenticatedPrincipal,
+    app_id: &str,
+    reference: &str,
+) -> Result<
+    (
+        session::SessionReceiptAuthority,
+        session::SessionReceiptSource,
+    ),
+    String,
+> {
+    let session_id = frame_session_id(reference)?;
+    let (authority, source) = state
+        .services
+        .session
+        .resolve_frame_source(&session_id, reference)
+        .await
+        .map_err(|error| error.to_string())?;
+    let claims = principal.0.claims();
+    let platform = state
+        .services
+        .app_platform
+        .as_ref()
+        .ok_or("APP platform unavailable")?;
+    let admitted = platform
+        .catalog()
+        .get(&AppId(app_id.into()))
+        .ok_or("APP unavailable")?;
+    if claims.kind != harness_contract::security::PrincipalKind::Human
+        || source.principal_id != claims.principal_id
+        || source.tenant_id != claims.tenant_id
+        || source.app_id != app_id
+        || source.app_generation != admitted.generation.0
+        || source.profile_revision != claims.profile_revision.to_string()
+        || source.credential_epoch != claims.credential_epoch.to_string()
+        || source.workspace_id
+            != format!(
+                "sha256:{:x}",
+                Sha256::digest(state.workspace_root.to_string_lossy().as_bytes())
+            )
+        || claims.app_profile(app_id).is_none()
+    {
+        return Err("frame source does not match current authorization".into());
+    }
+    state
+        .revalidate_frame_session(principal, &session_id)
+        .await?;
+    validate_frame_lineage(state, &source)?;
+    Ok((authority, source))
+}
+
+pub(crate) fn validate_frame_lineage(
+    state: &AppState,
+    source: &session::SessionReceiptSource,
+) -> Result<(), String> {
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or("runtime unavailable")?
+        .runtime_services();
+    let graph = runtime
+        .graph_state_store()
+        .load(&source.execution_id)
+        .map_err(|error| error.to_string())?;
+    let lineage = graph.lineage.as_ref().ok_or("frame graph has no lineage")?;
+    let index = runtime.session_execution_index(&source.session_id);
+    let canonical = index
+        .executions
+        .iter()
+        .filter(|entry| {
+            entry.graph_id.as_deref() == Some(source.execution_id.as_str())
+                && entry.turn_id.as_deref() == Some(source.turn_id.as_str())
+        })
+        .count()
+        == 1;
+    if lineage.session_id != source.session_id
+        || lineage.turn_id != source.turn_id
+        || lineage.root_task_id != source.root_task_id
+        || lineage.generation.to_string() != source.lineage_generation
+        || index.session_id != source.session_id
+        || !canonical
+        || graph.parent_execution.is_some()
+    {
+        return Err("frame canonical lineage changed".into());
+    }
+    Ok(())
+}
+
+async fn current_frame(
+    state: &AppState,
+    binding: &CoreBoundPrincipal,
+) -> Result<
+    (
+        session::SessionReceiptAuthority,
+        session::SessionReceiptSource,
+    ),
+    String,
+> {
+    let reference = binding
+        .frame_reference
+        .as_deref()
+        .ok_or("Host frame source required")?;
+    let app_id = binding
+        .producer_id
+        .strip_prefix("app:")
+        .ok_or("APP producer required")?;
+    let principal = crate::api_routes::AuthenticatedPrincipal(binding.principal.clone());
+    resolve_host_frame(state, &principal, app_id, reference).await
+}
+
+async fn terminal_receipt_operation(
+    state: &AppState,
+    binding: &CoreBoundPrincipal,
+    _app_id: &str,
+    operation_id: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    let (authority, source) = current_frame(state, binding).await?;
+    let mut discovered = None;
+    let message_id = if operation_id == SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID {
+        let input: cowd_app_protocol::SessionTerminalReceiptReadInputV1 =
+            serde_json::from_value(payload.clone()).map_err(json_error)?;
+        match input {
+            cowd_app_protocol::SessionTerminalReceiptReadInputV1::Message { message_id } => {
+                message_id
+            }
+            cowd_app_protocol::SessionTerminalReceiptReadInputV1::BoundSourceTerminal {} => {
+                let runtime = state
+                    .services
+                    .runtime
+                    .as_ref()
+                    .ok_or("Runtime delivery authority unavailable")?;
+                let port = runtime.runtime_services().session_terminal_delivery();
+                let session_id = source.session_id.clone();
+                let execution_id = source.execution_id.clone();
+                let turn_id = source.turn_id.clone();
+                discovered = tokio::task::spawn_blocking(move || {
+                    port.for_execution(&session_id, &execution_id, &turn_id)
+                })
+                .await
+                .map_err(|_| "Runtime terminal discovery unavailable")?
+                .map_err(|_| "Runtime terminal discovery failed")?;
+                current_frame(state, binding).await?;
+                let Some(record) = discovered.as_ref() else {
+                    return encode(harness_contract::live::SessionMessageReceiptContext::Unavailable {
+                        reason: harness_contract::live::SessionMessageReceiptUnavailableReason::UnboundOrInvalidated,
+                    });
+                };
+                if record.session_id != source.session_id
+                    || record.execution_id.as_deref() != Some(source.execution_id.as_str())
+                    || record.turn_id.as_deref() != Some(source.turn_id.as_str())
+                    || record.message_id.is_empty()
+                {
+                    return Err("Runtime terminal discovery returned a foreign source".into());
+                }
+                record.message_id.clone()
+            }
+        }
+    } else {
+        let input: cowd_app_protocol::SessionTerminalReceiptAckInputV1 =
+            serde_json::from_value(payload.clone()).map_err(json_error)?;
+        input.message_id
+    };
+    if message_id.is_empty() || message_id.len() > 256 || message_id.chars().any(char::is_control) {
+        return Err("invalid terminal message identity".into());
+    }
+    let query = session::SessionTerminalReceiptQuery {
+        authority,
+        message_id,
+    };
+    let mut context = match state
+        .services
+        .session
+        .get_terminal_message_receipt_context(query.clone())
+        .await
+    {
+        Ok(context) => context,
+        Err(session::SessionError::NotFound(_))
+            if discovered
+                .as_ref()
+                .is_some_and(|record| record.status != "materialized") =>
+        {
+            current_frame(state, binding).await?;
+            return encode(harness_contract::live::SessionMessageReceiptContext::Unavailable {
+                reason: harness_contract::live::SessionMessageReceiptUnavailableReason::UnboundOrInvalidated,
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if let (
+        harness_contract::live::SessionMessageReceiptContext::Available {
+            outbox_observation, ..
+        },
+        Some(input),
+        Some(runtime),
+    ) = (
+        &mut context.context,
+        context.input.as_ref(),
+        state.services.runtime.as_ref(),
+    ) {
+        let port = runtime.runtime_services().session_terminal_delivery();
+        let terminal_id = format!("turn-terminal:{}", input.request_id);
+        let lookup = terminal_id.clone();
+        let record = tokio::task::spawn_blocking(move || port.get(&lookup))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        if let Some(record) = record.filter(|record| {
+            record.terminal_id == terminal_id
+                && record.session_id == source.session_id
+                && record.message_id == format!("assistant:{}", input.message_id)
+                && record.execution_id.as_deref() == Some(source.execution_id.as_str())
+                && record.turn_id.as_deref() == Some(source.turn_id.as_str())
+                && record.request_id.as_deref() == Some(input.request_id.as_str())
+                && Some(record.commit_cursor) == input.runtime_commit_cursor
+                && record.session_generation == Some(input.session_generation)
+                && record.input_sequence == u64::try_from(input.sequence).ok()
+        }) {
+            *outbox_observation =
+                harness_contract::live::SessionReceiptOutboxObservation::RuntimeOutbox {
+                    terminal_id: record.terminal_id,
+                    revision: record.revision.to_string(),
+                    status: record.status,
+                    materialized_at_ms: record.materialized_at_ms,
+                    runtime_commit_cursor: harness_contract::live::ReceiptCursor::parse(
+                        &record.commit_cursor.to_string(),
+                    )?,
+                    execution_id: record.execution_id,
+                    turn_id: input.turn_id.clone(),
+                    request_id: input.request_id.clone(),
+                };
+        }
+    }
+    if operation_id == SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID {
+        current_frame(state, binding).await?;
+        return encode(context.context);
+    }
+    let input: cowd_app_protocol::SessionTerminalReceiptAckInputV1 =
+        serde_json::from_value(payload.clone()).map_err(json_error)?;
+    let cursor =
+        harness_contract::live::ReceiptCursor::parse(&input.runtime_commit_cursor)?.value()?;
+    match &context.context {
+        harness_contract::live::SessionMessageReceiptContext::Available {
+            message_sequence,
+            runtime_commit_cursor,
+            content_digest,
+            ..
+        } if *message_sequence == input.message_sequence
+            && runtime_commit_cursor.value()? == cursor
+            && *content_digest == input.content_digest => {}
+        _ => return Err("receipt current tuple is unavailable or changed".into()),
+    }
+    current_frame(state, binding).await?;
+    let receipt = state
+        .services
+        .session
+        .record_terminal_message_ack(session::SessionTerminalAckCommand {
+            query,
+            binding: session::SessionTerminalMessageBinding {
+                runtime_commit_cursor: cursor,
+                content_digest: input.content_digest,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    current_frame(state, binding).await?;
+    encode(receipt)
+}
+
 async fn runtime_execution_projection_snapshot(
     state: &AppState,
     binding: &CoreBoundPrincipal,
@@ -1187,6 +1634,10 @@ async fn runtime_execution_projection_snapshot(
     let projection = runtime::execution_projection::snapshot(&runtime, execution_id, &context)
         .await
         .map_err(|error| error.to_string())?;
+    let (_, source) = current_frame(state, binding).await?;
+    if source.execution_id != execution_id {
+        return Err("frame execution changed".into());
+    }
     let revision = projection.revision;
     let cursor = projection.cursor;
     Ok(RuntimeExecutionProjectionSnapshotOutput {
@@ -1231,6 +1682,10 @@ async fn runtime_execution_projection_changes(
     let mut commits = runtime.event_reader().subscribe_commits();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(input.wait_ms);
     loop {
+        let (_, source) = current_frame(state, binding).await?;
+        if source.execution_id != execution_id {
+            return Err("frame execution changed".into());
+        }
         let delta = runtime::execution_projection::delta(
             &runtime,
             execution_id,
@@ -1244,18 +1699,21 @@ async fn runtime_execution_projection_changes(
                 runtime::execution_projection::snapshot(&runtime, execution_id, &context)
                     .await
                     .map_err(|error| error.to_string())?;
+            current_frame(state, binding).await?;
             return Ok(RuntimeExecutionProjectionChangesOutput::Resync { reason, snapshot });
         }
         if delta.target_cursor > input.after_cursor
             || delta.target_revision > input.after_revision
             || !delta.operations.is_empty()
         {
+            current_frame(state, binding).await?;
             return Ok(RuntimeExecutionProjectionChangesOutput::Delta { delta });
         }
         if tokio::time::timeout_at(deadline, commits.changed())
             .await
             .is_err()
         {
+            current_frame(state, binding).await?;
             return Ok(RuntimeExecutionProjectionChangesOutput::Heartbeat {
                 execution_id: execution_id.to_string(),
                 revision: delta.target_revision,
@@ -2624,6 +3082,484 @@ fn is_terminal_outbox_status(status: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FrameHttpFixture {
+        base_url: String,
+        app_id: String,
+        source_a: cowd_app_protocol::AppFrameSourceBindingRequestV1,
+        source_b: cowd_app_protocol::AppFrameSourceBindingRequestV1,
+        message_a: String,
+        message_b: String,
+    }
+
+    struct FrameHttpClient {
+        fixture: FrameHttpFixture,
+        client: reqwest::Client,
+        token: String,
+    }
+
+    impl FrameHttpClient {
+        fn load() -> Self {
+            let path = std::path::PathBuf::from(
+                std::env::var_os("COWD_R1_FRAME_FIXTURE")
+                    .expect("isolated R1-03-produced fixture path"),
+            );
+            assert!(path.is_absolute());
+            let mut fixture: FrameHttpFixture =
+                serde_json::from_slice(&std::fs::read(path).expect("real producer fixture"))
+                    .unwrap();
+            fixture.source_a.frame_nonce = uuid::Uuid::new_v4().to_string();
+            fixture.source_b.frame_nonce = uuid::Uuid::new_v4().to_string();
+            let url: reqwest::Url = fixture.base_url.parse().unwrap();
+            assert!(matches!(
+                url.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]")
+            ));
+            assert_eq!(url.scheme(), "http");
+            assert_ne!(fixture.source_a.session_id, fixture.source_b.session_id);
+            assert_ne!(fixture.source_a.execution_id, fixture.source_b.execution_id);
+            let token =
+                std::env::var("COWD_R1_FRAME_HUMAN_TOKEN").expect("isolated human credential");
+            Self {
+                fixture,
+                client: reqwest::Client::new(),
+                token,
+            }
+        }
+
+        async fn bind(
+            &self,
+            source: &cowd_app_protocol::AppFrameSourceBindingRequestV1,
+        ) -> cowd_app_protocol::AppFrameSourceBindingV1 {
+            let response = self
+                .client
+                .post(format!(
+                    "{}/api/apps/{}/frame-source-bindings",
+                    self.fixture.base_url, self.fixture.app_id
+                ))
+                .bearer_auth(&self.token)
+                .header("origin", &self.fixture.base_url)
+                .header("sec-fetch-site", "same-origin")
+                .json(source)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "Host bind status {}",
+                response.status()
+            );
+            response.json().await.unwrap()
+        }
+
+        async fn invoke(
+            &self,
+            grant: &cowd_app_protocol::AppFrameSourceBindingV1,
+            suffix: &str,
+            payload: Value,
+            key: Option<&str>,
+        ) -> reqwest::Response {
+            let operation = format!("{}.{}", self.fixture.app_id, suffix);
+            self.client
+                .post(format!(
+                    "{}/api/apps/{}/operations/{operation}/invoke",
+                    self.fixture.base_url, self.fixture.app_id
+                ))
+                .bearer_auth(&self.token)
+                .header("x-cowd-frame-binding", &grant.frame_binding_ref)
+                .json(&serde_json::json!({"payload":payload,"idempotency_key":key}))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        async fn detach(
+            &self,
+            source: &cowd_app_protocol::AppFrameSourceBindingRequestV1,
+            grant: &cowd_app_protocol::AppFrameSourceBindingV1,
+        ) {
+            let mut input = source.clone();
+            input.frame_binding_ref = Some(grant.frame_binding_ref.clone());
+            let response = self
+                .client
+                .delete(format!(
+                    "{}/api/apps/{}/frame-source-bindings",
+                    self.fixture.base_url, self.fixture.app_id
+                ))
+                .bearer_auth(&self.token)
+                .header("origin", &self.fixture.base_url)
+                .header("sec-fetch-site", "same-origin")
+                .json(&input)
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+        }
+
+        async fn context(
+            &self,
+            grant: &cowd_app_protocol::AppFrameSourceBindingV1,
+            message: &str,
+        ) -> Value {
+            let response = self
+                .invoke(
+                    grant,
+                    "session.terminal_receipt.read",
+                    serde_json::json!({"selection":"message","message_id":message}),
+                    None,
+                )
+                .await;
+            assert!(response.status().is_success());
+            let response: Value = response.json().await.unwrap();
+            response["payload"].clone()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires same frozen Gateway and real R1-03 two-session fixture; explicitly select in integrated acceptance"]
+    async fn r1_client_receipt_bound_source_discovery_is_read_only() {
+        let host = FrameHttpClient::load();
+        let grant_a = host.bind(&host.fixture.source_a).await;
+        let grant_b = host.bind(&host.fixture.source_b).await;
+        for (grant, source, message_id) in [
+            (&grant_a, &host.fixture.source_a, &host.fixture.message_a),
+            (&grant_b, &host.fixture.source_b, &host.fixture.message_b),
+        ] {
+            for _attempt in 0..2 {
+                let response = host
+                    .invoke(
+                        grant,
+                        "session.terminal_receipt.read",
+                        serde_json::json!({"selection":"bound_source_terminal"}),
+                        None,
+                    )
+                    .await;
+                assert!(response.status().is_success());
+                let body: Value = response.json().await.unwrap();
+                let context = &body["payload"];
+                assert_eq!(context["status"], "available");
+                assert_eq!(
+                    context["session_id"].as_str(),
+                    Some(source.session_id.as_str())
+                );
+                assert_eq!(
+                    context["session_source"]["turn_id"].as_str(),
+                    Some(source.turn_id.as_str())
+                );
+                assert_eq!(context["message_id"].as_str(), Some(message_id.as_str()));
+                assert_eq!(
+                    context["client_id"].as_str(),
+                    Some(grant.client_id.as_str())
+                );
+                assert!(context["receipt"].is_null(), "discovery is never an ACK");
+            }
+        }
+        for invalid in [
+            serde_json::json!({"message_id":host.fixture.message_a}),
+            serde_json::json!({"selection":"bound_source_terminal","session_id":host.fixture.source_b.session_id}),
+            serde_json::json!({"selection":"bound_source_terminal","execution_id":host.fixture.source_b.execution_id}),
+        ] {
+            let response = host
+                .invoke(&grant_a, "session.terminal_receipt.read", invalid, None)
+                .await;
+            assert!(!response.status().is_success());
+        }
+        host.detach(&host.fixture.source_a, &grant_a).await;
+        host.detach(&host.fixture.source_b, &grant_b).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires same frozen Gateway and real R1-03 two-session fixture; explicitly select in integrated acceptance"]
+    async fn r1_surface_axes_frame_source_rejects_another_owned_session() {
+        let host = FrameHttpClient::load();
+        let grant = host.bind(&host.fixture.source_a).await;
+        let own = host.context(&grant, &host.fixture.message_a).await;
+        assert_eq!(own["status"], "available");
+        assert_eq!(own["session_id"], host.fixture.source_a.session_id);
+        let foreign = host
+            .invoke(
+                &grant,
+                "session.terminal_receipt.read",
+                serde_json::json!({"selection":"message","message_id":host.fixture.message_b}),
+                None,
+            )
+            .await;
+        assert!(!foreign.status().is_success());
+        let substituted = host
+            .invoke(
+                &grant,
+                "live.snapshot",
+                serde_json::json!({"execution_id":host.fixture.source_b.execution_id}),
+                None,
+            )
+            .await;
+        let substituted: Value = substituted.json().await.unwrap();
+        assert_ne!(
+            substituted["payload"]["collaboration"]["snapshot"]["execution_id"],
+            host.fixture.source_b.execution_id
+        );
+        host.detach(&host.fixture.source_a, &grant).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fresh exact-client real R1-03 terminal fixture; explicitly select in integrated acceptance"]
+    async fn r1_client_receipt_read_request_cannot_create_ack() {
+        let host = FrameHttpClient::load();
+        let grant = host.bind(&host.fixture.source_a).await;
+        for _ in 0..2 {
+            let context = host.context(&grant, &host.fixture.message_a).await;
+            assert_eq!(context["client_id"], grant.client_id);
+            assert_eq!(context["status"], "available");
+            assert!(context["receipt"].is_null());
+        }
+        let forged = host.invoke(&grant, "session.terminal_receipt.read", serde_json::json!({
+            "message_id":host.fixture.message_a,"runtime_commit_cursor":"1","content_digest":"injected"
+        }), None).await;
+        assert!(!forged.status().is_success());
+        assert!(host.context(&grant, &host.fixture.message_a).await["receipt"].is_null());
+        host.detach(&host.fixture.source_a, &grant).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real frozen Gateway/CoreBridge/Session; tests actual hot command replay, not a mock cache"]
+    async fn r1_client_receipt_cache_hit_rechecks_frame_source() {
+        let host = FrameHttpClient::load();
+        let grant = host.bind(&host.fixture.source_a).await;
+        let context = host.context(&grant, &host.fixture.message_a).await;
+        assert_eq!(context["status"], "available");
+        let tuple = serde_json::json!({"message_id":host.fixture.message_a,
+            "message_sequence":context["message_sequence"],"runtime_commit_cursor":context["runtime_commit_cursor"],"content_digest":context["content_digest"]});
+        let key = format!("r1-cache-{}", uuid::Uuid::new_v4());
+        let first = host
+            .invoke(
+                &grant,
+                "session.terminal_receipt.ack",
+                tuple.clone(),
+                Some(&key),
+            )
+            .await;
+        assert!(first.status().is_success());
+        let first_context = host.context(&grant, &host.fixture.message_a).await;
+        assert!(first_context["receipt"].is_object());
+        let replay = host
+            .invoke(
+                &grant,
+                "session.terminal_receipt.ack",
+                tuple.clone(),
+                Some(&key),
+            )
+            .await;
+        assert!(replay.status().is_success());
+        assert_eq!(
+            host.context(&grant, &host.fixture.message_a).await["receipt"],
+            first_context["receipt"]
+        );
+        host.detach(&host.fixture.source_a, &grant).await;
+        let rejected = host
+            .invoke(&grant, "session.terminal_receipt.ack", tuple, Some(&key))
+            .await;
+        assert!(!rejected.status().is_success());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires quiescent real producer fixture and actual Worker long poll; explicitly select"]
+    async fn r1_client_receipt_projection_wait_rechecks_source() {
+        let host = FrameHttpClient::load();
+        let grant = host.bind(&host.fixture.source_a).await;
+        let operation = format!("{}.live.stream", host.fixture.app_id);
+        let mut response = host
+            .client
+            .post(format!(
+                "{}/api/apps/{}/operations/{operation}/stream",
+                host.fixture.base_url, host.fixture.app_id
+            ))
+            .bearer_auth(&host.token)
+            .header("x-cowd-frame-binding", &grant.frame_binding_ref)
+            .json(
+                &serde_json::json!({"payload":{"execution_id":host.fixture.source_a.execution_id}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let mut pending = Vec::<u8>::new();
+        let mut saw_initial = false;
+        while !saw_initial {
+            let chunk = tokio::time::timeout(Duration::from_secs(10), response.chunk())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("initial stream");
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                let line = pending.drain(..=end).collect::<Vec<_>>();
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let frame: Value = serde_json::from_slice(&line).unwrap();
+                if frame["kind"] == "data" && frame["payload"]["kind"] == "snapshot" {
+                    assert_eq!(
+                        frame["payload"]["state"]["collaboration"]["snapshot"]["execution_id"],
+                        host.fixture.source_a.execution_id
+                    );
+                    saw_initial = true;
+                }
+            }
+        }
+        assert!(
+            pending.is_empty(),
+            "fixture must begin from a quiescent observer"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), response.chunk())
+                .await
+                .is_err(),
+            "must actually enter the Worker/Core wait before source detach"
+        );
+        host.detach(&host.fixture.source_a, &grant).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let chunk = tokio::time::timeout_at(deadline, response.chunk())
+                .await
+                .expect("bounded wait exit")
+                .unwrap()
+                .expect("authorization diagnostic before stream close");
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                let line = pending.drain(..=end).collect::<Vec<_>>();
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let frame: Value = serde_json::from_slice(&line).unwrap();
+                if frame["kind"] == "error" {
+                    return;
+                }
+                if frame["kind"] == "data" && frame["payload"]["kind"] == "runtime_collaboration" {
+                    let update = &frame["payload"]["update"];
+                    assert_eq!(
+                        update["kind"], "diagnostic",
+                        "revoked wait must not return projection/delta/resync/heartbeat"
+                    );
+                    assert_eq!(update["diagnostic"], "authorization");
+                    assert_eq!(update["retryable"], false);
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r1_client_receipt_exact_client_overlay_only() {
+        let input = serde_json::json!({"message_id":"message","client_id":"forged","source":{"session_id":"foreign"}});
+        assert!(validate_typed_input(SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID, &input).is_err());
+        let input = serde_json::json!({"message_id":"message","message_sequence":"1","runtime_commit_cursor":"9007199254740993",
+            "content_digest":format!("session-public-v1:sha256:{}", "a".repeat(64)), "client_id":"forged"});
+        assert!(validate_typed_input(SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID, &input).is_err());
+    }
+
+    #[test]
+    fn r1_client_receipt_context_cursor_never_rounds() {
+        for value in ["9007199254740993", "9223372036854775807"] {
+            let input = serde_json::json!({"message_id":"message","message_sequence":value,"runtime_commit_cursor":value,
+                "content_digest":format!("session-public-v1:sha256:{}", "a".repeat(64))});
+            let validated =
+                validate_typed_input(SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID, &input).unwrap();
+            assert_eq!(validated["runtime_commit_cursor"], value);
+            assert_eq!(validated["message_sequence"], value);
+        }
+    }
+
+    #[test]
+    fn r1_surface_axes_generated_outputs_follow_authority() {
+        let definitions = super::super::core_matrix_catalog::definitions().unwrap();
+        for operation in [
+            SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+            SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+        ] {
+            assert_eq!(
+                definitions
+                    .iter()
+                    .filter(|definition| definition.descriptor.operation_id == operation)
+                    .count(),
+                1
+            );
+        }
+        let read = definitions
+            .iter()
+            .find(|definition| {
+                definition.descriptor.operation_id == SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID
+            })
+            .unwrap();
+        assert!(read.descriptor.read_only);
+        let ack = definitions
+            .iter()
+            .find(|definition| {
+                definition.descriptor.operation_id == SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID
+            })
+            .unwrap();
+        assert!(!ack.descriptor.read_only);
+        assert_eq!(
+            ack.descriptor.idempotency,
+            cowd_app_protocol::IdempotencySemanticsV1::Required
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("contracts/core-operations/v1");
+        for definition in [read, ack] {
+            for (direction, expected) in [
+                ("input", &definition.input_schema),
+                ("output", &definition.output_schema),
+            ] {
+                let relative = format!(
+                    "schemas/{}.{direction}.schema.json",
+                    definition.descriptor.operation_id
+                );
+                let dev = std::fs::read(root.join(&relative)).expect("canonical generated schema");
+                assert_eq!(serde_json::from_slice::<Value>(&dev).unwrap(), *expected);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "consumer alignment follows verified kernel R5; requires frozen Edge and MFG roots"]
+    fn r1_surface_axes_consumer_generated_mirrors_follow_authority() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("contracts/core-operations/v1");
+        let mfg = std::path::PathBuf::from(
+            std::env::var_os("COWD_R1_MFG_ROOT").expect("frozen MFG root"),
+        );
+        for operation in [
+            SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+            SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+        ] {
+            for direction in ["input", "output"] {
+                let relative = format!("schemas/{operation}.{direction}.schema.json");
+                let dev = std::fs::read(root.join(&relative)).expect("canonical generated schema");
+                let mirror = std::fs::read(
+                    mfg.join("crates/app-mfg-contract/contracts/core-operations/v1")
+                        .join(&relative),
+                )
+                .expect("frozen MFG mirror");
+                assert_eq!(dev, mirror);
+            }
+        }
+        let edge = std::path::PathBuf::from(
+            std::env::var_os("COWD_R1_EDGE_ROOT").expect("frozen Edge root"),
+        );
+        let meta = std::fs::read_to_string(
+            edge.join("surfaces/webui/src/generated/projection-contract-meta.ts"),
+        )
+        .unwrap();
+        assert!(meta.contains("EXECUTION_PROJECTION_SCHEMA_VERSION = 5"));
+        assert!(meta.contains("EXECUTION_PROJECTION_REDUCER_VERSION = 5"));
+        let api = std::fs::read_to_string(edge.join("surfaces/webui/src/generated/gateway-api.ts"))
+            .unwrap();
+        assert!(api.contains("/api/apps/{app_id}/frame-source-bindings"));
+        assert!(api.contains("SessionMessageReceiptContext"));
+    }
+
     fn envelope(operation_id: &str, payload: Value) -> AppInvocationEnvelopeV1 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2714,7 +3650,7 @@ mod tests {
         let ids = PLATFORM_OPERATION_IDS
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ids.len(), 18);
+        assert_eq!(ids.len(), 20);
         assert!(supports(ACTION_PLAN_OPERATION_ID));
         assert!(supports(SURFACE_OUTBOX_LIST_OPERATION_ID));
         assert!(!supports("core.matrix.health"));
@@ -2830,7 +3766,7 @@ mod tests {
                 serde_json::json!({"execution_id":"execution-1","after_revision":0,"after_cursor":0,"wait_ms":1}),
             ),
         ];
-        assert_eq!(fixtures.len(), PLATFORM_OPERATION_IDS.len() - 2);
+        assert_eq!(fixtures.len(), PLATFORM_OPERATION_IDS.len() - 4);
         for (operation_id, payload) in fixtures {
             validate_typed_input(operation_id, &payload)
                 .unwrap_or_else(|error| panic!("{operation_id} fixture rejected: {error}"));
@@ -2847,144 +3783,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_projection_changes_returns_delta_then_heartbeat_without_polling() {
-        use harness_contract::execution_graph::{
-            ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage, ExecutionNodeKind,
-            ExecutionNodeSpec, ExecutionNodeStatus,
-        };
-        use runtime::ExecutionGraphHost;
-
+    async fn runtime_projection_queries_reject_unbound_service_requests() {
         let state = crate::api_routes::tests::test_state();
-        let session_id = format!("core-projection-{}", uuid::Uuid::new_v4());
-        let mut graph = ExecutionGraph::new("Core projection long-poll contract").with_lineage(
-            ExecutionGraphLineage {
-                session_id: session_id.clone(),
-                turn_id: "core-projection-turn".to_owned(),
-                root_task_id: "core-projection-task".to_owned(),
-                task_id: "core-projection-task".to_owned(),
-                generation: 1,
-            },
-        );
-        let node = ExecutionNodeSpec::new(
-            ExecutionNodeKind::InlineModel,
-            "inline_model",
-            serde_json::json!({"kind":"core_projection_contract"}).to_string(),
-        );
-        graph
-            .node_statuses
-            .insert(node.id.clone(), ExecutionNodeStatus::Planned);
-        graph.nodes.push(node);
-        let execution_id = graph.id.clone();
-        let runtime = state
-            .services
-            .runtime
-            .as_ref()
-            .expect("runtime service")
-            .runtime_services();
-        runtime
-            .execution_supervisor()
-            .submit_graph(
-                graph,
-                ExecutionGraphCommand::Start {
-                    expected_revision: 0,
-                },
-            )
-            .await
-            .expect("register projection graph");
-        runtime
-            .execution_supervisor()
-            .wait_for_quiescence(&execution_id)
-            .await
-            .expect("projection graph quiesces");
-
-        let snapshot_payload = serde_json::json!({"execution_id":execution_id});
-        let mut snapshot_request = envelope(
-            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
-            snapshot_payload.clone(),
-        );
-        snapshot_request.principal.granted_scopes = vec![format!("session:{session_id}")];
-        bind_fixture_request(&state, &snapshot_request);
-        let snapshot = dispatch(
-            &state,
-            &snapshot_request,
-            "fixture",
-            "fixture.operation",
-            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
-            &snapshot_payload,
-        )
-        .await
-        .expect("Core projection snapshot");
-        let revision = snapshot["revision"].as_u64().expect("snapshot revision");
-        let cursor = snapshot["cursor"].as_u64().expect("snapshot cursor");
-
-        let delta_payload = serde_json::json!({
-            "execution_id":execution_id,
-            "after_revision":0,
-            "after_cursor":0,
-            "wait_ms":1
-        });
-        let mut delta_request = envelope(
-            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
-            delta_payload.clone(),
-        );
-        delta_request.principal.granted_scopes = vec![format!("session:{session_id}")];
-        bind_fixture_request(&state, &delta_request);
-        let delta = dispatch(
-            &state,
-            &delta_request,
-            "fixture",
-            "fixture.operation",
-            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
-            &delta_payload,
-        )
-        .await
-        .expect("Core projection delta");
-        assert_eq!(delta["kind"], "delta");
-
-        let mut observed_revision = revision;
-        let mut observed_cursor = cursor;
-        let mut heartbeat = None;
-        // Projection materialization can publish a final commit immediately after the
-        // first snapshot. Advance through that real delta, then require the observer
-        // lane to settle on a bounded heartbeat instead of assuming a race-free test.
-        for _ in 0..8 {
-            let heartbeat_payload = serde_json::json!({
-                "execution_id":execution_id,
-                "after_revision":observed_revision,
-                "after_cursor":observed_cursor,
-                "wait_ms":5
-            });
-            let mut heartbeat_request = envelope(
+        for (operation_id, payload) in [
+            (
+                RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+                serde_json::json!({"execution_id":"unbound"}),
+            ),
+            (
                 RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
-                heartbeat_payload.clone(),
-            );
-            heartbeat_request.principal.granted_scopes = vec![format!("session:{session_id}")];
-            bind_fixture_request(&state, &heartbeat_request);
-            let change = dispatch(
+                serde_json::json!({
+                    "execution_id":"unbound","after_revision":0,"after_cursor":0,"wait_ms":1
+                }),
+            ),
+        ] {
+            let request = envelope(operation_id, payload.clone());
+            bind_fixture_request(&state, &request);
+            let error = dispatch(
                 &state,
-                &heartbeat_request,
+                &request,
                 "fixture",
                 "fixture.operation",
-                RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
-                &heartbeat_payload,
+                operation_id,
+                &payload,
             )
             .await
-            .expect("Core projection heartbeat");
-            if change["kind"] == "heartbeat" {
-                heartbeat = Some(change);
-                break;
-            }
-            assert_eq!(change["kind"], "delta");
-            observed_revision = change["delta"]["target_revision"]
-                .as_u64()
-                .expect("delta target revision");
-            observed_cursor = change["delta"]["target_cursor"]
-                .as_u64()
-                .expect("delta target cursor");
+            .unwrap_err();
+            assert!(error.contains("Host frame source required"), "{error}");
         }
-        let heartbeat = heartbeat.expect("observer lane settles on a heartbeat");
-        assert_eq!(heartbeat["revision"], observed_revision);
-        assert_eq!(heartbeat["cursor"], observed_cursor);
     }
 
     #[tokio::test]

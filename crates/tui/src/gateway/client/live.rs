@@ -1,4 +1,13 @@
 use super::*;
+pub(super) fn terminal_receipt_refresh_hint(event: &CowdEvent) -> Option<&str> {
+    match event {
+        CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::TerminalCommitted { correlation, .. },
+        } => correlation.message_id.as_deref(),
+        _ => None,
+    }
+}
+
 impl TuiLiveMultiplexer {
     pub(super) async fn subscribe(
         &self,

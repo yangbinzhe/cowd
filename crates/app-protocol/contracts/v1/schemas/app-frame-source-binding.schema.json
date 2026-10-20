@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppFrameSourceBindingV1",
+  "type": "object",
+  "properties": {
+    "client_expires_at_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "client_id": {
+      "type": "string"
+    },
+    "frame_binding_ref": {
+      "type": "string"
+    },
+    "presence_revision": {
+      "type": "string"
+    },
+    "receipt_protocol": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "frame_binding_ref",
+    "client_id",
+    "client_expires_at_ms",
+    "receipt_protocol",
+    "presence_revision"
+  ]
+}

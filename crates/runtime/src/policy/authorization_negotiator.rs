@@ -998,17 +998,26 @@ impl AuthorizationNegotiator {
         let already_consumed = registry.consumed_idempotency.contains(&idempotency);
         let (result, consumed_snapshot) = {
             let lease = registry.leases.get_mut(&lease_id)?;
-            if already_consumed {
-                return Some(execution_snapshot(lease, &request.idempotency_key));
-            }
-            if !lease.is_active_at(now)
-                || !lease.permits(&request.capability, required_mode)
+            if !lease.permits(&request.capability, required_mode)
                 || !lease_scopes_cover(lease, &request.effect.scopes)
+                || lease.principal_id != request.principal_id
+                || lease.parent_lease_id != request.parent_lease_id
                 || lease.policy_revision == 0
                 || lease.policy_revision != request.policy_revision
                 || lease.effect_descriptor_hash != request.effect.descriptor_hash
+                || now > lease.expires_at_ms
+                || matches!(
+                    lease.status,
+                    AuthorizationLeaseStatus::Expired | AuthorizationLeaseStatus::Revoked
+                )
                 || !Self::verify_lease_signature(lease)
             {
+                return None;
+            }
+            if already_consumed {
+                return Some(execution_snapshot(lease, &request.idempotency_key));
+            }
+            if !lease.is_active_at(now) {
                 return None;
             }
             lease.remaining_uses = lease.remaining_uses.saturating_sub(1);
@@ -1104,20 +1113,7 @@ impl AuthorizationNegotiator {
     }
 
     fn sign(lease: &AuthorizationLease) -> String {
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "lease_id": lease.lease_id,
-            "principal_id": lease.principal_id,
-            "parent_lease_id": lease.parent_lease_id,
-            "capability": lease.capability,
-            "scopes": lease.scopes,
-            "ceiling": lease.ceiling,
-            "issued_at_ms": lease.issued_at_ms,
-            "expires_at_ms": lease.expires_at_ms,
-            "max_uses": lease.max_uses,
-            "policy_revision": lease.policy_revision,
-            "effect_descriptor_hash": lease.effect_descriptor_hash,
-        }))
-        .unwrap_or_default();
+        let payload = serde_json::to_vec(&authorization_lease_signed_payload(lease)).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(process_authorization_signing_secret().as_bytes());
         hasher.update(payload);
@@ -1335,6 +1331,57 @@ fn required_mode_for_effect(
     descriptor: &ToolEffectDescriptor,
     assessment: &EffectAssessment,
 ) -> PermissionMode {
+    let file_observation = descriptor.effect_kind == ToolEffectKind::Read
+        && descriptor.idempotency == harness_contract::tool::ToolIdempotency::Idempotent
+        && descriptor.required_permission == PermissionMode::ReadOnly
+        && descriptor.approval_class == ToolApprovalClass::None
+        && !descriptor.uses_network
+        && !descriptor.spawns_process
+        && !descriptor.mutates_packages
+        && !descriptor.mutates_system
+        && descriptor
+            .scopes
+            .iter()
+            .any(|scope| scope.resource == harness_contract::policy::PermissionResource::File)
+        && descriptor.scopes.iter().all(|scope| {
+            scope.operation == harness_contract::policy::PermissionOperation::Read
+                && matches!(
+                    scope.resource,
+                    harness_contract::policy::PermissionResource::File
+                        | harness_contract::policy::PermissionResource::Tool
+                )
+        })
+        && assessment.externality == EffectExternality::Workspace
+        && assessment.reversibility == EffectReversibility::Reversible
+        && assessment.novelty == EffectNovelty::Routine
+        && matches!(
+            assessment.blast_radius,
+            EffectBlastRadius::Item | EffectBlastRadius::Workspace
+        )
+        && matches!(
+            assessment.data_sensitivity,
+            DataClassification::Public
+                | DataClassification::Internal
+                | DataClassification::Confidential
+        );
+    let internal_control = descriptor.effect_kind == ToolEffectKind::Write
+        && descriptor.idempotency == harness_contract::tool::ToolIdempotency::IdempotentWithKey
+        && descriptor.required_permission == PermissionMode::ReadOnly
+        && descriptor.approval_class == ToolApprovalClass::None
+        && !descriptor.scopes.is_empty()
+        && descriptor.scopes.iter().all(|scope| {
+            scope.resource == harness_contract::policy::PermissionResource::Tool
+                && scope.operation == harness_contract::policy::PermissionOperation::Control
+        })
+        && !descriptor.uses_network
+        && !descriptor.spawns_process
+        && !descriptor.mutates_packages
+        && !descriptor.mutates_system
+        && assessment.externality == EffectExternality::Internal
+        && assessment.blast_radius == EffectBlastRadius::Item
+        && assessment.reversibility == EffectReversibility::Compensatable
+        && assessment.novelty == EffectNovelty::Routine
+        && assessment.data_sensitivity != DataClassification::Secret;
     let assessed_mode =
         if matches!(
             assessment.externality,
@@ -1343,11 +1390,12 @@ fn required_mode_for_effect(
             || matches!(assessment.data_sensitivity, DataClassification::Secret)
         {
             PermissionMode::DangerFullAccess
-        } else if matches!(assessment.externality, EffectExternality::Workspace)
-            || matches!(
-                descriptor.effect_kind,
-                ToolEffectKind::Write | ToolEffectKind::Process | ToolEffectKind::Package
-            )
+        } else if (assessment.externality == EffectExternality::Workspace && !file_observation)
+            || (!internal_control
+                && matches!(
+                    descriptor.effect_kind,
+                    ToolEffectKind::Write | ToolEffectKind::Process | ToolEffectKind::Package
+                ))
         {
             PermissionMode::WorkspaceWrite
         } else if assessment.externality == EffectExternality::NetworkRead
@@ -1407,6 +1455,8 @@ fn capability_fingerprint(request: &AuthorizationRequest, required_mode: Permiss
         "scopes": request.effect.scopes,
         "required_mode": required_mode,
         "parent_ceiling": request.parent_ceiling,
+        "parent_lease_id": request.parent_lease_id,
+        "policy_revision": request.policy_revision,
         "recovery_scope": request.recovery_scope,
         "effect_descriptor": request.effect.descriptor_hash,
         "input_digest": format!("{:x}", Sha256::digest(request.input.as_bytes())),
@@ -1679,6 +1729,892 @@ mod tests {
     }
 
     #[test]
+    fn r1_typed_control_effective_floor_preserves_risk_and_lease_boundaries() {
+        let resolver = harness_contract::tool::ToolEffectResolverSpec {
+            resolver_id: "runtime.agent_action".into(),
+            resolver_version: 2,
+        };
+        let input = serde_json::json!({"task_ref":"task:one"});
+        let base = tools::tool_orchestrator::resolve_registered_tool_effect(
+            &resolver,
+            "task_claim",
+            &input,
+            PermissionMode::ReadOnly,
+        );
+        let effective =
+            AuthorizationNegotiator::compile_effective_descriptor(&base, &input.to_string());
+        assert_eq!(
+            effective.descriptor.required_permission,
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(effective.descriptor.descriptor_hash, base.descriptor_hash);
+        let mut multiple = base.clone();
+        multiple.scopes.push(PermissionScope {
+            resource: PermissionResource::Tool,
+            operation: PermissionOperation::Control,
+            target: Some("second".into()),
+        });
+        assert_eq!(
+            required_mode_for_effect(&multiple, &multiple.assessment),
+            PermissionMode::ReadOnly
+        );
+        for data in [
+            DataClassification::Public,
+            DataClassification::Internal,
+            DataClassification::Confidential,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.data_sensitivity = data;
+            assert_eq!(
+                required_mode_for_effect(&changed, &changed.assessment),
+                PermissionMode::ReadOnly
+            );
+            assert_eq!(
+                risk_for_effect(&changed.assessment),
+                if data == DataClassification::Confidential {
+                    RiskLevel::Medium
+                } else {
+                    RiskLevel::Low
+                }
+            );
+        }
+        let mut rejected = Vec::new();
+        for kind in [
+            ToolEffectKind::Process,
+            ToolEffectKind::Package,
+            ToolEffectKind::System,
+            ToolEffectKind::Destructive,
+            ToolEffectKind::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.effect_kind = kind;
+            if matches!(
+                kind,
+                ToolEffectKind::System | ToolEffectKind::Destructive | ToolEffectKind::Unknown
+            ) {
+                changed.assessment = EffectAssessment::default();
+            }
+            rejected.push(changed);
+        }
+        let mut empty = base.clone();
+        empty.scopes.clear();
+        rejected.push(empty);
+        for operation in [
+            PermissionOperation::Read,
+            PermissionOperation::Write,
+            PermissionOperation::Call,
+            PermissionOperation::Execute,
+        ] {
+            let mut changed = base.clone();
+            changed.scopes[0].operation = operation;
+            rejected.push(changed);
+        }
+        for resource in [
+            PermissionResource::File,
+            PermissionResource::Network,
+            PermissionResource::Provider,
+            PermissionResource::Config,
+        ] {
+            for operation in [PermissionOperation::Read, PermissionOperation::Write] {
+                let mut changed = base.clone();
+                changed.scopes.push(PermissionScope {
+                    resource: resource.clone(),
+                    operation,
+                    target: Some("target".into()),
+                });
+                rejected.push(changed);
+            }
+        }
+        for idempotency in [
+            ToolIdempotency::Idempotent,
+            ToolIdempotency::NonIdempotent,
+            ToolIdempotency::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.idempotency = idempotency;
+            rejected.push(changed);
+        }
+        for approval in [
+            ToolApprovalClass::Policy,
+            ToolApprovalClass::User,
+            ToolApprovalClass::Administrator,
+        ] {
+            let mut changed = base.clone();
+            changed.approval_class = approval;
+            rejected.push(changed);
+        }
+        for flag in 0..4 {
+            let mut changed = base.clone();
+            match flag {
+                0 => changed.uses_network = true,
+                1 => changed.spawns_process = true,
+                2 => changed.mutates_packages = true,
+                _ => changed.mutates_system = true,
+            }
+            rejected.push(changed);
+        }
+        for externality in [
+            EffectExternality::Workspace,
+            EffectExternality::System,
+            EffectExternality::ExternalMutation,
+            EffectExternality::NetworkRead,
+            EffectExternality::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.externality = externality;
+            rejected.push(changed);
+        }
+        for blast in [
+            EffectBlastRadius::Workspace,
+            EffectBlastRadius::ExternalAccount,
+            EffectBlastRadius::System,
+            EffectBlastRadius::Unbounded,
+            EffectBlastRadius::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.blast_radius = blast;
+            rejected.push(changed);
+        }
+        for reversibility in [
+            EffectReversibility::Reversible,
+            EffectReversibility::Irreversible,
+            EffectReversibility::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.reversibility = reversibility;
+            rejected.push(changed);
+        }
+        for novelty in [
+            EffectNovelty::NewTarget,
+            EffectNovelty::NewCapability,
+            EffectNovelty::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.novelty = novelty;
+            rejected.push(changed);
+        }
+        let mut defaulted = base.clone();
+        defaulted.assessment = EffectAssessment::default();
+        rejected.push(defaulted);
+        let mut secret = base.clone();
+        secret.assessment.data_sensitivity = DataClassification::Secret;
+        assert_eq!(
+            required_mode_for_effect(&secret, &secret.assessment),
+            PermissionMode::DangerFullAccess
+        );
+        rejected.push(secret);
+        for changed in rejected {
+            assert_ne!(
+                AuthorizationNegotiator::compile_effective_descriptor(&changed, "{}")
+                    .descriptor
+                    .required_permission,
+                PermissionMode::ReadOnly,
+                "{changed:?}"
+            );
+        }
+        for floor in [
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ] {
+            let mut changed = base.clone();
+            changed.required_permission = floor;
+            assert_eq!(
+                required_mode_for_effect(&changed, &changed.assessment),
+                floor
+            );
+        }
+        let negotiator = AuthorizationNegotiator::new();
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly);
+        let mut current = request(base.clone());
+        current.capability = base.tool_id.clone();
+        current.input = input.to_string();
+        current.parent_ceiling = PermissionMode::ReadOnly;
+        current.parent_lease_id = Some("parent:ro".into());
+        let assessment = negotiator.assess(&policy, &current);
+        let lease = assessment
+            .lease
+            .clone()
+            .expect("real negotiator issues RO control lease");
+        assert!(AuthorizationNegotiator::verify_lease_signature(&lease));
+        assert_eq!(lease.ceiling, PermissionMode::ReadOnly);
+        let decision = crate::ToolPolicy
+            .authorize(
+                &effective,
+                &assessment,
+                &current.idempotency_key,
+                lease.clone(),
+                30,
+            )
+            .unwrap();
+        let uses_after_first =
+            negotiator.registry.lock().unwrap().leases[&lease.lease_id].remaining_uses;
+        let retry = negotiator.assess(&policy, &current).lease.unwrap();
+        assert_eq!(retry.lease_id, lease.lease_id);
+        assert_eq!(
+            negotiator.registry.lock().unwrap().leases[&lease.lease_id].remaining_uses,
+            uses_after_first
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = |version| {
+            tools::ToolCatalog::builtin().with_runtime_tools(vec![tools::RuntimeToolDefinition {
+                name: "task_claim".into(),
+                description: Some("control contract".into()),
+                input_schema: serde_json::json!({"type":"object"}),
+                required_permission: PermissionMode::ReadOnly,
+                effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                    resolver_id: "runtime.agent_action".into(),
+                    resolver_version: version,
+                },
+            }])
+        };
+        for version in [0, 1, 3, u32::MAX] {
+            assert!(catalog(version).is_err());
+        }
+        let host = tools::ToolHost::new(
+            "control-contract",
+            directory.path(),
+            tools::ToolHostSnapshot::new(
+                Arc::new(tools::ToolCatalog::builtin()),
+                Arc::new(tools::lsp_client::LspRegistry::default()),
+                None,
+            ),
+        )
+        .with_authorization_lease_verifier(Arc::new(
+            AuthorizationNegotiator::verify_lease_signature,
+        ));
+        let old = host.pin_snapshot();
+        assert!(old
+            .validate_authorization(&decision.authorization, "task_claim", &input)
+            .is_err());
+        let definitions = old
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter(|definition| definition.name == "read_file")
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect::<Vec<_>>();
+        let bound = crate::step_snapshot::BoundStep::bind(
+            harness_contract::step::StepIdentity {
+                step_id: "control-step".into(),
+                session_id: "session:test".into(),
+                turn_id: "turn:test".into(),
+                execution_id: None,
+                actor_ref: None,
+                run_ref: None,
+                attempt: Some(1),
+                epoch: None,
+                goal_ref: None,
+                program_ref: None,
+                task_ref: None,
+                build_ref: "control-contract".into(),
+            },
+            old.clone(),
+            &definitions,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            BTreeMap::new(),
+            i64::MAX,
+        )
+        .unwrap();
+        let binding = crate::step_snapshot::StepCallBinding::provider(Arc::new(bound), "call");
+        let persisted: crate::step_snapshot::StepCallBinding =
+            serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap();
+        host.replace_snapshot(tools::ToolHostSnapshot::new(
+            Arc::new(catalog(2).unwrap()),
+            Arc::new(tools::lsp_client::LspRegistry::default()),
+            None,
+        ));
+        let new = host.pin_snapshot();
+        assert_ne!(
+            old.snapshot().descriptor_set_hash,
+            new.snapshot().descriptor_set_hash
+        );
+        assert!(persisted.resolve(Some(new.clone())).is_err());
+        let historical = binding.resolve(Some(new.clone())).unwrap();
+        assert!(historical
+            .validate_call(
+                &historical.provider_origin("call"),
+                "session:test",
+                "call",
+                "task_claim",
+                &current.input,
+                1
+            )
+            .is_err());
+        assert!(new
+            .validate_authorization(&decision.authorization, "task_claim", &input)
+            .is_ok());
+        host.replace_snapshot(new.snapshot().clone());
+        let repinned = host.pin_snapshot();
+        assert_ne!(repinned.revision(), new.revision());
+        assert_eq!(
+            repinned.describe_effect("task_claim", &input),
+            new.describe_effect("task_claim", &input)
+        );
+        assert_eq!(
+            negotiator.assess(&policy, &current).lease.unwrap().lease_id,
+            lease.lease_id
+        );
+        let old_effect = tools::tool_orchestrator::resolve_registered_tool_effect(
+            &harness_contract::tool::ToolEffectResolverSpec {
+                resolver_id: "runtime.agent_action".into(),
+                resolver_version: 1,
+            },
+            "task_claim",
+            &input,
+            PermissionMode::ReadOnly,
+        );
+        let mut old_request = current.clone();
+        old_request.effect = old_effect.clone();
+        let old_effective =
+            AuthorizationNegotiator::compile_effective_descriptor(&old_effect, &current.input);
+        assert_ne!(old_effective.fingerprint, effective.fingerprint);
+        assert_ne!(
+            capability_fingerprint(&old_request, old_effect.required_permission),
+            capability_fingerprint(&current, PermissionMode::ReadOnly)
+        );
+        let old_grant = approval_grant(&old_request, &old_effective);
+        assert!(validate_approval_grant(&old_grant, &current, &base.descriptor_hash).is_err());
+        assert!(negotiator.assess(&policy, &old_request).lease.is_none());
+        let calls = vec![crate::tool_dispatch::ToolRequest {
+            tool_use_id: "control-call".into(),
+            tool_name: "task_claim".into(),
+            input: current.input.clone(),
+            depends_on: vec![],
+        }];
+        let plan = |effect: &ToolEffectDescriptor, pin: &tools::ToolHostLease| {
+            crate::governed_tool_plan::GovernedToolCompiler.compile(
+                directory.path(),
+                &calls,
+                |_, _| {
+                    Some((
+                        effect.clone(),
+                        pin.revision(),
+                        pin.snapshot().descriptor_set_hash.clone(),
+                    ))
+                },
+            )
+        };
+        assert!(plan(&old_effect, &old).is_err());
+        assert_ne!(
+            plan(&base, &old).unwrap().topology_hash,
+            plan(&base, &new).unwrap().topology_hash
+        );
+        let mut approved_old = old_request.clone();
+        approved_old.parent_ceiling = PermissionMode::DangerFullAccess;
+        let old_assessment = negotiator.approve_effective(
+            &PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            &approved_old,
+            &old_effective,
+            &old_grant,
+        );
+        let old_lease = old_assessment.lease.clone().unwrap();
+        let old_authorization = crate::ToolPolicy
+            .authorize(
+                &old_effective,
+                &old_assessment,
+                &current.idempotency_key,
+                old_lease,
+                30,
+            )
+            .unwrap();
+        assert!(new
+            .validate_authorization(&old_authorization.authorization, "task_claim", &input)
+            .is_err());
+        let mut crossed = decision.authorization.clone();
+        crossed.authorization_lease = old_authorization.authorization.authorization_lease;
+        assert!(new
+            .validate_authorization(&crossed, "task_claim", &input)
+            .is_err());
+        let mut drifted = current.clone();
+        drifted.policy_revision += 1;
+        let renewed = negotiator.assess(&policy, &drifted).lease.unwrap();
+        assert_ne!(renewed.lease_id, lease.lease_id);
+        assert_eq!(renewed.policy_revision, drifted.policy_revision);
+        assert_eq!(
+            negotiator.assess(&policy, &drifted).lease.unwrap().lease_id,
+            renewed.lease_id
+        );
+        let mut reparented = current.clone();
+        reparented.parent_lease_id = Some("parent:other".into());
+        let reparented_lease = negotiator.assess(&policy, &reparented).lease.unwrap();
+        assert_ne!(reparented_lease.lease_id, lease.lease_id);
+        assert_eq!(reparented_lease.parent_lease_id, reparented.parent_lease_id);
+        for mutation in [
+            "revision",
+            "parent",
+            "descriptor",
+            "scope",
+            "signature",
+            "expired",
+            "revoked",
+            "exhausted",
+        ] {
+            let isolated = AuthorizationNegotiator::new();
+            let issued = isolated.assess(&policy, &current).lease.unwrap();
+            {
+                let mut registry = isolated.registry.lock().unwrap();
+                let stored = registry.leases.get_mut(&issued.lease_id).unwrap();
+                match mutation {
+                    "revision" => stored.policy_revision += 1,
+                    "parent" => stored.parent_lease_id = Some("parent:foreign".into()),
+                    "descriptor" => stored.effect_descriptor_hash.push_str("-foreign"),
+                    "scope" => stored.scopes.clear(),
+                    "signature" => {}
+                    "expired" => stored.expires_at_ms = 0,
+                    "revoked" => stored.status = AuthorizationLeaseStatus::Revoked,
+                    "exhausted" => {
+                        stored.status = AuthorizationLeaseStatus::Exhausted;
+                        stored.remaining_uses = 0;
+                    }
+                    _ => unreachable!(),
+                }
+                stored.signature = AuthorizationNegotiator::sign(stored);
+                if mutation == "signature" {
+                    stored.signature.push_str("-foreign");
+                }
+            }
+            let retried = isolated.assess(&policy, &current).lease.unwrap();
+            if mutation == "exhausted" {
+                assert_eq!(retried.lease_id, issued.lease_id);
+                assert_eq!(
+                    isolated.registry.lock().unwrap().leases[&issued.lease_id].remaining_uses,
+                    0
+                );
+            } else {
+                assert_ne!(retried.lease_id, issued.lease_id, "{mutation}");
+            }
+        }
+        let mut grant = approval_grant(&current, &effective);
+        for mutation in 0..4 {
+            let mut invalid = grant.clone();
+            match mutation {
+                0 => invalid.status = ApprovalGrantStatus::Revoked,
+                1 => invalid.expires_at_ms = Some(0),
+                2 => invalid.policy_revision += 1,
+                _ => invalid.invocation_id = Some("wrong-key".into()),
+            }
+            assert!(negotiator
+                .approve_effective(&policy, &current, &effective, &invalid)
+                .lease
+                .is_none());
+        }
+        grant.effect_descriptor_hash = Some(old_effect.descriptor_hash.clone());
+        assert!(negotiator
+            .approve_effective(&policy, &current, &effective, &grant)
+            .lease
+            .is_none());
+        for mutation in 0..7 {
+            let mut altered = decision.authorization.clone();
+            match mutation {
+                0 => altered.authorization_lease.signature.push('x'),
+                1 => altered.authorization_lease.status = AuthorizationLeaseStatus::Revoked,
+                2 => altered.authorization_lease.expires_at_ms = 0,
+                3 => altered.idempotency_key = Some("wrong-key".into()),
+                4 => altered.policy_revision += 1,
+                5 => altered.descriptor_hash = old_effect.descriptor_hash.clone(),
+                _ => altered.authorization_lease.scopes.clear(),
+            }
+            assert!(
+                new.validate_authorization(&altered, "task_claim", &input)
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+        assert!(crate::ToolPolicy
+            .authorize(&effective, &assessment, "wrong-key", lease.clone(), 30)
+            .is_err());
+        assert!(negotiator.revoke(&lease.lease_id));
+        let next = negotiator.assess(&policy, &current).lease.unwrap();
+        assert_ne!(next.lease_id, lease.lease_id);
+    }
+
+    #[test]
+    fn r1_readonly_workspace_observation_preserves_permission_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "first observation").unwrap();
+        std::fs::write(directory.path().join("b.txt"), "second observation").unwrap();
+        let host = tools::ToolHost::builtin("readonly-floor", directory.path())
+            .with_authorization_lease_verifier(Arc::new(
+                AuthorizationNegotiator::verify_lease_signature,
+            ));
+        let pin = host.pin_snapshot();
+        let input = serde_json::json!({"path":"a.txt"});
+        let base = pin.describe_effect("read_file", &input);
+        assert_eq!(base.assessment.externality, EffectExternality::Workspace);
+        assert_eq!(
+            base.assessment.reversibility,
+            EffectReversibility::Reversible
+        );
+        assert_eq!(base.assessment.novelty, EffectNovelty::Routine);
+        assert_eq!(base.assessment.blast_radius, EffectBlastRadius::Workspace);
+        let composite_input = serde_json::json!({"steps":[
+            {"id":"first","op":"call","tool":"read_file","input":{"path":"a.txt"}},
+            {"id":"second","op":"call","tool":"read_file","input":{"path":"b.txt"}}
+        ]});
+        let metadata_input = serde_json::json!({"steps":[
+            {"id":"first","op":"call","tool":"read_file","input":{"path":"a.txt"}},
+            {"id":"metadata","op":"call","tool":"tool_search","input":{"query":"read_file"}}
+        ]});
+        for (tool, value) in [
+            ("read_file", input.clone()),
+            ("tool_orchestrate", composite_input),
+            ("tool_orchestrate", metadata_input),
+        ] {
+            let descriptor = pin.describe_effect(tool, &value);
+            let effective = AuthorizationNegotiator::compile_effective_descriptor(
+                &descriptor,
+                &value.to_string(),
+            );
+            assert_eq!(
+                effective.descriptor.required_permission,
+                PermissionMode::ReadOnly
+            );
+            assert_eq!(
+                effective.descriptor.descriptor_hash,
+                descriptor.descriptor_hash
+            );
+            assert_eq!(
+                pin.describe_effect(tool, &value).descriptor_hash,
+                descriptor.descriptor_hash
+            );
+            let mut current = request(descriptor.clone());
+            current.input = value.to_string();
+            current.capability = tool.into();
+            current.parent_ceiling = PermissionMode::ReadOnly;
+            let negotiator = AuthorizationNegotiator::new();
+            let evaluated = negotiator
+                .assess_effective(&PermissionPolicy::new(PermissionMode::ReadOnly), &current);
+            assert_eq!(evaluated.assessment.risk, RiskLevel::Medium);
+            let lease = evaluated
+                .assessment
+                .lease
+                .clone()
+                .expect("signed RO file observation lease");
+            assert!(AuthorizationNegotiator::verify_lease_signature(&lease));
+            let authorization = crate::ToolPolicy
+                .authorize(
+                    &evaluated.effective,
+                    &evaluated.assessment,
+                    &current.idempotency_key,
+                    lease.clone(),
+                    30,
+                )
+                .unwrap()
+                .authorization;
+            let definitions = pin
+                .snapshot()
+                .catalog
+                .definitions(None)
+                .into_iter()
+                .filter(|definition| definition.name == tool)
+                .map(|definition| crate::ProviderToolDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    input_schema: definition.input_schema,
+                })
+                .collect::<Vec<_>>();
+            let bound = Arc::new(
+                crate::step_snapshot::BoundStep::bind(
+                    serde_json::from_value(
+                        serde_json::json!({"step_id":"readonly-floor", "session_id":"session:test",
+                    "turn_id":"turn:test", "build_ref":"readonly-floor"}),
+                    )
+                    .unwrap(),
+                    pin.clone(),
+                    &definitions,
+                    &serde_json::json!({}),
+                    &serde_json::json!({}),
+                    BTreeMap::new(),
+                    i64::MAX,
+                )
+                .unwrap(),
+            );
+            let binding = crate::step_snapshot::StepCallBinding::provider(bound.clone(), "call-1");
+            bound
+                .validate_call(
+                    &binding.origin,
+                    "session:test",
+                    "call-1",
+                    tool,
+                    &current.input,
+                    1,
+                )
+                .unwrap();
+            assert!(bound
+                .validate_call(
+                    &binding.origin,
+                    "wrong-session",
+                    "call-1",
+                    tool,
+                    &current.input,
+                    1
+                )
+                .is_err());
+            assert!(bound
+                .validate_call(
+                    &binding.origin,
+                    "session:test",
+                    "wrong-call",
+                    tool,
+                    &current.input,
+                    1
+                )
+                .is_err());
+            for index in 0..descriptor.scopes.len() {
+                let mut altered = authorization.clone();
+                altered.authorization_lease.scopes.remove(index);
+                altered.authorization_lease.signature =
+                    AuthorizationNegotiator::sign(&altered.authorization_lease);
+                assert!(
+                    pin.validate_authorization(&altered, tool, &value).is_err(),
+                    "missing scope {index}"
+                );
+            }
+            for axis in 0..8 {
+                let mut altered = authorization.clone();
+                match axis {
+                    0 => altered.authorization_lease.status = AuthorizationLeaseStatus::Revoked,
+                    1 => altered.authorization_lease.expires_at_ms = 0,
+                    2 => altered.authorization_lease.remaining_uses = 0,
+                    3 => altered.authorization_lease.capability = "foreign".into(),
+                    4 => altered.policy_revision += 1,
+                    5 => altered.descriptor_hash = "foreign".into(),
+                    6 => altered.idempotency_key = Some("foreign".into()),
+                    _ => altered.authorization_lease.effect_descriptor_hash = "foreign".into(),
+                }
+                altered.authorization_lease.signature =
+                    AuthorizationNegotiator::sign(&altered.authorization_lease);
+                assert!(
+                    pin.validate_authorization(&altered, tool, &value).is_err(),
+                    "lease axis {axis}"
+                );
+            }
+            let mut forged = authorization.clone();
+            forged.authorization_lease.signature.push('x');
+            let error = pin
+                .validate_authorization(&forged, tool, &value)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("signature"), "{error}");
+            assert!(pin
+                .execute(&authorization, tool, &value)
+                .unwrap()
+                .contains("first observation"));
+            assert!(negotiator.revoke(&lease.lease_id));
+            assert_ne!(
+                negotiator
+                    .assess_effective(&PermissionPolicy::new(PermissionMode::ReadOnly), &current)
+                    .assessment
+                    .lease
+                    .unwrap()
+                    .lease_id,
+                lease.lease_id
+            );
+            assert_ne!(
+                capability_fingerprint(&current, PermissionMode::ReadOnly),
+                capability_fingerprint(&current, PermissionMode::WorkspaceWrite)
+            );
+        }
+        for data in [
+            DataClassification::Public,
+            DataClassification::Internal,
+            DataClassification::Confidential,
+        ] {
+            for blast in [EffectBlastRadius::Item, EffectBlastRadius::Workspace] {
+                let mut changed = base.clone();
+                changed.assessment.data_sensitivity = data;
+                changed.assessment.blast_radius = blast;
+                changed.scopes.push(PermissionScope {
+                    resource: PermissionResource::Tool,
+                    operation: PermissionOperation::Read,
+                    target: Some("metadata".into()),
+                });
+                assert_eq!(
+                    required_mode_for_effect(&changed, &changed.assessment),
+                    PermissionMode::ReadOnly
+                );
+                assert_eq!(risk_for_effect(&changed.assessment), RiskLevel::Medium);
+            }
+        }
+        let mut rejected = Vec::new();
+        for kind in [
+            ToolEffectKind::Write,
+            ToolEffectKind::Process,
+            ToolEffectKind::Package,
+            ToolEffectKind::Network,
+            ToolEffectKind::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.effect_kind = kind;
+            rejected.push(changed);
+        }
+        for idempotency in [
+            ToolIdempotency::IdempotentWithKey,
+            ToolIdempotency::NonIdempotent,
+            ToolIdempotency::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.idempotency = idempotency;
+            rejected.push(changed);
+        }
+        for approval in [
+            ToolApprovalClass::Policy,
+            ToolApprovalClass::User,
+            ToolApprovalClass::Administrator,
+        ] {
+            let mut changed = base.clone();
+            changed.approval_class = approval;
+            rejected.push(changed);
+        }
+        for axis in 0..4 {
+            let mut changed = base.clone();
+            match axis {
+                0 => changed.uses_network = true,
+                1 => changed.spawns_process = true,
+                2 => changed.mutates_packages = true,
+                _ => changed.mutates_system = true,
+            }
+            rejected.push(changed);
+        }
+        for scope in [
+            PermissionScope {
+                resource: PermissionResource::File,
+                operation: PermissionOperation::Write,
+                target: Some("b.txt".into()),
+            },
+            PermissionScope {
+                resource: PermissionResource::Tool,
+                operation: PermissionOperation::Control,
+                target: Some("control".into()),
+            },
+            PermissionScope {
+                resource: PermissionResource::Tool,
+                operation: PermissionOperation::Write,
+                target: Some("write".into()),
+            },
+            PermissionScope {
+                resource: PermissionResource::Network,
+                operation: PermissionOperation::Read,
+                target: Some("remote".into()),
+            },
+            PermissionScope {
+                resource: PermissionResource::Shell,
+                operation: PermissionOperation::Execute,
+                target: Some("process".into()),
+            },
+        ] {
+            let mut changed = base.clone();
+            changed.scopes.push(scope);
+            rejected.push(changed);
+        }
+        let mut empty = base.clone();
+        empty.scopes.clear();
+        rejected.push(empty);
+        let mut tool_only = base.clone();
+        tool_only.scopes[0].resource = PermissionResource::Tool;
+        rejected.push(tool_only);
+        for novelty in [
+            EffectNovelty::NewTarget,
+            EffectNovelty::NewCapability,
+            EffectNovelty::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.novelty = novelty;
+            rejected.push(changed);
+        }
+        for blast in [
+            EffectBlastRadius::ExternalAccount,
+            EffectBlastRadius::System,
+            EffectBlastRadius::Unbounded,
+            EffectBlastRadius::Unknown,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.blast_radius = blast;
+            rejected.push(changed);
+        }
+        for reversibility in [
+            EffectReversibility::Compensatable,
+            EffectReversibility::Unknown,
+            EffectReversibility::Irreversible,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.reversibility = reversibility;
+            rejected.push(changed);
+        }
+        for changed in rejected {
+            assert_eq!(
+                required_mode_for_effect(&changed, &changed.assessment),
+                if changed.assessment.reversibility == EffectReversibility::Irreversible {
+                    PermissionMode::DangerFullAccess
+                } else {
+                    PermissionMode::WorkspaceWrite
+                },
+                "{changed:?}"
+            );
+        }
+        for externality in [
+            EffectExternality::Unknown,
+            EffectExternality::System,
+            EffectExternality::ExternalMutation,
+        ] {
+            let mut changed = base.clone();
+            changed.assessment.externality = externality;
+            assert_eq!(
+                required_mode_for_effect(&changed, &changed.assessment),
+                if externality == EffectExternality::Unknown {
+                    PermissionMode::ReadOnly
+                } else {
+                    PermissionMode::DangerFullAccess
+                }
+            );
+        }
+        let mut defaulted = base.clone();
+        defaulted.assessment = EffectAssessment::default();
+        assert_eq!(
+            AuthorizationNegotiator::compile_effective_descriptor(&defaulted, "{}")
+                .descriptor
+                .required_permission,
+            PermissionMode::ReadOnly
+        );
+        for floor in [
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ] {
+            let mut changed = base.clone();
+            changed.required_permission = floor;
+            assert_eq!(
+                required_mode_for_effect(&changed, &changed.assessment),
+                floor
+            );
+        }
+        for value in [
+            serde_json::json!({"path":".env"}),
+            serde_json::json!({"path":".ssh/id_rsa"}),
+            serde_json::json!({"path":"credentials.json"}),
+            serde_json::json!({"path":"a.txt","contains_secrets":true}),
+            serde_json::json!({"path":"a.txt","data_classification":"secret"}),
+            serde_json::json!({}),
+        ] {
+            let sensitive = pin.describe_effect("read_file", &value);
+            assert_eq!(
+                AuthorizationNegotiator::compile_effective_descriptor(
+                    &sensitive,
+                    &value.to_string()
+                )
+                .descriptor
+                .required_permission,
+                PermissionMode::DangerFullAccess
+            );
+        }
+    }
+
+    #[test]
     fn invocation_fingerprint_never_replaces_the_tool_host_descriptor_identity() {
         let descriptor = effect(PermissionMode::ReadOnly, EffectExternality::Internal);
         let first =
@@ -1944,10 +2880,8 @@ mod tests {
         )
         .expect("restart recovery");
         assert_eq!(open, vec![record.clone()]);
-        assert!(
-            restarted
-                .restore_controlled_recovery_claim(&open[0].fingerprint, &open[0].recovery_scope)
-        );
+        assert!(restarted
+            .restore_controlled_recovery_claim(&open[0].fingerprint, &open[0].recovery_scope));
         assert_eq!(hot_state_counts(&restarted).3, 1);
 
         // Building a terminal or returning from an attempt is not an ACK.
@@ -1987,16 +2921,14 @@ mod tests {
                 events: vec![terminal_event],
             })
             .expect("graph terminal commit");
-        assert!(
-            load_open_controlled_recovery_claims(
-                &store,
-                &record.session_id,
-                &record.turn_id,
-                &record.execution_id,
-            )
-            .expect("settled recovery stream")
-            .is_empty()
-        );
+        assert!(load_open_controlled_recovery_claims(
+            &store,
+            &record.session_id,
+            &record.turn_id,
+            &record.execution_id,
+        )
+        .expect("settled recovery stream")
+        .is_empty());
         assert!(persist_controlled_recovery_claim(&store, &record).is_err());
         assert_eq!(hot_state_counts(&restarted).3, 1);
         assert_eq!(
@@ -2311,15 +3243,13 @@ mod tests {
             PermissionMode::WorkspaceWrite,
             EffectExternality::Workspace,
         ));
-        assert!(
-            negotiator
-                .assess(
-                    &PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-                    &request,
-                )
-                .lease
-                .is_some()
-        );
+        assert!(negotiator
+            .assess(
+                &PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                &request,
+            )
+            .lease
+            .is_some());
         let stale_transition_ids = negotiator
             .take_transitions_for_persistence()
             .into_iter()
@@ -2394,4 +3324,50 @@ mod tests {
             AuthorizationLeaseTransitionKind::Expired
         );
     }
+}
+
+pub(crate) fn authorization_lease_signed_payload(lease: &AuthorizationLease) -> serde_json::Value {
+    serde_json::json!({
+        "lease_id":lease.lease_id,"principal_id":lease.principal_id,"parent_lease_id":lease.parent_lease_id,
+        "capability":lease.capability,"scopes":lease.scopes,"ceiling":lease.ceiling,
+        "issued_at_ms":lease.issued_at_ms,"expires_at_ms":lease.expires_at_ms,"max_uses":lease.max_uses,
+        "policy_revision":lease.policy_revision,"effect_descriptor_hash":lease.effect_descriptor_hash,
+    })
+}
+
+pub(crate) fn validate_historical_authorization_issuer(
+    issuer: &crate::DurableRuntimeEvent,
+    grant: &harness_contract::tool::ToolExecutionAuthorization,
+    receipt_cursor: u64,
+) -> Result<(), String> {
+    let transition: AuthorizationLeaseTransition = serde_json::from_value(issuer.payload.clone()).map_err(|error| error.to_string())?;
+    if issuer.stream_id != format!("authorization-lease:{}", grant.authorization_lease.lease_id)
+        || issuer.sequence != 1 || issuer.scope != crate::RuntimeEventScope::Tool || issuer.schema_version != 1
+        || issuer.kind != "authorization.lease_transition" || issuer.status.as_deref() != Some("issued")
+        || !matches!(issuer.actor.as_deref(), Some("conversation_runtime" | "conversation_runtime.early_tool" | "runtime.process_jsonl"))
+        || transition.kind != AuthorizationLeaseTransitionKind::Issued
+        || issuer.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
+        || issuer.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+        || issuer.transaction_index != 0 || issuer.commit_cursor == 0 || issuer.commit_cursor >= receipt_cursor
+        || issuer.refs.len() != 1 || issuer.refs[0].kind != "authorization_lease"
+        || issuer.refs[0].id != grant.authorization_lease.lease_id
+        || transition.lease.signature.is_empty() || transition.lease.signature != grant.authorization_lease.signature
+        || authorization_lease_signed_payload(&transition.lease) != authorization_lease_signed_payload(&grant.authorization_lease)
+    {
+        return Err("historical authorization issuer provenance or immutable grant mismatch".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+pub fn persist_authorization_fixture_transitions(
+    negotiator: &AuthorizationNegotiator,
+    store: &crate::RuntimeEventStore,
+) -> Result<(), String> {
+    let _ = negotiator.take_transitions_for_persistence();
+    for transition in negotiator.transitions_awaiting_persistence() {
+        persist_authorization_transition(store, &format!("authorization-lease:{}", transition.lease.lease_id), "conversation_runtime", &transition)?;
+        negotiator.acknowledge_persisted_transitions(std::slice::from_ref(&transition.transition_id));
+    }
+    Ok(())
 }

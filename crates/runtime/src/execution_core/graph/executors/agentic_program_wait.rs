@@ -519,6 +519,15 @@ async fn resolve_wait_once(
     let projection = actions
         .project(program_id)
         .map_err(|error| error.to_string())?;
+    if actions.recovery_session_is_excluded(&projection.session_id) {
+        return Ok(0);
+    }
+    #[cfg(any(test, feature = "test-fixtures"))]
+    if !allow_same_revision_quiescence && projection.status == AgenticProgramStatus::Verified {
+        supervisor
+            .observe_committed_verdict_for_test(program_id, projection.revision)
+            .await?;
+    }
     let Some(root_execution_id) = projection.root_execution_id.as_deref() else {
         // This exit is silent, and it is the one place a caller cannot tell "nothing
         // to do" from "never asked". A paid run put a synchronous reconcile in the
@@ -1134,11 +1143,11 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AgenticProgramWaitExecutor, AgenticProgramWaitRequest,
         reconcile_agentic_program_wait_for_settled_graph, resolve_agentic_program_wait,
+        AgenticProgramWaitExecutor, AgenticProgramWaitRequest,
     };
-    use crate::RuntimeServices;
     use crate::execution_core::graph::executors::AgentTaskExecutor;
+    use crate::RuntimeServices;
 
     fn root_actor(program_id: &str, root_execution_id: &str) -> AgentActorBinding {
         AgentActorBinding {
@@ -1233,18 +1242,16 @@ mod tests {
             .agent_action_service()
             .project(program_id)
             .expect("published projection");
-        assert!(
-            AgenticProgramWaitRequest::for_active_root(
-                &published,
-                root_execution_id,
-                services.graph_state_store(),
-                true,
-                None,
-            )
-            .await
-            .expect("derive pre-dispatch wait")
-            .is_none()
-        );
+        assert!(AgenticProgramWaitRequest::for_active_root(
+            &published,
+            root_execution_id,
+            services.graph_state_store(),
+            true,
+            None,
+        )
+        .await
+        .expect("derive pre-dispatch wait")
+        .is_none());
 
         apply_root(
             "staff-after-publish",
@@ -1272,18 +1279,16 @@ mod tests {
             .agent_action_service()
             .project(program_id)
             .expect("dispatched projection");
-        assert!(
-            AgenticProgramWaitRequest::for_active_root(
-                &dispatched,
-                root_execution_id,
-                services.graph_state_store(),
-                false,
-                None,
-            )
-            .await
-            .expect("continue publishing while a child is active")
-            .is_none()
-        );
+        assert!(AgenticProgramWaitRequest::for_active_root(
+            &dispatched,
+            root_execution_id,
+            services.graph_state_store(),
+            false,
+            None,
+        )
+        .await
+        .expect("continue publishing while a child is active")
+        .is_none());
         let downstream = apply_root(
             "publish-dependent-work-while-child-runs",
             AgentAction::TaskPublish(TaskPublishInput {

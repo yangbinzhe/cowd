@@ -31,15 +31,15 @@ pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 pub use evidence::RuntimeEvidenceSummary;
 pub use evidence_writer::ResourceEvidenceWriterHealth;
 pub use goal::{
-    GoalProgressReducer, GoalProjection, GoalStore, policy::InterventionPolicy,
-    supervisor::ObjectiveReconcileDecision, supervisor::ObjectiveSupervisor,
+    policy::InterventionPolicy, supervisor::ObjectiveReconcileDecision,
+    supervisor::ObjectiveSupervisor, GoalProgressReducer, GoalProjection, GoalStore,
 };
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
     ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphReplan, ExecutionGraphStateStore,
     ExecutionRunnerError, ExecutionStateStoreError, NodeExecutionContext, NodeExecutionOutcome,
-    NodeExecutionTicket, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ScopedNodeBackend,
-    ScopedNodeExecutor,
+    NodeExecutionTicket, NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
+    ProcessClosurePublicationAuthority, ScopedNodeBackend, ScopedNodeExecutor,
 };
 pub use hot_state::{
     DerivedMaterialization, DerivedMaterializerHealth, HotMemoryBudget, HotSessionSnapshot,
@@ -59,12 +59,12 @@ pub use orchestration_binding::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions,
 };
 pub use outcome_service::{
-    CalibrationOutcomeImportReceipt, LegacyOutcomeImportReceipt, OUTCOME_EVENT_KIND,
-    OUTCOME_IMPORT_EVENT_KIND, OutcomeRecordReceipt, OutcomeService,
+    CalibrationOutcomeImportReceipt, LegacyOutcomeImportReceipt, OutcomeRecordReceipt,
+    OutcomeService, OUTCOME_EVENT_KIND, OUTCOME_IMPORT_EVENT_KIND,
 };
 pub use pattern_catalog::{
-    ExecutionPatternCatalog, RuntimeCompileTarget, RuntimeExecutionPatternSpec,
-    execution_pattern_catalog_response,
+    execution_pattern_catalog_response, ExecutionPatternCatalog, RuntimeCompileTarget,
+    RuntimeExecutionPatternSpec,
 };
 pub use report::RuntimeExecutionReportSpec;
 pub use safety_fuse::{
@@ -78,9 +78,9 @@ pub use services::{
     SessionTerminalDeliveryPort,
 };
 pub use strategy_decision::{
-    RuntimeExecutionDecision, RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
-    StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,
-    TurnStrategyDecisionStatus, build_runtime_execution_decision,
+    build_runtime_execution_decision, RuntimeExecutionDecision, RuntimeExecutionPatternCandidate,
+    StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome,
+    TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
 pub use supervisor::{
     RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionShutdownReport,

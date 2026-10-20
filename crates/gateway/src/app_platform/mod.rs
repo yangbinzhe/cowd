@@ -23,10 +23,10 @@ use cowd_app_protocol::{
     derive_channel_token_v1, format_bootstrap_authorization_v1, format_channel_authorization_v1,
     manifest_authorization_profile_digest_v1, manifest_capability_digest_v1, AppHandshakeRequestV1,
     AppHandshakeV1, AppHealthStatusV1, AppHealthV1, AppId, BootstrapSecretV1, ChannelPurposeV1,
-    ChannelTokenV1, OperationDescriptorV1, ProtocolValidate, APP_HANDSHAKE_PATH_V1,
-    APP_HEALTH_PATH_V1, ENV_APP_CONFIG_FILE_V1, ENV_APP_CREDENTIAL_FILE_V1, ENV_APP_DATA_DIR_V1,
-    ENV_APP_GENERATION_V1, ENV_APP_ID_V1, ENV_APP_LOG_FORMAT_V1, ENV_APP_SOCKET_V1,
-    ENV_CORE_BRIDGE_SOCKET_V1, HEADER_AUTHORIZATION_V1, HEADER_CONTENT_TYPE_V1,
+    ChannelTokenV1, OperationDescriptorV1, ProtocolValidate, ProtocolValidationError, Sha256Digest,
+    APP_HANDSHAKE_PATH_V1, APP_HEALTH_PATH_V1, ENV_APP_CONFIG_FILE_V1, ENV_APP_CREDENTIAL_FILE_V1,
+    ENV_APP_DATA_DIR_V1, ENV_APP_GENERATION_V1, ENV_APP_ID_V1, ENV_APP_LOG_FORMAT_V1,
+    ENV_APP_SOCKET_V1, ENV_CORE_BRIDGE_SOCKET_V1, HEADER_AUTHORIZATION_V1, HEADER_CONTENT_TYPE_V1,
     PROTOCOL_REVISION_V1, UNARY_CONTENT_TYPE_V1,
 };
 use http_body_util::{BodyExt, Full};
@@ -46,8 +46,46 @@ pub(crate) use core_bridge::{CoreBridgeRegistry, CoreBridgeServer};
 const MAX_TRUST_STORE_BYTES: u64 = 1024 * 1024;
 const SYSTEM_RUNTIME_ROOT_CANDIDATES: &[&str] =
     &["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib"];
-pub(crate) const PROTOCOL_DIGEST_V1: &str =
-    "sha256:072d80864a8addaecfc4f236d077f9a5f6eaeec2e587518da515b2b7e9768769";
+
+fn parse_canonical_protocol_digest(
+    manifest: &str,
+) -> Result<Sha256Digest, ProtocolValidationError> {
+    let value: serde_json::Value = serde_json::from_str(manifest)
+        .map_err(|error| ProtocolValidationError::InvalidJson(error.to_string()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProtocolValidationError::InvalidField {
+            field: "contract_manifest",
+            reason: "must be an object".to_owned(),
+        })?;
+    for (field, expected) in [
+        ("schema_version", 1_u64),
+        ("protocol_revision", u64::from(PROTOCOL_REVISION_V1)),
+    ] {
+        if object.get(field).and_then(serde_json::Value::as_u64) != Some(expected) {
+            return Err(ProtocolValidationError::InvalidField {
+                field,
+                reason: format!("must be integer {expected}"),
+            });
+        }
+    }
+    let digest = object
+        .get("protocol_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ProtocolValidationError::InvalidField {
+            field: "protocol_digest",
+            reason: "must be a string".to_owned(),
+        })?;
+    let digest = Sha256Digest(digest.to_owned());
+    digest.validate_value("protocol_digest")?;
+    Ok(digest)
+}
+
+pub(crate) fn canonical_protocol_digest_v1() -> Result<Sha256Digest, ProtocolValidationError> {
+    parse_canonical_protocol_digest(include_str!(
+        "../../../app-protocol/contracts/v1/contract-manifest.json"
+    ))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AppPlatformError {
@@ -967,6 +1005,131 @@ mod tests {
     use super::*;
     use cowd_app_protocol::AppManifestV1;
     use std::os::unix::fs::symlink;
+
+    fn canonical_manifest_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../app-protocol/contracts/v1/contract-manifest.json"
+        ))
+        .expect("canonical manifest JSON")
+    }
+
+    #[test]
+    fn r1_client_receipt_protocol_metadata_uses_canonical_manifest() {
+        let manifest = canonical_manifest_fixture();
+        let digest = canonical_protocol_digest_v1().expect("checked canonical protocol digest");
+        assert_eq!(
+            digest.0,
+            manifest["protocol_digest"].as_str().expect("digest")
+        );
+        digest
+            .validate_value("protocol_digest")
+            .expect("valid digest");
+        assert_eq!(
+            parse_canonical_protocol_digest(&manifest.to_string()).expect("fixture digest"),
+            digest
+        );
+    }
+
+    #[test]
+    fn r1_client_receipt_protocol_metadata_rejects_malformed_manifest() {
+        for malformed in ["", "{", "null", "[]", "1", "true", "\"manifest\""] {
+            assert!(
+                parse_canonical_protocol_digest(malformed).is_err(),
+                "{malformed}"
+            );
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let mut manifest = canonical_manifest_fixture();
+            manifest["protocol_digest"] = invalid;
+            assert!(parse_canonical_protocol_digest(&manifest.to_string()).is_err());
+        }
+        let mut manifest = canonical_manifest_fixture();
+        manifest
+            .as_object_mut()
+            .expect("object")
+            .remove("protocol_digest");
+        assert!(parse_canonical_protocol_digest(&manifest.to_string()).is_err());
+    }
+
+    #[test]
+    fn r1_client_receipt_protocol_metadata_requires_supported_integer_versions() {
+        for field in ["schema_version", "protocol_revision"] {
+            let mut missing = canonical_manifest_fixture();
+            missing.as_object_mut().expect("object").remove(field);
+            assert!(parse_canonical_protocol_digest(&missing.to_string()).is_err());
+            for invalid in [
+                serde_json::json!(null),
+                serde_json::json!("1"),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::json!(-1),
+                serde_json::json!(0),
+                serde_json::json!(2),
+                serde_json::json!(1.0),
+                serde_json::json!(1.5),
+                serde_json::json!(65536),
+            ] {
+                let mut manifest = canonical_manifest_fixture();
+                manifest[field] = invalid;
+                assert!(
+                    parse_canonical_protocol_digest(&manifest.to_string()).is_err(),
+                    "{field}: {}",
+                    manifest[field]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r1_client_receipt_protocol_metadata_preserves_digest_validator_semantics() {
+        let mut manifest = canonical_manifest_fixture();
+        let canonical = manifest["protocol_digest"]
+            .as_str()
+            .expect("digest")
+            .to_owned();
+        let payload = canonical.strip_prefix("sha256:").expect("digest prefix");
+        for valid in [
+            canonical.clone(),
+            format!("sha256:{}", payload.to_ascii_uppercase()),
+        ] {
+            manifest["protocol_digest"] = serde_json::json!(valid);
+            assert_eq!(
+                parse_canonical_protocol_digest(&manifest.to_string())
+                    .expect("valid hex")
+                    .0,
+                valid
+            );
+        }
+        for invalid in [
+            String::new(),
+            payload.to_owned(),
+            format!("SHA256:{payload}"),
+            format!("sha512:{payload}"),
+            format!("sha256:{}", &payload[..63]),
+            format!("{canonical}0"),
+            format!("sha256:g{}", &payload[1..]),
+            format!("sha256:é{}", &payload[2..]),
+            format!(" {canonical}"),
+            format!("{canonical}\n"),
+        ] {
+            manifest["protocol_digest"] = serde_json::json!(invalid);
+            let error = parse_canonical_protocol_digest(&manifest.to_string())
+                .expect_err("invalid digest must fail");
+            assert_eq!(
+                error,
+                Sha256Digest(invalid)
+                    .validate_value("protocol_digest")
+                    .expect_err("original validator rejects digest")
+            );
+        }
+    }
 
     #[test]
     fn runtime_roots_are_canonical_deduplicated_and_system_owned() {

@@ -56,17 +56,18 @@ pub fn plan_context_fanout_for_intent(
                 ]}),
             ),
         ],
-        TaskIntent::Release | TaskIntent::Test => vec![
+        TaskIntent::Test => Vec::new(),
+        TaskIntent::Release => vec![
             call(
                 "workspace_snapshot",
                 json!({"include_git": true, "include_files": false}),
             ),
             call(
-                "tool_orchestrate",
-                json!({"calls": [
-                    {"name": "glob_search", "input": {"pattern": "scripts/validate.sh"}},
-                    {"name": "glob_search", "input": {"pattern": "**/Cargo.toml"}},
-                    {"name": "glob_search", "input": {"pattern": "**/package.json"}}
+                "glob_search",
+                json!({"patterns": [
+                    {"pattern": "scripts/validate.sh"},
+                    {"pattern": "**/Cargo.toml"},
+                    {"pattern": "**/package.json"}
                 ]}),
             ),
         ],
@@ -76,7 +77,7 @@ pub fn plan_context_fanout_for_intent(
                 json!({"include_git": true, "include_files": true, "roots": ["crates", "webui"], "max_files": 500}),
             ),
             call(
-                "tool_orchestrate",
+                "glob_search",
                 json!({"patterns": [
                     {"pattern": "**/*.tsx"},
                     {"pattern": "**/*.ts"},
@@ -86,10 +87,9 @@ pub fn plan_context_fanout_for_intent(
             ),
         ],
         TaskIntent::Docs => vec![call(
-            "tool_orchestrate",
+            "glob_search",
             json!({"patterns": [
                 {"pattern": "docs/**/*.md"},
-                {"pattern": "../plan/**/*.md"},
                 {"pattern": "*.md"}
             ]}),
         )],
@@ -137,10 +137,67 @@ mod tests {
     fn release_plan_uses_batch_readonly() {
         let plan = plan_context_fanout("发布前验收");
         assert_eq!(plan.intent, TaskIntent::Release);
-        assert!(
-            plan.calls
-                .iter()
-                .any(|call| call.name == "tool_orchestrate")
-        );
+        assert!(plan.calls.iter().any(|call| call.name == "glob_search"));
+    }
+
+    #[test]
+    fn every_fanout_example_validates_against_real_tool_schemas() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let lease = tools::ToolHost::builtin("fanout-schema", workspace.path()).pin_snapshot();
+        for intent in [
+            TaskIntent::Review,
+            TaskIntent::Bugfix,
+            TaskIntent::Release,
+            TaskIntent::Test,
+            TaskIntent::Frontend,
+            TaskIntent::Docs,
+            TaskIntent::Backend,
+            TaskIntent::Explore,
+        ] {
+            let plan = plan_context_fanout_for_intent(intent, "schema conformance");
+            for call in plan.calls {
+                lease
+                    .validate_input(&call.name, &call.input)
+                    .unwrap_or_else(|error| panic!("{intent:?} {}: {error}", call.name));
+            }
+        }
+        for invalid in [
+            json!({"calls": [{"name": "glob_search", "input": {"pattern": "*.rs"}}]}),
+            json!({"patterns": [{"pattern": "*.rs"}]}),
+        ] {
+            assert!(lease.validate_input("tool_orchestrate", &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn verification_intent_does_not_prescribe_repository_inspection() {
+        let plan = plan_context_fanout_for_intent(TaskIntent::Test, "verify file bytes");
+        assert!(plan.calls.is_empty());
+        for prompt in [
+            "test result.txt bytes and final newline",
+            "读取 input.txt 统计非空行，写入 result.txt 并验证实际字节",
+        ] {
+            let plan = plan_context_fanout(prompt);
+            assert_eq!(plan.intent, TaskIntent::Test);
+            assert!(plan.calls.is_empty());
+            let evidence = crate::evidence_planner::plan_evidence(prompt);
+            assert!(evidence.recommended_calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn docs_fanout_stays_inside_workspace() {
+        let plan = plan_context_fanout_for_intent(TaskIntent::Docs, "documentation");
+        assert!(plan.calls.iter().all(|call| call.name == "glob_search"));
+        for call in plan.calls {
+            for pattern in call.input["patterns"].as_array().expect("patterns") {
+                assert!(
+                    !pattern["pattern"]
+                        .as_str()
+                        .expect("pattern")
+                        .starts_with("../")
+                );
+            }
+        }
     }
 }

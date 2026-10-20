@@ -5,10 +5,9 @@ use harness_contract::execution_graph::{
     ExecutionNodeProjection, ExecutionNodeStatus,
 };
 use harness_contract::projection::{
-    AcceptanceSummaryProjection, ActivityRelationKind, ActivityVisibility,
-    EXECUTION_ACTIVITY_SCHEMA_VERSION, EffectSummaryProjection, ExecutionActivityKind,
-    ExecutionActivityProjection, ExecutionActivityRelation, ExecutionScopeProjection,
-    ExecutionStatusReasonKind,
+    AcceptanceSummaryProjection, ActivityRelationKind, ActivityVisibility, EffectSummaryProjection,
+    ExecutionActivityKind, ExecutionActivityProjection, ExecutionActivityRelation,
+    ExecutionScopeProjection, ExecutionStatusReasonKind, EXECUTION_ACTIVITY_SCHEMA_VERSION,
 };
 
 use super::reducer_support::ExecutionProjectionScope;
@@ -20,24 +19,59 @@ pub(super) fn project_execution_activities(
     scope: &ExecutionProjectionScope,
     graph: &ExecutionGraphProjection,
     include_audit_only: bool,
-) -> (
-    Vec<ExecutionActivityProjection>,
-    Vec<ExecutionActivityRelation>,
-) {
-    project_execution_activities_from_events(
+) -> Result<
+    (
+        Vec<ExecutionActivityProjection>,
+        Vec<ExecutionActivityRelation>,
+    ),
+    crate::RuntimeServicesError,
+> {
+    let through = services.event_store().durable_commit_cursor()?;
+    let facts = super::history::load_scope(services, scope, through)?;
+    let result = project_execution_activities_from_history(
         services,
         scope,
         graph,
-        execution_events(services, scope),
+        &facts,
         include_audit_only,
-    )
+    );
+    super::history::check_bytes(&result)?;
+    Ok(result)
 }
 
+#[cfg(test)]
 pub(super) fn project_execution_activities_from_events(
     services: &RuntimeServices,
     scope: &ExecutionProjectionScope,
     graph: &ExecutionGraphProjection,
     events: Vec<DurableRuntimeEvent>,
+    include_audit_only: bool,
+) -> (
+    Vec<ExecutionActivityProjection>,
+    Vec<ExecutionActivityRelation>,
+) {
+    let mut facts = BTreeMap::new();
+    for candidate in std::iter::once(graph).chain(scope.descendant_graphs.iter()) {
+        let root_scope = execution_scope(services, scope, candidate);
+        let mut state = super::history::HistoryState::default();
+        for event in events
+            .iter()
+            .filter(|event| event_belongs_to_graph(event, candidate))
+        {
+            state
+                .fold(event, candidate, &root_scope)
+                .expect("valid current test history");
+        }
+        facts.insert(candidate.graph_id.clone(), state);
+    }
+    project_execution_activities_from_history(services, scope, graph, &facts, include_audit_only)
+}
+
+pub(super) fn project_execution_activities_from_history(
+    services: &RuntimeServices,
+    scope: &ExecutionProjectionScope,
+    graph: &ExecutionGraphProjection,
+    facts: &BTreeMap<String, super::history::HistoryState>,
     include_audit_only: bool,
 ) -> (
     Vec<ExecutionActivityProjection>,
@@ -51,14 +85,7 @@ pub(super) fn project_execution_activities_from_events(
         }
     };
     let mut graphs = vec![project_graph(graph.clone())];
-    graphs.extend(
-        scope
-            .execution_ids
-            .iter()
-            .filter(|execution_id| execution_id.as_str() != graph.graph_id)
-            .filter_map(|execution_id| services.graph_state_store().projection(execution_id).ok())
-            .map(project_graph),
-    );
+    graphs.extend(scope.descendant_graphs.iter().cloned().map(project_graph));
     graphs.sort_by_key(|candidate| {
         (
             usize::from(candidate.parent_execution.is_some()),
@@ -69,16 +96,13 @@ pub(super) fn project_execution_activities_from_events(
     let mut activities = BTreeMap::<String, ExecutionActivityProjection>::new();
     let mut relations = BTreeMap::<String, ExecutionActivityRelation>::new();
     for lineage_graph in &graphs {
-        let graph_events = events
-            .iter()
-            .filter(|event| event_belongs_to_graph(event, lineage_graph))
-            .cloned()
-            .collect::<Vec<_>>();
-        let (graph_activities, graph_relations) = project_single_execution_activities_from_events(
+        let empty = super::history::HistoryState::default();
+        let graph_facts = facts.get(&lineage_graph.graph_id).unwrap_or(&empty);
+        let (graph_activities, graph_relations) = project_single_execution_activities_from_history(
             services,
             scope,
             lineage_graph,
-            graph_events,
+            graph_facts,
             include_audit_only,
         );
         for activity in graph_activities {
@@ -132,7 +156,9 @@ pub(super) fn project_execution_activities_from_events(
             None,
         );
     }
-    insert_explicit_tool_consumed_relations(&mut relations, &activities, &events);
+    for state in facts.values() {
+        insert_explicit_consumed_facts(&mut relations, &activities, &state.inputs);
+    }
 
     let mut activities = activities.into_values().collect::<Vec<_>>();
     activities.sort_by_key(|activity| {
@@ -157,6 +183,177 @@ pub(super) fn project_execution_activities_from_events(
         })
         .collect();
     (activities, relations)
+}
+
+pub(super) fn event_activity(
+    event: &DurableRuntimeEvent,
+    root_scope: &ExecutionScopeProjection,
+) -> Option<ExecutionActivityProjection> {
+    if !matches!(
+        event.scope,
+        RuntimeEventScope::ExecutionGraph
+            | RuntimeEventScope::Tool
+            | RuntimeEventScope::Skill
+            | RuntimeEventScope::Agent
+            | RuntimeEventScope::Team
+            | RuntimeEventScope::Program
+            | RuntimeEventScope::Approval
+            | RuntimeEventScope::Recovery
+            | RuntimeEventScope::Session
+    ) || (event.scope == RuntimeEventScope::Session && !is_public_reasoning_event(event))
+    {
+        return None;
+    }
+    let root_id = execution_activity_id(&root_scope.execution_id);
+    let graph_id = &root_scope.execution_id;
+    let team_activity_by_run = BTreeMap::<String, String>::new();
+    let binding = event.activity_binding();
+    if binding.is_none() && requires_activity_binding(event) {
+        return None;
+    }
+    let activity_id = binding.as_ref().map_or_else(
+        || format!("activity:event:{}", event.event_id),
+        |binding| binding.activity_id.clone(),
+    );
+    let (kind, mut visibility) = event_kind(event);
+    // Agent-first Program events are intentionally bound through their
+    // trusted execution ref rather than the legacy activity-binding
+    // envelope. They are first-class narrative facts, not audit-only
+    // leftovers; hiding them here is what reduced the browser graph to a
+    // single root node even while Teams were actually running.
+    if binding.is_none() && event.scope != RuntimeEventScope::Program {
+        visibility.retain(|item| *item != ActivityVisibility::Narrative);
+    }
+    let team_run_id = binding
+        .as_ref()
+        .and_then(|binding| binding.team_run_id.clone())
+        .or_else(|| value_string(&event.payload, "team_id"))
+        .or_else(|| agentic_team_id(event));
+    let agent_run_id = binding
+        .as_ref()
+        .and_then(|binding| binding.agent_run_id.clone());
+    let agent_instance_id = binding
+        .as_ref()
+        .and_then(|binding| binding.agent_instance_id.clone())
+        .or_else(|| value_string(&event.payload, "producer_instance_id"))
+        .or_else(|| agentic_agent_id(event));
+    let tool_call_id = binding
+        .as_ref()
+        .and_then(|binding| binding.tool_call_id.clone());
+    let approval_id = binding
+        .as_ref()
+        .and_then(|binding| binding.approval_id.clone());
+    let bound_parent_activity_id = binding
+        .as_ref()
+        .and_then(|binding| binding.parent_activity_id.clone())
+        .unwrap_or_else(|| root_id.clone());
+    let parent_activity_id = if matches!(
+        kind,
+        ExecutionActivityKind::Agent | ExecutionActivityKind::Discussion
+    ) {
+        team_run_id
+            .as_ref()
+            .and_then(|team_run_id| team_activity_by_run.get(team_run_id))
+            .cloned()
+            .unwrap_or(bound_parent_activity_id)
+    } else {
+        bound_parent_activity_id
+    };
+    let status = event_activity_status(event);
+    let terminal = is_terminal_status(&status)
+        || event.kind.contains("completed")
+        || event.kind.contains("failed")
+        || event.kind.contains("rejected");
+    let started_at_ms = event_started_at(event).or(Some(event.created_at_ms));
+    let completed_at_ms =
+        terminal.then(|| event_completed_at(event).unwrap_or(event.created_at_ms));
+    let candidate = ExecutionActivityProjection {
+        schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
+        activity_id: activity_id.clone(),
+        scope: root_scope.clone(),
+        kind,
+        node_id: binding.as_ref().and_then(|binding| binding.node_id.clone()),
+        display_label: event_display_label(event, kind),
+        display_role_label: (kind == ExecutionActivityKind::Agent)
+            .then(|| {
+                pointer_string(
+                    &event.payload,
+                    "/snapshot/binding/display/role_display_name",
+                )
+                .or_else(|| pointer_string(&event.payload, "/snapshot/binding/display/role_label"))
+            })
+            .flatten()
+            .and_then(|value| non_empty(&value))
+            .filter(|value| usable_agent_display_label(value)),
+        display_focus_label: (kind == ExecutionActivityKind::Agent)
+            .then(|| pointer_string(&event.payload, "/snapshot/binding/display/focus_label"))
+            .flatten()
+            .and_then(|value| non_empty(&value)),
+        display_provenance: (kind == ExecutionActivityKind::Agent)
+            .then(|| pointer_string(&event.payload, "/snapshot/binding/display/provenance"))
+            .flatten()
+            .and_then(|value| non_empty(&value)),
+        display_digest: (kind == ExecutionActivityKind::Agent)
+            .then(|| pointer_string(&event.payload, "/snapshot/binding/display/digest"))
+            .flatten()
+            .and_then(|value| non_empty(&value)),
+        phase: event_phase(event),
+        visibility,
+        parent_activity_id: Some(parent_activity_id.clone()),
+        initiator_activity_id: binding
+            .as_ref()
+            .and_then(|binding| binding.initiator_activity_id.clone())
+            .or_else(|| Some(parent_activity_id)),
+        causal_parent_ids: Vec::new(),
+        dependency_ids: Vec::new(),
+        parallel_group_id: binding
+            .as_ref()
+            .and_then(|binding| binding.parallel_group_id.clone()),
+        team_run_id,
+        agent_instance_id,
+        agent_run_id,
+        skill_id: binding
+            .as_ref()
+            .and_then(|binding| binding.skill_id.clone()),
+        skill_revision: binding
+            .as_ref()
+            .and_then(|binding| binding.skill_revision.clone()),
+        skill_activation_id: binding
+            .as_ref()
+            .and_then(|binding| binding.skill_activation_id.clone()),
+        tool_contract_id: binding
+            .as_ref()
+            .and_then(|binding| binding.tool_contract_id.clone()),
+        tool_call_id,
+        approval_id,
+        status,
+        status_reason_kind: None,
+        blocked_by_activity_ids: Vec::new(),
+        evidence_ready: None,
+        effect_summary: None,
+        acceptance_summary: None,
+        work_status: None,
+        work_revision: None,
+        claimant_instance_id: None,
+        claimant_role_id: None,
+        claim_lease_expires_at_ms: None,
+        input_artifact_refs: Vec::new(),
+        output_artifact_kinds: Vec::new(),
+        status_reason: event_status_reason(event),
+        required: value_bool(&event.payload, "required").unwrap_or(true),
+        started_at_ms,
+        completed_at_ms,
+        duration_ms: event_duration(event).or_else(|| duration(started_at_ms, completed_at_ms)),
+        sequence: event.sequence,
+        commit_cursor: event.commit_cursor,
+        public_summary: event_public_summary(event),
+        result_summary: terminal.then(|| event_result_summary(event)).flatten(),
+        artifact_refs: event_artifact_refs(event),
+        evidence_refs: event_evidence_refs(event),
+        definition_refs: Vec::new(),
+        detail_capability: Some(activity_detail_capability(graph_id)),
+    };
+    Some(candidate)
 }
 
 const SUMMARY_AUXILIARY_ACTIVITY_LIMIT: usize = 128;
@@ -220,11 +417,38 @@ fn bound_summary_activities(activities: &mut Vec<ExecutionActivityProjection>) {
     }
 }
 
+#[cfg(test)]
 fn project_single_execution_activities_from_events(
     services: &RuntimeServices,
     scope: &ExecutionProjectionScope,
     graph: &ExecutionGraphProjection,
     events: Vec<DurableRuntimeEvent>,
+    include_audit_only: bool,
+) -> (
+    Vec<ExecutionActivityProjection>,
+    Vec<ExecutionActivityRelation>,
+) {
+    let root_scope = execution_scope(services, scope, graph);
+    let mut facts = super::history::HistoryState::default();
+    for event in &events {
+        facts
+            .fold(event, graph, &root_scope)
+            .expect("valid current test history");
+    }
+    project_single_execution_activities_from_history(
+        services,
+        scope,
+        graph,
+        &facts,
+        include_audit_only,
+    )
+}
+
+fn project_single_execution_activities_from_history(
+    services: &RuntimeServices,
+    scope: &ExecutionProjectionScope,
+    graph: &ExecutionGraphProjection,
+    facts: &super::history::HistoryState,
     include_audit_only: bool,
 ) -> (
     Vec<ExecutionActivityProjection>,
@@ -236,7 +460,13 @@ fn project_single_execution_activities_from_events(
     // activities because their durable stream belongs to the child execution.
     let root_id = execution_activity_id(&graph.graph_id);
     let root_scope = execution_scope(services, scope, graph);
-    let (root_started, root_completed) = execution_bounds(&events, graph);
+    let root_started = facts.first;
+    let root_completed = graph
+        .nodes
+        .iter()
+        .all(|node| node.status.is_terminal())
+        .then_some(facts.last)
+        .flatten();
     let mut activities = BTreeMap::<String, ExecutionActivityProjection>::new();
     activities.insert(
         root_id.clone(),
@@ -323,23 +553,14 @@ fn project_single_execution_activities_from_events(
     for (index, node) in graph.nodes.iter().enumerate() {
         let activity_id = node_activity_id(&graph.graph_id, &node.node_id);
         let identity = graph_node_identity(node);
-        let node_events = events
-            .iter()
-            .filter(|event| event_refers_to_node(event, &node.node_id))
-            .collect::<Vec<_>>();
-        let started = node_events
-            .iter()
-            .map(|event| event.created_at_ms)
-            .min()
-            .or(root_started);
+        let node_facts = facts.nodes.get(&node.node_id);
+        let started = node_facts.and_then(|facts| facts.first).or(root_started);
         let completed = node
             .status
             .is_terminal()
             .then(|| {
-                node_events
-                    .iter()
-                    .map(|event| event.created_at_ms)
-                    .max()
+                node_facts
+                    .and_then(|facts| facts.last)
                     .or_else(|| started.map(|value| value.saturating_add(node.usage.duration_ms)))
             })
             .flatten();
@@ -357,7 +578,19 @@ fn project_single_execution_activities_from_events(
                 scope: root_scope.clone(),
                 kind: activity_kind(node.kind, &node.executor_kind),
                 node_id: Some(node.node_id.clone()),
-                display_label: projected_node_display_label(node, &node_events),
+                display_label: if node.kind == ExecutionNodeKind::AgentTask
+                    && node
+                        .display_label
+                        .as_deref()
+                        .filter(|label| usable_agent_display_label(label))
+                        .is_none()
+                {
+                    node_facts
+                        .and_then(|facts| facts.label.clone())
+                        .or_else(|| Some("agent".into()))
+                } else {
+                    projected_node_display_label(node, &[])
+                },
                 display_role_label: node.display_role_label.clone(),
                 display_focus_label: node.display_focus_label.clone(),
                 display_provenance: node.display_provenance.clone(),
@@ -439,11 +672,7 @@ fn project_single_execution_activities_from_events(
                     .then_some(node.usage.duration_ms)
                     .or_else(|| duration(started, completed)),
                 sequence: index as u64 + 1,
-                commit_cursor: node_events
-                    .iter()
-                    .map(|event| event.commit_cursor)
-                    .max()
-                    .unwrap_or(graph.commit_cursor),
+                commit_cursor: node_facts.map_or(graph.commit_cursor, |facts| facts.cursor),
                 public_summary: node
                     .summary
                     .as_deref()
@@ -488,172 +717,11 @@ fn project_single_execution_activities_from_events(
         }
     }
 
-    for event in events.iter().filter(|event| {
-        matches!(
-            event.scope,
-            RuntimeEventScope::ExecutionGraph
-                | RuntimeEventScope::Tool
-                | RuntimeEventScope::Skill
-                | RuntimeEventScope::Agent
-                | RuntimeEventScope::Team
-                | RuntimeEventScope::Program
-                | RuntimeEventScope::Approval
-                | RuntimeEventScope::Recovery
-                | RuntimeEventScope::Session
-        ) && (event.scope != RuntimeEventScope::Session || is_public_reasoning_event(event))
-    }) {
-        let binding = event.activity_binding();
-        if binding.is_none() && requires_activity_binding(event) {
-            continue;
-        }
-        let activity_id = binding.as_ref().map_or_else(
-            || format!("activity:event:{}", event.event_id),
-            |binding| binding.activity_id.clone(),
-        );
-        let (kind, mut visibility) = event_kind(event);
-        // Agent-first Program events are intentionally bound through their
-        // trusted execution ref rather than the legacy activity-binding
-        // envelope. They are first-class narrative facts, not audit-only
-        // leftovers; hiding them here is what reduced the browser graph to a
-        // single root node even while Teams were actually running.
-        if binding.is_none() && event.scope != RuntimeEventScope::Program {
-            visibility.retain(|item| *item != ActivityVisibility::Narrative);
-        }
-        let team_run_id = binding
-            .as_ref()
-            .and_then(|binding| binding.team_run_id.clone())
-            .or_else(|| value_string(&event.payload, "team_id"))
-            .or_else(|| agentic_team_id(event));
-        let agent_run_id = binding
-            .as_ref()
-            .and_then(|binding| binding.agent_run_id.clone());
-        let agent_instance_id = binding
-            .as_ref()
-            .and_then(|binding| binding.agent_instance_id.clone())
-            .or_else(|| value_string(&event.payload, "producer_instance_id"))
-            .or_else(|| agentic_agent_id(event));
-        let tool_call_id = binding
-            .as_ref()
-            .and_then(|binding| binding.tool_call_id.clone());
-        let approval_id = binding
-            .as_ref()
-            .and_then(|binding| binding.approval_id.clone());
-        let bound_parent_activity_id = binding
-            .as_ref()
-            .and_then(|binding| binding.parent_activity_id.clone())
-            .unwrap_or_else(|| root_id.clone());
-        let parent_activity_id = if matches!(
-            kind,
-            ExecutionActivityKind::Agent | ExecutionActivityKind::Discussion
-        ) {
-            team_run_id
-                .as_ref()
-                .and_then(|team_run_id| team_activity_by_run.get(team_run_id))
-                .cloned()
-                .unwrap_or(bound_parent_activity_id)
-        } else {
-            bound_parent_activity_id
-        };
-        let status = event_activity_status(event);
-        let terminal = is_terminal_status(&status)
-            || event.kind.contains("completed")
-            || event.kind.contains("failed")
-            || event.kind.contains("rejected");
-        let started_at_ms = event_started_at(event).or(Some(event.created_at_ms));
-        let completed_at_ms =
-            terminal.then(|| event_completed_at(event).unwrap_or(event.created_at_ms));
-        let candidate = ExecutionActivityProjection {
-            schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
-            activity_id: activity_id.clone(),
-            scope: root_scope.clone(),
-            kind,
-            node_id: binding.as_ref().and_then(|binding| binding.node_id.clone()),
-            display_label: event_display_label(event, kind),
-            display_role_label: (kind == ExecutionActivityKind::Agent)
-                .then(|| {
-                    pointer_string(
-                        &event.payload,
-                        "/snapshot/binding/display/role_display_name",
-                    )
-                    .or_else(|| {
-                        pointer_string(&event.payload, "/snapshot/binding/display/role_label")
-                    })
-                })
-                .flatten()
-                .and_then(|value| non_empty(&value))
-                .filter(|value| usable_agent_display_label(value)),
-            display_focus_label: (kind == ExecutionActivityKind::Agent)
-                .then(|| pointer_string(&event.payload, "/snapshot/binding/display/focus_label"))
-                .flatten()
-                .and_then(|value| non_empty(&value)),
-            display_provenance: (kind == ExecutionActivityKind::Agent)
-                .then(|| pointer_string(&event.payload, "/snapshot/binding/display/provenance"))
-                .flatten()
-                .and_then(|value| non_empty(&value)),
-            display_digest: (kind == ExecutionActivityKind::Agent)
-                .then(|| pointer_string(&event.payload, "/snapshot/binding/display/digest"))
-                .flatten()
-                .and_then(|value| non_empty(&value)),
-            phase: event_phase(event),
-            visibility,
-            parent_activity_id: Some(parent_activity_id.clone()),
-            initiator_activity_id: binding
-                .as_ref()
-                .and_then(|binding| binding.initiator_activity_id.clone())
-                .or_else(|| Some(parent_activity_id)),
-            causal_parent_ids: Vec::new(),
-            dependency_ids: Vec::new(),
-            parallel_group_id: binding
-                .as_ref()
-                .and_then(|binding| binding.parallel_group_id.clone()),
-            team_run_id,
-            agent_instance_id,
-            agent_run_id,
-            skill_id: binding
-                .as_ref()
-                .and_then(|binding| binding.skill_id.clone()),
-            skill_revision: binding
-                .as_ref()
-                .and_then(|binding| binding.skill_revision.clone()),
-            skill_activation_id: binding
-                .as_ref()
-                .and_then(|binding| binding.skill_activation_id.clone()),
-            tool_contract_id: binding
-                .as_ref()
-                .and_then(|binding| binding.tool_contract_id.clone()),
-            tool_call_id,
-            approval_id,
-            status,
-            status_reason_kind: None,
-            blocked_by_activity_ids: Vec::new(),
-            evidence_ready: None,
-            effect_summary: None,
-            acceptance_summary: None,
-            work_status: None,
-            work_revision: None,
-            claimant_instance_id: None,
-            claimant_role_id: None,
-            claim_lease_expires_at_ms: None,
-            input_artifact_refs: Vec::new(),
-            output_artifact_kinds: Vec::new(),
-            status_reason: event_status_reason(event),
-            required: value_bool(&event.payload, "required").unwrap_or(true),
-            started_at_ms,
-            completed_at_ms,
-            duration_ms: event_duration(event).or_else(|| duration(started_at_ms, completed_at_ms)),
-            sequence: event.sequence,
-            commit_cursor: event.commit_cursor,
-            public_summary: event_public_summary(event),
-            result_summary: terminal.then(|| event_result_summary(event)).flatten(),
-            artifact_refs: event_artifact_refs(event),
-            evidence_refs: event_evidence_refs(event),
-            definition_refs: Vec::new(),
-            detail_capability: Some(activity_detail_capability(&graph.graph_id)),
-        };
-        if let Some(existing) = activities.get_mut(&activity_id) {
+    for candidate in facts.activities.values().cloned() {
+        if let Some(existing) = activities.get_mut(&candidate.activity_id) {
             merge_activity(existing, candidate);
         } else {
-            activities.insert(activity_id, candidate);
+            activities.insert(candidate.activity_id.clone(), candidate);
         }
     }
 
@@ -873,55 +941,55 @@ fn insert_committed_predecessor_consumed_relations(
     }
 }
 
+fn insert_explicit_consumed_facts(
+    relations: &mut BTreeMap<String, ExecutionActivityRelation>,
+    activities: &BTreeMap<String, ExecutionActivityProjection>,
+    inputs: &std::collections::BTreeSet<(String, String)>,
+) {
+    for (consumer, reference) in inputs {
+        let producer = activities.values().find(|activity| {
+            activity.activity_id != *consumer && activity.artifact_refs.contains(reference)
+        });
+        let Some(producer) = producer else {
+            continue;
+        };
+        let artifact_id = artifact_activity_id(&producer.scope.execution_id, reference);
+        if activities.contains_key(&artifact_id) && activities.contains_key(consumer) {
+            insert_relation(
+                relations,
+                ActivityRelationKind::Consumed,
+                &artifact_id,
+                consumer,
+                Some(reference.clone()),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 fn insert_explicit_tool_consumed_relations(
     relations: &mut BTreeMap<String, ExecutionActivityRelation>,
     activities: &BTreeMap<String, ExecutionActivityProjection>,
     events: &[DurableRuntimeEvent],
 ) {
-    for event in events
+    let inputs = events
         .iter()
         .filter(|event| event.kind.starts_with("tool.invocation."))
-    {
-        let Some(binding) = event.activity_binding() else {
-            continue;
-        };
-        let Some(input_refs) = event
-            .payload
-            .get("input_refs")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for reference in input_refs
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .filter(|reference| !reference.trim().is_empty())
-        {
-            let producer = activities.values().find(|activity| {
-                activity.activity_id != binding.activity_id
-                    && activity
-                        .artifact_refs
-                        .iter()
-                        .any(|candidate| candidate == reference)
-            });
-            let Some(producer) = producer else {
-                continue;
-            };
-            let artifact_id = artifact_activity_id(&producer.scope.execution_id, reference);
-            if !activities.contains_key(&artifact_id)
-                || !activities.contains_key(&binding.activity_id)
-            {
-                continue;
-            }
-            insert_relation(
-                relations,
-                ActivityRelationKind::Consumed,
-                &artifact_id,
-                &binding.activity_id,
-                Some(reference.to_string()),
-            );
-        }
-    }
+        .flat_map(|event| {
+            let consumer = event.activity_binding().map(|binding| binding.activity_id);
+            event.payload["input_refs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(move |reference| {
+                    consumer
+                        .clone()
+                        .map(|consumer| (consumer, reference.to_string()))
+                })
+        })
+        .collect();
+    insert_explicit_consumed_facts(relations, activities, &inputs);
 }
 
 pub(super) fn event_belongs_to_graph(
@@ -953,7 +1021,7 @@ pub(super) fn event_belongs_to_graph(
         })
 }
 
-fn execution_scope(
+pub(super) fn execution_scope(
     services: &RuntimeServices,
     scope: &ExecutionProjectionScope,
     graph: &ExecutionGraphProjection,
@@ -1740,7 +1808,7 @@ fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind)
     .map(|value| crop(&value, 120))
 }
 
-fn agent_binding_display_label(events: &[&DurableRuntimeEvent]) -> Option<String> {
+pub(super) fn agent_binding_display_label(events: &[&DurableRuntimeEvent]) -> Option<String> {
     events
         .iter()
         .filter_map(|event| {
@@ -1810,7 +1878,7 @@ fn status_name(status: ExecutionNodeStatus) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn event_refers_to_node(event: &DurableRuntimeEvent, node_id: &str) -> bool {
+pub(super) fn event_refers_to_node(event: &DurableRuntimeEvent, node_id: &str) -> bool {
     event
         .refs
         .iter()
@@ -2094,83 +2162,6 @@ fn crop(value: &str, limit: usize) -> String {
     output
 }
 
-pub(super) fn execution_events(
-    services: &RuntimeServices,
-    scope: &ExecutionProjectionScope,
-) -> Vec<DurableRuntimeEvent> {
-    let mut events = Vec::new();
-    for execution_id in &scope.execution_ids {
-        events.extend(events_for_root_execution(services, execution_id));
-    }
-    events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
-    events.dedup_by(|left, right| left.event_id == right.event_id);
-    events
-}
-
-pub(super) fn events_for_root_execution(
-    services: &RuntimeServices,
-    execution_id: &str,
-) -> Vec<DurableRuntimeEvent> {
-    const PAGE_SIZE: usize = 512;
-    let mut events = Vec::new();
-    let mut after = None;
-    loop {
-        let Ok(page) =
-            services
-                .event_store()
-                .events_for_root_execution(execution_id, after, PAGE_SIZE)
-        else {
-            break;
-        };
-        if page.is_empty() {
-            break;
-        }
-        let next = page
-            .last()
-            .map(|event| (event.commit_cursor, event.transaction_index));
-        let page_len = page.len();
-        events.extend(page);
-        if page_len < PAGE_SIZE || next == after {
-            break;
-        }
-        after = next;
-    }
-    events
-}
-
-pub(super) fn events_for_root_execution_kind(
-    services: &RuntimeServices,
-    execution_id: &str,
-    kind: &str,
-) -> Vec<DurableRuntimeEvent> {
-    const PAGE_SIZE: usize = 128;
-    let mut events = Vec::new();
-    let mut after = None;
-    loop {
-        let Ok(page) = services.event_store().events_for_root_execution_kind(
-            execution_id,
-            kind,
-            after,
-            PAGE_SIZE,
-        ) else {
-            break;
-        };
-        if page.is_empty() {
-            break;
-        }
-        let next = page
-            .last()
-            .map(|event| (event.commit_cursor, event.transaction_index));
-        let page_len = page.len();
-        events.extend(page);
-        if page_len < PAGE_SIZE || next == after {
-            break;
-        }
-        after = next;
-    }
-    events
-}
-
 fn materialize_artifact_activities(activities: &mut BTreeMap<String, ExecutionActivityProjection>) {
     let producers = activities
         .values()
@@ -2287,7 +2278,7 @@ fn outcome_activity_id(execution_id: &str, reference: &str) -> String {
     format!("activity:execution:{execution_id}:outcome:{reference}")
 }
 
-fn merge_activity(
+pub(super) fn merge_activity(
     existing: &mut ExecutionActivityProjection,
     mut update: ExecutionActivityProjection,
 ) {
@@ -2602,6 +2593,7 @@ mod tests {
             }),
         );
         let scope = ExecutionProjectionScope {
+            programs: Vec::new(),
             session_id: Some("session-1".to_string()),
             mission_id: None,
             task_id: Some("task-1".to_string()),
@@ -3179,6 +3171,7 @@ mod tests {
             generation: 1,
         });
         let scope = ExecutionProjectionScope {
+            programs: Vec::new(),
             session_id: Some("session-1".to_string()),
             mission_id: None,
             task_id: Some("task-root-1".to_string()),
@@ -3539,10 +3532,8 @@ mod tests {
             !artifact_visibility("session-ingress-graph:execution:tool-results:2")
                 .contains(&ActivityVisibility::Narrative)
         );
-        assert!(
-            artifact_visibility("workspace://reports/result.md")
-                .contains(&ActivityVisibility::Narrative)
-        );
+        assert!(artifact_visibility("workspace://reports/result.md")
+            .contains(&ActivityVisibility::Narrative));
     }
 
     #[test]

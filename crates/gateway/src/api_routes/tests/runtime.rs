@@ -1842,39 +1842,67 @@ async fn runtime_timeline_resolves_session_terminal_to_canonical_graph_events() 
     let state = test_state_with_store(store);
     let graph_id = "graph:terminal-session";
     let child_graph_id = "graph:terminal-session:team";
-    state
-        .services
-        .runtime_events
-        .append_fixture(runtime::RuntimeEventInput {
-            stream_id: graph_id.to_string(),
-            scope: runtime::RuntimeEventScope::ExecutionGraph,
-            kind: "execution_graph.planned".to_string(),
-            status: Some("running".to_string()),
-            actor: Some("test".to_string()),
-            refs: Vec::new(),
-            payload: serde_json::json!({"graph": {"graph_id": graph_id, "status": "running"}}),
-        })
-        .unwrap();
-    state
-        .services
-        .runtime_events
-        .append_fixture(runtime::RuntimeEventInput {
-            stream_id: child_graph_id.to_string(),
-            scope: runtime::RuntimeEventScope::ExecutionGraph,
-            kind: "execution_graph.planned".to_string(),
-            status: Some("running".to_string()),
-            actor: Some("test".to_string()),
-            refs: Vec::new(),
-            payload: serde_json::json!({
-                "event": "planned",
-                "graph": {
-                    "id": child_graph_id,
-                    "node_statuses": {"researcher": "planned"},
-                    "nodes": [{"kind": "agent_task", "id": "researcher"}]
+    let topology = state.services.selected_storage.as_ref().unwrap();
+    for (stream_id, objective, child) in [
+        (graph_id, "terminal timeline persistence fixture", false),
+        (child_graph_id, "parallel review", true),
+    ] {
+        let mut graph = harness_contract::execution_graph::ExecutionGraph::new(objective)
+            .with_lineage(harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: session_id.into(),
+                turn_id: "timeline-terminal-turn".into(),
+                root_task_id: "timeline-root-task".into(),
+                task_id: if child {
+                    "timeline-child-task"
+                } else {
+                    "timeline-root-task"
                 }
-            }),
-        })
+                .into(),
+                generation: 1,
+            });
+        graph.id = stream_id.into();
+        graph.revision = 1;
+        if child {
+            let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+                harness_contract::execution_graph::ExecutionNodeKind::AgentTask,
+                "agent_task",
+                "timeline-persistence-node",
+            );
+            node.id = "researcher".into();
+            node.idempotency_key = "researcher:planned".into();
+            graph.node_statuses.insert(
+                node.id.clone(),
+                harness_contract::execution_graph::ExecutionNodeStatus::Planned,
+            );
+            graph.nodes.push(node);
+        }
+        let lineage = graph.lineage.as_ref().unwrap();
+        let binding = serde_json::from_value(serde_json::json!({
+            "root_execution_id": graph_id, "session_id": lineage.session_id,
+            "turn_id": lineage.turn_id, "root_task_id": lineage.root_task_id,
+            "task_id": lineage.task_id, "activity_id": stream_id,
+            "revision": 1, "fence": 1, "generation": lineage.generation
+        }))
         .unwrap();
+        let event = crate::current_terminal_fixture::inline_graph_event(
+            runtime::execution_core::graph::ExecutionGraphEvent::Planned { graph },
+            stream_id,
+            &format!("{stream_id}:planned"),
+            binding,
+            vec![],
+        );
+        topology
+            .runtime_event_store
+            .append_transaction(runtime::AppendTransactionRequest {
+                transaction_id: format!("{stream_id}:planned"),
+                expected_streams: vec![runtime::ExpectedStreamRevision {
+                    stream_id: stream_id.into(),
+                    expected_revision: 0,
+                }],
+                events: vec![event],
+            })
+            .unwrap();
+    }
     state
         .services
         .runtime_events
@@ -1893,27 +1921,69 @@ async fn runtime_timeline_resolves_session_terminal_to_canonical_graph_events() 
             }),
         })
         .unwrap();
-    state
-        .services
-        .runtime_events
-        .append_fixture(runtime::RuntimeEventInput {
-            stream_id: "session-terminal:timeline-terminal".to_string(),
-            scope: runtime::RuntimeEventScope::SessionInput,
-            kind: "runtime.session.terminal_requested".to_string(),
-            status: Some("pending_delivery".to_string()),
-            actor: Some("test".to_string()),
-            refs: vec![
-                runtime::RuntimeEventRef {
-                    kind: "execution_graph".to_string(),
-                    id: graph_id.to_string(),
-                },
-                runtime::RuntimeEventRef {
-                    kind: "session".to_string(),
-                    id: session_id.to_string(),
-                },
-            ],
-            payload: serde_json::json!({"session_id": session_id}),
-        })
+    let mut terminal = runtime::SessionTerminalInput {
+        terminal_id: "timeline-terminal".into(),
+        message_id: "timeline-terminal-message".into(),
+        session_id: session_id.into(),
+        execution_id: Some(graph_id.into()),
+        turn_id: Some("timeline-terminal-turn".into()),
+        request_id: Some("timeline-terminal-request".into()),
+        session_generation: Some(1),
+        input_sequence: Some(0),
+        input_claim_owner: Some("timeline-worker".into()),
+        input_claim_token: Some("timeline-token".into()),
+        input_claim_revision: Some(1),
+        controlled_recovery_claim_fingerprints: vec![],
+        payload_ref: String::new(),
+    };
+    let mut payload = crate::current_terminal_fixture::current_payload(
+        &terminal.terminal_id,
+        "timeline-ingress",
+        0,
+        "timeline persistence fixture",
+    );
+    payload["goal_completion"] = serde_json::json!("satisfied");
+    crate::current_terminal_fixture::publish(
+        &topology.runtime_event_store,
+        &topology.artifact_store,
+        &mut terminal,
+        &payload,
+    )
+    .await;
+    topology
+        .runtime_event_store
+        .append_transaction_with_terminal(
+            runtime::AppendTransactionRequest {
+                transaction_id: "timeline-terminal:requested".into(),
+                expected_streams: vec![runtime::ExpectedStreamRevision {
+                    stream_id: "session-terminal:timeline-terminal".into(),
+                    expected_revision: 0,
+                }],
+                events: vec![runtime::RuntimeTransactionEventInput {
+                    event: runtime::RuntimeEventInput {
+                        stream_id: "session-terminal:timeline-terminal".into(),
+                        scope: runtime::RuntimeEventScope::SessionInput,
+                        kind: "runtime.session.terminal_requested".into(),
+                        status: Some("pending_delivery".into()),
+                        actor: Some("test".into()),
+                        refs: vec![
+                            runtime::RuntimeEventRef {
+                                kind: "execution_graph".into(),
+                                id: graph_id.into(),
+                            },
+                            runtime::RuntimeEventRef {
+                                kind: "session".into(),
+                                id: session_id.into(),
+                            },
+                        ],
+                        payload: serde_json::to_value(&terminal).unwrap(),
+                    },
+                    idempotency_key: Some("timeline-terminal:requested".into()),
+                    schema_version: 1,
+                }],
+            },
+            terminal,
+        )
         .unwrap();
 
     let app = api_router(state);
@@ -2081,7 +2151,9 @@ async fn runtime_projection_uses_selected_empty_pg_sources() {
     assert_eq!(json["health_summary"]["degraded_events"], 0);
     assert!(json["health_summary"]["reasons"]
         .as_array()
-        .is_some_and(|reasons| reasons.iter().all(|reason| reason != "session store not available")));
+        .is_some_and(|reasons| reasons
+            .iter()
+            .all(|reason| reason != "session store not available")));
     assert_ne!(json["value_loop"]["status"], "degraded");
     assert_eq!(json["value_loop"]["missing_required_count"], 7);
     assert_eq!(json["agent_value"]["status"], "unproven");

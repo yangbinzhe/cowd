@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppFrameSourceBindingRequestV1",
+  "type": "object",
+  "properties": {
+    "execution_id": {
+      "type": "string"
+    },
+    "frame_binding_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "frame_nonce": {
+      "type": "string"
+    },
+    "lineage_generation": {
+      "type": "string"
+    },
+    "root_task_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "turn_id",
+    "execution_id",
+    "root_task_id",
+    "lineage_generation",
+    "frame_nonce"
+  ]
+}

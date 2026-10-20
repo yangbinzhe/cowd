@@ -292,6 +292,42 @@ impl SessionHistoryReader {
         self.repository.get_latest_snapshot(session_id).await
     }
 
+    pub fn domain_event_count_blocking(&self, session_id: &str) -> Result<usize> {
+        if session_id.trim().is_empty() {
+            return Err(crate::SessionError::InvalidArgument(
+                "domain count requires Session".into(),
+            ));
+        }
+        self.repository.count_domain_events_blocking(session_id)
+    }
+
+    pub fn domain_events_by_kind_blocking(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionDomainEvent>> {
+        if session_id.trim().is_empty() || kind.trim().is_empty() || limit == 0 {
+            return Err(crate::SessionError::InvalidArgument(
+                "domain event query requires Session, kind and nonzero limit".into(),
+            ));
+        }
+        self.repository
+            .get_session_domain_events_by_kind_limited_blocking(
+                session_id,
+                kind,
+                from_sequence,
+                limit.clamp(1, 4_096),
+            )?
+            .into_iter()
+            .map(|event| {
+                SessionDomainEvent::from_session_event(&event)
+                    .map_err(crate::SessionError::Serialization)
+            })
+            .collect()
+    }
+
     pub async fn domain_events_page(
         &self,
         session_id: &str,

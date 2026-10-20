@@ -322,6 +322,7 @@ mod tests {
             schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "execution-a".to_string(),
             agentic_collaboration: Default::default(),
+            terminal_axes: Default::default(),
             revision,
             cursor: revision,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

@@ -1692,8 +1692,10 @@ fn execution_verbs_cannot_borrow_team_objects_from_another_clause() {
     }
     // Only a countable Team binds.
     assert_eq!(
-        understand(&StrategyInput::from_prompt("启动一个团队进行研究，但不要创建文件"))
-            .required_team_count,
+        understand(&StrategyInput::from_prompt(
+            "启动一个团队进行研究，但不要创建文件"
+        ))
+        .required_team_count,
         1
     );
 }
@@ -1745,4 +1747,43 @@ fn domain_matching_respects_token_boundaries() {
         "Review the latest backend and frontend changes and cite the evidence",
     ));
     assert_eq!(understanding.independent_workstreams, 2);
+}
+
+#[test]
+fn negated_action_enumerations_do_not_invent_root_obligations() {
+    for prompt in [
+        "只回答 7 乘以 8 的结果。不要调用工具、创建团队、创建任务或写文件，不要附加解释。",
+        "只回答56。禁止调用工具、创建两个团队、修改或写文件。",
+        "Answer 56. Do not call tools or create teams or write files.",
+        "只回答56。不要生成一个新的文件。",
+    ] {
+        let understanding = understand(&StrategyInput::from_prompt(prompt));
+        assert!(!understanding.requires_write, "{prompt}");
+        assert!(!understanding.requests_multi_agent, "{prompt}");
+        assert_eq!(understanding.required_team_count, 0, "{prompt}");
+    }
+}
+
+#[test]
+fn affirmative_work_survives_unrelated_negative_actions() {
+    for prompt in [
+        "不要创建团队；创建一个说明文件",
+        "不要修改现有文件，生成一个新的 HTML 报告文件",
+        "创建一个说明文件，不要调用工具",
+        "创建一个名为不要忽略的文件",
+        "Do not create teams; create a documentation file",
+    ] {
+        assert!(
+            understand(&StrategyInput::from_prompt(prompt)).requires_write,
+            "{prompt}"
+        );
+    }
+    let explicit =
+        StrategyInput::from_prompt("不要调用工具、创建团队或写文件").with_explicit_write(true);
+    assert!(understand(&explicit).requires_write);
+    let teams = understand(&StrategyInput::from_prompt(
+        "创建两个团队并行审查；不要写文件",
+    ));
+    assert_eq!(teams.required_team_count, 2);
+    assert!(teams.requests_multi_agent);
 }

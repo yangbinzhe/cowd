@@ -428,6 +428,11 @@ impl TuiState {
     /// internal state-change notification. It is intentionally not encoded
     /// as a fake terminal event.
     pub fn apply_event(&mut self, event: CowdEvent) {
+        if matches!(&event, CowdEvent::SessionAuthorizationRevoked { session_id, .. } if session_id == &self.app.shell.session_id)
+        {
+            self.app.terminal_receipt = None;
+            self.app.terminal_receipt_selection = None;
+        }
         let apply_started = std::time::Instant::now();
         if let CowdEvent::AppSurface { event } = event {
             self.session.app_surface_host.apply_event(event);

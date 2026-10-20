@@ -1,7 +1,7 @@
 use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActorKind, TaskAttemptDispatchInput,
-    TaskAttemptFailInput, TaskClaimInput, TaskPublishInput, TaskReleaseInput, TaskReviewInput,
-    TaskReviewDecision, TaskSubmitInput, TaskSupersedeInput, TaskWithdrawInput,
+    TaskAttemptFailInput, TaskClaimInput, TaskPublishInput, TaskReleaseInput, TaskReviewDecision,
+    TaskReviewInput, TaskSubmitInput, TaskSupersedeInput, TaskWithdrawInput,
 };
 
 use crate::agentic::program::{AgenticProgramProjection, AgenticTaskStatus, AgenticTeamLifecycle};
@@ -9,7 +9,12 @@ use crate::agentic::program::{AgenticProgramProjection, AgenticTaskStatus, Agent
 use super::{actor_agent_id, is_durable_evidence_ref};
 
 fn unsupported_evidence_ref(reference: &str) -> (&'static str, String) {
-    ("unsupported_evidence_ref", format!("Evidence must use a durable tool:// or artifact:// observation. Action receipt: IDs are not evidence. Remove the unsupported entry, keep valid observations, and retry this same bound action. Unsupported reference: {reference}"))
+    (
+        "unsupported_evidence_ref",
+        format!(
+            "Evidence must use a durable tool:// or artifact:// observation. Action receipt: IDs are not evidence. Remove the unsupported entry, keep valid observations, and retry this same bound action. Unsupported reference: {reference}"
+        ),
+    )
 }
 
 pub(super) fn validate_transition(
@@ -18,8 +23,33 @@ pub(super) fn validate_transition(
     now_ms: u64,
     graphs: Option<&crate::ExecutionGraphStateStore>,
 ) -> Option<(&'static str, String)> {
+    validate_transition_with_completion_context(projection, envelope, now_ms, graphs, None)
+}
+
+pub(super) fn validate_transition_with_completion_context(
+    projection: &AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
+    now_ms: u64,
+    graphs: Option<&crate::ExecutionGraphStateStore>,
+    completion: Option<&crate::agentic::review_evidence::CompletionAdmissionContext>,
+) -> Option<(&'static str, String)> {
+    validate_transition_with_admission_contexts(
+        projection, envelope, now_ms, graphs, completion, None,
+    )
+}
+
+pub(super) fn validate_transition_with_admission_contexts(
+    projection: &AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
+    now_ms: u64,
+    graphs: Option<&crate::ExecutionGraphStateStore>,
+    completion: Option<&crate::agentic::review_evidence::CompletionAdmissionContext>,
+    retirement: Option<&super::RuntimeRetirementAdmission>,
+) -> Option<(&'static str, String)> {
+    let retiring = retirement.is_some_and(|context| context.covers(projection, envelope));
     if projection.status == crate::agentic::program::AgenticProgramStatus::CompletionRequested
         && !matches!(envelope.action, AgentAction::StateInspect(_))
+        && !retiring
     {
         return Some((
             "objective_verdict_pending",
@@ -35,6 +65,7 @@ pub(super) fn validate_transition(
             | crate::agentic::program::AgenticProgramStatus::Failed
             | crate::agentic::program::AgenticProgramStatus::Cancelled
     ) && !matches!(envelope.action, AgentAction::StateInspect(_))
+        && !retiring
     {
         return Some((
             "program_terminal",
@@ -199,7 +230,7 @@ pub(super) fn validate_transition(
             if !input.content_ref.starts_with("artifact://") {
                 return Some((
                     "content_ref_unresolved",
-                    crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT.to_string(),
+                    crate::agentic::order_contract::ARTIFACT_CONTENT_REF_CONTRACT.to_string(),
                 ));
             }
             None
@@ -283,7 +314,15 @@ pub(super) fn validate_transition(
             // but Runtime records the request as a human-review Partial rather
             // than forcing the model to keep working forever. `apply_locked`
             // has already rejected it while the Program was not quiescent.
-            match crate::agentic::supervision::completion_gap(projection, input) {
+            if completion.is_some_and(|context| !context.matches_envelope(envelope)) {
+                return Some((
+                    "objective_not_verifiable",
+                    "completion_context_envelope_mismatch".into(),
+                ));
+            }
+            match crate::agentic::supervision::completion_gap_with_context(
+                projection, input, completion,
+            ) {
                 Some(gap)
                     if input.blocked
                         && crate::agentic::action_service::agentic_program_is_quiescent(
@@ -965,6 +1004,68 @@ mod reclaim_discipline_tests {
     use super::*;
     use harness_contract::agent_action::{AgentActorBinding, AgentActorKind, TaskClaimInput};
 
+    #[test]
+    fn artifact_content_ref_feedback_is_generic_and_preserves_refusal_662() {
+        use harness_contract::agent_action::ArtifactCommitInput;
+
+        let projection = AgenticProgramProjection::empty("program", "objective");
+        for content_ref in [
+            "message://current",
+            "current_message_block:0",
+            "current_message_block:999999",
+            "file://workspace/result.txt",
+            "",
+        ] {
+            let mut request = envelope("content-ref");
+            request.action = AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: content_ref.to_string(),
+                kind: "result".to_string(),
+                title: "Existing deliverable".to_string(),
+                relates_to: Vec::new(),
+            });
+            let before = projection.clone();
+            let (code, detail) = validate_transition(&projection, &request, 10_000, None)
+                .expect("an unresolved content selector must remain rejected");
+            assert_eq!(code, "content_ref_unresolved");
+            assert_eq!(detail, crate::agentic::order_contract::ARTIFACT_CONTENT_REF_CONTRACT);
+            for required in [
+                "message://current",
+                "non-empty normal Text in this same model response",
+                "current_message_block:<zero-based-index>",
+                "real non-empty Text block",
+                "out-of-range block stays unresolved and rejected",
+                "artifact_publish",
+                "artifact://",
+                "not an implicit file read",
+                "Never select tool parameters or hidden reasoning",
+                "does not require creating a Task report",
+            ] {
+                assert!(detail.contains(required), "{required}: {detail}");
+            }
+            assert!(!detail.contains("For an ordinary Task report"));
+            assert!(!detail.contains("task_submit.deliverable"));
+            assert_eq!(projection, before);
+        }
+    }
+
+    #[test]
+    fn artifact_content_ref_feedback_does_not_change_durable_selector_gate_662() {
+        use harness_contract::agent_action::ArtifactCommitInput;
+
+        let projection = AgenticProgramProjection::empty("program", "objective");
+        let mut request = envelope("content-ref");
+        request.action = AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: "artifact://retained-content".to_string(),
+            kind: "result".to_string(),
+            title: "Existing deliverable".to_string(),
+            relates_to: Vec::new(),
+        });
+        assert!(validate_transition(&projection, &request, 10_000, None).is_none());
+        assert!(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT
+            .starts_with("For an ordinary Task report"));
+    }
+
+
     fn envelope(execution_id: &str) -> AgentActionEnvelope {
         AgentActionEnvelope {
             action_id: format!("claim:{}", execution_id),
@@ -1057,6 +1158,81 @@ mod reclaim_discipline_tests {
         projection
     }
     #[test]
+    fn runtime_retirement_requires_owner_admission_not_a_supervisor_label() {
+        use crate::agentic::program::{AgenticProgramStatus, AgenticTaskRetirement};
+        let mut request = envelope("exec-1");
+        request.action = AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+            task_ref: "task".into(),
+            execution_id: "exec-1".into(),
+            mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+            reason: "physical callback".into(),
+            retryable: true,
+        });
+        let mut projection = projection_with_streak(0);
+        let task = projection.tasks.get_mut("task").unwrap();
+        task.status = AgenticTaskStatus::CancelRequested;
+        task.pending_retirement = Some(AgenticTaskRetirement::Withdrawn);
+        for status in [
+            AgenticProgramStatus::CompletionRequested,
+            AgenticProgramStatus::Verified,
+        ] {
+            projection.status = status;
+            for kind in [
+                AgentActorKind::Root,
+                AgentActorKind::Agent,
+                AgentActorKind::Supervisor,
+            ] {
+                request.actor.kind = kind;
+                request.actor.actor_id = "runtime.program-supervisor".into();
+                assert!(validate_transition(&projection, &request, 10_000, None).is_some());
+                assert!(validate_transition_with_admission_contexts(
+                    &projection,
+                    &request,
+                    10_000,
+                    None,
+                    None,
+                    None
+                )
+                .is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_retirement_admission_is_exact_request_and_program_only() {
+        let mut request = envelope("exec-1");
+        request.actor.kind = AgentActorKind::Supervisor;
+        request.actor.actor_id = "runtime.program-supervisor".into();
+        request.actor.agent_id = None;
+        request.actor.team_id = None;
+        request.action = AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+            task_ref: "task".into(),
+            execution_id: "exec-1".into(),
+            mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+            reason: "physical callback".into(),
+            retryable: true,
+        });
+        let mut projection = projection_with_streak(0);
+        let context = super::super::RuntimeRetirementAdmission {
+            request_digest: crate::agentic::review_evidence::proof_value_digest(&request),
+            program_id: projection.program_id.clone(),
+            program_revision: projection.revision,
+            sources: Vec::new(),
+        };
+        assert!(context.covers(&projection, &request));
+        let mut foreign = request.clone();
+        foreign.actor.execution_id = Some("other-physical-graph".into());
+        assert!(!context.covers(&projection, &foreign));
+        foreign = request.clone();
+        foreign.action = AgentAction::TaskClaim(claim_input());
+        assert!(!context.covers(&projection, &foreign));
+        projection.revision += 1;
+        assert!(!context.covers(&projection, &request));
+        projection.revision -= 1;
+        projection.program_id = "foreign".into();
+        assert!(!context.covers(&projection, &request));
+    }
+    #[test]
     fn a_reclaim_without_progress_is_refused_past_the_bound() {
         let projection = projection_with_streak(3);
         let refusal = validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000);
@@ -1100,12 +1276,16 @@ mod reclaim_discipline_tests {
         root.actor.actor_id = "root:session".to_string();
         root.actor.agent_id = None;
         root.actor.team_id = None;
-        let refusal = validate_task_claim(&projection_with_streak(0), &root, &claim_input(), 10_000);
+        let refusal =
+            validate_task_claim(&projection_with_streak(0), &root, &claim_input(), 10_000);
         let (code, detail) = refusal.expect("a root claim must be refused");
         assert_eq!(code, "actor_cannot_execute_task");
         assert!(detail.contains("root:session"), "who was refused: {detail}");
         assert!(detail.contains("Root"), "what kind of actor: {detail}");
-        assert!(detail.contains("team"), "which Team owns the Task: {detail}");
+        assert!(
+            detail.contains("team"),
+            "which Team owns the Task: {detail}"
+        );
         assert!(
             detail.contains("agent_invite"),
             "the reachable next step: {detail}"

@@ -1117,7 +1117,7 @@ fn classifier_rejections_are_auditable_terminal_inputs_and_never_runnable() {
         assert_eq!(stored.terminal_at_ms, Some(100));
         assert_eq!(store.get_message_count(&session_id).unwrap(), 1);
         assert!(store
-            .claim_session_runtime_outbox("worker", 100, 1_000, 10)
+            .claim_session_runtime_outbox("worker", 100, 1_000, 10, &[])
             .unwrap()
             .is_empty());
         assert!(store.active_session_runtime_outbox(10).unwrap().is_empty());
@@ -1213,7 +1213,7 @@ fn claim_returns_only_each_session_runnable_head() {
     }
 
     let first = store
-        .claim_session_runtime_outbox("worker", 200, 1_000, 10)
+        .claim_session_runtime_outbox("worker", 200, 1_000, 10, &[])
         .unwrap();
     assert_eq!(first.len(), 2);
     assert_eq!(
@@ -1224,7 +1224,7 @@ fn claim_returns_only_each_session_runnable_head() {
         std::collections::BTreeSet::from(["input-a-1", "input-b-1"])
     );
     assert!(store
-        .claim_session_runtime_outbox("other", 201, 1_000, 10)
+        .claim_session_runtime_outbox("other", 201, 1_000, 10, &[])
         .unwrap()
         .is_empty());
 
@@ -1256,10 +1256,249 @@ fn claim_returns_only_each_session_runnable_head() {
         )
         .unwrap();
     let next = store
-        .claim_session_runtime_outbox("worker", 204, 1_000, 10)
+        .claim_session_runtime_outbox("worker", 204, 1_000, 10, &[])
         .unwrap();
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].input_id, "input-a-2");
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn claim_excludes_earliest_failed_session_before_limit_without_mutation() {
+    let (fixture, store) = make_store();
+    let excluded_session_ids = vec!["session-failed-earliest".to_string()];
+    for (session_id, input_suffix, created_at_ms) in [
+        ("session-failed-earliest", "failed-earliest", 100),
+        ("session-healthy-later", "healthy-later", 101),
+    ] {
+        store.create_session(&make_record(session_id)).unwrap();
+        let queued = store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                Some(r#"[{"type":"text","text":"queued"}]"#),
+                created_at_ms,
+                &ingress_request(
+                    input_suffix,
+                    1,
+                    InputRoutingDecision::StartNewTurn,
+                    None,
+                    created_at_ms,
+                ),
+            )
+            .unwrap();
+        assert_eq!(queued.status, SessionRuntimeInputStatus::Queued);
+        assert_eq!(queued.next_attempt_at_ms, created_at_ms);
+    }
+    let failed_before = runtime_claim_snapshot(&fixture, &excluded_session_ids);
+    assert_eq!(failed_before["outbox"].as_array().unwrap().len(), 1);
+    assert_eq!(failed_before["outbox"][0]["status"], "queued");
+    assert!(failed_before["outbox"][0]["claim_token"].is_null());
+    assert!(!failed_before["history"].as_array().unwrap().is_empty());
+
+    let claimed = store
+        .claim_session_runtime_outbox("healthy-worker", 200, 1_000, 1, &excluded_session_ids)
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].session_id, "session-healthy-later");
+    assert_eq!(claimed[0].request_id, "request-healthy-later");
+    assert_eq!(claimed[0].status, SessionRuntimeInputStatus::Claimed);
+    assert_eq!(claimed[0].claim_owner.as_deref(), Some("healthy-worker"));
+    assert!(claimed[0].claim_token.is_some());
+    assert_eq!(claimed[0].attempts, 1);
+    assert_eq!(claimed[0].claim_expires_at_ms, Some(1_200));
+    assert_eq!(
+        runtime_claim_snapshot(&fixture, &excluded_session_ids),
+        failed_before
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn claim_with_all_sessions_excluded_preserves_full_rows_and_history() {
+    let (fixture, store) = make_store();
+    let excluded_session_ids = vec![
+        "session-failed-first".to_string(),
+        "session-failed-second".to_string(),
+    ];
+    for (session_id, input_suffix, created_at_ms) in [
+        ("session-failed-first", "failed-first", 100),
+        ("session-failed-second", "failed-second", 101),
+    ] {
+        store.create_session(&make_record(session_id)).unwrap();
+        let queued = store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                Some(r#"[{"type":"text","text":"queued"}]"#),
+                created_at_ms,
+                &ingress_request(
+                    input_suffix,
+                    1,
+                    InputRoutingDecision::StartNewTurn,
+                    None,
+                    created_at_ms,
+                ),
+            )
+            .unwrap();
+        assert_eq!(queued.status, SessionRuntimeInputStatus::Queued);
+        assert_eq!(queued.next_attempt_at_ms, created_at_ms);
+    }
+    let before = runtime_claim_snapshot(&fixture, &excluded_session_ids);
+    assert_eq!(before["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(before["outbox"].as_array().unwrap().len(), 2);
+    assert!(!before["history"].as_array().unwrap().is_empty());
+
+    for (claim_at_ms, limit) in [(200, 1), (201, 10)] {
+        assert!(store
+            .claim_session_runtime_outbox(
+                "excluded-worker",
+                claim_at_ms,
+                1_000,
+                limit,
+                &excluded_session_ids,
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            runtime_claim_snapshot(&fixture, &excluded_session_ids),
+            before
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn claim_excludes_expired_claimed_session_without_reclaim_or_renewal() {
+    assert_excluded_expired_claim_is_unchanged(SessionRuntimeInputStatus::Claimed);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn claim_excludes_expired_running_session_without_reclaim_or_renewal() {
+    assert_excluded_expired_claim_is_unchanged(SessionRuntimeInputStatus::Running);
+}
+
+fn assert_excluded_expired_claim_is_unchanged(expected_status: SessionRuntimeInputStatus) {
+    let (fixture, store) = make_store();
+    let excluded_session_ids = vec!["session-failed-expired".to_string()];
+    for (session_id, input_suffix, created_at_ms) in [
+        ("session-failed-expired", "failed-expired", 100),
+        ("session-healthy-unclaimed", "healthy-unclaimed", 101),
+    ] {
+        store.create_session(&make_record(session_id)).unwrap();
+        store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                Some(r#"[{"type":"text","text":"queued"}]"#),
+                created_at_ms,
+                &ingress_request(
+                    input_suffix,
+                    1,
+                    InputRoutingDecision::StartNewTurn,
+                    None,
+                    created_at_ms,
+                ),
+            )
+            .unwrap();
+    }
+    let mut initial_claims = store
+        .claim_session_runtime_outbox("original-worker", 100, 50, 1, &[])
+        .unwrap();
+    assert_eq!(initial_claims.len(), 1);
+    let claimed = initial_claims.remove(0);
+    assert_eq!(claimed.request_id, "request-failed-expired");
+    let claim_token = claimed.claim_token.clone().unwrap();
+    let expired = if expected_status == SessionRuntimeInputStatus::Running {
+        store
+            .mark_session_runtime_outbox_running(
+                &claimed.request_id,
+                "original-worker",
+                claimed.session_generation,
+                &claim_token,
+                claimed.revision,
+                110,
+            )
+            .unwrap()
+    } else {
+        claimed
+    };
+    assert_eq!(expired.status, expected_status);
+    assert_eq!(expired.claim_expires_at_ms, Some(150));
+    let before = runtime_claim_snapshot(&fixture, &excluded_session_ids);
+    assert_eq!(before["outbox"].as_array().unwrap().len(), 1);
+    assert_eq!(before["outbox"][0]["status"], expected_status.as_str());
+    assert_eq!(before["outbox"][0]["claim_token"], claim_token.as_str());
+    assert!(!before["history"].as_array().unwrap().is_empty());
+
+    let healthy_claims = store
+        .claim_session_runtime_outbox("replacement-worker", 150, 50, 1, &excluded_session_ids)
+        .unwrap();
+    assert_eq!(healthy_claims.len(), 1);
+    assert_eq!(healthy_claims[0].session_id, "session-healthy-unclaimed");
+    assert_eq!(healthy_claims[0].request_id, "request-healthy-unclaimed");
+    assert_eq!(
+        runtime_claim_snapshot(&fixture, &excluded_session_ids),
+        before
+    );
+    assert!(store
+        .claim_session_runtime_outbox("replacement-worker", 151, 50, 10, &excluded_session_ids)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        runtime_claim_snapshot(&fixture, &excluded_session_ids),
+        before
+    );
+    assert!(store
+        .renew_session_runtime_outbox_lease(
+            &expired.request_id,
+            "original-worker",
+            expired.session_generation,
+            &claim_token,
+            expired.revision,
+            151,
+            1_000,
+        )
+        .is_err());
+    assert_eq!(
+        runtime_claim_snapshot(&fixture, &excluded_session_ids),
+        before
+    );
+}
+
+fn runtime_claim_snapshot(
+    fixture: &PostgresTestScope,
+    session_ids: &[String],
+) -> serde_json::Value {
+    let executor = fixture.reconnect();
+    let mut connection = executor.checkout_critical().unwrap();
+    let snapshot = connection
+        .query_one(
+            "SELECT jsonb_build_object(
+                'sessions', COALESCE((
+                    SELECT jsonb_agg(to_jsonb(session_record) ORDER BY session_record.session_id)
+                    FROM session_records session_record
+                    WHERE session_record.session_id = ANY($1::text[])
+                ), '[]'::jsonb),
+                'outbox', COALESCE((
+                    SELECT jsonb_agg(to_jsonb(outbox) ORDER BY outbox.request_id)
+                    FROM session_runtime_outbox outbox
+                    WHERE outbox.session_id = ANY($1::text[])
+                ), '[]'::jsonb),
+                'history', COALESCE((
+                    SELECT jsonb_agg(to_jsonb(history) ORDER BY history.history_id)
+                    FROM session_runtime_outbox_history history
+                    JOIN session_runtime_outbox outbox ON outbox.request_id = history.request_id
+                    WHERE outbox.session_id = ANY($1::text[])
+                ), '[]'::jsonb)
+            )",
+            &[&session_ids],
+        )
+        .unwrap()
+        .get(0);
+    drop(connection);
+    snapshot
 }
 
 #[test]
@@ -1300,7 +1539,7 @@ fn input_id_drives_reclassify_cancel_and_terminal_outcomes() {
     assert_eq!(reclassified.status, SessionRuntimeInputStatus::Reclassified);
     assert_eq!(reclassified.target_turn_id.as_deref(), Some("turn-active"));
     let claimed = store
-        .claim_session_runtime_outbox("worker", 102, 1_000, 1)
+        .claim_session_runtime_outbox("worker", 102, 1_000, 1, &[])
         .unwrap()
         .remove(0);
     let token = claimed.claim_token.clone().unwrap();
@@ -1372,7 +1611,7 @@ fn input_id_drives_reclassify_cancel_and_terminal_outcomes() {
         )
         .unwrap();
     let claimed = store
-        .claim_session_runtime_outbox("worker", 108, 1_000, 1)
+        .claim_session_runtime_outbox("worker", 108, 1_000, 1, &[])
         .unwrap()
         .remove(0);
     let token = claimed.claim_token.clone().unwrap();
@@ -1459,7 +1698,7 @@ fn attached_supplement_can_roll_forward_as_a_new_turn() {
     assert_eq!(rolled.target_turn_id, None);
     assert_eq!(
         store
-            .claim_session_runtime_outbox("worker", 103, 1_000, 1)
+            .claim_session_runtime_outbox("worker", 103, 1_000, 1, &[])
             .unwrap()
             .remove(0)
             .input_id,
@@ -1501,7 +1740,7 @@ fn generation_advance_closes_admission_and_fences_stale_claims() {
         )
         .unwrap();
     let claimed = store
-        .claim_session_runtime_outbox("worker", 101, 1_000, 1)
+        .claim_session_runtime_outbox("worker", 101, 1_000, 1, &[])
         .unwrap()
         .remove(0);
     let token = claimed.claim_token.clone().unwrap();
@@ -1593,7 +1832,7 @@ fn claimed_target_loss_reclassifies_and_requeues_under_owner_fence() {
         )
         .unwrap();
     let claimed = store
-        .claim_session_runtime_outbox("worker", 101, 1_000, 1)
+        .claim_session_runtime_outbox("worker", 101, 1_000, 1, &[])
         .unwrap()
         .remove(0);
     let token = claimed.claim_token.clone().unwrap();
@@ -1641,7 +1880,7 @@ fn claimed_target_loss_reclassifies_and_requeues_under_owner_fence() {
         )
         .is_err());
     let reclaimed = store
-        .claim_session_runtime_outbox("worker-next", 103, 1_000, 1)
+        .claim_session_runtime_outbox("worker-next", 103, 1_000, 1, &[])
         .unwrap()
         .remove(0);
     assert_eq!(reclaimed.input_id, claimed.input_id);
@@ -1842,16 +2081,16 @@ fn outbox_claim_lease_retry_block_manual_retry_and_ack_are_guarded() {
         .unwrap();
 
     let first = store
-        .claim_session_runtime_outbox("worker-a", 100, 50, 10)
+        .claim_session_runtime_outbox("worker-a", 100, 50, 10, &[])
         .unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].attempts, 1);
     assert!(store
-        .claim_session_runtime_outbox("worker-b", 149, 50, 10)
+        .claim_session_runtime_outbox("worker-b", 149, 50, 10, &[])
         .unwrap()
         .is_empty());
     let reclaimed = store
-        .claim_session_runtime_outbox("worker-b", 150, 50, 10)
+        .claim_session_runtime_outbox("worker-b", 150, 50, 10, &[])
         .unwrap();
     assert_eq!(reclaimed[0].attempts, 2);
     let reclaimed_token = reclaimed[0].claim_token.clone().unwrap();
@@ -1872,11 +2111,11 @@ fn outbox_claim_lease_retry_block_manual_retry_and_ack_are_guarded() {
         .unwrap();
     assert_eq!(retry.status, SessionRuntimeInputStatus::Queued);
     assert!(store
-        .claim_session_runtime_outbox("worker-c", 249, 50, 10)
+        .claim_session_runtime_outbox("worker-c", 249, 50, 10, &[])
         .unwrap()
         .is_empty());
     let final_claim = store
-        .claim_session_runtime_outbox("worker-c", 250, 50, 10)
+        .claim_session_runtime_outbox("worker-c", 250, 50, 10, &[])
         .unwrap();
     assert_eq!(final_claim[0].attempts, 3);
     let final_token = final_claim[0].claim_token.clone().unwrap();
@@ -1909,7 +2148,7 @@ fn outbox_claim_lease_retry_block_manual_retry_and_ack_are_guarded() {
     assert_eq!(pending.status, SessionRuntimeInputStatus::Queued);
     assert_eq!(pending.attempts, 3);
     let claimed = store
-        .claim_session_runtime_outbox("worker-d", 300, 50, 10)
+        .claim_session_runtime_outbox("worker-d", 300, 50, 10, &[])
         .unwrap()
         .remove(0);
     let token = claimed.claim_token.clone().unwrap();
@@ -1950,7 +2189,7 @@ fn outbox_lease_renewal_rejects_stale_ack_and_prevents_reclaim() {
         .append_message_with_runtime_outbox(&outbox_message("s-renew"), &outbox_request())
         .unwrap();
     let claimed = store
-        .claim_session_runtime_outbox("worker-a", 100, 50, 1)
+        .claim_session_runtime_outbox("worker-a", 100, 50, 1, &[])
         .unwrap()
         .remove(0);
     let token = claimed.claim_token.clone().unwrap();
@@ -1966,7 +2205,7 @@ fn outbox_lease_renewal_rejects_stale_ack_and_prevents_reclaim() {
         )
         .unwrap();
     assert!(store
-        .claim_session_runtime_outbox("worker-b", 151, 50, 1)
+        .claim_session_runtime_outbox("worker-b", 151, 50, 1, &[])
         .unwrap()
         .is_empty());
     assert!(store
@@ -2055,7 +2294,7 @@ fn recovery_manifest_tracks_transcript_outbox_and_external_signals() {
     assert!(pending.in_flight_turn);
 
     let claimed = store
-        .claim_session_runtime_outbox("worker", 100, 1_000, 1)
+        .claim_session_runtime_outbox("worker", 100, 1_000, 1, &[])
         .unwrap()
         .remove(0);
     let token = claimed.claim_token.clone().unwrap();

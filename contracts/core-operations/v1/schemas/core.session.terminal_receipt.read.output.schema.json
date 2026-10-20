@@ -1,0 +1,244 @@
+{
+  "$defs": {
+    "ReceiptCursor": {
+      "type": "string"
+    },
+    "SessionMessageAck": {
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "content_digest": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "received_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runtime_commit_cursor": {
+          "$ref": "#/$defs/ReceiptCursor"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "message_id",
+        "client_id",
+        "runtime_commit_cursor",
+        "content_digest",
+        "received_at_ms"
+      ],
+      "type": "object"
+    },
+    "SessionMessageReceiptUnavailableReason": {
+      "enum": [
+        "unbound_or_invalidated",
+        "payload_too_large",
+        "invalid_public_payload",
+        "binding_mismatch",
+        "ambiguous_terminal_input",
+        "terminal_input_mismatch"
+      ],
+      "type": "string"
+    },
+    "SessionPublicPayloadKind": {
+      "enum": [
+        "session-public-v1"
+      ],
+      "type": "string"
+    },
+    "SessionReceiptOutboxObservation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "const": "runtime_outbox_unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "execution_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "materialized_at_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "runtime_commit_cursor": {
+              "$ref": "#/$defs/ReceiptCursor"
+            },
+            "source": {
+              "const": "runtime_outbox",
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "terminal_id",
+            "revision",
+            "status",
+            "runtime_commit_cursor",
+            "turn_id",
+            "request_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "session_snapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "input_sequence": {
+          "type": "string"
+        },
+        "observed_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "presence_revision": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_generation": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id",
+        "turn_id",
+        "session_generation",
+        "input_sequence",
+        "presence_revision",
+        "observed_at_ms"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/SessionMessageReceiptUnavailableReason"
+        },
+        "status": {
+          "const": "unavailable",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "reason"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "content_digest": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "message_sequence": {
+          "type": "string"
+        },
+        "outbox_observation": {
+          "$ref": "#/$defs/SessionReceiptOutboxObservation"
+        },
+        "payload_json": {
+          "type": "string"
+        },
+        "payload_kind": {
+          "$ref": "#/$defs/SessionPublicPayloadKind"
+        },
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionMessageAck"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime_commit_cursor": {
+          "$ref": "#/$defs/ReceiptCursor"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "session_source": {
+          "$ref": "#/$defs/session_snapshot"
+        },
+        "status": {
+          "const": "available",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "payload_kind",
+        "payload_json",
+        "session_id",
+        "message_id",
+        "client_id",
+        "message_sequence",
+        "runtime_commit_cursor",
+        "content_digest",
+        "session_source",
+        "outbox_observation"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "SessionMessageReceiptContext"
+}

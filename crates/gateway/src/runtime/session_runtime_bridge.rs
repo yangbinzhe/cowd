@@ -28,7 +28,7 @@ use crate::{
 mod terminal_codec;
 use terminal_codec::annotate_terminal_tool_instances;
 #[cfg(test)]
-use terminal_codec::decode_terminal_payload;
+pub(crate) use terminal_codec::decode_terminal_payload;
 pub(crate) use terminal_codec::{
     load_terminal_payload, DecodedTerminalPayload, DecodedTerminalTranscriptMessage,
 };
@@ -47,6 +47,336 @@ const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const SUPERVISOR_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const CROSS_PROCESS_RECONCILIATION_FALLBACK: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+pub(crate) mod terminal_delivery_faults {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+
+    use tokio::sync::oneshot;
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub(crate) enum Point {
+        BeforeSessionCommit,
+        AfterSessionCommit,
+        BeforePublish,
+        BeforeAck,
+        AfterAck,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Release {
+        Continue,
+        ResponseLost,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Hit {
+        pub terminal_id: String,
+        pub worker_id: String,
+        pub revision: u64,
+        pub point: Point,
+    }
+
+    struct Pending {
+        registration: uuid::Uuid,
+        worker_id: String,
+        revision: u64,
+        hit: oneshot::Sender<Hit>,
+        release: oneshot::Receiver<Release>,
+    }
+
+    type Key = (String, Point);
+
+    struct NotificationSource {
+        receiver: tokio::sync::watch::Receiver<u64>,
+        witness: NotificationWitness,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct NotificationWitness {
+        pub safety_hits: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        pub idle_hits: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    fn notification_sources() -> &'static Mutex<HashMap<usize, NotificationSource>> {
+        static SOURCES: OnceLock<Mutex<HashMap<usize, NotificationSource>>> = OnceLock::new();
+        SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn use_notifications(
+        artifacts: &runtime::ArtifactStore,
+        receiver: tokio::sync::watch::Receiver<u64>,
+    ) -> Result<NotificationWitness, String> {
+        let mut sources = notification_sources()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = artifacts as *const runtime::ArtifactStore as usize;
+        if sources.contains_key(&key) {
+            return Err("duplicate delivery notification source".into());
+        }
+        let witness = NotificationWitness {
+            safety_hits: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            idle_hits: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        sources.insert(
+            key,
+            NotificationSource {
+                receiver,
+                witness: witness.clone(),
+            },
+        );
+        Ok(witness)
+    }
+
+    pub(crate) fn take_notifications(
+        artifacts: &runtime::ArtifactStore,
+    ) -> Option<(tokio::sync::watch::Receiver<u64>, NotificationWitness)> {
+        notification_sources()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(artifacts as *const runtime::ArtifactStore as usize))
+            .map(|source| (source.receiver, source.witness))
+    }
+
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub(crate) struct RequestIdentity {
+        pub session_id: String,
+        pub request_id: String,
+        pub turn_id: String,
+        pub generation: u64,
+        pub sequence: u64,
+        pub terminal_id: String,
+        pub execution_id: String,
+    }
+
+    impl RequestIdentity {
+        fn matches(&self, record: &runtime::RuntimeSessionOutboxRecord) -> bool {
+            record.session_id == self.session_id
+                && record.request_id.as_deref() == Some(self.request_id.as_str())
+                && record.turn_id.as_deref() == Some(self.turn_id.as_str())
+                && record.session_generation == Some(self.generation)
+                && record.input_sequence == Some(self.sequence)
+                && record.terminal_id == self.terminal_id
+                && record.execution_id.as_deref() == Some(self.execution_id.as_str())
+        }
+    }
+
+    struct PendingObservation {
+        registration: uuid::Uuid,
+        observed: oneshot::Sender<(runtime::RuntimeSessionOutboxRecord, String)>,
+        bound: oneshot::Receiver<()>,
+    }
+
+    fn observations() -> &'static Mutex<HashMap<RequestIdentity, PendingObservation>> {
+        static OBSERVATIONS: OnceLock<Mutex<HashMap<RequestIdentity, PendingObservation>>> =
+            OnceLock::new();
+        OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) struct Observer {
+        identity: RequestIdentity,
+        registration: uuid::Uuid,
+        pub observed: oneshot::Receiver<(runtime::RuntimeSessionOutboxRecord, String)>,
+        bound: Option<oneshot::Sender<()>>,
+    }
+
+    impl Observer {
+        pub(crate) fn bind(&mut self) -> Result<(), String> {
+            self.bound
+                .take()
+                .ok_or("delivery observer already bound")?
+                .send(())
+                .map_err(|_| "delivery observer no longer waiting".to_string())
+        }
+    }
+
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            let mut entries = observations()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if entries
+                .get(&self.identity)
+                .is_some_and(|entry| entry.registration == self.registration)
+            {
+                entries.remove(&self.identity);
+            }
+        }
+    }
+
+    pub(crate) fn observe(identity: RequestIdentity) -> Result<Observer, String> {
+        if [
+            &identity.session_id,
+            &identity.request_id,
+            &identity.turn_id,
+            &identity.terminal_id,
+            &identity.execution_id,
+        ]
+        .iter()
+        .any(|value| value.is_empty())
+        {
+            return Err("delivery observer requires complete request identity".into());
+        }
+        let mut entries = observations()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if entries.contains_key(&identity) {
+            return Err("duplicate delivery observer".into());
+        }
+        let registration = uuid::Uuid::new_v4();
+        let (observed_sender, observed) = oneshot::channel();
+        let (bound, bound_receiver) = oneshot::channel();
+        entries.insert(
+            identity.clone(),
+            PendingObservation {
+                registration,
+                observed: observed_sender,
+                bound: bound_receiver,
+            },
+        );
+        Ok(Observer {
+            identity,
+            registration,
+            observed,
+            bound: Some(bound),
+        })
+    }
+
+    pub(crate) async fn observe_claim(record: &runtime::RuntimeSessionOutboxRecord, worker: &str) {
+        let entry = {
+            let mut entries = observations()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let identity = entries
+                .keys()
+                .find(|identity| identity.matches(record))
+                .cloned();
+            identity.and_then(|identity| entries.remove(&identity))
+        };
+        if let Some(entry) = entry {
+            if entry
+                .observed
+                .send((record.clone(), worker.to_string()))
+                .is_ok()
+            {
+                let _ = entry.bound.await;
+            }
+        }
+    }
+
+    fn pending() -> &'static Mutex<HashMap<Key, Pending>> {
+        static PENDING: OnceLock<Mutex<HashMap<Key, Pending>>> = OnceLock::new();
+        PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) struct Barrier {
+        key: Key,
+        registration: uuid::Uuid,
+        pub hit: oneshot::Receiver<Hit>,
+        release: Option<oneshot::Sender<Release>>,
+    }
+
+    impl Barrier {
+        pub(crate) fn release(&mut self, command: Release) -> Result<(), String> {
+            self.release
+                .take()
+                .ok_or("delivery fault already released")?
+                .send(command)
+                .map_err(|_| "delivery fault no longer waiting".to_string())
+        }
+    }
+
+    impl Drop for Barrier {
+        fn drop(&mut self) {
+            let mut entries = pending().lock().unwrap_or_else(|error| error.into_inner());
+            if entries
+                .get(&self.key)
+                .is_some_and(|entry| entry.registration == self.registration)
+            {
+                entries.remove(&self.key);
+            }
+        }
+    }
+
+    pub(crate) fn register(
+        terminal_id: &str,
+        worker_id: &str,
+        revision: u64,
+        point: Point,
+    ) -> Result<Barrier, String> {
+        if terminal_id.is_empty() || worker_id.is_empty() {
+            return Err("delivery fault requires exact identities".to_string());
+        }
+        let key = (terminal_id.to_string(), point);
+        let registration = uuid::Uuid::new_v4();
+        let (hit_sender, hit) = oneshot::channel();
+        let (release, release_receiver) = oneshot::channel();
+        let mut entries = pending().lock().unwrap_or_else(|error| error.into_inner());
+        if entries.contains_key(&key) {
+            return Err("duplicate delivery fault registration".to_string());
+        }
+        entries.insert(
+            key.clone(),
+            Pending {
+                registration,
+                worker_id: worker_id.to_string(),
+                revision,
+                hit: hit_sender,
+                release: release_receiver,
+            },
+        );
+        Ok(Barrier {
+            key,
+            registration,
+            hit,
+            release: Some(release),
+        })
+    }
+
+    pub(crate) async fn checkpoint(
+        terminal_id: &str,
+        worker_id: &str,
+        revision: u64,
+        point: Point,
+    ) -> Result<(), String> {
+        let key = (terminal_id.to_string(), point);
+        let entry = {
+            let mut entries = pending().lock().unwrap_or_else(|error| error.into_inner());
+            if entries
+                .get(&key)
+                .is_some_and(|entry| entry.worker_id == worker_id && entry.revision == revision)
+            {
+                entries.remove(&key)
+            } else {
+                None
+            }
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        if entry
+            .hit
+            .send(Hit {
+                terminal_id: terminal_id.to_string(),
+                worker_id: worker_id.to_string(),
+                revision,
+                point,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+        match entry.release.await {
+            Ok(Release::ResponseLost) => Err(format!(
+                "injected terminal delivery response loss at {point:?}"
+            )),
+            Ok(Release::Continue) | Err(_) => Ok(()),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct GatewaySessionIngressExecutor {
@@ -2147,6 +2477,12 @@ async fn run_delivery_worker(
         return Err(message);
     }
     let mut commits = event_store.subscribe_commits();
+    #[cfg(test)]
+    let notification_witness =
+        terminal_delivery_faults::take_notifications(&artifacts).map(|(source, witness)| {
+            commits = source;
+            witness
+        });
     reporter.success(None);
     signal_worker_ready(ready)?;
     loop {
@@ -2200,10 +2536,21 @@ async fn run_delivery_worker(
         if had_work {
             continue;
         }
+        #[cfg(test)]
+        if let Some(witness) = &notification_witness {
+            witness
+                .idle_hits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         tokio::select! {
             _ = shutdown.changed() => {},
             _ = commits.changed() => {},
-            () = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {},
+            () = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {
+                #[cfg(test)]
+                if let Some(witness) = &notification_witness {
+                    witness.safety_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
         }
     }
     Ok(())
@@ -2218,8 +2565,46 @@ async fn deliver_terminal(
     worker_id: &str,
     record: runtime::RuntimeSessionOutboxRecord,
 ) -> Result<bool, String> {
+    #[cfg(test)]
+    terminal_delivery_faults::observe_claim(&record, worker_id).await;
     let outcome = match load_terminal_payload(artifacts, &record).await {
         Ok(payload) => {
+            let artifact = match runtime::decode_session_terminal_artifact_ref(&record.payload_ref)
+            {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    return record_delivery_failure(
+                        event_store,
+                        worker_id,
+                        &record,
+                        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                        error,
+                    )
+                    .await
+                }
+            };
+            let retained_artifacts = (*artifacts).clone();
+            let pin_owner = record.terminal_id.clone();
+            let retained = tokio::task::spawn_blocking(move || {
+                retained_artifacts.pin(
+                    &artifact,
+                    &pin_owner,
+                    runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            if let Err(error) = retained {
+                return record_delivery_failure(
+                    event_store,
+                    worker_id,
+                    &record,
+                    runtime::RuntimeSessionOutboxFailureClass::Retryable,
+                    format!("retain committed terminal artifact: {error}"),
+                )
+                .await;
+            }
             let terminal_status = live_terminal_status(payload.goal_completion);
             let terminal_presentation = payload.terminal_presentation.clone();
             let mut transcript = payload.transcript.unwrap_or_else(|| {
@@ -2410,6 +2795,14 @@ async fn deliver_terminal(
                 }
                 _ => None,
             };
+            #[cfg(test)]
+            terminal_delivery_faults::checkpoint(
+                &record.terminal_id,
+                worker_id,
+                record.revision,
+                terminal_delivery_faults::Point::BeforeSessionCommit,
+            )
+            .await?;
             let write = match terminal_commit {
                 Ok(commit) => session_service
                     .commit_terminal_transcript(&commit)
@@ -2419,6 +2812,14 @@ async fn deliver_terminal(
             };
             match write {
                 Ok((messages, inserted)) => {
+                    #[cfg(test)]
+                    terminal_delivery_faults::checkpoint(
+                        &record.terminal_id,
+                        worker_id,
+                        record.revision,
+                        terminal_delivery_faults::Point::AfterSessionCommit,
+                    )
+                    .await?;
                     if let Some((services, execution_id, generation)) = live_claim {
                         match services.finalize_live_terminal_fence(
                             execution_id,
@@ -2516,6 +2917,14 @@ async fn deliver_terminal(
     };
     match outcome {
         Ok((text, token_usage_json, terminal_presentation, message, inserted)) => {
+            #[cfg(test)]
+            terminal_delivery_faults::checkpoint(
+                &record.terminal_id,
+                worker_id,
+                record.revision,
+                terminal_delivery_faults::Point::BeforePublish,
+            )
+            .await?;
             // The message write is exactly-once; delivery notification is
             // intentionally at-least-once. A process can die after commit but
             // before broadcast, so suppressing a duplicate notification would
@@ -2555,6 +2964,14 @@ async fn deliver_terminal(
                 turn_id: record.turn_id.clone(),
             };
             event_bus.publish(&record.session_id, event).await;
+            #[cfg(test)]
+            terminal_delivery_faults::checkpoint(
+                &record.terminal_id,
+                worker_id,
+                record.revision,
+                terminal_delivery_faults::Point::BeforeAck,
+            )
+            .await?;
             let event_store = event_store.clone();
             let terminal_id = record.terminal_id.clone();
             let worker = worker_id.to_string();
@@ -2565,6 +2982,8 @@ async fn deliver_terminal(
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result.map_err(|error| error.to_string()));
+            #[cfg(test)]
+            let acknowledged = acknowledgement.is_ok();
             if let Err(error) = acknowledgement {
                 // The durable message ID makes replay safe. The store treats a
                 // retried ack after materialization as idempotent success
@@ -2578,6 +2997,16 @@ async fn deliver_terminal(
                 (runtime_services, record.execution_id.as_deref())
             {
                 services.release_live_terminal_fence(execution_id);
+            }
+            #[cfg(test)]
+            if acknowledged {
+                terminal_delivery_faults::checkpoint(
+                    &record.terminal_id,
+                    worker_id,
+                    record.revision,
+                    terminal_delivery_faults::Point::AfterAck,
+                )
+                .await?;
             }
             Ok(inserted)
         }

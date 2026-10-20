@@ -1,6 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+RECEIPT_ONLY=0
+if [[ -n "${COWD_R1_RECEIPT_TUI_CONFIG:-}" && "${1:-}" != "--r1-receipt-only" ]]; then
+  exit 1
+fi
+if [[ "${1:-}" == "--r1-receipt-only" ]]; then
+  [[ "$#" == 1 && -n "${COWD_R1_RECEIPT_TUI_CONFIG:-}" ]] || exit 1
+  RECEIPT_ONLY=1
+  mapfile -t RECEIPT_INPUTS < <(node --input-type=module - "$COWD_R1_RECEIPT_TUI_CONFIG" <<'JS'
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+const path = process.argv[2];
+const metadata = fs.lstatSync(path);
+if (!path.startsWith('/') || !metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid() || (metadata.mode & 0o077)) throw new Error('private receipt config required');
+const config = JSON.parse(fs.readFileSync(path));
+const fixture = JSON.parse(fs.readFileSync(config.frame_fixture_file));
+const provisioning = JSON.parse(fs.readFileSync(config.provisioning_file));
+const producer = JSON.parse(fs.readFileSync(config.producer_evidence_file));
+for (const file of [config.gateway_token_file,config.provisioning_file,config.frame_fixture_file,config.producer_evidence_file,config.terminal_preflight_config]) {
+  const stat = fs.lstatSync(file);
+  if (!file.startsWith(provisioning.run_directory+'/') || fs.realpathSync(file) !== file || !stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw new Error('private allocated terminal input required');
+}
+for (const directory of [config.config_home,config.home_directory,config.workspace,config.output_directory,config.state_directory]) {
+  const stat = fs.lstatSync(directory);
+  if (!directory.startsWith(provisioning.run_directory+'/') || fs.realpathSync(directory) !== directory || !stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw new Error('private allocated terminal directory required');
+}
+if (producer.status !== 'ready' || producer.run_id !== config.run_id || fixture.base_url !== config.gateway_url) throw new Error('fresh parent producer required');
+for (const [file,hash] of Object.entries(provisioning.hashes)) if (crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') !== hash) throw new Error('candidate changed');
+if (!provisioning.hashes[config.binary] || !provisioning.hashes[config.step_binary]) throw new Error('prebuilt executables not frozen');
+const values = [config.binary,config.config_home,config.home_directory,config.workspace,config.gateway_url,
+  config.gateway_token_file,config.model,config.output_directory,fixture.source_a.session_id,
+  config.state_directory,config.terminal_preflight_config,config.step_binary];
+if (values.some((value) => typeof value !== 'string' || !value || /[\r\n'\x00]/.test(value))) throw new Error('invalid terminal inputs');
+console.log(values.join('\n'));
+JS
+  )
+  [[ "${#RECEIPT_INPUTS[@]}" == 12 ]] || exit 1
+  BIN="${RECEIPT_INPUTS[0]}"
+  CONFIG_HOME="${RECEIPT_INPUTS[1]}"
+  HOME_DIR="${RECEIPT_INPUTS[2]}"
+  WORKSPACE="${RECEIPT_INPUTS[3]}"
+  BASE_URL="${RECEIPT_INPUTS[4]}"
+  RECEIPT_TOKEN_FILE="${RECEIPT_INPUTS[5]}"
+  TOKEN=""
+  MODEL="${RECEIPT_INPUTS[6]}"
+  ARTIFACT_DIR="${RECEIPT_INPUTS[7]}"
+  SESSION_A="${RECEIPT_INPUTS[8]}"
+  export XDG_STATE_HOME="${RECEIPT_INPUTS[9]}"
+  SCREEN_PREFIX="cowd-r1-receipt-$PPID-$$"
+  TMUX_SOCKET="$SCREEN_PREFIX"
+  GATEWAY_PID=""
+  PROVIDER_PID=""
+  SESSION_STREAM_PID=""
+  WEBUI_STREAM_PID=""
+  SUMMARY="$ARTIFACT_DIR/terminal-summary.tsv"
+else
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
@@ -42,6 +97,7 @@ GATEWAY_PID=""
 PROVIDER_PID=""
 SESSION_STREAM_PID=""
 WEBUI_STREAM_PID=""
+fi
 declare -A TUI_SCREEN=()
 declare -A TUI_DRIVER_PID=()
 declare -A TUI_UTF8_LOG=()
@@ -71,6 +127,7 @@ cleanup() {
     stop_tui "$target"
   done
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  [[ "$RECEIPT_ONLY" == 0 ]] || return 0
   if [[ -n "$SESSION_STREAM_PID" ]]; then
     kill "$SESSION_STREAM_PID" >/dev/null 2>&1 || true
     wait "$SESSION_STREAM_PID" >/dev/null 2>&1 || true
@@ -306,6 +363,10 @@ start_tui() {
   local screen_name="$SCREEN_PREFIX-$target"
   local driver_log="$ARTIFACT_DIR/$target-screen-driver.log"
   local utf8_log="$ARTIFACT_DIR/$target-screen-utf8.log"
+  local token_setup="export COWD_API_TOKEN='$TOKEN';"
+  if [[ "$RECEIPT_ONLY" == 1 ]]; then
+    token_setup="export COWD_API_TOKEN=\"\$(cat -- '$RECEIPT_TOKEN_FILE')\";"
+  fi
   [[ -z "${TUI_SCREEN[$target]:-}" ]] \
     || fail "TUI PTY target $target is already active"
   : >"$utf8_log"
@@ -315,7 +376,7 @@ start_tui() {
     -x "$width" \
     -y "$height" \
     -c "$WORKSPACE" \
-    "env COWD_CONFIG_HOME='$CONFIG_HOME' COWD_API_TOKEN='$TOKEN' COWD_GATEWAY_URL='$BASE_URL' COWD_TUI_OBSERVER_ID='$observer_id' COWD_DISABLE_DAEMON_AUTOSTART=1 HOME='$HOME_DIR' TERM=xterm-256color '$BIN' --yolo --model '$MODEL' --session '$session_id'" \
+    "$token_setup exec env COWD_CONFIG_HOME='$CONFIG_HOME' COWD_GATEWAY_URL='$BASE_URL' COWD_TUI_OBSERVER_ID='$observer_id' COWD_DISABLE_DAEMON_AUTOSTART=1 HOME='$HOME_DIR' TERM=xterm-256color '$BIN' --yolo --model '$MODEL' --session '$session_id'" \
     >>"$driver_log" 2>&1
   tmux -L "$TMUX_SOCKET" set-option -t "$screen_name" history-limit 200000 \
     >/dev/null 2>&1
@@ -428,6 +489,22 @@ send_prompt() {
   send_raw "$target" "$prompt"
   send_raw "$target" $'\r'
 }
+
+if [[ "$RECEIPT_ONLY" == 1 ]]; then
+  [[ -x "$BIN" && -x "${RECEIPT_INPUTS[11]}" && -d "$ARTIFACT_DIR" ]] || exit 1
+  for command in tmux node rg timeout; do command -v "$command" >/dev/null || exit 1; done
+  COWD_R1_RECEIPT_STEP_CONFIG="${RECEIPT_INPUTS[10]}" timeout --kill-after=2s 15s "${RECEIPT_INPUTS[11]}" \
+    --exact tests::r1_real_client_receipt_scenario_step --ignored --nocapture --test-threads=1 \
+    >"$ARTIFACT_DIR/terminal-preflight.log" 2>&1
+  start_tui receipt "$SESSION_A" "tui:r1-receipt-$PPID-$$" 220 80
+  wait_capture receipt 'This client .*received' receipt-first || fail 'real receipt UI did not become received'
+  stop_tui receipt
+  start_tui receipt "$SESSION_A" "tui:r1-receipt-reopen-$PPID-$$" 220 80
+  wait_capture receipt 'This client ' receipt-reopen || fail 'reopened real receipt panel missing'
+  stop_tui receipt
+  pass 'receipt-only real terminal consumed the parent-owned fresh producer without starting a model'
+  exit 0
+fi
 
 for command in tmux curl node python3 rg ss pgrep getconf; do
   command -v "$command" >/dev/null 2>&1 || {

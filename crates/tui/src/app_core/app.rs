@@ -30,6 +30,8 @@ const HARD_CAP: usize = 50000;
 /// Narrow composition root for terminal read models. Each slice has one
 /// lifecycle and stays below the structural field limit.
 pub struct App {
+    pub terminal_receipt: Option<crate::protocol::TerminalReceiptOverlay>,
+    pub terminal_receipt_selection: Option<(String, String, u64)>,
     pub shell: AppShellState,
     pub timeline: TimelineState,
     pub workbench: WorkbenchViewState,
@@ -371,6 +373,8 @@ pub struct CurrentTaskSummary {
 impl App {
     pub fn new(model: &str, session_id: &str) -> Self {
         Self {
+            terminal_receipt: None,
+            terminal_receipt_selection: None,
             shell: AppShellState {
                 model: model.to_string(),
                 requested_model: (!model.trim().is_empty()
@@ -4144,6 +4148,45 @@ impl App {
 
     fn apply_session_history_event(&mut self, event: CowdEvent) -> Result<(), CowdEvent> {
         match event {
+            CowdEvent::TerminalReceiptSelection {
+                session_id,
+                client_id,
+                epoch,
+            } => {
+                if session_id == self.shell.session_id
+                    && self
+                        .terminal_receipt_selection
+                        .as_ref()
+                        .is_none_or(|(_, _, current)| *current <= epoch)
+                {
+                    self.terminal_receipt_selection = Some((session_id, client_id, epoch));
+                    self.terminal_receipt = None;
+                    self.mark_dirty();
+                }
+            }
+            CowdEvent::TerminalReceiptContext { overlay } => {
+                if overlay.session_id == self.shell.session_id
+                    && overlay.expires_at_ms
+                        > std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(u64::MAX, |time| time.as_millis() as u64)
+                    && self
+                        .execution
+                        .current_turn_id
+                        .as_ref()
+                        .is_none_or(|turn| turn == &overlay.turn_id)
+                    && self.terminal_receipt_selection.as_ref().is_some_and(
+                        |(session, client, epoch)| {
+                            session == &overlay.session_id
+                                && client == &overlay.client_id
+                                && *epoch == overlay.epoch
+                        },
+                    )
+                {
+                    self.terminal_receipt = Some(overlay);
+                    self.mark_dirty();
+                }
+            }
             CowdEvent::SessionScoped {
                 session_id, event, ..
             } => {

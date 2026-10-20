@@ -52,12 +52,32 @@ struct PlaneCounters {
 /// Resource ownership retained by the governed executor until its durable
 /// terminal receipt has been committed.
 pub struct ToolExecutionAdmission {
-    _scope_lease: ScopeLockLease,
-    _resource_lease: ExecutionResourceLease,
+    state: Arc<ToolExecutionLeaseState>,
+}
+
+struct ToolExecutionLeaseState {
+    counters: Arc<PlaneCounters>,
+    active: std::sync::atomic::AtomicBool,
+    _scope_lease: Option<ScopeLockLease>,
+    _resource_lease: Option<ExecutionResourceLease>,
     resources: Arc<ExecutionResourceManager>,
     queue_wait: Duration,
     service_started: Instant,
-    result_class: ResourceResultClass,
+    result_class: std::sync::Mutex<ResourceResultClass>,
+}
+
+#[derive(Clone)]
+struct ToolExecutionFrame {
+    plane: Arc<PlaneCounters>,
+    demand: ResourceDemand,
+    service_class: ExecutionServiceClass,
+    ceiling: Option<ExecutionServiceClass>,
+    session_id: Option<String>,
+    state: Arc<ToolExecutionLeaseState>,
+}
+
+tokio::task_local! {
+    static TOOL_EXECUTION_FRAME: ToolExecutionFrame;
 }
 
 impl ToolExecutionAdmission {
@@ -66,30 +86,77 @@ impl ToolExecutionAdmission {
         resource_lease: ExecutionResourceLease,
         resources: Arc<ExecutionResourceManager>,
         queue_wait: Duration,
+        counters: Arc<PlaneCounters>,
     ) -> Self {
+        counters.active.fetch_add(1, Ordering::AcqRel);
         Self {
-            _scope_lease: scope_lease,
-            _resource_lease: resource_lease,
-            resources,
-            queue_wait,
-            service_started: Instant::now(),
-            result_class: ResourceResultClass::Failed,
+            state: Arc::new(ToolExecutionLeaseState {
+                counters,
+                active: std::sync::atomic::AtomicBool::new(true),
+                _scope_lease: Some(scope_lease),
+                _resource_lease: Some(resource_lease),
+                resources,
+                queue_wait,
+                service_started: Instant::now(),
+                result_class: std::sync::Mutex::new(ResourceResultClass::Failed),
+            }),
         }
     }
 
     fn set_result_class(&mut self, result_class: ResourceResultClass) {
-        self.result_class = result_class;
+        let mut current = self
+            .state
+            .result_class
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.state.active.load(Ordering::Acquire)
+            || *current != ResourceResultClass::Failed
+            || result_class != ResourceResultClass::Completed
+        {
+            *current = result_class;
+        }
+    }
+
+    fn finish_counters(&self) {
+        self.state.finish_counters();
     }
 }
 
-impl Drop for ToolExecutionAdmission {
+impl ToolExecutionLeaseState {
+    fn finish_counters(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            let result_class = *self
+                .result_class
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.counters.active.fetch_sub(1, Ordering::AcqRel);
+            if matches!(
+                result_class,
+                ResourceResultClass::Completed | ResourceResultClass::TimedOut
+            ) {
+                self.counters.completed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.counters.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl Drop for ToolExecutionLeaseState {
     fn drop(&mut self) {
+        let result_class = *self
+            .result_class
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self._scope_lease.take());
+        drop(self._resource_lease.take());
+        self.finish_counters();
         let _ = self.resources.record_observation(
             &ExecutionResourceKind::Tool,
             ResourceObservation::terminal(
                 self.queue_wait,
                 self.service_started.elapsed(),
-                self.result_class,
+                result_class,
             ),
         );
     }
@@ -122,6 +189,81 @@ impl ToolExecutionPlane {
 
     pub(crate) fn bind_supervisor(&self, supervisor: &Arc<crate::RuntimeExecutionSupervisor>) {
         let _ = self.supervisor.set(Arc::downgrade(supervisor));
+    }
+
+    pub(crate) fn scope_locks(&self) -> &Arc<ScopeLockManager> {
+        &self.scopes
+    }
+
+    pub(crate) fn owned_classification(
+        &self,
+    ) -> Option<(ExecutionServiceClass, Option<ExecutionServiceClass>)> {
+        TOOL_EXECUTION_FRAME
+            .try_with(|frame| (frame.service_class, frame.ceiling))
+            .ok()
+    }
+
+    pub(crate) async fn execute_owned_classified_retained<T, F>(
+        &self,
+        demand: &ResourceDemand,
+        timeout: Option<Duration>,
+        service_class: ExecutionServiceClass,
+        parent_class_ceiling: Option<ExecutionServiceClass>,
+        session_id: Option<&str>,
+        operation: F,
+    ) -> (
+        Result<T, ToolExecutionPlaneError>,
+        Option<ToolExecutionAdmission>,
+    )
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let frame = TOOL_EXECUTION_FRAME.try_with(Clone::clone).ok();
+        if let Some(frame) = frame {
+            if !Arc::ptr_eq(&frame.plane, &self.counters)
+                || frame.demand != *demand
+                || frame.service_class != service_class
+                || frame.ceiling != parent_class_ceiling
+                || frame.session_id.as_deref() != session_id
+            {
+                return (
+                    Err(ToolExecutionPlaneError::Admission(
+                        "owned tool frame mismatch".into(),
+                    )),
+                    None,
+                );
+            }
+            let result = tokio::task::spawn_blocking(move || {
+                let mut retained = ToolExecutionAdmission { state: frame.state };
+                let result = std::panic::catch_unwind(AssertUnwindSafe(operation))
+                    .map_err(|_| ToolExecutionPlaneError::Panicked);
+                if result.is_err() {
+                    frame.plane.panicked.fetch_add(1, Ordering::Relaxed);
+                }
+                retained.set_result_class(if result.is_ok() {
+                    ResourceResultClass::Completed
+                } else {
+                    ResourceResultClass::Failed
+                });
+                retained.finish_counters();
+                drop(retained);
+                result
+            })
+            .await
+            .unwrap_or_else(|error| Err(ToolExecutionPlaneError::Worker(error.to_string())));
+            (result, None)
+        } else {
+            self.execute_classified_retained(
+                demand,
+                timeout,
+                service_class,
+                parent_class_ceiling,
+                session_id,
+                operation,
+            )
+            .await
+        }
     }
 
     /// Central adapter for an explicitly blocking dependency used from an
@@ -219,21 +361,15 @@ impl ToolExecutionPlane {
             Ok(admission) => admission,
             Err(error) => return (Err(error), None),
         };
-        self.counters.active.fetch_add(1, Ordering::AcqRel);
         let counters = Arc::clone(&self.counters);
         let mut worker = tokio::task::spawn_blocking(move || {
             // The physical operation owns its admission. Aborting the async
             // waiter cannot release a path lock while this thread still writes.
             let mut admission = admission;
             let result = std::panic::catch_unwind(AssertUnwindSafe(operation));
-            counters.active.fetch_sub(1, Ordering::AcqRel);
             let execution = match result {
-                Ok(value) => {
-                    counters.completed.fetch_add(1, Ordering::Relaxed);
-                    Ok(value)
-                }
+                Ok(value) => Ok(value),
                 Err(_) => {
-                    counters.failed.fetch_add(1, Ordering::Relaxed);
                     counters.panicked.fetch_add(1, Ordering::Relaxed);
                     Err(ToolExecutionPlaneError::Panicked)
                 }
@@ -243,6 +379,7 @@ impl ToolExecutionPlane {
             } else {
                 ResourceResultClass::Failed
             });
+            admission.finish_counters();
             (execution, admission)
         });
 
@@ -327,8 +464,16 @@ impl ToolExecutionPlane {
             Ok(admission) => admission,
             Err(error) => return (Err(error), None),
         };
-        self.counters.active.fetch_add(1, Ordering::AcqRel);
-        let operation = AssertUnwindSafe(operation).catch_unwind();
+        let frame = ToolExecutionFrame {
+            plane: Arc::clone(&self.counters),
+            demand: demand.clone(),
+            service_class,
+            ceiling: parent_class_ceiling,
+            session_id: session_id.map(str::to_owned),
+            state: Arc::clone(&admission.state),
+        };
+        let operation =
+            TOOL_EXECUTION_FRAME.scope(frame, AssertUnwindSafe(operation).catch_unwind());
         tokio::pin!(operation);
         let mut soft_timed_out = false;
         let execution = if let Some(timeout) = timeout {
@@ -349,14 +494,9 @@ impl ToolExecutionPlane {
         } else {
             operation.await
         };
-        self.counters.active.fetch_sub(1, Ordering::AcqRel);
         let execution = match execution {
-            Ok(value) => {
-                self.counters.completed.fetch_add(1, Ordering::Relaxed);
-                Ok(value)
-            }
+            Ok(value) => Ok(value),
             Err(_) => {
-                self.counters.failed.fetch_add(1, Ordering::Relaxed);
                 self.counters.panicked.fetch_add(1, Ordering::Relaxed);
                 Err(ToolExecutionPlaneError::Panicked)
             }
@@ -368,6 +508,7 @@ impl ToolExecutionPlane {
         } else {
             ResourceResultClass::Failed
         });
+        admission.finish_counters();
         (execution, Some(admission))
     }
 
@@ -422,6 +563,7 @@ impl ToolExecutionPlane {
             lease,
             Arc::clone(&self.resources),
             admission_started.elapsed(),
+            Arc::clone(&self.counters),
         ))
     }
 
@@ -511,8 +653,166 @@ mod tests {
     use super::*;
     use crate::execution_core::graph::ResourceQuota;
     use harness_contract::tool::ResourceScopeDemand;
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn owned_worker_reuses_async_frame_and_survives_abandoned_waiter_283() {
+        let plane = Arc::new(plane(1));
+        let (started, began) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let outer = {
+            let plane = plane.clone();
+            tokio::spawn(async move {
+                let inner = plane.clone();
+                plane
+                    .execute_async_classified_retained(
+                        &ResourceDemand::default(),
+                        None,
+                        ExecutionServiceClass::Foreground,
+                        None,
+                        Some("retained-frame"),
+                        async move {
+                            inner
+                                .execute_owned_classified_retained(
+                                    &ResourceDemand::default(),
+                                    None,
+                                    ExecutionServiceClass::Foreground,
+                                    None,
+                                    Some("retained-frame"),
+                                    move || {
+                                        started.send(()).unwrap();
+                                        released.recv().unwrap();
+                                        283
+                                    },
+                                )
+                                .await
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), began)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plane.stats().submitted, 1);
+        outer.abort();
+        assert!(outer.await.err().unwrap().is_cancelled());
+        assert_eq!(plane.stats().active, 1);
+        let probe = plane
+            .execute(
+                &ResourceDemand::default(),
+                Some(Duration::from_millis(20)),
+                || 0,
+            )
+            .await;
+        assert!(matches!(probe, Err(ToolExecutionPlaneError::Admission(_))));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while plane.stats().active != 0
+                || plane
+                    .resources
+                    .snapshot(&ExecutionResourceKind::Tool)
+                    .unwrap()
+                    .active_leases
+                    != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(plane.stats().completed, 1);
+        assert_eq!(
+            plane
+                .resources
+                .snapshot(&ExecutionResourceKind::Tool)
+                .unwrap()
+                .active_leases,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_worker_without_frame_admits_once_and_retains_terminal_owner_283() {
+        let plane = plane(1);
+        let (result, admission) = plane
+            .execute_owned_classified_retained(
+                &ResourceDemand::default(),
+                None,
+                ExecutionServiceClass::Interactive,
+                None,
+                Some("owned-first"),
+                || 283,
+            )
+            .await;
+        assert_eq!(result.unwrap(), 283);
+        assert!(admission.is_some());
+        assert_eq!(plane.stats().submitted, 1);
+        assert_eq!(plane.stats().active, 0);
+        drop(admission);
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(plane.stats().completed, 1);
+    }
+
+    #[tokio::test]
+    async fn owned_worker_mismatched_frame_never_readmits_or_executes_283() {
+        let plane = plane(1);
+        for mismatch in 0..5 {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let captured = executions.clone();
+            let alien = plane.clone();
+            let unrelated = super::tests::plane(1);
+            let operation = async {
+                let selected = if mismatch == 0 { &unrelated } else { &alien };
+                let demand = ResourceDemand {
+                    tool_slots: if mismatch == 1 { 2 } else { 1 },
+                    ..ResourceDemand::default()
+                };
+                selected
+                    .execute_owned_classified_retained(
+                        &demand,
+                        None,
+                        if mismatch == 2 {
+                            ExecutionServiceClass::Background
+                        } else {
+                            ExecutionServiceClass::Foreground
+                        },
+                        if mismatch == 3 {
+                            Some(ExecutionServiceClass::Foreground)
+                        } else {
+                            None
+                        },
+                        Some(if mismatch == 4 {
+                            "other-session"
+                        } else {
+                            "frame-session"
+                        }),
+                        move || {
+                            captured.fetch_add(1, Ordering::SeqCst);
+                        },
+                    )
+                    .await
+            };
+            let (result, admission) = plane
+                .execute_async_classified_retained(
+                    &ResourceDemand::default(),
+                    None,
+                    ExecutionServiceClass::Foreground,
+                    None,
+                    Some("frame-session"),
+                    operation,
+                )
+                .await;
+            let (result, inner) = result.unwrap();
+            assert!(matches!(result, Err(ToolExecutionPlaneError::Admission(_))));
+            assert!(inner.is_none());
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            drop(admission);
+            assert_eq!(plane.stats().submitted, mismatch + 1);
+        }
+    }
 
     fn plane(limit: usize) -> ToolExecutionPlane {
         ToolExecutionPlane::new(
@@ -813,11 +1113,9 @@ mod tests {
         );
         let observed = observed.lock().unwrap();
         assert!(!observed.is_empty());
-        assert!(
-            observed
-                .iter()
-                .all(|observation| observation.fairness_key == "session:session-a")
-        );
+        assert!(observed
+            .iter()
+            .all(|observation| observation.fairness_key == "session:session-a"));
     }
 
     #[tokio::test]

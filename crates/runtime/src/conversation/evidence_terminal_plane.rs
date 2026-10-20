@@ -2,6 +2,385 @@
 
 use super::*;
 
+#[cfg(test)]
+mod raw_origin_tests {
+    use super::*;
+    use harness_contract::context::{
+        ArtifactRef, ArtifactWriteDescriptor, EvidenceAuditProjection, EvidenceContentKind,
+        ToolOutputDraft,
+    };
+
+    struct NoProvider;
+
+    impl ApiClient for NoProvider {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
+        > {
+            panic!("raw writer tests must not invoke a model")
+        }
+    }
+
+    async fn runtime() -> (
+        tempfile::TempDir,
+        ConversationRuntime<NoProvider, StaticToolExecutor>,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::test_support::session_store());
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "raw-writer-session".into(),
+                platform: "test".into(),
+                chat_id: "raw-writer".into(),
+                user_id: None,
+                model: None,
+                created_at: "2026-10-17T00:00:00Z".into(),
+                last_activity: "2026-10-17T00:00:00Z".into(),
+                message_count: 0,
+                reset_policy: "manual".into(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".into(),
+            })
+            .await
+            .unwrap();
+        let mut conversation = Session::new();
+        conversation.session_id = "raw-writer-session".into();
+        let artifacts = Arc::new(
+            crate::ArtifactStore::for_test(
+                workspace.path().join("artifacts"),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .unwrap(),
+        );
+        let runtime = ConversationRuntime::new(
+            conversation,
+            NoProvider,
+            StaticToolExecutor::new(),
+            crate::PermissionPolicy::new(crate::PermissionMode::ReadOnly),
+            vec![],
+        )
+        .without_memory()
+        .with_artifact_store(artifacts)
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+            store,
+        ))
+        .with_runtime_event_store(Arc::new(crate::RuntimeEventStore::for_test()))
+        .with_cowd_event_bus(crate::CowdEventBus::new());
+        (workspace, runtime)
+    }
+
+    fn cache(
+        runtime: &ConversationRuntime<NoProvider, StaticToolExecutor>,
+        access: EvidenceAccessRef,
+    ) {
+        let mut audits = runtime.turn_evidence_audits.lock().unwrap();
+        audits.clear();
+        audits.push(EvidenceAuditProjection {
+            evidence_ref: access.evidence_ref.clone(),
+            content_kind: EvidenceContentKind::Text,
+            raw_tokens: 0,
+            receipt_tokens: 0,
+            omitted_tokens: 0,
+            raw_available: true,
+            access: Some(access),
+        });
+    }
+
+    #[tokio::test]
+    async fn raw_writer_cache_checks_actual_bytes_scope_and_staged_access() {
+        let (_workspace, runtime) = runtime().await;
+        let (_, access) = runtime
+            .record_tool_raw_evidence(
+                "cache-call",
+                "read_file",
+                "input",
+                "actual raw bytes",
+                false,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        cache(&runtime, access.clone());
+        assert_eq!(
+            runtime
+                .record_tool_raw_evidence(
+                    "cache-call",
+                    "read_file",
+                    "input",
+                    "actual raw bytes",
+                    false,
+                    0,
+                    None
+                )
+                .await
+                .unwrap()
+                .1,
+            access
+        );
+        for field in [
+            "bytes",
+            "sha256",
+            "scope",
+            "selector",
+            "media",
+            "durability",
+        ] {
+            let mut wrong = access.clone();
+            match field {
+                "bytes" => wrong.bytes += 1,
+                "sha256" => wrong.sha256 = format!("sha256:{}", "0".repeat(64)),
+                "scope" => wrong.visibility_scope = "session:foreign".into(),
+                "selector" => wrong.retrieval_selector = "artifact://missing".into(),
+                "media" => wrong.media_type = "application/foreign".into(),
+                _ => wrong.durability = harness_contract::context::EvidenceDurability::Unavailable,
+            }
+            cache(&runtime, wrong);
+            assert!(
+                runtime
+                    .record_tool_raw_evidence(
+                        "cache-call",
+                        "read_file",
+                        "input",
+                        "actual raw bytes",
+                        false,
+                        0,
+                        None
+                    )
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        runtime.turn_evidence_audits.lock().unwrap().clear();
+        let artifacts = runtime.artifact_store.as_ref().unwrap();
+        let staged = artifacts
+            .write_bytes(
+                ArtifactWriteDescriptor {
+                    media_type: "application/octet-stream".into(),
+                    visibility_scope: "session:raw-writer-session".into(),
+                    expected_bytes: Some(20),
+                    original_name: None,
+                },
+                b"staged body not text",
+            )
+            .await
+            .unwrap();
+        let draft = ToolOutputDraft::staged_artifact("short summary", staged.clone());
+        let (_, staged_access) = runtime
+            .record_tool_output_evidence(
+                "staged-call",
+                "read_file",
+                "input",
+                &draft,
+                "short summary",
+                false,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        cache(&runtime, staged_access.clone());
+        assert_eq!(
+            runtime
+                .record_tool_output_evidence(
+                    "staged-call",
+                    "read_file",
+                    "input",
+                    &draft,
+                    "other presentation",
+                    false,
+                    0,
+                    None
+                )
+                .await
+                .unwrap()
+                .1,
+            staged_access
+        );
+        let mut wrong = staged_access.clone();
+        wrong.bytes += 1;
+        cache(&runtime, wrong);
+        assert!(runtime
+            .record_tool_output_evidence(
+                "staged-call",
+                "read_file",
+                "input",
+                &draft,
+                "summary",
+                false,
+                0,
+                None
+            )
+            .await
+            .is_err());
+        cache(&runtime, staged_access.clone());
+        artifacts
+            .unpin(
+                &staged,
+                &format!(
+                    "evidence:raw-writer-session:{}",
+                    staged_access.evidence_ref.id()
+                ),
+            )
+            .unwrap();
+        artifacts.delete(&staged, &staged.visibility_scope).unwrap();
+        assert!(runtime
+            .record_tool_output_evidence(
+                "staged-call",
+                "read_file",
+                "input",
+                &draft,
+                "summary",
+                false,
+                0,
+                None
+            )
+            .await
+            .is_err());
+        let raw = ArtifactRef::durable(
+            &access.retrieval_selector,
+            &access.sha256,
+            access.bytes,
+            &access.media_type,
+            &access.visibility_scope,
+        );
+        artifacts
+            .unpin(
+                &raw,
+                &format!("evidence:raw-writer-session:{}", access.evidence_ref.id()),
+            )
+            .unwrap();
+        artifacts.delete(&raw, &raw.visibility_scope).unwrap();
+        cache(&runtime, access);
+        assert!(runtime
+            .record_tool_raw_evidence(
+                "cache-call",
+                "read_file",
+                "input",
+                "actual raw bytes",
+                false,
+                0,
+                None
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn prepared_raw_writer_checks_original_invocation_and_never_seals_recovery_without_owner()
+    {
+        let (_workspace, runtime) = runtime().await;
+        runtime
+            .prepare_governed_tool_result_with_invocation(
+                "recovery",
+                "artifact_publish",
+                "{}",
+                "recovered bytes",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let store = runtime.runtime_event_store.as_ref().unwrap();
+        assert!(!store
+            .list_stream("session:raw-writer-session")
+            .unwrap()
+            .iter()
+            .any(|event| event.kind.starts_with("tool.invocation.")));
+        let record = ToolInvocationRecord::started(
+            "raw-writer-session",
+            0,
+            "prepared",
+            "artifact_publish",
+            "{}",
+            crate::ToolSafetyCategory::ReadOnly,
+            1,
+        )
+        .completed("prepared raw", 2);
+        let mut wrong = record.clone();
+        wrong.input_hash = crate::tool_invocation::stable_hash("different input");
+        assert!(runtime
+            .prepare_governed_tool_result_with_invocation(
+                "prepared",
+                "artifact_publish",
+                "{}",
+                "prepared raw",
+                false,
+                Some(wrong)
+            )
+            .await
+            .is_err());
+        let binding = serde_json::from_value(serde_json::json!({
+            "root_execution_id":"raw-root", "session_id":"raw-writer-session", "turn_id":"raw-turn",
+            "root_task_id":"raw-task", "task_id":"raw-task", "activity_id":"activity:execution:raw-root:owner:raw-model",
+            "revision":1, "fence":1, "generation":1,
+        })).unwrap();
+        let _scope = runtime.cowd_bus().unwrap().enter_execution_with_activity(
+            crate::CowdExecutionContext {
+                execution_id: "raw-root".into(),
+                session_id: "raw-writer-session".into(),
+                turn_id: "raw-turn".into(),
+            },
+            Some(binding),
+        );
+        runtime
+            .prepare_governed_tool_result_with_invocation(
+                "prepared",
+                "artifact_publish",
+                "{}",
+                "prepared raw",
+                false,
+                Some(record),
+            )
+            .await
+            .unwrap();
+        let events = store.list_stream("session:raw-writer-session").unwrap();
+        let started = events
+            .iter()
+            .find(|event| event.kind == "tool.invocation.started")
+            .unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.kind == "tool.invocation.completed")
+            .unwrap();
+        assert!(started.payload.get("runtime_raw_content_v1").is_none());
+        assert_eq!(
+            completed.payload["runtime_raw_content_v1"]["sha256"],
+            crate::context_evidence::read_sha256(b"prepared raw")
+        );
+        assert_eq!(
+            completed.payload["runtime_raw_content_v1"]["byte_count"],
+            12
+        );
+        assert!(completed.activity_binding().is_some());
+        runtime
+            .prepare_governed_tool_result_with_invocation(
+                "recovery",
+                "artifact_publish",
+                "{}",
+                "recovered bytes",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_stream("session:raw-writer-session")
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind.starts_with("tool.invocation."))
+                .count(),
+            2
+        );
+    }
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1027,6 +1406,40 @@ where
         let evidence_id = format!("tool-raw-{tool_use_id}-{content_hash:016x}");
         let evidence_ref = EvidenceRef::observed("tool", evidence_id.clone());
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
+            let digest = crate::context_evidence::read_sha256(output.as_bytes());
+            if !access.is_durable()
+                || access.evidence_ref != evidence_ref
+                || access.sha256.trim_start_matches("sha256:")
+                    != digest.trim_start_matches("sha256:")
+                || access.bytes != output.len() as u64
+                || access.visibility_scope != format!("session:{}", self.session_id())
+                || access.media_type != "text/plain; charset=utf-8"
+                || !access.retrieval_selector.starts_with("artifact://")
+            {
+                return Err(RuntimeError::new(
+                    "cached raw access disagrees with this call's actual bytes",
+                ));
+            }
+            let artifacts = self
+                .artifact_store
+                .as_ref()
+                .ok_or_else(|| RuntimeError::new("cached raw access requires Artifact store"))?;
+            let artifact = harness_contract::context::ArtifactRef::durable(
+                &access.retrieval_selector,
+                &access.sha256,
+                access.bytes,
+                &access.media_type,
+                &access.visibility_scope,
+            );
+            let bytes = artifacts
+                .read(&artifact, &access.visibility_scope, None)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if bytes != output.as_bytes() {
+                return Err(RuntimeError::new(
+                    "cached raw Artifact is not this call's actual bytes",
+                ));
+            }
             return Ok((evidence_ref, access));
         }
         let Some(ref session_port) = self.session_journal_port else {
@@ -1109,6 +1522,28 @@ where
         );
         let evidence_ref = EvidenceRef::observed("tool", evidence_id.clone());
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
+            if !artifact.is_durable()
+                || !access.is_durable()
+                || access.evidence_ref != evidence_ref
+                || access.sha256 != artifact.sha256
+                || access.bytes != artifact.bytes
+                || access.media_type != artifact.media_type
+                || access.retrieval_selector != artifact.selector
+                || access.visibility_scope != artifact.visibility_scope
+                || artifact.visibility_scope != format!("session:{}", self.session_id())
+            {
+                return Err(RuntimeError::new(
+                    "cached staged raw access disagrees with the original Artifact",
+                ));
+            }
+            let artifacts = self
+                .artifact_store
+                .as_ref()
+                .ok_or_else(|| RuntimeError::new("cached staged access requires Artifact store"))?;
+            artifacts
+                .read(artifact, &artifact.visibility_scope, Some(0..0))
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
             return Ok((evidence_ref, access));
         }
         let Some(ref session_port) = self.session_journal_port else {
@@ -2121,10 +2556,21 @@ where
                         .get("tool_name")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned);
-                    let Some(binding) = bus.current_tool_activity_binding(
+                    let tool_name = tool_contract_id.as_deref().unwrap_or("unknown_tool");
+                    let remembered = match self.native_tool_activity_owner(
                         &tool_call_id,
-                        tool_contract_id.as_deref().unwrap_or("unknown_tool"),
-                    ) else {
+                        tool_name,
+                        input.payload["input_hash"].as_str().unwrap_or_default(),
+                    ) {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            tracing::warn!(%error, event_kind = kind, "Native tool lifecycle source rejected");
+                            return;
+                        }
+                    };
+                    let Some(binding) = remembered
+                        .or_else(|| bus.current_tool_activity_binding(&tool_call_id, tool_name))
+                    else {
                         tracing::warn!(
                             session_id,
                             event_kind = kind,

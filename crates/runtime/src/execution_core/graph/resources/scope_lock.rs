@@ -141,17 +141,205 @@ struct State {
     pending: VecDeque<PendingLock>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Shared {
+    owner_generation: Uuid,
     state: Mutex<State>,
     changed: Notify,
     lock_root: Option<PathBuf>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            owner_generation: Uuid::new_v4(),
+            state: Mutex::new(State::default()),
+            changed: Notify::new(),
+            lock_root: None,
+        }
+    }
 }
 
 /// Atomic, conflict-aware acquisition for one or more hierarchical scopes.
 #[derive(Clone, Debug, Default)]
 pub struct ScopeLockManager {
     shared: Arc<Shared>,
+}
+
+pub(crate) struct BindingOwnerFence {
+    file: File,
+    key: String,
+    recovery: bool,
+    released: bool,
+    failed: bool,
+}
+
+pub(crate) struct ReleasedBindingLeases<'owner> {
+    owner: &'owner BindingOwnerFence,
+    closure: super::super::events::ExecutionBindingLeaseClosure,
+    sources: Vec<crate::ExpectedStreamRevision>,
+}
+
+impl ReleasedBindingLeases<'_> {
+    pub(crate) fn sources(&self) -> &[crate::ExpectedStreamRevision] {
+        &self.sources
+    }
+    pub(crate) fn closure(&self) -> &super::super::events::ExecutionBindingLeaseClosure {
+        &self.closure
+    }
+
+    pub(crate) fn authentic_for(
+        &self,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+    ) -> bool {
+        self.owner.released
+            && !self.owner.failed
+            && self.owner.key
+                == super::super::events::ExecutionBindingLeaseClosure::fence_key(
+                    graph,
+                    &self.closure.node_id,
+                    &self.closure.binding,
+                )
+            && self.owner.file.metadata().is_ok()
+    }
+}
+
+impl BindingOwnerFence {
+    fn matches(
+        &self,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+        node: &str,
+        binding: &super::super::events::ExecutionNodeBinding,
+    ) -> bool {
+        self.key
+            == super::super::events::ExecutionBindingLeaseClosure::fence_key(graph, node, binding)
+    }
+
+    fn proof<'owner>(
+        &'owner self,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+        node: &str,
+        binding: &super::super::events::ExecutionNodeBinding,
+        position: (u64, u64, u32),
+    ) -> ReleasedBindingLeases<'owner> {
+        ReleasedBindingLeases {
+            owner: self,
+            closure: super::super::events::ExecutionBindingLeaseClosure {
+                schema: 1,
+                graph_id: graph.id.clone(),
+                node_id: node.into(),
+                binding: binding.clone(),
+                start_sequence: position.0,
+                start_cursor: position.1,
+                start_transaction_index: position.2,
+                no_dispatch: None,
+                source: if self.recovery {
+                    "recovery_release"
+                } else {
+                    "normal_release"
+                }
+                .into(),
+            },
+            sources: Vec::new(),
+        }
+    }
+
+    pub(crate) fn release_original<'owner>(
+        &'owner mut self,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+        node: &str,
+        binding: &super::super::events::ExecutionNodeBinding,
+        position: (u64, u64, u32),
+        resource: &mut Option<super::ExecutionResourceLease>,
+        scope: &mut Option<ScopeLockLease>,
+        worktree: &mut Option<super::WorktreeLease>,
+        worktrees: &super::WorktreeLeaseManager,
+    ) -> Result<ReleasedBindingLeases<'owner>, String> {
+        if self.recovery || self.failed || !self.matches(graph, node, binding) {
+            return Err("original release has no exact original owner capability".into());
+        }
+        if !self.released {
+            if binding.resource_lease_refs
+                != resource
+                    .as_ref()
+                    .map(|lease| vec![lease.projection_reference()])
+                    .unwrap_or_default()
+                || binding.scope_lease_ref
+                    != scope.as_ref().map(ScopeLockLease::projection_reference)
+                || binding.worktree_lease_ref
+                    != worktree
+                        .as_ref()
+                        .map(|lease| lease.record().lease_id.to_string())
+            {
+                return Err("original release handles do not match durable binding".into());
+            }
+            if let Some(lease) = worktree.as_ref() {
+                let record = lease.record();
+                if record.task_id != graph.id || record.owner_id != node {
+                    return Err("original worktree handle identity mismatch".into());
+                }
+                if let Err(error) = worktrees.release(record.lease_id, &record.owner_id) {
+                    self.failed = true;
+                    return Err(error.to_string());
+                }
+                drop(worktree.take());
+            }
+            drop(resource.take());
+            if let Some(lease) = scope.take() {
+                if let Err(error) = lease.try_release() {
+                    self.failed = true;
+                    return Err(error.to_string());
+                }
+            }
+            self.released = true;
+        }
+        Ok(self.proof(graph, node, binding, position))
+    }
+
+    pub(crate) fn release_recovered<'owner>(
+        &'owner mut self,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+        node: &str,
+        binding: &super::super::events::ExecutionNodeBinding,
+        position: (u64, u64, u32),
+        physical: &super::super::commit_service::BindingRecoveryQuiescence,
+        worktrees: &super::WorktreeLeaseManager,
+        workspace: &str,
+    ) -> Result<ReleasedBindingLeases<'owner>, String> {
+        if !self.recovery
+            || self.failed
+            || !self.matches(graph, node, binding)
+            || !physical.matches(graph, node, binding)
+        {
+            return Err("recovered release lacks exact authenticated quiescence capability".into());
+        }
+        if let Some(identity) = &binding.worktree_lease_ref {
+            let identity = Uuid::parse_str(identity).map_err(|error| error.to_string())?;
+            let record = worktrees
+                .record(identity)
+                .map_err(|error| error.to_string())?
+                .ok_or("original worktree lease missing")?;
+            if record.workspace_id != workspace
+                || record.task_id != graph.id
+                || record.owner_id != node
+            {
+                return Err("recovered worktree exact owner mismatch".into());
+            }
+            match record.status {
+                super::WorktreeLeaseStatus::Active => {
+                    worktrees
+                        .release(identity, node)
+                        .map_err(|error| error.to_string())?;
+                }
+                super::WorktreeLeaseStatus::Released => {}
+                _ => return Err("TTL reclaim is not authenticated release".into()),
+            }
+        }
+        self.released = true;
+        let mut released = self.proof(graph, node, binding, position);
+        released.sources = physical.sources().to_vec();
+        Ok(released)
+    }
 }
 
 impl ScopeLockManager {
@@ -164,6 +352,7 @@ impl ScopeLockManager {
         fs::create_dir_all(&lock_root).map_err(|source| scope_io(&lock_root, source))?;
         Ok(Self {
             shared: Arc::new(Shared {
+                owner_generation: Uuid::new_v4(),
                 state: Mutex::new(State::default()),
                 changed: Notify::new(),
                 lock_root: Some(lock_root),
@@ -245,6 +434,8 @@ impl ScopeLockManager {
                     requests,
                     process_locks,
                     released: false,
+                    #[cfg(test)]
+                    fail_release: false,
                 });
             }
 
@@ -274,6 +465,189 @@ impl ScopeLockManager {
         }
     }
 
+    pub fn try_acquire(
+        &self,
+        requests: impl IntoIterator<Item = ScopeLockRequest>,
+    ) -> Result<Option<ScopeLockLease>, ScopeLockError> {
+        let requests = normalize_requests(requests)?;
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| ScopeLockError::Poisoned)?;
+        if guard
+            .pending
+            .iter()
+            .any(|pending| requests_conflict(&requests, &pending.requests))
+            || guard
+                .active
+                .values()
+                .any(|active| requests_conflict(&requests, &active.requests))
+        {
+            return Ok(None);
+        }
+        let Some(process_locks) = try_process_locks(self.shared.lock_root.as_deref(), &requests)?
+        else {
+            return Ok(None);
+        };
+        let id = Uuid::new_v4();
+        guard.active.insert(
+            id,
+            ActiveLock {
+                requests: requests.clone(),
+            },
+        );
+        Ok(Some(ScopeLockLease {
+            shared: Arc::clone(&self.shared),
+            id,
+            requests,
+            process_locks,
+            released: false,
+            #[cfg(test)]
+            fail_release: false,
+        }))
+    }
+
+    pub(crate) fn lease_is_active(&self, reference: &str) -> Result<Option<bool>, ScopeLockError> {
+        let Some((generation, identity)) = reference
+            .strip_prefix("scope-lease:")
+            .and_then(|value| value.split_once(':'))
+        else {
+            return Ok(None);
+        };
+        if generation != self.shared.owner_generation.to_string() {
+            return Ok(None);
+        }
+        let Ok(identity) = Uuid::parse_str(identity) else {
+            return Ok(None);
+        };
+        let guard = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| ScopeLockError::Poisoned)?;
+        Ok(Some(guard.active.contains_key(&identity)))
+    }
+
+    fn binding_owner_path(&self, key: &str) -> Result<PathBuf, ScopeLockError> {
+        if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ScopeLockError::InvalidPath(
+                "invalid binding owner identity".into(),
+            ));
+        }
+        let root = self.shared.lock_root.as_ref().ok_or_else(|| {
+            ScopeLockError::InvalidPath(
+                "binding recovery requires persistent scope lock root".into(),
+            )
+        })?;
+        Ok(root.join("binding-owners-v1").join(format!("{key}.lock")))
+    }
+
+    pub(crate) fn acquire_binding_owner(
+        &self,
+        key: &str,
+        validate_unadmitted: impl FnOnce() -> Result<(), String>,
+    ) -> Result<BindingOwnerFence, ScopeLockError> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let path = self.binding_owner_path(key)?;
+        let directory = path.parent().unwrap();
+        fs::create_dir_all(directory).map_err(|error| scope_io(directory, error))?;
+        File::open(directory.parent().unwrap())
+            .and_then(|file| file.sync_all())
+            .map_err(|error| scope_io(directory, error))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|error| scope_io(&path, error))?;
+        FileExt::try_lock_exclusive(&file).map_err(|error| scope_io(&path, error))?;
+        let metadata = file.metadata().map_err(|error| scope_io(&path, error))?;
+        let current = fs::symlink_metadata(&path).map_err(|error| scope_io(&path, error))?;
+        if !metadata.is_file()
+            || !current.is_file()
+            || metadata.dev() != current.dev()
+            || metadata.ino() != current.ino()
+        {
+            return Err(ScopeLockError::InvalidPath(
+                "binding owner inode changed".into(),
+            ));
+        }
+        let mut marker = String::new();
+        Read::by_ref(&mut file)
+            .take(128)
+            .read_to_string(&mut marker)
+            .map_err(|error| scope_io(&path, error))?;
+        let expected = format!("binding-owner-v1:{key}\n");
+        if !expected.starts_with(marker.as_str()) {
+            return Err(ScopeLockError::InvalidPath(
+                "unsupported or incomplete binding owner marker".into(),
+            ));
+        }
+        validate_unadmitted().map_err(ScopeLockError::InvalidPath)?;
+        if marker != expected {
+            file.seek(SeekFrom::Start(0))
+                .and_then(|_| file.write_all(expected.as_bytes()))
+                .map_err(|error| scope_io(&path, error))?;
+        }
+        file.sync_all().map_err(|error| scope_io(&path, error))?;
+        File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| scope_io(directory, error))?;
+        Ok(BindingOwnerFence {
+            file,
+            key: key.into(),
+            recovery: false,
+            released: false,
+            failed: false,
+        })
+    }
+
+    pub(crate) fn try_recover_binding_owner(
+        &self,
+        key: &str,
+    ) -> Result<Option<BindingOwnerFence>, ScopeLockError> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.binding_owner_path(key)?;
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(scope_io(&path, error)),
+        };
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(scope_io(&path, error)),
+        }
+        let mut marker = String::new();
+        file.by_ref()
+            .take(128)
+            .read_to_string(&mut marker)
+            .map_err(|error| scope_io(&path, error))?;
+        if marker != format!("binding-owner-v1:{key}\n") {
+            return Err(ScopeLockError::InvalidPath(
+                "unsupported or incomplete binding owner marker".into(),
+            ));
+        }
+        Ok(Some(BindingOwnerFence {
+            file,
+            key: key.into(),
+            recovery: true,
+            released: false,
+            failed: false,
+        }))
+    }
+
     pub fn active_lease_count(&self) -> Result<usize, ScopeLockError> {
         self.shared
             .state
@@ -289,9 +663,15 @@ pub struct ScopeLockLease {
     requests: Vec<ScopeLockRequest>,
     process_locks: Vec<File>,
     released: bool,
+    #[cfg(test)]
+    fail_release: bool,
 }
 
 impl ScopeLockLease {
+    pub(crate) fn projection_reference(&self) -> String {
+        format!("scope-lease:{}:{}", self.shared.owner_generation, self.id)
+    }
+
     pub fn id(&self) -> Uuid {
         self.id
     }
@@ -304,9 +684,36 @@ impl ScopeLockLease {
         self.release_inner();
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_release_for_test(&mut self) {
+        self.fail_release = true;
+    }
+
+    pub(crate) fn try_release(mut self) -> Result<(), ScopeLockError> {
+        self.release_checked()
+    }
+
     fn release_inner(&mut self) {
+        let _ = self.release_checked();
+    }
+
+    fn release_checked(&mut self) -> Result<(), ScopeLockError> {
         if self.released {
-            return;
+            return Ok(());
+        }
+        let mut release_error = None;
+        #[cfg(test)]
+        if self.fail_release {
+            release_error = Some(scope_io(
+                Path::new("scope-lease"),
+                std::io::Error::other("injected explicit release failure"),
+            ));
+        }
+        for lock in self.process_locks.drain(..).rev() {
+            if let Err(error) = FileExt::unlock(&lock) {
+                release_error = Some(scope_io(Path::new("scope-lease"), error));
+            }
+            drop(lock);
         }
         {
             let mut guard = self
@@ -316,11 +723,9 @@ impl ScopeLockLease {
                 .unwrap_or_else(|error| error.into_inner());
             guard.active.remove(&self.id);
         }
-        for lock in self.process_locks.drain(..).rev() {
-            let _ = FileExt::unlock(&lock);
-        }
         self.released = true;
         self.shared.changed.notify_waiters();
+        release_error.map_or(Ok(()), Err)
     }
 }
 
@@ -532,6 +937,138 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn r1_478_unadmitted_owner_retry_keeps_inode_and_runs_checker_under_lock() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ScopeLockManager::persistent(directory.path()).unwrap();
+        let peer = ScopeLockManager::persistent(directory.path()).unwrap();
+        let key = "a".repeat(64);
+        let first = manager.acquire_binding_owner(&key, || Ok(())).unwrap();
+        let path = manager.binding_owner_path(&key).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        let checks = std::cell::Cell::new(0);
+        assert!(peer
+            .acquire_binding_owner(&key, || {
+                checks.set(checks.get() + 1);
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(checks.get(), 0);
+        assert!(peer.try_recover_binding_owner(&key).unwrap().is_none());
+        drop(first);
+        let retried = peer
+            .acquire_binding_owner(&key, || {
+                checks.set(checks.get() + 1);
+                assert!(manager.try_recover_binding_owner(&key).unwrap().is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(checks.get(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("binding-owner-v1:{key}\n")
+        );
+        assert!(!retried.recovery);
+        drop(retried);
+        assert!(
+            manager
+                .try_recover_binding_owner(&key)
+                .unwrap()
+                .unwrap()
+                .recovery
+        );
+    }
+
+    #[test]
+    fn r1_478_canonical_rejection_preserves_marker_and_releases_same_inode_lock() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ScopeLockManager::persistent(directory.path()).unwrap();
+        let key = "b".repeat(64);
+        drop(manager.acquire_binding_owner(&key, || Ok(())).unwrap());
+        let path = manager.binding_owner_path(&key).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        let marker = fs::read(&path).unwrap();
+        let result = manager
+            .acquire_binding_owner(&key, || Err("canonical attempt already admitted".into()));
+        assert!(matches!(result, Err(ScopeLockError::InvalidPath(reason))
+            if reason == "canonical attempt already admitted"));
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read(&path).unwrap(), marker);
+        assert!(manager.try_recover_binding_owner(&key).unwrap().is_some());
+    }
+
+    #[test]
+    fn r1_478_empty_marker_requires_admission_check_and_missing_recovery_never_creates() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ScopeLockManager::persistent(directory.path()).unwrap();
+        let key = "c".repeat(64);
+        let path = manager.binding_owner_path(&key).unwrap();
+        assert!(manager.try_recover_binding_owner(&key).unwrap().is_none());
+        assert!(!path.exists());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        File::create(&path).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        assert!(manager.try_recover_binding_owner(&key).is_err());
+        assert!(manager
+            .acquire_binding_owner(&key, || Err("source unavailable".into()))
+            .is_err());
+        assert!(fs::read(&path).unwrap().is_empty());
+        drop(manager.acquire_binding_owner(&key, || Ok(())).unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("binding-owner-v1:{key}\n")
+        );
+        let interrupted = format!("binding-owner-v1:{}", &key[..8]);
+        fs::write(&path, &interrupted).unwrap();
+        assert!(manager.try_recover_binding_owner(&key).is_err());
+        assert!(manager
+            .acquire_binding_owner(&key, || Err("source unavailable".into()))
+            .is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), interrupted);
+        drop(manager.acquire_binding_owner(&key, || Ok(())).unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("binding-owner-v1:{key}\n")
+        );
+        fs::write(&path, "corrupt marker").unwrap();
+        let checks = std::cell::Cell::new(0);
+        assert!(manager
+            .acquire_binding_owner(&key, || {
+                checks.set(checks.get() + 1);
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(checks.get(), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "corrupt marker");
+    }
+
+    #[test]
+    fn r1_478_owner_admission_rejects_symlink_without_touching_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ScopeLockManager::persistent(directory.path()).unwrap();
+        let key = "d".repeat(64);
+        let path = manager.binding_owner_path(&key).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = directory.path().join("unrelated");
+        fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let checks = std::cell::Cell::new(0);
+        assert!(manager
+            .acquire_binding_owner(&key, || {
+                checks.set(checks.get() + 1);
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(checks.get(), 0);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    }
+
     fn request(scope: ScopedResource, mode: ScopeLockMode) -> ScopeLockRequest {
         ScopeLockRequest { scope, mode }
     }
@@ -633,18 +1170,16 @@ mod tests {
                 .await,
             Err(ScopeLockError::TimedOut { .. })
         ));
-        assert!(
-            manager
-                .acquire(
-                    [request(
-                        workspace_object_in("other-repo", "src/lib.rs"),
-                        ScopeLockMode::Write,
-                    )],
-                    Some(Duration::from_millis(10)),
-                )
-                .await
-                .is_ok()
-        );
+        assert!(manager
+            .acquire(
+                [request(
+                    workspace_object_in("other-repo", "src/lib.rs"),
+                    ScopeLockMode::Write,
+                )],
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -730,18 +1265,16 @@ mod tests {
             Err(ScopeLockError::TimedOut { .. })
         ));
         drop(held);
-        assert!(
-            second
-                .acquire(
-                    [request(
-                        ScopedResource::workspace("workspace").unwrap(),
-                        ScopeLockMode::Read,
-                    )],
-                    Some(Duration::from_millis(50)),
-                )
-                .await
-                .is_ok()
-        );
+        assert!(second
+            .acquire(
+                [request(
+                    ScopedResource::workspace("workspace").unwrap(),
+                    ScopeLockMode::Read,
+                )],
+                Some(Duration::from_millis(50)),
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -759,18 +1292,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            second
-                .acquire(
-                    [request(
-                        ScopedResource::workspace("right").unwrap(),
-                        ScopeLockMode::Write,
-                    )],
-                    Some(Duration::from_millis(25)),
-                )
-                .await
-                .is_ok()
-        );
+        assert!(second
+            .acquire(
+                [request(
+                    ScopedResource::workspace("right").unwrap(),
+                    ScopeLockMode::Write,
+                )],
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -789,18 +1320,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            second
-                .acquire(
-                    [request(
-                        workspace_object("tests/e2e.rs"),
-                        ScopeLockMode::Write,
-                    )],
-                    Some(Duration::from_millis(25)),
-                )
-                .await
-                .is_ok()
-        );
+        assert!(second
+            .acquire(
+                [request(
+                    workspace_object("tests/e2e.rs"),
+                    ScopeLockMode::Write,
+                )],
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .is_ok());
         assert!(matches!(
             second
                 .acquire(
@@ -813,5 +1342,112 @@ mod tests {
                 .await,
             Err(ScopeLockError::TimedOut { .. })
         ));
+    }
+    #[test]
+    fn try_acquire_normalizes_conflicts_and_releases_at_scope_exit() {
+        let manager = ScopeLockManager::new();
+        let scope = workspace_object("proof/source.py");
+        {
+            let lease = manager
+                .try_acquire([
+                    request(scope.clone(), ScopeLockMode::Read),
+                    request(scope.clone(), ScopeLockMode::Write),
+                ])
+                .unwrap()
+                .unwrap();
+            assert_eq!(lease.requests().len(), 1);
+            assert_eq!(lease.requests()[0].mode, ScopeLockMode::Write);
+            assert!(manager
+                .try_acquire([request(scope.clone(), ScopeLockMode::Read)])
+                .unwrap()
+                .is_none());
+            assert_eq!(manager.active_lease_count().unwrap(), 1);
+        }
+        assert_eq!(manager.active_lease_count().unwrap(), 0);
+        assert!(manager
+            .try_acquire([request(scope, ScopeLockMode::Write)])
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_respects_original_pending_writer_fairness_without_waiting() {
+        let manager = ScopeLockManager::new();
+        let scope = workspace_object("proof/source.py");
+        let reader = manager
+            .try_acquire([request(scope.clone(), ScopeLockMode::Read)])
+            .unwrap()
+            .unwrap();
+        let waiter_manager = manager.clone();
+        let waiter_scope = scope.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_manager
+                .acquire([request(waiter_scope, ScopeLockMode::Write)], None)
+                .await
+        });
+        for _iteration in 0..1000 {
+            if !manager.shared.state.lock().unwrap().pending.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(manager.shared.state.lock().unwrap().pending.len(), 1);
+        let started = Instant::now();
+        assert!(manager
+            .try_acquire([request(scope.clone(), ScopeLockMode::Read)])
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let independent = manager
+            .try_acquire([request(
+                workspace_object("other/source.py"),
+                ScopeLockMode::Write,
+            )])
+            .unwrap()
+            .unwrap();
+        drop(independent);
+        drop(reader);
+        let writer = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(manager
+            .try_acquire([request(scope, ScopeLockMode::Read)])
+            .unwrap()
+            .is_none());
+        drop(writer);
+        assert_eq!(manager.active_lease_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn try_acquire_preserves_persistent_process_lock_exclusion() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = ScopeLockManager::persistent(directory.path()).unwrap();
+        let peer = ScopeLockManager::persistent(directory.path()).unwrap();
+        let scope = workspace_object("proof/source.py");
+        let writer = original
+            .try_acquire([request(scope.clone(), ScopeLockMode::Write)])
+            .unwrap()
+            .unwrap();
+        assert!(peer
+            .try_acquire([request(scope.clone(), ScopeLockMode::Read)])
+            .unwrap()
+            .is_none());
+        assert_eq!(peer.active_lease_count().unwrap(), 0);
+        drop(writer);
+        let reader = peer
+            .try_acquire([request(scope.clone(), ScopeLockMode::Read)])
+            .unwrap()
+            .unwrap();
+        assert!(original
+            .try_acquire([request(scope.clone(), ScopeLockMode::Write)])
+            .unwrap()
+            .is_none());
+        drop(reader);
+        assert!(original
+            .try_acquire([request(scope, ScopeLockMode::Write)])
+            .unwrap()
+            .is_some());
     }
 }

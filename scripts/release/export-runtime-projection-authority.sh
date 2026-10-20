@@ -8,6 +8,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COWD_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+: "${COWD_GENERATION_FROZEN_SOURCESET:?canonical generation requires the frozen R1 source manifest identity}"
 OUTPUT_DIR="$1"
 if [[ -e "$OUTPUT_DIR" ]]; then
   echo "authority output already exists: $OUTPUT_DIR" >&2

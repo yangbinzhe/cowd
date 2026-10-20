@@ -1508,9 +1508,9 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let config_diagnostics = loaded.diagnostics;
     emit_config_diagnostics(&config_diagnostics);
     let provider_registry = match runtime::ProviderRegistry::new_with_context_windows(
-        runtime_config.providers().clone(), runtime_config.model_context_windows().clone(),
-    )
-    {
+        runtime_config.providers().clone(),
+        runtime_config.model_context_windows().clone(),
+    ) {
         Ok(registry) => Arc::new(registry),
         Err(rejected) => {
             let error = format!(
@@ -1945,10 +1945,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .await
                 {
                     Ok(admitted) if admitted > 0 => {
-                        tracing::info!(
-                            admitted,
-                            "periodic agentic reconciliation admitted work"
-                        );
+                        tracing::info!(admitted, "periodic agentic reconciliation admitted work");
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -2343,6 +2340,11 @@ pub(crate) async fn restore_runtime_before_admission(
         };
         recovery_supervisor.record_recovery(summary, recovery_state);
         if complete {
+            runtime_services
+                .install_startup_recovery_exclusions(excluded_sessions)
+                .map_err(|error| {
+                    format!("failed to install recovered Session partition: {error}")
+                })?;
             return Ok(());
         }
         if attempt < MAX_ATTEMPTS {

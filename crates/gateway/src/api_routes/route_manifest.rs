@@ -139,6 +139,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frame_source_routes_have_one_owner_and_no_writer_lease() {
+        let manifest = gateway_route_manifest();
+        let metadata = typed_route_metadata();
+        let frames = manifest
+            .iter()
+            .filter(|entry| entry.path.ends_with("/frame-source-bindings"))
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 2);
+        for route in frames {
+            assert_eq!(route.source, "app_routes.rs");
+            let typed = metadata
+                .iter()
+                .find(|entry| entry.method == route.method && entry.path == route.path)
+                .unwrap();
+            assert_eq!(
+                typed.session_writer,
+                super::super::route_registry::SessionWriterPolicy::None
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_routes_are_unique_and_do_not_require_a_writer() {
+        let manifest = gateway_route_manifest();
+        let receipts = manifest
+            .iter()
+            .filter(|entry| entry.path.contains("/messages/:message_id/"))
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 2);
+        let metadata = typed_route_metadata();
+        for route in receipts {
+            let typed = metadata
+                .iter()
+                .find(|entry| entry.method == route.method && entry.path == route.path)
+                .unwrap();
+            assert_eq!(
+                typed.session_writer,
+                super::super::route_registry::SessionWriterPolicy::None
+            );
+            assert_eq!(route.source, "message_routes.rs");
+        }
+    }
+
+    #[test]
     fn route_manifest_contains_skill_lifecycle_routes() {
         let manifest = gateway_route_manifest();
         let has = |method: &str, path: &str| {

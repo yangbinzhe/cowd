@@ -4,7 +4,7 @@
 //! no scheduler, model loop, or Gateway dependency; interventions remain
 //! proposals until RuntimeExecutionSupervisor applies them at a checkpoint.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -26,13 +26,16 @@ use harness_contract::goal::{
 };
 
 use crate::{
-    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
-    runtime_event_store::RuntimeTransactionEventInput,
+    runtime_event_store::RuntimeTransactionEventInput, RuntimeEventInput, RuntimeEventRef,
+    RuntimeEventScope, RuntimeEventStore,
 };
 
 #[derive(Clone)]
 pub struct GoalStore {
     event_store: Arc<RuntimeEventStore>,
+    proof_artifacts: Option<Arc<crate::ArtifactStore>>,
+    process_input_verifier: Option<crate::agentic::review_evidence::ProcessInputVerifier>,
+    proof_session_queries: Option<Arc<OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>>>,
 }
 
 /// Read model reconstructed exclusively from the durable Goal stream. Runtime
@@ -228,11 +231,6 @@ impl GoalProgressReducer {
             .last_observed_at_ms
             .max(observation.freshness.observed_at_ms);
         snapshot.applied_observation_keys.push(key);
-        if snapshot.applied_observation_keys.len() > 256 {
-            snapshot
-                .applied_observation_keys
-                .drain(..snapshot.applied_observation_keys.len() - 256);
-        }
         normalize(&mut snapshot.evidence_refs);
         normalize(&mut snapshot.invalidated_evidence_refs);
         normalize(&mut snapshot.open_conflicts);
@@ -341,6 +339,8 @@ impl GoalStore {
         let current = self
             .get(&goal_id)?
             .ok_or_else(|| format!("Objective action target {goal_id} not found"))?;
+        self.event_store
+            .ensure_session_recovery_admitted(&current.session_id)?;
         // Resolve over-qualified criterion refs before any validation or event
         // building so both see the plain specification id.
         let action = Self::normalize_criterion_ref(&envelope.action, &current);
@@ -704,7 +704,35 @@ pub(crate) fn goal_spec_digest(goal: &GoalContract) -> String {
 impl GoalStore {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
-        Self { event_store }
+        Self {
+            event_store,
+            proof_artifacts: None,
+            process_input_verifier: None,
+            proof_session_queries: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_process_input_verifier(
+        mut self,
+        verifier: crate::agentic::review_evidence::ProcessInputVerifier,
+    ) -> Self {
+        self.process_input_verifier = Some(verifier);
+        self
+    }
+
+    pub(crate) fn with_artifact_store(mut self, artifacts: Arc<crate::ArtifactStore>) -> Self {
+        self.proof_artifacts = Some(artifacts);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_session_query_slot(
+        mut self,
+        queries: Arc<OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>>,
+    ) -> Self {
+        self.proof_session_queries = Some(queries);
+        self
     }
 
     pub fn create(&self, goal: GoalContract) -> Result<GoalContract, String> {
@@ -733,24 +761,8 @@ impl GoalStore {
     }
 
     pub fn get(&self, goal_id: &str) -> Result<Option<GoalContract>, String> {
-        let stream_id = stream_id(goal_id);
-        let mut latest = None;
-        for event in self
-            .event_store
-            .list_stream(&stream_id)
-            .map_err(|error| error.to_string())?
-        {
-            if event.scope != RuntimeEventScope::Goal {
-                return Err(format!("goal stream {stream_id} contains a non-goal event"));
-            }
-            if let Some(value) = event.payload.get("goal") {
-                latest = Some(
-                    serde_json::from_value::<GoalContract>(value.clone())
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-        }
-        Ok(latest)
+        self.projection(goal_id)
+            .map(|projection| projection.map(|projection| projection.goal))
     }
 
     pub fn projection(&self, goal_id: &str) -> Result<Option<GoalProjection>, String> {
@@ -761,93 +773,209 @@ impl GoalStore {
         let mut intervention_traces = Vec::new();
         let mut progress = None;
         let mut stream_revision = 0_u64;
-        for event in self
+        let head = self
             .event_store
-            .list_stream(&stream_id)
-            .map_err(|error| error.to_string())?
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let checkpoint_id = format!("goal-projection:{goal_id}");
+        let checkpoint = self
+            .event_store
+            .projection_checkpoint(&checkpoint_id)
+            .map_err(|error| error.to_string())?;
+        let mut checkpoint_valid = false;
+        if let Some(saved) = checkpoint
+            .as_ref()
+            .filter(|saved| saved.source_cursor <= head)
         {
-            stream_revision = event.sequence;
-            if event.scope != RuntimeEventScope::Goal {
-                return Err(format!("goal stream {stream_id} contains a non-goal event"));
-            }
-            if let Some(value) = event.payload.get("goal") {
-                let event_goal = serde_json::from_value::<GoalContract>(value.clone())
-                    .map_err(|error| error.to_string())?;
-                if progress.is_none() {
-                    progress = Some(GoalProgressReducer::from_goal(&event_goal));
-                } else if matches!(
-                    event.kind.as_str(),
-                    "goal.created" | "goal.revised" | "goal.completed" | "goal.completion_waiting"
-                ) {
-                    let previous_goal = goal
-                        .as_ref()
-                        .ok_or_else(|| "goal revision precedes goal creation".to_string())?;
-                    let goal_progress = progress
-                        .as_mut()
-                        .ok_or_else(|| "goal progress was not initialized".to_string())?;
-                    GoalProgressReducer::reconcile_goal(goal_progress, previous_goal, &event_goal);
-                }
-                goal = Some(event_goal);
-            }
-            if let Some(value) = event.payload.get("observation") {
-                let observation = serde_json::from_value::<RuntimeObservation>(value.clone())
-                    .map_err(|error| error.to_string())?;
-                GoalProgressReducer::apply(
-                    progress
-                        .as_mut()
-                        .ok_or_else(|| "goal observation precedes goal creation".to_string())?,
-                    &observation,
-                )?;
-                observations.push(observation);
-                if observations.len() > 256 {
-                    observations.remove(0);
-                }
-            }
-            if let Some(value) = event.payload.get("intervention") {
-                interventions.push(
-                    serde_json::from_value::<RuntimeIntervention>(value.clone())
-                        .map_err(|error| error.to_string())?,
-                );
-                intervention_traces.push(
-                    serde_json::from_value::<RuntimeInterventionTrace>(
-                        event
-                            .payload
-                            .get("intervention_trace")
-                            .cloned()
-                            .ok_or_else(|| {
-                                "goal intervention event has no typed trigger trace".to_string()
-                            })?,
+            let restored = saved.payload["scope"]
+                .as_str()
+                .ok_or_else(|| "Goal checkpoint scope missing".to_string())
+                .and_then(|scope| {
+                    self.event_store.resolve_content(
+                        scope,
+                        &saved.payload["body"],
+                        &crate::PreparedArtifactOrigin::CheckpointBody {
+                            projection_id: checkpoint_id.clone(),
+                            source_cursor: saved.source_cursor,
+                        },
                     )
-                    .map_err(|error| error.to_string())?,
-                );
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<GoalProjection>(value)
+                        .map_err(|_| "invalid Goal checkpoint".to_string())
+                });
+            if let Ok(restored) = restored {
+                if restored.goal.id == goal_id
+                    && restored.stream_revision == saved.source_cursor
+                    && saved.payload["schema"] == 2
+                    && saved.payload["scope"] == format!("session:{}", restored.goal.session_id)
+                {
+                    checkpoint_valid = true;
+                    stream_revision = restored.stream_revision;
+                    goal = Some(restored.goal);
+                    observations = restored.observations;
+                    interventions = restored.interventions;
+                    intervention_traces = restored.intervention_traces;
+                    progress = Some(restored.progress);
+                }
             }
         }
-        Ok(goal.map(|goal| GoalProjection {
+        while stream_revision < head {
+            let page = self.event_store.list_stream_after(
+                &stream_id,
+                stream_revision,
+                head,
+                100,
+                1024 * 1024,
+            )?;
+            if page.is_empty() {
+                return Err("Goal tail has a sequence gap".into());
+            }
+            for event in page {
+                if event.stream_id != stream_id
+                    || event.sequence
+                        != stream_revision
+                            .checked_add(1)
+                            .ok_or("Goal sequence overflow")?
+                {
+                    return Err("Goal tail is not continuous".into());
+                }
+                stream_revision = event.sequence;
+                if (event.kind == "goal.observation" && event.payload.get("goal").is_some())
+                    || (event.kind != "goal.observation" && event.schema_version != 1)
+                {
+                    return Err("unsupported Goal event schema".into());
+                }
+                if event.scope != RuntimeEventScope::Goal {
+                    return Err(format!("goal stream {stream_id} contains a non-goal event"));
+                }
+                if let Some(value) = event.payload.get("goal") {
+                    let event_goal = serde_json::from_value::<GoalContract>(value.clone())
+                        .map_err(|error| error.to_string())?;
+                    if event_goal.id != goal_id {
+                        return Err("Goal snapshot identity mismatch".into());
+                    }
+                    if progress.is_none() {
+                        progress = Some(GoalProgressReducer::from_goal(&event_goal));
+                    } else if matches!(
+                        event.kind.as_str(),
+                        "goal.created"
+                            | "goal.revised"
+                            | "goal.completed"
+                            | "goal.completion_waiting"
+                    ) {
+                        let previous_goal = goal
+                            .as_ref()
+                            .ok_or_else(|| "goal revision precedes goal creation".to_string())?;
+                        let goal_progress = progress
+                            .as_mut()
+                            .ok_or_else(|| "goal progress was not initialized".to_string())?;
+                        GoalProgressReducer::reconcile_goal(
+                            goal_progress,
+                            previous_goal,
+                            &event_goal,
+                        );
+                    }
+                    goal = Some(event_goal);
+                }
+                if event.kind == "goal.observation" {
+                    let value = self.event_store.resolve_observation_record(&event)?;
+                    let source = &event.payload["goal_source"];
+                    let current = goal.as_ref().ok_or("observation precedes Goal creation")?;
+                    if source["stream_id"] != stream_id
+                        || source["goal_revision"] != current.revision
+                        || source["spec_digest"] != current.spec_digest
+                        || source["sequence"]
+                            .as_u64()
+                            .is_none_or(|sequence| sequence >= event.sequence)
+                    {
+                        return Err("observation Goal source mismatch".into());
+                    }
+                    let observation = serde_json::from_value::<RuntimeObservation>(value)
+                        .map_err(|error| error.to_string())?;
+                    if observation.goal_id() != goal_id {
+                        return Err("observation Goal identity mismatch".into());
+                    }
+                    GoalProgressReducer::apply(
+                        progress
+                            .as_mut()
+                            .ok_or_else(|| "goal observation precedes goal creation".to_string())?,
+                        &observation,
+                    )?;
+                    observations.push(observation);
+                    if observations.len() > 256 {
+                        observations.remove(0);
+                    }
+                }
+                if let Some(value) = event.payload.get("intervention") {
+                    interventions.push(
+                        serde_json::from_value::<RuntimeIntervention>(value.clone())
+                            .map_err(|error| error.to_string())?,
+                    );
+                    intervention_traces.push(
+                        serde_json::from_value::<RuntimeInterventionTrace>(
+                            event
+                                .payload
+                                .get("intervention_trace")
+                                .cloned()
+                                .ok_or_else(|| {
+                                    "goal intervention event has no typed trigger trace".to_string()
+                                })?,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    );
+                }
+            }
+        }
+        let projection = goal.map(|goal| GoalProjection {
             progress: progress.unwrap_or_else(|| GoalProgressReducer::from_goal(&goal)),
             goal,
             stream_revision,
             observations,
             interventions,
             intervention_traces,
-        }))
+        });
+        if let Some(projection) = &projection {
+            if checkpoint.as_ref().is_none_or(|saved| {
+                saved.source_cursor <= head && (!checkpoint_valid || saved.source_cursor < head)
+            }) {
+                let scope = format!("session:{}", projection.goal.session_id);
+                let body = self.event_store.prepare_content(
+                    &scope,
+                    &format!("{checkpoint_id}:{head}"),
+                    &serde_json::to_value(projection).map_err(|error| error.to_string())?,
+                    &crate::PreparedArtifactOrigin::CheckpointBody {
+                        projection_id: checkpoint_id.clone(),
+                        source_cursor: head,
+                    },
+                )?;
+                let payload = serde_json::json!({"schema":2,"scope":scope,"body":body});
+                let expected = checkpoint.as_ref().map_or(0, |saved| saved.revision);
+                let write = if checkpoint.is_some() && !checkpoint_valid {
+                    RuntimeEventStore::compare_and_repair_projection_checkpoint
+                } else {
+                    RuntimeEventStore::compare_and_put_projection_checkpoint
+                };
+                match write(
+                    &self.event_store,
+                    &checkpoint_id,
+                    head,
+                    expected,
+                    &payload,
+                    0,
+                ) {
+                    Ok(_) | Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        Ok(projection)
     }
 
     pub fn observations(&self, goal_id: &str) -> Result<Vec<RuntimeObservation>, String> {
-        self.event_store
-            .list_stream(&stream_id(goal_id))
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter(|event| event.kind == "goal.observation")
-            .filter_map(|event| event.payload.get("observation").cloned())
-            .map(serde_json::from_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|mut observations| {
-                if observations.len() > 256 {
-                    observations.drain(..observations.len() - 256);
-                }
-                observations
-            })
-            .map_err(|error| error.to_string())
+        Ok(self
+            .projection(goal_id)?
+            .map_or_else(Vec::new, |projection| projection.observations))
     }
 
     pub fn revise(
@@ -892,6 +1020,8 @@ impl GoalStore {
         let mut goal = self
             .get(goal_id)?
             .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        self.event_store
+            .ensure_session_recovery_admitted(&goal.session_id)?;
         if goal.revision != expected_revision {
             return Err(format!(
                 "goal revision stale: expected {expected_revision}, actual {}",
@@ -943,14 +1073,25 @@ impl GoalStore {
             .iter()
             .any(|existing| existing == &key)
         {
+            if self
+                .event_store
+                .event_by_idempotency_key(
+                    &stream_id(observation.goal_id()),
+                    &format!("direct:{key}"),
+                )
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                self.observation_event_at(&projection, &observation, format!("direct:{key}"))?;
+            }
             return Ok(());
         }
-        let event = self.observation_event(&observation, format!("direct:{key}"))?;
+        let event =
+            self.observation_event_at(&projection, &observation, format!("direct:{key}"))?;
         let stream_id = event.event.stream_id.clone();
-        let revision = self
-            .event_store
-            .stream_revision(&stream_id)
-            .map_err(|error| error.to_string())?;
+        let revision = event.event.payload["goal_source"]["sequence"]
+            .as_u64()
+            .ok_or("observation source revision missing")?;
         self.event_store
             .append_batch_if_revision(
                 stream_id,
@@ -1281,10 +1422,65 @@ impl GoalStore {
         idempotency_key: String,
     ) -> Result<RuntimeTransactionEventInput, String> {
         validate_observation(observation)?;
-        let goal = self
-            .get(observation.goal_id())?
+        let projection = self
+            .projection(observation.goal_id())?
             .ok_or_else(|| format!("goal {} not found", observation.goal_id()))?;
-        Ok(goal_event(
+        self.observation_event_at(&projection, observation, idempotency_key)
+    }
+
+    pub(crate) fn observation_event_at(
+        &self,
+        projection: &GoalProjection,
+        observation: &RuntimeObservation,
+        idempotency_key: String,
+    ) -> Result<RuntimeTransactionEventInput, String> {
+        validate_observation(observation)?;
+        let goal = &projection.goal;
+        self.event_store
+            .ensure_session_recovery_admitted(&goal.session_id)?;
+        if goal.id != observation.goal_id() {
+            return Err("observation crosses frozen Goal source".into());
+        }
+        if observation.identity.session_id != goal.session_id {
+            return Err("observation crosses Goal Session".into());
+        }
+        let value = serde_json::to_value(observation).map_err(|error| error.to_string())?;
+        if let Some(original) = self
+            .event_store
+            .event_by_idempotency_key(&stream_id(&goal.id), &idempotency_key)
+            .map_err(|error| error.to_string())?
+        {
+            if self.event_store.resolve_observation_record(&original)? != value {
+                return Err(
+                    "observation retry conflicts with original current-schema bytes".into(),
+                );
+            }
+            return Ok(RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: original.stream_id,
+                    scope: original.scope,
+                    kind: original.kind,
+                    status: original.status,
+                    actor: original.actor,
+                    refs: original.refs,
+                    payload: original.payload,
+                },
+                idempotency_key: Some(idempotency_key),
+                schema_version: original.schema_version,
+            });
+        }
+        let body = self.event_store.prepare_content(
+            &format!("session:{}", goal.session_id),
+            &format!("{}:{idempotency_key}", stream_id(&goal.id)),
+            &value,
+            &crate::PreparedArtifactOrigin::EventBody {
+                stream_id: stream_id(&goal.id),
+                idempotency_key: idempotency_key.clone(),
+                kind: "goal.observation".into(),
+            },
+        )?;
+        let classifier = RuntimeEventStore::classify_observation(&value)?;
+        let mut event = goal_event(
             &goal,
             "goal.observation",
             "observed",
@@ -1299,9 +1495,13 @@ impl GoalStore {
                     id: id.clone(),
                 })
                 .collect(),
-            serde_json::json!({ "goal": goal, "observation": observation }),
+            serde_json::json!({ "observation_schema":2, "session_id":goal.session_id,
+                "goal_source":{"stream_id":stream_id(&goal.id),"sequence":projection.stream_revision,"goal_revision":goal.revision,"spec_digest":goal.spec_digest},
+                "classifier":classifier,"observation_body":body }),
             idempotency_key,
-        ))
+        );
+        event.schema_version = 2;
+        Ok(event)
     }
 
     /// Build, but do not append, an intervention event. Policy remains a
@@ -1334,6 +1534,8 @@ impl GoalStore {
         let goal = self
             .get(&intervention.goal_id)?
             .ok_or_else(|| format!("goal {} not found", intervention.goal_id))?;
+        self.event_store
+            .ensure_session_recovery_admitted(&goal.session_id)?;
         Ok(goal_event(
             &goal,
             "goal.intervention",
@@ -1399,6 +1601,8 @@ impl GoalStore {
             .projection(goal_id)?
             .ok_or_else(|| format!("goal {goal_id} not found"))?;
         let mut goal = projection.goal;
+        self.event_store
+            .ensure_session_recovery_admitted(&goal.session_id)?;
         if goal.completion != GoalCompletion::Open {
             return Err(format!("goal {goal_id} is already terminal"));
         }
@@ -1799,6 +2003,8 @@ impl GoalStore {
         actor: &str,
         refs: Vec<RuntimeEventRef>,
     ) -> Result<(), String> {
+        self.event_store
+            .ensure_session_recovery_admitted(&goal.session_id)?;
         self.append_goal_event_with_payload(
             stream_id,
             expected_revision,
@@ -1828,25 +2034,23 @@ impl GoalStore {
                 stream_id.to_string(),
                 expected_revision,
                 transaction_id,
-                vec![
-                    RuntimeEventInput {
-                        stream_id: stream_id.to_string(),
-                        scope: RuntimeEventScope::Goal,
-                        kind: kind.to_string(),
-                        status: Some(status.to_string()),
-                        actor: Some(actor.to_string()),
-                        refs,
-                        payload,
-                    }
-                    .into(),
-                ],
+                vec![RuntimeEventInput {
+                    stream_id: stream_id.to_string(),
+                    scope: RuntimeEventScope::Goal,
+                    kind: kind.to_string(),
+                    status: Some(status.to_string()),
+                    actor: Some(actor.to_string()),
+                    refs,
+                    payload,
+                }
+                .into()],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
     }
 }
 
-fn validate_observation(observation: &RuntimeObservation) -> Result<(), String> {
+pub(crate) fn validate_observation(observation: &RuntimeObservation) -> Result<(), String> {
     if observation.identity.workspace_id.trim().is_empty()
         || observation.identity.session_id.trim().is_empty()
         || observation.identity.graph_id.trim().is_empty()
@@ -2187,6 +2391,187 @@ mod tests {
     }
 
     #[test]
+    fn r1_recovery_quarantine_blocks_original_goal_mutation_and_preserves_healthy_goal() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let goals = GoalStore::new(Arc::clone(&events));
+        goals.create(goal()).unwrap();
+        let mut healthy = goal();
+        healthy.id = "healthy-goal".into();
+        healthy.session_id = "healthy-session".into();
+        goals.create(healthy).unwrap();
+        let before = goals.projection("goal-test").unwrap().unwrap();
+        let head = events.stream_revision("goal:goal-test").unwrap();
+        events.replace_session_recovery_exclusions(std::collections::BTreeSet::from([
+            "session-test".into(),
+        ]));
+        let called = std::cell::Cell::new(false);
+        let error = goals
+            .revise("goal-test", 1, 2, "must remain quarantined", |goal| {
+                called.set(true);
+                goal.objective = "must not apply".into();
+                Vec::new()
+            })
+            .unwrap_err();
+        assert_eq!(error, "session_recovery_quarantined:session-test");
+        assert!(!called.get());
+        let error = goals.record_observation(observation(1)).unwrap_err();
+        assert_eq!(error, "session_recovery_quarantined:session-test");
+        assert_eq!(events.stream_revision("goal:goal-test").unwrap(), head);
+        assert_eq!(goals.projection("goal-test").unwrap().unwrap(), before);
+        let updated = goals
+            .revise(
+                "healthy-goal",
+                1,
+                2,
+                "healthy partition remains live",
+                |goal| {
+                    goal.objective = "healthy revision applied".into();
+                    Vec::new()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.0.objective, "healthy revision applied");
+    }
+
+    #[test]
+    fn r1_event_replay_current_schema_recovers_and_rejects_legacy() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
+                .expect("explicit private plan fixture root"),
+        )
+        .join(format!("goal-current-{}", uuid::Uuid::new_v4()));
+        assert!(root.is_absolute());
+        assert!(root.starts_with("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel"));
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(&root));
+        events.bind_artifact_store(Arc::clone(&artifacts)).unwrap();
+        let goals = GoalStore::new(Arc::clone(&events));
+        goals.create(goal()).unwrap();
+        let mut observed = observation(1);
+        observed.summary = "durable observation body ".repeat(2048);
+        observed.cost_delta.tool_calls = 3;
+        goals.record_observation(observed.clone()).unwrap();
+        let original = goals.projection("goal-test").unwrap().unwrap();
+        let event = events
+            .latest_for_stream_kind("goal:goal-test", "goal.observation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.schema_version, 2);
+        assert!(event.payload.get("goal").is_none());
+        let reference: harness_contract::context::ArtifactRef =
+            serde_json::from_value(event.payload["observation_body"]["body"]["artifact"].clone())
+                .unwrap();
+        let bytes = artifacts
+            .read_blocking(&reference, "session:session-test", None)
+            .unwrap();
+        assert_eq!(
+            format!("sha256:{:x}", sha2::Sha256::digest(&bytes)),
+            reference.sha256
+        );
+        assert_eq!(bytes.len() as u64, reference.bytes);
+        assert_eq!(
+            serde_json::from_slice::<RuntimeObservation>(&bytes).unwrap(),
+            observed
+        );
+        drop(goals);
+        let recovered = GoalStore::new(Arc::clone(&events));
+        assert_eq!(
+            recovered.projection("goal-test").unwrap().unwrap(),
+            original
+        );
+        let checkpoint = events
+            .projection_checkpoint("goal-projection:goal-test")
+            .unwrap()
+            .unwrap();
+        events
+            .inject_content_checkpoint_fault(
+                "goal-projection:goal-test",
+                checkpoint.source_cursor,
+                checkpoint.revision,
+                &serde_json::json!({"schema":999,"body":"not a current checkpoint"}),
+            )
+            .unwrap();
+        assert_eq!(
+            GoalStore::new(events.clone())
+                .projection("goal-test")
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        let repaired = events
+            .projection_checkpoint("goal-projection:goal-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.payload["schema"], 2);
+        assert_eq!(repaired.source_cursor, checkpoint.source_cursor);
+        recovered.record_observation(observed.clone()).unwrap();
+        assert_eq!(
+            recovered.projection("goal-test").unwrap().unwrap(),
+            original
+        );
+        let mut changed_retry = observed.clone();
+        changed_retry.summary.push_str(" changed bytes");
+        assert!(recovered.record_observation(changed_retry).is_err());
+        assert_eq!(
+            recovered.projection("goal-test").unwrap().unwrap(),
+            original
+        );
+        let prepared = recovered
+            .observation_event(
+                &observed,
+                "direct:".to_string() + &observed.idempotency_fingerprint(),
+            )
+            .unwrap();
+        let head = events.stream_revision("goal:goal-test").unwrap();
+        for schema in [1, 999] {
+            let mut unsupported = prepared.clone();
+            unsupported.schema_version = schema;
+            assert!(events
+                .append_batch_if_revision(
+                    "goal:goal-test",
+                    head,
+                    format!("unsupported-{schema}"),
+                    vec![unsupported]
+                )
+                .is_err());
+            assert_eq!(events.stream_revision("goal:goal-test").unwrap(), head);
+        }
+        assert_eq!(
+            recovered.projection("goal-test").unwrap().unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn proof_readers_bind_original_resources_and_projection_stays_optional() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let unbound = GoalStore::new(Arc::clone(&events));
+        assert!(unbound.proof_artifacts.is_none());
+        assert!(unbound.proof_session_queries.is_none());
+        let temporary = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(temporary.path()));
+        let queries = Arc::new(OnceLock::new());
+        let bound = GoalStore::new(Arc::clone(&events))
+            .with_artifact_store(Arc::clone(&artifacts))
+            .with_session_query_slot(Arc::clone(&queries));
+        let cloned = bound.clone();
+        assert!(Arc::ptr_eq(
+            cloned.proof_artifacts.as_ref().unwrap(),
+            &artifacts
+        ));
+        assert!(Arc::ptr_eq(
+            cloned.proof_session_queries.as_ref().unwrap(),
+            &queries
+        ));
+        assert!(queries.get().is_none());
+        unbound.create(goal()).unwrap();
+        assert_eq!(
+            bound.get("goal-test").unwrap(),
+            unbound.get("goal-test").unwrap()
+        );
+    }
+
+    #[test]
     fn goal_spec_digest_tracks_requirements_without_progress_state() {
         let mut original = goal();
         original
@@ -2498,13 +2883,11 @@ mod tests {
                 operation,
                 Some("checked".into()),
             );
-            assert!(
-                services
-                    .submit_agent_action(&rejected)
-                    .await
-                    .unwrap_err()
-                    .contains("original user_intent")
-            );
+            assert!(services
+                .submit_agent_action(&rejected)
+                .await
+                .unwrap_err()
+                .contains("original user_intent"));
             assert_eq!(
                 services
                     .event_store()
@@ -2561,13 +2944,11 @@ mod tests {
         assert_eq!(current.obligations, original.obligations);
         assert_eq!(current.source_intent_ref, original.source_intent_ref);
         assert_eq!(current.spec_revision, 4);
-        assert!(
-            services
-                .submit_agent_action(&review("cannot-review-retired-criterion"))
-                .await
-                .unwrap_err()
-                .contains("does not exist")
-        );
+        assert!(services
+            .submit_agent_action(&review("cannot-review-retired-criterion"))
+            .await
+            .unwrap_err()
+            .contains("does not exist"));
 
         let before = services
             .event_store()
@@ -2781,27 +3162,23 @@ mod tests {
             .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
             .unwrap();
         let before = events.stream_revision("goal:goal-test").unwrap();
-        assert!(
-            store
-                .complete(
-                    "goal-test",
-                    completed.revision,
-                    GoalCompletion::Satisfied,
-                    "again"
-                )
-                .is_err()
-        );
-        assert!(
-            store
-                .complete_objective("goal-test", completed.revision, terminal_for_test())
-                .is_err()
-        );
+        assert!(store
+            .complete(
+                "goal-test",
+                completed.revision,
+                GoalCompletion::Satisfied,
+                "again"
+            )
+            .is_err());
+        assert!(store
+            .complete_objective("goal-test", completed.revision, terminal_for_test())
+            .is_err());
         assert_eq!(events.stream_revision("goal:goal-test").unwrap(), before);
     }
 
     #[test]
-    fn objective_terminal_fence_replays_same_result_before_revision_check_and_rejects_changed_evidence()
-     {
+    fn objective_terminal_fence_replays_same_result_before_revision_check_and_rejects_changed_evidence(
+    ) {
         let events = Arc::new(RuntimeEventStore::for_test());
         let store = GoalStore::new(Arc::clone(&events));
         let mut goal = goal();
@@ -2820,12 +3197,10 @@ mod tests {
             completed
         );
         retry.evidence_refs.push("different-evidence".into());
-        assert!(
-            store
-                .complete_objective("goal-test", 1, retry)
-                .unwrap_err()
-                .contains("fence_conflict")
-        );
+        assert!(store
+            .complete_objective("goal-test", 1, retry)
+            .unwrap_err()
+            .contains("fence_conflict"));
         assert_eq!(events.stream_revision("goal:goal-test").unwrap(), before);
     }
 
@@ -2833,11 +3208,9 @@ mod tests {
     fn goal_revision_is_monotonic_and_completion_requires_acceptance() {
         let store = GoalStore::new(Arc::new(RuntimeEventStore::for_test()));
         store.create(goal()).unwrap();
-        assert!(
-            store
-                .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
-                .is_err()
-        );
+        assert!(store
+            .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
+            .is_err());
         let (revised, revision) = store
             .revise("goal-test", 1, 2, "evidence checked", |goal| {
                 goal.criteria[0].status = AcceptanceStatus::Satisfied;
@@ -3057,7 +3430,8 @@ mod tests {
                     result_refs: vec![],
                     evidence_refs: vec![material.selector.clone()],
                     reason_ref: material.selector.clone(),
-                reason: "the reviewed delivery does not yet cover every current result".to_string(),
+                    reason: "the reviewed delivery does not yet cover every current result"
+                        .to_string(),
                 }),
             })
             .await

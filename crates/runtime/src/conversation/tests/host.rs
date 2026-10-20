@@ -303,7 +303,7 @@ fn a_terminal_request_keeps_the_tools_it_still_owes_and_drops_them_only_when_not
     // A completion gap is owed: the closing tool must survive the terminal
     // request, together with the reads the closing action needs.
     let owed = mandatory_action_tool_ids(true, &["classify_issues".to_string()]);
-    for required in ["message_publish", "state_inspect", "evidence_retrieve"] {
+    for required in ["message_publish"] {
         assert!(
             owed.contains(required),
             "a terminal request that still owes an issue classification must expose {required}: {owed:?}"
@@ -314,7 +314,7 @@ fn a_terminal_request_keeps_the_tools_it_still_owes_and_drops_them_only_when_not
     // obligation, not the rung name the model happens to be on.
     let review = mandatory_action_tool_ids(true, &["objective_review".to_string()]);
     assert!(review.contains("objective_review"));
-    assert!(review.contains("state_inspect"));
+    assert!(!review.contains("state_inspect"));
     assert!(
         !review.contains("message_publish"),
         "an Objective-review gap must not be handed the issue-classification tool: {review:?}"
@@ -324,7 +324,7 @@ fn a_terminal_request_keeps_the_tools_it_still_owes_and_drops_them_only_when_not
     // legitimately needs its references read first.
     let integration = mandatory_action_tool_ids(true, &["publish_integration_task".to_string()]);
     assert!(integration.contains("task_publish"));
-    assert!(integration.contains("evidence_retrieve"));
+    assert!(!integration.contains("evidence_retrieve"));
 }
 
 /// The cumulative repeat counter must not count a wait, and must not count a call
@@ -628,4 +628,60 @@ fn three_per_task_reports_are_not_a_synthesis() {
         delivered_results_are_synthesized(&program),
         "an artifact hosted on an accepted Task and relating to two of them synthesizes"
     );
+}
+
+#[test]
+fn same_state_owed_context_separates_mutations_reads_and_unknown_wire() {
+    use super::host_backend::owed_action_context;
+    let names = ["artifact_commit", "read_ref"].into_iter().map(str::to_string).collect();
+    let state = serde_json::json!({"remaining":[{"step":"register_delivery"}],
+        "program_source":{"revision":4},"goal":{"spec_revision":2}});
+    let context = owed_action_context(&state, Some(&names));
+    assert_eq!(context["remaining"], state["remaining"]);
+    assert_eq!(context["program_source"], state["program_source"]);
+    assert_eq!(context["candidate_mutations"], serde_json::json!(["artifact_commit"]));
+    assert_eq!(context["prerequisite_reads"], serde_json::json!(["read_ref"]));
+    assert_eq!(context["final_wire_inventory"], "unknown_until_provider_compilation");
+    let missing = owed_action_context(&state, None);
+    assert_eq!(missing["candidate_mutations"], serde_json::json!([]));
+    assert_eq!(missing["tool_inventory_status"], "unknown");
+}
+
+#[test]
+fn same_state_optional_review_route_is_not_an_immediate_root_mutation() {
+    use super::host_backend::owed_action_context;
+    let names = ["objective_review", "team_create", "task_publish", "read_ref"]
+        .into_iter().map(str::to_string).collect();
+    let state = serde_json::json!({"remaining":[{
+        "step":"objective_review","closing_tool":"objective_review",
+        "actionability":"requires_explicit_independent_actor",
+        "optional_route":{"execution":"optional_explicit_authorized_calls_only"}
+    }]});
+    let context = owed_action_context(&state, Some(&names));
+    assert_eq!(context["candidate_mutations"], serde_json::json!([]));
+    assert_eq!(context["advisory_routes"][0]["optional_route"],
+        state["remaining"][0]["optional_route"]);
+    assert_eq!(context["remaining"], state["remaining"]);
+    assert_eq!(context["final_wire_inventory"], "unknown_until_provider_compilation");
+    let unknown = owed_action_context(&state, None);
+    assert_eq!(unknown["candidate_mutations"], serde_json::json!([]));
+    assert_eq!(unknown["tool_inventory_status"], "unknown");
+}
+
+#[test]
+fn same_state_publication_discovery_is_advisory_not_forced_business_debt() {
+    use super::host_backend::owed_action_context;
+    let names = ["artifact_commit", "artifact_publish", "tool_search"]
+        .into_iter().map(str::to_string).collect();
+    let state = serde_json::json!({"remaining":[{
+        "step":"register_delivery","closing_tool":"artifact_commit",
+        "publication_route":{"discovery_tool":"tool_search",
+            "file_publication_tool":"artifact_publish","registration_tool":"artifact_commit",
+            "body_alternative":"message://current"}
+    }]});
+    let context = owed_action_context(&state, Some(&names));
+    assert_eq!(context["candidate_mutations"], serde_json::json!(["artifact_commit"]));
+    assert_eq!(context["advisory_routes"][0]["publication_route"],
+        state["remaining"][0]["publication_route"]);
+    assert_eq!(context["final_wire_inventory"], "unknown_until_provider_compilation");
 }

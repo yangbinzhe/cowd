@@ -151,13 +151,11 @@ pub(crate) fn decode_terminal_payload(
     let schema_version = payload
         .get("schema_version")
         .and_then(serde_json::Value::as_u64);
-    if !schema_version.is_some_and(|version| {
-        (1..=runtime::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION).contains(&version)
-    }) {
+    if schema_version != Some(runtime::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION) {
         return Err((
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
             format!(
-                "terminal artifact schema_version must be in 1..={}",
+                "terminal artifact schema_version must equal {}",
                 runtime::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION
             ),
         ));
@@ -222,35 +220,30 @@ pub(crate) fn decode_terminal_payload(
             )
         })?
         .unwrap_or(harness_contract::goal::GoalCompletion::Satisfied);
-    if schema_version.is_some_and(|version| version >= 2)
-        && !terminal_presentation.as_ref().is_some_and(|presentation| {
-            presentation.state == harness_contract::outcome::TerminalPresentationState::Committed
-        })
+    if !terminal_presentation.as_ref().is_some_and(|presentation| {
+        presentation.state == harness_contract::outcome::TerminalPresentationState::Committed
+    }) {
+        return Err((
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            "current terminal artifact requires a committed terminal_presentation".to_string(),
+        ));
+    }
+    let collaboration_evidence = payload.get("collaboration_evidence").ok_or_else(|| {
+        (
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            "terminal artifact schema_version 3 requires collaboration_evidence".to_string(),
+        )
+    })?;
+    if !collaboration_evidence.is_null()
+        && !collaboration_evidence
+            .as_str()
+            .is_some_and(|evidence| !evidence.trim().is_empty())
     {
         return Err((
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-            "terminal artifact schema_version 2+ requires a committed terminal_presentation"
+            "terminal artifact collaboration_evidence must be null or a non-empty string"
                 .to_string(),
         ));
-    }
-    if schema_version == Some(3) {
-        let collaboration_evidence = payload.get("collaboration_evidence").ok_or_else(|| {
-            (
-                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                "terminal artifact schema_version 3 requires collaboration_evidence".to_string(),
-            )
-        })?;
-        if !collaboration_evidence.is_null()
-            && !collaboration_evidence
-                .as_str()
-                .is_some_and(|evidence| !evidence.trim().is_empty())
-        {
-            return Err((
-                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                "terminal artifact collaboration_evidence must be null or a non-empty string"
-                    .to_string(),
-            ));
-        }
     }
     let messages = payload
         .get("transcript")
