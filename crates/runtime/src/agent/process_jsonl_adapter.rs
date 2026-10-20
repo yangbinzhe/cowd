@@ -796,6 +796,46 @@ impl ProcessJsonlAdapter {
     /// still hold the worker's pipes open and keep producing effects. The
     /// observation is deliberately conservative — `None` means the group is
     /// unknown, and only an observed empty group proves the exit.
+    /// Whether the process group still holds a member that is actually alive.
+    ///
+    /// A reaped-but-not-yet-collected child (zombie state `Z`) is already
+    /// dead: it holds no descriptor, no lease and no ability to act, so it
+    /// must not keep the physical scope open.
+    fn process_group_has_live_member(process_group: i32) -> bool {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            // Without /proc the group cannot be inspected; assume the group is
+            // still busy so the exit stays unproven.
+            return true;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.chars().all(|character| character.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
+            let Some(fields) = stat.get(close + 1..) else {
+                continue;
+            };
+            // After the comm field the /proc stat fields are, in order:
+            // state, ppid, pgrp, session, ...
+            let parts = fields.split_whitespace().collect::<Vec<_>>();
+            let Some(state) = parts.first() else { continue };
+            let Some(pgid) = parts.get(2).and_then(|value| value.parse::<i32>().ok()) else {
+                continue;
+            };
+            if pgid == process_group && *state != "Z" {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn owned_process_group_is_empty(&self, run_id: &str) -> Option<bool> {
         #[cfg(unix)]
         {
@@ -814,7 +854,12 @@ impl ProcessJsonlAdapter {
             // adapter owns. Signal 0 probes liveness and delivers nothing.
             let probe = unsafe { libc::kill(-process_group, 0) };
             if probe == 0 {
-                return Some(false);
+                // The group still exists, but a killed child that nobody has
+                // reaped yet stays in it as a zombie. A zombie holds no
+                // process, no file handle and no lease: it cannot produce
+                // another effect, so it does not keep the physical scope
+                // open. Only a *live* member does.
+                return Some(!Self::process_group_has_live_member(process_group));
             }
             return match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::ESRCH) => Some(true),
@@ -2659,6 +2704,79 @@ fn write_process_message_recorded(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// A killed child that nobody reaped yet stays in its process group as a
+    /// zombie. It holds no descriptor, no lease and no ability to act, so it
+    /// must not keep the physical scope open.
+    #[test]
+    fn r1_891_a_zombie_group_member_is_not_a_live_member() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new("/bin/true")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a child in its own process group");
+        let process_group = child.id() as i32;
+        // Wait until the child is really gone but deliberately not reaped, so
+        // it stays visible as a zombie in /proc.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{}/stat", child.id()))
+                .ok()
+                .and_then(|stat| {
+                    let close = stat.rfind(')')?;
+                    stat.get(close + 1..)?
+                        .split_whitespace()
+                        .next()
+                        .map(str::to_owned)
+                });
+            if state.as_deref() == Some("Z") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never reached the zombie state: {state:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !ProcessJsonlAdapter::process_group_has_live_member(process_group),
+            "a zombie member must not keep the physical scope open"
+        );
+        // Reaping the child removes the group entirely.
+        let _ = child.wait();
+        assert!(
+            !ProcessJsonlAdapter::process_group_has_live_member(process_group),
+            "a reaped group has no live member"
+        );
+    }
+
+    /// A live member does keep the scope open: the exit stays unproven.
+    #[test]
+    fn r1_891_a_live_group_member_keeps_the_scope_open() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a child in its own process group");
+        let process_group = child.id() as i32;
+        assert!(
+            ProcessJsonlAdapter::process_group_has_live_member(process_group),
+            "a live member must keep the physical scope open"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     use super::*;
     use harness_contract::context::ChildExecutionBudgetReservation;
 

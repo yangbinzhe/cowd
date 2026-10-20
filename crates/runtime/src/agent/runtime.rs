@@ -183,6 +183,12 @@ impl RetainedAgentRun {
     }
 
     /// Decide the exit phase of this run exactly once.
+    /// Decide the exit phase of this run exactly once.
+    ///
+    /// Only a **positive** phase may decide it. An unproven exit is not a
+    /// decision: committing it would fix the run as "physically unproven" for
+    /// good and would stop the run owner from publishing the real exit fact
+    /// it may still be able to prove.
     fn decide_exit_phase(&self, proposed: LocalRunPhase) -> LocalRunPhase {
         let mut decided = self
             .exit_phase
@@ -191,7 +197,9 @@ impl RetainedAgentRun {
         match decided.as_ref() {
             Some(phase) => phase.clone(),
             None => {
-                *decided = Some(proposed.clone());
+                if proposed.positive_phase() {
+                    *decided = Some(proposed.clone());
+                }
                 proposed
             }
         }
@@ -234,6 +242,22 @@ enum LocalRunPhase {
     /// observed, never on the strength of the cancellation request alone.
     Cancelled,
     Unknown,
+}
+
+impl LocalRunPhase {
+    /// Whether this phase can carry a positive (proven) exit fact.
+    ///
+    /// `Admitted`, `BackendPending` and `Unknown` cannot: a run in one of
+    /// those phases has not proven that its physical resources are gone.
+    fn positive_phase(&self) -> bool {
+        matches!(
+            self,
+            LocalRunPhase::NotStarted
+                | LocalRunPhase::Cancelled
+                | LocalRunPhase::LocalReturned
+                | LocalRunPhase::ProcessReaped
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2881,11 +2905,15 @@ impl AgentRuntime {
                 None => {}
             }
             // The run owner ended without publishing its exit: it can no
-            // longer commit one, so this cancellation does it. The physical
-            // exit is unproven, so the fact stays the honest unknown.
+            // longer commit one. An unproven physical exit must stay
+            // unproven: publishing an unknown exit fact here would fix the
+            // run as unproven for good and would block the one writer that
+            // could still prove it.
             if retained.owner_ended().await {
-                self.publish_cancelled_exit(&retained, LocalRunPhase::Unknown)
-                    .await;
+                tracing::warn!(
+                    run_id = %snapshot.run_id,
+                    "cancelled agent run ended without a proven physical exit; the exit stays unproven"
+                );
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2899,12 +2927,19 @@ impl AgentRuntime {
 
     /// Publish the cancelled exit of a run through the authenticated channel.
     async fn publish_cancelled_exit(&self, retained: &RetainedAgentRun, phase: LocalRunPhase) {
+        if !phase.positive_phase() {
+            // An unproven exit is never committed.
+            return;
+        }
         let Some(mut evidence) = retained.mirrored_exit_evidence() else {
             // The run never reached an authenticated admission: the run owner
             // owns the "never started" exit fact.
             return;
         };
         evidence.phase = retained.decide_exit_phase(phase);
+        if !evidence.phase.positive_phase() {
+            return;
+        }
         self.publish_run_exit(retained, &evidence).await;
     }
 
