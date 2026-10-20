@@ -334,6 +334,11 @@ impl RunExitFact {
     }
 }
 
+/// The durable reason a run was cancelled by command. The run owner and the
+/// cancelling authority must record the same reason: a cancellation is one
+/// fact with one reason, whoever happens to write it.
+pub(crate) const CANCELLED_BY_COMMAND: &str = "agent cancelled by command";
+
 pub(crate) fn confirmed_run_exit(
     store: &RuntimeEventStore,
     packet: &AgentTaskPacket,
@@ -2255,7 +2260,7 @@ impl AgentRuntime {
         {
             returned.status = AgentTerminalStatus::Cancelled;
             returned.outcome.clear();
-            returned.failure = Some("agent cancelled by command".into());
+            returned.failure = Some(CANCELLED_BY_COMMAND.into());
         }
         if returned.status == AgentTerminalStatus::Completed
             && backend_from_packet(&packet)? == AgentBackendKind::InProcess
@@ -2811,7 +2816,46 @@ impl AgentRuntime {
                 "agent backend is unavailable",
             );
         };
-        if let Err(reason) = backend.backend.command(&snapshot.handle(), &request).await {
+        if matches!(
+            request.command,
+            AgentCommand::Cancel | AgentCommand::Shutdown
+        ) {
+            // A cancellation is durable before the child is torn down. The
+            // caller that observes the death of the worker must already see
+            // the run as cancelled: the cancellation is the Runtime's own
+            // decision, the death of the process is only its consequence.
+            // The physical exit stays a separate fact, proven by whoever can
+            // prove it.
+            let mut cancelling = snapshot.clone();
+            cancelling.status = AgentStatus::Cancelled;
+            cancelling.failure = Some(CANCELLED_BY_COMMAND.into());
+            cancelling.updated_at_ms = now_ms();
+            let _ = self.persist_snapshot(
+                cancelling,
+                "agent.cancellation_requested",
+                "cancellation accepted",
+                None,
+                None,
+            );
+            // The authenticated exit of the cancelled run is published next to
+            // the kill, not after it: the owner publishes when it returns, and
+            // the cancelling authority covers the case where the owner can no
+            // longer publish one. Both write the same fact under the same
+            // single-writer claim, and only a proven exit may claim it.
+            let handle = snapshot.handle();
+            let (command, ()) = tokio::join!(
+                backend.backend.command(&handle, &request),
+                self.commit_cancelled_exit(&snapshot),
+            );
+            if let Err(reason) = command {
+                return self.reject_command(
+                    request,
+                    snapshot.status,
+                    reason,
+                    "agent backend rejected command",
+                );
+            }
+        } else if let Err(reason) = backend.backend.command(&snapshot.handle(), &request).await {
             return self.reject_command(
                 request,
                 snapshot.status,

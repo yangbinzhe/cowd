@@ -308,6 +308,10 @@ struct ActiveProcess {
     command_ack_supported: AtomicBool,
     pending_commands: Mutex<BTreeMap<String, PendingProcessCommand>>,
     limits: AgentProcessTransportLimits,
+    /// The scratch directory this launch owns. A cancelled run may never
+    /// reach its own exit path, so the cancelling authority reclaims it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fixture_scratch: Option<std::path::PathBuf>,
 }
 
 /// A command the child never acknowledges must not block its caller forever.
@@ -423,6 +427,18 @@ enum ProcessDriverFault {
 
 #[cfg(test)]
 impl ProcessJsonlRegistry {
+    /// The scratch directory a run owns, when the adapter runs with the
+    /// fixture scratch enabled.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_scratch_path(&self, packet: &AgentTaskPacket) -> Option<std::path::PathBuf> {
+        let root = self.fixture_scratch.lock().ok()?.clone()?;
+        Some(root.join(format!(
+            "{}-{}",
+            crate::context_evidence::read_sha256(packet.run_id().as_bytes())
+                .trim_start_matches("sha256:"),
+            packet.attempt
+        )))
+    }
     fn take_driver_panic(&self, packet: &AgentTaskPacket, driver: ProcessDriverFault) -> bool {
         let mut fault = self.driver_panic.lock().unwrap();
         if fault.as_ref().is_some_and(|(run_id, requested)| {
@@ -650,6 +666,27 @@ fn cleanup_owned_scratch(
                 path = %directory.display(), phase, error = %error, "ProcessJsonl scratch cleanup failed");
             Err(format!("ProcessJsonl scratch cleanup failed: run={} attempt={} path={} phase={phase}: {error}",
                 packet.run_id(), packet.attempt, directory.display()) + &format!(" [kind={:?}]", error.kind()))
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+fn cleanup_owned_scratch_ids(
+    run_id: &str,
+    attempt: u32,
+    directory: &Path,
+    phase: &str,
+) -> Result<(), String> {
+    match std::fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            tracing::warn!(run_id, attempt, path = %directory.display(), phase, error = %error,
+                "ProcessJsonl scratch cleanup failed");
+            Err(format!(
+                "ProcessJsonl scratch cleanup failed: run={run_id} attempt={attempt} path={} phase={phase}: {error}",
+                directory.display()
+            ))
         }
     }
 }
@@ -1481,12 +1518,14 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
             AgentCommand::Cancel | AgentCommand::Shutdown => {
                 active.close_commands();
                 let cancelled = Arc::clone(&active);
+                #[cfg(any(test, feature = "test-fixtures"))]
+                let owned_scratch = cancelled.fixture_scratch.clone();
                 // The signal alone leaves the killed leader inside its own
                 // process group until the OS reaps it, so an owned group can
                 // never look empty. Reap the leader here: the Runtime proves
                 // the cancelled exit from that empty group, and the run owner
                 // observes the same cached exit status when it waits.
-                tokio::task::spawn_blocking(move || {
+                let killed = tokio::task::spawn_blocking(move || {
                     let mut child = cancelled
                         .child
                         .lock()
@@ -1498,8 +1537,25 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
                     killed
                 })
                 .await
-                .unwrap_or_else(|_| Err(std::io::Error::other("ProcessJsonl cancel join failed")))
-                .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)
+                .unwrap_or_else(|_| Err(std::io::Error::other("ProcessJsonl cancel join failed")));
+                if killed.is_ok() {
+                    // A cancelled run owns a physical scratch directory. The
+                    // run owner may never reach its own exit path - it can be
+                    // stuck in a wait that the cancellation cut short - so the
+                    // cancelling authority reclaims that scope here. Leaving
+                    // it behind would keep the run's physical footprint open
+                    // after the Runtime already published its exit.
+                    #[cfg(any(test, feature = "test-fixtures"))]
+                    if let Some(scratch) = owned_scratch {
+                        if let Err(error) =
+                            cleanup_owned_scratch_ids(&handle.run_id, 0, &scratch, "cancelled")
+                        {
+                            tracing::warn!(run_id = %handle.run_id, path = %scratch.display(),
+                                error = %error, "cancelled Process scratch reclaim failed");
+                        }
+                    }
+                }
+                killed.map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)
             }
             AgentCommand::SendInput | AgentCommand::Interrupt => {
                 let queued_at = std::time::Instant::now();
@@ -1699,6 +1755,8 @@ fn execute_prepared_child(
         command_ack_supported: AtomicBool::new(false),
         pending_commands: Mutex::new(BTreeMap::new()),
         limits: spec.transport_limits,
+        #[cfg(any(test, feature = "test-fixtures"))]
+        fixture_scratch: registry.fixture_scratch_path(&packet),
     });
     let cancel_before_activation = {
         let mut lifecycle = registry
@@ -3566,6 +3624,8 @@ time.sleep(300)
                 command_ack_supported: AtomicBool::new(true),
                 pending_commands: Mutex::new(BTreeMap::new()),
                 limits: AgentProcessTransportLimits::default(),
+                #[cfg(any(test, feature = "test-fixtures"))]
+                fixture_scratch: None,
             });
             adapter
                 .registry
@@ -3714,6 +3774,8 @@ time.sleep(300)
             command_ack_supported: AtomicBool::new(false),
             pending_commands: Mutex::new(BTreeMap::new()),
             limits: AgentProcessTransportLimits::default(),
+            #[cfg(any(test, feature = "test-fixtures"))]
+            fixture_scratch: None,
         });
         {
             adapter
@@ -3791,6 +3853,8 @@ time.sleep(300)
             command_ack_supported: AtomicBool::new(true),
             pending_commands: Mutex::new(BTreeMap::new()),
             limits: AgentProcessTransportLimits::default(),
+            #[cfg(any(test, feature = "test-fixtures"))]
+            fixture_scratch: None,
         });
         struct Reclaim(Arc<ActiveProcess>);
         impl Drop for Reclaim {

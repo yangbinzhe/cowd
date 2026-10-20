@@ -18,7 +18,6 @@ use super::commit_service::{
 use super::events::{ExecutionBindingLeaseClosure, ExecutionNodeBinding};
 use super::recovery::{ExecutionGraphRecovery, ExecutionRecoveryError};
 
-use super::PHYSICAL_CLOSURE_BUDGET;
 use super::registry::{
     NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor,
     NodeExecutorError, NodeExecutorRegistry,
@@ -30,6 +29,7 @@ use super::resources::{
     WorktreeLease, WorktreeLeaseManager, WorktreeLeaseRequest, WorktreeOwnership,
 };
 use super::state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
+use super::PHYSICAL_CLOSURE_BUDGET;
 
 #[derive(Debug, Error)]
 pub enum ExecutionRunnerError {
@@ -1265,6 +1265,33 @@ impl ExecutionGraphRunner {
             .map(|active| active.callback_gate.clone())
     }
 
+    /// Commit the node as cancelled, once, at the moment the cancellation is
+    /// issued. The transition is idempotent: a later terminal commit of the
+    /// same cancelled node stays legal.
+    async fn mark_node_cancelled(
+        &self,
+        graph_id: &str,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<(), ExecutionRunnerError> {
+        let graph = self.state_store.load_async(graph_id).await?;
+        let Some(status) = graph.node_statuses.get(&ticket.node_id).copied() else {
+            return Ok(());
+        };
+        if status.is_terminal() {
+            return Ok(());
+        }
+        self.commit_service
+            .transition_node(
+                &graph,
+                &ticket.node_id,
+                harness_contract::execution_graph::ExecutionNodeStatus::Cancelled,
+                None,
+                vec![],
+            )
+            .map_err(ExecutionRunnerError::Commit)?;
+        Ok(())
+    }
+
     async fn cancel_and_drain_locked(
         &self,
         graph_id: &str,
@@ -1295,6 +1322,11 @@ impl ExecutionGraphRunner {
                 reason: "original cancellation budget expired; drain unconfirmed".into(),
             })??;
         }
+        // The node is cancelled from the moment the cancellation is issued.
+        // The caller that observes the death of the worker must already see
+        // the node as cancelled: the cancellation is the Runtime's decision,
+        // and the physical closure of what the node owned is a later fact.
+        self.mark_node_cancelled(graph_id, ticket).await?;
         if executor.cancellation_requires_quiescence(ticket) {
             use futures::FutureExt;
             match executor.cancel(ticket).now_or_never() {
@@ -1442,7 +1474,9 @@ impl ExecutionGraphRunner {
                     // opaque terminal and every operator has to reconstruct the
                     // cause from the event store after the fact.
                     let diagnostic = self.commit_service.physical_closure_diagnostic(
-                        &graph, &ticket.node_id, &binding,
+                        &graph,
+                        &ticket.node_id,
+                        &binding,
                     );
                     #[cfg(test)]
                     eprintln!("OWN834_PHYSICAL_CLOSURE_UNPROVED {diagnostic}");
@@ -3869,11 +3903,18 @@ mod nodispatch_duration_617_tests {
             Ok(outcome)
         }
 
-        async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        async fn after_commit(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<(), NodeExecutorError> {
             self.inner.after_commit(ticket).await
         }
 
-        async fn after_abort(&self, ticket: &NodeExecutionTicket, reason: &str) -> Result<(), NodeExecutorError> {
+        async fn after_abort(
+            &self,
+            ticket: &NodeExecutionTicket,
+            reason: &str,
+        ) -> Result<(), NodeExecutorError> {
             self.inner.after_abort(ticket, reason).await
         }
 
@@ -3917,19 +3958,32 @@ mod nodispatch_duration_617_tests {
 
     #[async_trait::async_trait]
     impl NodeExecutor for LifecycleProbe660 {
-        fn kind(&self) -> &str { "lifecycle-660" }
+        fn kind(&self) -> &str {
+            "lifecycle-660"
+        }
 
-        fn supports_resumable_pause(&self) -> bool { false }
+        fn supports_resumable_pause(&self) -> bool {
+            false
+        }
 
-        fn validate(&self, _: &harness_contract::execution_graph::ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+        fn validate(
+            &self,
+            _: &harness_contract::execution_graph::ExecutionNodeSpec,
+        ) -> Result<(), NodeExecutorError> {
             Ok(())
         }
 
-        async fn start(&self, _: NodeExecutionContext) -> Result<NodeExecutionTicket, NodeExecutorError> {
+        async fn start(
+            &self,
+            _: NodeExecutionContext,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
             unreachable!()
         }
 
-        async fn poll_or_await(&self, _: &NodeExecutionTicket) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        async fn poll_or_await(
+            &self,
+            _: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
             unreachable!()
         }
 
@@ -3937,19 +3991,31 @@ mod nodispatch_duration_617_tests {
             panic!("bounded cancellation must not fall back to unbounded cancellation")
         }
 
-        async fn cancel_bounded(&self, _: &NodeExecutionTicket, budget: std::time::Duration) -> Result<(), NodeExecutorError> {
+        async fn cancel_bounded(
+            &self,
+            _: &NodeExecutionTicket,
+            budget: std::time::Duration,
+        ) -> Result<(), NodeExecutorError> {
             self.budgets.lock().unwrap().push(budget);
             Ok(())
         }
 
-        fn cancellation_requires_quiescence(&self, _: &NodeExecutionTicket) -> bool { true }
+        fn cancellation_requires_quiescence(&self, _: &NodeExecutionTicket) -> bool {
+            true
+        }
 
         fn cancellation_finalized(&self, _: &NodeExecutionTicket) {
             self.finalized.fetch_add(1, Ordering::SeqCst);
         }
 
-        async fn recover(&self, ticket: &NodeExecutionTicket) -> Result<NodeExecutionTicket, NodeExecutorError> {
-            Err(NodeExecutorError::Recover { node_id: ticket.node_id.clone(), reason: "original recovery result".into() })
+        async fn recover(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            Err(NodeExecutorError::Recover {
+                node_id: ticket.node_id.clone(),
+                reason: "original recovery result".into(),
+            })
         }
     }
 
@@ -3957,13 +4023,18 @@ mod nodispatch_duration_617_tests {
     async fn r1_660_duration_observer_forwards_original_lifecycle_contract() {
         let inner = Arc::new(LifecycleProbe660::default());
         let wrapper = TamperedExecutor617 {
-            inner: inner.clone(), drop_witness: false,
+            inner: inner.clone(),
+            drop_witness: false,
             observed: Some(Arc::new(std::sync::Mutex::new(None))),
         };
         let ticket = NodeExecutionTicket {
-            graph_id: "graph-660".into(), node_id: "node-660".into(),
-            executor_kind: "lifecycle-660".into(), service_class: Default::default(),
-            attempt: 1, idempotency_key: "attempt-660".into(), payload_ref: "payload-660".into(),
+            graph_id: "graph-660".into(),
+            node_id: "node-660".into(),
+            executor_kind: "lifecycle-660".into(),
+            service_class: Default::default(),
+            attempt: 1,
+            idempotency_key: "attempt-660".into(),
+            payload_ref: "payload-660".into(),
         };
         assert_eq!(wrapper.kind(), inner.kind());
         assert!(!wrapper.supports_resumable_pause());
