@@ -591,6 +591,12 @@ pub struct AgentRuntime {
     #[cfg(test)]
     exit_append_failed: Arc<tokio::sync::Notify>,
     #[cfg(test)]
+    command_append_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    cancellation_append_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    cancellation_append_failed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
     backend_append_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     backend_append_failed: Arc<tokio::sync::Notify>,
@@ -680,6 +686,12 @@ impl AgentRuntime {
             #[cfg(test)]
             exit_append_failures: self.exit_append_failures.clone(),
             #[cfg(test)]
+            command_append_failures: self.command_append_failures.clone(),
+            #[cfg(test)]
+            cancellation_append_failures: self.cancellation_append_failures.clone(),
+            #[cfg(test)]
+            cancellation_append_failed: self.cancellation_append_failed.clone(),
+            #[cfg(test)]
             exit_append_failed: self.exit_append_failed.clone(),
             #[cfg(test)]
             backend_append_failures: self.backend_append_failures.clone(),
@@ -711,6 +723,12 @@ impl AgentRuntime {
             owner_epoch: Arc::new(uuid::Uuid::new_v4().to_string()),
             #[cfg(test)]
             exit_append_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            command_append_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            cancellation_append_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            cancellation_append_failed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             exit_append_failed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -2823,6 +2841,9 @@ impl AgentRuntime {
                 "agent backend is unavailable",
             );
         };
+        // The revision a cancellation was accepted at, when this command was a
+        // cancellation. Only a durable revision may be named by a receipt.
+        let mut cancellation_revision: Option<u64> = None;
         if matches!(
             request.command,
             AgentCommand::Cancel | AgentCommand::Shutdown
@@ -2837,13 +2858,61 @@ impl AgentRuntime {
             cancelling.status = AgentStatus::Cancelled;
             cancelling.failure = Some(CANCELLED_BY_COMMAND.into());
             cancelling.updated_at_ms = now_ms();
-            let _ = self.persist_snapshot(
+            // A cancellation is accepted only when its own snapshot is durable.
+            // The failure is never swallowed: when the snapshot cannot be
+            // persisted the worker is not torn down and the caller is told
+            // that the cancellation was not accepted.
+            let cancellation = match self.persist_snapshot(
                 cancelling.clone(),
                 "agent.cancellation_requested",
                 "cancellation accepted",
+                Some(AgentCommandReceipt {
+                    command_id: request.command_id.clone(),
+                    agent_id: request.agent_id.clone(),
+                    accepted_revision: 0,
+                    status: AgentStatus::Cancelled,
+                    accepted: true,
+                    reject_reason: None,
+                    message: "cancellation accepted".into(),
+                }),
                 None,
-                None,
-            );
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                // The run may have ended while the cancellation was being
+                // accepted. A cancellation of a run that already reached a
+                // terminal state is not a rejection of the caller's intent:
+                // the run is gone either way, and the family converges.
+                let current = self.current_run_snapshot(&snapshot.agent_id);
+                let (status, reason) = match current
+                    .as_ref()
+                    .filter(|current| current.run_id == snapshot.run_id)
+                    .filter(|current| current.status.is_terminal())
+                {
+                    Some(current) => (
+                        current.status,
+                        AgentCommandRejectReason::Terminal,
+                    ),
+                    None => (
+                        snapshot.status,
+                        if error.contains("stale") {
+                            AgentCommandRejectReason::StaleRevision
+                        } else {
+                            AgentCommandRejectReason::InvalidInput
+                        },
+                    ),
+                };
+                return self.reject_command(
+                    request,
+                    status,
+                    reason,
+                    &format!("agent cancellation was not accepted: {error}"),
+                );
+                }
+            };
+            // The revision the cancellation was accepted at is the one that is
+            // durable: the commit service wrote it with the snapshot.
+            cancellation_revision = Some(cancellation.accepted_revision);
             // The graph node that owns this run is cancelled by the same
             // authority, and the transition is committed before the worker is
             // torn down: a caller that observes the death of the worker must
@@ -2857,10 +2926,10 @@ impl AgentRuntime {
             // the cancelling authority covers the case where the owner can no
             // longer publish one. Both write the same fact under the same
             // single-writer claim, and only a proven exit may claim it.
-            let handle = snapshot.handle();
+            let handle = cancelling.handle();
             let (command, ()) = tokio::join!(
                 backend.backend.command(&handle, &request),
-                self.commit_cancelled_exit(&snapshot),
+                self.commit_cancelled_exit(&cancelling),
             );
             if let Err(reason) = command {
                 return self.reject_command(
@@ -2878,26 +2947,43 @@ impl AgentRuntime {
                 "agent backend rejected command",
             );
         }
-        let mut updated = snapshot;
-        updated.status = match request.command {
-            AgentCommand::Pause => AgentStatus::Paused,
-            AgentCommand::Resume => AgentStatus::Running,
-            AgentCommand::Cancel | AgentCommand::Shutdown => AgentStatus::Cancelled,
-            AgentCommand::SendInput | AgentCommand::Interrupt => updated.status,
-        };
-        updated.updated_at_ms = now_ms();
-        if matches!(
+        // The trailing receipt is written against the latest legal revision of
+        // this run, not against the snapshot the command started from: the
+        // cancellation, the exit fact and the agent's own return may all have
+        // moved the run forward while the command was in flight. Reusing the
+        // stale snapshot would make a legal cancellation look like a rejected
+        // one.
+        let cancellation_accepted = matches!(
             request.command,
             AgentCommand::Cancel | AgentCommand::Shutdown
-        ) {
+        );
+        let mut updated = self
+            .current_run_snapshot(&snapshot.agent_id)
+            .filter(|current| current.run_id == snapshot.run_id)
+            .unwrap_or_else(|| snapshot.clone());
+        if !updated.status.is_terminal() {
+            updated.status = match request.command {
+                AgentCommand::Pause => AgentStatus::Paused,
+                AgentCommand::Resume => AgentStatus::Running,
+                AgentCommand::Cancel | AgentCommand::Shutdown => AgentStatus::Cancelled,
+                AgentCommand::SendInput | AgentCommand::Interrupt => updated.status,
+            };
+        }
+        updated.updated_at_ms = now_ms();
+        if cancellation_accepted {
             // A cancellation must leave one authenticated exit fact even when
             // the run owner can no longer reach its own publication point.
             self.commit_cancelled_exit(&updated).await;
         }
+        let durable_revision = if cancellation_accepted {
+            cancellation_revision.unwrap_or_else(|| updated.revision.saturating_add(1))
+        } else {
+            updated.revision.saturating_add(1)
+        };
         let receipt = AgentCommandReceipt {
             command_id: request.command_id,
             agent_id: updated.agent_id.clone(),
-            accepted_revision: updated.revision.saturating_add(1),
+            accepted_revision: durable_revision,
             status: updated.status,
             accepted: true,
             reject_reason: None,
@@ -2910,12 +2996,42 @@ impl AgentRuntime {
             Some(receipt.clone()),
             None,
         )
-        .unwrap_or_else(|error| AgentCommandReceipt {
-            accepted: false,
-            reject_reason: Some(AgentCommandRejectReason::InvalidInput),
-            message: error,
-            ..receipt
+        .unwrap_or_else(|error| {
+            if cancellation_accepted {
+                // The cancellation itself is durable; only the trailing command
+                // record failed. The receipt still reports the accepted
+                // cancellation and names the trailing failure instead of
+                // pretending the cancellation was never accepted.
+                AgentCommandReceipt {
+                    accepted: true,
+                    // The receipt names the revision that is durable (the
+                    // cancellation), never a revision that was never written.
+                    accepted_revision: durable_revision,
+                    message: format!(
+                        "agent cancellation accepted; the trailing command record failed: {error}"
+                    ),
+                    ..receipt
+                }
+            } else {
+                AgentCommandReceipt {
+                    accepted: false,
+                    reject_reason: Some(AgentCommandRejectReason::InvalidInput),
+                    message: error,
+                    ..receipt
+                }
+            }
         })
+    }
+
+    /// The latest durable snapshot of a run, or `None` when the agent owns no
+    /// run. The trailing command receipt is written against this snapshot so
+    /// it never reuses a revision that the run has already left behind.
+    fn current_run_snapshot(&self, agent_id: &str) -> Option<AgentRunSnapshot> {
+        self.records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .and_then(|record| record.snapshot.clone())
     }
 
     /// Commit the cancellation of the graph node that owns a cancelled run.
@@ -3437,6 +3553,35 @@ impl AgentRuntime {
                 })
                 .map_err(|error| error.to_string())?;
         } else {
+            // A controlled failure of the cancellation snapshot proves that a
+            // cancellation which cannot be persisted is never accepted.
+            #[cfg(test)]
+            if kind == "agent.command"
+                && self
+                    .command_append_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(
+                    "test injected original Agent trailing command record append failure".into(),
+                );
+            }
+            #[cfg(test)]
+            if kind == "agent.cancellation_requested"
+                && self
+                    .cancellation_append_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                self.cancellation_append_failed.notify_one();
+                return Err(
+                    "test injected original Agent cancellation snapshot append failure".into(),
+                );
+            }
             self.event_store
                 .append(agent_event)
                 .map_err(|error| error.to_string())?;
@@ -3683,34 +3828,100 @@ impl AgentTaskBackend for AgentRuntime {
                 .remove(&run_cancellation_key(packet));
             return Ok(());
         }
-        let receipt = self
-            .command(AgentCommandRequest {
-                command_id: format!("graph-cancel:{}:{}", packet.graph_id(), packet.node_id()),
-                agent_id: packet.agent_id().to_string(),
-                expected_revision: snapshot.revision,
-                command: AgentCommand::Cancel,
-                input: None,
-            })
-            .await;
-        if receipt.accepted
-            || receipt.reject_reason == Some(AgentCommandRejectReason::Terminal)
-            || self
-                .get(packet.agent_id())
-                .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
-        {
-            self.pending_cancellations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&run_cancellation_key(packet));
-            Ok(())
-        } else {
-            Err(format!(
+        // The cancellation continues on the latest legal revision: the run
+        // may move forward while the command is in flight, and that is a
+        // retryable condition, not a rejection of the caller's intent.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let Some(current) = self.get(packet.agent_id()) else {
+                self.pending_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&run_cancellation_key(packet));
+                return Ok(());
+            };
+            if current.run_id != packet.run_id()
+                || current.graph_id != packet.graph_id()
+                || current.node_id != packet.node_id()
+                || current.attempt != packet.attempt
+            {
+                // The agent now owns a different run. This cancellation named
+                // an exact run, so it is not satisfied by the new one.
+                self.pending_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&run_cancellation_key(packet));
+                return Err("Agent cancellation does not match the current exact run".into());
+            }
+            if current.status.is_terminal() {
+                // The named run already reached a terminal state: the
+                // cancellation is moot, and its pending key is released.
+                self.pending_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&run_cancellation_key(packet));
+                return Ok(());
+            }
+            let receipt = self
+                .command(AgentCommandRequest {
+                    // The command id names the revision the cancellation is
+                    // issued against. A duplicate cancellation of the same
+                    // revision replays its own receipt, while a cancellation
+                    // that continues on a newer revision is a new command and
+                    // never inherits the rejection of an older one.
+                    command_id: format!(
+                        "graph-cancel:{}:{}:r{}",
+                        packet.graph_id(),
+                        packet.node_id(),
+                        current.revision
+                    ),
+                    agent_id: packet.agent_id().to_string(),
+                    expected_revision: current.revision,
+                    command: AgentCommand::Cancel,
+                    input: None,
+                })
+                .await;
+            if receipt.accepted
+                || receipt.reject_reason == Some(AgentCommandRejectReason::Terminal)
+                || self.get(packet.agent_id()).is_some_and(|current| {
+                    // Only the run this cancellation names may be reported as
+                    // cancelled. A newer run that happens to be cancelled is
+                    // not the evidence for this one.
+                    current.status == AgentStatus::Cancelled
+                        && current.run_id == packet.run_id()
+                        && current.graph_id == packet.graph_id()
+                        && current.node_id == packet.node_id()
+                        && current.attempt == packet.attempt
+                })
+            {
+                self.pending_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&run_cancellation_key(packet));
+                return Ok(());
+            }
+            if receipt.reject_reason == Some(AgentCommandRejectReason::StaleRevision)
+                && attempt < CANCEL_REVISION_ATTEMPTS
+            {
+                // The run moved to a newer revision: continue on it.
+                continue;
+            }
+            // The cancellation is still pending: the caller may finalize it
+            // later, and the run keeps its pending cancellation until then.
+            return Err(format!(
                 "AgentRuntime cancel rejected for {}: {}",
                 packet.agent_id(),
                 receipt.message
-            ))
+            ));
         }
+        self.pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_cancellation_key(packet));
+        Ok(())
     }
+
 
     fn terminal_committed(&self, packet: &AgentTaskPacket) {
         {
@@ -3778,6 +3989,10 @@ impl AgentTaskBackendResolver for AgentRuntimeResolver {
 /// The bounded time a cancellation waits for the run owner to publish its
 /// own exit fact before it commits the cancelled exit itself.
 const CANCELLED_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many times a cancellation continues on a newer legal revision of its
+/// run before the caller is told the cancellation was not accepted.
+const CANCEL_REVISION_ATTEMPTS: u32 = 4;
 
 /// Whether a graph commit failed only because the graph moved on.
 fn is_stale_graph_revision(error: &crate::execution_core::graph::ExecutionCommitError) -> bool {
@@ -4329,6 +4544,225 @@ mod tests {
     /// T2 and T4: a cancelled Process run whose owner can no longer publish
     /// still leaves exactly one authenticated cancelled local exit.
     #[cfg(unix)]
+    /// N4: a cancellation whose own snapshot cannot be persisted is not
+    /// accepted. The worker is not torn down, the run does not claim to be
+    /// cancelled, and no exit fact is published for a cancellation that never
+    /// happened.
+    #[tokio::test]
+    async fn r1_900_a_cancellation_that_cannot_be_persisted_is_not_accepted() {
+        let (_temporary, _services, adapter, packet) =
+            crate::agent_process_jsonl_adapter::tests::driver_cancel_fixture();
+        let adapter = Arc::new(adapter);
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        runtime.register_runtime_process_jsonl_backend(adapter.clone());
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while adapter.owned_process_group_is_empty(&packet.run_id()) != Some(false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process child never owned a live process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        runtime
+            .cancellation_append_failures
+            .store(1, Ordering::SeqCst);
+        let rejected = AgentTaskBackend::cancel(runtime.as_ref(), &packet).await;
+        assert!(
+            rejected.is_err(),
+            "a cancellation that cannot be persisted is not accepted: {rejected:?}"
+        );
+        let snapshot = runtime.get(packet.agent_id()).expect("the run still exists");
+        assert_ne!(
+            snapshot.status,
+            AgentStatus::Cancelled,
+            "an unpersisted cancellation never claims the run as cancelled"
+        );
+        assert_ne!(
+            snapshot.failure.as_deref(),
+            Some(CANCELLED_BY_COMMAND),
+            "an unpersisted cancellation never claims the cancel reason"
+        );
+        assert_eq!(
+            runtime.cancellation_append_failures.load(Ordering::SeqCst),
+            0,
+            "the injected failure is consumed exactly once"
+        );
+        let stream = agent_stream_id(packet.agent_id());
+        let exits = runtime
+            .event_store
+            .list_stream(&stream)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "agent.local_exit"
+                    && event.idempotency_key.as_deref()
+                        == Some(format!("agent.local_exit:{}", packet.run_id()).as_str())
+            })
+            .count();
+        assert_eq!(exits, 0, "no exit fact is published for a rejected cancellation");
+        // The cancellation converges once it is durable again: the caller is
+        // either told the cancellation was accepted, or that the run already
+        // reached a terminal state. It is never told the cancellation was
+        // accepted while nothing was durable.
+        let converged = AgentTaskBackend::cancel(runtime.as_ref(), &packet).await;
+        assert!(
+            converged.is_ok(),
+            "the cancellation converges once it is durable: first={rejected:?} second={converged:?}"
+        );
+        let snapshot = runtime.get(packet.agent_id()).expect("the run still exists");
+        assert!(
+            snapshot.status.is_terminal(),
+            "the cancelled run reaches a terminal state: {:?}",
+            snapshot.status
+        );
+        let _ = caller.await;
+    }
+
+    /// N4: when the cancellation fact is durable but the trailing command
+    /// record cannot be written, the receipt still names a revision that
+    /// exists, the same command replays the same answer, and a restarted
+    /// Runtime finds the same run identity.
+    #[tokio::test]
+    async fn r1_900_c_a_failed_trailing_record_never_names_an_unwritten_revision() {
+        let (_temporary, _services, adapter, packet) =
+            crate::agent_process_jsonl_adapter::tests::driver_cancel_fixture();
+        let adapter = Arc::new(adapter);
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::clone(&store),
+            configured_registry(),
+        ));
+        runtime.register_runtime_process_jsonl_backend(adapter.clone());
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while adapter.owned_process_group_is_empty(&packet.run_id()) != Some(false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process child never owned a live process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let snapshot = runtime.get(packet.agent_id()).expect("the run exists");
+        runtime.command_append_failures.store(1, Ordering::SeqCst);
+        let request = AgentCommandRequest {
+            command_id: "r1-900-c-cancel".into(),
+            agent_id: packet.agent_id().to_string(),
+            expected_revision: snapshot.revision,
+            command: AgentCommand::Cancel,
+            input: None,
+        };
+        let receipt = runtime.command(request.clone()).await;
+        assert!(receipt.accepted, "the cancellation itself was accepted: {receipt:?}");
+        let stream = agent_stream_id(packet.agent_id());
+        let cancellation_revision = store
+            .list_stream(&stream)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "agent.cancellation_requested")
+            .and_then(|event| {
+                event
+                    .payload
+                    .get("snapshot")
+                    .and_then(|snapshot| snapshot.get("revision"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .expect("the cancellation fact is durable");
+        assert_eq!(
+            receipt.accepted_revision,
+            cancellation_revision,
+            "the receipt names the revision the cancellation was written at"
+        );
+        assert!(
+            receipt.message.contains("trailing command record failed"),
+            "the receipt names the trailing failure: {receipt:?}"
+        );
+        // The same command replays the same answer.
+        let replay = runtime.command(request).await;
+        assert_eq!(replay.accepted_revision, receipt.accepted_revision);
+        assert_eq!(replay.accepted, receipt.accepted);
+        // A restarted Runtime finds the same run and its identity.
+        let restarted = AgentRuntime::new(Arc::clone(&store), configured_registry());
+        let recovered = restarted.get(packet.agent_id()).expect("the run is recovered");
+        assert_eq!(recovered.run_id, packet.run_id());
+        assert_eq!(recovered.status, AgentStatus::Cancelled);
+        let _ = caller.await;
+    }
+
+    /// N4: the trailing command receipt is written against the latest legal
+    /// revision of the run, not against the revision the command started
+    /// from. The cancellation and the trailing record are two durable steps.
+    #[tokio::test]
+    async fn r1_900_b_the_trailing_receipt_follows_the_latest_legal_revision() {
+        let (_temporary, _services, adapter, packet) =
+            crate::agent_process_jsonl_adapter::tests::driver_cancel_fixture();
+        let adapter = Arc::new(adapter);
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        runtime.register_runtime_process_jsonl_backend(adapter.clone());
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while adapter.owned_process_group_is_empty(&packet.run_id()) != Some(false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process child never owned a live process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let snapshot = runtime.get(packet.agent_id()).expect("the run exists");
+        let receipt = runtime
+            .command(AgentCommandRequest {
+                command_id: "r1-900-b-cancel".into(),
+                agent_id: packet.agent_id().to_string(),
+                expected_revision: snapshot.revision,
+                command: AgentCommand::Cancel,
+                input: None,
+            })
+            .await;
+        assert!(receipt.accepted, "the cancellation is accepted: {receipt:?}");
+        let stream = agent_stream_id(packet.agent_id());
+        let events = runtime.event_store.list_stream(&stream).unwrap();
+        let revision_of = |kind: &str| -> u64 {
+            events
+                .iter()
+                .find(|event| event.kind == kind)
+                .and_then(|event| event.payload.get("snapshot"))
+                .and_then(|snapshot| snapshot.get("revision"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| panic!("{kind} event with a revision"))
+        };
+        let cancellation_revision = revision_of("agent.cancellation_requested");
+        let command_revision = revision_of("agent.command");
+        assert!(
+            command_revision > cancellation_revision,
+            "the trailing record is written against the next legal revision"
+        );
+        let current = runtime
+            .event_store
+            .stream_revision(&stream)
+            .expect("the agent stream revision");
+        assert_eq!(
+            current, command_revision,
+            "the run ends on the revision the trailing record was written against"
+        );
+        assert_eq!(
+            receipt.accepted_revision, current,
+            "the receipt names the revision it was accepted at"
+        );
+        let _ = caller.await;
+    }
+
     #[tokio::test]
     async fn cancelled_process_run_publishes_one_cancelled_local_exit() {
         let (_temporary, _services, adapter, packet) =
