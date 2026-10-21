@@ -480,12 +480,25 @@ impl ProcessJsonlRegistry {
     /// fixture scratch enabled.
     #[cfg(any(test, feature = "test-fixtures"))]
     fn fixture_scratch_path(&self, packet: &AgentTaskPacket) -> Option<std::path::PathBuf> {
+        self.fixture_scratch_directory_for(packet.run_id(), packet.attempt)
+    }
+
+    /// The private scratch directory one run attempt owns.
+    ///
+    /// The cancelling authority needs this path without an admitted packet:
+    /// a cancelled run is reclaimed by identity, and the reclaim must be able
+    /// to run after the run owner already reaped the process.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_scratch_directory_for(
+        &self,
+        run_id: &str,
+        attempt: u32,
+    ) -> Option<std::path::PathBuf> {
         let root = self.fixture_scratch.lock().ok()?.clone()?;
         Some(root.join(format!(
             "{}-{}",
-            crate::context_evidence::read_sha256(packet.run_id().as_bytes())
-                .trim_start_matches("sha256:"),
-            packet.attempt
+            crate::context_evidence::read_sha256(run_id.as_bytes()).trim_start_matches("sha256:"),
+            attempt
         )))
     }
 
@@ -1396,6 +1409,28 @@ impl ProcessJsonlAdapter {
         }
         *installed = Some(root);
         Ok(())
+    }
+
+    /// Close the private physical scope one cancelled run owns.
+    ///
+    /// The scope is reclaimed by identity: the cancelling authority closes it
+    /// even when the run owner already reaped the process, so the reclaim
+    /// never depends on which side of the cancellation observes the exit
+    /// first. The reclaim is idempotent.
+    pub(crate) fn reclaim_run_scope(&self, run_id: &str, attempt: u32) -> Result<(), String> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        {
+            let Some(directory) = self.registry.fixture_scratch_directory_for(run_id, attempt)
+            else {
+                return Ok(());
+            };
+            cleanup_owned_scratch_ids(run_id, attempt, &directory, "cancelled")
+        }
+        #[cfg(not(any(test, feature = "test-fixtures")))]
+        {
+            let _ = (run_id, attempt);
+            Ok(())
+        }
     }
 
     #[cfg(any(test, feature = "test-fixtures"))]

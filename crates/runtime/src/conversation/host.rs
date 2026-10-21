@@ -6065,14 +6065,81 @@ async fn execute_fenced_runtime_tool(
             if let Some(observation) = observation {
                 observation.uncertain(request);
             }
-            let outcome = host.execute_runtime_tool(request).await;
-            let committed = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                commit_service.commit_bound_readonly_tool_receipt(
+            let mut outcome = host.execute_runtime_tool(request).await;
+            // A process-class effect owns a physical process tree, so its
+            // durable receipt must carry the honest quiescence proof. The
+            // host shell is not a sandbox process: it can prove that the
+            // command is gone and that nothing of it is still alive, and
+            // nothing more. The Runtime kernel is the only authority that may
+            // publish that fact, and this commit point is one of the three
+            // that must mint it (the bound tool batch and the scoped root
+            // effect are the other two).
+            let host_process_terminal = if outcome.status
+                == crate::RuntimeToolExecutionStatus::Executed
+            {
+                match crate::host_process_closure::mint_host_process_evidence(
+                    commit_service,
                     request,
-                    &outcome,
                     effect,
-                    admitted_scope.as_ref().unwrap(),
+                    &mut outcome,
                 )
+                .await
+                {
+                Ok(minted) => minted,
+                Err(error) => {
+                    // An unprovable process terminal is never a successful
+                    // effect: the receipt is not committed, so the physical
+                    // closure witness keeps failing closed.
+                    return crate::RuntimeToolExecutionOutcome {
+                        tool_use_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        status: crate::RuntimeToolExecutionStatus::Failed,
+                        category: request.category,
+                        output: None,
+                        error: Some(format!(
+                            "tool `{}` host process terminal failed: {error}",
+                            request.tool_name
+                        )),
+                        evidence_ref: format!(
+                            "tool-effect-host-process-unproven:{}",
+                            request.idempotency_key
+                        ),
+                        observed_evidence: Vec::new(),
+                    };
+                }
+            }
+            } else {
+                false
+            };
+            if effect.spawns_process && !host_process_terminal {
+                // A process-class effect without a process terminal can never
+                // close physically. The witness stays closed, and the
+                // production log names the effect instead of leaving the
+                // operator with an opaque stall.
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    idempotency_key = %request.idempotency_key,
+                    "process-class effect carries no process terminal; its physical closure stays unproven"
+                );
+            }
+            let committed = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                if host_process_terminal {
+                    commit_service.commit_bound_readonly_tool_receipt_with_host_process(
+                        request,
+                        &outcome,
+                        effect,
+                        admitted_scope.as_ref().unwrap(),
+                    )
+                } else {
+                    commit_service.commit_bound_readonly_tool_receipt(
+                        request,
+                        &outcome,
+                        effect,
+                        admitted_scope.as_ref().unwrap(),
+                    )
+                }
+            } else if host_process_terminal {
+                commit_service.commit_tool_effect_with_host_process(request, effect, &outcome)
             } else {
                 commit_service.commit_tool_effect(request, effect, &outcome)
             };

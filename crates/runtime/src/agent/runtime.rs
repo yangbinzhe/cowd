@@ -456,12 +456,19 @@ fn authenticate_run_lifecycle_records(
         let Some(event) = records.iter().find(|record| record.kind == kind) else {
             continue;
         };
+        if event.sequence > revision {
+            // The run stream advanced while this lifecycle was read: the
+            // reader holds a stale view of the stream, not an untrusted one.
+            // The caller reads the lifecycle again and decides on the fresh
+            // view, so this is a retryable source change rather than a trust
+            // violation.
+            return Err("Agent exit source changed during authentication".into());
+        }
         if event.scope != RuntimeEventScope::Agent
             || event.actor.as_deref() != Some("agent_runtime")
             || event.stream_id != stream_id
             || event.kind != kind
             || event.sequence <= previous_sequence
-            || event.sequence > revision
             || event.commit_cursor <= previous_cursor
             || event.transaction_index != 0
         {
@@ -2831,12 +2838,20 @@ impl AgentRuntime {
             cancelling.failure = Some(CANCELLED_BY_COMMAND.into());
             cancelling.updated_at_ms = now_ms();
             let _ = self.persist_snapshot(
-                cancelling,
+                cancelling.clone(),
                 "agent.cancellation_requested",
                 "cancellation accepted",
                 None,
                 None,
             );
+            // The graph node that owns this run is cancelled by the same
+            // authority, and the transition is committed before the worker is
+            // torn down: a caller that observes the death of the worker must
+            // already see the node as cancelled, because the cancellation is
+            // the Runtime's decision and the death of the process is only its
+            // consequence. The transition is idempotent and never touches the
+            // executor, so the in-flight work of the node is not truncated.
+            self.cancel_run_graph_node(&cancelling).await;
             // The authenticated exit of the cancelled run is published next to
             // the kill, not after it: the owner publishes when it returns, and
             // the cancelling authority covers the case where the owner can no
@@ -2903,6 +2918,72 @@ impl AgentRuntime {
         })
     }
 
+    /// Commit the cancellation of the graph node that owns a cancelled run.
+    ///
+    /// The node and the run are two views of the same Runtime decision, so
+    /// the authority that cancels the run commits the node as cancelled too.
+    /// The transition is idempotent: `from == to` is a legal transition, and a
+    /// node that already reached a terminal state keeps exactly the state it
+    /// has. This path never cancels the executor, so the work that the node
+    /// still owns is never truncated by the transition.
+    async fn cancel_run_graph_node(&self, snapshot: &AgentRunSnapshot) {
+        let Some(services) = self.services() else {
+            return;
+        };
+        for _ in 0..4 {
+            let graph = match services
+                .graph_state_store()
+                .load_async(snapshot.graph_id.clone())
+                .await
+            {
+                Ok(graph) => graph,
+                Err(error) => {
+                    tracing::warn!(
+                        graph_id = %snapshot.graph_id,
+                        node_id = %snapshot.node_id,
+                        %error,
+                        "cancelled run has no readable graph; the node keeps its own terminal commit"
+                    );
+                    return;
+                }
+            };
+            let Some(status) = graph.node_statuses.get(&snapshot.node_id).copied() else {
+                return;
+            };
+            if status.is_terminal() {
+                return;
+            }
+            match services
+                .commit_service()
+                .transition_node_async(
+                    graph,
+                    snapshot.node_id.clone(),
+                    ExecutionNodeStatus::Cancelled,
+                    None,
+                    Vec::new(),
+                )
+                .await
+            {
+                Ok(_) => return,
+                Err(error) if is_stale_graph_revision(&error) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        graph_id = %snapshot.graph_id,
+                        node_id = %snapshot.node_id,
+                        %error,
+                        "cancelled node transition failed; the node keeps its own terminal commit"
+                    );
+                    return;
+                }
+            }
+        }
+        tracing::warn!(
+            graph_id = %snapshot.graph_id,
+            node_id = %snapshot.node_id,
+            "cancelled node transition raced with the node's own events"
+        );
+    }
+
     /// Commit the authenticated exit fact of a cancelled run.
     ///
     /// The run owner publishes `agent.local_exit` when it returns from the
@@ -2941,6 +3022,14 @@ impl AgentRuntime {
                 // The owned process group is empty: the cancelled worker can
                 // no longer produce an effect, so its exit is proven.
                 Some(true) => {
+                    // The physical scope of the cancelled run is closed before
+                    // the exit is published. An observer of the exit then
+                    // observes a closed run: the scope is gone, the run is
+                    // cancelled and the node is cancelled. The reclaim runs
+                    // here as well as in the run owner, because the owner may
+                    // already have reaped the process without reaching its own
+                    // cleanup.
+                    self.reclaim_cancelled_run_scope(snapshot).await;
                     self.publish_cancelled_exit(&retained, LocalRunPhase::Cancelled)
                         .await;
                     return;
@@ -2966,6 +3055,32 @@ impl AgentRuntime {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Close the private physical scope of a cancelled run.
+    ///
+    /// The scope belongs to the run, not to the side that observes its exit.
+    /// The cancelling authority closes it by identity, so the scope is closed
+    /// even when the run owner already reaped the process and never reached
+    /// its own cleanup. A failure to close the scope never rewrites the exit
+    /// fact: the exit stays proven and the scope stays honestly unfinished.
+    async fn reclaim_cancelled_run_scope(&self, snapshot: &AgentRunSnapshot) {
+        let adapter = self
+            .process_jsonl_adapter
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(adapter) = adapter else {
+            return;
+        };
+        if let Err(error) = adapter.reclaim_run_scope(&snapshot.run_id, snapshot.attempt) {
+            tracing::warn!(
+                run_id = %snapshot.run_id,
+                attempt = snapshot.attempt,
+                %error,
+                "cancelled agent run kept its physical scope open"
+            );
         }
     }
 
@@ -3663,6 +3778,19 @@ impl AgentTaskBackendResolver for AgentRuntimeResolver {
 /// The bounded time a cancellation waits for the run owner to publish its
 /// own exit fact before it commits the cancelled exit itself.
 const CANCELLED_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a graph commit failed only because the graph moved on.
+fn is_stale_graph_revision(error: &crate::execution_core::graph::ExecutionCommitError) -> bool {
+    use crate::execution_core::graph::ExecutionCommitError;
+    use harness_contract::execution_graph::ExecutionTransitionError;
+    use crate::runtime_event_store::RuntimeEventStoreError;
+    match error {
+        ExecutionCommitError::StaleRevision { .. } => true,
+        ExecutionCommitError::Transition(ExecutionTransitionError::StaleRevision { .. }) => true,
+        ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision { .. }) => true,
+        _ => false,
+    }
+}
 
 fn agent_stream_id(agent_id: &str) -> String {
     format!("agent:{agent_id}")
