@@ -273,8 +273,14 @@ fn step_belongs_to_packet(
             .actor_ref
             .as_deref()
             .is_some_and(|actor_ref| actor_ref == principal || actor_ref == agent)
+        // The native provider path does not carry the Program in the Step
+        // identity, so the Program is bound by the TRUSTED packet and the
+        // actor. When the Step does name one, it has to be that Program.
         && packet.agentic_binding.as_ref().is_some_and(|binding| {
-            identity.program_ref.as_deref() == Some(binding.program_id.as_str())
+            identity
+                .program_ref
+                .as_deref()
+                .is_none_or(|program| program == binding.program_id.as_str())
         })
         && focus_task.is_some_and(|task| identity.task_ref.as_deref() == Some(task))
 }
