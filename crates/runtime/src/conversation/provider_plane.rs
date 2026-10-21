@@ -2393,6 +2393,19 @@ where
             let effective_model = effective_provider_identity
                 .as_ref()
                 .map(|identity| identity.model.clone());
+            // The inputs this request delivered are observed facts, and they
+            // are settled here rather than at the end of the response
+            // handling: a refused or malformed output frame ends the step
+            // early, and it must not un-read an input the model did read.
+            if let (Some(context), None) = (native_context.as_ref(), stream_run.failure.as_ref()) {
+                self.settle_observed_inputs(
+                    packed_model_observations.clone(),
+                    effective_model.as_deref().unwrap_or(model.as_str()),
+                    context,
+                    native_step.as_ref(),
+                )
+                .await?;
+            }
             if let Some(identity) = effective_provider_identity {
                 *self
                     .active_provider_identity
@@ -3098,14 +3111,6 @@ where
             if let Some(model) = effective_model.as_ref() {
                 if !models_tried.contains(model) {
                     models_tried.push(model.clone());
-                }
-                if let Some(context) = native_context.as_ref() {
-                    self.confirm_model_observations(
-                        packed_model_observations,
-                        model,
-                        context,
-                        native_step.as_ref(),
-                    )?;
                 }
             }
             self.consume_active_runtime_inputs_for_next_step(

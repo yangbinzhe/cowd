@@ -4486,6 +4486,7 @@ mod r1_native_real_wire {
         endpoint: String,
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
         disconnect: Arc<AtomicBool>,
+        reject_output: Arc<AtomicBool>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -4502,7 +4503,9 @@ mod r1_native_real_wire {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let captured = requests.clone();
             let disconnect = Arc::new(AtomicBool::new(false));
+            let reject_output = Arc::new(AtomicBool::new(false));
             let disconnected = disconnect.clone();
+            let rejected_output = reject_output.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -4547,6 +4550,14 @@ mod r1_native_real_wire {
                             "function":{"name":"read_file","arguments":
                                 serde_json::json!({"path":"target.txt","complete":true}).to_string()}
                         }]})
+                    } else if rejected_output.load(Ordering::SeqCst) {
+                        // The output frame names a tool this request never
+                        // exposed, so Runtime refuses the whole frame.
+                        serde_json::json!({"role":"assistant","tool_calls":[{
+                            "index":0,"id":"native-refused-output","type":"function",
+                            "function":{"name":"not_an_exposed_tool","arguments":
+                                serde_json::json!({"path":"target.txt"}).to_string()}
+                        }]})
                     } else {
                         serde_json::json!({"role":"assistant","content":"The supplied read result was received."})
                     };
@@ -4576,6 +4587,7 @@ mod r1_native_real_wire {
                 endpoint,
                 requests,
                 disconnect,
+                reject_output,
                 task,
             }
         }
@@ -5398,6 +5410,63 @@ mod r1_native_real_wire {
                 .iter()
                 .all(|event| event.payload["acquisition_cursor"] == primary.commit_cursor));
         }
+    }
+
+    /// A read the model really received stays recorded when the frame the
+    /// model produced afterwards is refused.
+    ///
+    /// The delivered read is a fact about what the model saw. A refused
+    /// output frame ends the step early, and it must not un-read an input
+    /// that was already delivered, or a reviewer that really did read the
+    /// result looks like it never read it.
+    #[tokio::test]
+    async fn r1_observed_input_survives_a_refused_output_frame() {
+        let fixture = NativeFixture::new(Some("original source\n"), "none").await;
+        fixture.server.reject_output.store(true, Ordering::SeqCst);
+        let (mut fixture, call) = fixture.run_root_host(false).await;
+
+        // The read really executed and produced its own original receipt.
+        let primary = fixture.acquisition(&call);
+        assert!(!primary.payload[READ_ACQUISITION_FIELD].is_null());
+
+        // The output frame that followed named a tool the request never
+        // exposed, so Runtime refused it instead of running it.
+        assert!(fixture.server.requests.lock().unwrap().len() >= 2);
+        assert!(!fixture
+            .runtime
+            .tool_executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.tool_use_id == "native-refused-output"));
+
+        // The delivered read is still recorded: one delivery material bound
+        // to the original acquisition, and a model observation.
+        let materials = fixture.materials();
+        assert!(!materials.is_empty(), "the delivered read must stay recorded");
+        let mut per_attempt = std::collections::BTreeMap::<
+            String,
+            std::collections::BTreeSet<String>,
+        >::new();
+        for event in &materials {
+            let material = decode_read_delivery(&event.payload).unwrap();
+            // Every delivery is bound to the original acquisition, never to a
+            // re-published or a foreign one.
+            assert_eq!(material.acquisition_event_id, primary.event_id);
+            let ReadDeliveryTransport::NativeProviderContinuation { request_id, .. } =
+                &material.transport
+            else {
+                panic!("unexpected delivery transport {:?}", material.transport);
+            };
+            // One attempt writes one delivery per observed invocation, so
+            // settling the same observation again is idempotent.
+            assert!(per_attempt
+                .entry(request_id.clone())
+                .or_default()
+                .insert(material.tool_invocation_id.clone()));
+        }
+        assert!(!fixture.runtime.turn_model_observations().is_empty());
     }
 
     #[tokio::test]
