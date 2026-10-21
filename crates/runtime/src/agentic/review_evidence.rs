@@ -279,6 +279,163 @@ pub(crate) fn review_result_identity(
     }
 }
 
+/// The logical and content identities ONE Program artifact reference names.
+///
+/// A logical artifact ref ("artifact:<24 hex>") and a content selector
+/// ("artifact://art_...") are two identities of ONE artifact. A reader that
+/// resolves content needs the content; a reader that identifies the business
+/// artifact needs the logical identity. Both are returned, so the two
+/// namespaces are kept apart instead of one being dressed as the other.
+///
+/// A reference that names SEVERAL artifacts is refused: two logical
+/// identities over one content are never merged.
+pub(crate) fn bound_artifact_identities(
+    program: &AgenticProgramProjection,
+    reference: &str,
+) -> Result<Vec<String>, String> {
+    let matches = program
+        .artifacts
+        .values()
+        .filter(|artifact| {
+            artifact.artifact_ref == reference
+                || artifact.content_ref == reference
+                || same_reference_spelling(&artifact.artifact_ref, reference)
+                || same_reference_spelling(&artifact.content_ref, reference)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(Vec::new()),
+        [artifact] => Ok(vec![
+            artifact.artifact_ref.clone(),
+            artifact.content_ref.clone(),
+        ]),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|artifact| format!("{}=>{}", artifact.content_ref, artifact.artifact_ref))
+                .collect::<Vec<_>>()
+                .join(",");
+            Err(format!(
+                "proof artifact identity is ambiguous: reference {reference} matches {candidates}"
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod bound_artifact_tests {
+    use super::*;
+    use crate::agentic::program::AgenticArtifactProjection;
+
+    fn artifact(artifact_ref: &str, content_ref: &str) -> AgenticArtifactProjection {
+        AgenticArtifactProjection {
+            artifact_ref: artifact_ref.into(),
+            content_ref: content_ref.into(),
+            kind: "report".into(),
+            title: String::new(),
+            relates_to: Vec::new(),
+            committed_by: "agent".into(),
+            claim_execution_id: None,
+            claim_generation: None,
+        }
+    }
+
+    fn program(artifacts: Vec<AgenticArtifactProjection>) -> AgenticProgramProjection {
+        let mut program = AgenticProgramProjection::empty("program", "objective");
+        for artifact in artifacts {
+            program
+                .artifacts
+                .insert(artifact.artifact_ref.clone(), artifact);
+        }
+        program
+    }
+
+    /// A logical artifact reference and the content it is bound to are TWO
+    /// identities of one artifact. Both are returned, so neither namespace is
+    /// dressed as the other.
+    #[test]
+    fn r1_a_logical_artifact_reference_binds_its_content() {
+        let program = program(vec![artifact(
+            "artifact:5efe90ba23d164d6672da34f",
+            "artifact://art_99d6cafe58c24009872332b4880508a0",
+        )]);
+        assert_eq!(
+            bound_artifact_identities(&program, "artifact:5efe90ba23d164d6672da34f")
+                .expect("one artifact"),
+            vec![
+                "artifact:5efe90ba23d164d6672da34f".to_string(),
+                "artifact://art_99d6cafe58c24009872332b4880508a0".to_string(),
+            ]
+        );
+        // The dressed spelling of the same logical reference names the same
+        // artifact, so the content is bound again and never invented.
+        assert_eq!(
+            bound_artifact_identities(&program, "artifact://5efe90ba23d164d6672da34f")
+                .expect("one artifact"),
+            vec![
+                "artifact:5efe90ba23d164d6672da34f".to_string(),
+                "artifact://art_99d6cafe58c24009872332b4880508a0".to_string(),
+            ]
+        );
+        // The content reference names the same artifact too.
+        assert_eq!(
+            bound_artifact_identities(&program, "artifact://art_99d6cafe58c24009872332b4880508a0")
+                .expect("one artifact"),
+            vec![
+                "artifact:5efe90ba23d164d6672da34f".to_string(),
+                "artifact://art_99d6cafe58c24009872332b4880508a0".to_string(),
+            ]
+        );
+    }
+
+    /// Two logical identities over one content are NOT merged: the reference
+    /// is ambiguous and is refused.
+    #[test]
+    fn r1_two_logical_identities_over_one_content_are_refused() {
+        let program = program(vec![
+            artifact(
+                "artifact:5efe90ba23d164d6672da34f",
+                "artifact://art_99d6cafe58c24009872332b4880508a0",
+            ),
+            artifact(
+                "artifact:6cd2be959677023bc86cdfd4",
+                "artifact://art_99d6cafe58c24009872332b4880508a0",
+            ),
+        ]);
+        let error = bound_artifact_identities(&program, "artifact://art_99d6cafe58c24009872332b4880508a0")
+            .expect_err("two logical identities over one content are ambiguous");
+        assert!(error.contains("artifact identity is ambiguous"), "{error}");
+    }
+
+    /// A reference this Program does not own binds nothing: it is not this
+    /// Program's artifact, so no content may be invented for it.
+    #[test]
+    fn r1_a_foreign_reference_binds_nothing() {
+        let program = program(vec![artifact(
+            "artifact:5efe90ba23d164d6672da34f",
+            "artifact://art_99d6cafe58c24009872332b4880508a0",
+        )]);
+        assert!(
+            bound_artifact_identities(&program, "artifact://art_somebody_elses_content")
+                .expect("no ambiguity")
+                .is_empty(),
+            "a foreign content reference binds nothing"
+        );
+        assert!(
+            bound_artifact_identities(&program, "artifact:000000000000000000000000")
+                .expect("no ambiguity")
+                .is_empty(),
+            "an unknown logical reference binds nothing"
+        );
+        // A non-artifact reference (a tool receipt, a graph) is untouched.
+        assert!(
+            bound_artifact_identities(&program, "tool://raw-chatcmpl-tool-1")
+                .expect("no ambiguity")
+                .is_empty()
+        );
+    }
+}
+
 fn canonical_review_result_refs(
     program: &AgenticProgramProjection,
     references: &[String],

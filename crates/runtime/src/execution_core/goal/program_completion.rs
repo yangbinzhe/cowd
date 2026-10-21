@@ -308,6 +308,27 @@ impl GoalStore {
         for review in &goal.reviews {
             evidence.extend(review.evidence_refs.iter().cloned());
         }
+        // The Goal's evidence is read as CONTENT. A logical artifact
+        // reference ("artifact:<24 hex>") is one artifact's business
+        // identity; the content it is bound to is what a reader can resolve.
+        // Keep BOTH identities, so a logical reference is never dressed as a
+        // content selector, and refuse a reference that names SEVERAL
+        // artifacts: two logical identities over one content are never merged.
+        let mut evidence = evidence
+            .iter()
+            .map(|reference| {
+                let bound =
+                    crate::agentic::review_evidence::bound_artifact_identities(program, reference)?;
+                Ok(if bound.is_empty() {
+                    vec![reference.clone()]
+                } else {
+                    bound
+                })
+            })
+            .collect::<Result<Vec<Vec<String>>, String>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         evidence.sort();
         evidence.dedup();
         apply_completion_criterion_state(&mut goal, &projection.progress, &evidence);

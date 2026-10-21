@@ -806,6 +806,7 @@ impl RuntimeEventStore {
     fn validate_live_typed_selector(
         &self,
         selector: &str,
+        field: &str,
     ) -> RuntimeEventStoreResult<Option<ArtifactRef>> {
         if !selector.starts_with("artifact://") {
             return Ok(None);
@@ -819,8 +820,8 @@ impl RuntimeEventStore {
             .map(Some)
             .map_err(|error| {
                 RuntimeEventStoreError::InvalidTransaction(format!(
-                    "{}: typed selector {}",
-                    error, selector
+                    "{}: typed selector {} in {}",
+                    error, selector, field
                 ))
             })
     }
@@ -836,21 +837,27 @@ impl RuntimeEventStore {
             .chain(&observation.evidence_delta.invalidated)
             .chain(&observation.information_gain.distinguishing_evidence_refs)
         {
-            self.validate_live_typed_selector(selector)?;
+            self.validate_live_typed_selector(selector, "observation.evidence_refs")?;
         }
         for delta in &observation.criterion_deltas {
             for selector in &delta.evidence_refs {
-                self.validate_live_typed_selector(selector)?;
+                self.validate_live_typed_selector(selector, "observation.criterion_deltas.evidence_refs")?;
             }
         }
         for delta in &observation.conflict_deltas {
             for selector in &delta.evidence_refs {
-                self.validate_live_typed_selector(selector)?;
+                self.validate_live_typed_selector(
+                    selector,
+                    "observation.conflict_deltas.evidence_refs",
+                )?;
             }
         }
         for delta in &observation.unknown_deltas {
             for selector in &delta.evidence_refs {
-                self.validate_live_typed_selector(selector)?;
+                self.validate_live_typed_selector(
+                    selector,
+                    "observation.unknown_deltas.evidence_refs",
+                )?;
             }
         }
         Ok(())
@@ -862,9 +869,13 @@ impl RuntimeEventStore {
     ) -> RuntimeEventStoreResult<()> {
         use crate::execution_core::graph::ExecutionGraphEvent;
         let validate_result = |result: &harness_contract::execution_graph::ExecutionNodeResult| -> RuntimeEventStoreResult<()> {
-            if let Some(selector) = &result.result_ref { self.validate_live_typed_selector(selector)?; }
+            if let Some(selector) = &result.result_ref {
+                self.validate_live_typed_selector(selector, "observation.result_refs")?;
+            }
             for evidence in result.evidence_refs.iter().chain(result.failure.iter().flat_map(|failure| &failure.evidence_refs)) {
-                if let Some(artifact) = self.validate_live_typed_selector(&evidence.retrieval_selector)? {
+                if let Some(artifact) =
+                    self.validate_live_typed_selector(&evidence.retrieval_selector, "observation.observed_evidence.retrieval_selector")?
+                {
                     if !evidence.is_durable() || artifact.sha256 != evidence.sha256 || artifact.bytes != evidence.bytes
                         || artifact.media_type != evidence.media_type || artifact.visibility_scope != evidence.visibility_scope {
                         return Err(RuntimeEventStoreError::InvalidTransaction("typed Graph evidence identity mismatch".into()));
@@ -877,7 +888,7 @@ impl RuntimeEventStore {
             ExecutionGraphEvent::Planned { graph }
             | ExecutionGraphEvent::Checkpoint { graph, .. } => {
                 for node in &graph.nodes {
-                    self.validate_live_typed_selector(&node.payload_ref)?;
+                    self.validate_live_typed_selector(&node.payload_ref, "observation.node.payload_ref")?;
                 }
                 for result in graph.node_results.values() {
                     validate_result(result)?;
@@ -901,7 +912,7 @@ impl RuntimeEventStore {
             | ExecutionGraphEvent::Recovered { delta, .. } => delta,
         };
         for node in &delta.added_nodes {
-            self.validate_live_typed_selector(&node.payload_ref)?;
+            self.validate_live_typed_selector(&node.payload_ref, "observation.node.payload_ref")?;
         }
         for result in delta.node_result_updates.values() {
             validate_result(result)?;
@@ -1010,7 +1021,7 @@ impl RuntimeEventStore {
         if goal.is_some() {
             let projection: crate::execution_core::GoalProjection = serde_json::from_value(body)?;
             for selector in &projection.goal.evidence_refs {
-                self.validate_live_typed_selector(selector)?;
+                self.validate_live_typed_selector(selector, "goal.evidence_refs")?;
             }
             for criterion in &projection.goal.criteria {
                 for selector in criterion
@@ -1019,7 +1030,7 @@ impl RuntimeEventStore {
                     .chain(&criterion.required_evidence)
                     .chain(criterion.statement_ref.iter())
                 {
-                    self.validate_live_typed_selector(selector)?;
+                    self.validate_live_typed_selector(selector, "goal.criterion.evidence")?;
                 }
             }
             for observation in &projection.observations {
@@ -1028,10 +1039,10 @@ impl RuntimeEventStore {
         } else if program {
             let projection: crate::AgenticProgramProjection = serde_json::from_value(body)?;
             for artifact in projection.artifacts.values() {
-                self.validate_live_typed_selector(&artifact.content_ref)?;
+                self.validate_live_typed_selector(&artifact.content_ref, "artifact.content_ref")?;
             }
             if let Some(selector) = &projection.final_artifact_ref {
-                self.validate_live_typed_selector(selector)?;
+                self.validate_live_typed_selector(selector, "program.final_artifact_ref")?;
             }
         }
         Ok(())

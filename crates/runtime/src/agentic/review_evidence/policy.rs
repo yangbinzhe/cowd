@@ -8135,7 +8135,10 @@ mod tests {
         };
         for second_review in [false, true] {
             with_native_task_review_async(
-                NativeTaskReviewCase::default(),
+                NativeTaskReviewCase {
+                    complete_goal: !second_review,
+                    ..NativeTaskReviewCase::default()
+                },
                 move |services, envelope, donor| Box::pin(async move {
                     let program = services
                         .agent_action_service()
