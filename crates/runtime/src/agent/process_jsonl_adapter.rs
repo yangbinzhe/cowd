@@ -427,18 +427,6 @@ enum ProcessDriverFault {
 
 #[cfg(test)]
 impl ProcessJsonlRegistry {
-    /// The scratch directory a run owns, when the adapter runs with the
-    /// fixture scratch enabled.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    fn fixture_scratch_path(&self, packet: &AgentTaskPacket) -> Option<std::path::PathBuf> {
-        let root = self.fixture_scratch.lock().ok()?.clone()?;
-        Some(root.join(format!(
-            "{}-{}",
-            crate::context_evidence::read_sha256(packet.run_id().as_bytes())
-                .trim_start_matches("sha256:"),
-            packet.attempt
-        )))
-    }
     fn take_driver_panic(&self, packet: &AgentTaskPacket, driver: ProcessDriverFault) -> bool {
         let mut fault = self.driver_panic.lock().unwrap();
         if fault.as_ref().is_some_and(|(run_id, requested)| {
@@ -488,6 +476,19 @@ impl ProcessLocalExitEvidence {
 }
 
 impl ProcessJsonlRegistry {
+    /// The scratch directory a run owns, when the adapter runs with the
+    /// fixture scratch enabled.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_scratch_path(&self, packet: &AgentTaskPacket) -> Option<std::path::PathBuf> {
+        let root = self.fixture_scratch.lock().ok()?.clone()?;
+        Some(root.join(format!(
+            "{}-{}",
+            crate::context_evidence::read_sha256(packet.run_id().as_bytes())
+                .trim_start_matches("sha256:"),
+            packet.attempt
+        )))
+    }
+
     fn record_local_exit(
         &self,
         packet: &AgentTaskPacket,
