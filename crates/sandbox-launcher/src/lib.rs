@@ -942,12 +942,30 @@ fn process_host_executable_path() -> Result<PathBuf, SandboxError> {
 }
 
 fn launcher_protocol_matches(path: &Path) -> bool {
-    let output = Command::new(path)
-        .args([INTERNAL_DISPATCH, INTERNAL_ROLE, "--protocol-version"])
-        .env_clear()
-        .stdin(Stdio::null())
-        .output();
-    let Ok(output) = output else {
+    // The launcher binary can be rewritten while the acceptance lanes run (a
+    // fresh build replaces it). Executing a binary that is being written
+    // fails with ETXTBSY, which must not be mistaken for "this binary does
+    // not expose the inner role": that turns a build into a false acceptance
+    // failure.
+    let mut output = None;
+    for attempt in 0..5 {
+        let attempt_output = Command::new(path)
+            .args([INTERNAL_DISPATCH, INTERNAL_ROLE, "--protocol-version"])
+            .env_clear()
+            .stdin(Stdio::null())
+            .output();
+        match attempt_output {
+            Ok(result) => {
+                output = Some(result);
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => break,
+        }
+    }
+    let Some(output) = output else {
         return false;
     };
     let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();

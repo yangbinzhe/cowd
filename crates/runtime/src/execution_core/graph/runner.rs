@@ -1273,22 +1273,38 @@ impl ExecutionGraphRunner {
         graph_id: &str,
         ticket: &NodeExecutionTicket,
     ) -> Result<(), ExecutionRunnerError> {
-        let graph = self.state_store.load_async(graph_id).await?;
-        let Some(status) = graph.node_statuses.get(&ticket.node_id).copied() else {
-            return Ok(());
-        };
-        if status.is_terminal() {
-            return Ok(());
-        }
-        self.commit_service
-            .transition_node(
+        // The node's own events can land while the cancellation is issued, so
+        // the transition is retried against the current revision. A failure
+        // here must never fail the cancellation itself: the node still commits
+        // its own terminal state when its execution ends.
+        for _ in 0..4 {
+            let graph = self.state_store.load_async(graph_id).await?;
+            let Some(status) = graph.node_statuses.get(&ticket.node_id).copied() else {
+                return Ok(());
+            };
+            if status.is_terminal() {
+                return Ok(());
+            }
+            match self.commit_service.transition_node(
                 &graph,
                 &ticket.node_id,
                 harness_contract::execution_graph::ExecutionNodeStatus::Cancelled,
                 None,
                 vec![],
-            )
-            .map_err(ExecutionRunnerError::Commit)?;
+            ) {
+                Ok(_) => return Ok(()),
+                Err(commit_error) => {
+                    if commit_error.to_string().contains("StaleRevision") {
+                        continue;
+                    }
+                    tracing::warn!(graph_id, node_id = %ticket.node_id, error = %commit_error,
+                        "cancelled node transition failed; the node keeps its own terminal commit");
+                    return Ok(());
+                }
+            }
+        }
+        tracing::warn!(graph_id, node_id = %ticket.node_id,
+            "cancelled node transition raced with the node's own events");
         Ok(())
     }
 
