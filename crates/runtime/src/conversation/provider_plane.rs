@@ -2403,8 +2403,7 @@ where
                     effective_model.as_deref().unwrap_or(model.as_str()),
                     context,
                     native_step.as_ref(),
-                )
-                .await?;
+                )?;
             }
             if let Some(identity) = effective_provider_identity {
                 *self

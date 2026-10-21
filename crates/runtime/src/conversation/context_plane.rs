@@ -1366,46 +1366,19 @@ where
     /// ledgers, and not at the end of the response handling that a refusal can
     /// skip.
     ///
-    /// The provider transport persists the attempt outcome after the stream it
-    /// forwarded ends, so the consumer can reach this point before the wire is
-    /// accepted. Waiting for that acceptance is what makes the boundary
-    /// deterministic: an attempt that failed, was cancelled, or was never
-    /// confirmed writes nothing, and a candidate is only written when the
-    /// wire, the step, the outcome, the recipient and the matching results all
-    /// agree.
-    pub(super) async fn settle_observed_inputs(
+    /// The settlement needs the accepted wire of the attempt that carried the
+    /// observation. The transport persists that outcome before it publishes
+    /// the terminal, so the consumer sees an accepted wire at this boundary
+    /// deterministically. An attempt that failed, was cancelled, or was never
+    /// confirmed has no accepted wire, and then the confirmation gates write
+    /// nothing: that is the honest answer, not a lost observation.
+    pub(super) fn settle_observed_inputs(
         &self,
         candidates: Vec<harness_contract::context::ProviderModelObservationAttestation>,
         effective_model: &str,
         context: &crate::ProviderRequestEvidenceContext,
         accepted_step: Option<&harness_contract::step::StepSnapshot>,
     ) -> Result<(), RuntimeError> {
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(2_000);
-        loop {
-            if self.cancellation_token.is_cancelled() {
-                // A cancelled attempt observed nothing: nothing is recorded.
-                return Ok(());
-            }
-            let accepted = self
-                .native_wire_receipts
-                .lock()
-                .map_err(|_| RuntimeError::new("native wire receipt projection poisoned"))?
-                .iter()
-                .any(|wire| wire.context == *context && wire.outcome_sequence.is_some());
-            if accepted {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                // The attempt never produced an accepted wire: nothing is
-                // recorded, because no model observation can be claimed.
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
         self.confirm_model_observations(candidates, effective_model, context, accepted_step)
     }
 
