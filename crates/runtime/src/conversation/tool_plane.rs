@@ -1752,7 +1752,17 @@ where
         // so it keeps its plain read receipt and the witness stays honestly
         // unproven for it.
         let committed = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-            if let Some(root) = root {
+            if host_process_terminal {
+                commit
+                    .commit_host_process_read_closure(
+                        request,
+                        descriptor,
+                        &outcome,
+                        &locked.scope,
+                        root,
+                    )
+                    .await
+            } else if let Some(root) = root {
                 commit.commit_root_read_acquisition(
                     request,
                     &outcome,
