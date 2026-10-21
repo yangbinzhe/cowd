@@ -17,8 +17,9 @@
 //! entry without that context exempts nothing.
 
 use harness_contract::agent_action::{
-    AgentAction, AgentActorBinding, AgentActorKind, OBJECTIVE_REVIEW_TOOL_ID, TASK_REVIEW_TOOL_ID,
+    AgentAction, AgentActorBinding, OBJECTIVE_REVIEW_TOOL_ID, TASK_REVIEW_TOOL_ID,
 };
+use harness_contract::agent::AgentTaskPacket;
 use serde_json::Value;
 
 /// The review action that is being applied, with the durable invocation id
@@ -37,31 +38,107 @@ fn review_control_tool(action: &AgentAction) -> Option<&'static str> {
     }
 }
 
+/// One governed tool call of the Session's plans, with the identity the
+/// proof would exempt.
+struct PlanCandidate {
+    effect_key: String,
+    tool_name: String,
+    step: crate::step_snapshot::StepCallBinding,
+}
+
+/// Every governed tool call of the pinned Session plans.
+fn plan_candidates(session_events: &[crate::DurableRuntimeEvent]) -> Vec<PlanCandidate> {
+    let mut candidates = Vec::new();
+    for event in session_events {
+        if event.kind != "tool.execution_plan.created"
+            || event.actor.as_deref() != Some("conversation_runtime")
+            || event.scope != crate::RuntimeEventScope::Tool
+        {
+            continue;
+        }
+        let Some(tasks) = event.payload["tasks"].as_array() else {
+            continue;
+        };
+        for task in tasks {
+            let Ok(step) = serde_json::from_value::<crate::step_snapshot::StepCallBinding>(
+                task["step_binding"].clone(),
+            ) else {
+                continue;
+            };
+            candidates.push(PlanCandidate {
+                effect_key: step.effect_idempotency_key(),
+                tool_name: task["tool_name"].as_str().unwrap_or_default().to_string(),
+                step,
+            });
+        }
+    }
+    candidates
+}
+
+/// Re-bind a stored identity against the durable evidence.
+///
+/// A proof carries the effect identity of the review call it was built
+/// under, but a stored value is only a CANDIDATE. This entry re-derives the
+/// call it names from the pinned plans and checks that the call is a review
+/// control action of THIS reviewer. A candidate that does not re-bind exempts
+/// nothing, so a proof can never grant an exemption by carrying a key.
+pub(crate) fn rebind_current_review_effect_key(
+    session_events: &[crate::DurableRuntimeEvent],
+    packet: &AgentTaskPacket,
+    carried: Option<&str>,
+    original_action_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(carried) = carried else {
+        return Ok(None);
+    };
+    // The stored candidate is only the review's own call when it is the
+    // invocation the ORIGINAL applied action recorded. A candidate that names
+    // another call of the same reviewer is another review, not this one.
+    if original_action_id != Some(carried) {
+        return Ok(None);
+    }
+    let mut rebound = Vec::new();
+    for candidate in plan_candidates(session_events) {
+        if candidate.effect_key != carried
+            || !matches!(
+                candidate.tool_name.as_str(),
+                TASK_REVIEW_TOOL_ID | OBJECTIVE_REVIEW_TOOL_ID
+            )
+            || !step_belongs_to_packet(&candidate.step, packet)
+        {
+            continue;
+        }
+        rebound.push(candidate.effect_key);
+    }
+    match rebound.len() {
+        0 => Ok(None),
+        1 => Ok(Some(rebound.remove(0))),
+        _ => Err("current review call is ambiguous".into()),
+    }
+}
+
 /// Resolve the ONE review control call that is currently executing.
 ///
-/// Returns `None` when the action is not a review, when the reviewer is not a
-/// delegated Agent (a root review is a goal-metadata control action and is
+/// The reviewer is the TRUSTED physical packet the proof already verified:
+/// its digest was checked against the proof's packet digests and its owner
+/// against the reviewer's execution identity. That is the same identity the
+/// read-delivery boundary checks, so the exemption is bound exactly as
+/// tightly as the delivery evidence is.
+///
+/// Returns `None` when the action is not a review, when the reviewer has no
+/// trusted packet (a root review is a goal-metadata control action and is
 /// already outside the business write set), when no pinned plan task carries
 /// the presented invocation id, or when the candidate does not authenticate
-/// against the reviewer and the action. An ambiguous resolution is an error:
-/// two different calls could both claim the exclusion.
+/// against the packet, the actor and the action. An ambiguous resolution is
+/// an error: two different calls could both claim the exclusion.
 pub(crate) fn resolve_current_review_effect_key(
     session_events: &[crate::DurableRuntimeEvent],
-    reviewer_execution_id: &str,
+    packet: &AgentTaskPacket,
     context: &CurrentReviewContext<'_>,
 ) -> Result<Option<String>, String> {
     let Some(expected_tool) = review_control_tool(context.action) else {
         return Ok(None);
     };
-    // Only a delegated reviewer's own call can be in flight while the proof
-    // is assembled. A root review is settled through the Goal lane, so it has
-    // no tool effect to exempt and no run to bind the call to.
-    let Some(reviewer_run) = reviewer_execution_id.strip_prefix("agent-run:") else {
-        return Ok(None);
-    };
-    if reviewer_run.is_empty() || context.actor.kind != AgentActorKind::Agent {
-        return Ok(None);
-    }
     let mut resolved: Vec<String> = Vec::new();
     for event in session_events {
         if event.kind != "tool.execution_plan.created"
@@ -83,7 +160,7 @@ pub(crate) fn resolve_current_review_effect_key(
             // A direct call presents its own effect identity.
             if effect_key == context.action_id {
                 if task["tool_name"].as_str() == Some(expected_tool)
-                    && step_belongs_to_reviewer(&step, reviewer_run, context.actor)
+                    && step_belongs_to_reviewer(&step, packet, context.actor)
                     && action_matches(&task["normalized_input"], context.action)
                 {
                     resolved.push(effect_key);
@@ -108,7 +185,7 @@ pub(crate) fn resolve_current_review_effect_key(
             let inner = &actions[0];
             if inner["tool"].as_str() != Some(expected_tool)
                 || format!("{effect_key}:0") != context.action_id
-                || !step_belongs_to_reviewer(&step, reviewer_run, context.actor)
+                || !step_belongs_to_reviewer(&step, packet, context.actor)
                 || !action_matches(&inner["input"], context.action)
             {
                 continue;
@@ -123,21 +200,83 @@ pub(crate) fn resolve_current_review_effect_key(
     }
 }
 
-/// The Step binding must belong to the reviewer's own execution: the same
-/// session and turn, and the same delegated run. The run binds the agent, the
-/// graph and the attempt together, so a second call of the same tool in that
-/// run - a different Step, a different attempt - carries a different effect
-/// identity and is never excluded.
+/// The receipt index stream that carries the reviewer's OWN admitted calls.
+///
+/// The stream names the graph, the agent node and the attempt, so an intent
+/// found in it is the reviewer's call in THAT attempt. An intent with the
+/// same effect identity in any other stream belongs to another attempt,
+/// another node or another graph, and is never the review's own call.
+pub(crate) fn reviewer_receipt_stream(packet: &AgentTaskPacket) -> String {
+    format!(
+        "execution-agent-receipts:{}:{}:{}",
+        packet.graph_id(),
+        packet.node_id(),
+        packet.attempt
+    )
+}
+
+/// The Step binding must belong to the reviewer's own execution.
+///
+/// Every coordinate is compared against the TRUSTED packet the proof
+/// verified: the session, the turn, the run, the principal, the Program and
+/// the Task the reviewer is bound to. The actor is compared too: its
+/// execution id is the graph the packet belongs to, so an actor from
+/// another graph cannot claim this packet's call.
 fn step_belongs_to_reviewer(
     step: &crate::step_snapshot::StepCallBinding,
-    reviewer_run: &str,
+    packet: &AgentTaskPacket,
     actor: &AgentActorBinding,
 ) -> bool {
+    step_belongs_to_packet(step, packet)
+        && actor.session_id == packet.session_id()
+        && actor.turn_id == packet.assignment.execution_identity.turn_id().unwrap_or_default()
+        && packet
+            .agentic_binding
+            .as_ref()
+            .is_some_and(|binding| actor.program_id == binding.program_id)
+        && actor.execution_id.as_deref() == Some(packet.graph_id())
+}
+
+/// The Step binding must belong to the reviewer's own execution.
+///
+/// Every coordinate is compared against the TRUSTED packet the proof
+/// verified: the session, the turn, the run, the principal, the Program and
+/// the Task the reviewer is bound to.
+fn step_belongs_to_packet(
+    step: &crate::step_snapshot::StepCallBinding,
+    packet: &AgentTaskPacket,
+) -> bool {
     let identity = &step.snapshot.identity;
-    identity.session_id == actor.session_id
-        && identity.turn_id == actor.turn_id
-        && identity.execution_id.as_deref() == Some(reviewer_run)
-        && identity.run_ref.as_deref() == Some(reviewer_run)
+    let principal = packet.assignment.execution_identity.principal_id();
+    let agent = packet.agent_id();
+    let turn = packet.assignment.execution_identity.turn_id();
+    let focus_task = packet
+        .agentic_binding
+        .as_ref()
+        .and_then(|binding| match &binding.focus {
+            harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref }
+            | harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => {
+                Some(task_ref.as_str())
+            }
+            _ => None,
+        });
+    identity.session_id == packet.session_id()
+        && turn.is_some_and(|turn| identity.turn_id == turn)
+        && identity.execution_id.as_deref() == Some(packet.run_id())
+        && identity.run_ref.as_deref() == Some(packet.run_id())
+        // The native provider path does not carry the attempt in the Step
+        // identity; when it does, it has to be the reviewer's attempt. The
+        // attempt is bound in full by the receipt index stream the call was
+        // admitted in.
+        && identity.attempt.is_none_or(|attempt| attempt == packet.attempt)
+        && identity
+            .actor_ref
+            .as_deref()
+            .is_some_and(|actor_ref| actor_ref == principal || actor_ref == agent)
+        && packet.agentic_binding.as_ref().is_some_and(|binding| {
+            identity.program_ref.as_deref() == Some(binding.program_id.as_str())
+        })
+        && focus_task.is_some_and(|task| identity.task_ref.as_deref() == Some(task))
 }
 
 /// The recorded tool input must be the action being submitted: the same
@@ -209,13 +348,97 @@ fn normalized_refs(refs: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_contract::agent::AgenticExecutionBinding;
     use harness_contract::agent_action::{
         AgentActorBinding, AgentActorKind, TaskReviewDecision, TaskReviewInput,
     };
 
-    const REVIEWER_RUN: &str = "run:agentic-graph:review";
+    const RUN: &str = "run:agentic-graph:review";
+    const SESSION: &str = "session";
+    // The trusted packet's own turn identity: Runtime binds the packet's
+    // lineage turn, the Program turn and the actor's turn to one value.
+    const TURN: &str = "test-turn";
 
-    fn step_binding(call_id: &str, run: &str, attempt: Option<u32>) -> Value {
+    fn packet() -> AgentTaskPacket {
+        let mut packet = AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "agent",
+                RUN,
+                "task",
+                SESSION,
+                "mission",
+                Some("team"),
+                "graph",
+                "node",
+            ),
+            attempt: 2,
+            expected_graph_revision: 7,
+            objective: "review".into(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            cohort_prompt_package: None,
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::DangerFullAccess,
+            policy_revision: 1,
+            model_lease: "model".into(),
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "agent",
+                1,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "key".into(),
+            agentic_binding: None,
+        };
+        packet.agentic_binding = Some(AgenticExecutionBinding {
+            program_id: "program".into(),
+            agent_id: "agent".into(),
+            membership_id: "membership".into(),
+            team_id: "team".into(),
+            task_team_id: "team".into(),
+            source_spec_revision: 1,
+            task_purpose: None,
+            focus: harness_contract::agent::AgenticExecutionFocus::TaskReview {
+                task_ref: "task:one".into(),
+            },
+        });
+        packet
+    }
+
+    fn actor() -> AgentActorBinding {
+        AgentActorBinding {
+            objective_id: "objective".into(),
+            program_id: "program".into(),
+            session_id: SESSION.into(),
+            turn_id: TURN.into(),
+            root_execution_id: Some("graph".into()),
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: String::new(),
+            model_lease: "model".into(),
+            permission_ceiling: None,
+            resource_scopes: Vec::new(),
+            actor_id: "agent".into(),
+            kind: AgentActorKind::Agent,
+            execution_id: Some("graph".into()),
+            team_id: Some("team".into()),
+            agent_id: Some("agent".into()),
+        }
+    }
+
+    fn step_binding(call_id: &str) -> Value {
         serde_json::json!({
             "origin": {
                 "origin_step_id": format!("step-{call_id}"),
@@ -227,12 +450,15 @@ mod tests {
                 "contract_version": 1,
                 "identity": {
                     "step_id": format!("step-{call_id}"),
-                    "session_id": "session",
-                    "turn_id": "turn",
-                    "execution_id": run,
-                    "actor_ref": "runtime.agentic",
-                    "run_ref": run,
-                    "attempt": attempt,
+                    "session_id": SESSION,
+                    "turn_id": TURN,
+                    "execution_id": RUN,
+                    "actor_ref": "test.principal",
+                    "run_ref": RUN,
+                    "attempt": 2,
+                    "epoch": "revision-7",
+                    "program_ref": "program",
+                    "task_ref": "task:one",
                     "build_ref": "build",
                 },
                 "provider_attempt": {
@@ -250,24 +476,24 @@ mod tests {
         })
     }
 
-    fn review_task(call_id: &str, task_ref: &str, run: &str) -> Value {
+    fn review_task(call_id: &str) -> Value {
         serde_json::json!({
             "tool_name": "task_review",
             "tool_call_id": call_id,
             "normalized_input": {
-                "task_ref": task_ref,
+                "task_ref": "task:one",
                 "decision": "accept",
                 "reason": "independently read",
                 "evidence_refs": ["artifact://read"],
             },
-            "step_binding": step_binding(call_id, run, None),
+            "step_binding": step_binding(call_id),
         })
     }
 
     fn plan_event(tasks: Value) -> crate::DurableRuntimeEvent {
         crate::DurableRuntimeEvent {
             event_id: "plan-event".into(),
-            stream_id: "session:session".into(),
+            stream_id: format!("session:{SESSION}"),
             sequence: 1,
             scope: crate::RuntimeEventScope::Tool,
             kind: "tool.execution_plan.created".into(),
@@ -284,30 +510,9 @@ mod tests {
         }
     }
 
-    fn actor() -> AgentActorBinding {
-        AgentActorBinding {
-            objective_id: "objective".into(),
-            program_id: "program".into(),
-            session_id: "session".into(),
-            turn_id: "turn".into(),
-            root_execution_id: Some("graph".into()),
-            required_team_count: 0,
-            exact_team_count: None,
-            objective_summary: String::new(),
-            model_lease: "model".into(),
-            permission_ceiling: None,
-            resource_scopes: Vec::new(),
-            actor_id: "agent".into(),
-            kind: AgentActorKind::Agent,
-            execution_id: Some("graph".into()),
-            team_id: Some("team".into()),
-            agent_id: Some("agent".into()),
-        }
-    }
-
-    fn review_action(task_ref: &str) -> AgentAction {
+    fn review_action() -> AgentAction {
         AgentAction::TaskReview(TaskReviewInput {
-            task_ref: task_ref.into(),
+            task_ref: "task:one".into(),
             decision: TaskReviewDecision::Accept,
             reason: "independently read".into(),
             operator_requirement: None,
@@ -323,29 +528,84 @@ mod tests {
 
     fn resolve(
         events: &[crate::DurableRuntimeEvent],
+        packet: &AgentTaskPacket,
         context: &CurrentReviewContext<'_>,
     ) -> Option<String> {
-        resolve_current_review_effect_key(events, &format!("agent-run:{REVIEWER_RUN}"), context)
-            .expect("an unambiguous resolution")
+        resolve_current_review_effect_key(events, packet, context).expect("an unambiguous resolution")
     }
 
+    /// A stored candidate is only the review's own call when it is the
+    /// invocation the ORIGINAL applied action recorded. A candidate that names
+    /// another review call of the same reviewer is another review.
+    #[test]
+    fn r1_a_stored_candidate_must_be_the_original_action_invocation() {
+        let packet = packet();
+        let applied = review_task("call-a");
+        let other = review_task("call-b");
+        let events = [plan_event(serde_json::json!([applied.clone(), other.clone()]))];
+        let applied_key = effect_key(&applied);
+        let other_key = effect_key(&other);
+
+        // The original action recorded the applied review's invocation.
+        assert_eq!(
+            rebind_current_review_effect_key(
+                &events,
+                &packet,
+                Some(applied_key.as_str()),
+                Some(applied_key.as_str()),
+            )
+            .expect("an unambiguous rebinding"),
+            Some(applied_key.clone())
+        );
+        // The same candidate, but the original action recorded another
+        // invocation: this is not the review's own call.
+        assert_eq!(
+            rebind_current_review_effect_key(
+                &events,
+                &packet,
+                Some(applied_key.as_str()),
+                Some(other_key.as_str()),
+            )
+            .expect("an unambiguous rebinding"),
+            None,
+            "a candidate that is not the original invocation exempts nothing"
+        );
+        // Another review call of the same reviewer is another review, even
+        // when the original action recorded it.
+        assert_eq!(
+            rebind_current_review_effect_key(
+                &events,
+                &packet,
+                Some(other_key.as_str()),
+                Some(other_key.as_str()),
+            )
+            .expect("an unambiguous rebinding"),
+            Some(other_key.clone()),
+            "the call the original action recorded is the review's own call"
+        );
+        // No candidate, no exemption.
+        assert_eq!(
+            rebind_current_review_effect_key(&events, &packet, None, None)
+                .expect("an unambiguous rebinding"),
+            None
+        );
+    }
     /// Two review calls in the SAME run, with the SAME tool: only the one the
     /// submitted action names may be exempt. The other one is a second
     /// unfinished review and must keep blocking.
     #[test]
     fn r1_second_unfinished_review_in_the_same_run_is_not_exempt() {
-        let first = review_task("call-a", "task:one", REVIEWER_RUN);
-        let second = review_task("call-b", "task:one", REVIEWER_RUN);
-        let events = [plan_event(serde_json::json!([
-            first.clone(),
-            second.clone()
-        ]))];
+        let first = review_task("call-a");
+        let second = review_task("call-b");
+        let events = [plan_event(serde_json::json!([first.clone(), second.clone()]))];
+        let packet = packet();
+        let action = review_action();
         let context = CurrentReviewContext {
             action_id: &effect_key(&first),
-            action: &review_action("task:one"),
+            action: &action,
             actor: &actor(),
         };
-        let resolved = resolve(&events, &context).expect("the presented call resolves");
+        let resolved = resolve(&events, &packet, &context).expect("the presented call resolves");
         assert_eq!(resolved, effect_key(&first));
         assert_ne!(
             resolved,
@@ -354,15 +614,16 @@ mod tests {
         );
     }
 
-    /// A forged invocation id, an action the call did not perform, a call
-    /// from another run, a call with no Step identity, and a review performed
-    /// by the root all resolve to nothing: nothing is exempt.
+    /// A forged invocation id, an action the call did not perform, another
+    /// reviewer, a call with no Step identity and a root reviewer all resolve
+    /// to nothing: nothing is exempt.
     #[test]
     fn r1_unauthenticated_review_resolves_to_nothing() {
-        let task = review_task("call-a", "task:one", REVIEWER_RUN);
+        let task = review_task("call-a");
         let events = [plan_event(serde_json::json!([task.clone()]))];
+        let packet = packet();
+        let action = review_action();
         let key = effect_key(&task);
-        let action = review_action("task:one");
 
         let forged = CurrentReviewContext {
             action_id: "forged-invocation-id",
@@ -370,17 +631,23 @@ mod tests {
             actor: &actor(),
         };
         assert!(
-            resolve(&events, &forged).is_none(),
+            resolve(&events, &packet, &forged).is_none(),
             "a forged invocation id names no call"
         );
 
         let other_action = CurrentReviewContext {
             action_id: &key,
-            action: &review_action("task:two"),
+            action: &AgentAction::TaskReview(TaskReviewInput {
+                task_ref: "task:two".into(),
+                decision: TaskReviewDecision::Accept,
+                reason: "independently read".into(),
+                operator_requirement: None,
+                evidence_refs: vec!["artifact://read".into()],
+            }),
             actor: &actor(),
         };
         assert!(
-            resolve(&events, &other_action).is_none(),
+            resolve(&events, &packet, &other_action).is_none(),
             "a review of another Task is not this call"
         );
 
@@ -396,23 +663,11 @@ mod tests {
             actor: &actor(),
         };
         assert!(
-            resolve(&events, &other_verdict).is_none(),
+            resolve(&events, &packet, &other_verdict).is_none(),
             "another verdict is another action"
         );
 
-        let foreign = review_task("call-foreign", "task:one", "run:agentic-graph:other");
-        let foreign_events = [plan_event(serde_json::json!([foreign.clone()]))];
-        let foreign_context = CurrentReviewContext {
-            action_id: &effect_key(&foreign),
-            action: &action,
-            actor: &actor(),
-        };
-        assert!(
-            resolve(&foreign_events, &foreign_context).is_none(),
-            "another run is not this call"
-        );
-
-        let mut unbound = review_task("call-unbound", "task:one", REVIEWER_RUN);
+        let mut unbound = review_task("call-unbound");
         unbound["step_binding"] = Value::Null;
         let unbound_events = [plan_event(serde_json::json!([unbound]))];
         let unbound_context = CurrentReviewContext {
@@ -421,8 +676,93 @@ mod tests {
             actor: &actor(),
         };
         assert!(
-            resolve(&unbound_events, &unbound_context).is_none(),
+            resolve(&unbound_events, &packet, &unbound_context).is_none(),
             "a call with no Step identity is not exempt"
+        );
+    }
+
+    /// The same call, the same session, turn, run, Step and model call - with
+    /// ONE coordinate changed - must not be exempt. Each mutation is a
+    /// different reviewer or a different attempt of the same reviewer.
+    #[test]
+    fn r1_a_mutated_step_or_actor_is_not_exempt() {
+        let packet = packet();
+        let action = review_action();
+
+        let mutate = |change: &str| {
+            let mut task = review_task("call-a");
+            let step = &mut task["step_binding"]["snapshot"]["identity"];
+            match change {
+                "actor_ref" => step["actor_ref"] = Value::String("someone.else".into()),
+                "attempt" => step["attempt"] = serde_json::json!(99),
+                "program" => step["program_ref"] = Value::String("other-program".into()),
+                "task" => step["task_ref"] = Value::String("task:other".into()),
+                "session" => step["session_id"] = Value::String("other-session".into()),
+                "turn" => step["turn_id"] = Value::String("other-turn".into()),
+                "run" => {
+                    step["execution_id"] = Value::String("run:other".into());
+                    step["run_ref"] = Value::String("run:other".into());
+                }
+                other => panic!("unknown mutation {other}"),
+            }
+            task
+        };
+
+        for change in [
+            "actor_ref",
+            "attempt",
+            "program",
+            "task",
+            "session",
+            "turn",
+            "run",
+        ] {
+            let task = mutate(change);
+            let events = [plan_event(serde_json::json!([task.clone()]))];
+            let context = CurrentReviewContext {
+                action_id: &effect_key(&task),
+                action: &action,
+                actor: &actor(),
+            };
+            assert!(
+                resolve(&events, &packet, &context).is_none(),
+                "a call with a mutated {change} is not the reviewer's own call"
+            );
+        }
+    }
+
+    /// The actor is the reviewer's own: its execution id is the graph the
+    /// trusted packet belongs to. An actor from another graph cannot claim
+    /// this packet's call, and neither can an actor from another session.
+    #[test]
+    fn r1_a_mutated_actor_is_not_exempt() {
+        let task = review_task("call-a");
+        let events = [plan_event(serde_json::json!([task.clone()]))];
+        let packet = packet();
+        let action = review_action();
+
+        let mut foreign_graph = actor();
+        foreign_graph.execution_id = Some("other-graph".into());
+        let context = CurrentReviewContext {
+            action_id: &effect_key(&task),
+            action: &action,
+            actor: &foreign_graph,
+        };
+        assert!(
+            resolve(&events, &packet, &context).is_none(),
+            "an actor of another graph is not the reviewer"
+        );
+
+        let mut foreign_session = actor();
+        foreign_session.session_id = "other-session".into();
+        let context = CurrentReviewContext {
+            action_id: &effect_key(&task),
+            action: &action,
+            actor: &foreign_session,
+        };
+        assert!(
+            resolve(&events, &packet, &context).is_none(),
+            "an actor of another session is not the reviewer"
         );
     }
 
@@ -432,7 +772,8 @@ mod tests {
     /// action, and the excluded effect is the batch call itself.
     #[test]
     fn r1_batch_siblings_are_not_exempt() {
-        let action = review_action("task:one");
+        let packet = packet();
+        let action = review_action();
         let sibling = serde_json::json!({
             "tool": "task_submit",
             "input": {"task_ref": "task:two", "artifact_refs": ["artifact://x"]},
@@ -451,7 +792,7 @@ mod tests {
                 "tool_name": "agent_action_batch",
                 "tool_call_id": "call-batch",
                 "normalized_input": {"actions": actions},
-                "step_binding": step_binding("call-batch", REVIEWER_RUN, None),
+                "step_binding": step_binding("call-batch"),
             })
         };
 
@@ -464,7 +805,7 @@ mod tests {
             actor: &actor(),
         };
         assert!(
-            resolve(&sibling_events, &sibling_context).is_none(),
+            resolve(&sibling_events, &packet, &sibling_context).is_none(),
             "a batch with siblings is not exempt"
         );
 
@@ -477,7 +818,7 @@ mod tests {
             actor: &actor(),
         };
         assert_eq!(
-            resolve(&alone_events, &alone_context),
+            resolve(&alone_events, &packet, &alone_context),
             Some(alone_key.clone()),
             "a batch that carries exactly one action is that action"
         );
@@ -488,33 +829,8 @@ mod tests {
             actor: &actor(),
         };
         assert!(
-            resolve(&alone_events, &missing_child).is_none(),
+            resolve(&alone_events, &packet, &missing_child).is_none(),
             "a child index that does not exist names no call"
-        );
-    }
-
-    /// A root review is settled through the Goal lane and has no delegated run
-    /// to bind a call to, so it is never exempt.
-    #[test]
-    fn r1_root_reviewer_is_never_exempt() {
-        let task = review_task("call-a", "task:one", REVIEWER_RUN);
-        let events = [plan_event(serde_json::json!([task.clone()]))];
-        let mut root = actor();
-        root.kind = AgentActorKind::Root;
-        root.execution_id = None;
-        root.agent_id = None;
-        root.team_id = None;
-        root.actor_id = "root:session".into();
-        let context = CurrentReviewContext {
-            action_id: &effect_key(&task),
-            action: &review_action("task:one"),
-            actor: &root,
-        };
-        assert!(
-            resolve_current_review_effect_key(&events, "root-execution:graph", &context)
-                .expect("an unambiguous resolution")
-                .is_none(),
-            "a root review has no in-flight delegated call to exempt"
         );
     }
 }

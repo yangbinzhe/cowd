@@ -24,6 +24,10 @@ pub(crate) struct ProofInputSnapshot {
     pub policy_digest: String,
     pub effects: RootReviewPolicySnapshot,
     pub sources: Vec<ExpectedStreamRevision>,
+    /// The effect identity of the review control call this snapshot exempts.
+    /// It is a CANDIDATE that every entry re-binds against the durable
+    /// evidence; a snapshot without one exempts nothing.
+    pub current_review_effect_key: Option<String>,
 }
 
 impl ProofInputSnapshot {
@@ -3353,6 +3357,58 @@ fn review_write_outcome(
     ReviewWriteOutcome::Blocked
 }
 
+/// Whether this intent is the reviewer's OWN admitted call.
+///
+/// Two things have to hold, and they are two different facts:
+///
+/// * the effect identity is the one Runtime resolved for the action being
+///   applied - the same call, the same Step, the same model tool call;
+/// * the intent was admitted in the reviewer's OWN receipt index stream,
+///   which names the graph, the agent node and the attempt. The Step of a
+///   call does not carry the attempt on the native provider path, so the
+///   attempt is bound here, where the durable evidence actually records it.
+fn is_review_own_admitted_call(
+    current_review_effect_key: Option<&str>,
+    reviewer_receipt_stream: Option<&str>,
+    source: &str,
+    identity: &str,
+) -> bool {
+    current_review_effect_key == Some(identity) && reviewer_receipt_stream == Some(source)
+}
+
+/// The invocation id of the ORIGINAL applied action that produced a proof.
+///
+/// The durable action record carries the envelope it applied and the proof it
+/// accepted, so the action and the proof are one record. Exactly one applied
+/// action may carry a proof: two would make the review's own call ambiguous,
+/// and the proof must not pick one.
+fn original_review_action_id(
+    events: &[crate::DurableRuntimeEvent],
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+) -> Result<Option<String>, String> {
+    let proof_value = serde_json::to_value(proof).map_err(|error| error.to_string())?;
+    let mut found: Option<String> = None;
+    for event in events {
+        if event.kind != "agentic.action_applied"
+            || event.status.as_deref() != Some("applied")
+            || event.payload["review_verification"] != proof_value
+        {
+            continue;
+        }
+        let envelope: harness_contract::agent_action::AgentActionEnvelope =
+            serde_json::from_value(event.payload["envelope"].clone())
+                .map_err(|_| "original review action envelope missing")?;
+        if event.actor.as_deref() != Some(envelope.actor.actor_id.as_str()) {
+            return Err("original review action owner mismatch".into());
+        }
+        if found.is_some() {
+            return Err("original review action is ambiguous".into());
+        }
+        found = Some(envelope.action_id);
+    }
+    Ok(found)
+}
+
 pub(super) fn actual_input_snapshot(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -4180,21 +4236,6 @@ fn proof_input_snapshot_for_phase(
         start_cursor = start_cursor.min(cursor);
     }
     let session_events = pinned_events(store, &session, &mut sources, start_cursor)?;
-    // The review is a control action the reviewer performs while this proof is
-    // assembled, so its own call is still in flight and the checks below would
-    // trip on the review itself. Runtime resolves that ONE call from the
-    // evidence this proof already pinned - the Session's governed tool plans -
-    // and authenticates it against the live action and the reviewer's own
-    // execution. No live action means no exemption, and a record can never
-    // grant one.
-    let current_review_effect_key = match current_review {
-        Some(context) => super::current_review::resolve_current_review_effect_key(
-            &session_events,
-            &proof.reviewer_execution_id,
-            context,
-        )?,
-        None => None,
-    };
     let strategy = session_events.iter().find(|event| {
         event.kind.starts_with("runtime.strategy.")
             && event.actor.as_deref() == Some("conversation_runtime.strategy_owner")
@@ -4822,17 +4863,27 @@ fn proof_input_snapshot_for_phase(
     }
     let mut actual_boundaries = Vec::new();
     let mut business_outputs = Vec::new();
-    if proof.reads.iter().any(|read| {
-        read.effect_observation_refs
-            .iter()
-            .any(|reference| super::is_process_body_receipt(reference))
-    }) {
-        let proof_value = serde_json::to_value(proof).map_err(|error| error.to_string())?;
-        for event in super::results::result_source_events(
+    // The applied action records are read ONCE, from the Program source this
+    // proof already pins. The review's own call is identified from the
+    // ORIGINAL action that produced this proof, and the Process body evidence
+    // is checked against the same record.
+    let program_actions = if proof.current_review_effect_key.is_some()
+        || proof.reads.iter().any(|read| {
+            read.effect_observation_refs
+                .iter()
+                .any(|reference| super::is_process_body_receipt(reference))
+        }) {
+        Some(super::results::result_source_events(
             store,
             &format!("agentic-program:{}", program.program_id),
             &mut sources,
-        )? {
+        )?)
+    } else {
+        None
+    };
+    if let Some(program_actions) = program_actions.as_deref() {
+        let proof_value = serde_json::to_value(proof).map_err(|error| error.to_string())?;
+        for event in program_actions {
             if event.kind != "agentic.action_applied"
                 || event.status.as_deref() != Some("applied")
                 || event.payload["review_verification"] != proof_value
@@ -4868,6 +4919,64 @@ fn proof_input_snapshot_for_phase(
     {
         return Err("proof has no authenticated read-delivery recipient".into());
     }
+    // The review is a control action the reviewer performs while this proof is
+    // assembled, so its own call is still in flight and the checks below would
+    // trip on the review itself. Runtime resolves that ONE call from the
+    // evidence this proof already pinned - the Session's governed tool plans -
+    // and authenticates it against the TRUSTED reviewer packet the proof just
+    // verified, the actor and the live action. No live action means no
+    // exemption, and a record can never grant one.
+    let reviewer_receipt_stream = reviewer_delivery_packet
+        .as_ref()
+        .map(super::current_review::reviewer_receipt_stream);
+    // The live action resolves the call it is performing; a stored proof
+    // carries the identity it was built under as a CANDIDATE, and this entry
+    // re-binds that candidate against the same durable evidence. When both
+    // are present they have to agree, so a proof can never exempt a call the
+    // live action did not perform.
+    let live_identity = match (current_review, reviewer_delivery_packet.as_ref()) {
+        (Some(context), Some(packet)) => super::current_review::resolve_current_review_effect_key(
+            &session_events,
+            packet,
+            context,
+        )?,
+        _ => None,
+    };
+    let rebound_identity = match reviewer_delivery_packet.as_ref() {
+        Some(packet) => {
+            let original = match program_actions.as_deref() {
+                Some(events) => original_review_action_id(events, proof)?,
+                None => None,
+            };
+            super::current_review::rebind_current_review_effect_key(
+                &session_events,
+                packet,
+                proof.current_review_effect_key.as_deref(),
+                original.as_deref(),
+            )?
+        }
+        None => None,
+    };
+    // A live action is the authority: the call it performs is the only call
+    // that may be exempt, and a carried candidate has to be exactly that
+    // call. A live action that authenticates to NOTHING exempts nothing -
+    // falling back to the stored candidate would exempt a call this action
+    // is not performing.
+    let current_review_effect_key = match (current_review, live_identity, rebound_identity) {
+        (Some(_), Some(live), Some(rebound)) => {
+            if live != rebound {
+                return Err(
+                    "proof review call identity changed between the review and its application"
+                        .into(),
+                );
+            }
+            Some(live)
+        }
+        (Some(_), Some(live), None) => Some(live),
+        (Some(_), None, _) => None,
+        (None, _, Some(rebound)) => Some(rebound),
+        (None, _, None) => None,
+    };
     let deliveries = review_delivery_snapshot(
         store,
         program,
@@ -5378,8 +5487,19 @@ fn proof_input_snapshot_for_phase(
                     Some("executed" | "blocked_permission")
                 )
             });
+            // The exemption is the reviewer's OWN admitted call: the intent
+            // has to be the one Runtime admitted for THIS graph, node and
+            // attempt. The receipt index stream names all three, so an intent
+            // with the same effect identity in another stream belongs to
+            // another attempt, another node or another graph.
             match review_write_outcome(
-                current_review_effect_key.as_deref(),
+                is_review_own_admitted_call(
+                    current_review_effect_key.as_deref(),
+                    reviewer_receipt_stream.as_deref(),
+                    source.as_str(),
+                    identity,
+                )
+                .then_some(identity),
                 identity,
                 settled,
                 disjoint,
@@ -5720,6 +5840,7 @@ fn proof_input_snapshot_for_phase(
             additional_sources: Vec::new(),
         },
         sources,
+        current_review_effect_key,
     })
 }
 
@@ -6391,6 +6512,68 @@ mod tests {
         );
     }
 
+    /// The attempt is bound by the durable evidence, not by the Step.
+    ///
+    /// The native provider path does not carry the attempt in the Step
+    /// identity, so the attempt comes from the receipt index stream, which
+    /// names the graph, the node and the attempt. The same effect identity
+    /// admitted in another attempt's stream is another call.
+    #[test]
+    fn r1_the_review_call_must_be_admitted_in_the_reviewers_own_attempt() {
+        let identity = "effect-identity-of-the-review-being-applied";
+        let reviewer_stream = "execution-agent-receipts:graph:node:2";
+        let other_attempt = "execution-agent-receipts:graph:node:1";
+        let other_node = "execution-agent-receipts:graph:other-node:2";
+        let other_graph = "execution-agent-receipts:other-graph:node:2";
+
+        assert!(is_review_own_admitted_call(
+            Some(identity),
+            Some(reviewer_stream),
+            reviewer_stream,
+            identity
+        ));
+        // Same call identity, another attempt: not the reviewer's own call.
+        assert!(!is_review_own_admitted_call(
+            Some(identity),
+            Some(reviewer_stream),
+            other_attempt,
+            identity
+        ));
+        // Same call identity, another node or another graph.
+        assert!(!is_review_own_admitted_call(
+            Some(identity),
+            Some(reviewer_stream),
+            other_node,
+            identity
+        ));
+        assert!(!is_review_own_admitted_call(
+            Some(identity),
+            Some(reviewer_stream),
+            other_graph,
+            identity
+        ));
+        // Another call's identity in the reviewer's own stream.
+        assert!(!is_review_own_admitted_call(
+            Some(identity),
+            Some(reviewer_stream),
+            reviewer_stream,
+            "effect-identity-of-another-call"
+        ));
+        // Without a resolved identity, or without a trusted reviewer stream,
+        // nothing is the reviewer's own call.
+        assert!(!is_review_own_admitted_call(
+            None,
+            Some(reviewer_stream),
+            reviewer_stream,
+            identity
+        ));
+        assert!(!is_review_own_admitted_call(
+            Some(identity),
+            None,
+            reviewer_stream,
+            identity
+        ));
+    }
     #[test]
     fn pinned_delivery_projection_preserves_confirmations_across_pages_without_effects() {
         let store = RuntimeEventStore::for_test();
@@ -7931,6 +8114,154 @@ mod tests {
             assert_eq!(services.goal_store().get(&before.id).unwrap().unwrap(),before);
             assert!(program.tasks.values().any(|task|task.status == crate::AgenticTaskStatus::Submitted));
         })).await;
+    }
+
+    /// The applied review is exempt; a SECOND unfinished review in the same
+    /// run is not.
+    ///
+    /// This is the business path: the real native task review, the real
+    /// Program, the real proof. The applied review settles its own call
+    /// (that is the self-dependency the exemption exists for), and a second
+    /// review of the same reviewer that is still in flight keeps the review
+    /// from accepting until it lands.
+    ///
+    /// The second review is INJECTED as a second planned review call of the
+    /// same reviewer - the real business fixture, with one extra durable plan
+    /// - not two genuinely concurrent model calls.
+    #[tokio::test]
+    async fn r1_a_second_unfinished_review_in_the_same_run_blocks_the_applied_review() {
+        use crate::agentic::execution::reviewed_goal_fixture::{
+            with_native_task_review_async, NativeTaskReviewCase,
+        };
+        for second_review in [false, true] {
+            with_native_task_review_async(
+                NativeTaskReviewCase::default(),
+                move |services, envelope, donor| Box::pin(async move {
+                    let program = services
+                        .agent_action_service()
+                        .project(&envelope.actor.program_id)
+                        .unwrap();
+                    let task_ref = match &envelope.action {
+                        harness_contract::agent_action::AgentAction::TaskReview(input) => {
+                            input.task_ref.clone()
+                        }
+                        _ => unreachable!(),
+                    };
+                    if second_review {
+                        // A second review call of the SAME reviewer, still in
+                        // flight: it has its own Step and its own effect
+                        // identity, so it is not the call the applied review
+                        // is performing.
+                        let reviewer_run = donor
+                            .verification
+                            .reviewer_execution_id
+                            .strip_prefix("agent-run:")
+                            .expect("a delegated reviewer")
+                            .to_string();
+                        let store = services.event_store();
+                        let events = store
+                            .list_stream(&format!("session:{}", program.session_id))
+                            .unwrap();
+                        let original = events
+                            .iter()
+                            .find(|event| event.kind == "tool.execution_plan.created")
+                            .expect("the reviewer's governed plan is durable");
+                        let mut payload = original.payload.clone();
+                        payload["plan_id"] =
+                            serde_json::json!(format!("r1-second-review:{}", uuid::Uuid::new_v4()));
+                        payload["tasks"] = serde_json::json!([{
+                            "tool_name": "task_review",
+                            "tool_call_id": "r1-second-review-call",
+                            "effect": {"effect_kind": "write"},
+                            "normalized_input": {
+                                "task_ref": task_ref,
+                                "decision": "accept",
+                                "reason": "a second review of the same Task",
+                                "evidence_refs": [],
+                            },
+                            "step_binding": {
+                                "origin": {
+                                    "origin_step_id": "r1-second-review-step",
+                                    "call_id": "r1-second-review-call",
+                                    "catalog_digest": "catalog",
+                                    "source": {"kind": "provider", "attempt_id": "attempt-1"},
+                                },
+                                "snapshot": {
+                                    "contract_version": 1,
+                                    "identity": {
+                                        "step_id": "r1-second-review-step",
+                                        "session_id": envelope.actor.session_id,
+                                        "turn_id": envelope.actor.turn_id,
+                                        "execution_id": reviewer_run,
+                                        "actor_ref": "runtime.agentic",
+                                        "run_ref": reviewer_run,
+                                        "build_ref": "build",
+                                    },
+                                    "provider_attempt": {
+                                        "attempt_id": "attempt-1",
+                                        "origin_step_id": "r1-second-review-step",
+                                        "model_profile_digest": "profile",
+                                        "request_digest": "request",
+                                    },
+                                    "catalog_digest": "catalog",
+                                    "tools": [],
+                                    "related_revisions": {},
+                                    "context_refs": [],
+                                    "expires_at_ms": 0,
+                                },
+                            },
+                        }]);
+                        store
+                            .append(crate::RuntimeEventInput {
+                                stream_id: original.stream_id.clone(),
+                                scope: original.scope,
+                                kind: original.kind.clone(),
+                                status: original.status.clone(),
+                                actor: original.actor.clone(),
+                                refs: original.refs.clone(),
+                                payload,
+                            })
+                            .unwrap();
+                    }
+                    let outcome = services.submit_agent_action(&envelope).await;
+                    if second_review {
+                        let error = outcome
+                            .err()
+                            .expect("a second unfinished review must block the applied review");
+                        assert!(
+                            error.contains("effect_review_pending"),
+                            "a second unfinished review in the same run must still block: {error}"
+                        );
+                        assert_eq!(
+                            services
+                                .agent_action_service()
+                                .project(&envelope.actor.program_id)
+                                .unwrap()
+                                .tasks[&task_ref]
+                                .status,
+                            crate::AgenticTaskStatus::Submitted
+                        );
+                    } else {
+                        let applied = outcome.expect("the applied review is applied");
+                        assert_eq!(
+                            applied.status,
+                            harness_contract::agent_action::AgentActionStatus::Applied,
+                            "{applied:?}"
+                        );
+                        assert_eq!(
+                            services
+                                .agent_action_service()
+                                .project(&envelope.actor.program_id)
+                                .unwrap()
+                                .tasks[&task_ref]
+                                .status,
+                            crate::AgenticTaskStatus::Accepted
+                        );
+                    }
+                }),
+            )
+            .await;
+        }
     }
 
     #[tokio::test]

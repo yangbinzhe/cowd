@@ -155,6 +155,19 @@ pub struct ObjectiveReviewVerification {
     pub reviewer_execution_id: String,
     pub producer_execution_ids: Vec<String>,
     pub reads: Vec<ObjectiveResultReadProof>,
+    /// The effect identity of the review control call this proof was built
+    /// under.
+    ///
+    /// This is a CANDIDATE, never a truth. A review is a governed tool call,
+    /// so while the proof is assembled that very call is still in flight and
+    /// the proof's "every write must be settled" check would trip on the
+    /// review itself. Every entry that rebuilds, submits or re-verifies a
+    /// proof RE-BINDS this identity against the durable evidence: the plan
+    /// task it names, the reviewer it belongs to and the receipt index it was
+    /// admitted in. An identity that does not re-bind exempts nothing, so a
+    /// stored proof can never grant an exemption on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_review_effect_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -61,7 +61,14 @@ impl RuntimeEventStore {
             ContentBody::ArtifactRef { artifact } => Some(self.artifacts.get()
                 .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("MissingContentStore".into()))?
                 .checkpoint_guard_after_write(&artifact, &scope, &origin)
-                .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?),
+                .map_err(|error| {
+                    RuntimeEventStoreError::InvalidTransaction(format!(
+                        "{}: prepared history checkpoint artifact {} (projection {})",
+                        error,
+                        artifact.selector,
+                        projection_id
+                    ))
+                })?),
         };
         Ok(PreparedHistoryCheckpoint {
             backend: self.backend.clone(), projection_id: projection_id.into(), source_cursor,
@@ -85,7 +92,14 @@ impl RuntimeEventStore {
             (Some(guard), ContentBody::ArtifactRef { artifact }) => self.artifacts.get()
                 .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("MissingContentStore".into()))?
                 .validate_checkpoint_guard(guard, &artifact, scope, &origin)
-                .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?,
+                .map_err(|error| {
+                    RuntimeEventStoreError::InvalidTransaction(format!(
+                        "{}: prepared history checkpoint artifact {} (projection {})",
+                        error,
+                        artifact.selector,
+                        proof.projection_id
+                    ))
+                })?,
             (None, ContentBody::Inline { .. }) => (),
             _ => return Err(RuntimeEventStoreError::InvalidTransaction("prepared history witness mismatch".into())),
         }
@@ -183,7 +197,14 @@ impl RuntimeEventStore {
         })?;
         let resolved = store
             .resolve(&artifact.selector)
-            .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+            .map_err(|error| {
+                RuntimeEventStoreError::InvalidTransaction(format!(
+                    "{}: session terminal artifact {} (session {})",
+                    error,
+                    artifact.selector,
+                    terminal.session_id
+                ))
+            })?;
         if resolved != artifact
             || artifact.visibility_scope != format!("session:{}", terminal.session_id)
             || artifact.media_type != "application/vnd.cowd.session-terminal+json"
@@ -760,7 +781,13 @@ impl RuntimeEventStore {
                     })?
                     .resolve(&reference.id)
                     .map_err(|error| {
-                        RuntimeEventStoreError::InvalidTransaction(error.to_string())
+                        RuntimeEventStoreError::InvalidTransaction(format!(
+                            "{}: event {} on stream {} references artifact {}",
+                            error,
+                            input.event.kind,
+                            input.event.stream_id,
+                            reference.id
+                        ))
                     })?;
             }
             if let Some(artifact) = own {
@@ -790,7 +817,12 @@ impl RuntimeEventStore {
             })?
             .resolve(selector)
             .map(Some)
-            .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))
+            .map_err(|error| {
+                RuntimeEventStoreError::InvalidTransaction(format!(
+                    "{}: typed selector {}",
+                    error, selector
+                ))
+            })
     }
 
     fn validate_observation_typed_artifacts(

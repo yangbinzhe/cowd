@@ -1809,6 +1809,7 @@ impl RuntimeServices {
             work_manifest_digest: String::new(),
             reviewer_execution_id,
             producer_execution_ids: producer_execution_ids.into_iter().collect(),
+            current_review_effect_key: None,
             reads: coverage
                 .into_values()
                 .map(|mut state| {
@@ -2959,6 +2960,10 @@ impl RuntimeServices {
         )?;
         verification.work_manifest_digest = snapshot.work_digest;
         verification.effect_manifest_digest = Some(snapshot.effects.digest);
+        // The identity of the review control call this proof was built
+        // under. It travels with the proof as a CANDIDATE: every entry that
+        // re-verifies the proof re-binds it against the durable evidence.
+        verification.current_review_effect_key = snapshot.current_review_effect_key.clone();
         if !verification.independence_required {
             verification.review_policy_digest = Some(snapshot.policy_digest.clone());
         }

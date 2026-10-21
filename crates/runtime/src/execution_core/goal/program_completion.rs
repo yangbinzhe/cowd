@@ -1169,6 +1169,7 @@ mod tests {
                                 ),
                             reviewer_execution_id: "review-run".into(),
                             producer_execution_ids: vec!["producer-run".into()],
+                            current_review_effect_key: None,
                             reads: vec![harness_contract::goal::ObjectiveResultReadProof {
                                 result_kind: harness_contract::goal::GoalResultKind::Artifact,
                                 effect_observation_refs: vec![],
