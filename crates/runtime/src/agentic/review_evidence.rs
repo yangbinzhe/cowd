@@ -220,6 +220,30 @@ pub(crate) fn review_snapshot_key(
     )
 }
 
+/// The reference that names one material receipt.
+///
+/// A receipt alias is only ever built from a genuine receipt. The delegated
+/// receipt stream also carries the intent of every call, and that intent
+/// carries its own logical sequence under the same payload key a receipt
+/// uses for its observation sequence. A raw stream scan therefore read the
+/// intent's sequence as a receipt selector, and the intent collided with the
+/// read it was supposed to point at: the collector then refused the read as
+/// "not an actual material receipt" even though the read had really
+/// happened. Every other event keeps the plain event reference, so an intent
+/// is never mistaken for a read.
+pub(crate) fn receipt_alias(source: &str, event: &crate::DurableRuntimeEvent) -> String {
+    if source.starts_with("execution-agent-receipts:")
+        && event.kind == "execution.agent_tool.receipt"
+    {
+        return format!(
+            "{}#{}",
+            source,
+            event.payload["sequence"].as_u64().unwrap_or_default()
+        );
+    }
+    format!("runtime-event:{}", event.event_id)
+}
+
 pub(crate) fn review_result_identity(
     program: &AgenticProgramProjection,
     reference: &str,
@@ -1953,6 +1977,7 @@ impl RuntimeServices {
             })
             .collect::<BTreeSet<_>>();
         let mut matched_receipts = BTreeSet::new();
+        let mut matched_receipt_events: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut material_events = delivery_snapshot
             .reads
             .iter()
@@ -2460,15 +2485,7 @@ impl RuntimeServices {
                     if event.commit_cursor < start_cursor {
                         continue;
                     }
-                    let reference = if source.starts_with("execution-agent-receipts:") {
-                        format!(
-                            "{}#{}",
-                            source,
-                            event.payload["sequence"].as_u64().unwrap_or_default()
-                        )
-                    } else {
-                        format!("runtime-event:{}", event.event_id)
-                    };
+                    let reference = receipt_alias(source.as_str(), &event);
                     let packet_read = source.starts_with("execution-agent-receipts:")
                         && event.kind == "execution.agent_tool.receipt"
                         && event.payload["effect_kind"] == "read"
@@ -2498,6 +2515,15 @@ impl RuntimeServices {
                         return Err("actual material crosses the review discovery cut; rebuild the whole review".into());
                     }
                     if selected_receipts.contains(&reference) {
+                        let matched = matched_receipt_events
+                            .entry(reference.clone())
+                            .or_default()
+                            .insert(event.event_id.clone());
+                        if matched && matched_receipt_events[&reference].len() > 1 {
+                            return Err(
+                                "v2 selected read matches more than one material receipt".into(),
+                            );
+                        }
                         let actual_read = if source.starts_with("execution-agent-receipts:") {
                             event.kind == "execution.agent_tool.receipt"
                                 && event.payload["outcome"]["status"] == "executed"
@@ -3038,6 +3064,64 @@ impl RuntimeServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An intent and a read in the same delegated receipt stream carry the
+    /// same logical sequence under the same payload key, so only a genuine
+    /// receipt may name a receipt.
+    ///
+    /// The collector used to build a receipt alias for every event in the
+    /// stream, so the intent's alias collided with the read's alias and the
+    /// collector refused a read that had really happened.
+    #[test]
+    fn r1_receipt_alias_never_names_an_intent() {
+        let source = "execution-agent-receipts:graph:node:agent:1";
+        let event = |kind: &str, event_id: &str, sequence: u64, payload: serde_json::Value| {
+            crate::DurableRuntimeEvent {
+                event_id: event_id.into(),
+                stream_id: source.into(),
+                sequence,
+                scope: crate::RuntimeEventScope::ExecutionNode,
+                kind: kind.into(),
+                status: None,
+                actor: Some("governed_tool".into()),
+                refs: Vec::new(),
+                payload,
+                created_at_ms: 0,
+                commit_cursor: 0,
+                transaction_id: "tx".into(),
+                transaction_index: 0,
+                schema_version: 1,
+                idempotency_key: None,
+            }
+        };
+        let read = event(
+            "execution.agent_tool.receipt",
+            "event-read",
+            1,
+            serde_json::json!({
+                "sequence": 1,
+                "effect_kind": "read",
+                "outcome": {"status": "executed"},
+            }),
+        );
+        let intent = event(
+            "execution.agent_tool.intent",
+            "event-intent",
+            2,
+            serde_json::json!({
+                "sequence": 1,
+                "effect_kind": "write",
+                "tool_name": "task_review",
+            }),
+        );
+
+        // The read keeps the receipt alias the producer emits.
+        assert_eq!(receipt_alias(source, &read), format!("{source}#1"));
+        // The intent never names a receipt, and never collides with the read.
+        assert_ne!(receipt_alias(source, &intent), receipt_alias(source, &read));
+        assert!(!receipt_alias(source, &intent).starts_with(source));
+        assert_eq!(receipt_alias(source, &intent), "runtime-event:event-intent");
+    }
 
     #[test]
     fn a_refusal_names_which_producer_requirement_was_not_met() {
