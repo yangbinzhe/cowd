@@ -6065,6 +6065,34 @@ async fn execute_fenced_runtime_tool(
             if let Some(observation) = observation {
                 observation.uncertain(request);
             }
+            // The admission of a process-class effect is durable before the
+            // command runs: the host executor can only report quiescence after
+            // the fact, and the receipt may only be settled against an
+            // admission that was published first.
+            let host_process_admission = match commit_service
+                .admit_host_process(request, effect)
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return crate::RuntimeToolExecutionOutcome {
+                        tool_use_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        status: crate::RuntimeToolExecutionStatus::Failed,
+                        category: request.category,
+                        output: None,
+                        error: Some(format!(
+                            "tool `{}` host process admission failed: {error}",
+                            request.tool_name
+                        )),
+                        evidence_ref: format!(
+                            "tool-effect-host-process-unadmitted:{}",
+                            request.idempotency_key
+                        ),
+                        observed_evidence: Vec::new(),
+                    };
+                }
+            };
             let mut outcome = host.execute_runtime_tool(request).await;
             // A process-class effect owns a physical process tree, so its
             // durable receipt must carry the honest quiescence proof. The
@@ -6082,6 +6110,7 @@ async fn execute_fenced_runtime_tool(
                     request,
                     effect,
                     &mut outcome,
+                    host_process_admission.as_ref(),
                 )
                 .await
                 {
@@ -6122,24 +6151,20 @@ async fn execute_fenced_runtime_tool(
                     "process-class effect carries no process terminal; its physical closure stays unproven"
                 );
             }
+            // A read-class effect has no settlement stream for a process
+            // terminal, so it keeps its plain read receipt and the witness stays
+            // honestly unproven for it.
             let committed = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                if host_process_terminal {
-                    commit_service.commit_bound_readonly_tool_receipt_with_host_process(
-                        request,
-                        &outcome,
-                        effect,
-                        admitted_scope.as_ref().unwrap(),
-                    )
-                } else {
-                    commit_service.commit_bound_readonly_tool_receipt(
-                        request,
-                        &outcome,
-                        effect,
-                        admitted_scope.as_ref().unwrap(),
-                    )
-                }
+                commit_service.commit_bound_readonly_tool_receipt(
+                    request,
+                    &outcome,
+                    effect,
+                    admitted_scope.as_ref().unwrap(),
+                )
             } else if host_process_terminal {
-                commit_service.commit_tool_effect_with_host_process(request, effect, &outcome)
+                commit_service
+                    .commit_host_process_closure(request, effect, &outcome)
+                    .await
             } else {
                 commit_service.commit_tool_effect(request, effect, &outcome)
             };

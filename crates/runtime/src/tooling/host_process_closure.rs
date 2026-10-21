@@ -17,7 +17,7 @@ use crate::execution_core::graph::ExecutionCommitService;
 use crate::RuntimeToolExecutionRequest;
 use harness_contract::context::{
     ArtifactRef, EvidenceAccessRef, EvidenceTargetIdentity, ObservedEvidence,
-    ObservedEvidenceProvenance, ToolExecutionAdmission, ToolExecutionBinding, ToolExecutionFact,
+    ObservedEvidenceProvenance, ToolExecutionAdmission, ToolExecutionFact,
     ToolExecutionStopReason, ToolExecutionTerminal, ToolProcessClosure,
 };
 use harness_contract::tool::ToolEffectDescriptor;
@@ -108,10 +108,30 @@ pub(crate) async fn mint_host_process_evidence(
     request: &crate::RuntimeToolExecutionRequest,
     descriptor: &ToolEffectDescriptor,
     outcome: &mut crate::RuntimeToolExecutionOutcome,
+    admission: Option<&ToolExecutionAdmission>,
 ) -> Result<bool, String> {
     if !descriptor.spawns_process {
         return Ok(false);
     }
+    // A read-class effect has no durable intent/admission stream: its receipt is
+    // a `read-receipt` and there is nothing the physical closure witness could
+    // settle a process terminal against. Claiming a terminal there would be a
+    // closure the kernel cannot prove, so the effect keeps its normal read
+    // receipt and the witness stays honestly unproven.
+    if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+        tracing::debug!(
+            tool = %request.tool_name,
+            idempotency_key = %request.idempotency_key,
+            "read-class process effect carries no settlement stream; no process terminal is minted"
+        );
+        return Ok(false);
+    }
+    let Some(admission) = admission else {
+        // Without the admission published before the command ran there is
+        // nothing that binds the executor's report to the authorized program,
+        // so the kernel refuses to claim a terminal at all.
+        return Ok(false);
+    };
     if outcome.observed_evidence.iter().any(|observed| {
         matches!(
             observed.target,
@@ -127,7 +147,6 @@ pub(crate) async fn mint_host_process_evidence(
         return Ok(false);
     };
     let report = read_host_process_report(outcome.output.as_deref());
-    let source_bytes = source_bundle_bytes(request)?;
     let body_bytes = body_bytes(request, &report)?;
     let scope = format!(
         "session:{}",
@@ -136,18 +155,6 @@ pub(crate) async fn mint_host_process_evidence(
             .as_deref()
             .ok_or_else(|| "host process Session missing".to_string())?
     );
-    let source_bundle = artifacts
-        .write_bytes(
-            harness_contract::context::ArtifactWriteDescriptor {
-                media_type: "application/octet-stream".into(),
-                visibility_scope: scope.clone(),
-                expected_bytes: Some(source_bytes.len() as u64),
-                original_name: None,
-            },
-            &source_bytes,
-        )
-        .await
-        .map_err(|error| format!("host process source archive failed: {error}"))?;
     let body = artifacts
         .write_bytes(
             harness_contract::context::ArtifactWriteDescriptor {
@@ -167,7 +174,7 @@ pub(crate) async fn mint_host_process_evidence(
             i64::MAX as u64,
         )
         .map_err(|error| format!("host process closure pin failed: {error}"))?;
-    let fact = build_host_process_fact(request, descriptor, &report, body, source_bundle)?;
+    let fact = build_host_process_fact(request, descriptor, &report, body, admission.clone())?;
     outcome
         .observed_evidence
         .push(host_process_observation(request, fact));
@@ -301,41 +308,12 @@ pub(crate) fn build_host_process_fact(
     descriptor: &ToolEffectDescriptor,
     report: &HostProcessReport,
     body: ArtifactRef,
-    source_bundle: ArtifactRef,
+    admission: ToolExecutionAdmission,
 ) -> Result<ToolExecutionFact, String> {
-    let input = harness_contract::step::parse_strict_json(&request.input)
-        .map_err(|error| error.to_string())?;
-    let input_sha256 = ExecutionCommitService::bounded_process_input_sha256(&input)
-        .map_err(|error| error.to_string())?;
-    let descriptor_sha256 = ExecutionCommitService::bounded_process_descriptor_sha256(descriptor)
-        .map_err(|error| error.to_string())?;
-    let replay = crate::execution_core::graph::receipt_replay_contract(request)
-        .map_err(|error: crate::execution_core::graph::ExecutionCommitError| error.to_string())?;
-    let authority_sha256 = canonical_digest(
-        "cowd.host_process.authority.v1",
-        &serde_json::json!({
-            "replay": replay,
-            "authorization": request.authorization,
-            "parent_execution_attempt": request.parent_execution_attempt,
-        }),
-    )?;
+    let _ = descriptor;
     let fact = ToolExecutionFact {
         version: 1,
-        admission: ToolExecutionAdmission {
-            version: 1,
-            binding: ToolExecutionBinding {
-                call_key: request.idempotency_key.clone(),
-                tool_use_id: request.tool_use_id.clone(),
-                input_sha256,
-                descriptor_sha256,
-                authority_sha256,
-            },
-            // The host shell admits exactly one source: the program text that
-            // was authorized. It is archived verbatim as the source bundle.
-            code_sha256: hex_digest(request.input.as_bytes()),
-            inputs: Vec::new(),
-            source_bundle,
-        },
+        admission,
         terminal: report.terminal.clone(),
         body,
         stdout_sha256: report.stdout_sha256.clone(),
@@ -345,7 +323,88 @@ pub(crate) fn build_host_process_fact(
         capture_complete: report.capture_complete,
     };
     validate_host_process_fact(&fact)?;
+    if fact.admission.binding.call_key != request.idempotency_key
+        || fact.admission.binding.tool_use_id != request.tool_use_id
+    {
+        return Err("host process fact admission is not this effect".into());
+    }
     Ok(fact)
+}
+
+/// The digest of the authorized program text of a host process effect.
+pub(crate) fn code_digest(request: &crate::RuntimeToolExecutionRequest) -> String {
+    hex_digest(request.input.as_bytes())
+}
+
+/// The digest that binds a host process fact to the authority it ran under.
+pub(crate) fn authority_digest(request: &crate::RuntimeToolExecutionRequest) -> Result<String, String> {
+    let replay = crate::execution_core::graph::receipt_replay_contract(request)
+        .map_err(|error: crate::execution_core::graph::ExecutionCommitError| error.to_string())?;
+    canonical_digest(
+        "cowd.host_process.authority.v1",
+        &serde_json::json!({
+            "replay": replay,
+            "authorization": request.authorization,
+            "parent_execution_attempt": request.parent_execution_attempt,
+        }),
+    )
+}
+
+/// A test-only admission for one host process effect.
+///
+/// Production always publishes the admission before the command runs; the
+/// negative tests need the same object without the durable event, so they can
+/// prove that a fact without a published admission still never closes.
+#[cfg(test)]
+pub(crate) fn test_admission(request: &crate::RuntimeToolExecutionRequest) -> ToolExecutionAdmission {
+    ToolExecutionAdmission {
+        version: 1,
+        binding: harness_contract::context::ToolExecutionBinding {
+            call_key: request.idempotency_key.clone(),
+            tool_use_id: request.tool_use_id.clone(),
+            input_sha256: "sha256:".to_string() + &"1".repeat(64),
+            descriptor_sha256: "sha256:".to_string() + &"2".repeat(64),
+            authority_sha256: "sha256:".to_string() + &"3".repeat(64),
+        },
+        code_sha256: "4".repeat(64),
+        inputs: Vec::new(),
+        source_bundle: ArtifactRef {
+            sha256: format!("sha256:{}", "5".repeat(64)),
+            bytes: 4,
+            media_type: "application/octet-stream".into(),
+            visibility_scope: format!("session:{}", request.session_id.as_deref().unwrap_or_default()),
+            selector: "artifact://test-source".into(),
+            durability: harness_contract::context::EvidenceDurability::Durable,
+        },
+    }
+}
+
+/// The honest shape of a published host process admission.
+pub(crate) fn validate_host_process_admission(
+    admission: &ToolExecutionAdmission,
+) -> Result<(), String> {
+    if admission.version != 1 {
+        return Err("host process admission version is not supported".into());
+    }
+    if admission.binding.call_key.trim().is_empty()
+        || admission.binding.tool_use_id.trim().is_empty()
+        || admission.code_sha256.len() != 64
+        || !admission.code_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !admission.inputs.is_empty()
+    {
+        return Err("host process admission does not bind one authorized program".into());
+    }
+    for digest in [
+        &admission.binding.input_sha256,
+        &admission.binding.descriptor_sha256,
+        &admission.binding.authority_sha256,
+    ] {
+        let bare = digest.strip_prefix("sha256:").unwrap_or(digest.as_str());
+        if bare.len() != 64 || !bare.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("host process admission digest is not canonical".into());
+        }
+    }
+    Ok(())
 }
 
 /// The honest shape of a host process fact.

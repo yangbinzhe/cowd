@@ -52,7 +52,7 @@ pub(crate) use tool_receipt_query::ToolReceiptQuery;
 pub(crate) enum ProcessTerminalAuthority<'a> {
     Absent,
     BoundedProcess(&'a serde_json::Value),
-    HostProcess,
+    HostProcess(&'a serde_json::Value),
 }
 
 
@@ -3743,6 +3743,213 @@ impl ExecutionCommitService {
         Ok(outcome)
     }
 
+    /// Admit a host-shell process effect before its command runs.
+    ///
+    /// The host executor can only report quiescence *after* the fact, so the
+    /// admission has to be durable before the command runs: it binds the
+    /// authorized program text, the effect descriptor and the root/delegated
+    /// authority snapshot to the effect key, and the receipt may only be
+    /// settled against the admission that was published first. The archive of
+    /// the authorized program text is written here as well, so the fact that
+    /// later claims a terminal can be checked against the exact program that
+    /// was admitted.
+    ///
+    /// Returns `None` for an effect that owns no process tree.
+    pub(crate) async fn admit_host_process(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+    ) -> Result<Option<harness_contract::context::ToolExecutionAdmission>, ExecutionCommitError> {
+        let invalid = ExecutionCommitError::InvalidCommand;
+        if !effect.spawns_process {
+            return Ok(None);
+        }
+        let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        let admission_key = format!("{}:process-admission", request.idempotency_key);
+        let input = harness_contract::step::parse_strict_json(&request.input)
+            .map_err(|error| invalid(error.to_string()))?;
+        let digests = json!({
+            "call_key": request.idempotency_key,
+            "tool_use_id": request.tool_use_id,
+            "input_sha256": Self::bounded_process_input_sha256(&input)?,
+            "descriptor_sha256": Self::bounded_process_descriptor_sha256(effect)?,
+            "authority_sha256": crate::host_process_closure::authority_digest(request)
+                .map_err(|error| invalid(error))?,
+            "code_sha256": crate::host_process_closure::code_digest(request),
+        });
+        if let Some(existing) = self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &admission_key)?
+        {
+            let published = existing
+                .payload
+                .get("admission")
+                .and_then(|value| serde_json::from_value::<
+                    harness_contract::context::ToolExecutionAdmission,
+                >(value.clone()).ok())
+                .ok_or_else(|| invalid("published host process admission is unreadable".into()))?;
+            let admitted = json!({
+                "call_key": published.binding.call_key,
+                "tool_use_id": published.binding.tool_use_id,
+                "input_sha256": published.binding.input_sha256,
+                "descriptor_sha256": published.binding.descriptor_sha256,
+                "authority_sha256": published.binding.authority_sha256,
+                "code_sha256": published.code_sha256,
+            });
+            if admitted != digests {
+                return Err(invalid(
+                    "host process admission does not match the original effect".into(),
+                ));
+            }
+            return Ok(Some(published));
+        }
+        let intent = self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &format!("{}:intent", request.idempotency_key))?
+            .ok_or_else(|| {
+                let revision = self.event_store.stream_revision(&stream_id).unwrap_or(0);
+                invalid(format!(
+                    "host process admission requires original intent in {stream_id} (revision {revision})"
+                ))
+            })?;
+        let mut sources = self.bounded_process_sources(request, effect, &intent)?;
+        sources.push(ExpectedStreamRevision {
+            stream_id: stream_id.clone(),
+            expected_revision: self.event_store.stream_revision(&stream_id)?,
+        });
+        let scope = format!(
+            "session:{}",
+            request
+                .session_id
+                .as_deref()
+                .ok_or_else(|| invalid("host process admission Session missing".into()))?
+        );
+        let source_bytes = crate::host_process_closure::source_bundle_bytes(request)
+            .map_err(|error| invalid(error))?;
+        let artifacts = self.bounded_process_artifacts()?;
+        let source_bundle = artifacts
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/octet-stream".into(),
+                    visibility_scope: scope,
+                    expected_bytes: Some(source_bytes.len() as u64),
+                    original_name: None,
+                },
+                &source_bytes,
+            )
+            .await
+            .map_err(|error| invalid(format!("host process source archive failed: {error}")))?;
+        let admission = harness_contract::context::ToolExecutionAdmission {
+            version: 1,
+            binding: harness_contract::context::ToolExecutionBinding {
+                call_key: request.idempotency_key.clone(),
+                tool_use_id: request.tool_use_id.clone(),
+                input_sha256: Self::bounded_process_input_sha256(&input)?,
+                descriptor_sha256: Self::bounded_process_descriptor_sha256(effect)?,
+                authority_sha256: crate::host_process_closure::authority_digest(request)
+                    .map_err(|error| invalid(error))?,
+            },
+            code_sha256: crate::host_process_closure::code_digest(request),
+            inputs: Vec::new(),
+            source_bundle,
+        };
+        crate::host_process_closure::validate_host_process_admission(&admission)
+            .map_err(|error| invalid(error))?;
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: admission_key.clone(),
+                expected_streams: sources,
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id,
+                        scope: intent.scope,
+                        kind: "execution.process.admitted".into(),
+                        status: Some("inflight".into()),
+                        actor: intent.actor.clone(),
+                        refs: intent.refs.clone(),
+                        payload: json!({
+                            "version": 1,
+                            "admission": admission,
+                            "admission_sha256": format!(
+                                "{:x}",
+                                Sha256::digest(serde_json::to_vec(&admission)?)
+                            ),
+                            "original_input": request.input,
+                        }),
+                    },
+                    idempotency_key: Some(admission_key),
+                    schema_version: 1,
+                }],
+            })?;
+        Ok(Some(admission))
+    }
+
+    /// Publish the physical closure document of a host-shell process effect and
+    /// commit its durable receipt against the admission that was published
+    /// before the command ran.
+    ///
+    /// The closure document binds the admitted program, the effect descriptor,
+    /// the authenticated intent, the executor's own outcome and the terminal it
+    /// reported into one artifact that only this commit service can publish.
+    /// The receipt and its index are written in the same transaction, so a
+    /// consumer that reads either one can settle the physical closure.
+    pub(crate) async fn commit_host_process_closure(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+    ) -> Result<(), ExecutionCommitError> {
+        let invalid = ExecutionCommitError::InvalidCommand;
+        Self::validate_host_process_outcome(outcome)?;
+        let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        let intent = self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &format!("{}:intent", request.idempotency_key))?
+            .ok_or_else(|| invalid("host process closure original intent missing".into()))?;
+        let document = process_closure_document(&intent, outcome)?;
+        let encoded = serde_json::to_vec(&document)?;
+        if encoded.len() > 32 * 1024 {
+            return Err(invalid(
+                "host process closure metadata exceeds bounded extent".into(),
+            ));
+        }
+        let scope = format!(
+            "session:{}",
+            request
+                .session_id
+                .as_deref()
+                .ok_or_else(|| invalid("host process closure Session missing".into()))?
+        );
+        let origin = crate::PreparedArtifactOrigin::ToolEffectClosure {
+            stream_id: stream_id.clone(),
+            idempotency_key: format!("{}:receipt", request.idempotency_key),
+        };
+        let authority = ProcessClosurePublicationAuthority {
+            origin: origin.clone(),
+            sha256: format!("sha256:{:x}", Sha256::digest(&encoded)),
+            bytes: encoded.len() as u64,
+            scope: scope.clone(),
+        };
+        let artifacts = self.bounded_process_artifacts()?;
+        let proof = artifacts
+            .write_process_closure_blocking(
+                &scope,
+                &format!("process-closure:{}", request.idempotency_key),
+                &encoded,
+                &origin,
+                &authority,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        let closure = json!({"content_schema":2,"sha256":proof.sha256,"bytes":proof.bytes,
+            "body":{"kind":"artifact_ref","artifact":proof}});
+        self.commit_tool_effect_trusted(
+            request,
+            effect,
+            outcome,
+            ProcessTerminalAuthority::HostProcess(&closure),
+        )
+    }
+
     pub(crate) fn begin_bound_tool_effect(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
@@ -4755,30 +4962,6 @@ impl ExecutionCommitService {
         )
     }
 
-    /// Commit a receipt whose outcome carries the Runtime-minted host process
-    /// closure fact.
-    ///
-    /// The host shell is not a sandbox process. It can only prove
-    /// *quiescence*, and it proves it by reporting it in its own structured
-    /// result. This path is the one place where such a fact may enter a
-    /// durable receipt; the public path above still refuses every process
-    /// terminal fact.
-    pub(crate) fn commit_tool_effect_with_host_process(
-        &self,
-        request: &crate::RuntimeToolExecutionRequest,
-        effect: &ToolEffectDescriptor,
-        outcome: &crate::RuntimeToolExecutionOutcome,
-    ) -> Result<(), ExecutionCommitError> {
-        Self::validate_host_process_outcome(outcome)?;
-        local_network::validate_outcome(request, effect, outcome)?;
-        self.commit_tool_effect_trusted(
-            request,
-            effect,
-            outcome,
-            ProcessTerminalAuthority::HostProcess,
-        )
-    }
-
     /// The honest shape of a Runtime-minted host process terminal.
     fn validate_host_process_outcome(
         outcome: &crate::RuntimeToolExecutionOutcome,
@@ -4927,12 +5110,47 @@ impl ExecutionCommitService {
                         expected_streams.insert(source.stream_id, source.expected_revision);
                     }
                 }
-                ProcessTerminalAuthority::HostProcess => {
+                ProcessTerminalAuthority::HostProcess(_) => {
                     // The Runtime kernel minted this fact itself from the
-                    // trusted host executor's quiescence report. It carries no
-                    // private sandbox capability, so it needs no private
-                    // closure publication and no live process authority.
+                    // trusted host executor's quiescence report, and the
+                    // admission of this effect was published before the command
+                    // ran. The host shell carries no private sandbox
+                    // capability, so it needs no live process authority, but it
+                    // is bound to exactly the same root/delegated authority
+                    // snapshot and the same durable admission as the bounded
+                    // process: without them the receipt can never be settled.
                     Self::validate_host_process_outcome(outcome)?;
+                    for source in self.bounded_process_sources(request, effect, &intent)? {
+                        expected_streams.insert(source.stream_id, source.expected_revision);
+                    }
+                    let admission_key = format!("{}:process-admission", request.idempotency_key);
+                    let published = self
+                        .event_store
+                        .event_by_idempotency_key(&stream_id, &admission_key)?
+                        .ok_or_else(|| {
+                            ExecutionCommitError::InvalidCommand(
+                                "host process receipt requires its original admission".into(),
+                            )
+                        })?;
+                    let fact = outcome
+                        .observed_evidence
+                        .iter()
+                        .find_map(|observed| match &observed.target {
+                            harness_contract::context::EvidenceTargetIdentity::ToolExecution {
+                                execution,
+                            } => Some(execution),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            ExecutionCommitError::InvalidCommand(
+                                "host process receipt requires its execution fact".into(),
+                            )
+                        })?;
+                    if published.payload["admission"] != serde_json::to_value(&fact.admission)? {
+                        return Err(ExecutionCommitError::InvalidCommand(
+                            "host process receipt admission does not match the published one".into(),
+                        ));
+                    }
                 }
                 ProcessTerminalAuthority::Absent => {
                     return Err(ExecutionCommitError::InvalidCommand(
@@ -4969,14 +5187,18 @@ impl ExecutionCommitService {
                     ),
                     "descriptor_hash": effect.descriptor_hash,
                     "outcome": bounded_tool_effect_outcome(outcome),
-                    "process_admission_ref":matches!(authority, ProcessTerminalAuthority::BoundedProcess(_)).then(|| format!("{}:process-admission", request.idempotency_key)),
+                    "process_admission_ref": matches!(authority,
+                        ProcessTerminalAuthority::BoundedProcess(_) | ProcessTerminalAuthority::HostProcess(_))
+                        .then(|| format!("{}:process-admission", request.idempotency_key)),
                     "resolved_effect_scope":intent.payload["resolved_effect_scope"],
                 }))?,
             },
             idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
             schema_version: 1,
         }];
-        if let ProcessTerminalAuthority::BoundedProcess(closure) = authority {
+        if let ProcessTerminalAuthority::BoundedProcess(closure)
+        | ProcessTerminalAuthority::HostProcess(closure) = authority
+        {
             events[0].event.payload["process_closure"] = closure.clone();
         }
         if let Some(mut agent_receipt) =
@@ -4990,7 +5212,9 @@ impl ExecutionCommitService {
                 intent.payload["root_effect_context"].clone();
             agent_receipt.event.payload["process_admission_ref"] =
                 events[0].event.payload["process_admission_ref"].clone();
-            if let ProcessTerminalAuthority::BoundedProcess(closure) = authority {
+            if let ProcessTerminalAuthority::BoundedProcess(closure)
+            | ProcessTerminalAuthority::HostProcess(closure) = authority
+            {
                 agent_receipt.event.payload["process_closure"] = closure.clone();
             }
             agent_receipt.event.payload["root_effect_owner"] =
@@ -11453,12 +11677,14 @@ mod host_process_quiescence_tests {
         let request = request();
         let effect = bash_effect();
         let report = read_host_process_report(Some(&output));
+        let mut admission = crate::host_process_closure::test_admission(&request);
+        admission.source_bundle = artifact("artifact://r1-890-source");
         let fact = build_host_process_fact(
             &request,
             &effect,
             &report,
             artifact("artifact://r1-890-body"),
-            artifact("artifact://r1-890-source"),
+            admission,
         )
         .expect("host process fact");
         crate::RuntimeToolExecutionOutcome {
@@ -11634,12 +11860,14 @@ mod host_process_quiescence_tests {
         let report = read_host_process_report(Some(&bash_output(json!({
             "exitCode": 0, "signal": null, "initReaped": true, "allChildrenReaped": true,
         }))));
+        let mut admission = crate::host_process_closure::test_admission(&request);
+        admission.source_bundle = artifact("artifact://r1-890-source");
         let fact = build_host_process_fact(
             &request,
             &effect,
             &report,
             artifact("artifact://r1-890-body"),
-            artifact("artifact://r1-890-source"),
+            admission,
         )
         .expect("host process fact");
         let mut forged = fact.clone();

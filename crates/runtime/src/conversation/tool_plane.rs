@@ -1691,6 +1691,13 @@ where
             | crate::execution_core::graph::ToolEffectState::NotRequired => {}
         }
         validate_root_physical_scope(&locked.resolver, &locked.scope)?;
+        // A process-class effect is admitted before its command runs: the host
+        // executor can only report quiescence after the fact, and the receipt
+        // may only be settled against a durable admission.
+        let host_process_admission = commit
+            .admit_host_process(request, descriptor)
+            .await
+            .map_err(|error| ToolError::new(error.to_string()))?;
         let execution = execute().await;
         self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ToolCommit)
             .await
@@ -1729,6 +1736,7 @@ where
                 request,
                 descriptor,
                 &mut outcome,
+                host_process_admission.as_ref(),
             )
             .await
             .map_err(|error| {
@@ -1740,15 +1748,11 @@ where
         } else {
             false
         };
+        // A read-class effect has no settlement stream for a process terminal,
+        // so it keeps its plain read receipt and the witness stays honestly
+        // unproven for it.
         let committed = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-            if host_process_terminal {
-                commit.commit_bound_readonly_tool_receipt_with_host_process(
-                    request,
-                    &outcome,
-                    descriptor,
-                    &locked.scope,
-                )
-            } else if let Some(root) = root {
+            if let Some(root) = root {
                 commit.commit_root_read_acquisition(
                     request,
                     &outcome,
@@ -1765,7 +1769,9 @@ where
                 )
             }
         } else if host_process_terminal {
-            commit.commit_tool_effect_with_host_process(request, descriptor, &outcome)
+            commit
+                .commit_host_process_closure(request, descriptor, &outcome)
+                .await
         } else {
             commit.commit_tool_effect(request, descriptor, &outcome)
         };

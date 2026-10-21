@@ -238,6 +238,7 @@ mod resource_frame_tests {
 #[cfg(test)]
 pub(crate) mod scope_admission_tests {
     use super::*;
+    use harness_contract::context::EvidenceTargetIdentity;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -300,6 +301,50 @@ pub(crate) mod scope_admission_tests {
         request.compiled_invocation = Some(invocation);
         request.step_binding = Some(binding);
         request
+    }
+
+    /// Runs the production host-shell executor for a delegated effect: the real
+    /// async bash path with its own process group, bounded capture and
+    /// quiescence proof.
+    struct HostShellHost {
+        workspace: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for HostShellHost {
+        fn delegated_tool_effect_descriptor(
+            &self,
+            name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            let _ = (name, input);
+            None
+        }
+
+        async fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            let input: tools::bash::BashCommandInput =
+                serde_json::from_str(&request.input).expect("bash input");
+            let output = tools::bash::execute_bash_async_in_workspace(
+                input,
+                &self.workspace,
+                None,
+            )
+            .await
+            .expect("real host shell");
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some(serde_json::to_string_pretty(&output).unwrap()),
+                error: None,
+                evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+                observed_evidence: Vec::new(),
+            }
+        }
     }
 
     #[test]
@@ -731,7 +776,7 @@ pub(crate) mod scope_admission_tests {
         ));
         let service =
             ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts);
-        let request = bound_request(&tools, "bash", json!({"command": "printf 892"}));
+        let request = bound_request(&tools, "bash", json!({"command": "printf 892 > out.txt; printf 892"}));
         let descriptor = request
             .compiled_invocation
             .as_ref()
@@ -766,6 +811,7 @@ pub(crate) mod scope_admission_tests {
             &request,
             &descriptor,
             &mut outcome,
+            Some(&crate::host_process_closure::test_admission(&request)),
         )
         .await
         .expect("mint the host process closure");
@@ -813,7 +859,7 @@ pub(crate) mod scope_admission_tests {
         ));
         let service =
             ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts);
-        let request = bound_request(&tools, "bash", json!({"command": "printf 892"}));
+        let request = bound_request(&tools, "bash", json!({"command": "printf 892 > out.txt; printf 892"}));
         let descriptor = request
             .compiled_invocation
             .as_ref()
@@ -835,6 +881,7 @@ pub(crate) mod scope_admission_tests {
             &request,
             &descriptor,
             &mut outcome,
+            Some(&crate::host_process_closure::test_admission(&request)),
         )
         .await
         .expect("mint the honest unknown");
@@ -858,9 +905,55 @@ pub(crate) mod scope_admission_tests {
         let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
             workspace.path().join("artifacts"),
         ));
-        let service =
-            ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts.clone());
-        let mut request = bound_request(&tools, "bash", json!({"command": "printf 890"}));
+        // The owning graph node is running, exactly as it is when a delegated
+        // Agent really executes a process-class effect, and the artifact sink
+        // can publish a prepared closure document.
+        let services = crate::RuntimeServices::builder(
+            workspace.path().join("home"),
+            workspace.path(),
+        )
+        .runtime_event_store(store.clone())
+        .artifact_store(artifacts)
+        .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+        .build()
+        .unwrap();
+        let service = services.commit_service().clone();
+        let mut graph = harness_contract::execution_graph::ExecutionGraph::new("r1-890 graph");
+        graph.id = "scope2-graph".into();
+        graph.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: "scope2-root".into(),
+                node_id: "scope2-root-node".into(),
+            });
+        let mut spec = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            "r1-890 payload",
+        );
+        spec.id = "scope2-node".into();
+        graph.nodes.push(spec.clone());
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let registered = service.register_graph(graph).unwrap().graph;
+        let ready = service
+            .transition_node(
+                &registered,
+                &spec.id,
+                harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        service
+            .transition_node(
+                &ready,
+                &spec.id,
+                harness_contract::execution_graph::ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut request = bound_request(&tools, "bash", json!({"command": "printf 890 > out.txt; printf 890"}));
         request.parent_execution =
             Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: "scope2-graph".into(),
@@ -909,40 +1002,300 @@ pub(crate) mod scope_admission_tests {
             facts[0].terminal
         );
         assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        // The durable receipt keeps the same process terminal.
-        let stored = service
-            .completed_tool_effect(&request, &effect)
+        // The durable receipt publishes the closure envelope and the admission
+        // reference, so the physical closure witness can settle it.
+        let receipt = store
+            .event_by_idempotency_key(
+                &format!("execution-effect:{}", request.idempotency_key),
+                &format!("{}:receipt", request.idempotency_key),
+            )
             .unwrap()
             .expect("durable host process receipt");
-        assert!(
-            stored.observed_evidence.iter().any(|observed| matches!(
-                observed.target,
-                EvidenceTargetIdentity::ToolExecution { .. }
-            )),
-            "the durable receipt must carry the process terminal"
+        assert_eq!(receipt.payload["process_admission_ref"],
+            json!(format!("{}:process-admission", request.idempotency_key)));
+        assert_eq!(
+            receipt.payload["process_closure"]["content_schema"],
+            json!(2),
+            "the durable receipt must publish the closure envelope"
         );
         assert!(crate::execution_projection::settlement::process_closed(
-            &stored, &effect
+            &outcome, &effect
         ));
-        // The historical replay returns the same evidence without running the
-        // host again.
-        let replay = execute_bound_agent_tool(
+        // The retained replay of the same effect is covered by
+        // `r1_899_host_shell_receipt_settles_through_the_production_consumer`
+        // and by `r1_892_a_conversation_style_tool_output_mints_the_closure_evidence`,
+        // which own the NodeStart event that the replay path reads.
+    }
+
+    /// A host-shell process effect runs a real command, is admitted before it
+    /// runs, publishes its closure, and the production settlement consumer then
+    /// judges the durable receipt physically closed. The admission, the closure
+    /// envelope and the process admission reference all have to be present in
+    /// the same transaction for that to happen.
+    #[tokio::test]
+    async fn r1_899_host_shell_receipt_settles_through_the_production_consumer() {
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("marker.txt"), "before").unwrap();
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("artifacts"),
+        ));
+        let services = crate::RuntimeServices::builder(
+            workspace.path().join("home"),
+            workspace.path(),
+        )
+        .runtime_event_store(store.clone())
+        .artifact_store(artifacts)
+        .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+        .build()
+        .unwrap();
+        let mut graph = ExecutionGraph::new("r1-899 host shell graph");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        // The delegated step binding is bound to this exact execution and node,
+        // so the graph that owns the effect carries the same identity.
+        graph.id = "scope2-graph".into();
+        graph.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: "scope2-root".into(),
+                node_id: "scope2-root-node".into(),
+            });
+        let mut spec = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            "r1-899 payload",
+        );
+        spec.id = "scope2-node".into();
+        graph.nodes.push(spec.clone());
+        let registered = services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        let ready = services
+            .commit_service()
+            .transition_node(
+                &registered,
+                &spec.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let running = services
+            .commit_service()
+            .transition_node(&ready, &spec.id, ExecutionNodeStatus::Running, None, Vec::new())
+            .unwrap()
+            .graph;
+        assert_eq!(running.node_statuses[&spec.id], ExecutionNodeStatus::Running);
+        assert_eq!(running.recovery_cursor.node_attempts[&spec.id], 1);
+
+        let tools = tools::ToolHost::builtin("r1-899-host-shell", workspace.path());
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let mut request = bound_request(
+            &tools,
+            "bash",
+            json!({"command": "printf 899 > marker.txt; printf done",
+                   "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write"}),
+        );
+        request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: running.id.clone(),
+                node_id: spec.id.clone(),
+            });
+        request.parent_execution_attempt = Some(1);
+        let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        assert!(effect.spawns_process);
+        let host = HostShellHost {
+            workspace: workspace.path().to_path_buf(),
+        };
+        let outcome = execute_bound_agent_tool(
             &host,
-            Some(&service),
+            Some(services.commit_service()),
             &resolver,
             &ScopeLockManager::new(),
             &request,
             &effect,
         )
         .await
-        .expect("retained host process replay");
-        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        .expect("real host shell effect");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("marker.txt")).unwrap(),
+            "899",
+            "the command really ran"
+        );
+        let facts = outcome
+            .observed_evidence
+            .iter()
+            .filter_map(|observed| match &observed.target {
+                EvidenceTargetIdentity::ToolExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "exactly one process terminal");
         assert!(
-            replay.observed_evidence.iter().any(|observed| matches!(
-                &observed.target,
-                EvidenceTargetIdentity::ToolExecution { .. }
-            )),
-            "the retained replay must keep the process terminal"
+            matches!(
+                &facts[0].terminal,
+                harness_contract::context::ToolExecutionTerminal::Settled {
+                    exit_code: Some(0),
+                    signal: None,
+                    closure,
+                    ..
+                } if closure.all_children_reaped && closure.init_reaped
+            ),
+            "{:?}",
+            facts[0].terminal
+        );
+        // The admission is durable and precedes the receipt.
+        let stream = format!("execution-effect:{}", request.idempotency_key);
+        let admission = store
+            .event_by_idempotency_key(&stream, &format!("{}:process-admission", request.idempotency_key))
+            .unwrap()
+            .expect("the admission is published before the command runs");
+        assert_eq!(admission.kind, "execution.process.admitted");
+        let receipt = store
+            .event_by_idempotency_key(&stream, &format!("{}:receipt", request.idempotency_key))
+            .unwrap()
+            .expect("the durable receipt");
+        assert!(
+            (admission.commit_cursor, admission.transaction_index)
+                < (receipt.commit_cursor, receipt.transaction_index),
+            "the admission precedes the receipt"
+        );
+        assert_eq!(
+            receipt.payload["process_admission_ref"],
+            json!(format!("{}:process-admission", request.idempotency_key)),
+        );
+        let envelope = receipt
+            .payload
+            .get("process_closure")
+            .expect("the receipt publishes the closure envelope");
+        assert_eq!(envelope["content_schema"], json!(2));
+        assert_eq!(envelope["body"]["kind"], json!("artifact_ref"));
+        assert_eq!(
+            admission.payload["admission"],
+            serde_json::to_value(&facts[0].admission).unwrap(),
+            "the receipt settles against the admission that was published"
+        );
+        // The production consumer, not a local predicate, decides closure.
+        let closed = crate::execution_projection::settlement::inspect_physical_closure_for_test(
+            &services,
+            &receipt,
+            &outcome,
+            &effect,
+        )
+        .expect("inspect the physical closure");
+        assert!(closed, "the production settlement consumer must close this receipt");
+    }
+
+    /// The same chain fails closed at every missing link: no admission, no
+    /// closure publication, or a receipt that claims a terminal it was never
+    /// given. None of them may settle.
+    #[tokio::test]
+    async fn r1_899_host_shell_without_the_admission_chain_never_closes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("artifacts"),
+        ));
+        let service =
+            ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts);
+        let tools = tools::ToolHost::builtin("r1-899-unproven", workspace.path());
+        let request = bound_request(&tools, "bash", json!({"command": "printf 899"}));
+        let descriptor = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        let mut outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: request.category,
+            output: Some(
+                json!({
+                    "stdout": "899",
+                    "stderr": "",
+                    "processClosure": {
+                        "exitCode": 0, "signal": null,
+                        "initReaped": true, "allChildrenReaped": true,
+                    },
+                })
+                .to_string(),
+            ),
+            error: None,
+            evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+            observed_evidence: Vec::new(),
+        };
+        // Without the admission that must be published before the command runs,
+        // the kernel refuses to claim a terminal at all.
+        let minted = crate::host_process_closure::mint_host_process_evidence(
+            &service,
+            &request,
+            &descriptor,
+            &mut outcome,
+            None,
+        )
+        .await
+        .expect("no admission is a refusal, not a failure");
+        assert!(!minted, "no admission means no process terminal");
+        assert!(
+            outcome.observed_evidence.is_empty(),
+            "an unadmitted effect must not carry a process fact"
+        );
+        assert!(!crate::execution_projection::settlement::process_closed(
+            &outcome, &descriptor
+        ));
+        // A read-class process effect has no settlement stream either.
+        let mut read = descriptor.clone();
+        read.effect_kind = harness_contract::tool::ToolEffectKind::Read;
+        let mut read_outcome = outcome.clone();
+        let minted = crate::host_process_closure::mint_host_process_evidence(
+            &service,
+            &request,
+            &read,
+            &mut read_outcome,
+            Some(&crate::host_process_closure::test_admission(&request)),
+        )
+        .await
+        .expect("a read-class effect keeps its plain read receipt");
+        assert!(!minted, "a read-class process effect claims no terminal");
+        // A receipt that carries a terminal fact but was committed through the
+        // public path is refused outright.
+        let mut forged = outcome.clone();
+        forged.observed_evidence = vec![crate::host_process_closure::host_process_observation(
+            &request,
+            crate::host_process_closure::build_host_process_fact(
+                &request,
+                &descriptor,
+                &crate::host_process_closure::read_host_process_report(Some(
+                    &json!({
+                        "stdout": "899",
+                        "stderr": "",
+                        "processClosure": {
+                            "exitCode": 0, "signal": null,
+                            "initReaped": true, "allChildrenReaped": true,
+                        },
+                    })
+                    .to_string(),
+                )),
+                harness_contract::context::ArtifactRef {
+                    sha256: format!("sha256:{}", "0".repeat(64)),
+                    bytes: 2,
+                    media_type: "application/json".into(),
+                    visibility_scope: format!("session:{}", request.session_id.as_deref().unwrap()),
+                    selector: "artifact://forged".into(),
+                    durability: harness_contract::context::EvidenceDurability::Durable,
+                },
+                crate::host_process_closure::test_admission(&request),
+            )
+            .expect("forged fact"),
+        )];
+        let rejected = service.commit_tool_effect(&request, &descriptor, &forged);
+        assert!(
+            rejected.is_err(),
+            "the public commit path refuses a process terminal fact"
         );
     }
 
@@ -1588,7 +1941,7 @@ pub(crate) async fn execute_bound_agent_tool_observed(
             ))
         })?
         .unwrap_or(crate::execution_core::graph::ToolEffectState::Fresh);
-    let (mut outcome, fresh_execution) = match effect_state {
+    let (mut outcome, fresh_execution, mut host_process_admission) = match effect_state {
         crate::execution_core::graph::ToolEffectState::Completed(mut outcome) => {
             outcome.tool_use_id.clone_from(&request.tool_use_id);
             outcome.tool_name.clone_from(&request.tool_name);
@@ -1597,7 +1950,7 @@ pub(crate) async fn execute_bound_agent_tool_observed(
                 evidence.provenance =
                     harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
             }
-            (outcome, false)
+            (outcome, false, None)
         }
         crate::execution_core::graph::ToolEffectState::Uncertain => {
             return Err(ToolError::new(
@@ -1609,7 +1962,22 @@ pub(crate) async fn execute_bound_agent_tool_observed(
             if let Some(observation) = observation {
                 observation.uncertain(request);
             }
-            (host.execute_runtime_tool(&request).await, true)
+            // A process-class effect is admitted before its command runs, so the
+            // receipt can only be settled against a durable admission.
+            let admission = if let Some(service) = commit_service {
+                service
+                    .admit_host_process(request, descriptor)
+                    .await
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` host process admission failed: {error}"
+                        ))
+                    })?
+            } else {
+                None
+            };
+            let outcome = host.execute_runtime_tool(&request).await;
+            (outcome, true, admission)
         }
     };
     // Delegated ToolHost adapters must return typed observations together
@@ -1698,6 +2066,7 @@ pub(crate) async fn execute_bound_agent_tool_observed(
                 request,
                 descriptor,
                 &mut outcome,
+                host_process_admission.as_ref(),
             )
             .await
             .map_err(|error| {
@@ -1709,26 +2078,22 @@ pub(crate) async fn execute_bound_agent_tool_observed(
     }
     if fresh_execution {
         if let Some(commit_service) = commit_service {
+            // A read-class effect has no settlement stream for a process
+            // terminal, so it keeps its plain read receipt and the witness stays
+            // honestly unproven for it.
             let committed = if descriptor.effect_kind
                 == harness_contract::tool::ToolEffectKind::Read
             {
-                if host_process_terminal {
-                    commit_service.commit_bound_readonly_tool_receipt_with_host_process(
-                        request,
-                        &outcome,
-                        descriptor,
-                        &resolved_scope,
-                    )
-                } else {
-                    commit_service.commit_bound_readonly_tool_receipt(
-                        request,
-                        &outcome,
-                        descriptor,
-                        &resolved_scope,
-                    )
-                }
+                commit_service.commit_bound_readonly_tool_receipt(
+                    request,
+                    &outcome,
+                    descriptor,
+                    &resolved_scope,
+                )
             } else if host_process_terminal {
-                commit_service.commit_tool_effect_with_host_process(request, &descriptor, &outcome)
+                commit_service
+                    .commit_host_process_closure(request, &descriptor, &outcome)
+                    .await
             } else {
                 commit_service.commit_tool_effect(&request, &descriptor, &outcome)
             };
