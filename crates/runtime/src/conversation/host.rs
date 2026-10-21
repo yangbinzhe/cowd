@@ -6155,12 +6155,24 @@ async fn execute_fenced_runtime_tool(
             // terminal, so it keeps its plain read receipt and the witness stays
             // honestly unproven for it.
             let committed = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                commit_service.commit_bound_readonly_tool_receipt(
-                    request,
-                    &outcome,
-                    effect,
-                    admitted_scope.as_ref().unwrap(),
-                )
+                if host_process_terminal {
+                    commit_service
+                        .commit_host_process_read_closure(
+                            request,
+                            effect,
+                            &outcome,
+                            admitted_scope.as_ref().unwrap(),
+                            None,
+                        )
+                        .await
+                } else {
+                    commit_service.commit_bound_readonly_tool_receipt(
+                        request,
+                        &outcome,
+                        effect,
+                        admitted_scope.as_ref().unwrap(),
+                    )
+                }
             } else if host_process_terminal {
                 commit_service
                     .commit_host_process_closure(request, effect, &outcome)

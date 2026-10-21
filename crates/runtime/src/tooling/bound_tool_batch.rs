@@ -1193,6 +1193,148 @@ pub(crate) mod scope_admission_tests {
         assert!(closed, "the production settlement consumer must close this receipt");
     }
 
+    /// H2: a read-class effect that owns a process tree keeps its own key
+    /// family. It is admitted before the command runs, its read receipt
+    /// carries the published closure and the admission reference, and the
+    /// production settlement consumer closes it against the read intent.
+    #[tokio::test]
+    async fn r1_901_a_read_class_process_effect_settles_through_the_production_consumer() {
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("artifacts"),
+        ));
+        let services = crate::RuntimeServices::builder(
+            workspace.path().join("home"),
+            workspace.path(),
+        )
+        .runtime_event_store(store.clone())
+        .artifact_store(artifacts)
+        .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+        .build()
+        .unwrap();
+        let mut graph = ExecutionGraph::new("r1-901 read process graph");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.id = "scope2-graph".into();
+        graph.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: "scope2-root".into(),
+                node_id: "scope2-root-node".into(),
+            });
+        let mut spec = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            "r1-901 payload",
+        );
+        spec.id = "scope2-node".into();
+        graph.nodes.push(spec.clone());
+        let registered = services.commit_service().register_graph(graph).unwrap().graph;
+        let ready = services
+            .commit_service()
+            .transition_node(
+                &registered,
+                &spec.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let running = services
+            .commit_service()
+            .transition_node(&ready, &spec.id, ExecutionNodeStatus::Running, None, Vec::new())
+            .unwrap()
+            .graph;
+        let tools = tools::ToolHost::builtin("r1-901-read-process", workspace.path());
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let mut request = bound_request(&tools, "bash", json!({"command": "printf 901"}));
+        request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: running.id.clone(),
+                node_id: spec.id.clone(),
+            });
+        request.parent_execution_attempt = Some(1);
+        let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        assert!(effect.spawns_process, "the read effect owns a process tree");
+        assert_eq!(
+            effect.effect_kind,
+            harness_contract::tool::ToolEffectKind::Read,
+            "the effect is read-class"
+        );
+        let host = HostShellHost {
+            workspace: workspace.path().to_path_buf(),
+        };
+        let outcome = execute_bound_agent_tool(
+            &host,
+            Some(services.commit_service()),
+            &resolver,
+            &ScopeLockManager::new(),
+            &request,
+            &effect,
+        )
+        .await
+        .expect("read-class host shell effect");
+        let facts = outcome
+            .observed_evidence
+            .iter()
+            .filter_map(|observed| match &observed.target {
+                EvidenceTargetIdentity::ToolExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "exactly one process terminal");
+        let stream = format!("execution-effect:{}", request.idempotency_key);
+        let read_intent = store
+            .event_by_idempotency_key(&stream, &format!("{}:read-intent", request.idempotency_key))
+            .unwrap()
+            .expect("the read family keeps its own intent");
+        let admission = store
+            .event_by_idempotency_key(
+                &stream,
+                &format!("{}:process-admission", request.idempotency_key),
+            )
+            .unwrap()
+            .expect("the admission is published before the command runs");
+        assert!(
+            (read_intent.commit_cursor, read_intent.transaction_index)
+                < (admission.commit_cursor, admission.transaction_index),
+            "the admission follows the read intent"
+        );
+        let receipt = store
+            .event_by_idempotency_key(&stream, &format!("{}:read-receipt", request.idempotency_key))
+            .unwrap()
+            .expect("the read receipt");
+        assert_eq!(
+            receipt.payload["process_admission_ref"],
+            json!(format!("{}:process-admission", request.idempotency_key)),
+        );
+        assert_eq!(
+            receipt.payload["process_closure"]["content_schema"],
+            json!(2),
+            "the read receipt publishes the closure envelope"
+        );
+        assert_eq!(
+            admission.payload["admission"],
+            serde_json::to_value(&facts[0].admission).unwrap(),
+        );
+        let closed = crate::execution_projection::settlement::inspect_physical_closure_for_test(
+            &services,
+            &receipt,
+            &outcome,
+            &effect,
+        )
+        .expect("inspect the physical closure");
+        assert!(
+            closed,
+            "the production settlement consumer must close a read-class process receipt"
+        );
+    }
+
     /// The same chain fails closed at every missing link: no admission, no
     /// closure publication, or a receipt that claims a terminal it was never
     /// given. None of them may settle.
@@ -1247,7 +1389,9 @@ pub(crate) mod scope_admission_tests {
         assert!(!crate::execution_projection::settlement::process_closed(
             &outcome, &descriptor
         ));
-        // A read-class process effect has no settlement stream either.
+        // A read-class effect that owns a process tree keeps its own key
+        // family: it mints its terminal against its read admission, and it is
+        // settled against the read intent rather than the mutation intent.
         let mut read = descriptor.clone();
         read.effect_kind = harness_contract::tool::ToolEffectKind::Read;
         let mut read_outcome = outcome.clone();
@@ -1259,8 +1403,11 @@ pub(crate) mod scope_admission_tests {
             Some(&crate::host_process_closure::test_admission(&request)),
         )
         .await
-        .expect("a read-class effect keeps its plain read receipt");
-        assert!(!minted, "a read-class process effect claims no terminal");
+        .expect("a read-class effect mints against its read admission");
+        assert!(
+            minted,
+            "a read-class process effect with an admission claims its terminal"
+        );
         // A receipt that carries a terminal fact but was committed through the
         // public path is refused outright.
         let mut forged = outcome.clone();
@@ -2084,12 +2231,24 @@ pub(crate) async fn execute_bound_agent_tool_observed(
             let committed = if descriptor.effect_kind
                 == harness_contract::tool::ToolEffectKind::Read
             {
-                commit_service.commit_bound_readonly_tool_receipt(
-                    request,
-                    &outcome,
-                    descriptor,
-                    &resolved_scope,
-                )
+                if host_process_terminal {
+                    commit_service
+                        .commit_host_process_read_closure(
+                            request,
+                            descriptor,
+                            &outcome,
+                            &resolved_scope,
+                            None,
+                        )
+                        .await
+                } else {
+                    commit_service.commit_bound_readonly_tool_receipt(
+                        request,
+                        &outcome,
+                        descriptor,
+                        &resolved_scope,
+                    )
+                }
             } else if host_process_terminal {
                 commit_service
                     .commit_host_process_closure(request, &descriptor, &outcome)

@@ -3020,6 +3020,30 @@ impl ExecutionCommitService {
         root_intent: Option<&crate::DurableRuntimeEvent>,
         host_process: bool,
     ) -> Result<(), ExecutionCommitError> {
+        self.commit_readonly_tool_receipts_with_closure(
+            receipts,
+            scope,
+            root_intent,
+            host_process,
+            None,
+        )
+    }
+
+    /// The read receipt of a process-class read carries the published closure
+    /// envelope and the admission reference, so the production consumer can
+    /// settle it against the read key family exactly like a mutation receipt
+    /// is settled against the mutation key family.
+    fn commit_readonly_tool_receipts_with_closure(
+        &self,
+        receipts: &[(
+            crate::RuntimeToolExecutionRequest,
+            crate::RuntimeToolExecutionOutcome,
+        )],
+        scope: Option<&harness_contract::goal::ProofEffectScope>,
+        root_intent: Option<&crate::DurableRuntimeEvent>,
+        host_process: bool,
+        closure: Option<&serde_json::Value>,
+    ) -> Result<(), ExecutionCommitError> {
         for (_, outcome) in receipts {
             Self::reject_public_process_facts(outcome, host_process)?;
         }
@@ -3037,7 +3061,7 @@ impl ExecutionCommitService {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.commit_readonly_tool_receipts_once(receipts, scope, root_intent) {
+            match self.commit_readonly_tool_receipts_once(receipts, scope, root_intent, closure) {
                 Ok(()) => return Ok(()),
                 Err(ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision {
                     ..
@@ -3055,6 +3079,7 @@ impl ExecutionCommitService {
         )],
         scope: Option<&harness_contract::goal::ProofEffectScope>,
         root_intent: Option<&crate::DurableRuntimeEvent>,
+        closure: Option<&serde_json::Value>,
     ) -> Result<(), ExecutionCommitError> {
         if receipts.is_empty() {
             return Ok(());
@@ -3186,6 +3211,10 @@ impl ExecutionCommitService {
                         "outcome": bounded_tool_effect_outcome(outcome),
                         "resolved_effect_scope":scope,
                         "read_acquisition_v1": acquisition,
+                        "process_admission_ref": closure.map(|_| {
+                            format!("{}:process-admission", request.idempotency_key)
+                        }),
+                        "process_closure": closure.cloned(),
                     }))?,
                 },
                 idempotency_key: Some(receipt_key.clone()),
@@ -3214,6 +3243,16 @@ impl ExecutionCommitService {
                     .map_or(serde_json::Value::Null, |intent| {
                         intent.payload["root_effect_owner"].clone()
                     });
+                // The per-attempt index carries the same closure envelope and
+                // admission reference as the primary receipt, so a consumer
+                // that reads either one sees the same proven closure.
+                if let Some(closure) = closure {
+                    agent_receipt.event.payload["process_closure"] = closure.clone();
+                    agent_receipt.event.payload["process_admission_ref"] = json!(format!(
+                        "{}:process-admission",
+                        request.idempotency_key
+                    ));
+                }
                 agent_receipt.event.payload["effect"] = serde_json::to_value(effect)?;
                 agent_receipt.event.payload["resolved_effect_scope"] = serde_json::to_value(scope)?;
                 agent_receipt.event.payload[crate::context_evidence::READ_ACQUISITION_FIELD] =
@@ -3245,7 +3284,7 @@ impl ExecutionCommitService {
                 &format!("execution-effect:{}", request.idempotency_key),
                 &format!("{}:read-receipt", request.idempotency_key),
             ).is_ok_and(|receipt| receipt.is_some())) {
-                return self.commit_readonly_tool_receipts_once(receipts, scope, root_intent);
+                return self.commit_readonly_tool_receipts_once(receipts, scope, root_intent, None);
             }
             return Err(error.into());
         }
@@ -3743,6 +3782,62 @@ impl ExecutionCommitService {
         Ok(outcome)
     }
 
+    /// Write the read intent of a read-class effect that owns a process tree.
+    ///
+    /// The read family keeps its own identity: the intent is the read intent
+    /// and the receipt is the read receipt, so a process-class read is never
+    /// recorded as a mutation. A read that owns no process keeps the cheap
+    /// path and writes nothing.
+    fn begin_read_process_intent(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        scope: Option<&harness_contract::goal::ProofEffectScope>,
+    ) -> Result<(), ExecutionCommitError> {
+        let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        let key = format!("{}:read-intent", request.idempotency_key);
+        if self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &key)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Some(scope) = scope {
+            Self::validate_bound_effect_scope(effect, scope)?;
+        }
+        let revision = self.event_store.stream_revision(&stream_id)?;
+        self.event_store.append_transaction(AppendTransactionRequest {
+            transaction_id: key.clone(),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: stream_id.clone(),
+                expected_revision: revision,
+            }],
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: stream_id.clone(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.intent".into(),
+                    status: Some("inflight".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: tool_effect_refs(request),
+                    payload: json!({
+                        "idempotency_key": request.idempotency_key,
+                        "tool_use_id": request.tool_use_id,
+                        "tool_name": request.tool_name,
+                        "effect": effect,
+                        "resolved_effect_scope": scope,
+                        "replay": receipt_replay_contract(request)?,
+                        "process_class": true,
+                    }),
+                },
+                idempotency_key: Some(key),
+                schema_version: 1,
+            }],
+        })?;
+        Ok(())
+    }
+
     /// Admit a host-shell process effect before its command runs.
     ///
     /// The host executor can only report quiescence *after* the fact, so the
@@ -3803,13 +3898,21 @@ impl ExecutionCommitService {
             }
             return Ok(Some(published));
         }
+        // A read-class effect owns its own key family: its intent is the read
+        // intent and its receipt is the read receipt. A process-class read
+        // must not borrow the mutation identity.
+        let intent_key = if effect.effect_kind == ToolEffectKind::Read {
+            format!("{}:read-intent", request.idempotency_key)
+        } else {
+            format!("{}:intent", request.idempotency_key)
+        };
         let intent = self
             .event_store
-            .event_by_idempotency_key(&stream_id, &format!("{}:intent", request.idempotency_key))?
+            .event_by_idempotency_key(&stream_id, &intent_key)?
             .ok_or_else(|| {
                 let revision = self.event_store.stream_revision(&stream_id).unwrap_or(0);
                 invalid(format!(
-                    "host process admission requires original intent in {stream_id} (revision {revision})"
+                    "host process admission requires original intent {intent_key} in {stream_id} (revision {revision})"
                 ))
             })?;
         let mut sources = self.bounded_process_sources(request, effect, &intent)?;
@@ -3893,6 +3996,82 @@ impl ExecutionCommitService {
     /// reported into one artifact that only this commit service can publish.
     /// The receipt and its index are written in the same transaction, so a
     /// consumer that reads either one can settle the physical closure.
+    /// Publish the physical closure document of a read-class process effect and
+    /// commit its read receipt against it.
+    ///
+    /// The read family keeps its own identity: the receipt is the read
+    /// receipt, the admission is the read family's admission, and the closure
+    /// envelope travels with the receipt in the same transaction.
+    pub(crate) async fn commit_host_process_read_closure(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        scope: &harness_contract::goal::ProofEffectScope,
+        root: Option<&crate::CowdExecutionContext>,
+    ) -> Result<(), ExecutionCommitError> {
+        let invalid = ExecutionCommitError::InvalidCommand;
+        Self::validate_host_process_outcome(outcome)?;
+        let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        let intent_key = format!("{}:read-intent", request.idempotency_key);
+        let intent = self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &intent_key)?
+            .ok_or_else(|| invalid("host process read closure requires original read intent".into()))?;
+        // A root read keeps the original root owner: the receipt is settled
+        // against the same owner that admitted the read.
+        let root_intent = match root {
+            Some(root) => {
+                self.root_intent_owner(request, effect, root, scope, &intent)?;
+                Some(&intent)
+            }
+            None => None,
+        };
+        let document = process_closure_document(&intent, outcome)?;
+        let encoded = serde_json::to_vec(&document)?;
+        if encoded.len() > 32 * 1024 {
+            return Err(invalid(
+                "host process read closure metadata exceeds bounded extent".into(),
+            ));
+        }
+        let scope_name = format!(
+            "session:{}",
+            request
+                .session_id
+                .as_deref()
+                .ok_or_else(|| invalid("host process read closure Session missing".into()))?
+        );
+        let origin = crate::PreparedArtifactOrigin::ToolEffectClosure {
+            stream_id: stream_id.clone(),
+            idempotency_key: format!("{}:read-receipt", request.idempotency_key),
+        };
+        let authority = ProcessClosurePublicationAuthority {
+            origin: origin.clone(),
+            sha256: format!("sha256:{:x}", Sha256::digest(&encoded)),
+            bytes: encoded.len() as u64,
+            scope: scope_name.clone(),
+        };
+        let artifacts = self.bounded_process_artifacts()?;
+        let proof = artifacts
+            .write_process_closure_blocking(
+                &scope_name,
+                &format!("process-closure:{}", request.idempotency_key),
+                &encoded,
+                &origin,
+                &authority,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        let closure = json!({"content_schema":2,"sha256":proof.sha256,"bytes":proof.bytes,
+            "body":{"kind":"artifact_ref","artifact":proof}});
+        self.commit_readonly_tool_receipts_with_closure(
+            &[(request.clone(), outcome.clone())],
+            Some(scope),
+            root_intent,
+            true,
+            Some(&closure),
+        )
+    }
+
     pub(crate) async fn commit_host_process_closure(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
@@ -4766,6 +4945,13 @@ impl ExecutionCommitService {
         }
         if effect.effect_kind == ToolEffectKind::Read {
             self.validate_system_tool_parent_scoped(request, root)?;
+            if effect.spawns_process {
+                // A read that owns a process tree still needs a durable
+                // identity before the command runs: the read intent is the
+                // anchor of the read key family, and the admission of the
+                // process is bound to it.
+                self.begin_read_process_intent(request, effect, scope)?;
+            }
             return Ok(ToolEffectState::NotRequired);
         }
         let stream_id = format!("execution-effect:{}", request.idempotency_key);

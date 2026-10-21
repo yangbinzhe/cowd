@@ -113,11 +113,17 @@ impl PreparedArtifactOrigin {
                 stream_id,
                 idempotency_key,
             } => {
+                // The closure of a process-class effect is published for one
+                // exact receipt of its own key family: the mutation receipt or
+                // the read receipt. Both are committed by this service, and
+                // the origin still binds the artifact to that exact receipt.
                 if !stream_id.starts_with("execution-effect:")
                     || stream_id
                         .strip_prefix("execution-effect:")
                         .is_none_or(|key| {
-                            key.is_empty() || idempotency_key != &format!("{key}:receipt")
+                            key.is_empty()
+                                || (idempotency_key != &format!("{key}:receipt")
+                                    && idempotency_key != &format!("{key}:read-receipt"))
                         })
                 {
                     return Err("invalid process closure primary identity".into());

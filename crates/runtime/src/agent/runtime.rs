@@ -3907,8 +3907,24 @@ impl AgentTaskBackend for AgentRuntime {
                 // The run moved to a newer revision: continue on it.
                 continue;
             }
-            // The cancellation is still pending: the caller may finalize it
-            // later, and the run keeps its pending cancellation until then.
+            // A cancellation that was durably accepted stays pending even when
+            // the physical operation failed: the run keeps its reclaim
+            // responsibility. A cancellation that was never accepted is not
+            // pending at all, and the pending key must not be able to cancel
+            // the run behind the caller's back.
+            let durably_cancelled = self.get(packet.agent_id()).is_some_and(|current| {
+                current.status == AgentStatus::Cancelled
+                    && current.run_id == packet.run_id()
+                    && current.graph_id == packet.graph_id()
+                    && current.node_id == packet.node_id()
+                    && current.attempt == packet.attempt
+            });
+            if !durably_cancelled {
+                self.pending_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&run_cancellation_key(packet));
+            }
             return Err(format!(
                 "AgentRuntime cancel rejected for {}: {}",
                 packet.agent_id(),
@@ -4694,6 +4710,60 @@ mod tests {
         assert_eq!(recovered.run_id, packet.run_id());
         assert_eq!(recovered.status, AgentStatus::Cancelled);
         let _ = caller.await;
+    }
+
+    /// N4: a cancellation whose own snapshot could not be persisted is never
+    /// accepted, and the pending key it left behind must not cancel the run
+    /// afterwards. The worker is released to return normally and the run must
+    /// end on its own result, not as a cancellation nobody accepted.
+    #[tokio::test]
+    async fn r1_900_d_an_unaccepted_cancellation_never_cancels_the_run_later() {
+        let (runtime, backend) = held_exit_runtime(Some(AgentTerminalStatus::Completed), false);
+        let packet = task("r1-900-d-unaccepted-cancel");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        backend.entered.notified().await;
+        runtime
+            .cancellation_append_failures
+            .store(1, Ordering::SeqCst);
+        let rejected = AgentTaskBackend::cancel(runtime.as_ref(), &packet).await;
+        assert!(
+            rejected.is_err(),
+            "a cancellation that cannot be persisted is not accepted: {rejected:?}"
+        );
+        assert!(
+            !runtime
+                .pending_cancellations
+                .lock()
+                .unwrap()
+                .contains(&run_cancellation_key(&packet)),
+            "an unaccepted cancellation is not pending"
+        );
+        // The worker returns normally: nothing cancelled it.
+        backend.release.notify_one();
+        let returned = tokio::time::timeout(std::time::Duration::from_secs(30), caller)
+            .await
+            .expect("the run must return")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            returned.status,
+            AgentTerminalStatus::Completed,
+            "an unaccepted cancellation must not change the outcome"
+        );
+        let snapshot = runtime.get(packet.agent_id()).expect("the run exists");
+        assert_ne!(
+            snapshot.status,
+            AgentStatus::Cancelled,
+            "the run was never cancelled: {:?}",
+            snapshot.status
+        );
+        assert_ne!(
+            snapshot.failure.as_deref(),
+            Some(CANCELLED_BY_COMMAND),
+            "the run never claims a cancellation nobody accepted"
+        );
     }
 
     /// N4: the trailing command receipt is written against the latest legal

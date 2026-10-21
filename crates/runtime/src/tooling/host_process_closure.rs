@@ -113,19 +113,10 @@ pub(crate) async fn mint_host_process_evidence(
     if !descriptor.spawns_process {
         return Ok(false);
     }
-    // A read-class effect has no durable intent/admission stream: its receipt is
-    // a `read-receipt` and there is nothing the physical closure witness could
-    // settle a process terminal against. Claiming a terminal there would be a
-    // closure the kernel cannot prove, so the effect keeps its normal read
-    // receipt and the witness stays honestly unproven.
-    if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-        tracing::debug!(
-            tool = %request.tool_name,
-            idempotency_key = %request.idempotency_key,
-            "read-class process effect carries no settlement stream; no process terminal is minted"
-        );
-        return Ok(false);
-    }
+    // A read-class effect that owns a process tree keeps its own key family:
+    // its admission is bound to its read intent and its receipt is the read
+    // receipt, and the physical closure witness settles it against exactly
+    // that family.
     let Some(admission) = admission else {
         // Without the admission published before the command ran there is
         // nothing that binds the executor's report to the authorized program,

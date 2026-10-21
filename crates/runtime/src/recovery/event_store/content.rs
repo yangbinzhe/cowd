@@ -386,13 +386,26 @@ impl RuntimeEventStore {
         let session = primary.payload["replay"]["session_id"]
             .as_str()
             .ok_or("process closure session missing")?;
+        // The primary is the receipt of the effect's own key family, and its
+        // key names that family exactly.
+        let read_family = primary.kind == "execution.read.receipt";
+        let expected_primary_kind = if read_family {
+            "execution.read.receipt"
+        } else {
+            "execution.effect.receipt"
+        };
+        let expected_primary_key = if read_family {
+            format!("{call}:read-receipt")
+        } else {
+            format!("{call}:receipt")
+        };
         if primary.scope != RuntimeEventScope::ExecutionNode
             || primary_schema != 1
-            || primary.kind != "execution.effect.receipt"
+            || primary.kind != expected_primary_kind
             || primary.actor.as_deref() != Some("governed_tool")
             || primary.status.as_deref() != Some("completed")
             || primary.stream_id != format!("execution-effect:{call}")
-            || primary_key != format!("{call}:receipt")
+            || primary_key != expected_primary_key
             || artifact.visibility_scope != format!("session:{session}")
             || primary.payload["process_admission_ref"] != format!("{call}:process-admission")
             || index.scope != RuntimeEventScope::ExecutionNode
@@ -495,7 +508,12 @@ impl RuntimeEventStore {
     ) -> RuntimeEventStoreResult<std::collections::BTreeMap<usize, ArtifactRef>> {
         let mut own = std::collections::BTreeMap::new();
         for (position, input) in request.events.iter().enumerate() {
-            if input.event.kind != "execution.effect.receipt"
+            // The closure of a process-class effect belongs to the primary
+            // receipt of its own key family: the mutation receipt or the read
+            // receipt. Both are published by the commit service in the same
+            // transaction as their per-attempt index.
+            if (input.event.kind != "execution.effect.receipt"
+                && input.event.kind != "execution.read.receipt")
                 || !input
                     .event
                     .payload

@@ -606,14 +606,16 @@ fn physical_receipt_closed(
     let key = receipt.payload["idempotency_key"]
         .as_str()
         .ok_or_else(invalid)?;
-    let intent = primary(
-        services,
-        &receipt.stream_id,
-        &format!("{key}:intent"),
-        through,
-        budget,
-    )?
-    .ok_or_else(invalid)?;
+    // The receipt is settled against the intent of its own key family: a read
+    // receipt is settled against the read intent, a mutation receipt against
+    // the mutation intent.
+    let intent_key = if receipt.kind == "execution.read.receipt" {
+        format!("{key}:read-intent")
+    } else {
+        format!("{key}:intent")
+    };
+    let intent = primary(services, &receipt.stream_id, &intent_key, through, budget)?
+        .ok_or_else(invalid)?;
     let admission = primary(
         services,
         &receipt.stream_id,
@@ -685,7 +687,8 @@ pub(crate) fn inspect_physical_closure_for_test(
         .validate_terminal_scope_from_records(
             effect,
             receipt,
-            false,
+            // The receipt is settled against the scope of its own key family.
+            receipt.kind == "execution.read.receipt",
             &mut ProjectionScopeReader {
                 services,
                 budget: &mut budget,
