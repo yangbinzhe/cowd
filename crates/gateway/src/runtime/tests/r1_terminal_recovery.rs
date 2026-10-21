@@ -1090,20 +1090,39 @@ impl ReviewedTurn {
                 }).to_string(),
             }}],
         })).unwrap();
-        let review_request = reviewer.next().await;
-        let review_result = review_request.body["messages"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .rev()
-            .find(|message| {
-                message["role"] == "tool"
-                    && message["tool_call_id"] == "recovery-task-review"
-            })
-            .and_then(|message| message["content"].as_str());
+        // The review call ends the reviewer's turn when the review is
+        // accepted, so its outcome is read from the durable record. A
+        // follow-up request only exists when the call failed and the model
+        // still has to react to it, so the fixture waits for the record
+        // instead of for a request that may never arrive.
+        let review_outcome = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let found = ["tool.invocation.completed", "tool.invocation.failed", "tool.invocation.denied"]
+                    .into_iter()
+                    .filter_map(|kind| services.topology.runtime_event_store
+                        .events_for_root_execution_kind(&graph_id, kind, None, 64).ok())
+                    .flatten()
+                    .find(|event| event.payload["tool_call_id"] == "recovery-task-review");
+                if let Some(event) = found {
+                    break Some(event.payload["result"].clone());
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        let review_result = review_outcome.as_ref().and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| serde_json::to_string(value).ok())
+        });
         let observation = review_result
+            .as_deref()
             .and_then(|content| {
-                serde_json::from_str::<Value>(content).ok().or_else(|| {
+                serde_json::from_str::<Value>(&content).ok().or_else(|| {
                     let offset = content.find('{')?;
                     serde_json::Deserializer::from_str(&content[offset..])
                         .into_iter::<Value>()
@@ -1118,6 +1137,19 @@ impl ReviewedTurn {
                     || value["code"].is_string()
                     || value["reason"].is_string()
             });
+        // A refused review leaves the model with a tool result it still has
+        // to react to, so the follow-up request is taken only in that case.
+        // An accepted review ends the reviewer's turn, and there is nothing
+        // left to answer.
+        let review_request = if observation.as_ref().is_some_and(|value| {
+            value["error"]["code"].is_string()
+                || value["error"].is_string()
+                || value["code"].is_string()
+        }) {
+            Some(reviewer.next().await)
+        } else {
+            None
+        };
         let redact = |value: Option<&str>| {
             value.map(|text| {
                 let mut redacted = Vec::new();
@@ -1174,7 +1206,7 @@ impl ReviewedTurn {
                 "tool_result_present":review_result.is_some(),
                 "structured_result_present":observation.is_some(),
                 "code":redact(review_code),
-                "reason":redact(review_reason.or(review_result)),
+                "reason":redact(review_reason.or(review_result.as_deref())),
                 "classification":if review_code.is_some() || review_reason.is_some() {
                     "structured_error"
                 } else if observation.is_some() {
@@ -1201,10 +1233,12 @@ impl ReviewedTurn {
         )
         .await;
         let goal_id = format!("goal:{graph_id}");
-        review_request
-            .reply
-            .send(json!({"role":"assistant","content":"The physical result and authored report are independently accepted."}))
-            .unwrap();
+        if let Some(review_request) = review_request {
+            review_request
+                .reply
+                .send(json!({"role":"assistant","content":"The physical result and authored report are independently accepted."}))
+                .unwrap();
+        }
         let accepted = runtime.agent_action_service().project(&program_id).unwrap();
         let independent_agent = accepted.tasks[&task_ref].reviewed_by.clone().unwrap();
         assert_ne!(

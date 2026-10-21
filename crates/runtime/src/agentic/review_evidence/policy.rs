@@ -3341,6 +3341,55 @@ mod primary_material_621_tests {
     }
 }
 
+/// Whether this planned root call IS the review that is being built.
+///
+/// The root plan carries the call that performs the review, so while the
+/// proof is assembled that call is still pending. The exclusion is the same
+/// narrow one the delegated write check applies: the reviewer's own
+/// authenticated review call, and only that one.
+fn is_current_review_control_step(
+    reviewer_execution_id: &str,
+    tool_name: &str,
+    step: &crate::step_snapshot::StepCallBinding,
+) -> bool {
+    if !matches!(tool_name, "task_review" | "objective_review") {
+        return false;
+    }
+    let run = reviewer_execution_id
+        .strip_prefix("agent-run:")
+        .unwrap_or(reviewer_execution_id);
+    step.snapshot.identity.execution_id.as_deref() == Some(run)
+}
+
+/// Whether this in-flight delegated write IS the review that is being built.
+///
+/// A reviewer performs the review as a control action, so while the proof is
+/// assembled the intent of that very call is still in flight. The proof
+/// checks every delegated write that may intersect the required work, and it
+/// found this one unsettled, which is a self-dependency rather than a real
+/// gap: the review can never settle the action it is.
+///
+/// The exclusion is deliberately narrow. The call must be the reviewer's own
+/// governed call, proven from the execution identity the proof was built
+/// under, and it must be a review control action. Another agent's in-flight
+/// write, and another write by this same reviewer, are still refused.
+fn is_current_review_control_call(
+    reviewer_execution_id: &str,
+    intent: &crate::DurableRuntimeEvent,
+) -> bool {
+    let tool = intent.payload["tool_name"].as_str().unwrap_or_default();
+    if !matches!(tool, "task_review" | "objective_review") {
+        return false;
+    }
+    let run = reviewer_execution_id
+        .strip_prefix("agent-run:")
+        .unwrap_or(reviewer_execution_id);
+    let graph = run.strip_prefix("run:").unwrap_or(run);
+    intent
+        .stream_id
+        .starts_with(&format!("execution-agent-receipts:{graph}:"))
+}
+
 pub(super) fn actual_input_snapshot(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -5310,6 +5359,7 @@ fn proof_input_snapshot_for_phase(
                 _ => {}
             }
         }
+        let mut current_control_calls: Vec<String> = Vec::new();
         for (identity, intent) in intents {
             let scope = admitted_intent_scope(store, intent, &mut sources)?;
             if let Some(run) = authenticated_process_for_key(store, identity, &mut sources)? {
@@ -5337,6 +5387,19 @@ fn proof_input_snapshot_for_phase(
                 )
             });
             if !settled && !disjoint {
+                if is_current_review_control_call(&proof.reviewer_execution_id, &intent) {
+                    // The review is a control action the reviewer performs
+                    // while this proof is assembled, so its own intent is
+                    // still in flight when the proof checks it. Requiring it
+                    // to be settled first is a self-dependency: the review can
+                    // never settle the action it is. Only that exact call is
+                    // excluded, and only after it is authenticated as the
+                    // reviewer's own governed call. Every other in-flight
+                    // control change, including another write by this same
+                    // reviewer, still fails closed.
+                    current_control_calls.push(identity.to_string());
+                    continue;
+                }
                 return Err(
                     "effect_review_pending: unknown required or possibly intersecting delegated write"
                         .into(),
@@ -5385,6 +5448,7 @@ fn proof_input_snapshot_for_phase(
         }
     }
     let mut planned = BTreeSet::new();
+    let mut current_review_planned: BTreeSet<(String, String)> = BTreeSet::new();
     let mut completed = BTreeSet::new();
     for event in &session_events {
         if event.actor.as_deref() != Some("conversation_runtime") {
@@ -5427,6 +5491,13 @@ fn proof_input_snapshot_for_phase(
                     serde_json::from_value(task["step_binding"].clone())
                         .map_err(|_| "root effect plan lacks its original Step identity")?;
                 let call_key = step.effect_idempotency_key();
+                if is_current_review_control_step(
+                    &proof.reviewer_execution_id,
+                    task["tool_name"].as_str().unwrap_or_default(),
+                    &step,
+                ) {
+                    current_review_planned.insert((plan.to_string(), call.to_string()));
+                }
                 if authenticated_process_for_key(store, &call_key, &mut sources)?.is_none() {
                     relevant_writes.push((event.commit_cursor, None, Some(call_key)));
                     last_effect_cursor = last_effect_cursor.max(event.commit_cursor);
@@ -5499,10 +5570,24 @@ fn proof_input_snapshot_for_phase(
         }
     }
     if !planned.is_subset(&completed) {
-        return Err(format!(
-            "effect_review_pending: root writes must settle before acceptance; pending={:?}; terminal={completed:?}",
-            planned.difference(&completed).collect::<Vec<_>>(),
-        ));
+        // The review is a control action the reviewer performs while this
+        // proof is assembled, so the call that carries it is still pending
+        // here. Requiring it to settle first is a self-dependency. The
+        // exclusion is the same narrow one the delegated write check applies:
+        // only the reviewer's own authenticated review call, and only the
+        // call the review is actually performing. Every other planned write
+        // still has to settle.
+        let pending = planned
+            .difference(&completed)
+            .filter(|(plan, call)| {
+                !current_review_planned.contains(&(plan.clone(), call.clone()))
+            })
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            return Err(format!(
+                "effect_review_pending: root writes must settle before acceptance; pending={pending:?}; terminal={completed:?}",
+            ));
+        }
     }
     #[cfg(test)]
     if !runtime_control_keys.is_empty() {
@@ -6268,6 +6353,50 @@ pub(crate) fn effect_review_snapshot(
 mod tests {
     use super::*;
     use harness_contract::{policy::*, tool::*};
+
+    /// The review cannot be required to settle the control action it is.
+    ///
+    /// A reviewer performs the review while the proof is assembled, so that
+    /// call's intent is still in flight. Excluding it must be narrow: only
+    /// that reviewer's own review call, never another agent's in-flight
+    /// write and never another write by the same reviewer.
+    #[test]
+    fn r1_current_review_control_call_is_excluded_and_nothing_else_is() {
+        let reviewer = "agent-run:run:agentic-graph:881f5104981de6ca8fb83addee9d1384e73095156d9cdbf6d53b3f9bfa6e19aa";
+        let intent = |stream: &str, tool: &str| crate::DurableRuntimeEvent {
+            event_id: "event".into(),
+            stream_id: stream.into(),
+            sequence: 2,
+            scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "execution.agent_tool.intent".into(),
+            status: Some("inflight".into()),
+            actor: Some("governed_tool".into()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"tool_name": tool, "sequence": 1}),
+            created_at_ms: 0,
+            commit_cursor: 0,
+            transaction_id: "tx".into(),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: None,
+        };
+        let own = "execution-agent-receipts:agentic-graph:881f5104981de6ca8fb83addee9d1384e73095156d9cdbf6d53b3f9bfa6e19aa:agentic-graph:881f5104981de6ca8fb83addee9d1384e73095156d9cdbf6d53b3f9bfa6e19aa:agent:1";
+        let foreign = "execution-agent-receipts:agentic-graph:0000000000000000000000000000000000000000000000000000000000000000:agentic-graph:0000000000000000000000000000000000000000000000000000000000000000:agent:1";
+
+        // The reviewer's own review call is the call being reviewed.
+        assert!(is_current_review_control_call(reviewer, &intent(own, "task_review")));
+        assert!(is_current_review_control_call(
+            reviewer,
+            &intent(own, "objective_review")
+        ));
+        // Another write by the same reviewer is not the review.
+        assert!(!is_current_review_control_call(reviewer, &intent(own, "edit")));
+        // Another agent's review call is not this review.
+        assert!(!is_current_review_control_call(
+            reviewer,
+            &intent(foreign, "task_review")
+        ));
+    }
 
     #[test]
     fn pinned_delivery_projection_preserves_confirmations_across_pages_without_effects() {
