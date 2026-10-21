@@ -352,6 +352,7 @@ async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
             envelope.action_id = "public-objective-gap-without-proof".into();
             if let AgentAction::ObjectiveReview(input) = &mut envelope.action {
                 input.decision = harness_contract::agent_action::ObjectiveReviewDecision::Gap;
+                input.reason = "gap: the independent objective review has not yet been accepted".into();
             } else {
                 unreachable!()
             }

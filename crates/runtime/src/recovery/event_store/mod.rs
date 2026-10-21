@@ -53,6 +53,7 @@ pub use ephemeral::EphemeralRuntimeEventStore;
 /// schema. Backend adapters are composed explicitly at the trusted host root.
 #[derive(Debug)]
 pub struct RuntimeEventStore {
+    repetition_namespace: String,
     session_recovery_exclusions: std::sync::RwLock<BTreeSet<String>>,
     artifacts: OnceLock<Arc<crate::ArtifactStore>>,
     backend: Arc<dyn RuntimeEventStoreBackend>,
@@ -72,6 +73,24 @@ pub struct RuntimeEventStore {
 }
 
 impl RuntimeEventStore {
+    pub(crate) fn repetition_scope(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> crate::repetition_guard::RepetitionScope {
+        crate::repetition_guard::RepetitionScope::turn(session_id, turn_id)
+            .in_namespace(&self.repetition_namespace)
+    }
+
+    pub(crate) fn repetition_execution_scope(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+    ) -> crate::repetition_guard::RepetitionScope {
+        crate::repetition_guard::RepetitionScope::execution(session_id, execution_id)
+            .in_namespace(&self.repetition_namespace)
+    }
+
     /// Construct an explicit process-local test backend.
     #[must_use]
     pub fn for_test() -> Self {
@@ -113,6 +132,7 @@ impl RuntimeEventStore {
             .unwrap_or_default();
         let (commit_signal, _) = tokio::sync::watch::channel(latest_cursor);
         Self {
+            repetition_namespace: uuid::Uuid::new_v4().to_string(),
             backend,
             session_recovery_exclusions: std::sync::RwLock::new(BTreeSet::new()),
             artifacts: OnceLock::new(),

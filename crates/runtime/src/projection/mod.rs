@@ -1112,13 +1112,70 @@ mod tests {
                 harness_contract::projection::TerminalExecutionPhase::Terminal
             );
             worker.withdraw().await;
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while !gate.entered.load(std::sync::atomic::Ordering::Acquire) {
-                    tokio::task::yield_now().await;
+            let withdrawal = fixture
+                .services
+                .event_store()
+                .event_by_idempotency_key(
+                    &format!(
+                        "agentic-program:{}",
+                        worker.packet.agentic_binding.as_ref().unwrap().program_id
+                    ),
+                    &format!("agent-action:physical-withdraw:{}", worker.packet.run_id()),
+                )
+                .unwrap()
+                .expect("the original withdrawal must be durably applied");
+            let envelope: harness_contract::agent_action::AgentActionEnvelope =
+                serde_json::from_value(withdrawal.payload["envelope"].clone())
+                    .expect("the durable withdrawal must carry its original envelope");
+            assert!(
+                matches!(
+                    &envelope.action,
+                    harness_contract::agent_action::AgentAction::TaskWithdraw(input)
+                        if input.task_ref == worker.task_ref
+                ),
+                "the durable withdrawal must be the original Task retirement"
+            );
+            let dispatch_context = crate::agentic::execution::AgenticDispatchContext {
+                session_id: worker.packet.session_id().to_string(),
+                turn_id: envelope.actor.turn_id.clone(),
+                model_lease: worker.packet.model_lease.clone(),
+                permission_ceiling: worker.packet.permission_ceiling,
+                resource_scopes: worker.packet.resource_scopes.clone(),
+            };
+            let mut dispatch = fixture
+                .services
+                .dispatch_agentic_followups(&envelope, dispatch_context);
+            struct GateRelease(std::sync::Arc<crate::agent_process_jsonl_adapter::ProcessExitGate>);
+            impl Drop for GateRelease {
+                fn drop(&mut self) {
+                    self.0.release();
+                }
+            }
+            let _gate_release = GateRelease(gate.clone());
+            let mut dispatched: Option<
+                Result<Vec<crate::agentic::execution::AgenticDispatchReceipt>, String>,
+            > = None;
+            let entered = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    tokio::select! {
+                        result = &mut dispatch => {
+                            dispatched = Some(result);
+                            return gate.entered.load(std::sync::atomic::Ordering::Acquire);
+                        }
+                        _ = tokio::task::yield_now() => {
+                            if gate.entered.load(std::sync::atomic::Ordering::Acquire) {
+                                return true;
+                            }
+                        }
+                    }
                 }
             })
             .await
-            .unwrap();
+            .unwrap_or(false);
+            assert!(
+                entered,
+                "the original withdrawal consumer must cancel the live process before the driver is released"
+            );
             assert!(crate::agent_runtime::confirmed_run_exit(
                 fixture.services.event_store(),
                 &worker.packet
@@ -1148,7 +1205,23 @@ mod tests {
                 harness_contract::projection::TerminalExecutionPhase::Terminal
             );
             gate.release();
-            worker.wait_terminal().await;
+            let consumer = async {
+                match dispatched {
+                    Some(result) => result,
+                    None => tokio::time::timeout(std::time::Duration::from_secs(30), dispatch)
+                        .await
+                        .expect("the original withdrawal consumer must finish"),
+                }
+            };
+            let (consumer_result, terminal_result) = tokio::join!(
+                consumer,
+                tokio::time::timeout(std::time::Duration::from_secs(30), worker.wait_terminal()),
+            );
+            terminal_result.expect("the original driver must reach its terminal state");
+            assert!(
+                consumer_result.is_ok(),
+                "the original withdrawal consumer must apply the durable cancellation: {consumer_result:?}"
+            );
             let turn_id = fixture
                 .services
                 .graph_state_store()
@@ -1164,7 +1237,8 @@ mod tests {
                 &turn_id,
                 "cancelled",
             );
-            let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut last_axes = None;
+            let settled_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 loop {
                     let projection =
                         snapshot(&fixture.services, &graph_id, &context(&fixture.services))
@@ -1176,11 +1250,28 @@ mod tests {
                     {
                         break projection;
                     }
+                    last_axes = Some(serde_json::json!(&projection.terminal_axes));
                     tokio::task::yield_now().await;
                 }
             })
-            .await
-            .unwrap();
+            .await;
+            let settled = settled_result.unwrap_or_else(|error| {
+                let task = fixture.services.agent_action_service()
+                    .project(&worker.packet.agentic_binding.as_ref().unwrap().program_id)
+                    .ok().and_then(|program| program.tasks.get(&worker.task_ref).cloned());
+                let graph = fixture.services.graph_state_store().load(&graph_id).ok();
+                panic!("physical retirement did not converge: {error}; {}", serde_json::json!({
+                    "run_id": worker.packet.run_id(), "attempt": worker.packet.attempt,
+                    "unknown": unknown, "last_axes": last_axes,
+                    "node_statuses": graph.map(|graph| graph.node_statuses),
+                    "task": task.map(|task| serde_json::json!({
+                        "status": task.status, "pending_retirement": task.pending_retirement,
+                        "active_attempts": task.active_attempts, "claim_generation": task.claim_generation,
+                    })),
+                    "exact_exit": format!("{:?}", crate::agent_runtime::confirmed_run_exit(
+                        fixture.services.event_store(), &worker.packet).map(|exit| exit.is_some())),
+                }));
+            });
             assert_eq!(
                 settled.terminal_axes.outcome.outcome,
                 Some(harness_contract::goal::ObjectiveTerminalKind::Cancelled)

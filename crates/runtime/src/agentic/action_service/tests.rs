@@ -384,7 +384,7 @@ fn delegated_inspection_and_action_receipts_keep_root_closure_as_background() {
                 generation: 0,
             },
         );
-        let observation = inspected_observation(&request, &program, None);
+        let observation = inspected_observation(&service.store, &request, &program, None);
         assert_eq!(observation.status, AgentActionStatus::Observed);
         let page = observation.projection.expect("leaf page");
         assert!(page.get("next_rungs").is_none());
@@ -413,7 +413,7 @@ fn delegated_inspection_and_action_receipts_keep_root_closure_as_background() {
         if mode == AgentAttemptMode::Execute {
             program.tasks.get_mut(&task_ref).unwrap().purpose =
                 harness_contract::agent_action::TaskPurpose::Exploration;
-            let exploration = inspected_observation(&request, &program, None);
+            let exploration = inspected_observation(&service.store, &request, &program, None);
             assert!(exploration
                 .actionable
                 .iter()
@@ -431,7 +431,7 @@ fn delegated_inspection_and_action_receipts_keep_root_closure_as_background() {
             .iter()
             .any(|action| action.contains("claim an available Task")
                 || action.contains("objective_complete_request")));
-        let root_page = inspected_observation(&root_request, &program, None)
+        let root_page = inspected_observation(&service.store, &root_request, &program, None)
             .projection
             .expect("root page");
         assert_eq!(

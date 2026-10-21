@@ -3186,6 +3186,25 @@ impl ExecutionCommitService {
                 })
             })
             .flatten();
+            let mut read_payload = local_network::receipt_payload(&self.event_store, request, json!({
+                "effect":effect,
+                "root_effect_context":root_intent.map(|intent| &intent.payload["root_effect_context"]),
+                "root_effect_owner":root_intent.map(|intent| &intent.payload["root_effect_owner"]),
+                "idempotency_key": request.idempotency_key,
+                "tool_use_id": request.tool_use_id,
+                "tool_name": request.tool_name,
+                "replay": receipt_replay_contract(request)?,
+                "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
+                "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
+                "outcome": bounded_tool_effect_outcome(outcome),
+                "resolved_effect_scope":scope,
+                "read_acquisition_v1": acquisition,
+                "process_admission_ref": closure.map(|_| format!("{}:process-admission", request.idempotency_key)),
+                "process_closure": closure.cloned(),
+            }))?;
+            if acquisition.is_some() {
+                read_payload["original_input"] = json!(request.input);
+            }
             events.push(RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id,
@@ -3195,27 +3214,7 @@ impl ExecutionCommitService {
                     actor: Some("governed_tool".to_string()),
                     refs: root_owner.as_ref().map_or_else(|| tool_effect_refs(request),
                         |(owner, attempt)| root_effect_receipt_refs(request, owner, *attempt)),
-                    payload: local_network::receipt_payload(&self.event_store, request, json!({
-                        "effect":effect,
-                        "root_effect_context":root_intent.map(|intent| &intent.payload["root_effect_context"]),
-                        "root_effect_owner":root_intent.map(|intent| &intent.payload["root_effect_owner"]),
-                        "idempotency_key": request.idempotency_key,
-                        "tool_use_id": request.tool_use_id,
-                        "tool_name": request.tool_name,
-                        "replay": receipt_replay_contract(request)?,
-                        "input_sha256": format!(
-                            "sha256:{:x}",
-                            Sha256::digest(request.input.as_bytes())
-                        ),
-                        "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
-                        "outcome": bounded_tool_effect_outcome(outcome),
-                        "resolved_effect_scope":scope,
-                        "read_acquisition_v1": acquisition,
-                        "process_admission_ref": closure.map(|_| {
-                            format!("{}:process-admission", request.idempotency_key)
-                        }),
-                        "process_closure": closure.cloned(),
-                    }))?,
+                    payload: read_payload,
                 },
                 idempotency_key: Some(receipt_key.clone()),
                 schema_version: 1,

@@ -742,17 +742,6 @@ pub(crate) fn apply_task_review(
         match input.decision {
             TaskReviewDecision::Accept => {
                 task.status = AgenticTaskStatus::Accepted;
-                // Durable progress for this turn: every failure breaker filed
-                // under it is stale, because a later call that failed before the
-                // accept must not be suppressed by a pre-accept failure. This is
-                // the only production site where a Task becomes Accepted.
-                //
-                // Failure breakers only. Clearing the whole ledger here also wiped
-                // the cumulative repeat counts, so a call issued ten times never
-                // reached its block bound and was never refused - run one25 was
-                // diagnosed seven times and issued the call ten times anyway.
-                crate::repetition_guard::clear_failure_breakers(&crate::repetition_guard::RepetitionScope::turn(
-                    &envelope.actor.session_id, &envelope.actor.turn_id));
             }
             TaskReviewDecision::Challenge | TaskReviewDecision::Rework => {
                 task.claimant = None;
@@ -1297,6 +1286,43 @@ mod criterion_source_tests {
         let mut program = AgenticProgramProjection::empty("program-1", "objective-1");
         program.objective_summary = objective.to_string();
         program
+    }
+
+    #[test]
+    fn r1_review_projection_replay_never_clears_runtime_breakers() {
+        use crate::repetition_guard::*;
+
+        let mut envelope = envelope();
+        envelope.actor.session_id = "r1-projection-replay-session".into();
+        envelope.actor.turn_id = "r1-projection-replay-turn".into();
+        let store = crate::RuntimeEventStore::for_test();
+        let scoped = store.repetition_scope(&envelope.actor.session_id, &envelope.actor.turn_id);
+        let unscoped = RepetitionScope::turn(&envelope.actor.session_id, &envelope.actor.turn_id);
+        for scope in [&scoped, &unscoped] {
+            for _ in 0..repetition_bound() {
+                record_tool_failure(scope, "read_file", "input", &[],
+                    crate::tool_invocation::ToolFailureKind::ExecutionError,
+                    "graph run:abc123 is missing");
+            }
+        }
+        let mut program = program_with_objective("Read source");
+        apply_task_publish(&mut program, &envelope, &publish_input("source evidence"), Some("task"));
+        let review = TaskReviewInput {
+            task_ref: "task".into(),
+            decision: TaskReviewDecision::Accept,
+            reason: "source evidence".into(),
+            operator_requirement: None,
+            evidence_refs: Vec::new(),
+        };
+        for _ in 0..2 {
+            apply_task_review(&mut program, &envelope, &review);
+            assert_eq!(program.tasks["task"].status, AgenticTaskStatus::Accepted);
+            for scope in [&scoped, &unscoped] {
+                assert!(cause_blocked_for_tool(scope, "read_file"));
+            }
+        }
+        clear_turn(&scoped);
+        clear_turn(&unscoped);
     }
 
     /// The operator asked for one verifiable fact per file. A Task that also

@@ -923,7 +923,7 @@ where
                 ),
             );
             let refusal_text_only = crate::repetition_guard::take_refusal_ignored(
-                &crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id));
+                &self.services.event_store().repetition_scope(&state.session_id, &state.turn_id));
             let made_progress = std::mem::take(&mut state.last_verified_progress);
             state.consecutive_unverified_model_steps = next_unverified_model_step_streak(
                 state.consecutive_unverified_model_steps,
@@ -7113,6 +7113,14 @@ where
             })?;
             let (event_bus, memory_context, reality_context, execution_policy) = {
                 let runtime = self.runtime.lock().await;
+                if let Ok(compilation) = &governed_compilation {
+                    if let Some(plan) = &compilation.plan {
+                        runtime.record_governed_tool_plan(plan).map_err(|error| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason: format!("persist original governed tool plan before execution: {error}"),
+                        })?;
+                    }
+                }
                 (
                     runtime.cowd_bus().cloned(),
                     runtime.memory_turn_context(),
@@ -7775,7 +7783,7 @@ where
             executed_failures(
                 failed,
                 &calls,
-                &crate::repetition_guard::RepetitionScope::turn(&session_id, &turn_id),
+                &self.services.event_store().repetition_scope(&session_id, &turn_id),
             ),
             false,
         );
@@ -7829,7 +7837,7 @@ where
         // was missing - that the call has been made before and produced this
         // result - and where the same bytes can be had without another call.
         let repeat_turn =
-            crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id);
+            self.services.event_store().repetition_scope(&state.session_id, &state.turn_id);
         let repeated_calls = record_repeated_calls(&repeat_turn, &calls, &successful_call_ids);
         if let Some((tool, count)) = repeated_calls.first() {
             let repeated_tools = repeated_calls
@@ -7983,7 +7991,7 @@ where
             |protocol| {
                 protocol.terminal_action_ids().any(|tool| {
                     !crate::repetition_guard::cause_blocked_for_tool(
-                        &crate::repetition_guard::RepetitionScope::turn(
+                        &self.services.event_store().repetition_scope(
                             &state.session_id,
                             &state.turn_id,
                         ),
@@ -8470,7 +8478,7 @@ where
             && protocol_closure_can_be_required(
                 delegated_protocol_for_batch.as_ref(),
                 intervention.as_ref(),
-                &crate::repetition_guard::RepetitionScope::turn(&session_id, &turn_id),
+                &self.services.event_store().repetition_scope(&session_id, &turn_id),
             );
         if protocol_closure_required {
             let protocol = delegated_protocol_for_batch

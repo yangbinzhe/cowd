@@ -1463,6 +1463,35 @@ async fn run_bounded_process_versions_283(
     runs
 }
 
+/// Read the confirmed physical run exit, tolerating the documented
+/// stale-view race on a live agent run stream.
+///
+/// The agent run stream can advance while the exit is read. That is a stale
+/// view of a live stream, not an untrusted one, and the product reports it as
+/// retryable for exactly that reason. Unwrapping it made whole scenarios
+/// fail on a concurrent append that has nothing to do with what they assert.
+fn confirmed_run_exit_with_retry(
+    store: &crate::RuntimeEventStore,
+    packet: &harness_contract::agent::AgentTaskPacket,
+) -> Option<(
+    crate::agent_runtime::RunExitEvidence,
+    Vec<crate::ExpectedStreamRevision>,
+)> {
+    let mut attempt = 0;
+    loop {
+        match crate::agent_runtime::confirmed_run_exit(store, packet) {
+            Ok(exit) => return exit,
+            Err(error)
+                if error == "Agent exit source changed during authentication" && attempt < 400 =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                attempt += 1;
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
 pub(super) async fn exercise_reviewed_goal_proof_scenario(
     services: Arc<RuntimeServices>,
     read_host: Arc<ReviewReadHost>,
@@ -1868,11 +1897,7 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
         .load(&valid_parent.execution_id)
         .unwrap();
     probe_worker.finish_readonly_control().await;
-    assert!(crate::agent_runtime::confirmed_run_exit(
-        negative_services.event_store(),
-        &probe_worker.packet
-    )
-    .unwrap()
+    assert!(confirmed_run_exit_with_retry(negative_services.event_store(), &probe_worker.packet)
     .is_some());
     assert!(!probe_worker.directory().exists());
     let mut rebound_graph = valid_graph.clone();
@@ -2217,8 +2242,7 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
     );
     for original in &optional_packets {
         wait_retired_process(&services, original, &published.changed_refs[0]).await;
-        assert!(crate::agent_runtime::confirmed_run_exit(services.event_store(), original)
-            .unwrap().is_some());
+        assert!(confirmed_run_exit_with_retry(services.event_store(), original).is_some());
         assert!(crate::agent_runtime::authenticated_run_lifecycle(services.event_store(), original)
             .unwrap().no_direct_effects());
     }
@@ -3465,8 +3489,7 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
             )
             .unwrap();
             assert!(
-                crate::agent_runtime::confirmed_run_exit(services.event_store(), &original)
-                    .unwrap()
+                confirmed_run_exit_with_retry(services.event_store(), &original)
                     .is_some()
             );
             assert_eq!(
@@ -4522,6 +4545,11 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                 .await
                 .unwrap();
         }
+        reviewer.reader.execute_tool(
+            "native-goal-independent-current-target-read",
+            "read_file",
+            r#"{"path":"review-effect.txt","complete":true}"#,
+        ).await.unwrap();
         reviewed_delivery_refs.extend(native.result_refs.clone());
     }
     #[cfg(test)]
@@ -4809,21 +4837,23 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                 bounded_selected_body_receipts = receipts;
             }
         }
-        let (_, runtime) = root_reads_generic_results(
+        let (_, runtime) = execute_root_review_reads_with_approval(
             &services,
             effect_host.clone(),
             &content.selector,
             true,
             false,
+            PermissionMode::DangerFullAccess,
+            Some(Arc::clone(services.approval_coordinator())),
         )
         .await;
         assert!(!crate::ToolExecutor::owns_durable_tool_effect(
             &RootReviewReader(effect_host.clone()),
             "execute_code"
         ));
-        root_review_input_tool(&runtime, "bounded-root-nonowns-283", "execute_code",
-            &serde_json::json!({"language":"python","code":"exec(open('/project/bounded_test.py').read())",
-                "input_files":["bounded_source.py","bounded_test.py"],"timeout_ms":5000}).to_string()).await;
+        let bounded_input = serde_json::json!({"language":"python","code":"exec(open('/project/bounded_test.py').read())",
+            "input_files":["bounded_source.py","bounded_test.py"],"timeout_ms":5000}).to_string();
+        runtime.execute_approved_bounded_code(&bounded_input).await.unwrap();
         let request = effect_host
             .calls
             .lock()
@@ -5494,11 +5524,7 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
             )
             .unwrap();
             assert!(!lifecycle.no_direct_effects());
-            assert!(crate::agent_runtime::confirmed_run_exit(
-                services.event_store(),
-                &optional.packet
-            )
-            .unwrap()
+            assert!(confirmed_run_exit_with_retry(services.event_store(), &optional.packet)
             .is_some());
             assert!(!process_control_directory(&services, &optional.packet).exists());
             let mut retried = obligation_envelope.clone();
@@ -6727,15 +6753,10 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                     |proof| !proof.reads.is_empty() && proof.effect_manifest_digest.is_some()
                 )));
         assert!(
-            crate::agent_runtime::confirmed_run_exit(services.event_store(), &packet)
-                .unwrap()
+            confirmed_run_exit_with_retry(services.event_store(), &packet)
                 .is_none()
         );
-        assert!(crate::agent_runtime::confirmed_run_exit(
-            services.event_store(),
-            &reviewer_session.packet
-        )
-        .unwrap()
+        assert!(confirmed_run_exit_with_retry(services.event_store(), &reviewer_session.packet)
         .is_none());
         for (execution_id, node_id) in [
             (packet.graph_id(), packet.node_id()),
@@ -6915,8 +6936,18 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                 .status,
             crate::AgenticProgramStatus::Verified
         );
-        for review in &goal.reviews {
-            let proof = review.verification.as_ref().unwrap();
+        assert!(crate::agentic::current_reviews_satisfy_the_goal(&goal));
+        let conditions = crate::agentic::review_evidence::required_review_conditions(&goal);
+        assert!(!conditions.is_empty());
+        for condition in conditions {
+            let review = goal.reviews.iter().rev()
+                .find(|review| review.criterion_ref == condition)
+                .expect("satisfied goal requires its current required review");
+            assert_eq!(review.decision, "satisfied");
+            assert_eq!(review.spec_revision, goal.spec_revision);
+            assert_eq!(review.input_manifest_digest, goal.spec_digest);
+            let proof = review.verification.as_ref()
+                .expect("current satisfied required review must carry verification");
             if let Some(native) = native_sources.as_ref() {
                 for source_packet in [&packet, &native.packet] {
                     assert!(
@@ -8653,11 +8684,7 @@ impl R1OptionalEffect {
                     );
                 }
                 if all_terminal
-                    && crate::agent_runtime::confirmed_run_exit(
-                        services.event_store(),
-                        &self.packet,
-                    )
-                    .unwrap()
+                    && confirmed_run_exit_with_retry(services.event_store(), &self.packet,)
                     .is_some()
                 {
                     break;
@@ -8715,8 +8742,7 @@ impl R1OptionalEffect {
             assert!(!task.active_attempts.is_empty());
             assert!(after.objective_verdict.is_none());
             assert!(!process_control_directory(services, &self.packet).exists());
-            assert!(crate::agent_runtime::confirmed_run_exit(services.event_store(), &self.packet)
-                .unwrap().is_some());
+            assert!(confirmed_run_exit_with_retry(services.event_store(), &self.packet).is_some());
             println!("R1_REAPED_INVALID_CHILD_REMAINS_UNSETTLED {}", serde_json::json!({
                 "task":self.task_ref,"graph":self.graph_id,"reason":reason,
                 "physical_exit":true,"task_withdrawn":false,"goal_satisfied":false,
@@ -8745,11 +8771,7 @@ impl R1OptionalEffect {
                         .node_statuses
                         .values()
                         .all(|status| status.is_terminal())
-                    && crate::agent_runtime::confirmed_run_exit(
-                        services.event_store(),
-                        &self.packet,
-                    )
-                    .unwrap()
+                    && confirmed_run_exit_with_retry(services.event_store(), &self.packet,)
                     .is_some()
                 {
                     break program;
@@ -10267,6 +10289,7 @@ pub(super) fn root_reads_generic_results<'fixture>(
         selector,
         read_tool_receipt,
         write_effect,
+        if write_effect { PermissionMode::DangerFullAccess } else { PermissionMode::ReadOnly },
     ))
 }
 
@@ -10373,6 +10396,21 @@ async fn execute_root_review_reads(
     selector: &str,
     read_tool_receipt: bool,
     write_effect: bool,
+    permission_mode: PermissionMode,
+) -> (Option<String>, RootReviewRuntime) {
+    execute_root_review_reads_with_approval(
+        services, host, selector, read_tool_receipt, write_effect, permission_mode, None,
+    ).await
+}
+
+async fn execute_root_review_reads_with_approval(
+    services: &Arc<RuntimeServices>,
+    host: Arc<ReviewReadHost>,
+    selector: &str,
+    read_tool_receipt: bool,
+    write_effect: bool,
+    permission_mode: PermissionMode,
+    approval_coordinator: Option<Arc<crate::ApprovalCoordinator>>,
 ) -> (Option<String>, RootReviewRuntime) {
     {
         let commits = services.commit_service();
@@ -10510,11 +10548,7 @@ async fn execute_root_review_reads(
         session,
         client,
         RootReviewReader(host),
-        crate::PermissionPolicy::new(if write_effect {
-            PermissionMode::DangerFullAccess
-        } else {
-            PermissionMode::ReadOnly
-        }),
+        crate::PermissionPolicy::new(permission_mode),
         vec!["Read current result and independently verify the requested bounded evidence.".into()],
     )
     .without_memory()
@@ -10523,6 +10557,11 @@ async fn execute_root_review_reads(
     .with_artifact_store(Arc::clone(services.artifact_store()))
     .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()))
     .with_cowd_event_bus(bus.clone());
+    if let Some(coordinator) = approval_coordinator {
+        conversation = conversation
+            .with_checkpoint_identity(services.workspace_key(), None)
+            .with_approval_coordinator(coordinator);
+    }
     conversation.set_active_model("r1-root-wire");
     conversation = conversation.with_model_context_window(262_144);
     conversation.session_input_stream().set_active_turn(Some(
@@ -11198,8 +11237,7 @@ impl PhysicalWorker {
             resource_scopes: self.packet.resource_scopes.clone(),
         }).await.expect("original withdrawal follow-up must drive physical cancellation");
         wait_process_graph_terminal(services, &self.process).await;
-        assert!(crate::agent_runtime::confirmed_run_exit(services.event_store(), &self.packet)
-            .unwrap().is_some());
+        assert!(confirmed_run_exit_with_retry(services.event_store(), &self.packet).is_some());
         assert!(self.lifecycle().no_direct_effects(),
             "this host-only fixture must not conceal opaque Process effects");
         assert!(!process_control_directory(services, &self.packet).exists(),
@@ -11340,9 +11378,7 @@ impl PhysicalWorker {
             match reason.as_deref() {
                 Some("Agentic Task was withdrawn or superseded") => {}
                 Some("Original Agent exited during Task retirement") => {
-                    let (_, exit_sources) = crate::agent_runtime::confirmed_run_exit(
-                        services.event_store(), &self.packet,
-                    ).unwrap().expect("same packet must have an authenticated positive local exit");
+                    let (_, exit_sources) = confirmed_run_exit_with_retry(services.event_store(), &self.packet,).expect("same packet must have an authenticated positive local exit");
                     let lifecycle = crate::agent_runtime::authenticated_run_lifecycle(
                         services.event_store(), &self.packet,
                     ).unwrap();
@@ -11402,11 +11438,29 @@ impl PhysicalWorker {
         process_control_directory(&self.process.services, &self.packet)
     }
     pub(super) fn lifecycle(&self) -> crate::agent_runtime::AuthenticatedRunLifecycle {
-        crate::agent_runtime::authenticated_run_lifecycle(
-            self.process.services.event_store(),
-            &self.packet,
-        )
-        .unwrap()
+        // The agent run stream can advance while the lifecycle is read. That is
+        // a stale view of a live stream, not an untrusted one, and the product
+        // reports it as retryable for exactly that reason. Unwrapping it made
+        // the whole scenario fail on a concurrent append that has nothing to
+        // do with what the scenario asserts, so read it again on the fresh
+        // view and only give up when the stream really stops moving.
+        let mut attempt = 0;
+        loop {
+            match crate::agent_runtime::authenticated_run_lifecycle(
+                self.process.services.event_store(),
+                &self.packet,
+            ) {
+                Ok(lifecycle) => return lifecycle,
+                Err(error)
+                    if error == "Agent exit source changed during authentication"
+                        && attempt < 400 =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    attempt += 1;
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
     }
     pub(super) async fn probe(&self, probe: serde_json::Value) -> serde_json::Value {
         self.process
@@ -11845,8 +11899,7 @@ impl PhysicalWorker {
         assert!(self.lifecycle().no_direct_effects());
         assert!(!self.directory().exists());
         assert!(
-            crate::agent_runtime::confirmed_run_exit(services.event_store(), &self.packet)
-                .unwrap()
+            confirmed_run_exit_with_retry(services.event_store(), &self.packet)
                 .is_some()
         );
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -13169,8 +13222,7 @@ pub(crate) async fn exercise_r1_backend_resource_lifetime_for_test(backend: R1Re
         .expect("actual backend cancellation command must be bounded");
     assert!(!hold.released.load(std::sync::atomic::Ordering::Acquire));
     assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), &first.packet)
-            .unwrap()
+        confirmed_run_exit_with_retry(services.event_store(), &first.packet)
             .is_none()
     );
     assert_r1_resource_effect_pending(services, &request);
@@ -13354,8 +13406,7 @@ pub(crate) async fn exercise_r1_backend_resource_lifetime_for_test(backend: R1Re
     )
     .await;
     assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), &second.packet)
-            .unwrap()
+        confirmed_run_exit_with_retry(services.event_store(), &second.packet)
             .is_none()
     );
     second_hold.release.notify_one();
@@ -13472,8 +13523,7 @@ pub(super) async fn exercise_r1_backend_unknown_exit_for_test() {
     .expect("the real Process driver must reach its original exit witness gate");
     assert!(worker.directory().exists());
     assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
-            .unwrap()
+        confirmed_run_exit_with_retry(services.event_store(), &worker.packet)
             .is_none()
     );
     gate.release();
@@ -13483,8 +13533,7 @@ pub(super) async fn exercise_r1_backend_unknown_exit_for_test() {
         "uncertain driver join cannot authorize private scratch deletion"
     );
     assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
-            .unwrap()
+        confirmed_run_exit_with_retry(services.event_store(), &worker.packet)
             .is_none(),
         "an actual effect receipt cannot manufacture confirmed Process exit"
     );
@@ -14159,8 +14208,7 @@ impl RealProcessSession {
                     .is_some_and(|revision| revision.parse::<u64>().is_ok());
                 assert!(exact_cancelled_request, "unexpected retirement failure: {error}");
                 worker.assert_original_control_action(envelope);
-                assert!(crate::agent_runtime::confirmed_run_exit(self.services.event_store(), &self.packet)
-                    .unwrap().is_some(), "wire loss requires authenticated original physical exit");
+                assert!(confirmed_run_exit_with_retry(self.services.event_store(), &self.packet).is_some(), "wire loss requires authenticated original physical exit");
                 let run = self.services.agent_runtime().get(self.packet.agent_id()).unwrap();
                 assert_eq!(run.status, harness_contract::agent::AgentStatus::Cancelled);
                 assert_eq!(run.failure.as_deref(), Some("agent cancelled by command"));
@@ -14242,8 +14290,7 @@ impl RealProcessSession {
         let result = self.command(serde_json::json!({"finish":true})).await;
         if let Err(error) = result {
             assert!(
-                crate::agent_runtime::confirmed_run_exit(self.services.event_store(), &self.packet)
-                    .unwrap()
+                confirmed_run_exit_with_retry(self.services.event_store(), &self.packet)
                     .is_some(),
                 "{error}"
             );
@@ -14254,11 +14301,7 @@ impl RealProcessSession {
     async fn wait_exit(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
-                if let Some((_, sources)) = crate::agent_runtime::confirmed_run_exit(
-                    self.services.event_store(),
-                    &self.packet,
-                )
-                .unwrap()
+                if let Some((_, sources)) = confirmed_run_exit_with_retry(self.services.event_store(), &self.packet,)
                 {
                     assert!(sources
                         .iter()
@@ -14396,8 +14439,7 @@ async fn wait_real_process_definition(
     });
     assert_eq!(actual.agentic_binding, session.packet.agentic_binding);
     assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), &session.packet)
-            .unwrap()
+        confirmed_run_exit_with_retry(services.event_store(), &session.packet)
             .is_none()
     );
     session
@@ -14825,6 +14867,152 @@ impl RootReviewRuntime {
         Some(&self.bus)
     }
 
+    async fn execute_approved_bounded_code(&self, input: &str) -> Result<(), String> {
+        use harness_contract::policy::{
+            ApprovalDecisionActorKind, ApprovalGrantScope, ApprovalGrantStatus, ApprovalStatus,
+        };
+
+        let call_id = "bounded-root-nonowns-283";
+        let expected_input: serde_json::Value =
+            serde_json::from_str(input).map_err(|error| error.to_string())?;
+        let input = expected_input.to_string();
+        let store = self.services.event_store();
+        let cursor = store.durable_commit_cursor().map_err(|error| error.to_string())?;
+        let owner = store
+            .latest_for_stream("root-agentic-execution:node:root-agentic-execution:model")
+            .map_err(|error| error.to_string())?
+            .and_then(|event| event.activity_binding())
+            .ok_or("bounded root approval requires the original root activity")?;
+        let (host, policy) = {
+            let runtime = self.runtime.lock().await;
+            (Arc::clone(&runtime.tool_executor().0),
+                runtime.permission_policy().execution_policy_control().snapshot())
+        };
+        let queue = self.services.approval_coordinator().queue();
+        let prior_approvals: std::collections::BTreeSet<_> = queue.list().into_iter()
+            .map(|request| request.approval_id).collect();
+        let calls = [crate::conversation::ModelToolCall {
+            binding: None, id: call_id.into(), name: "execute_code".into(),
+            input: input.clone(), depends_on: vec![],
+        }];
+        let prompter = crate::SharedPrompter::none();
+        let executed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.execute_tool_batch_step(&calls, &prompter, 4),
+        ).await;
+        let approvals = queue.list_for_execution_scope(
+            Some(&owner.session_id), &Default::default(), &Default::default(),
+        );
+        let result = executed
+            .map_err(|_| format!("bounded root execution exceeded its 30s deadline; owner={owner:?}; approvals={approvals:?}"))?
+            .map_err(|error| format!("bounded root execution failed: {error}; owner={owner:?}; approvals={approvals:?}"))?;
+        if result.failed != 0 || !result.refused_before_dispatch.is_empty() {
+            return Err(format!("bounded root execution rejected: {result:?}; owner={owner:?}; approvals={approvals:?}"));
+        }
+        let requests: Vec<_> = host.calls.lock().unwrap().iter()
+            .filter(|request| request.tool_use_id == call_id && request.tool_name == "execute_code")
+            .cloned().collect();
+        let [request] = requests.as_slice() else {
+            return Err("bounded root must dispatch its exact original call once".into());
+        };
+        let authorization = request.authorization.as_ref()
+            .ok_or("bounded root actual request has no authorization")?;
+        let matching: Vec<_> = approvals.iter().filter(|approval| {
+            !prior_approvals.contains(&approval.approval_id)
+                && approval.context.invocation_id.as_deref() == Some(authorization.request_id.as_str())
+        }).collect();
+        let [approval] = matching.as_slice() else {
+            return Err(format!("bounded root requires one new exact approval; approvals={approvals:?}"));
+        };
+        let context = &approval.context;
+        if approval.status != ApprovalStatus::Approved
+            || context.principal_id != format!("session:{}", owner.session_id)
+            || context.session_id.as_deref() != Some(owner.session_id.as_str())
+            || context.turn_id.as_deref() != Some(owner.turn_id.as_str())
+            || context.execution_id.as_deref() != Some(owner.root_execution_id.as_str())
+            || context.task_id.as_deref() != Some(owner.task_id.as_str())
+            || context.workspace_key != self.services.workspace_key()
+            || context.capability != "execute_code"
+            || context.approval_profile != Some(policy.approval_profile)
+            || context.profile_id != policy.approval_profile.as_str()
+            || context.policy_revision != policy.revision
+            || approval.decision.as_ref().is_none_or(|decision| {
+                !decision.evidence_refs.iter()
+                    .any(|evidence| evidence == "approval.router.auto")
+                    || !decision.evidence_refs.iter()
+                        .any(|evidence| evidence == "approval.router.profile:Autonomous")
+            })
+        {
+            return Err(format!("bounded root approval owner or policy mismatch: {approval:?}"));
+        }
+        let mut matching_tasks = Vec::new();
+        for event in store.list_stream(&format!("session:{}", owner.session_id))
+            .map_err(|error| error.to_string())?
+        {
+            if event.commit_cursor <= cursor || event.kind != "tool.execution_plan.created"
+                || event.actor.as_deref() != Some("conversation_runtime")
+                || event.scope != crate::RuntimeEventScope::Tool
+            {
+                continue;
+            }
+            let plan: crate::governed_tool_plan::GovernedToolPlan =
+                serde_json::from_value(event.payload).map_err(|error| error.to_string())?;
+            matching_tasks.extend(plan.tasks.into_iter().filter(|task| task.tool_call_id == call_id));
+        }
+        let [task] = matching_tasks.as_slice() else {
+            return Err("root approval must identify one actual persisted plan call".into());
+        };
+        let binding = task.step_binding.as_ref().ok_or("root approval call lacks its Step")?;
+        let identity = &binding.snapshot.identity;
+        if task.tool_name != "execute_code" || task.normalized_input != expected_input
+            || task.invocation.intent.normalized_input != expected_input
+            || binding.origin.call_id != call_id
+            || identity.session_id != owner.session_id || identity.turn_id != owner.turn_id
+            || identity.execution_id.as_deref() != Some(owner.root_execution_id.as_str())
+            || request.compiled_invocation.as_ref() != Some(&task.invocation)
+            || request.idempotency_key != binding.effect_idempotency_key()
+        {
+            return Err("root approval Step or exact input mismatch".into());
+        }
+        let effective = crate::AuthorizationNegotiator::compile_effective_descriptor(&task.effect, &input);
+        let targets: Vec<String> = effective.descriptor.scopes.iter()
+            .filter_map(|scope| scope.target.clone()).collect();
+        let grant = queue.grant_for_approval(&approval.approval_id)
+            .ok_or("bounded root Policy grant is missing")?;
+        if context.effect.as_ref() != Some(&effective.descriptor)
+            || context.resource_targets != targets
+            || authorization.descriptor_hash != effective.descriptor.descriptor_hash
+            || authorization.policy_revision != policy.revision
+            || grant.scope != ApprovalGrantScope::Once
+            || grant.issued_by.kind != ApprovalDecisionActorKind::Policy
+            || grant.issued_by.actor_id != "approval-router-auto"
+            || grant.status != ApprovalGrantStatus::Expired
+            || grant.invocation_id != context.invocation_id
+            || grant.session_id != context.session_id || grant.turn_id != context.turn_id
+            || grant.task_id != context.task_id || grant.principal_id != context.principal_id
+            || grant.workspace_key != context.workspace_key || grant.profile_id != context.profile_id
+            || grant.capability != context.capability || grant.policy_revision != context.policy_revision
+            || grant.resource_targets != targets
+            || grant.effect_descriptor_hash.as_deref() != Some(effective.descriptor.descriptor_hash.as_str())
+        {
+            return Err(format!("bounded root exact Policy Once grant mismatch: {approval:?}; {grant:?}"));
+        }
+        let events = store.list_stream(&format!("approval:{}", approval.approval_id))
+            .map_err(|error| error.to_string())?;
+        let issued: Vec<_> = events.iter().filter(|event| event.commit_cursor > cursor
+            && event.kind == "approval.grant_issued"
+            && event.payload["grant"]["grant_id"].as_str() == Some(grant.grant_id.as_str())).collect();
+        let consumed: Vec<_> = events.iter().filter(|event| event.commit_cursor > cursor
+            && event.kind == "approval.grant_consumed"
+            && event.payload["grant_id"].as_str() == Some(grant.grant_id.as_str())).collect();
+        if issued.len() != 1 || consumed.len() != 1
+            || issued[0].commit_cursor >= consumed[0].commit_cursor
+        {
+            return Err(format!("bounded root requires its unique Policy Once issuance and consumption: {events:?}"));
+        }
+        Ok(())
+    }
+
     pub(super) async fn execute_tool_batch_step(
         &self,
         calls: &[crate::conversation::ModelToolCall],
@@ -14921,17 +15109,21 @@ impl RootReviewRuntime {
                 .iter()
                 .filter(|call| matches!(call.name.as_str(), "read_file" | "edit" | "execute_code"))
             {
-                if result
+                let key = call.binding.as_ref().unwrap().effect_idempotency_key();
+                if let Some((_, reason)) = result
                     .refused_before_dispatch
                     .iter()
-                    .any(|(refused, _)| refused == &call.name)
+                    .find(|(refused, _)| refused == &call.id)
                 {
-                    // A call refused before dispatch (e.g. the process input fence
-                    // rejecting changed input after review) never produces an
-                    // execution-effect receipt; the refusal itself is the terminal.
+                    assert!(!reason.trim().is_empty());
+                    for phase in ["receipt", "read-receipt"] {
+                        assert!(self.services.event_store().event_by_idempotency_key(
+                            &format!("execution-effect:{key}"),
+                            &format!("{key}:{phase}"),
+                        ).unwrap().is_none(), "pre-dispatch refusal must not publish an effect receipt for {}", call.id);
+                    }
                     continue;
                 }
-                let key = call.binding.as_ref().unwrap().effect_idempotency_key();
                 let primary = self
                     .services
                     .event_store()
@@ -14947,7 +15139,10 @@ impl RootReviewRuntime {
                         ),
                     )
                     .unwrap()
-                    .unwrap();
+                    .unwrap_or_else(|| panic!(
+                        "executed root call requires primary receipt: id={} name={} key={key} refused={:?} results={:?}",
+                        call.id, call.name, result.refused_before_dispatch, result.messages,
+                    ));
                 assert!(primary.payload["replay"]["parent_execution"].is_null());
                 let owner: harness_contract::projection::RuntimeActivityBinding =
                     serde_json::from_value(primary.payload["root_effect_owner"]["binding"].clone())
@@ -15339,8 +15534,7 @@ async fn exercise_process_proof_case(
         .unwrap();
     assert!(before.terminal.is_none());
     assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), packet)
-            .unwrap()
+        confirmed_run_exit_with_retry(services.event_store(), packet)
             .is_none()
     );
     match case {
@@ -15500,9 +15694,7 @@ async fn exercise_process_proof_case(
                     "driver_failure": driver_failure.chars().take(1200).collect::<String>(),
                     "acquisition_primary": primary.event_id,
                     "acquisition_index": index.event_id,
-                    "confirmed_exit": crate::agent_runtime::confirmed_run_exit(
-                        services.event_store(), packet
-                    ).unwrap().is_some(),
+                    "confirmed_exit": confirmed_run_exit_with_retry(services.event_store(), packet).is_some(),
                 })
             );
             assert_eq!(
@@ -15770,8 +15962,7 @@ async fn exercise_process_proof_case(
             assert!(receipt.accepted, "{receipt:?}");
             output.unwrap();
             assert!(
-                crate::agent_runtime::confirmed_run_exit(services.event_store(), packet)
-                    .unwrap()
+                confirmed_run_exit_with_retry(services.event_store(), packet)
                     .is_none()
             );
             let projection = services
@@ -15828,8 +16019,7 @@ async fn exercise_process_proof_case(
                 Arc::new(crate::ProviderRegistry::empty()),
             );
             assert!(
-                crate::agent_runtime::confirmed_run_exit(services.event_store(), &original)
-                    .unwrap()
+                confirmed_run_exit_with_retry(services.event_store(), &original)
                     .is_some()
             );
             cold.execute_task(original.clone()).await.unwrap();
@@ -15854,8 +16044,7 @@ async fn exercise_process_proof_case(
                     .is_none()
             );
             assert!(
-                crate::agent_runtime::confirmed_run_exit(services.event_store(), packet)
-                    .unwrap()
+                confirmed_run_exit_with_retry(services.event_store(), packet)
                     .is_none()
             );
         }
@@ -15885,11 +16074,7 @@ async fn exercise_process_proof_case(
                 })
                 .await;
             assert!(killed.accepted, "{killed:?}");
-            assert!(crate::agent_runtime::confirmed_run_exit(
-                services.event_store(),
-                &optional.packet
-            )
-            .unwrap()
+            assert!(confirmed_run_exit_with_retry(services.event_store(), &optional.packet)
             .is_none());
             assert!(services
                 .settle_abandoned_agentic_attempt(
@@ -16721,7 +16906,7 @@ async fn wait_process_graph_terminal(
 async fn wait_admitted_graph_terminal(services: &Arc<RuntimeServices>, packet: &AgentTaskPacket) {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let exit = crate::agent_runtime::confirmed_run_exit(services.event_store(), packet).unwrap();
+            let exit = confirmed_run_exit_with_retry(services.event_store(), packet);
             let graph = services.graph_state_store().load(packet.graph_id()).unwrap();
             if exit.is_some() && graph.node_statuses.values().all(|status|status.is_terminal()) { break; }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -17946,38 +18131,86 @@ async fn exercise_native_task_sources(
     for receipt in native_index.iter().filter(|event| event.kind == "execution.agent_tool.receipt") {
         let outcome = &receipt.payload["outcome"];
         let call = outcome["tool_use_id"].as_str().unwrap();
-        let terminal = native_session.iter().find(|event| {
-            event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == call
-        });
-        let Some(terminal) = terminal else {
-            assert!(
-                !native_session.iter().any(|event| {
-                    event.kind == "tool.invocation.started"
-                        && event.payload["tool_call_id"] == call
-                }),
-                "model-started Native ToolDAG call {call} never completed its Session callback"
-            );
-            continue;
-        };
-        let plan_id = terminal.payload["governed_plan_id"].as_str().unwrap();
-        assert!(native_session.iter().any(|event| {
-            event.kind == "tool.execution_plan.created"
-                && event.payload["plan_id"] == plan_id
-                && event.payload["tasks"].as_array().unwrap().iter()
-                    .any(|task| task["tool_call_id"] == call)
-        }));
         assert_eq!(outcome["status"], "executed");
         let key = receipt.payload["idempotency_key"].as_str().unwrap();
         let phase = if receipt.payload["effect_kind"] == "read" { "read-receipt" } else { "receipt" };
         let primary = services.event_store().event_by_idempotency_key(
             &format!("execution-effect:{key}"), &format!("{key}:{phase}"),
         ).unwrap().unwrap();
+        let delegated_parent = &primary.payload["replay"]["parent_execution"];
+        let delegated = !delegated_parent.is_null();
+        let terminal = native_session.iter().find(|event| {
+            event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == call
+        });
+        if delegated {
+            let attempt = receipt
+                .refs
+                .iter()
+                .find(|reference| reference.kind == "agent_attempt")
+                .and_then(|reference| reference.id.parse::<u64>().ok())
+                .expect("a delegated receipt carries the attempt of its owner");
+            assert_eq!(
+                receipt.stream_id,
+                format!(
+                    "execution-agent-receipts:{}:{}:{attempt}",
+                    delegated_parent["execution_id"].as_str().unwrap(),
+                    delegated_parent["node_id"].as_str().unwrap(),
+                ),
+                "the per-attempt index must name the delegated owner of the receipt"
+            );
+            assert_eq!(
+                delegated_parent["execution_id"].as_str().unwrap(),
+                packet.graph_id(),
+                "the delegated owner is this agent task's graph"
+            );
+            assert_eq!(
+                delegated_parent["node_id"].as_str().unwrap(),
+                packet.node_id(),
+                "the delegated owner is this agent task's node"
+            );
+            assert_eq!(
+                attempt,
+                u64::from(packet.attempt),
+                "the delegated owner is this attempt"
+            );
+        } else {
+            let terminal = terminal.expect("a root receipt requires its original Session callback");
+            let plan_id = terminal.payload["governed_plan_id"].as_str().unwrap();
+            assert!(native_session.iter().any(|event| {
+                event.kind == "tool.execution_plan.created"
+                    && event.payload["plan_id"] == plan_id
+                    && event.payload["tasks"].as_array().unwrap().iter()
+                        .any(|task| task["tool_call_id"] == call)
+            }));
+        }
         assert_eq!(primary.schema_version, 1);
         assert_eq!(primary.transaction_id, receipt.transaction_id);
         assert_eq!(primary.commit_cursor, receipt.commit_cursor);
         assert_eq!(primary.payload["outcome"], receipt.payload["outcome"]);
-        assert!(primary.commit_cursor <= terminal.commit_cursor);
-        native_completed_calls.insert(call.to_string());
+        assert!(primary.commit_cursor <= terminal.map_or(u64::MAX, |terminal| terminal.commit_cursor));
+        if !delegated {
+            let owner = &primary.payload["root_effect_owner"];
+            let expected_stream = format!(
+                "execution-agent-receipts:{}:{}:{}",
+                owner["binding"]["root_execution_id"].as_str().unwrap_or_default(),
+                owner["binding"]["node_id"].as_str().unwrap_or_default(),
+                owner["attempt"].as_u64().unwrap_or_default(),
+            );
+            assert_eq!(
+                receipt.stream_id, expected_stream,
+                "the per-attempt receipt index must name the real producer of the receipt"
+            );
+        }
+        if call.starts_with("native-") {
+            let terminal = terminal.expect("scripted Native call requires its original Session callback");
+            assert!(native_session.iter().any(|event| {
+                event.kind == "tool.execution_plan.created"
+                    && event.payload["plan_id"] == terminal.payload["governed_plan_id"]
+                    && event.payload["tasks"].as_array().unwrap().iter()
+                        .any(|task| task["tool_call_id"] == call)
+            }));
+            native_completed_calls.insert(call.to_string());
+        }
     }
     let mut expected_native_calls = std::collections::BTreeSet::from([
         "native-claim".to_string(), "native-preview-read".to_string(),
@@ -17994,23 +18227,18 @@ async fn exercise_native_task_sources(
     {
         expected_native_calls.insert("native-first-claim-artifact".to_string());
     }
-    // A rework attempt re-runs the Native Task under a new attempt: the
-    // harness then iterates the latest attempt receipt stream, the identical
-    // reads replay from the retained Session receipts (no fresh callback), and
-    // only the fresh model-driven calls join the completed set.
-    if native_index.iter().any(|event| {
-        event.kind == "execution.agent_tool.receipt"
-            && event.payload["outcome"]["tool_use_id"]
-                .as_str()
-                .is_some_and(|call| call.starts_with("native-rework-"))
-    }) {
-        expected_native_calls = std::collections::BTreeSet::from([
-            "native-rework-claim".to_string(),
-            "native-rework-publication-small".to_string(),
-            "native-rework-submit".to_string(),
-        ]);
-    }
-    assert_eq!(native_completed_calls, expected_native_calls);
+    assert_eq!(native_completed_calls, expected_native_calls,
+        "native receipt completeness: packet={}:{}:{}; host_calls={:?}; session_calls={:?}; wire_requests={}",
+        packet.graph_id(), packet.node_id(), packet.attempt,
+        host.calls.lock().unwrap().iter()
+            .filter(|request| request.tool_use_id.starts_with("native-"))
+            .map(|request| (&request.tool_use_id, &request.parent_execution, request.parent_execution_attempt, &request.idempotency_key))
+            .collect::<Vec<_>>(),
+        native_session.iter().filter(|event| event.payload["tool_call_id"].as_str().is_some_and(|call| call.starts_with("native-")))
+            .map(|event| (&event.kind, &event.payload["tool_call_id"], event.commit_cursor, &event.payload["governed_plan_id"]))
+            .collect::<Vec<_>>(),
+        wire.requests.lock().unwrap().len(),
+    );
     let program = services
         .agent_action_service()
         .project(&root_actor.program_id)
@@ -18114,19 +18342,7 @@ async fn exercise_native_task_sources(
         .event_store()
         .list_stream(&format!("session:{}", packet.session_id()))
         .unwrap();
-    // A rework attempt's identical reads replay from the retained Session
-    // receipts (idempotent replay): its own attempt stream carries no fresh
-    // read-delivery events, so the original-run delivery verification below
-    // applies only to the attempt that physically performed the reads.
-    let has_read_deliveries = events.iter().any(|event| {
-        event.kind == crate::context_evidence::NATIVE_DELIVERY_KIND
-    });
-    if !has_read_deliveries {
-        // Either a rework attempt (identical reads replay from retained
-        // receipts) or an input variant whose claimant never performed the
-        // native read: in both cases there is no fresh delivery to verify
-        // here; the variant's outcome is covered by the assertions below.
-    } else {
+    {
         let material = events
             .iter()
             .filter(|event| event.kind == crate::context_evidence::NATIVE_DELIVERY_KIND)
@@ -18513,6 +18729,16 @@ async fn exercise_native_task_sources(
         .await
         .unwrap();
     assert_eq!(actor.team_id.as_deref(), Some(reviewer_team.as_str()));
+    let mut seen_review_refs = std::collections::BTreeSet::new();
+    let review_evidence_refs: Vec<_> = result_refs.iter()
+        .map(|reference| {
+            reference.strip_prefix("artifact:")
+                .filter(|logical| !logical.starts_with("//"))
+                .map_or_else(|| reference.clone(), |logical| format!("artifact://{logical}"))
+        })
+        .chain(result_contents.iter().skip(1).cloned())
+        .filter(|reference| seen_review_refs.insert(reference.clone()))
+        .collect();
     let envelope = AgentActionEnvelope {
         action_id: "native-sources:task-review".into(),
         actor,
@@ -18524,7 +18750,7 @@ async fn exercise_native_task_sources(
             reason:
                 "The actual immutable Native report and selected source were independently read"
                     .into(),
-            evidence_refs: result_contents.clone(),
+            evidence_refs: review_evidence_refs,
         }),
     };
     let mut probed = false;
@@ -18647,8 +18873,7 @@ async fn exercise_native_task_sources(
     }
     wait_process_graph_terminal(services, &verifier).await;
     verifier.wait_exit().await;
-    assert!(crate::agent_runtime::confirmed_run_exit(services.event_store(), &verifier.packet)
-        .unwrap().is_some());
+    assert!(confirmed_run_exit_with_retry(services.event_store(), &verifier.packet).is_some());
     assert!(!services.agent_runtime().running_agentic_members(&root_actor.program_id)
         .contains(&independent_reviewer));
     if !probed {
@@ -18662,17 +18887,11 @@ async fn exercise_native_task_sources(
             crate::AgenticTaskStatus::Accepted
         );
     }
-    if has_read_deliveries {
-        // Only the attempt that physically performed the read issues a fresh
-        // read request bound to its own execution; a rework attempt's reads
-        // replay from retained receipts and input variants whose claimant
-        // never read have no such request to bind.
-        assert!(host.calls.lock().unwrap().iter().any(|request| request
+    assert!(host.calls.lock().unwrap().iter().any(|request| request
             .parent_execution
             .as_ref()
             .is_some_and(|parent| parent.execution_id == packet.graph_id())
             && request.tool_name == "read_file"));
-    }
     NativeSourcePair {
         packet,
         result_refs,
@@ -19435,8 +19654,7 @@ async fn r1_772_original_self_withdrawal_761_retires_without_control_graph() {
     assert!(program.objective_verdict.is_none());
     assert_eq!(services.goal_store().get(&goal_id).unwrap(), goal_before);
     assert!(worker.lifecycle().no_direct_effects());
-    assert!(crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
-        .unwrap().is_some());
+    assert!(confirmed_run_exit_with_retry(services.event_store(), &worker.packet).is_some());
     let links = services.graph_state_store().child_links(worker.packet.graph_id()).unwrap();
     let mut original_io_children = 0;
     for link in &links {
@@ -19487,8 +19705,7 @@ async fn r1_known_exited_process_helpers_reject_without_recreating_control() {
     let directory = worker.directory();
     worker.finish_readonly_control().await;
     assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
-            .unwrap()
+        confirmed_run_exit_with_retry(services.event_store(), &worker.packet)
             .is_some()
     );
     let program = services

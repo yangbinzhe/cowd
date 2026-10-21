@@ -42,6 +42,10 @@ use crate::tool_invocation::ToolFailureKind;
 pub struct RepetitionScope(String);
 
 impl RepetitionScope {
+    pub(crate) fn in_namespace(self, namespace: &str) -> Self {
+        Self(serde_json::json!(["runtime", namespace, self.0]).to_string())
+    }
+
     pub fn turn(session_id: &str, turn_id: &str) -> Self {
         Self(serde_json::json!(["turn", session_id, turn_id]).to_string())
     }
@@ -938,6 +942,72 @@ mod repetition_guard_tests {
         // Another turn is unaffected.
         mark_refusal_ignored(t);
         assert!(take_refusal_ignored(&RepetitionScope::turn("guard-test-session", &format!("{t}-other"))) == false);
+    }
+
+    #[test]
+    fn r1_inspection_preserves_execution_partition_with_runtime_namespace() {
+        let store = crate::RuntimeEventStore::for_test();
+        let first = store.repetition_execution_scope("session-dispatch", "reviewer-first");
+        let second = store.repetition_execution_scope("session-dispatch", "reviewer-second");
+        let same_execution = store.repetition_execution_scope("session-dispatch", "reviewer-first");
+        let turn = store.repetition_scope("session-dispatch", "turn-dispatch");
+        let other_store = crate::RuntimeEventStore::for_test();
+        let other_runtime = other_store.repetition_execution_scope("session-dispatch", "reviewer-first");
+        assert_eq!(first, same_execution);
+        assert_ne!(first, second);
+        assert_ne!(first, turn);
+        assert_ne!(first, other_runtime);
+        assert!(!record_unchanged_inspection(&first, "input", "answer"));
+        assert!(record_unchanged_inspection(&same_execution, "input", "answer"));
+        assert!(!record_unchanged_inspection(&second, "input", "answer"));
+        assert!(!record_unchanged_inspection(&turn, "input", "answer"));
+        assert!(!record_unchanged_inspection(&other_runtime, "input", "answer"));
+        clear_inspection_memory(&second);
+        clear_inspection_memory(&other_runtime);
+        assert!(record_unchanged_inspection(&first, "input", "answer"));
+        clear_inspection_memory(&first);
+        clear_inspection_memory(&turn);
+    }
+
+    #[test]
+    fn r1_runtime_namespace_isolates_every_guard_memory_and_clear() {
+        let first_store = crate::RuntimeEventStore::for_test();
+        let first = first_store.repetition_scope("session-dispatch", "turn-dispatch");
+        for _ in 0..repetition_bound() {
+            record_tool_failure(&first, "read_file", "input", &[], ToolFailureKind::ExecutionError,
+                "graph run:abc123 is missing");
+        }
+        record_repeated_call(&first, "read_file", "input");
+        assert_eq!(record_refused_frame(&first, "read_file", "{}"), 1);
+        for _ in 0..PATTERN_DOMINANCE {
+            observe_call_pattern(&first, "read_file");
+        }
+        assert!(!record_unchanged_inspection(&first, "input", "revision"));
+        assert!(!record_repeated_read(&first, "reference"));
+        mark_refusal_ignored(&first);
+        let second_store = crate::RuntimeEventStore::for_test();
+        let second = second_store.repetition_scope("session-dispatch", "turn-dispatch");
+        assert_ne!(first, second);
+        assert!(!cause_blocked_for_tool(&second, "read_file"));
+        assert!(refusal_for(&second, "read_file", "input").is_none());
+        assert_eq!(repeated_call_count(&second, "read_file", "input"), 0);
+        assert_eq!(record_refused_frame(&second, "read_file", "{}"), 1);
+        assert!(!observe_call_pattern(&second, "read_file"));
+        assert!(!record_unchanged_inspection(&second, "input", "revision"));
+        assert!(!record_repeated_read(&second, "reference"));
+        assert!(!take_refusal_ignored(&second));
+        clear_failure_breakers(&second);
+        clear_breakers_for_role(&second, true);
+        clear_served_reads(&second);
+        assert!(cause_blocked_for_tool(&first, "read_file"));
+        assert_eq!(repeated_call_count(&first, "read_file", "input"), 1);
+        assert_eq!(record_refused_frame(&first, "read_file", "{}"), 2);
+        assert!(observe_call_pattern(&first, "read_file"));
+        assert!(record_unchanged_inspection(&first, "input", "revision"));
+        assert!(record_repeated_read(&first, "reference"));
+        assert!(take_refusal_ignored(&first));
+        clear_turn(&first);
+        clear_served_reads(&first);
     }
 
     #[test]

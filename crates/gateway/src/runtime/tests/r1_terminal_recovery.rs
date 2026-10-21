@@ -87,6 +87,55 @@ struct ProviderRequest {
     reply: tokio::sync::oneshot::Sender<Value>,
 }
 
+fn recovery_evidence_result_metadata(message: Option<&Value>) -> Value {
+    let text = message.and_then(|message| message["content"].as_str());
+    let parsed = text.and_then(|text| {
+        serde_json::from_str::<Value>(text).ok().or_else(|| {
+            let offset = text.find('{')?;
+            serde_json::Deserializer::from_str(&text[offset..])
+                .into_iter::<Value>().next().and_then(Result::ok)
+        })
+    });
+    let value = parsed.as_ref().unwrap_or(&Value::Null);
+    json!({
+        "tool_result_present":message.is_some(), "text_bytes":text.map(str::len),
+        "parsed":parsed.is_some(), "message_is_error":message.map(|message| &message["is_error"]),
+        "kind":value["kind"], "available":value["available"],
+        "error_present":parsed.as_ref().map(|value| !value["error"].is_null()),
+        "plain_text_tool_failure":text.map(|text| text.starts_with("Tool `") && text.contains(" failed.")),
+        "status":value["status"],
+        "evidence_ref":value["evidence_ref"], "sha256":value["sha256"],
+        "bytes":value["bytes"], "media_type":value["media_type"], "encoding":value["encoding"],
+        "total_chunks":value["total_chunks"], "truncated":value["truncated"],
+        "chunk_indices":value["chunks"].as_array().map(|chunks| chunks.iter()
+            .take(16).map(|chunk| chunk["index"].clone()).collect::<Vec<_>>()),
+        "returned_chunk_count":value["chunks"].as_array().map(Vec::len),
+        "query_present":!value["query"].is_null(),
+        "next_cursor_present":!value["next_cursor"].is_null(),
+        "next_request_present":!value["next_request"].is_null(),
+        "coverage":value["coverage"],
+    })
+}
+
+fn recovery_read_event_metadata(event: &runtime::RuntimeEventRecord) -> Value {
+    json!({
+        "event_id":event.event_id, "stream_id":event.stream_id, "sequence":event.sequence,
+        "schema_version":event.schema_version, "kind":event.kind, "actor":event.actor,
+        "scope":event.scope, "status":event.status, "transaction_id":event.transaction_id,
+        "transaction_index":event.transaction_index, "commit_cursor":event.commit_cursor,
+        "tool_use_id":event.payload["tool_use_id"], "tool_name":event.payload["tool_name"],
+        "outcome_status":event.payload["outcome"]["status"],
+        "outcome_error_present":!event.payload["outcome"]["error"].is_null(),
+        "outcome_truncated":event.payload["outcome_truncated"],
+        "sequence_owner":event.payload["sequence_owner"],
+        "sequence_base":event.payload["sequence_base"],
+        "index_revision_before":event.payload["index_revision_before"],
+        "index_sequence":event.payload["sequence"],
+        "source_observation_wave_sequence":event.payload["source_observation_wave_sequence"],
+        "acquisition":event.payload["read_acquisition_v1"],
+    })
+}
+
 const LOOPBACK_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
 const LOOPBACK_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
@@ -329,6 +378,15 @@ impl LoopbackProvider {
             self.marker
         );
         let request = self.next().await;
+        if id == "recovery-review-file" && self.marker == "RECOVERY_REVIEWER_LANE" {
+            let result = request.body["messages"].as_array().into_iter().flatten().rev()
+                .find(|message| message["role"] == "tool"
+                    && message["tool_call_id"] == "recovery-review-result");
+            eprintln!("recovery_result_read_wire_metadata {}", json!({
+                "capture_phase":"first_provider_request_after_result", "lane":self.marker,
+                "call_id":"recovery-review-result", "result":recovery_evidence_result_metadata(result),
+            }));
+        }
         request
             .reply
             .send(json!({"role":"assistant", "content":text,
@@ -933,10 +991,203 @@ impl ReviewedTurn {
                 None,
             )
             .await;
-        reviewer.tool("recovery-task-review", "task_review", json!({
+        let read_request = reviewer.next().await;
+        let read_message = read_request.body["messages"].as_array().into_iter().flatten().rev()
+            .find(|message| message["role"] == "tool"
+                && message["tool_call_id"] == "recovery-review-result");
+        let read_wire_metadata = recovery_evidence_result_metadata(read_message);
+        let read_store = &services.topology.runtime_event_store;
+        let read_calls = services.physical_calls.lock().unwrap().iter()
+            .filter(|call| call.tool_use_id == "recovery-review-result"
+                && call.tool_name == "evidence_retrieve")
+            .cloned().collect::<Vec<_>>();
+        let mut read_acquisition_runs = Vec::new();
+        let mut read_originals = Vec::new();
+        for call in read_calls.iter().take(4) {
+            let primary_lookup = read_store.event_by_idempotency_key(
+                &format!("execution-effect:{}", call.idempotency_key),
+                &format!("{}:read-receipt", call.idempotency_key),
+            );
+            let primary_lookup_failed = primary_lookup.is_err();
+            let primary = primary_lookup.ok().flatten();
+            let index_address = primary.as_ref().and_then(|primary| {
+                let seal = &primary.payload["read_acquisition_v1"];
+                Some((seal["index_stream"].as_str()?.to_string(), seal["index_key"].as_str()?.to_string()))
+            }).or_else(|| {
+                let parent = call.parent_execution.as_ref()?;
+                Some((format!("execution-agent-receipts:{}:{}:{}", parent.execution_id, parent.node_id, call.attempt?),
+                    format!("agent-tool-receipt:{}", call.idempotency_key)))
+            });
+            let index_lookup = index_address.as_ref().map(|(stream, key)|
+                read_store.event_by_idempotency_key(stream, key));
+            let index_lookup_failed = index_lookup.as_ref().is_some_and(Result::is_err);
+            let index = index_lookup.and_then(Result::ok).flatten();
+            if let Some(run) = primary.as_ref().and_then(|primary|
+                primary.payload["read_acquisition_v1"]["step"]["run_ref"].as_str()) {
+                read_acquisition_runs.push(run.to_string());
+            }
+            let packet = call.parent_execution.as_ref().and_then(|parent| {
+                let graph = runtime.graph_state_store().load(&parent.execution_id).ok()?;
+                let node = graph.nodes.iter().find(|node| node.id == parent.node_id)?;
+                let packet = serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref).ok()?;
+                Some(json!({"graph_id":packet.graph_id(), "node_id":packet.node_id(),
+                    "run_id":packet.run_id(), "attempt":packet.attempt,
+                    "execution_identity":packet.assignment.execution_identity,
+                    "tool_allowed":packet.allowed_tools.contains(&call.tool_name),
+                    "tool_bound":packet.binding.as_ref().is_some_and(|binding|
+                        binding.tool_contract_refs.contains(&call.tool_name))}))
+            });
+            read_originals.push(json!({
+                "call_id":call.tool_use_id, "idempotency_key":call.idempotency_key,
+                "parent_execution":call.parent_execution, "attempt":call.attempt,
+                "primary_lookup_failed":primary_lookup_failed,
+                "primary":primary.as_ref().map(recovery_read_event_metadata),
+                "index_address":index_address, "index_lookup_failed":index_lookup_failed,
+                "index":index.as_ref().map(recovery_read_event_metadata), "packet":packet,
+            }));
+        }
+        let delivery_lookup = read_store.latest_for_stream_kind(
+            &format!("session:{session_id}"), "context.model_input_observed");
+        let delivery_lookup_failed = delivery_lookup.is_err();
+        let delivery = delivery_lookup.ok().flatten();
+        let delivery_matches_call = delivery.as_ref().is_some_and(|event|
+            event.payload["tool_invocation_id"] == "recovery-review-result"
+                && event.payload["session_id"] == session_id);
+        let delivery_matches_original_primary = delivery.as_ref().is_some_and(|event|
+            read_originals.iter().any(|original| original["primary"]["event_id"].is_string()
+                && original["primary"]["event_id"] == event.payload["acquisition_event_id"]
+                && original["index"]["event_id"] == event.payload["index_event_id"]));
+        let task_contents = result_refs.iter().map(|reference| {
+            let Some(artifact) = submitted.0.artifacts.get(reference) else {
+                return json!({"logical_ref":reference,"logical_mapping_missing":true});
+            };
+            let selector = &artifact.content_ref;
+            let metadata = runtime.artifact_store().resolve(selector);
+            json!({"logical_ref":reference,"content_ref":selector,
+                "metadata_lookup_failed":metadata.is_err(), "content":metadata.ok()})
+        }).collect::<Vec<_>>();
+        eprintln!("recovery_result_read_metadata {}", json!({
+            "capture_phase":"pre_task_review_provider_guard", "session_id":session_id,
+            "task_ref":task_ref,"program_id":program_id,
+            "capture_commit_cursor":read_store.current_commit_cursor(),
+            "wire_tool_result":read_wire_metadata, "task_contents":task_contents,
+            "recorded_call_count":read_calls.len(), "captured_call_limit":4,
+            "originals":read_originals,"delivery_lookup_failed":delivery_lookup_failed,
+            "delivery_lookup":"latest_native_at_pre_review_guard_not_exhaustive",
+            "delivery_matches_call":delivery_matches_call,
+            "delivery_matches_original_primary_index":delivery_matches_original_primary,
+            "latest_delivery_call_id":delivery.as_ref().map(|event| &event.payload["tool_invocation_id"]),
+            "delivery":delivery.as_ref().filter(|_| delivery_matches_call).map(|event| json!({
+                "event":recovery_read_event_metadata(event), "material":event.payload,
+            })),
+        }));
+        eprintln!("recovery188 scripted_tool lane={} id=recovery-task-review name=task_review", reviewer.marker);
+        read_request.reply.send(json!({"role":"assistant", "content":null,
+            "tool_calls":[{"index":0,"id":"recovery-task-review","type":"function","function":{
+                "name":"task_review","arguments":json!({
             "task_ref":task_ref,"decision":"accept","reason":"I independently read the immutable report and actual file",
             "evidence_refs":[content_ref],
-        }), None).await;
+                }).to_string(),
+            }}],
+        })).unwrap();
+        let review_request = reviewer.next().await;
+        let review_result = review_request.body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .rev()
+            .find(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "recovery-task-review"
+            })
+            .and_then(|message| message["content"].as_str());
+        let observation = review_result
+            .and_then(|content| {
+                serde_json::from_str::<Value>(content).ok().or_else(|| {
+                    let offset = content.find('{')?;
+                    serde_json::Deserializer::from_str(&content[offset..])
+                        .into_iter::<Value>()
+                        .next()
+                        .and_then(Result::ok)
+                })
+            })
+            .filter(|value| {
+                value["action"] == "task_review"
+                    || value["error"]["code"].is_string()
+                    || value["error"].is_string()
+                    || value["code"].is_string()
+                    || value["reason"].is_string()
+            });
+        let redact = |value: Option<&str>| {
+            value.map(|text| {
+                let mut redacted = Vec::new();
+                let mut hide_next = false;
+                for word in text.split_whitespace().take(128) {
+                    let lowered = word.to_ascii_lowercase();
+                    let sensitive = lowered.contains("://")
+                        || lowered.starts_with("sk-")
+                        || ["token", "secret", "password", "credential", "api_key"]
+                            .iter()
+                            .any(|marker| {
+                                lowered.contains(&format!("{marker}="))
+                                    || lowered.contains(&format!("{marker}:"))
+                            });
+                    redacted.push(if hide_next || sensitive {
+                        "[redacted]"
+                    } else {
+                        word
+                    });
+                    hide_next = lowered == "bearer"
+                        || (sensitive && (word.ends_with(':') || word.ends_with('=')));
+                }
+                redacted.join(" ").chars().take(512).collect::<String>()
+            })
+        };
+        let review_code = observation.as_ref().and_then(|value| {
+            value["error"]["code"].as_str().or_else(|| value["code"].as_str())
+        });
+        let review_reason = observation.as_ref().and_then(|value| {
+            value["error"]["message"].as_str()
+                .or_else(|| value["error"].as_str())
+                .or_else(|| value["reason"].as_str())
+        });
+        let review_event = ["tool.invocation.completed", "tool.invocation.failed", "tool.invocation.denied"]
+            .into_iter()
+            .filter_map(|kind| services.topology.runtime_event_store
+                .events_for_root_execution_kind(&graph_id, kind, None, 64).ok())
+            .flatten()
+            .find(|event| event.payload["tool_call_id"] == "recovery-task-review");
+        eprintln!(
+            "recovery_task_review_result {}",
+            json!({
+                "call_id":"recovery-task-review", "session_id":session_id,
+                "task_ref":task_ref, "program_id":program_id, "root_execution_id":graph_id,
+                "reviewer_lane":reviewer.marker,
+                "reviewer_activity":review_event.as_ref().and_then(|event| event.activity_binding()),
+                "result_read_same_run_as_reviewer":review_event.as_ref()
+                    .and_then(|event| event.activity_binding())
+                    .and_then(|binding| binding.agent_run_id)
+                    .map(|run| !read_acquisition_runs.is_empty()
+                        && read_acquisition_runs.iter().all(|original| original == &run)),
+                "result_commit_cursor":review_event.as_ref().map(|event| event.commit_cursor),
+                "capture_commit_cursor":services.topology.runtime_event_store.current_commit_cursor(),
+                "tool_result_present":review_result.is_some(),
+                "structured_result_present":observation.is_some(),
+                "code":redact(review_code),
+                "reason":redact(review_reason.or(review_result)),
+                "classification":if review_code.is_some() || review_reason.is_some() {
+                    "structured_error"
+                } else if observation.is_some() {
+                    "action_observation"
+                } else if review_result.is_some() {
+                    "tool_result_plain_text"
+                } else {
+                    "missing_tool_result"
+                },
+                "action_id":redact(observation.as_ref().and_then(|value| value["action_id"].as_str())),
+                "revision":observation.as_ref().and_then(|value| value["revision"].as_u64()),
+            })
+        );
         durable_turn_until(
             services,
             &graph_id,
@@ -950,9 +1201,10 @@ impl ReviewedTurn {
         )
         .await;
         let goal_id = format!("goal:{graph_id}");
-        reviewer
-            .finish("The physical result and authored report are independently accepted.")
-            .await;
+        review_request
+            .reply
+            .send(json!({"role":"assistant","content":"The physical result and authored report are independently accepted."}))
+            .unwrap();
         let accepted = runtime.agent_action_service().project(&program_id).unwrap();
         let independent_agent = accepted.tasks[&task_ref].reviewed_by.clone().unwrap();
         assert_ne!(

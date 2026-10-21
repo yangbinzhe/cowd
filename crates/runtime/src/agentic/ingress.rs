@@ -43,6 +43,7 @@ const MAX_REVIEW_SOURCE_CHANGED_RETRIES: u32 = 3;
 /// genuinely cannot be read must not loop forever. Twelve is enough to read
 /// every delivered result of a normal request and then submit.
 const MAX_REVIEW_PRECONDITION_RETRIES: u32 = 12;
+const MAX_REVIEW_PROGRAM_REBUILDS: u32 = 3;
 
 static REVIEW_SOURCE_CHANGED_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -74,6 +75,11 @@ fn is_review_content_refusal(error: &str) -> bool {
 
 fn is_review_source_changed_retry(error: &str) -> bool {
     is_review_precondition_refusal(error) || is_review_content_refusal(error)
+}
+
+fn is_review_program_advanced(error: &str) -> bool {
+    error.starts_with("result Program changed during original producer resolution:")
+        || error.starts_with("result metadata changed after original effect enumeration:")
 }
 
 fn review_attempt_key(envelope: &AgentActionEnvelope) -> String {
@@ -412,83 +418,100 @@ impl RuntimeServices {
         // the submitted body, and the Task can never be independently accepted.
         let is_review = positive_review || matches!(&envelope.action, AgentAction::TaskReview(_));
         let review = if is_review {
-            // Resolve both the result set and its manifest from one projection.
-            let program = actions
+            let key = review_attempt_key(envelope);
+            let mut program = actions
                 .project(&envelope.actor.program_id)
                 .map_err(|error| error.to_string())?;
-            let results = match &envelope.action {
-                AgentAction::ObjectiveReview(input) => &input.result_refs,
-                AgentAction::TaskReview(input) => {
-                    &program
+            let mut rebuilds = 0u32;
+            loop {
+                // Resolve both the result set and its manifest from one projection.
+                let results = match &envelope.action {
+                    AgentAction::ObjectiveReview(input) => input.result_refs.clone(),
+                    AgentAction::TaskReview(input) => program
                         .tasks
                         .get(&input.task_ref)
                         .ok_or("review Task not found")?
                         .artifact_refs
+                        .clone(),
+                    _ => unreachable!("review classification"),
+                };
+                if matches!(
+                    &envelope.action,
+                    AgentAction::ObjectiveReview(input)
+                        if input.decision
+                            == harness_contract::agent_action::ObjectiveReviewDecision::Satisfied
+                ) {
+                    validate_current_objective_review_scope(&program, &results)?;
                 }
-                _ => unreachable!("review classification"),
-            };
-            if matches!(
-                &envelope.action,
-                AgentAction::ObjectiveReview(input)
-                    if input.decision == harness_contract::agent_action::ObjectiveReviewDecision::Satisfied
-            ) {
-                validate_current_objective_review_scope(&program, results)?;
-            }
-            let key = review_attempt_key(envelope);
-            match self
-                .independent_result_review_with_evidence(
-                    &envelope.actor,
-                    &program,
-                    results,
-                    match &envelope.action {
-                        AgentAction::ObjectiveReview(input) => Some(input.criterion_ref.as_str()),
-                        _ => None,
-                    },
-                    match &envelope.action {
-                        AgentAction::TaskReview(input) => &input.evidence_refs,
-                        AgentAction::ObjectiveReview(input) => &input.evidence_refs,
-                        _ => unreachable!("review classification"),
-                    },
-                )
-                .await
-            {
-                Ok(review) => {
-                    clear_review_streak(&key);
-                    Some(review)
-                }
-                Err(error) => {
-                    if is_review_source_changed_retry(&error) {
-                        // A precondition the caller has not satisfied yet is not
-                        // a failed attempt, so it draws on its own budget. Both
-                        // classes still settle: neither may loop forever.
-                        let bound = if is_review_precondition_refusal(&error) {
-                            MAX_REVIEW_PRECONDITION_RETRIES
-                        } else {
-                            MAX_REVIEW_SOURCE_CHANGED_RETRIES
-                        };
-                        let streak = bump_review_streak(&key);
-                        if streak >= bound {
-                            clear_review_streak(&key);
-                            // The active review graph is wedged on a retry-class
-                            // rejection that never becomes a durable failure.
-                            // Settle a durable TaskAttemptFail so the bounded
-                            // review-attempt policy can close the Task.
-                            let settlement = self
-                                .settle_wedged_review_attempt(envelope, &program, &error)
-                                .await;
-                            return match settlement {
-                                Ok(()) => Err(format!(
-                                    "review attempt settled after {streak} retryable rejections: {error}"
-                                )),
-                                Err(settle_error) => Err(format!(
-                                    "{error}; runtime review-attempt settlement failed: {settle_error}"
-                                )),
-                            };
-                        }
-                    } else {
+                let built = self
+                    .independent_result_review_with_evidence(
+                        &envelope.actor,
+                        &program,
+                        &results,
+                        match &envelope.action {
+                            AgentAction::ObjectiveReview(input) => Some(input.criterion_ref.as_str()),
+                            _ => None,
+                        },
+                        match &envelope.action {
+                            AgentAction::TaskReview(input) => &input.evidence_refs,
+                            AgentAction::ObjectiveReview(input) => &input.evidence_refs,
+                            _ => unreachable!("review classification"),
+                        },
+                    )
+                    .await;
+                match built {
+                    Ok(review) => {
                         clear_review_streak(&key);
+                        break Some(review);
                     }
-                    return Err(error);
+                    Err(error) if is_review_program_advanced(&error) => {
+                        rebuilds += 1;
+                        if rebuilds > MAX_REVIEW_PROGRAM_REBUILDS {
+                            clear_review_streak(&key);
+                            return Err(format!(
+                                "review could not reach a stable Program cut after \
+                                 {MAX_REVIEW_PROGRAM_REBUILDS} rebuilds: {error}"
+                            ));
+                        }
+                        program = actions
+                            .project(&envelope.actor.program_id)
+                            .map_err(|projection_error| projection_error.to_string())?;
+                        continue;
+                    }
+                    Err(error) => {
+                        if is_review_source_changed_retry(&error) {
+                            // A precondition the caller has not satisfied yet is not
+                            // a failed attempt, so it draws on its own budget. Both
+                            // classes still settle: neither may loop forever.
+                            let bound = if is_review_precondition_refusal(&error) {
+                                MAX_REVIEW_PRECONDITION_RETRIES
+                            } else {
+                                MAX_REVIEW_SOURCE_CHANGED_RETRIES
+                            };
+                            let streak = bump_review_streak(&key);
+                            if streak >= bound {
+                                clear_review_streak(&key);
+                                // The active review graph is wedged on a retry-class
+                                // rejection that never becomes a durable failure.
+                                // Settle a durable TaskAttemptFail so the bounded
+                                // review-attempt policy can close the Task.
+                                let settlement = self
+                                    .settle_wedged_review_attempt(envelope, &program, &error)
+                                    .await;
+                                return match settlement {
+                                    Ok(()) => Err(format!(
+                                        "review attempt settled after {streak} retryable rejections: {error}"
+                                    )),
+                                    Err(settle_error) => Err(format!(
+                                        "{error}; runtime review-attempt settlement failed: {settle_error}"
+                                    )),
+                                };
+                            }
+                        } else {
+                            clear_review_streak(&key);
+                        }
+                        return Err(error);
+                    }
                 }
             }
         } else {
@@ -944,6 +967,23 @@ mod tests {
 
     #[test]
     fn review_source_changed_retry_matches_only_runtime_retry_messages() {
+        assert!(is_review_program_advanced(
+            "result metadata changed after original effect enumeration: result=artifact:one source=session:one expected=1 observed=2; rebuild the review"
+        ));
+        assert!(is_review_program_advanced(
+            "result Program changed during original producer resolution: source agentic-program:one is at revision 2 but the reviewed Program projection is at 1"
+        ));
+        for error in [
+            "result metadata changed after original effect enumeration",
+            "actual result input source moved during enumeration",
+            "primary acquisition source changed during recovery",
+            "publication source changed during original review discovery",
+            "primary acquisition source changed during discovery",
+            "proof artifact identity is ambiguous",
+            "review_requires_effect_observation:artifact:new",
+        ] {
+            assert!(!is_review_program_advanced(error), "{error}");
+        }
         assert!(is_review_source_changed_retry(
             "effect review source changed; retry current effects"
         ));

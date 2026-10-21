@@ -45,6 +45,7 @@ pub(super) struct RequestBudget {
     incomplete: bool,
     scope_progress: bool,
     checkpoint_base_bytes: usize,
+    checkpoint_records: usize,
     #[cfg(test)]
     prefix_stop: Option<serde_json::Value>,
     prefix_fences: BTreeMap<String, u64>,
@@ -72,6 +73,7 @@ impl Default for RequestBudget {
             incomplete: false,
             scope_progress: false,
             checkpoint_base_bytes: 0,
+            checkpoint_records: prefix::COMMIT_RECORDS,
             #[cfg(test)]
             prefix_stop: None,
             prefix_fences: BTreeMap::new(),
@@ -92,7 +94,7 @@ impl RequestBudget {
         bytes: usize,
     ) -> Result<(), RuntimeServicesError> {
         if let Some(work) = &self.terminal_work {
-            if self.records < records.saturating_add(prefix::COMMIT_RECORDS)
+            if self.records < records.saturating_add(self.checkpoint_records)
                 || self.bytes < bytes.saturating_add(work.reserve)
             {
                 self.terminal_deferred = true;
@@ -115,11 +117,13 @@ impl RequestBudget {
         let mut state = work.template.clone();
         state.terminal_pending = Some(memo.clone());
         let reserve = prefix::commit_reserve(services, &work.graph, &state, &work.prefix, &work.content_scope)?;
-        if reserve > self.bytes || self.records < prefix::COMMIT_RECORDS {
+        let records = prefix::commit_record_reserve(&work.graph, &state, &work.prefix, &work.content_scope)?;
+        if reserve > self.bytes || self.records < records {
             self.terminal_deferred = true;
             return Err(RuntimeServicesError::Invariant(INCOMPLETE.into()));
         }
         let work = self.terminal_work.as_mut().ok_or_else(checkpoint_error)?;
+        self.checkpoint_records = records;
         work.reserve = reserve;
         work.memo = memo;
         Ok(())
@@ -276,7 +280,7 @@ impl RequestBudget {
             .map(|(_, records, _)| records).copied().sum::<usize>();
         let bytes = work.iter().filter(|(identity, _, _)| !self.terminal_rechecks.contains(identity))
             .map(|(_, _, bytes)| bytes).copied().sum::<usize>();
-        if self.records < records.saturating_add(prefix::COMMIT_RECORDS) || self.bytes < bytes {
+        if self.records < records.saturating_add(self.checkpoint_records) || self.bytes < bytes {
             return Ok(false);
         }
         self.charge(records, bytes)?;
@@ -416,7 +420,7 @@ impl RequestBudget {
             return Ok(true);
         }
         let lookup_bytes = stream.len().saturating_add(key.len()).saturating_add(8);
-        if self.records <= prefix::COMMIT_RECORDS + 3 || self.bytes <= reserve.saturating_add(lookup_bytes) {
+        if self.records <= self.checkpoint_records + 3 || self.bytes <= reserve.saturating_add(lookup_bytes) {
             return Ok(false);
         }
         self.charge(1, lookup_bytes)?;
@@ -460,7 +464,7 @@ impl RequestBudget {
         if self.stream_heads.contains_key(&(stream.to_owned(), through)) {
             return Ok(true);
         }
-        if self.records <= prefix::COMMIT_RECORDS || self.bytes < reserve.saturating_add(stream.len()).saturating_add(20) {
+        if self.records <= self.checkpoint_records || self.bytes < reserve.saturating_add(stream.len()).saturating_add(20) {
             return Ok(false);
         }
         self.stream_head(services, stream, through)?;
@@ -883,6 +887,18 @@ impl RequestBudget {
                 .unwrap_or(false));
         }
         Ok(payload)
+    }
+
+    fn publication_records(pending: &PendingCheckpoint) -> Result<usize, RuntimeServicesError> {
+        let (records, _) = crate::runtime_event_store::content::history_checkpoint_metadata_reserve(&pending.encoded)
+            .map_err(error)?;
+        let stage_source_fence = 1;
+        let encoded_state = 1;
+        let graph_head_checks = 2;
+        let prepared_payload_fence = 1;
+        let scope_and_consumer_fences = 2;
+        Ok(records.saturating_add(stage_source_fence + encoded_state + graph_head_checks
+            + prepared_payload_fence + scope_and_consumer_fences))
     }
 
     fn publication_reserve(
@@ -1662,17 +1678,15 @@ fn load_budgeted(
     historical: bool,
     budget: &mut RequestBudget,
 ) -> Result<HistoryState, RuntimeServicesError> {
-    if budget.incremental && !historical {
+    if !historical {
+        if !budget.incremental {
+            budget.enable_incremental();
+        }
         return prefix::load(services, scope, graph, through, budget);
     }
     let source_fence = budget.capture_source_fence(services)?;
     budget.require_source_fence(services, &source_fence)?;
     budget.charge(1, 0)?;
-    if !historical && graph.commit_cursor > through {
-        return Err(RuntimeServicesError::Invariant(
-            "projection source is ahead of requested cursor; resync required".into(),
-        ));
-    }
     let root_scope = activity::execution_scope(services, scope, graph);
     let identity = format!(
         "sha256:{:x}",
@@ -1775,12 +1789,6 @@ fn load_budgeted(
                 && restored.start_tickets.len() == restored.bindings.len()
                 && restored.start_specs.len() == restored.bindings.len()
                 && restored.start_positions.len() == restored.bindings.len()
-                && (historical
-                    || restored.through != through
-                    || restored
-                        .graph_state
-                        .as_ref()
-                        .is_some_and(|state| state.revision == graph.revision))
                 && restored
                     .position
                     .is_none_or(|position| position.0 <= restored.through)
@@ -1793,13 +1801,6 @@ fn load_budgeted(
         }
     }
     if current_checkpoint {
-        if !historical {
-            let (references, missing) =
-                reducer_support::validate_history_effects(services, &state, through, budget)?;
-            state.effect_evidence_refs = references;
-            state.effect_missing_receipt = missing;
-            state.effects_checked_through = Some(through);
-        }
         if let Some(fence) = &state.source_fence {
             budget.require_source_fence(services, fence)?;
         }
@@ -1877,67 +1878,6 @@ fn load_budgeted(
     }
     state.position = after;
     state.through = through;
-    if historical {
-        return Ok(state);
-    }
-    if state
-        .graph_state
-        .as_ref()
-        .is_none_or(|state| state.id != graph.graph_id || state.revision != graph.revision)
-    {
-        return Err(RuntimeServicesError::Invariant(
-            "projection history is incomplete at requested source cut".into(),
-        ));
-    }
-    let (references, missing) = match reducer_support::validate_history_effects(
-        services,
-        &state,
-        through,
-        budget,
-    ) {
-        Ok(result) => result,
-        Err(error @ RuntimeServicesError::EventStore(
-            crate::RuntimeEventStoreError::HistoryBudgetExceeded(_),
-        )) => {
-            // The bounded request ran out of record budget while verifying
-            // effect receipts. Degrade to an incomplete history instead of
-            // failing the whole request, exactly like the incremental prefix
-            // path does (history_prefix.rs safe_stop), so the next bounded
-            // request resumes from the published checkpoint.
-            state.incomplete = true;
-            budget.incomplete = true;
-            state.effect_evidence_refs.clear();
-            state.effect_missing_receipt = true;
-            return Ok(state);
-        }
-        Err(error) => return Err(error),
-    };
-    state.effect_evidence_refs = references;
-    state.effect_missing_receipt = missing;
-    state.effects_checked_through = Some(through);
-    if let Some(fence) = &state.source_fence {
-        budget.require_source_fence(services, fence)?;
-    }
-    let encoded = encode_storage_checkpoint(&state)?;
-    let expected = checkpoint.as_ref().map_or(0, |saved| saved.revision);
-    if checkpoint
-        .as_ref()
-        .is_none_or(|saved| saved.source_cursor <= through)
-    {
-        budget.checkpoints.insert(
-            projection_id.clone(),
-            PendingCheckpoint {
-                source_fence: state.source_fence.clone(),
-                schema: if state.source_fence.is_some() { 6 } else { 5 },
-                projection_id,
-                content_scope,
-                identity,
-                through,
-                expected_revision: expected,
-                encoded,
-            },
-        );
-    }
     Ok(state)
 }
 

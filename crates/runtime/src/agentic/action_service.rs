@@ -1930,7 +1930,7 @@ impl AgentActionService {
                             ));
                         }
                     };
-                let mut observation = inspected_observation(envelope, &projection, goal.as_ref());
+                let mut observation = inspected_observation(&self.store, envelope, &projection, goal.as_ref());
                 observation.projection = Some(json!({
                     "advisory_only": true,
                     "instruction": "These are structural observations from independent completed Turns, not prescribed plans, quality guarantees, executable definitions, or capability grants. Adopt, adapt, or ignore them. Inspect Runtime capabilities before using any suggested tool or skill.",
@@ -1943,7 +1943,7 @@ impl AgentActionService {
                 }));
                 return Ok(observation);
             }
-            return Ok(inspected_observation(envelope, &projection, goal.as_ref()));
+            return Ok(inspected_observation(&self.store, envelope, &projection, goal.as_ref()));
         }
         let mut review_source = None;
         if let AgentAction::TaskReview(input) = &envelope.action {
@@ -2470,6 +2470,9 @@ impl AgentActionService {
         if let AgentAction::TaskReview(input) = &envelope.action {
             match input.decision {
                 harness_contract::agent_action::TaskReviewDecision::Accept => {
+                    crate::repetition_guard::clear_failure_breakers(
+                        &self.store.repetition_scope(&envelope.actor.session_id, &envelope.actor.turn_id),
+                    );
                     crate::execution_core::performance::observe_count("agentic_task_accepted", 1);
                 }
                 harness_contract::agent_action::TaskReviewDecision::Challenge
@@ -4337,6 +4340,7 @@ fn strip_envelope_fields(value: &mut serde_json::Value) {
 }
 
 fn inspected_observation(
+    store: &RuntimeEventStore,
     envelope: &AgentActionEnvelope,
     projection: &AgenticProgramProjection,
     goal: Option<&harness_contract::goal::GoalContract>,
@@ -4476,30 +4480,9 @@ fn inspected_observation(
         let mut answer = value.clone();
         strip_envelope_fields(&mut answer);
         let state_token = serde_json::to_string(&answer).unwrap_or_default();
-        // Keyed on the actor's execution, not its turn.
-        //
-        // A delegated Agent issues each model step as its own turn, so a turn-keyed
-        // memory is empty at every step and can never see that the agent already
-        // asked. One live run polled the identical `state_inspect {"query":
-        // "task:X"}` eleven times across turn_index 18 through 22, with an
-        // entity-level token already in place, and nothing fired - because every
-        // one of those was a different turn.
-        //
-        // The execution id is the agent's own graph, which is stable for the whole
-        // run and is exactly the scope in which "you already asked" is true.
         let inspection_scope = envelope.actor.execution_id.as_deref().map_or_else(
-            || {
-                crate::repetition_guard::RepetitionScope::turn(
-                    &envelope.actor.session_id,
-                    &envelope.actor.turn_id,
-                )
-            },
-            |execution_id| {
-                crate::repetition_guard::RepetitionScope::execution(
-                    &envelope.actor.session_id,
-                    execution_id,
-                )
-            },
+            || store.repetition_scope(&envelope.actor.session_id, &envelope.actor.turn_id),
+            |execution_id| store.repetition_execution_scope(&envelope.actor.session_id, execution_id),
         );
         if crate::repetition_guard::record_unchanged_inspection(
             &inspection_scope,

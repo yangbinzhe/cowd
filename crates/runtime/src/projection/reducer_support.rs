@@ -259,6 +259,15 @@ pub(super) fn validate_history_effect_binding(
         "execution-agent-receipts:{}:{}:{}",
         ticket.graph_id, node_id, binding.attempt
     );
+    if facts.source_fence.is_some() && facts.source_fence == budget.request_source {
+        if let Some(proof) = facts.effect_proofs.get(slot) {
+            if proof.identity == history::effect_proof_identity(facts, slot)?
+                && proof.through == through
+            {
+                return Ok((proof.references.clone(), proof.missing_receipt));
+            }
+        }
+    }
     let delegated_head = budget.stream_head(services, &delegated_stream, through)?;
     if delegated_head > 0 {
         evidence_refs.push(delegated_stream.clone());

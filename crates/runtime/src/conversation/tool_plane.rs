@@ -1045,7 +1045,7 @@ where
                 parallel_batches: 0,
             });
         };
-        self.record_governed_tool_plan(&plan, self.session_head().await.message_count);
+        self.record_governed_tool_plan(&plan)?;
         // Accountability: a call the model emitted that is neither scheduled
         // nor refused was swallowed, and a swallowed call is invisible to the
         // model, the ledger and the operator. Report it and tell the model,
@@ -2668,7 +2668,10 @@ where
     }
 
     pub(crate) fn active_repetition_scope(&self) -> crate::repetition_guard::RepetitionScope {
-        crate::repetition_guard::RepetitionScope::turn(self.session_id(), &self.active_turn_id())
+        self.runtime_event_store.as_ref().map_or_else(
+            || crate::repetition_guard::RepetitionScope::turn(self.session_id(), &self.active_turn_id()),
+            |store| store.repetition_scope(self.session_id(), &self.active_turn_id()),
+        )
     }
 
     /// Append the repetition diagnosis when this exact call has already failed.
@@ -3175,22 +3178,50 @@ where
         }
     }
 
-    pub(super) fn record_governed_tool_plan(&self, plan: &GovernedToolPlan, _sequence: usize) {
+    pub(crate) fn record_governed_tool_plan(
+        &self,
+        plan: &GovernedToolPlan,
+    ) -> Result<(), RuntimeError> {
+        if let Some(store) = self.runtime_event_store.as_ref() {
+            let mut refs = vec![RuntimeEventRef {
+                kind: "governed_tool_plan".to_string(),
+                id: plan.plan_id.clone(),
+            }];
+            if let Some(context) = self
+                .cowd_bus()
+                .and_then(crate::CowdEventBus::current_execution_context)
+            {
+                refs.extend([
+                    RuntimeEventRef {
+                        kind: "execution".into(),
+                        id: context.execution_id,
+                    },
+                    RuntimeEventRef {
+                        kind: "session".into(),
+                        id: context.session_id,
+                    },
+                    RuntimeEventRef {
+                        kind: "turn".into(),
+                        id: context.turn_id,
+                    },
+                ]);
+            }
+            store.append(RuntimeEventInput {
+                stream_id: format!("session:{}", self.session_id()),
+                scope: RuntimeEventScope::Tool,
+                kind: "tool.execution_plan.created".into(),
+                status: Some("planned".into()),
+                actor: Some("conversation_runtime".into()),
+                refs,
+                payload: serde_json::to_value(plan)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?,
+            })
+            .map_err(RuntimeError::new)?;
+        }
         if let Ok(mut plans) = self.turn_governed_tool_plans.lock() {
             plans.push(plan.projection());
         }
-        self.append_execution_runtime_event(
-            RuntimeEventScope::Tool,
-            "tool.execution_plan.created",
-            Some("planned".to_string()),
-            vec![RuntimeEventRef {
-                kind: "governed_tool_plan".to_string(),
-                id: plan.plan_id.clone(),
-            }],
-            serde_json::to_value(plan).unwrap_or_else(
-                |error| serde_json::json!({ "serialization_error": error.to_string() }),
-            ),
-        );
+        Ok(())
     }
 
     pub(super) fn record_tool_strategy_validation(
@@ -3961,6 +3992,85 @@ mod agentic_action_body_tests {
     }
 
     struct TicketApi;
+
+    fn repetition_runtime(
+        store: std::sync::Arc<crate::RuntimeEventStore>,
+    ) -> super::ConversationRuntime<TicketApi, crate::StaticToolExecutor> {
+        let mut session = super::Session::new();
+        session.session_id = "session-dispatch".into();
+        let runtime = super::ConversationRuntime::new(
+            session,
+            TicketApi,
+            crate::StaticToolExecutor::new(),
+            super::PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec![],
+        )
+        .without_memory()
+        .with_runtime_event_store(store);
+        runtime.session_input_stream().set_active_turn(Some(
+            harness_contract::turn::TurnId::from_string("turn-dispatch"),
+        ));
+        runtime
+    }
+
+    #[test]
+    fn r1_repetition_same_session_turn_isolated_across_runtimes() {
+        use crate::repetition_guard::*;
+
+        let input = r#"{"path":"proof.txt"}"#;
+        let input_hash = crate::tool_invocation::stable_hash(input);
+        let first = repetition_runtime(std::sync::Arc::new(crate::RuntimeEventStore::for_test()));
+        let first_scope = first.active_repetition_scope();
+        for _ in 0..repeated_call_block_bound_for("read_file", input) {
+            record_repeated_call(&first_scope, "read_file", &input_hash);
+        }
+        assert!(first.blocked_repeated_call("read_file", "first", input, 1).is_some());
+        for _ in 0..8 {
+            let fresh = repetition_runtime(std::sync::Arc::new(crate::RuntimeEventStore::for_test()));
+            let fresh_scope = fresh.active_repetition_scope();
+            assert_ne!(first_scope, fresh_scope);
+            assert!(fresh.blocked_repeated_call("read_file", "fresh", input, 1).is_none());
+            clear_failure_breakers(&fresh_scope);
+            clear_breakers_for_role(&fresh_scope, true);
+            assert!(first.blocked_repeated_call("read_file", "first", input, 1).is_some());
+        }
+        clear_turn(&first_scope);
+    }
+
+    #[test]
+    fn r1_repetition_same_namespace_accumulates_across_delegated_graphs() {
+        use crate::repetition_guard::*;
+
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let root = repetition_runtime(store.clone());
+        let scope = root.active_repetition_scope();
+        let input = r#"{"path":"proof.txt"}"#;
+        let input_hash = crate::tool_invocation::stable_hash(input);
+        let bound = repeated_call_block_bound_for("read_file", input);
+        for graph_index in 0..bound {
+            let bus = crate::CowdEventBus::new();
+            let _execution = bus.enter_execution_with_activity(
+                crate::CowdExecutionContext {
+                    execution_id: format!("delegated-graph-{graph_index}"),
+                    session_id: "session-dispatch".into(),
+                    turn_id: "turn-dispatch".into(),
+                },
+                None,
+            );
+            let delegated = repetition_runtime(store.clone()).with_cowd_event_bus(bus);
+            assert_eq!(scope, delegated.active_repetition_scope());
+            assert!(delegated.blocked_repeated_call("read_file", "delegated", input, 1).is_none());
+            record_repeated_call(&delegated.active_repetition_scope(), "read_file", &input_hash);
+            assert!(!clear_breakers_for_role(&delegated.active_repetition_scope(), false));
+            clear_failure_breakers(&delegated.active_repetition_scope());
+        }
+        let next_delegated = repetition_runtime(store);
+        assert!(next_delegated.blocked_repeated_call("read_file", "next", input, 1).is_some());
+        assert!(root.blocked_repeated_call("read_file", "root", input, 1).is_some());
+        assert!(clear_breakers_for_role(&scope, true));
+        assert!(root.blocked_repeated_call("read_file", "new-turn", input, 1).is_none());
+        clear_turn(&scope);
+    }
 
     impl super::ApiClient for TicketApi {
         fn stream(

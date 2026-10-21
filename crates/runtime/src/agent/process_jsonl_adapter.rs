@@ -297,6 +297,9 @@ struct ActiveProcess {
     /// adapter owns. A cancelled child stays inside its own group until the
     /// OS reaps it, so the group id is what proves the tree is empty.
     process_group: i32,
+    /// The attempt this launch belongs to. The owned process group proves the
+    /// physical exit of this attempt only.
+    attempt: u32,
     /// Runtime-to-child stream has its own sequence independent from the
     /// child-to-Runtime stream. Only protocol-ready runs may receive normal
     /// input; cancellation remains available before readiness.
@@ -457,6 +460,17 @@ enum ProcessLocalExitPhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessLocalExitEvidence {
     packet_sha256: String,
+    /// The attempt this exit belongs to. The physical exit channel is exact:
+    /// the exit of one attempt never answers for another attempt of the same
+    /// run.
+    attempt: u32,
+    /// The owned process group of the launch this exit belongs to.
+    ///
+    /// Only the identity is retained, never a verdict: the emptiness of the
+    /// group is re-probed live on every observation, so a recycled group id
+    /// can never be reported as the closed scope of an earlier run, and a
+    /// reaped parent never stands in for an observed empty group.
+    owned_process_group: Option<i32>,
     phase: ProcessLocalExitPhase,
 }
 
@@ -468,6 +482,17 @@ impl ProcessLocalExitEvidence {
 
     pub(crate) fn is_not_started(&self) -> bool {
         self.phase == ProcessLocalExitPhase::NotStarted
+    }
+
+    /// Whether this evidence belongs to the exact attempt and the exact
+    /// backend packet of that run, using its bare lowercase SHA256 digest.
+    pub(crate) fn matches_run(&self, attempt: u32, packet_sha256: &str) -> bool {
+        self.attempt == attempt
+            && packet_sha256.len() == 64
+            && packet_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && self.packet_sha256.strip_prefix("sha256:") == Some(packet_sha256)
     }
 
     pub(crate) fn is_reaped(&self) -> bool {
@@ -506,10 +531,13 @@ impl ProcessJsonlRegistry {
         &self,
         packet: &AgentTaskPacket,
         phase: ProcessLocalExitPhase,
+        owned_process_group: Option<i32>,
     ) -> Result<(), String> {
         let packet_bytes = serde_json::to_vec(packet).map_err(|error| error.to_string())?;
         let evidence = ProcessLocalExitEvidence {
             packet_sha256: crate::context_evidence::read_sha256(&packet_bytes),
+            attempt: packet.attempt,
+            owned_process_group,
             phase,
         };
         let mut lifecycle = self
@@ -720,10 +748,11 @@ fn record_exit_and_cleanup(
     registry: &ProcessJsonlRegistry,
     packet: &AgentTaskPacket,
     exit: ProcessLocalExitPhase,
+    owned_process_group: Option<i32>,
     scratch: Option<&Path>,
     phase: &str,
 ) -> Result<(), String> {
-    let recorded = registry.record_local_exit(packet, exit);
+    let recorded = registry.record_local_exit(packet, exit, owned_process_group);
     if let Err(error) = &recorded {
         tracing::warn!(run_id = packet.run_id(), attempt = packet.attempt, phase,
             path = ?scratch, error = %error, "ProcessJsonl local exit recording failed");
@@ -749,6 +778,7 @@ impl Drop for PreparedProcessLaunch {
                 &self.adapter.registry,
                 &self.packet,
                 ProcessLocalExitPhase::NotStarted,
+                None,
                 self.envelope.control_scratch.as_deref(),
                 "drop_not_started",
             ) {
@@ -852,51 +882,76 @@ impl ProcessJsonlAdapter {
     /// A reaped-but-not-yet-collected child (zombie state `Z`) is already
     /// dead: it holds no descriptor, no lease and no ability to act, so it
     /// must not keep the physical scope open.
-    fn process_group_has_live_member(process_group: i32) -> bool {
+    ///
+    /// `None` means the group could not be inspected completely: a member that
+    /// cannot be read is never read as an empty group.
+    fn process_group_has_live_member(process_group: i32) -> Option<bool> {
         let Ok(entries) = std::fs::read_dir("/proc") else {
-            // Without /proc the group cannot be inspected; assume the group is
-            // still busy so the exit stays unproven.
-            return true;
+            return None;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else { return None };
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if !name.chars().all(|character| character.is_ascii_digit()) {
                 continue;
             }
-            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                continue;
+            let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(_) => return None,
             };
             let Some(close) = stat.rfind(')') else {
-                continue;
+                return None;
             };
             let Some(fields) = stat.get(close + 1..) else {
-                continue;
+                return None;
             };
             // After the comm field the /proc stat fields are, in order:
             // state, ppid, pgrp, session, ...
             let parts = fields.split_whitespace().collect::<Vec<_>>();
-            let Some(state) = parts.first() else { continue };
+            let Some(state) = parts.first() else { return None };
             let Some(pgid) = parts.get(2).and_then(|value| value.parse::<i32>().ok()) else {
-                continue;
+                return None;
             };
             if pgid == process_group && *state != "Z" {
-                return true;
+                return Some(true);
             }
         }
-        false
+        Some(false)
     }
 
-    pub(crate) fn owned_process_group_is_empty(&self, run_id: &str) -> Option<bool> {
+    /// Whether the owned process group of this run is empty.
+    ///
+    /// The group identity is exact: it belongs to the launch of this attempt
+    /// only, and it is re-probed live on every observation. An empty group is
+    /// never cached, so a recycled group id can never be reported as the
+    /// closed scope of an earlier run, and a reaped parent never stands in
+    /// for an observed empty group.
+    pub(crate) fn owned_process_group_is_empty(&self, run_id: &str, attempt: u32) -> Option<bool> {
         #[cfg(unix)]
         {
-            let lifecycle = self
-                .registry
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let active = lifecycle.active.get(run_id)?;
-            let process_group = active.process_group;
+            let (live_group, recorded_group) = {
+                let lifecycle = self
+                    .registry
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let live = lifecycle
+                    .active
+                    .get(run_id)
+                    .filter(|active| active.attempt == attempt)
+                    .map(|active| active.process_group);
+                let recorded = lifecycle
+                    .local_exits
+                    .get(run_id)
+                    .filter(|evidence| evidence.attempt == attempt)
+                    .and_then(|evidence| evidence.owned_process_group);
+                (live, recorded)
+            };
+            let process_group = live_group.or(recorded_group)?;
             if process_group <= 0 {
                 return None;
             }
@@ -910,16 +965,20 @@ impl ProcessJsonlAdapter {
                 // process, no file handle and no lease: it cannot produce
                 // another effect, so it does not keep the physical scope
                 // open. Only a *live* member does.
-                return Some(!Self::process_group_has_live_member(process_group));
+                return match Self::process_group_has_live_member(process_group) {
+                    Some(true) => Some(false),
+                    Some(false) => Some(true),
+                    None => None,
+                };
             }
             return match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::ESRCH) => Some(true),
-                _ => Some(false),
+                _ => None,
             };
         }
         #[cfg(not(unix))]
         {
-            let _ = run_id;
+            let _ = (run_id, attempt);
             None
         }
     }
@@ -942,6 +1001,48 @@ impl ProcessJsonlAdapter {
         } else {
             None
         }
+    }
+
+    /// The physical exit evidence of the exact run identity, without consuming
+    /// it. The identity is the attempt and the backend packet digest, so a
+    /// witness of another attempt or another packet cannot answer for it.
+    pub(crate) fn local_exit_evidence_for_run(
+        &self,
+        run_id: &str,
+        attempt: u32,
+        packet_sha256: &str,
+    ) -> Option<ProcessLocalExitEvidence> {
+        let lifecycle = self
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle
+            .local_exits
+            .get(run_id)
+            .filter(|evidence| evidence.matches_run(attempt, packet_sha256))
+            .cloned()
+    }
+
+    /// The physical exit evidence of this exact run, without consuming it.
+    ///
+    /// The evidence carries the owned process group of the launch. A run whose
+    /// exit is not proven yet must keep it, so the group can still be
+    /// re-probed later.
+    pub(crate) fn local_exit_evidence(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Option<ProcessLocalExitEvidence> {
+        let lifecycle = self
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle
+            .local_exits
+            .get(packet.run_id())
+            .filter(|evidence| evidence.matches_packet(packet))
+            .cloned()
     }
 
     #[must_use]
@@ -1227,6 +1328,7 @@ impl ProcessJsonlAdapter {
                             &packet,
                             ProcessLocalExitPhase::NotStarted,
                             None,
+                            None,
                             "prepare_failed",
                         ),
                     );
@@ -1249,6 +1351,7 @@ impl ProcessJsonlAdapter {
                         &adapter.registry,
                         &packet,
                         ProcessLocalExitPhase::NotStarted,
+                        None,
                         None,
                         "sandbox_prepare",
                     );
@@ -1750,6 +1853,7 @@ fn execute_prepared_child(
                     registry,
                     packet,
                     ProcessLocalExitPhase::NotStarted,
+                    None,
                     scratch,
                     "spawn_failed",
                 ),
@@ -1761,11 +1865,13 @@ fn execute_prepared_child(
     let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
     let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
         let _ = terminate_process_tree(&mut child);
+        let spawned_group = child.id() as i32;
         let cleanup = match child.wait() {
             Ok(_) => record_exit_and_cleanup(
                 registry,
                 packet,
                 ProcessLocalExitPhase::Reaped,
+                Some(spawned_group),
                 scratch,
                 "pipes_unavailable",
             ),
@@ -1781,6 +1887,7 @@ fn execute_prepared_child(
         child: Mutex::new(child),
         stdin: Mutex::new(stdin),
         process_group,
+        attempt: packet.attempt,
         next_runtime_sequence: Mutex::new(1),
         protocol_ready: AtomicBool::new(false),
         terminal_received: AtomicBool::new(false),
@@ -2027,6 +2134,7 @@ fn execute_prepared_child(
         registry,
         packet,
         ProcessLocalExitPhase::Reaped,
+        Some(process_group),
         scratch,
         "reaped",
     );
@@ -2836,14 +2944,16 @@ pub(crate) mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(
-            !ProcessJsonlAdapter::process_group_has_live_member(process_group),
+        assert_eq!(
+            ProcessJsonlAdapter::process_group_has_live_member(process_group),
+            Some(false),
             "a zombie member must not keep the physical scope open"
         );
         // Reaping the child removes the group entirely.
         let _ = child.wait();
-        assert!(
-            !ProcessJsonlAdapter::process_group_has_live_member(process_group),
+        assert_eq!(
+            ProcessJsonlAdapter::process_group_has_live_member(process_group),
+            Some(false),
             "a reaped group has no live member"
         );
     }
@@ -2863,8 +2973,9 @@ pub(crate) mod tests {
             .spawn()
             .expect("spawn a child in its own process group");
         let process_group = child.id() as i32;
-        assert!(
+        assert_eq!(
             ProcessJsonlAdapter::process_group_has_live_member(process_group),
+            Some(true),
             "a live member must keep the physical scope open"
         );
         let _ = child.kill();
@@ -3652,6 +3763,7 @@ time.sleep(300)
                 child: Mutex::new(child),
                 stdin: Mutex::new(stdin),
                 process_group: process_group,
+                attempt: packet.attempt,
                 next_runtime_sequence: Mutex::new(1),
                 protocol_ready: AtomicBool::new(true),
                 terminal_received: AtomicBool::new(false),
@@ -3802,6 +3914,7 @@ time.sleep(300)
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             process_group: process_group,
+            attempt: packet.attempt,
             next_runtime_sequence: Mutex::new(1),
             protocol_ready: AtomicBool::new(false),
             terminal_received: AtomicBool::new(false),
@@ -3881,6 +3994,7 @@ time.sleep(300)
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             process_group: process_group,
+            attempt: packet.attempt,
             next_runtime_sequence: Mutex::new(1),
             protocol_ready: AtomicBool::new(true),
             terminal_received: AtomicBool::new(false),

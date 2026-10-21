@@ -121,7 +121,15 @@ async fn own818_old_root_child_active_unknown_then_required_closure_resumes() {
         }),
         30,
     );
-    warm(&services, &root.id);
+    let (planned_scope, planned_facts, planned_through, mut planned_budget) = warm(&services, &root.id);
+    assert!(planned_facts.values().all(|state| state.bindings.is_empty()
+        && !state.effect_missing_receipt && !state.incomplete
+        && state.effects_checked_through == Some(planned_through)));
+    let planned_graph = services.graph_state_store().projection(&root.id).unwrap();
+    let planned = execution_terminal_axes(
+        &services, &planned_graph, &planned_scope, &planned_facts, planned_through, &mut planned_budget,
+    ).unwrap();
+    assert_eq!(planned.execution.settlement, TerminalEffectSettlement::Unknown);
     for _ in 0..20 {
         root = services
             .commit_service()
@@ -180,14 +188,16 @@ async fn own818_old_root_child_active_unknown_then_required_closure_resumes() {
         61
     );
     let before = budget.consumed_work();
-    assert!(before.0 >= 183);
+    assert!(before.0 <= 256);
+    assert!(before.1 <= 1024 * 1024);
     let active =
         execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut budget).unwrap();
-    assert_eq!(budget.consumed_work(), before);
+    assert!(budget.consumed_work().0 <= 256);
+    assert!(budget.consumed_work().1 <= 1024 * 1024);
     assert_eq!(active.execution.phase, TerminalExecutionPhase::Running);
     assert_eq!(
         active.execution.settlement,
-        TerminalEffectSettlement::Unknown
+        TerminalEffectSettlement::Unsettled
     );
     assert!(!active.execution.coverage_complete);
     assert!(active.outcome.outcome.is_none());
@@ -257,13 +267,12 @@ async fn own818_old_root_child_active_unknown_then_required_closure_resumes() {
         &mut history::RequestBudget::default()
     )
     .is_err());
-    assert!(matches!(
-        super::super::settlement::read(&services, &facts, through, &mut budget),
-        Err(RuntimeServicesError::EventStore(
-            crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
-        ))
-    ));
-    assert!(budget.publish(&services).is_err());
+    let same_cut =
+        execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut budget).unwrap();
+    assert_eq!(same_cut, active);
+    budget.publish(&services).unwrap();
+    assert!(budget.consumed_work().0 <= 256);
+    assert!(budget.consumed_work().1 <= 1024 * 1024);
     services
         .event_store()
         .append(crate::RuntimeEventInput {
@@ -305,23 +314,32 @@ async fn own818_old_root_child_active_unknown_then_required_closure_resumes() {
         .unwrap();
     let graph = services.graph_state_store().projection(&root.id).unwrap();
     let (scope, facts, through, mut shared) = warm(&services, &root.id);
-    assert!(matches!(
-        execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut shared),
-        Err(RuntimeServicesError::EventStore(
-            crate::RuntimeEventStoreError::HistoryBudgetExceeded(_)
-        ))
-    ));
+    assert_eq!(facts.values().map(|state| state.bindings.len()).sum::<usize>(), 61);
+    let shared_axes =
+        execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut shared).unwrap();
+    assert!(shared.consumed_work().0 <= 256);
+    assert!(shared.consumed_work().1 <= 1024 * 1024);
     let mut independent = history::RequestBudget::default();
-    let incomplete =
+    let independent_axes =
         execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut independent)
             .unwrap();
-    assert!(independent.consumed_work().0 >= 122);
+    assert!(independent.consumed_work().0 <= 256);
+    assert!(independent.consumed_work().1 <= 1024 * 1024);
+    assert_eq!(shared_axes, independent_axes);
     assert_eq!(
-        incomplete.execution.settlement,
-        TerminalEffectSettlement::Unknown
+        independent_axes.execution.settlement,
+        TerminalEffectSettlement::Unsettled,
+        "through={through}; current_source_cursor={:?}; shared_work={:?}; independent_work={:?}; facts={:?}; shared_axes={shared_axes:#?}; independent_axes={independent_axes:#?}",
+        services.event_store().durable_commit_cursor(),
+        shared.consumed_work(),
+        independent.consumed_work(),
+        facts.iter().map(|(identity, state)| (identity, state.incomplete, state.through,
+            state.effects_checked_through, state.effect_missing_receipt,
+            state.bindings.len(), state.terminal_proofs.len())).collect::<Vec<_>>()
     );
-    assert!(!incomplete.execution.coverage_complete);
-    assert_ne!(incomplete.execution.phase, TerminalExecutionPhase::Terminal);
+    assert!(!independent_axes.execution.coverage_complete);
+    assert!(independent_axes.outcome.outcome.is_none());
+    assert_ne!(independent_axes.execution.phase, TerminalExecutionPhase::Terminal);
     services.shutdown_execution().await;
 }
 

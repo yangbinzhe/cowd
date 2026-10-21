@@ -141,7 +141,7 @@ impl RuntimeServices {
             metadata
                 .primary_inputs
                 .iter()
-                .any(|input| input.selector == selector),
+                .any(|input| input.content.selector == selector),
             "the derived publisher's actual read must enter recursive primary validation"
         );
         let source_content = self.artifact_store().resolve(selector).unwrap();
@@ -149,7 +149,7 @@ impl RuntimeServices {
             metadata
                 .primary_inputs
                 .iter()
-                .any(|input| input == &source_content),
+                .any(|input| input.content == source_content),
             "D must retain the exact original S content, not only its selector spelling"
         );
         let stream = format!("session:{}", actor.session_id);
@@ -347,7 +347,7 @@ pub(super) fn process_has_no_external_effects(
     }
 }
 
-fn process_ticket_start(
+pub(super) fn process_ticket_start(
     store: &crate::RuntimeEventStore,
     graph_id: &str,
     node_id: &str,
@@ -1139,7 +1139,7 @@ pub(super) struct ResolvedReviewResult {
     pub effect_scopes: Vec<PermissionScope>,
     pub effect_targets: Vec<harness_contract::goal::ProofEffectTarget>,
     pub unscoped_effect: bool,
-    pub primary_inputs: Vec<ArtifactRef>,
+    pub primary_inputs: Vec<super::policy::ActualImmutableInput>,
     pub input_boundaries: Vec<ResultInputBoundary>,
     pub process_runs: Vec<AuthenticatedProcessExecution>,
 }
@@ -1926,6 +1926,57 @@ fn result_packet(
     Ok(packet)
 }
 
+fn authenticate_callback_parent_chain(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    producer_graph: &str,
+    binding: &harness_contract::projection::RuntimeActivityBinding,
+    programs: &[AgenticProgramProjection],
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let graphs = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store));
+    let mut execution = producer_graph.to_string();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(execution.clone()) {
+            return Err("result callback producer parent chain is cyclic".into());
+        }
+        pin_result_source(store, &execution, cuts)?;
+        let graph = graphs.load(&execution).map_err(|error| error.to_string())?;
+        if cuts.get(&execution) != Some(&graph.revision)
+            || graph.lineage.as_ref().is_none_or(|lineage| {
+                lineage.session_id != binding.session_id
+                    || lineage.turn_id != binding.turn_id
+                    || lineage.root_task_id != binding.root_task_id
+            })
+        {
+            return Err("result callback producer has a foreign parent lineage".into());
+        }
+        let Some(parent) = graph.parent_execution else {
+            if !programs.iter().any(|program| {
+                program.root_execution_id.as_deref() == Some(execution.as_str())
+                    && program.session_id == binding.session_id
+                    && program.turn_id == binding.turn_id
+            }) || !visited.contains(&binding.root_execution_id)
+            {
+                return Err("result callback producer does not reach its bound Program root".into());
+            }
+            return Ok(());
+        };
+        pin_result_source(store, &format!("execution-lineage:{}", parent.execution_id), cuts)?;
+        if !graphs.child_links(&parent.execution_id).map_err(|error| error.to_string())?
+            .iter().any(|link| link.child_execution_id == execution && link.parent_node_id == parent.node_id)
+        {
+            return Err("result callback producer lacks its original parent link".into());
+        }
+        pin_result_source(store, &parent.execution_id, cuts)?;
+        let original_parent = graphs.load(&parent.execution_id).map_err(|error| error.to_string())?;
+        if !original_parent.nodes.iter().any(|node| node.id == parent.node_id) {
+            return Err("result callback producer parent node is missing".into());
+        }
+        execution = parent.execution_id;
+    }
+}
+
 pub(super) fn result_tool_plan<'events>(
     events: &'events [DurableRuntimeEvent],
     event: &DurableRuntimeEvent,
@@ -2002,7 +2053,10 @@ pub(super) fn result_tool_plan<'events>(
     }
     selected
         .map(Some)
-        .ok_or_else(|| "result original tool plan does not contain its claimed call".into())
+        .ok_or_else(|| format!(
+            "result original tool plan does not contain its claimed call: plan_id={plan_id} call_id={call_id} owner_event_id={}",
+            event.event_id
+        ))
 }
 
 pub(super) fn original_tool_primary(
@@ -2020,13 +2074,6 @@ pub(super) fn original_tool_primary(
         .ok_or("publication has no original tool owner")?;
     if step.snapshot.identity.session_id != binding.session_id
         || step.snapshot.identity.turn_id != binding.turn_id
-        || match binding.agent_run_id.as_deref() {
-            Some(run) => step.snapshot.identity.run_ref.as_deref() != Some(run),
-            None => {
-                step.snapshot.identity.execution_id.as_deref()
-                    != Some(binding.root_execution_id.as_str())
-            }
-        }
         || owner.payload["tool_call_id"] != step.origin.call_id
         || task["tool_name"] != owner.payload["tool_name"]
     {
@@ -2118,9 +2165,6 @@ pub(super) fn original_tool_primary(
         require_original_effect_scope(&primary.payload["resolved_effect_scope"], &descriptor)?;
     }
     let root_owner = if primary.payload["replay"]["parent_execution"].is_null() {
-        if binding.agent_run_id.is_some() {
-            return Err("Agent output cannot borrow root effect authority".into());
-        }
         let suffix = if primary.kind == "execution.read.receipt" {
             "read-intent"
         } else {
@@ -2145,6 +2189,9 @@ pub(super) fn original_tool_primary(
             || admitted.root_execution_id != binding.root_execution_id
             || admitted.session_id != binding.session_id
             || admitted.turn_id != binding.turn_id
+            || step.snapshot.identity.execution_id.as_deref()
+                != Some(admitted.root_execution_id.as_str())
+            || !super::binding_is_owned_by_root(&binding, Some(&admitted.root_execution_id))
             || binding
                 .node_id
                 .as_ref()
@@ -2193,7 +2240,13 @@ pub(super) fn original_tool_primary(
     {
         return Err("publication tool ticket graph changed during original receipt lookup".into());
     }
-    let packet_attempt = if let Some(run) = binding.agent_run_id.as_deref() {
+    let original_node = graph_state.nodes.iter().find(|candidate| candidate.id == node)
+        .ok_or("publication original graph node missing")?;
+    let packet_attempt = if root_owner.is_none()
+        && original_node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
+        let run = binding.agent_run_id.as_deref()
+            .ok_or_else(|| format!("delegated tool output has no original run identity: graph={graph} node={node} kind={:?} step={}",
+                original_node.kind, step.snapshot.identity.step_id))?;
         let packet = graph_state
             .nodes
             .iter()
@@ -2232,6 +2285,7 @@ pub(super) fn original_tool_primary(
         if packet.run_id() != run
             || packet.graph_id() != graph
             || packet.node_id() != node
+            || binding.agent_instance_id.as_deref() != Some(packet.agent_id())
             || packet.session_id() != binding.session_id
             || packet.assignment.execution_identity.turn_id() != Some(binding.turn_id.as_str())
             || identity.execution_id.as_deref() != Some(expected_execution)
@@ -2246,6 +2300,26 @@ pub(super) fn original_tool_primary(
             return Err("Agent tool output Step does not match its original packet".into());
         }
         packet.attempt
+    } else if root_owner.is_none() {
+        let identity = &step.snapshot.identity;
+        if !matches!((original_node.kind, original_node.executor_kind.as_str()),
+                (harness_contract::execution_graph::ExecutionNodeKind::InlineModel, "inline_model")
+                | (harness_contract::execution_graph::ExecutionNodeKind::ToolBatch, "tool_batch"))
+            || graph_state.parent_execution.is_some()
+            || binding.root_execution_id != graph
+            || binding.agent_run_id.is_some()
+            || identity.execution_id.as_deref() != Some(graph)
+            || identity.run_ref.is_some()
+            || step.origin.origin_step_id != identity.step_id
+            || step.origin.catalog_digest != step.snapshot.catalog_digest
+            || !matches!(&step.origin.source, harness_contract::step::CallSource::Provider { attempt_id }
+                if !attempt_id.is_empty() && attempt_id == &step.snapshot.provider_attempt.attempt_id)
+            || !super::binding_is_owned_by_root(&binding, Some(graph))
+        {
+            return Err(format!("graph-bound root output original caller mismatch: graph={graph} node={node} kind={:?} step={} actor={:?}",
+                original_node.kind, identity.step_id, identity.actor_ref));
+        }
+        0
     } else {
         0
     };
@@ -2282,6 +2356,75 @@ pub(super) fn original_tool_primary(
             .event_by_idempotency_key(&index_source, &format!("agent-tool-receipt:{key}"))
             .map_err(|error| error.to_string())?
         {
+            if root_owner.is_none() && packet_attempt == 0 {
+                let states = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store));
+                let original_binding = states.current_binding(&graph_state, node, attempt)
+                    .map_err(|error| error.to_string())?;
+                let (ticket, spec) = states.binding_start_ticket(&graph_state, node, &original_binding)
+                    .map_err(|error| error.to_string())?;
+                if spec.kind != original_node.kind || spec.executor_kind != original_node.executor_kind
+                    || ticket.graph_id != graph || ticket.node_id != node || ticket.attempt != attempt
+                {
+                    return Err("graph-bound root output original start kind conflicts".into());
+                }
+                if spec.kind == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch {
+                    let (calls, _) = crate::host::decode_tool_batch(&ticket.payload_ref)
+                        .map_err(|error| error.to_string())?;
+                    let mut originals = calls.iter().filter(|call| call.id == step.origin.call_id);
+                    let call = originals.next().ok_or("graph-bound root output original batch call missing")?;
+                    let input = harness_contract::step::parse_strict_json(&call.input)
+                        .map_err(|error| error.to_string())?;
+                    if originals.next().is_some() || call.binding.as_ref() != Some(&step)
+                        || task["tool_name"] != call.name
+                        || harness_contract::step::canonical_digest("tool-effect-payload", &input)
+                            .map_err(|error| error.to_string())? != digest
+                    {
+                        return Err("graph-bound root output original batch Step/input conflicts".into());
+                    }
+                }
+                for original in process_ticket_start(store, graph, node, attempt, &primary)? {
+                    pin_result_source(store, &original.stream_id, cuts)?;
+                    if original.kind == "execution_node.transitioned" {
+                        let revision = original.payload["graph_revision"].as_u64()
+                            .filter(|revision| *revision > 0)
+                            .ok_or("graph-bound root output original start revision missing")?;
+                        let lineage = graph_state.lineage.as_ref()
+                            .ok_or("graph-bound root output original lineage missing")?;
+                        let root_activity = format!("activity:execution:{graph}");
+                        let expected = harness_contract::projection::RuntimeActivityBinding {
+                            root_execution_id: graph.to_string(),
+                            session_id: lineage.session_id.clone(),
+                            turn_id: lineage.turn_id.clone(),
+                            root_task_id: lineage.root_task_id.clone(),
+                            task_id: lineage.task_id.clone(),
+                            activity_id: format!("{root_activity}:node:{node}"),
+                            node_id: Some(node.to_string()),
+                            parent_activity_id: Some(root_activity.clone()),
+                            initiator_activity_id: Some(root_activity),
+                            team_run_id: None,
+                            agent_instance_id: None,
+                            agent_run_id: None,
+                            skill_id: None,
+                            skill_revision: None,
+                            skill_activation_id: None,
+                            tool_contract_id: None,
+                            tool_call_id: None,
+                            approval_id: None,
+                            parallel_group_id: None,
+                            revision,
+                            fence: revision,
+                            generation: lineage.generation,
+                        };
+                        if original.activity_binding().as_ref() != Some(&expected)
+                            || !original.refs.iter().any(|reference| {
+                                reference.kind == "execution_graph" && reference.id == graph
+                            })
+                        {
+                            return Err("graph-bound root output has a foreign original caller".into());
+                        }
+                    }
+                }
+            }
             if original_index.replace(index).is_some() {
                 return Err("original tool output has ambiguous attempt indexes".into());
             }
@@ -2295,6 +2438,7 @@ pub(super) fn original_tool_primary(
             || index.scope != primary.scope
             || index.transaction_id != primary.transaction_id
             || index.commit_cursor != primary.commit_cursor
+            || index.transaction_index <= primary.transaction_index
             || index.payload["outcome"] != primary.payload["outcome"]
             || index.payload["resolved_effect_scope"] != primary.payload["resolved_effect_scope"]
             || root_owner.is_some()
@@ -2993,7 +3137,12 @@ fn publication_sources(
         let source = format!("agentic-program:{}", origin.program_id);
         let events = result_source_events(store, &source, cuts)?;
         if cuts.get(&source) != Some(&origin.revision) {
-            return Err("result Program changed during original producer resolution".into());
+            return Err(format!(
+                "result Program changed during original producer resolution: source {source} is at \
+                 revision {} but the reviewed Program projection is at {}",
+                cuts.get(&source).copied().unwrap_or_default(),
+                origin.revision
+            ));
         }
         publications.extend(events);
     }
@@ -3512,24 +3661,51 @@ pub(super) fn resolve_result_metadata_for_phase(
             if binding.session_id != program.session_id {
                 continue;
             }
-            let delegated_packet = if let Some(run) = binding.agent_run_id.as_deref() {
-                let packet = result_packet(store, &binding.root_execution_id, program, &mut cuts)?;
+            let task = result_tool_plan(&session_events, event)?;
+            let primary = task.map(|task| original_tool_primary(store, event, task, &mut cuts)).transpose()?;
+            let producer_parent = primary.as_ref()
+                .filter(|primary| !primary.payload["replay"]["parent_execution"].is_null())
+                .map(|primary| &primary.payload["replay"]["parent_execution"]);
+            let delegated_execution = if let Some(parent) = producer_parent {
+                let execution = parent["execution_id"].as_str()
+                    .ok_or("result callback original graph missing")?;
+                let node = parent["node_id"].as_str()
+                    .ok_or("result callback original node missing")?;
+                pin_result_source(store, execution, &mut cuts)?;
+                let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
+                    .load(execution).map_err(|error| error.to_string())?;
+                let original = graph.nodes.iter().find(|candidate| candidate.id == node)
+                    .ok_or("result callback original producer node missing")?;
+                match original.kind {
+                    harness_contract::execution_graph::ExecutionNodeKind::AgentTask => Some(execution),
+                    harness_contract::execution_graph::ExecutionNodeKind::InlineModel
+                    | harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => None,
+                    kind => return Err(format!("result callback unsupported original producer: graph={execution} node={node} kind={kind:?}")),
+                }
+            } else { None };
+            let delegated_packet = if let Some(execution) = delegated_execution {
+                let parent = primary.as_ref().ok_or("result callback original primary missing")?;
+                let packet = result_packet(store, execution, program, &mut cuts)?;
                 let Some(scope) = packet.agentic_binding.as_ref() else { continue; };
                 if !programs.iter().any(|origin|
                     origin.program_id == scope.program_id && origin.turn_id == binding.turn_id)
                 {
                     continue;
                 }
-                if packet.graph_id() != binding.root_execution_id
-                    || packet.run_id() != run
+                if Some(packet.run_id()) != binding.agent_run_id.as_deref()
+                    || parent.payload["replay"]["parent_execution"]["node_id"] != packet.node_id()
                     || binding.agent_instance_id.as_deref() != Some(packet.agent_id())
                     || packet.assignment.execution_identity.turn_id() != Some(binding.turn_id.as_str())
-                    || !super::binding_is_owned_by_root(&binding, Some(packet.graph_id()))
+                    || !super::binding_is_owned_by_root(&binding, Some(&binding.root_execution_id))
                 {
                     return Err("result callback crosses its original delegated physical owner".into());
                 }
+                authenticate_callback_parent_chain(store, packet.graph_id(), &binding, &programs, &mut cuts)?;
                 Some(packet)
             } else {
+                if primary.is_none() && binding.agent_run_id.is_some() {
+                    return Err("result callback has no authenticated original primary owner".into());
+                }
                 if !programs.iter().any(|origin| {
                     origin.turn_id == binding.turn_id
                         && origin.root_execution_id.as_deref() == Some(binding.root_execution_id.as_str())
@@ -3538,7 +3714,6 @@ pub(super) fn resolve_result_metadata_for_phase(
                 }
                 None
             };
-            let task = result_tool_plan(&session_events, event)?;
             let effect = task
                 .map(|task| {
                     serde_json::from_value::<ToolEffectDescriptor>(task["effect"].clone())
@@ -3553,9 +3728,9 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .is_some_and(|effect| effect.effect_kind == ToolEffectKind::Read);
             if is_effect {
                 lifecycle_effects.push((
-                    binding.agent_run_id.as_ref().map_or_else(
+                    delegated_packet.as_ref().map_or_else(
                         || format!("root-execution:{}", binding.root_execution_id),
-                        |run| format!("agent-run:{run}"),
+                        |packet| format!("agent-run:{}", packet.run_id()),
                     ),
                     event,
                     event.payload["tool_name"]
@@ -3768,19 +3943,20 @@ pub(super) fn resolve_result_metadata_for_phase(
             }
             resolved.origin = resolved.origin.merge(match_origin);
             publication_cursor = publication_cursor.max(event.commit_cursor);
-            let (execution, packet, actor) = if let Some(run) = &binding.agent_run_id {
-                let packet = delegated_packet.clone()
-                    .ok_or("delegated result callback has no authenticated packet")?;
+            let (execution, packet, actor) = if let Some(packet) = delegated_packet.clone() {
+                let run = packet.run_id().to_string();
                 let graph = event
                     .refs
                     .iter()
                     .find(|reference| {
                         matches!(reference.kind.as_str(), "execution_graph" | "execution")
-                            && super::packet_identity_matches(packet.graph_id(), packet.run_id(), &reference.id)
+                            && (super::packet_identity_matches(packet.graph_id(), packet.run_id(), &reference.id)
+                                || reference.id == binding.root_execution_id)
                     })
                     .ok_or("result Tool activity has no physical execution reference")?;
-                if packet.run_id() != run
-                    || !super::packet_identity_matches(packet.graph_id(), packet.run_id(), &graph.id)
+                if Some(packet.run_id()) != binding.agent_run_id.as_deref()
+                    || !(super::packet_identity_matches(packet.graph_id(), packet.run_id(), &graph.id)
+                        || graph.id == binding.root_execution_id)
                 {
                     return Err("result Tool activity does not match its physical producer".into());
                 }
@@ -4015,15 +4191,13 @@ pub(super) fn resolve_result_metadata_for_phase(
         ));
     }
     for (source, expected) in &cuts {
-        if store
+        let observed = store
             .stream_revision(source)
-            .map_err(|error| error.to_string())?
-            != *expected
-        {
-            return Err(
-                "result metadata changed after original effect enumeration; rebuild the review"
-                    .into(),
-            );
+            .map_err(|error| error.to_string())?;
+        if observed != *expected {
+            return Err(format!(
+                "result metadata changed after original effect enumeration: result={reference} source={source} expected={expected} observed={observed}; rebuild the review"
+            ));
         }
     }
     for run in process_runs_for_boundaries(store, &resolved.input_boundaries, &mut cuts)? {

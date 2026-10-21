@@ -95,15 +95,44 @@ pub(super) fn commit_reserve_delta(
     state: &HistoryState,
     prefix: &HistoryPrefix,
     content_scope: &str,
-    base_bytes: usize,
+    budget: &mut RequestBudget,
 ) -> Result<usize, RuntimeServicesError> {
-    Ok(COMMIT_BYTES.max(
-        commit_reserve(services, graph, state, prefix, content_scope)?.saturating_sub(base_bytes),
-    ))
+    let mut staged = state.clone();
+    staged.prefix = Some(prefix.clone());
+    let pending = pending_checkpoint(&staged, &graph.graph_id, prefix.target_cursor, 0, content_scope)?;
+    let records = RequestBudget::publication_records(&pending)?;
+    let bytes = RequestBudget::publication_reserve(services, &pending, &graph.graph_id)?;
+    budget.checkpoint_records = records;
+    Ok(COMMIT_BYTES.max(bytes.saturating_sub(budget.checkpoint_base_bytes)))
+}
+
+pub(super) fn commit_record_reserve(
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+    state: &HistoryState,
+    prefix: &HistoryPrefix,
+    content_scope: &str,
+) -> Result<usize, RuntimeServicesError> {
+    let mut staged = state.clone();
+    staged.prefix = Some(prefix.clone());
+    RequestBudget::publication_records(&pending_checkpoint(
+        &staged, &graph.graph_id, prefix.target_cursor, 0, content_scope,
+    )?)
+}
+
+fn publication_fits(
+    services: &RuntimeServices,
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+    state: &HistoryState,
+    prefix: &HistoryPrefix,
+    content_scope: &str,
+    budget: &mut RequestBudget,
+) -> Result<bool, RuntimeServicesError> {
+    let bytes = commit_reserve_delta(services, graph, state, prefix, content_scope, budget)?;
+    Ok(bytes <= budget.bytes && budget.checkpoint_records <= budget.records)
 }
 
 fn room(budget: &RequestBudget, reserve: usize) -> bool {
-    budget.records > COMMIT_RECORDS + 2 && budget.bytes > reserve.saturating_add(16 * 1024)
+    budget.records > budget.checkpoint_records + 2 && budget.bytes > reserve.saturating_add(16 * 1024)
 }
 
 fn body_bytes(record: &DurableRuntimeEvent) -> Result<usize, RuntimeServicesError> {
@@ -223,12 +252,14 @@ fn stage(
     let pending = pending_checkpoint(state, &graph.graph_id, source_cursor, expected_revision, content_scope)?;
     let reserve = RequestBudget::publication_reserve(services, &pending, &graph.graph_id)?
         .saturating_sub(budget.checkpoint_base_bytes);
-    if reserve > budget.bytes {
+    let records = RequestBudget::publication_records(&pending)?;
+    if reserve > budget.bytes || records > budget.records {
         return Err(crate::RuntimeEventStoreError::HistoryBudgetExceeded(
-            format!("history prefix commit publication budget: required_bytes={reserve}, remaining_bytes={}, caller={}",
-                    budget.bytes, std::panic::Location::caller()),
+            format!("history prefix commit publication budget: required_records={records}, remaining_records={}, required_bytes={reserve}, remaining_bytes={}, caller={}",
+                    budget.records, budget.bytes, std::panic::Location::caller()),
         ).into());
     }
+    budget.checkpoint_records = records;
     budget.require_source_fence(services, pending.source_fence.as_ref().ok_or_else(|| invalid("source proof missing"))?)?;
     let bytes = serde_json::to_vec(&pending.encoded).map_err(|_| invalid("checkpoint encoding"))?.len();
     budget.charge(1, bytes.saturating_sub(budget.checkpoint_base_bytes))?;
@@ -479,7 +510,7 @@ pub(super) fn load(
     let mut changed = false;
     let mut safe_stop = false;
     loop {
-        let reserve = commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget.checkpoint_base_bytes)?;
+        let reserve = commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget)?;
         if !prefix.history_complete {
             if !room(budget, reserve) {
                 #[cfg(test)]
@@ -571,13 +602,14 @@ pub(super) fn load(
             prefix.records.push(fingerprint(&record)?);
             state.position = Some(position);
             state.through = position.0;
-            if commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget.checkpoint_base_bytes)? > budget.bytes {
+            if !publication_fits(services, graph, &state, &prefix, &content_scope, budget)? {
                 #[cfg(test)]
                 { budget.prefix_stop = Some(serde_json::json!({"phase":"post_fold_publication",
                     "position":position,"body":body,"available":budget.bytes,"records":budget.records,
-                    "reserve":commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget.checkpoint_base_bytes)?})); }
+                    "reserve":commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget)?})); }
                 state = previous_state;
                 prefix.records.truncate(previous_records);
+                commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget)?;
                 safe_stop = true;
                 break;
             }
@@ -607,7 +639,7 @@ pub(super) fn load(
             break;
         }
         if let Some((slot, node_id, binding, identity)) = next {
-            if budget.records < COMMIT_RECORDS + 7 {
+            if budget.records < budget.checkpoint_records + 7 {
                 safe_stop = true;
                 break;
             }
@@ -639,12 +671,13 @@ pub(super) fn load(
             let previous = state.effect_proofs.insert(slot.clone(), HistoryEffectProof {
                 identity, through: prefix.target_cursor, references, missing_receipt, receipt_present,
             });
-            if commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget.checkpoint_base_bytes)? > budget.bytes {
+            if !publication_fits(services, graph, &state, &prefix, &content_scope, budget)? {
                 if let Some(previous) = previous {
                     state.effect_proofs.insert(slot, previous);
                 } else {
                     state.effect_proofs.remove(&slot);
                 }
+                commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget)?;
                 safe_stop = true;
                 break;
             }
@@ -663,7 +696,7 @@ pub(super) fn load(
                 })
             }).cloned();
             if let Some(slot) = next {
-                if budget.records < COMMIT_RECORDS + 8 {
+                if budget.records < budget.checkpoint_records + 8 {
                     safe_stop = true;
                     break;
                 }
@@ -685,9 +718,11 @@ pub(super) fn load(
                 match result {
                     Err(error) if deferred && error.to_string().contains(INCOMPLETE) => {
                         let previous = state.terminal_pending.replace(memo);
-                        if commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget.checkpoint_base_bytes)? > budget.bytes {
+                        if !publication_fits(services, graph, &state, &prefix, &content_scope, budget)? {
                             state.terminal_pending = previous;
-                            return Err(invalid("terminal continuation publication reservation mismatch"));
+                            commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget)?;
+                            safe_stop = true;
+                            break;
                         }
                         changed |= serde_json::to_value(&state.terminal_pending).map_err(|_| invalid("terminal memo encoding"))?
                             != serde_json::to_value(&previous).map_err(|_| invalid("terminal memo encoding"))?;
@@ -706,10 +741,11 @@ pub(super) fn load(
                             through: prefix.target_cursor,
                             read,
                         });
-                        if commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget.checkpoint_base_bytes)? > budget.bytes {
+                        if !publication_fits(services, graph, &state, &prefix, &content_scope, budget)? {
                             if let Some(previous) = previous { state.terminal_proofs.insert(slot, previous); }
                             else { state.terminal_proofs.remove(&slot); }
                             state.terminal_pending = previous_memo;
+                            commit_reserve_delta(services, graph, &state, &prefix, &content_scope, budget)?;
                             safe_stop = true;
                             break;
                         }
@@ -735,7 +771,7 @@ pub(super) fn load(
                 (0usize, 0usize, 0usize), |(_, records, bytes), (_, count, extent)| {
                     (0, records.saturating_add(count), bytes.saturating_add(extent))
                 });
-            if budget.records < records.saturating_add(COMMIT_RECORDS)
+            if budget.records < records.saturating_add(budget.checkpoint_records)
                 || budget.bytes < reserve.saturating_add(bytes)
                 || !budget.prepay_terminal_recheck(&read)?
             {

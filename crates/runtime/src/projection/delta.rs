@@ -159,12 +159,16 @@ pub fn delta(
     let facts = match history::load_scope_budgeted(services, &scope, target_cursor, false, &mut budget) {
         Ok(facts) => facts,
         Err(RuntimeServicesError::Invariant(message)) if message == history::INCOMPLETE => {
+            budget.require_captured_source(services)?;
+            budget.publish(services)?;
             return Ok(resync_delta(execution_id, base_revision, base_cursor, upper_bound,
                 context, ProjectionResyncReason::UnsafeMaterialization));
         }
         Err(error) => return Err(error),
     };
     if facts.values().any(|state| state.incomplete) {
+        budget.require_captured_source(services)?;
+        budget.publish(services)?;
         return Ok(resync_delta(execution_id, base_revision, base_cursor,
             upper_bound, context, ProjectionResyncReason::UnsafeMaterialization));
     }

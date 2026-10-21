@@ -2852,7 +2852,7 @@ where
             state.tool_results.clear();
             state.write_attempt_paths.clear();
             crate::repetition_guard::clear_breakers_for_role(
-                &crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id),
+                &self.services.event_store().repetition_scope(&state.session_id, &state.turn_id),
                 state.execution_role.owns_root_presentation(),
             );
             state.summary = Some(summary);

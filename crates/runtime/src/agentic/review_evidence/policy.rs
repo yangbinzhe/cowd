@@ -87,6 +87,20 @@ impl CompletionAdmissionContext {
     }
 }
 
+fn review_covers_reference(
+    program: &AgenticProgramProjection,
+    reviewed: &[String],
+    reference: &str,
+) -> bool {
+    let Ok(wanted) = super::review_result_identity(program, reference) else {
+        return false;
+    };
+    reviewed.iter().any(|reviewed| {
+        super::review_result_identity(program, reviewed)
+            .is_ok_and(|identity| identity == wanted)
+    })
+}
+
 pub(crate) fn completion_admission_context(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -233,18 +247,19 @@ pub(crate) fn completion_admission_context(
             ));
         }
         for reference in &results {
-            let identity = super::review_result_identity(program, reference)?;
-            if !review.result_refs.iter().any(|reviewed| {
-                super::review_result_identity(program, reviewed)
-                    .is_ok_and(|reviewed| reviewed == identity)
-            }) || !proof.reads.iter().any(|read| {
-                super::review_result_identity(program, &read.result_ref)
-                    .is_ok_and(|read_identity| read_identity == identity)
+            if !review_covers_reference(program, &review.result_refs, reference)
+                || !proof.reads.iter().any(|read| {
+                    review_covers_reference(
+                        program,
+                        std::slice::from_ref(&read.result_ref),
+                        reference,
+                    )
                     && !read.sha256.is_empty()
                     && !read.receipt_refs.is_empty()
                     && (read.result_kind != harness_contract::goal::GoalResultKind::ToolEffect
                         || !read.effect_observation_refs.is_empty())
-            }) {
+                })
+            {
                 return Err(format!(
                     "completion context review does not cover result:{reference}"
                 ));
@@ -2106,9 +2121,327 @@ pub(super) struct ActualFileDependency {
     pub source_sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) struct ActualImmutableInput {
+    pub content: harness_contract::context::ArtifactRef,
+    pub reference: String,
+    pub acquisition: crate::context_evidence::ReadAcquisitionSeal,
+    pub acquisition_cursor: u64,
+}
+
+impl ActualImmutableInput {
+    pub(super) fn from_acquisition(
+        store: &std::sync::Arc<RuntimeEventStore>,
+        program: &AgenticProgramProjection,
+        primary: &crate::DurableRuntimeEvent,
+        index: &crate::DurableRuntimeEvent,
+        session_events: &[crate::DurableRuntimeEvent],
+        packet: Option<&harness_contract::agent::AgentTaskPacket>,
+        readers: super::ResultContentReaders<'_>,
+        actual: &mut ActualInputSnapshot,
+    ) -> Result<Self, String> {
+        let acquisition = crate::context_evidence::decode_read_acquisition(
+            &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
+        )
+        .map_err(str::to_string)?;
+        let intent = &primary.payload["replay"]["invocation"]["intent"];
+        if intent["invocation_id"] != acquisition.invocation_id
+            || intent["tool_name"] != acquisition.tool_name
+            || primary.stream_id != acquisition.primary_stream
+            || primary.idempotency_key.as_deref() != Some(acquisition.primary_key.as_str())
+            || primary.payload["input_sha256"] != acquisition.input_sha256
+        {
+            return Err("immutable acquisition original request binding conflicts".into());
+        }
+        let key = primary.payload["idempotency_key"].as_str()
+            .ok_or("immutable acquisition original call key missing")?;
+        if primary.kind != "execution.read.receipt"
+            || primary.schema_version != 1
+            || primary.actor.as_deref() != Some("governed_tool")
+            || primary.scope != crate::RuntimeEventScope::ExecutionNode
+            || primary.status.as_deref() != Some("completed")
+            || index.kind != "execution.agent_tool.receipt"
+            || index.schema_version != 2
+            || index.actor != primary.actor || index.scope != primary.scope
+            || index.status != primary.status
+            || index.transaction_id != primary.transaction_id
+            || index.commit_cursor != primary.commit_cursor
+            || index.transaction_index <= primary.transaction_index
+            || index.stream_id != acquisition.index_stream
+            || index.idempotency_key.as_deref() != Some(acquisition.index_key.as_str())
+            || index.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
+                != primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
+            || index.payload["idempotency_key"] != key
+            || index.payload["effect_kind"] != "read"
+            || crate::ExecutionCommitService::receipt_observation_sequence(index).is_none()
+            || primary.payload["outcome"]["status"] != "executed"
+            || !primary.payload["outcome"]["error"].is_null()
+            || index.payload["outcome"] != primary.payload["outcome"]
+            || index.payload["resolved_effect_scope"] != primary.payload["resolved_effect_scope"]
+            || primary.payload["replay"]["origin"] != acquisition.origin
+            || primary.payload["replay"]["call_id"] != acquisition.invocation_id
+            || primary.payload["replay"]["invocation"]["invocation_id"] != acquisition.invocation_id
+            || primary.payload["replay"]["invocation"]["origin"] != acquisition.origin
+            || primary.payload["replay"]["session_id"] != acquisition.session_id
+            || acquisition.session_id != program.session_id
+            || acquisition.primary_stream != format!("execution-effect:{key}")
+            || acquisition.primary_key != format!("{key}:read-receipt")
+            || acquisition.index_stream != format!("execution-agent-receipts:{}:{}:{}",
+                acquisition.graph_id, acquisition.node_id, acquisition.attempt)
+            || acquisition.index_key != format!("agent-tool-receipt:{key}")
+        {
+            return Err("immutable acquisition primary/index identity conflicts".into());
+        }
+        let descriptor = super::results::receipt_effect_descriptor(primary)?;
+        if descriptor.effect_kind != ToolEffectKind::Read {
+            return Err("immutable acquisition is not an original Read".into());
+        }
+        read_original_scope(primary, &descriptor, &acquisition)?;
+        super::results::original_acquisition_output(store, primary, session_events, readers, &mut actual.sources)?;
+        let mut original_input = if let Some(raw) = primary.payload.get("original_input") {
+            let raw = raw.as_str().ok_or("immutable acquisition original request is not raw input")?;
+            let input = harness_contract::step::parse_strict_json(raw)
+                .map_err(|error| error.to_string())?;
+            if crate::context_evidence::read_sha256(raw.as_bytes()) != acquisition.input_sha256
+                || primary.payload["replay"]["payload_digest"]
+                    != harness_contract::step::canonical_digest("tool-effect-payload", &input)
+                        .map_err(|error| error.to_string())?
+            {
+                return Err("immutable acquisition original raw/canonical input conflicts".into());
+            }
+            Some(input)
+        } else { None };
+        let mut original_owner = None;
+        for owner in session_events.iter().filter(|event| {
+            event.kind == "tool.invocation.completed"
+                && event.payload["tool_call_id"] == acquisition.invocation_id
+                && event.payload["tool_name"] == acquisition.tool_name
+        }) {
+            let Some(task) = super::results::result_tool_plan(session_events, owner)? else {
+                continue;
+            };
+            let step: crate::step_snapshot::StepCallBinding =
+                serde_json::from_value(task["step_binding"].clone())
+                    .map_err(|_| "immutable acquisition original plan Step missing")?;
+            if step.effect_idempotency_key() != key {
+                continue;
+            }
+            let input = &task["normalized_input"];
+            if primary.payload["replay"]["payload_digest"]
+                != harness_contract::step::canonical_digest("tool-effect-payload", input)
+                    .map_err(|error| error.to_string())?
+                || serde_json::to_value(&step.origin).map_err(|error| error.to_string())?
+                    != acquisition.origin
+                || step.snapshot.identity != acquisition.step
+                || original_input.as_ref().is_some_and(|previous| previous != input)
+            {
+                return Err("immutable acquisition original plan/input conflicts".into());
+            }
+            retain_actual_material(&mut actual.material_events, owner);
+            for plan in session_events.iter().filter(|event| {
+                event.kind == "tool.execution_plan.created"
+                    && event.payload["plan_id"] == owner.payload["governed_plan_id"]
+            }) {
+                retain_actual_material(&mut actual.material_events, plan);
+            }
+            original_input = Some(input.clone());
+            original_owner = Some((owner, task));
+        }
+        let original_input = match (original_input, packet) {
+            (Some(input), _) => input,
+            (None, Some(packet)) => authenticate_unsealed_delegated_input(
+                store, primary, index, packet, actual,
+            )?,
+            (None, None) => return Err("immutable acquisition has no authenticated original request".into()),
+        };
+        let requested_evidence = original_input["evidence_ref"].as_str();
+        let requested_reference = original_input["reference"].as_str();
+        if requested_evidence.zip(requested_reference).is_some_and(|(left, right)| left != right) {
+            return Err("immutable acquisition original requested references conflict".into());
+        }
+        if let Some(packet) = packet {
+            let source_matches = match acquisition.origin["source"]["kind"].as_str() {
+                Some("process") => acquisition.origin["source"]["worker_id"] == packet.run_id()
+                    && acquisition.origin["source"]["sequence"].as_u64().is_some_and(|sequence| sequence > 0)
+                    && acquisition.step.execution_id.as_deref() == Some(packet.graph_id())
+                    && acquisition.step.actor_ref.as_deref() == Some(packet.agent_id())
+                    && acquisition.step.attempt == Some(packet.attempt),
+                Some("provider") => acquisition.origin["source"]["attempt_id"].as_str().is_some_and(|attempt| !attempt.is_empty())
+                    && acquisition.step.execution_id.as_deref() == Some(packet.run_id())
+                    && acquisition.step.actor_ref.as_deref() == Some(packet.assignment.execution_identity.principal_id()),
+                _ => false,
+            };
+            if !source_matches || acquisition.graph_id != packet.graph_id()
+                || acquisition.node_id != packet.node_id() || acquisition.attempt != packet.attempt
+                || acquisition.session_id != packet.session_id()
+                || acquisition.step.turn_id != packet.assignment.execution_identity.turn_id().unwrap_or_default()
+                || acquisition.step.run_ref.as_deref() != Some(packet.run_id())
+                || acquisition.step.attempt.is_some_and(|attempt| attempt != packet.attempt)
+                || primary.payload["replay"]["parent_execution"]["execution_id"] != packet.graph_id()
+                || primary.payload["replay"]["parent_execution"]["node_id"] != packet.node_id()
+            {
+                return Err("immutable acquisition original producer Step/packet conflicts".into());
+            }
+        } else if primary.payload["replay"]["parent_execution"].is_null() {
+            super::results::authenticate_root_receipt_owner(store, primary, &mut actual.sources)?;
+            let owner = &primary.payload["root_effect_owner"];
+            if owner["binding"]["root_execution_id"] != acquisition.graph_id
+                || owner["binding"]["node_id"] != acquisition.node_id
+                || owner["attempt"].as_u64() != Some(u64::from(acquisition.attempt))
+                || acquisition.step.execution_id.as_deref() != Some(acquisition.graph_id.as_str())
+                || acquisition.step.run_ref.is_some()
+            {
+                return Err("immutable acquisition original root owner/attempt conflicts".into());
+            }
+        } else {
+            let (owner, task) = original_owner
+                .ok_or("immutable acquisition graph-bound root original plan missing")?;
+            let original = super::results::original_tool_primary(store, owner, task, &mut actual.sources)?;
+            if original.event_id != primary.event_id
+                || acquisition.step.execution_id.as_deref() != Some(acquisition.graph_id.as_str())
+                || acquisition.step.run_ref.is_some()
+            {
+                return Err("immutable acquisition has no authenticated root producer".into());
+            }
+        }
+        for original in super::results::process_ticket_start(store, &acquisition.graph_id,
+            &acquisition.node_id, acquisition.attempt, primary)? {
+            super::results::pin_result_source(store, &original.stream_id, &mut actual.sources)?;
+            retain_actual_material(&mut actual.material_events, &original);
+        }
+        for original in [primary, index] {
+            super::results::pin_result_source(store, &original.stream_id, &mut actual.sources)?;
+            retain_actual_material(&mut actual.material_events, original);
+        }
+        super::results::pin_result_source(store, &acquisition.graph_id, &mut actual.sources)?;
+        let requested = original_input["evidence_ref"].as_str()
+            .or_else(|| original_input["reference"].as_str())
+            .filter(|reference| !reference.is_empty())
+            .ok_or("immutable acquisition has no original requested reference")?;
+        let source = &acquisition.body.source_ref;
+        let source_selector = if source.starts_with("artifact:")
+            && !source.starts_with("artifact://art_")
+            && !source.starts_with("artifact://sha256:")
+        {
+            let identity = super::review_result_identity(program, source)?;
+            program.artifacts.get(&identity).map_or(source.as_str(), |artifact| {
+                artifact.content_ref.as_str()
+            })
+        } else {
+            source.as_str()
+        };
+        let content = if source_selector.starts_with("artifact://") {
+            readers.artifacts.ok_or("immutable acquisition Artifact owner unavailable")?
+                .resolve(source_selector).map_err(|error| error.to_string())?
+        } else {
+            harness_contract::context::ArtifactRef::durable(
+                source_selector, &acquisition.body.source_sha256,
+                acquisition.body.source_bytes, "application/octet-stream",
+                format!("session:{}", acquisition.session_id),
+            )
+        };
+        if content.sha256.trim_start_matches("sha256:")
+            != acquisition.body.source_sha256.trim_start_matches("sha256:")
+            || content.bytes != acquisition.body.source_bytes
+            || (content.visibility_scope != "public"
+                && content.visibility_scope != format!("session:{}", acquisition.session_id)
+                && packet.is_none_or(|packet| !packet.resource_scopes.contains(&content.visibility_scope)))
+        {
+            return Err("immutable acquisition conflicts with original content or grant".into());
+        }
+        let mut reference = requested.to_string();
+        let requested_identity = program.artifacts.values().any(|artifact| {
+            super::same_reference_spelling(&artifact.artifact_ref, requested)
+        });
+        let source_identity = program.artifacts.values().any(|artifact| {
+            super::same_reference_spelling(&artifact.artifact_ref, source)
+        });
+        if requested_identity {
+            reference = super::review_result_identity(program, requested)?;
+            if program.artifacts[&reference].content_ref != content.selector
+                || source_identity && super::review_result_identity(program, source)? != reference
+            {
+                return Err("immutable acquisition exact reference conflicts with original content".into());
+            }
+        } else if source_identity {
+            reference = super::review_result_identity(program, source)?;
+            if program.artifacts[&reference].content_ref != content.selector {
+                return Err("immutable acquisition sealed publication conflicts with content".into());
+            }
+        } else if requested.starts_with("artifact:") && !requested.starts_with("artifact://") {
+            return Err("immutable acquisition exact publication binding missing".into());
+        } else if requested == content.selector {
+            let mut bound = BTreeSet::new();
+            for evidence in packet.into_iter().flat_map(|packet| &packet.evidence_refs) {
+                if evidence.retrieval_selector != content.selector {
+                    continue;
+                }
+                if evidence.sha256 != content.sha256 || evidence.bytes != content.bytes
+                    || evidence.media_type != content.media_type
+                    || evidence.visibility_scope != content.visibility_scope
+                {
+                    return Err("immutable acquisition packet grant conflicts with original content".into());
+                }
+                if program.artifacts.values().any(|artifact| {
+                    super::same_reference_spelling(&artifact.artifact_ref, &evidence.evidence_ref.id)
+                }) {
+                    bound.insert(super::review_result_identity(program, &evidence.evidence_ref.id)?);
+                } else if evidence.evidence_ref.ref_type == "agent"
+                    || evidence.evidence_ref.id.starts_with("artifact:")
+                        && !evidence.evidence_ref.id.starts_with("artifact://")
+                {
+                    return Err("immutable acquisition packet exact publication binding missing".into());
+                }
+            }
+            if bound.len() > 1 {
+                return Err("immutable acquisition packet has ambiguous exact publication bindings".into());
+            }
+            if let Some(identity) = bound.into_iter().next() {
+                if program.artifacts[&identity].content_ref != content.selector {
+                    return Err("immutable acquisition packet publication conflicts with content".into());
+                }
+                reference = identity;
+            }
+        }
+        Ok(Self { content, reference, acquisition, acquisition_cursor: primary.commit_cursor })
+    }
+
+    pub(super) fn dependency_identity(
+        &self,
+        program: &AgenticProgramProjection,
+        body: &harness_contract::context::ArtifactRef,
+        process_runs: &[super::results::AuthenticatedProcessExecution],
+    ) -> Result<Option<String>, String> {
+        if self.reference == self.content.selector
+            && (&self.content == body || process_runs.iter().any(|run| run.fact.body == self.content))
+        {
+            return Ok(None);
+        }
+        super::review_result_identity(program, &self.reference).map(Some)
+    }
+
+    pub(super) fn validate_dependency(
+        &self,
+        program: &AgenticProgramProjection,
+        reference: &str,
+        dependency: &super::results::ResolvedReviewResult,
+    ) -> Result<(), String> {
+        if program.artifacts.contains_key(reference)
+            && !dependency.input_boundaries.iter().any(|boundary| {
+                boundary.source.stream_id.starts_with("agentic-program:")
+                    && boundary.step.is_none()
+                    && boundary.cursor < self.acquisition_cursor
+            })
+        {
+            return Err("immutable acquisition predates its exact publication binding".into());
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct ActualInputSnapshot {
     pub file_dependencies: Vec<ActualFileDependency>,
-    pub immutable_inputs: Vec<harness_contract::context::ArtifactRef>,
+    pub immutable_inputs: Vec<ActualImmutableInput>,
     pub sources: std::collections::BTreeMap<String, u64>,
     pub material_events: Vec<harness_contract::goal::ProofInputEvent>,
     pub canonical_facts: Vec<serde_json::Value>,
@@ -2259,6 +2592,7 @@ pub(super) fn read_original_scope(
 
 fn collect_actual_acquisition(
     store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
     primary: &crate::DurableRuntimeEvent,
     index: &crate::DurableRuntimeEvent,
     session_events: &[crate::DurableRuntimeEvent],
@@ -2430,39 +2764,10 @@ fn collect_actual_acquisition(
             });
         }
         ReadExtent::ArtifactChunks { .. } => {
-            let input = if seal.body.source_ref.starts_with("artifact://") {
-                let artifact = readers
-                    .artifacts
-                    .ok_or("actual immutable input original Artifact owner unavailable")?
-                    .resolve(&seal.body.source_ref)
-                    .map_err(|error| error.to_string())?;
-                if artifact.sha256 != seal.body.source_sha256
-                    || artifact.bytes != seal.body.source_bytes
-                {
-                    return Err(
-                        "actual immutable input differs from its original acquisition source"
-                            .into(),
-                    );
-                }
-                let session_scope = format!("session:{}", seal.session_id);
-                if artifact.visibility_scope != "public"
-                    && artifact.visibility_scope != session_scope
-                    && !boundary.packet.as_ref().is_some_and(|packet| {
-                        packet.resource_scopes.contains(&artifact.visibility_scope)
-                    })
-                {
-                    return Err("actual immutable acquisition exceeds its original producer resource scopes".into());
-                }
-                artifact
-            } else {
-                harness_contract::context::ArtifactRef::durable(
-                    &seal.body.source_ref,
-                    &seal.body.source_sha256,
-                    seal.body.source_bytes,
-                    "application/octet-stream",
-                    format!("session:{}", seal.session_id),
-                )
-            };
+            let input = ActualImmutableInput::from_acquisition(
+                store, program, primary, index, session_events,
+                boundary.packet.as_ref(), readers, actual,
+            )?;
             if !actual.immutable_inputs.contains(&input) {
                 actual.immutable_inputs.push(input);
             }
@@ -2477,7 +2782,7 @@ fn authenticate_unsealed_delegated_input(
     index: &crate::DurableRuntimeEvent,
     packet: &harness_contract::agent::AgentTaskPacket,
     actual: &mut ActualInputSnapshot,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
     use harness_contract::step::CallSource;
     let key = primary.payload["idempotency_key"]
         .as_str()
@@ -2666,7 +2971,7 @@ fn authenticate_unsealed_delegated_input(
             );
         }
         retain_actual_material(&mut actual.material_events, original);
-        selected = Some(());
+        selected = Some(input);
     }
     selected.ok_or_else(|| {
         "actual immutable input has no authenticated original producer request".into()
@@ -2936,39 +3241,6 @@ pub(super) fn primary_producer_immutable_inputs(
             if goal_metadata_tool(&seal.tool_name) {
                 continue;
             }
-            let content = if seal.body.source_ref.starts_with("artifact://") {
-                readers
-                    .artifacts
-                    .ok_or("primary immutable acquisition Artifact owner unavailable")?
-                    .resolve(&seal.body.source_ref)
-                    .map_err(|error| error.to_string())?
-            } else {
-                harness_contract::context::ArtifactRef::durable(
-                    &seal.body.source_ref,
-                    &seal.body.source_sha256,
-                    seal.body.source_bytes,
-                    "application/octet-stream",
-                    format!("session:{}", program.session_id),
-                )
-            };
-            if content
-                .sha256
-                .strip_prefix("sha256:")
-                .unwrap_or(&content.sha256)
-                != seal
-                    .body
-                    .source_sha256
-                    .strip_prefix("sha256:")
-                    .unwrap_or(&seal.body.source_sha256)
-                || content.bytes != seal.body.source_bytes
-                || content.visibility_scope != "public"
-                    && content.visibility_scope != format!("session:{}", program.session_id)
-                    && producer.packet.as_ref().is_none_or(|packet| {
-                        !packet.resource_scopes.contains(&content.visibility_scope)
-                    })
-            {
-                return Err("primary immutable acquisition conflicts with original source identity or grant".into());
-            }
             retain_actual_material(&mut actual.material_events, &read.event);
             retain_actual_material(&mut actual.material_events, &read.receipt);
             let primary = store
@@ -2976,6 +3248,11 @@ pub(super) fn primary_producer_immutable_inputs(
                 .map_err(|error| error.to_string())?
                 .ok_or("primary immutable acquisition original receipt disappeared")?;
             retain_actual_material(&mut actual.material_events, &primary);
+            super::results::pin_result_source(store, &primary.stream_id, &mut actual.sources)?;
+            let content = ActualImmutableInput::from_acquisition(
+                store, program, &primary, &read.receipt, &events,
+                producer.packet.as_ref(), readers, &mut actual,
+            )?;
             if !actual.immutable_inputs.contains(&content) {
                 actual.immutable_inputs.push(content);
             }
@@ -3193,6 +3470,7 @@ pub(super) fn actual_input_snapshot_for_phase(
                 }
                 collect_actual_acquisition(
                     store,
+                    program,
                     &primary,
                     &event,
                     &session_events,
@@ -3278,6 +3556,7 @@ pub(super) fn actual_input_snapshot_for_phase(
                 retain_actual_material(&mut actual.material_events, event);
                 collect_actual_acquisition(
                     store,
+                    program,
                     &primary,
                     &index,
                     &session_events,
@@ -4744,34 +5023,27 @@ fn proof_input_snapshot_for_phase(
                     );
                 }
             }
-            for input in metadata.primary_inputs {
-                let reference = super::review_result_identity(program, &input.selector)?;
+            for input in &metadata.primary_inputs {
+                let Some(reference) = input.dependency_identity(program, &metadata.content, &metadata.process_runs)? else {
+                    continue;
+                };
                 if !program.artifacts.contains_key(&reference)
                     && !reference.starts_with("tool://")
                     && !reference.starts_with("approval:v1:")
                     && !reference.starts_with("artifact://")
                 {
-                    continue;
+                    return Err("immutable input has no authenticated producer reference".into());
                 }
-                let recovered = match super::results::resolve_result_metadata_for_phase(
+                let recovered = super::results::resolve_result_metadata_for_phase(
                     store,
                     program,
                     &reference,
-                    &input,
+                    &input.content,
                     Some(&inputs.source_revisions),
                     readers,
                     !inputs.semantic_digest.is_empty(),
-                ) {
-                    Ok(recovered) => recovered,
-                    Err(error)
-                        if reference.starts_with("artifact://")
-                            && error
-                                .starts_with("review result has no Runtime-resolved producer:") =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+                )?;
+                input.validate_dependency(program, &reference, &recovered)?;
                 recovered.origin.require_strong()?;
                 remember_primary_content(&mut metadata_identities, &reference, &recovered.content)?;
                 pending_metadata.push((reference, recovered));
@@ -6131,6 +6403,51 @@ mod tests {
     }
 
     #[test]
+    fn completion_coverage_rejects_same_bytes_foreign_identity_and_ambiguous_content() {
+        let mut program = AgenticProgramProjection::empty("program", "objective");
+        for (reference, producer, execution, generation) in [
+            ("artifact:old", "producer:old", "run:old", 1),
+            ("artifact:new", "producer:new", "run:new", 2),
+        ] {
+            program.artifacts.insert(
+                reference.into(),
+                crate::agentic::program::AgenticArtifactProjection {
+                    artifact_ref: reference.into(),
+                    content_ref: "artifact://shared-bytes".into(),
+                    kind: "report".into(),
+                    title: reference.into(),
+                    relates_to: vec![format!("task:{generation}")],
+                    committed_by: producer.into(),
+                    claim_execution_id: Some(execution.into()),
+                    claim_generation: Some(generation),
+                },
+            );
+        }
+        for (reviewed, required, expected) in [
+            ("artifact:old", "artifact:new", false),
+            ("artifact:new", "artifact:old", false),
+            ("artifact:old", "artifact://shared-bytes", false),
+            ("artifact://shared-bytes", "artifact:new", false),
+            ("artifact://shared-bytes", "artifact://shared-bytes", false),
+            ("artifact:new", "artifact:new", true),
+            ("artifact://new", "artifact:new", true),
+            ("tool://receipt", "tool://receipt", true),
+        ] {
+            assert_eq!(
+                review_covers_reference(&program, &[reviewed.into()], required),
+                expected,
+                "reviewed={reviewed}, required={required}"
+            );
+        }
+        program.artifacts.remove("artifact:old");
+        assert!(review_covers_reference(
+            &program,
+            &["artifact:new".into()],
+            "artifact://shared-bytes"
+        ));
+    }
+
+    #[test]
     fn low_risk_effect_policy_rejects_unbounded_external_unknown_or_independently_gated_writes() {
         let effect = ToolEffectDescriptor {
             tool_id: "edit".into(),
@@ -6397,6 +6714,38 @@ mod tests {
                 "extent":{"kind":"artifact_chunks","total_chunks":1,
                     "chunks":[{"index":0,"body_sha256":"chunk-digest","body_bytes":1}]}}
         })).unwrap();
+        let content = harness_contract::context::ArtifactRef::durable(
+            "artifact://immutable", "source-digest", 1, "application/octet-stream", "session:session",
+        );
+        let mut program = AgenticProgramProjection::empty("program", "objective");
+        for reference in ["artifact:body", "artifact:foreign"] {
+            program.artifacts.insert(reference.into(), crate::agentic::program::AgenticArtifactProjection {
+                artifact_ref: reference.into(), content_ref: content.selector.clone(),
+                kind: "report".into(), title: reference.into(), relates_to: Vec::new(),
+                committed_by: reference.into(), claim_execution_id: None, claim_generation: None,
+            });
+        }
+        let mut input = ActualImmutableInput {
+            content: content.clone(), reference: content.selector.clone(),
+            acquisition: acquisition.clone(), acquisition_cursor: primary.commit_cursor,
+        };
+        assert_eq!(input.dependency_identity(&program, &content, &[]).unwrap(), None);
+        for field in ["selector", "sha256", "bytes", "media_type", "visibility_scope"] {
+            let mut other = content.clone();
+            match field {
+                "selector" => other.selector = "artifact://other".into(),
+                "sha256" => other.sha256 = "other-digest".into(),
+                "bytes" => other.bytes += 1,
+                "media_type" => other.media_type = "text/plain".into(),
+                "visibility_scope" => other.visibility_scope = "public".into(),
+                _ => unreachable!(),
+            }
+            assert!(input.dependency_identity(&program, &other, &[]).is_err(), "{field}");
+        }
+        input.reference = "artifact:foreign".into();
+        assert_eq!(input.dependency_identity(&program, &content, &[]).unwrap(), Some("artifact:foreign".into()));
+        assert_eq!(input.acquisition_cursor, primary.commit_cursor);
+        assert_eq!(input.acquisition, acquisition);
         assert!(read_original_scope(&primary, &descriptor, &acquisition)
             .unwrap()
             .is_none());
@@ -6517,7 +6866,7 @@ mod tests {
                             &selected, None, readers).unwrap());
                     }
                     assert!(!recovered.is_empty());
-                    assert_eq!(recovered.iter().any(|result| result.primary_inputs.contains(&content)),
+                    assert_eq!(recovered.iter().any(|result| result.primary_inputs.iter().any(|input| input.content == content)),
                         mode != 2, "only the selected producer's real acquisition may close D");
                     let (_, actual) = real_review_actual_inputs(&services, &program, &donor.verification);
                     assert!(actual.required_scopes().iter().any(|target|
@@ -7404,7 +7753,8 @@ mod tests {
                             "the real earlier consumer cannot use a later producer reacquisition",
                         );
                     assert!(
-                        error.contains("proof_actual_input_stale_before_use"),
+                        error.contains("cites results outside Task")
+                            || error.contains("proof_actual_input_stale_before_use"),
                         "{error}"
                     );
                     let goal = services

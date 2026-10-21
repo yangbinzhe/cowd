@@ -1018,7 +1018,7 @@ pub(crate) async fn dispatch(
             surface_outbox_list(state, input)
                 .and_then(|output| serde_json::to_value(output).map_err(|error| error.to_string()))
         }
-        operation_id if PLATFORM_OPERATION_IDS[2..].contains(&operation_id) => {
+        operation_id if supports(operation_id) => {
             dispatch_bound_host_operation(
                 state,
                 envelope,
@@ -3330,6 +3330,23 @@ mod tests {
         assert_eq!(context["status"], "available");
         let tuple = serde_json::json!({"message_id":host.fixture.message_a,
             "message_sequence":context["message_sequence"],"runtime_commit_cursor":context["runtime_commit_cursor"],"content_digest":context["content_digest"]});
+        let mut mismatched = tuple.clone();
+        let digest = format!("session-public-v1:sha256:{}", "a".repeat(64));
+        mismatched["content_digest"] = Value::String(if context["content_digest"] == digest {
+            format!("session-public-v1:sha256:{}", "b".repeat(64))
+        } else {
+            digest
+        });
+        let rejected = host
+            .invoke(
+                &grant,
+                "session.terminal_receipt.ack",
+                mismatched,
+                Some(&format!("r1-mismatch-{}", uuid::Uuid::new_v4())),
+            )
+            .await;
+        assert!(!rejected.status().is_success());
+        assert!(host.context(&grant, &host.fixture.message_a).await["receipt"].is_null());
         let key = format!("r1-cache-{}", uuid::Uuid::new_v4());
         let first = host
             .invoke(
@@ -3702,6 +3719,15 @@ mod tests {
             .expect("evidence packet");
         let fixtures = vec![
             (
+                SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+                serde_json::json!({"selection":"bound_source_terminal"}),
+            ),
+            (
+                SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+                serde_json::json!({"message_id":"message-1","message_sequence":"1","runtime_commit_cursor":"9007199254740993",
+                    "content_digest":format!("session-public-v1:sha256:{}", "a".repeat(64))}),
+            ),
+            (
                 RUNTIME_START_GOAL_OPERATION_ID,
                 serde_json::json!({"task_id":"task-1","mission":{"selector":"workspace_default"},"source_session_id":"session-1","source_turn_id":"turn-1","objective":"objective","preemptive":false}),
             ),
@@ -3766,7 +3792,7 @@ mod tests {
                 serde_json::json!({"execution_id":"execution-1","after_revision":0,"after_cursor":0,"wait_ms":1}),
             ),
         ];
-        assert_eq!(fixtures.len(), PLATFORM_OPERATION_IDS.len() - 4);
+        assert_eq!(fixtures.len(), PLATFORM_OPERATION_IDS.len() - 2);
         for (operation_id, payload) in fixtures {
             validate_typed_input(operation_id, &payload)
                 .unwrap_or_else(|error| panic!("{operation_id} fixture rejected: {error}"));
@@ -3786,6 +3812,15 @@ mod tests {
     async fn runtime_projection_queries_reject_unbound_service_requests() {
         let state = crate::api_routes::tests::test_state();
         for (operation_id, payload) in [
+            (
+                SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+                serde_json::json!({"selection":"bound_source_terminal"}),
+            ),
+            (
+                SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+                serde_json::json!({"message_id":"message-1","message_sequence":"1","runtime_commit_cursor":"9007199254740993",
+                    "content_digest":format!("session-public-v1:sha256:{}", "a".repeat(64))}),
+            ),
             (
                 RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
                 serde_json::json!({"execution_id":"unbound"}),
