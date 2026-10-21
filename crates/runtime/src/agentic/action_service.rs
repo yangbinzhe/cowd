@@ -2036,12 +2036,20 @@ impl AgentActionService {
                 .transpose()
                 .map_err(AgentActionServiceError::EventStore)?
                 .flatten();
-            match super::review_evidence::validate_proof_inputs(
+            // The proof is re-verified against the action it is applying, so
+            // the review's own in-flight call is resolved again from the
+            // durable evidence - never from a value the proof carries.
+            match super::review_evidence::validate_proof_inputs_for_action(
                 &self.store,
                 &projection,
                 goal.as_ref(),
                 proof,
                 readers,
+                Some(&super::review_evidence::CurrentReviewContext {
+                    action_id: &envelope.action_id,
+                    action: &envelope.action,
+                    actor: &envelope.actor,
+                }),
             ) {
                 Ok(snapshot) => policy_sources.extend(snapshot.sources),
                 Err(error) => {

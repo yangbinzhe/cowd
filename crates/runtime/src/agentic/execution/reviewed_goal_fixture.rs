@@ -3200,23 +3200,6 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
     .expect("original complete content must seal before storage bounding");
     let original_body: serde_json::Value = serde_json::from_str(&original_evidence_output).unwrap();
     let original_chunks = original_body["chunks"].as_array().unwrap();
-    eprintln!(
-        "R1_READ_208_FIXTURE_BODY {}",
-        serde_json::json!({
-            "artifact_digest": content.sha256,
-            "artifact_bytes": content.bytes,
-            "sealed_digest": original_acquisition.body.source_sha256,
-            "sealed_bytes": original_acquisition.body.source_bytes,
-            "original_declared_digest": original_body["sha256"],
-            "original_declared_bytes": original_body["bytes"],
-            "chunks": original_chunks.iter().map(|chunk| serde_json::json!({
-                "index": chunk["index"],
-                "actual_bytes": chunk["content"].as_str().map(str::len),
-                "actual_digest": chunk["content"].as_str()
-                    .map(|body| crate::context_evidence::read_sha256(body.as_bytes())),
-            })).collect::<Vec<_>>(),
-        })
-    );
     assert_eq!(
         original_body["total_chunks"].as_u64().unwrap(),
         original_chunks.len() as u64

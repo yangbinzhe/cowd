@@ -1,10 +1,16 @@
+mod current_review;
 mod policy;
 mod results;
+// The record-path entries re-verify a proof without a live action, so they
+// are the fixture and completion-lane entry points as well.
+#[allow(unused_imports)]
 pub(crate) use policy::{
     committed_proof_sources, completion_admission_context, effect_review_snapshot,
-    proof_input_snapshot, root_self_review_policy, validate_proof_inputs,
-    CompletionAdmissionContext, ProofInputSnapshot,
+    proof_input_snapshot, proof_input_snapshot_for_action, root_self_review_policy,
+    validate_proof_inputs, validate_proof_inputs_for_action, CompletionAdmissionContext,
+    ProofInputSnapshot,
 };
+pub(crate) use current_review::CurrentReviewContext;
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -656,37 +662,12 @@ fn same_reference_spelling(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
-#[cfg(test)]
-fn read_digest_208(value: &str) -> Option<String> {
-    let digest = value.strip_prefix("sha256:").unwrap_or(value);
-    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| digest.to_ascii_lowercase())
-}
-
 impl ReadCoverage {
     fn observe_delivered(&mut self, read: &policy::VerifiedReadDelivery) -> Result<(), String> {
         if !read.body_delivered() {
             return Ok(());
         }
         let body = &read.material.acquisition.body;
-        #[cfg(test)]
-        eprintln!(
-            "R1_READ_208_BODY {}",
-            serde_json::json!({
-                "receipt": read.receipt_reference(),
-                "result": self.proof.result_ref,
-                "source_ref": body.source_ref,
-                "content_ref": self.proof.content_ref,
-                "source_digest": body.source_sha256,
-                "proof_digest": self.proof.sha256,
-                "source_digest_canonical": read_digest_208(&body.source_sha256),
-                "proof_digest_canonical": read_digest_208(&self.proof.sha256),
-                "literal_digest_matches": body.source_sha256 == self.proof.sha256,
-                "source_bytes": body.source_bytes,
-                "proof_bytes": self.proof.bytes,
-                "extent": body.extent,
-            })
-        );
         if body.source_sha256 != self.proof.sha256
             || body.source_bytes != self.proof.bytes
             || !(same_reference_spelling(&body.source_ref, &self.proof.content_ref)
@@ -1441,6 +1422,7 @@ impl RuntimeServices {
             result_refs,
             condition_ref,
             &[],
+            None,
         )
         .await
     }
@@ -1452,6 +1434,7 @@ impl RuntimeServices {
         result_refs: &[String],
         condition_ref: Option<&str>,
         explicit_evidence_refs: &[String],
+        current_review: Option<&CurrentReviewContext<'_>>,
     ) -> Result<IndependentReview, String> {
         let process_verifier = ProcessInputVerifier::new(std::sync::Arc::clone(self.scope_locks()));
         let process_frame = process_verifier.frame();
@@ -1762,42 +1745,6 @@ impl RuntimeServices {
             }
         }
         let complete_file_reads = delivery_snapshot.complete_file_reads()?;
-        #[cfg(test)]
-        eprintln!(
-            "R1_READ_208_COVERAGE {}",
-            serde_json::json!({
-                "verified_reads": delivery_snapshot.reads.len(),
-                "reads": delivery_snapshot.reads.iter().map(|read| serde_json::json!({
-                    "receipt": read.receipt_reference(),
-                    "tool": read.material.acquisition.tool_name,
-                    "grade": read.material.grade,
-                    "requires_model": read.requires_model,
-                    "body_delivered": read.body_delivered(),
-                    "body_omitted": read.material.body_omitted,
-                    "extent": read.material.acquisition.body.extent,
-                    "source_digest": read.material.acquisition.body.source_sha256,
-                    "resolved_effect_scope": read.receipt.payload["resolved_effect_scope"],
-                    "observed_evidence": read.receipt.payload["outcome"]["observed_evidence"],
-                    "sequence": read.receipt.payload["sequence"],
-                    "cursor": read.material.acquisition_cursor,
-                })).collect::<Vec<_>>(),
-                "complete_files": complete_file_reads.iter().map(|read| serde_json::json!({
-                    "scope": read.scope, "path": read.path,
-                    "cursor": read.cursor, "receipts": read.receipt_refs,
-                })).collect::<Vec<_>>(),
-                "results": coverage.values().map(|state| serde_json::json!({
-                    "proof": state.proof, "total": state.total,
-                    "chunks": state.chunks, "complete": state.complete(),
-                })).collect::<Vec<_>>(),
-                "effects": resolved.iter().map(|result| serde_json::json!({
-                    "reference": result.reference,
-                    "cursor": result.effect_cursor,
-                    "unscoped": result.unscoped_effect,
-                    "scopes": result.effect_scopes,
-                    "targets": result.effect_targets,
-                })).collect::<Vec<_>>(),
-            })
-        );
         let runs_by_result = resolved
             .iter()
             .map(|result| (result.reference.clone(), result.process_runs.clone()))
@@ -3002,12 +2949,13 @@ impl RuntimeServices {
             history: history.as_deref(),
             process_inputs: Some(&process_frame),
         };
-        let snapshot = proof_input_snapshot(
+        let snapshot = proof_input_snapshot_for_action(
             self.event_store(),
             program,
             goal.as_ref(),
             &verification,
             readers,
+            current_review,
         )?;
         verification.work_manifest_digest = snapshot.work_digest;
         verification.effect_manifest_digest = Some(snapshot.effects.digest);

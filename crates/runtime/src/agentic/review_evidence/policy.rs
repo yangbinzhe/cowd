@@ -315,12 +315,29 @@ pub(crate) fn completion_admission_context(
     }))
 }
 
+/// Re-verify a proof as a RECORD. A record carries no live action, so it
+/// re-derives no exemption: the review's own in-flight call is not excluded
+/// here, and a stored proof can never grant one.
 pub(crate) fn validate_proof_inputs(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
     goal: Option<&GoalContract>,
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
+) -> Result<ProofInputSnapshot, String> {
+    validate_proof_inputs_for_action(store, program, goal, proof, readers, None)
+}
+
+/// Re-verify a proof against the LIVE action it is applying, so the review's
+/// own in-flight call is resolved again from the durable evidence instead of
+/// from anything the proof carries.
+pub(crate) fn validate_proof_inputs_for_action(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    goal: Option<&GoalContract>,
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+    readers: super::ResultContentReaders<'_>,
+    current_review: Option<&super::current_review::CurrentReviewContext<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
     let current = crate::AgentActionService::new(std::sync::Arc::clone(store))
         .project(&program.program_id)
@@ -334,7 +351,14 @@ pub(crate) fn validate_proof_inputs(
         })
         .transpose()?
         .flatten();
-    let snapshot = proof_input_snapshot(store, &current, current_goal.as_ref(), proof, readers)?;
+    let snapshot = proof_input_snapshot_for_action(
+        store,
+        &current,
+        current_goal.as_ref(),
+        proof,
+        readers,
+        current_review,
+    )?;
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
     if snapshot.semantic_digest != inputs.semantic_digest
         || snapshot.policy_digest != inputs.acceptance_policy_digest
@@ -455,6 +479,8 @@ pub(crate) fn committed_proof_sources(
                 ));
             }
         }
+        // A committed record is re-verified without a live action, so it
+        // re-derives no exemption.
         let snapshot = proof_input_snapshot_for_phase(
             store,
             program,
@@ -462,6 +488,7 @@ pub(crate) fn committed_proof_sources(
             proof,
             Some(&inputs.acceptance_policy_digest),
             readers,
+            None,
         )?;
         if !snapshot.reviewer_matches(program, review)
             || snapshot.semantic_digest != inputs.semantic_digest
@@ -927,45 +954,6 @@ fn review_delivery_snapshot_from_events(
         }
         let material = crate::context_evidence::decode_read_delivery(&event.payload)
             .map_err(str::to_string)?;
-        #[cfg(test)]
-        eprintln!(
-            "R1_READ_208_CANDIDATE {}",
-            serde_json::json!({
-                "event": event.event_id,
-                "invocation": material.tool_invocation_id,
-                "session_matches": material.session_id == program.session_id,
-                "turn_matches": material.turn_id == program.turn_id,
-                "recipient": material.recipient,
-                "grade": material.grade,
-                "step": material.acquisition.step,
-                "origin": material.acquisition.origin,
-                "graph": material.acquisition.graph_id,
-                "node": material.acquisition.node_id,
-                "attempt": material.acquisition.attempt,
-                "expected": packet.map(|packet| serde_json::json!({
-                    "identity": packet.assignment.execution_identity,
-                    "agent_id": packet.agent_id(),
-                    "principal_id": packet.assignment.execution_identity.principal_id(),
-                    "graph": packet.graph_id(), "node": packet.node_id(),
-                    "attempt": packet.attempt, "run": packet.run_id(),
-                    "tool_allowed": packet.allowed_tools.contains(&material.acquisition.tool_name),
-                    "tool_bound": packet.binding.as_ref().is_some_and(|binding|
-                        binding.tool_contract_refs.contains(&material.acquisition.tool_name)),
-                    "recipient_identity_matches": match &material.recipient {
-                        crate::context_evidence::ReadDeliveryRecipient::AgentTask { identity } =>
-                            *identity == packet.assignment.execution_identity,
-                        _ => false,
-                    },
-                    "graph_matches": material.acquisition.graph_id == packet.graph_id(),
-                    "node_matches": material.acquisition.node_id == packet.node_id(),
-                    "attempt_matches": material.acquisition.attempt == packet.attempt,
-                    "run_matches": material.acquisition.step.run_ref.as_deref() == Some(packet.run_id()),
-                    "agent_actor_matches": material.acquisition.step.actor_ref.as_deref() == Some(packet.agent_id()),
-                    "principal_actor_matches": material.acquisition.step.actor_ref.as_deref()
-                        == Some(packet.assignment.execution_identity.principal_id()),
-                })),
-            })
-        );
         if material.session_id != program.session_id || material.turn_id != program.turn_id {
             continue;
         }
@@ -1004,15 +992,6 @@ fn review_delivery_snapshot_from_events(
             }
             _ => false,
         };
-        #[cfg(test)]
-        eprintln!(
-            "R1_READ_208_RECIPIENT {}",
-            serde_json::json!({
-                "event": event.event_id,
-                "invocation": material.tool_invocation_id,
-                "matches": recipient_matches,
-            })
-        );
         if !recipient_matches {
             continue;
         }
@@ -3341,53 +3320,37 @@ mod primary_material_621_tests {
     }
 }
 
-/// Whether this planned root call IS the review that is being built.
-///
-/// The root plan carries the call that performs the review, so while the
-/// proof is assembled that call is still pending. The exclusion is the same
-/// narrow one the delegated write check applies: the reviewer's own
-/// authenticated review call, and only that one.
-fn is_current_review_control_step(
-    reviewer_execution_id: &str,
-    tool_name: &str,
-    step: &crate::step_snapshot::StepCallBinding,
-) -> bool {
-    if !matches!(tool_name, "task_review" | "objective_review") {
-        return false;
-    }
-    let run = reviewer_execution_id
-        .strip_prefix("agent-run:")
-        .unwrap_or(reviewer_execution_id);
-    step.snapshot.identity.execution_id.as_deref() == Some(run)
+/// What the proof does with one delegated write it found in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewWriteOutcome {
+    /// Already settled, or provably disjoint from the reviewed work.
+    Settled,
+    /// The review's own control call: it is in flight because the review is
+    /// performing it, and it can never settle the action it is.
+    Exempt,
+    /// A write that must be settled before the review may accept.
+    Blocked,
 }
 
-/// Whether this in-flight delegated write IS the review that is being built.
+/// The production decision for one delegated write.
 ///
-/// A reviewer performs the review as a control action, so while the proof is
-/// assembled the intent of that very call is still in flight. The proof
-/// checks every delegated write that may intersect the required work, and it
-/// found this one unsettled, which is a self-dependency rather than a real
-/// gap: the review can never settle the action it is.
-///
-/// The exclusion is deliberately narrow. The call must be the reviewer's own
-/// governed call, proven from the execution identity the proof was built
-/// under, and it must be a review control action. Another agent's in-flight
-/// write, and another write by this same reviewer, are still refused.
-fn is_current_review_control_call(
-    reviewer_execution_id: &str,
-    intent: &crate::DurableRuntimeEvent,
-) -> bool {
-    let tool = intent.payload["tool_name"].as_str().unwrap_or_default();
-    if !matches!(tool, "task_review" | "objective_review") {
-        return false;
+/// The exemption is the review's OWN call and nothing else. Its identity is
+/// the exact effect identity Runtime resolved from the durable evidence, so
+/// a second unfinished review in the same run - a different Step, a
+/// different attempt - carries a different identity and still blocks.
+fn review_write_outcome(
+    current_review_effect_key: Option<&str>,
+    identity: &str,
+    settled: bool,
+    disjoint: bool,
+) -> ReviewWriteOutcome {
+    if settled || disjoint {
+        return ReviewWriteOutcome::Settled;
     }
-    let run = reviewer_execution_id
-        .strip_prefix("agent-run:")
-        .unwrap_or(reviewer_execution_id);
-    let graph = run.strip_prefix("run:").unwrap_or(run);
-    intent
-        .stream_id
-        .starts_with(&format!("execution-agent-receipts:{graph}:"))
+    if current_review_effect_key == Some(identity) {
+        return ReviewWriteOutcome::Exempt;
+    }
+    ReviewWriteOutcome::Blocked
 }
 
 pub(super) fn actual_input_snapshot(
@@ -4041,6 +4004,8 @@ pub(super) fn original_material_scope(
     .map(Some)
 }
 
+/// Build a proof snapshot as a RECORD: no live action, so no exemption is
+/// derived and a stored proof can never grant one.
 pub(crate) fn proof_input_snapshot(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -4048,7 +4013,19 @@ pub(crate) fn proof_input_snapshot(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
 ) -> Result<ProofInputSnapshot, String> {
-    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers)
+    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, None)
+}
+
+/// Build a proof snapshot against the LIVE action being applied.
+pub(crate) fn proof_input_snapshot_for_action(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    goal: Option<&GoalContract>,
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+    readers: super::ResultContentReaders<'_>,
+    current_review: Option<&super::current_review::CurrentReviewContext<'_>>,
+) -> Result<ProofInputSnapshot, String> {
+    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review)
 }
 
 fn proof_input_snapshot_for_phase(
@@ -4058,6 +4035,7 @@ fn proof_input_snapshot_for_phase(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     accepted_policy_digest: Option<&str>,
     readers: super::ResultContentReaders<'_>,
+    current_review: Option<&super::current_review::CurrentReviewContext<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
     if inputs.version != 2 {
@@ -4202,6 +4180,21 @@ fn proof_input_snapshot_for_phase(
         start_cursor = start_cursor.min(cursor);
     }
     let session_events = pinned_events(store, &session, &mut sources, start_cursor)?;
+    // The review is a control action the reviewer performs while this proof is
+    // assembled, so its own call is still in flight and the checks below would
+    // trip on the review itself. Runtime resolves that ONE call from the
+    // evidence this proof already pinned - the Session's governed tool plans -
+    // and authenticates it against the live action and the reviewer's own
+    // execution. No live action means no exemption, and a record can never
+    // grant one.
+    let current_review_effect_key = match current_review {
+        Some(context) => super::current_review::resolve_current_review_effect_key(
+            &session_events,
+            &proof.reviewer_execution_id,
+            context,
+        )?,
+        None => None,
+    };
     let strategy = session_events.iter().find(|event| {
         event.kind.starts_with("runtime.strategy.")
             && event.actor.as_deref() == Some("conversation_runtime.strategy_owner")
@@ -5359,7 +5352,6 @@ fn proof_input_snapshot_for_phase(
                 _ => {}
             }
         }
-        let mut current_control_calls: Vec<String> = Vec::new();
         for (identity, intent) in intents {
             let scope = admitted_intent_scope(store, intent, &mut sources)?;
             if let Some(run) = authenticated_process_for_key(store, identity, &mut sources)? {
@@ -5386,24 +5378,34 @@ fn proof_input_snapshot_for_phase(
                     Some("executed" | "blocked_permission")
                 )
             });
-            if !settled && !disjoint {
-                if is_current_review_control_call(&proof.reviewer_execution_id, &intent) {
+            match review_write_outcome(
+                current_review_effect_key.as_deref(),
+                identity,
+                settled,
+                disjoint,
+            ) {
+                ReviewWriteOutcome::Exempt => {
                     // The review is a control action the reviewer performs
                     // while this proof is assembled, so its own intent is
                     // still in flight when the proof checks it. Requiring it
                     // to be settled first is a self-dependency: the review can
-                    // never settle the action it is. Only that exact call is
-                    // excluded, and only after it is authenticated as the
-                    // reviewer's own governed call. Every other in-flight
-                    // control change, including another write by this same
-                    // reviewer, still fails closed.
-                    current_control_calls.push(identity.to_string());
+                    // never settle the action it is.
+                    //
+                    // Only that ONE call is exempt, and only because Runtime
+                    // resolved its exact effect identity from the durable
+                    // evidence and authenticated it against the action being
+                    // applied. Another in-flight write by this same reviewer -
+                    // even another unfinished review - carries a different
+                    // identity and still blocks.
                     continue;
                 }
-                return Err(
-                    "effect_review_pending: unknown required or possibly intersecting delegated write"
-                        .into(),
-                );
+                ReviewWriteOutcome::Blocked => {
+                    return Err(
+                        "effect_review_pending: unknown required or possibly intersecting delegated write"
+                            .into(),
+                    );
+                }
+                ReviewWriteOutcome::Settled => {}
             }
             if settled_descriptor.as_ref().is_some_and(super::results::runtime_control_descriptor) {
                 runtime_control_keys.insert(identity.to_string());
@@ -5448,7 +5450,6 @@ fn proof_input_snapshot_for_phase(
         }
     }
     let mut planned = BTreeSet::new();
-    let mut current_review_planned: BTreeSet<(String, String)> = BTreeSet::new();
     let mut completed = BTreeSet::new();
     for event in &session_events {
         if event.actor.as_deref() != Some("conversation_runtime") {
@@ -5485,18 +5486,17 @@ fn proof_input_snapshot_for_phase(
                 ) else {
                     return Err("proof root effect identity missing".into());
                 };
-                planned.insert((plan.to_string(), call.to_string()));
                 required_effects.insert(format!("{}:{call}", event.event_id), task.clone());
                 let step: crate::step_snapshot::StepCallBinding =
                     serde_json::from_value(task["step_binding"].clone())
                         .map_err(|_| "root effect plan lacks its original Step identity")?;
                 let call_key = step.effect_idempotency_key();
-                if is_current_review_control_step(
-                    &proof.reviewer_execution_id,
-                    task["tool_name"].as_str().unwrap_or_default(),
-                    &step,
-                ) {
-                    current_review_planned.insert((plan.to_string(), call.to_string()));
+                if current_review_effect_key.as_deref() != Some(call_key.as_str()) {
+                    // The call that carries the review is the same exact
+                    // identity the delegated receipt index resolves, so both
+                    // views name ONE call. Every other planned write still has
+                    // to settle.
+                    planned.insert((plan.to_string(), call.to_string()));
                 }
                 if authenticated_process_for_key(store, &call_key, &mut sources)?.is_none() {
                     relevant_writes.push((event.commit_cursor, None, Some(call_key)));
@@ -5570,19 +5570,10 @@ fn proof_input_snapshot_for_phase(
         }
     }
     if !planned.is_subset(&completed) {
-        // The review is a control action the reviewer performs while this
-        // proof is assembled, so the call that carries it is still pending
-        // here. Requiring it to settle first is a self-dependency. The
-        // exclusion is the same narrow one the delegated write check applies:
-        // only the reviewer's own authenticated review call, and only the
-        // call the review is actually performing. Every other planned write
-        // still has to settle.
-        let pending = planned
-            .difference(&completed)
-            .filter(|(plan, call)| {
-                !current_review_planned.contains(&(plan.clone(), call.clone()))
-            })
-            .collect::<Vec<_>>();
+        // The call that carries the review is already out of `planned`: it is
+        // the review itself, and the review cannot settle the action it is.
+        // Every other planned write still has to settle.
+        let pending = planned.difference(&completed).collect::<Vec<_>>();
         if !pending.is_empty() {
             return Err(format!(
                 "effect_review_pending: root writes must settle before acceptance; pending={pending:?}; terminal={completed:?}",
@@ -6359,43 +6350,45 @@ mod tests {
     /// A reviewer performs the review while the proof is assembled, so that
     /// call's intent is still in flight. Excluding it must be narrow: only
     /// that reviewer's own review call, never another agent's in-flight
-    /// write and never another write by the same reviewer.
-    #[test]
-    fn r1_current_review_control_call_is_excluded_and_nothing_else_is() {
-        let reviewer = "agent-run:run:agentic-graph:881f5104981de6ca8fb83addee9d1384e73095156d9cdbf6d53b3f9bfa6e19aa";
-        let intent = |stream: &str, tool: &str| crate::DurableRuntimeEvent {
-            event_id: "event".into(),
-            stream_id: stream.into(),
-            sequence: 2,
-            scope: crate::RuntimeEventScope::ExecutionNode,
-            kind: "execution.agent_tool.intent".into(),
-            status: Some("inflight".into()),
-            actor: Some("governed_tool".into()),
-            refs: Vec::new(),
-            payload: serde_json::json!({"tool_name": tool, "sequence": 1}),
-            created_at_ms: 0,
-            commit_cursor: 0,
-            transaction_id: "tx".into(),
-            transaction_index: 0,
-            schema_version: 1,
-            idempotency_key: None,
-        };
-        let own = "execution-agent-receipts:agentic-graph:881f5104981de6ca8fb83addee9d1384e73095156d9cdbf6d53b3f9bfa6e19aa:agentic-graph:881f5104981de6ca8fb83addee9d1384e73095156d9cdbf6d53b3f9bfa6e19aa:agent:1";
-        let foreign = "execution-agent-receipts:agentic-graph:0000000000000000000000000000000000000000000000000000000000000000:agentic-graph:0000000000000000000000000000000000000000000000000000000000000000:agent:1";
 
-        // The reviewer's own review call is the call being reviewed.
-        assert!(is_current_review_control_call(reviewer, &intent(own, "task_review")));
-        assert!(is_current_review_control_call(
-            reviewer,
-            &intent(own, "objective_review")
-        ));
-        // Another write by the same reviewer is not the review.
-        assert!(!is_current_review_control_call(reviewer, &intent(own, "edit")));
-        // Another agent's review call is not this review.
-        assert!(!is_current_review_control_call(
-            reviewer,
-            &intent(foreign, "task_review")
-        ));
+    /// The review cannot be required to settle the control action it is.
+    ///
+    /// The exemption names ONE call, by the exact effect identity Runtime
+    /// resolved for the action being applied. A second unfinished review in
+    /// the same run - the same tool, the same reviewer, a different Step - has
+    /// a different identity and keeps blocking. The old exclusion matched the
+    /// tool name and the execution instead, so it skipped both of them.
+    #[test]
+    fn r1_only_the_applied_review_call_is_exempt() {
+        let applied = "effect-identity-of-the-review-being-applied";
+        let other = "effect-identity-of-the-second-unfinished-review";
+
+        // The review's own call is in flight because the review is performing
+        // it, and it can never settle the action it is.
+        assert_eq!(
+            review_write_outcome(Some(applied), applied, false, false),
+            ReviewWriteOutcome::Exempt
+        );
+        // The second unfinished review of the same run is not exempt.
+        assert_eq!(
+            review_write_outcome(Some(applied), other, false, false),
+            ReviewWriteOutcome::Blocked
+        );
+        // A settled write, and a write that provably does not intersect the
+        // reviewed work, are both settled.
+        assert_eq!(
+            review_write_outcome(Some(applied), other, true, false),
+            ReviewWriteOutcome::Settled
+        );
+        assert_eq!(
+            review_write_outcome(Some(applied), other, false, true),
+            ReviewWriteOutcome::Settled
+        );
+        // Without a resolved identity nothing is exempt.
+        assert_eq!(
+            review_write_outcome(None, applied, false, false),
+            ReviewWriteOutcome::Blocked
+        );
     }
 
     #[test]

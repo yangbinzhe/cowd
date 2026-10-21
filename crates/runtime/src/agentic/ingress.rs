@@ -457,6 +457,11 @@ impl RuntimeServices {
                             AgentAction::ObjectiveReview(input) => &input.evidence_refs,
                             _ => unreachable!("review classification"),
                         },
+                        Some(&crate::agentic::review_evidence::CurrentReviewContext {
+                            action_id: &envelope.action_id,
+                            action: &envelope.action,
+                            actor: &envelope.actor,
+                        }),
                     )
                     .await;
                 match built {
