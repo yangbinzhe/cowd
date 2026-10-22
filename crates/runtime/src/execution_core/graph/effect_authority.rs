@@ -166,11 +166,14 @@ impl ExecutionCommitService {
                 if request.session_id.as_deref() != Some(lineage.session_id.as_str()) {
                     return Err(denied("Root invocation Session mismatch"));
                 }
-                return self.root_effect_authority(&crate::CowdExecutionContext {
-                    execution_id: graph.id.clone(),
-                    session_id: lineage.session_id.clone(),
-                    turn_id: lineage.turn_id.clone(),
-                });
+                return self.root_effect_authority_with_refusal(
+                    &crate::CowdExecutionContext {
+                        execution_id: graph.id.clone(),
+                        session_id: lineage.session_id.clone(),
+                        turn_id: lineage.turn_id.clone(),
+                    },
+                    refused,
+                );
             }
             return Ok(sources);
         }
@@ -646,16 +649,33 @@ impl ExecutionCommitService {
         &self,
         context: &crate::CowdExecutionContext,
     ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        self.root_effect_authority_with_refusal(context, &|_| {})
+    }
+
+    pub(super) fn root_effect_authority_with_refusal(
+        &self,
+        context: &crate::CowdExecutionContext,
+        refused: &dyn Fn(&str),
+    ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
         let denied = |reason: &str| {
-            ExecutionCommitError::InvalidCommand(format!("root_effect_authority: {reason}"))
+            let message = format!("root_effect_authority: {reason}");
+            refused(&message);
+            ExecutionCommitError::InvalidCommand(message)
+        };
+        // A failed source read proves no refusal. Only known policy/identity
+        // predicates above their original durable sources may certify it.
+        let unavailable = |reason: String| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "root_effect_authority source unavailable: {reason}"
+            ))
         };
         let graph = self
             .effect_authority_graphs
             .load(&context.execution_id)
-            .map_err(|error| denied(&error.to_string()))?;
+            .map_err(|error| unavailable(error.to_string()))?;
         self.event_store
             .ensure_session_recovery_admitted(&context.session_id)
-            .map_err(|error| denied(&error))?;
+            .map_err(unavailable)?;
         if graph.parent_execution.is_some()
             || !graph.lineage.as_ref().is_some_and(|lineage| {
                 lineage.session_id == context.session_id && lineage.turn_id == context.turn_id
@@ -671,7 +691,7 @@ impl ExecutionCommitService {
         let goal_stream = format!("goal:{goal_id}");
         let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.event_store))
             .projection(&goal_id)
-            .map_err(|error| denied(&error))?;
+            .map_err(unavailable)?;
         let mut sources = vec![
             ExpectedStreamRevision {
                 stream_id: graph.id.clone(),
@@ -708,7 +728,7 @@ impl ExecutionCommitService {
         let program = self
             .effect_authority_actions
             .project_if_exists(&program_id)
-            .map_err(|error| denied(&error.to_string()))?;
+            .map_err(|error| unavailable(error.to_string()))?;
         if let Some(program) = &program {
             if !matches!(
                 program.status,

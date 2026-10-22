@@ -20,6 +20,10 @@ use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentR
 use crate::agent_runtime::AgentRuntimeBackend;
 use crate::execution_core::graph::ScopeLockManager;
 
+#[cfg(any(test, feature = "test-fixtures"))]
+#[path = "in_process/exit_hold.rs"]
+mod exit_hold;
+
 #[path = "in_process/stages.rs"]
 mod stages;
 use stages::*;
@@ -1525,6 +1529,15 @@ impl InProcessAgentWorker {
             pending_cancellations: Mutex::new(BTreeSet::new()),
             completed_runs: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Pause this exact original native attempt after all business calls and
+    /// before its backend exits. Available only to controlled fixture builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn hold_exit_for_test(
+        packet: &AgentTaskPacket,
+    ) -> Result<exit_hold::BackendExitHold, String> {
+        exit_hold::register(packet)
     }
 
     fn record_completed_run(&self, run_id: &str) {

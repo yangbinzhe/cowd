@@ -7,6 +7,9 @@ use crate::selected_storage::SelectedStorageTopology;
 #[path = "r1_startup_partition.rs"]
 mod startup_partition_483;
 
+#[path = "r1_receipt_owner.rs"]
+mod receipt_owner;
+
 use crate::session_runtime_bridge::terminal_delivery_faults::{
     checkpoint, observe, register, Point, Release, RequestIdentity,
 };
@@ -458,6 +461,73 @@ impl LoopbackProvider {
             .send(json!({"role":"assistant","content":text}))
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn loopback_drop_closes_an_entered_rpc_even_if_its_reply_is_retained() {
+    let mut provider = LoopbackProvider::start("root").await;
+    let endpoint = format!("{}/chat/completions", provider.endpoint);
+    let client = tokio::spawn(async move {
+        reqwest::Client::new().post(endpoint).json(&json!({
+            "model":"test-model", "stream":true, "max_tokens":512,
+            "messages":[{"role":"system","content":"RECOVERY_ROOT_LANE"},{"role":"user","content":"bounded lifecycle handshake"}]
+        })).send().await
+    });
+    let retained_reply = tokio::time::timeout(Duration::from_secs(2), provider.next())
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_reply.body["messages"][1]["content"],
+        "bounded lifecycle handshake"
+    );
+    drop(provider);
+    assert!(tokio::time::timeout(Duration::from_secs(2), client)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    drop(retained_reply);
+}
+
+async fn await_satisfaction_or_offer_completion<T>(
+    satisfied: impl std::future::Future<Output = T>,
+    completion: impl std::future::Future<Output = ()>,
+) -> T {
+    tokio::pin!(satisfied);
+    tokio::select! {
+        biased;
+        goal = &mut satisfied => goal,
+        () = completion => satisfied.await,
+    }
+}
+
+#[tokio::test]
+async fn satisfied_goal_does_not_require_another_provider_continuation() {
+    let offered = std::sync::atomic::AtomicBool::new(false);
+    let original =
+        await_satisfaction_or_offer_completion(async { "original satisfied Goal" }, async {
+            offered.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+        .await;
+    assert_eq!(original, "original satisfied Goal");
+    assert!(!offered.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn open_goal_can_consume_its_original_completion_request_before_satisfaction() {
+    let (sent, accepted) = tokio::sync::oneshot::channel();
+    let original = await_satisfaction_or_offer_completion(
+        async {
+            accepted.await.unwrap();
+            "original satisfied Goal"
+        },
+        async {
+            sent.send(()).unwrap();
+        },
+    )
+    .await;
+    assert_eq!(original, "original satisfied Goal");
 }
 
 #[test]
@@ -1035,6 +1105,41 @@ impl ReviewedTurn {
                 None,
             )
             .await;
+        let producer_exit_hold = if hold_producer_until_a {
+            let packet = durable_turn_until(
+                services,
+                &graph_id,
+                &program_id,
+                "producer_exact_attempt",
+                || {
+                    let program = runtime.agent_action_service().project(&program_id).unwrap();
+                    let producer_graph = program.tasks[&task_ref].claim_execution_id.as_deref()?;
+                    let graph = runtime.graph_state_store().load(producer_graph).unwrap();
+                    let node = graph.nodes.iter().find(|node| {
+                        node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                    })?;
+                    let packet: harness_contract::agent::AgentTaskPacket =
+                        serde_json::from_str(&node.payload_ref).unwrap();
+                    assert_eq!(
+                        graph.recovery_cursor.node_attempts.get(&node.id),
+                        Some(&packet.attempt)
+                    );
+                    Some(packet)
+                },
+            )
+            .await;
+            let hold = runtime::InProcessAgentWorker::hold_exit_for_test(&packet).unwrap();
+            eprintln!(
+                "native_exit_hold registered graph={} node={} attempt={} run={}",
+                packet.graph_id(),
+                packet.node_id(),
+                packet.attempt,
+                packet.run_id()
+            );
+            Some((packet, hold))
+        } else {
+            None
+        };
         producer.tool("recovery-write", "edit", json!({
             "action":"write","path":"recovery-effect.txt","content":"recovery-effect-once\n",
         }), None).await;
@@ -1071,6 +1176,29 @@ impl ReviewedTurn {
                 producer_graph,
             )
             .await;
+        }
+        if let Some((packet, hold)) = &producer_exit_hold {
+            tokio::time::timeout(Duration::from_secs(30), hold.entered())
+                .await
+                .expect("real native backend did not enter exit hold")
+                .unwrap();
+            assert!(!hold.is_released() && !hold.has_exited());
+            assert!(services
+                .topology
+                .runtime_event_store
+                .event_by_idempotency_key(
+                    &format!("agent:{}", packet.agent_id()),
+                    &format!("agent.local_exit:{}", packet.run_id())
+                )
+                .unwrap()
+                .is_none());
+            eprintln!(
+                "native_exit_hold entered graph={} node={} attempt={} run={}",
+                packet.graph_id(),
+                packet.node_id(),
+                packet.attempt,
+                packet.run_id()
+            );
         }
         if !hold_producer_until_a {
             // TaskExecute closes on Submitted through the production owner;
@@ -1616,16 +1744,7 @@ impl ReviewedTurn {
             },
         )
         .await;
-        root.tool(
-            "recovery-complete",
-            "objective_complete_request",
-            json!({
-                "result_refs":result_refs,"evidence_refs":[content_ref],"unresolved":[],
-            }),
-            None,
-        )
-        .await;
-        let goal = durable_turn_until(
+        let satisfied = durable_turn_until(
             services,
             &graph_id,
             &program_id,
@@ -1635,8 +1754,19 @@ impl ReviewedTurn {
                     goal.completion == harness_contract::goal::GoalCompletion::Satisfied
                 })
             },
-        )
-        .await;
+        );
+        let completion_request = root.tool(
+            "recovery-complete",
+            "objective_complete_request",
+            json!({
+                "result_refs":result_refs,"evidence_refs":[content_ref],"unresolved":[],
+            }),
+            None,
+        );
+        // The original Program/Goal owner can satisfy A and enter B without
+        // another Provider RPC. An already satisfied Goal must not wait for an
+        // unnecessary scripted command; a still-open Goal may consume it.
+        let goal = await_satisfaction_or_offer_completion(satisfied, completion_request).await;
         let program = runtime.agent_action_service().project(&program_id).unwrap();
         assert_eq!(program.status, runtime::AgenticProgramStatus::Verified);
         let mut optional_receipts = Vec::new();
@@ -1644,7 +1774,14 @@ impl ReviewedTurn {
             let task = &program.tasks[&optional_task];
             assert_eq!(task.status, runtime::AgenticTaskStatus::CancelRequested);
             assert!(!task.active_attempts.is_empty());
-            let pending = root_events(&services.topology.runtime_event_store, &graph_id);
+            let pending = services
+                .topology
+                .runtime_event_store
+                .list_stream(&receipt_owner::stream(
+                    request.parent_execution.as_ref().unwrap(),
+                    request.parent_execution_attempt.unwrap(),
+                ))
+                .unwrap();
             let intent = pending
                 .iter()
                 .find(|event| {
@@ -1685,7 +1822,14 @@ impl ReviewedTurn {
                 &program_id,
                 "optional_effect_receipted",
                 || {
-                    let receipts = root_events(&services.topology.runtime_event_store, &graph_id)
+                    let receipts = services
+                        .topology
+                        .runtime_event_store
+                        .list_stream(&receipt_owner::stream(
+                            request.parent_execution.as_ref().unwrap(),
+                            request.parent_execution_attempt.unwrap(),
+                        ))
+                        .unwrap()
                         .into_iter()
                         .filter(|event| {
                             event.kind == "execution.agent_tool.receipt"
@@ -1751,7 +1895,78 @@ impl ReviewedTurn {
                     .any(|status| !status.is_terminal()),
                 "A must be real while its already-receipted producer is still physically alive"
             );
-            producer.finish("The claimed Task is submitted with its original report; no further write is needed.").await;
+            let (packet, hold) = producer_exit_hold.as_ref().unwrap();
+            assert!(
+                !hold.is_released(),
+                "A must precede the explicit physical release"
+            );
+            assert!(
+                !hold.has_exited(),
+                "the real backend future must still own the hold at A"
+            );
+            assert!(
+                services
+                    .topology
+                    .runtime_event_store
+                    .event_by_idempotency_key(
+                        &format!("agent:{}", packet.agent_id()),
+                        &format!("agent.local_exit:{}", packet.run_id())
+                    )
+                    .unwrap()
+                    .is_none(),
+                "Graph status is not proof of physical liveness"
+            );
+            hold.release();
+            tokio::time::timeout(Duration::from_secs(30), hold.exited())
+                .await
+                .expect("native backend exit hold did not close")
+                .unwrap();
+            durable_turn_until(
+                services,
+                &graph_id,
+                &program_id,
+                "producer_original_exit_and_graph_closure",
+                || {
+                    let exit = services
+                        .topology
+                        .runtime_event_store
+                        .event_by_idempotency_key(
+                            &format!("agent:{}", packet.agent_id()),
+                            &format!("agent.local_exit:{}", packet.run_id()),
+                        )
+                        .unwrap()?;
+                    assert_eq!(exit.actor.as_deref(), Some("agent_runtime"));
+                    assert_eq!(exit.payload["graph_id"], packet.graph_id());
+                    assert_eq!(exit.payload["node_id"], packet.node_id());
+                    assert_eq!(exit.payload["run_id"], packet.run_id());
+                    assert_eq!(exit.payload["attempt"], packet.attempt);
+                    assert_eq!(exit.payload["agent_id"], packet.agent_id());
+                    assert_eq!(exit.payload["backend"], "in_process");
+                    assert_eq!(exit.payload["phase"], "local_returned");
+                    use sha2::Digest;
+                    assert_eq!(
+                        exit.payload["packet_sha256"],
+                        format!(
+                            "{:x}",
+                            sha2::Sha256::digest(serde_json::to_vec(packet).unwrap())
+                        )
+                    );
+                    let graph = runtime.graph_state_store().load(packet.graph_id()).unwrap();
+                    graph
+                        .node_statuses
+                        .values()
+                        .all(|status| status.is_terminal())
+                        .then_some(())
+                },
+            )
+            .await;
+            eprintln!(
+                "native_exit_hold exited graph={} node={} attempt={} run={}",
+                packet.graph_id(),
+                packet.node_id(),
+                packet.attempt,
+                packet.run_id()
+            );
         }
         assert!(!goal.reviews.is_empty());
         assert!(goal
@@ -1804,21 +2019,6 @@ impl ReviewedTurn {
                 assert!(read.bytes > 0);
             }
         }
-        let effects = root_events(&services.topology.runtime_event_store, &graph_id);
-        let effect_receipts = effects
-            .into_iter()
-            .filter(|event| {
-                event.kind == "execution.agent_tool.receipt"
-                    && event.payload.to_string().contains("recovery-write")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            effect_receipts.len(),
-            1,
-            "one real physical write receipt, not zero-effect nonduplication"
-        );
-        assert_eq!(effect_receipts[0].payload["outcome"]["status"], "executed");
-        assert_eq!(effect_receipts[0].payload["outcome"]["tool_name"], "edit");
         let writes = services
             .physical_calls
             .lock()
@@ -1828,6 +2028,16 @@ impl ReviewedTurn {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(writes.len(), 1);
+        let effect_receipts =
+            receipt_owner::original_receipts(&services.topology.runtime_event_store, &writes[0])
+                .unwrap();
+        assert_eq!(
+            effect_receipts.len(),
+            1,
+            "one real physical write receipt, not zero-effect nonduplication"
+        );
+        assert_eq!(effect_receipts[0].payload["outcome"]["status"], "executed");
+        assert_eq!(effect_receipts[0].payload["outcome"]["tool_name"], "edit");
         assert_eq!(writes[0].tool_use_id, "recovery-write");
         assert_eq!(
             effect_receipts[0].payload["idempotency_key"],
@@ -2229,7 +2439,14 @@ impl ReviewedTurn {
                 assert_eq!(program.tasks[task_ref].reviewed_by, task.reviewed_by);
             }
         }
-        let events = root_events(&services.topology.runtime_event_store, &self.graph_id);
+        // Session terminal publication owns its original request stream. The
+        // root activity index contains activity-bound events, not all Session
+        // events that refer to this Graph.
+        let events = services
+            .topology
+            .runtime_event_store
+            .list_stream(&format!("session-terminal:{}", self.request_id))
+            .unwrap();
         let graph = runtime.graph_state_store().load(&self.graph_id).unwrap();
         let waits = graph
             .nodes
@@ -2242,23 +2459,36 @@ impl ReviewedTurn {
         );
         assert!(waits.iter().all(|node| graph.node_statuses.get(&node.id)
             == Some(&harness_contract::execution_graph::ExecutionNodeStatus::Completed)));
-        let writes = events
+        let original_write_calls = self
+            .physical_calls
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|event| {
-                event.kind == "execution.agent_tool.receipt"
-                    && event.payload["outcome"]["tool_use_id"] == "recovery-write"
-            })
+            .filter(|call| call.tool_use_id == "recovery-write")
             .cloned()
             .collect::<Vec<_>>();
+        assert_eq!(original_write_calls.len(), 1);
+        let writes = receipt_owner::original_receipts(
+            &services.topology.runtime_event_store,
+            &original_write_calls[0],
+        )
+        .unwrap();
         assert_eq!(writes, self.effect_receipts);
         assert_eq!(writes.len(), 1);
-        let optional_receipts = events
+        let optional_calls = self
+            .physical_calls
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|event| {
-                event.kind == "execution.agent_tool.receipt"
-                    && event.payload["outcome"]["tool_use_id"] == "recovery-optional-write"
-            })
+            .filter(|call| call.tool_use_id == "recovery-optional-write")
             .cloned()
+            .collect::<Vec<_>>();
+        let optional_receipts = optional_calls
+            .iter()
+            .flat_map(|call| {
+                receipt_owner::original_receipts(&services.topology.runtime_event_store, call)
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         assert_eq!(optional_receipts, self.optional_receipts);
         assert_eq!(
@@ -2489,18 +2719,35 @@ async fn assert_staged_artifact(
     assert_eq!(payload["ingress_message_id"], turn.input.message_id);
     assert!(!payload["transcript"].as_array().unwrap().is_empty());
     let artifact_id = artifact.selector.strip_prefix("artifact://").unwrap();
-    let until: i64 = services
+    // Prepared artifacts use the catalog's permanent private-prepared pin;
+    // the caller identity is carried by typed provenance, not the pin owner.
+    let prepared = services
         .topology
         .postgres_executor
         .checkout_online_read()
         .unwrap()
         .query_one(
-            "SELECT until_ms FROM artifact_pins WHERE artifact_id=$1 AND owner=$2",
-            &[&artifact_id, &format!("staging:{}", turn.terminal_id)],
+            "SELECT p.until_ms, r.prepared_origin FROM artifact_pins p \
+             JOIN artifact_records r USING (artifact_id) \
+             WHERE p.artifact_id=$1 AND p.owner=$2",
+            &[&artifact_id, &"cowd:private-prepared:v1"],
         )
-        .unwrap()
-        .get(0);
-    assert!(until as u64 > recovery_now_ms());
+        .unwrap();
+    let until: i64 = prepared.get(0);
+    assert_eq!(until as u64, runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS);
+    let origin: Value = prepared.get(1);
+    assert_eq!(origin["origin_kind"], "terminal_body");
+    assert_eq!(origin["terminal_id"], turn.terminal_id);
+    assert_eq!(origin["session_id"], turn.session_id);
+    assert_eq!(origin["execution_id"], turn.graph_id);
+    assert_eq!(origin["turn_id"], turn.turn_id);
+    assert_eq!(
+        origin["event_stream"],
+        format!("session-terminal:{}", turn.request_id)
+    );
+    assert!(origin["event_key"]
+        .as_str()
+        .is_some_and(|key| !key.is_empty()));
     assert!(services
         .topology
         .runtime_event_store
@@ -2536,6 +2783,8 @@ async fn r1_normal_business_chain_reaches_real_session() {
     )
     .unwrap();
     let services = RecoveryServices::start(root.path(), topology, providers.clone()).await;
+    use futures::FutureExt;
+    let result = std::panic::AssertUnwindSafe(async {
     let mut turn = ReviewedTurn::produce(
         &services,
         &mut provider,
@@ -2602,7 +2851,46 @@ async fn r1_normal_business_chain_reaches_real_session() {
             .completion,
         harness_contract::goal::GoalCompletion::Satisfied
     );
-    drop(services.stop().await);
+    }).catch_unwind().await;
+    // Preserve identities and physical originals BEFORE attempting cleanup,
+    // including when cleanup itself is the first failing consumer.
+    let retained_namespace = services
+        .topology
+        .preserve_failed_test_namespace()
+        .map(str::to_owned);
+    let retained_root = root.keep();
+    eprintln!("normal_b retained_namespace={retained_namespace:?}");
+    eprintln!("normal_b retained_fixture_root={}", retained_root.display());
+    let panic_message = |error: &(dyn std::any::Any + Send)| {
+        error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string fixture panic")
+            .chars()
+            .take(2048)
+            .collect::<String>()
+    };
+    if let Err(error) = &result {
+        eprintln!("normal_b first_failure={}", panic_message(error.as_ref()));
+        // Close the owned fixture transports before joining their RPC owner.
+        drop(provider);
+        drop(producer);
+        drop(reviewer);
+    }
+    let cleanup = std::panic::AssertUnwindSafe(services.stop())
+        .catch_unwind()
+        .await;
+    if let Err(error) = &cleanup {
+        eprintln!("normal_b cleanup_failure={}", panic_message(error.as_ref()));
+    }
+    // A secondary cleanup panic never replaces the original business oracle.
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+    if let Err(error) = cleanup {
+        std::panic::resume_unwind(error);
+    }
 }
 
 
@@ -3860,23 +4148,6 @@ async fn r1_terminal_recovery_session_epoch_race() {
     ] {
         epoch_race_case(race).await;
     }
-}
-
-fn root_events(
-    store: &runtime::RuntimeEventStore,
-    graph: &str,
-) -> Vec<runtime::RuntimeEventRecord> {
-    let mut events = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = store.events_for_root_execution(graph, cursor, 128).unwrap();
-        let Some(last) = page.last() else {
-            break;
-        };
-        cursor = Some((last.commit_cursor, last.transaction_index));
-        events.extend(page);
-    }
-    events
 }
 
 fn review_events(

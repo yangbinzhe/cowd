@@ -1683,9 +1683,51 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
         session_id: lineage.session_id.clone(),
         turn_id: lineage.turn_id.clone(),
     };
-    let mut write = request("root-write");
-    write.session_id = Some(context.session_id.clone());
     let effect = mutation_effect(ToolIdempotency::Idempotent);
+    // Root receipts authenticate the original Step and compiled payload. A
+    // legacy unbound request cannot exercise retained-replay/settlement.
+    let bound_request = |id: &str| {
+        let mut request = request(id);
+        request.session_id = Some(context.session_id.clone());
+        let snapshot: harness_contract::step::StepSnapshot = serde_json::from_value(json!({
+            "contract_version":harness_contract::step::STEP_CONTRACT_VERSION,
+            "identity":{"step_id":"root-ledger-step","session_id":context.session_id,
+                "turn_id":context.turn_id,"execution_id":context.execution_id,"build_ref":"isolated-root-ledger"},
+            "provider_attempt":{"attempt_id":"root-ledger-attempt","origin_step_id":"root-ledger-step",
+                "model_profile_digest":"fixture-profile","request_digest":"fixture-request"},
+            "catalog_digest":"fixture-catalog","tools":[],"related_revisions":{},"context_refs":[],
+            "expires_at_ms":i64::MAX,
+        })).unwrap();
+        let origin = harness_contract::step::CallOrigin {
+            origin_step_id: "root-ledger-step".into(),
+            call_id: id.into(),
+            catalog_digest: "fixture-catalog".into(),
+            source: harness_contract::step::CallSource::OfflineTest,
+        };
+        let binding =
+            crate::step_snapshot::StepCallBinding::persisted(origin.clone(), Arc::new(snapshot));
+        request.idempotency_key = binding.effect_idempotency_key();
+        request.compiled_invocation = Some(harness_contract::tool::GovernedToolInvocation {
+            origin: Some(origin),
+            contract_version: 1,
+            invocation_id: id.into(),
+            intent: harness_contract::tool::ToolIntent {
+                invocation_id: id.into(),
+                tool_name: request.tool_name.clone(),
+                normalized_input: serde_json::from_str(&request.input).unwrap(),
+            },
+            effect: effect.clone(),
+            resource_demand: crate::governed_tool_plan::resource_demand_from_effect(&effect),
+            explicit_dependencies: vec![],
+            compiled_dependencies: vec![],
+            catalog_revision: 1,
+            descriptor_set_hash: "fixture-descriptors".into(),
+            idempotency_key: request.idempotency_key.clone(),
+        });
+        request.step_binding = Some(binding);
+        request
+    };
+    let write = bound_request("root-write");
     let scope = root_ledger_scope(&effect);
     let (owner, attempt) = root_ledger_owner(&store, &graph, &node);
     assert!(service
@@ -1705,7 +1747,7 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
         .is_err());
     assert_eq!(
         store
-            .stream_revision("execution-effect:idem-root-write")
+            .stream_revision(&format!("execution-effect:{}", write.idempotency_key))
             .unwrap(),
         0
     );
@@ -1728,8 +1770,7 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     service
         .commit_tool_effect(&write, &effect, &outcome("root-write", "written"))
         .unwrap();
-    let mut pending = request("root-pending");
-    pending.session_id = write.session_id.clone();
+    let pending = bound_request("root-pending");
     assert_eq!(
         service
             .begin_root_tool_effect(&pending, &effect, &context, &scope, &owner, attempt)
@@ -1748,14 +1789,13 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     assert!(service
         .begin_root_tool_effect(&pending, &effect, &context, &scope, &owner, attempt)
         .is_err());
-    let mut late = request("root-late");
-    late.session_id = write.session_id.clone();
+    let late = bound_request("root-late");
     assert!(service
         .begin_root_tool_effect(&late, &effect, &context, &scope, &owner, attempt)
         .is_err());
     assert_eq!(
         store
-            .stream_revision("execution-effect:idem-root-late")
+            .stream_revision(&format!("execution-effect:{}", late.idempotency_key))
             .unwrap(),
         0
     );

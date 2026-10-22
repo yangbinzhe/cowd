@@ -6,6 +6,7 @@ mod pre_effect_admission_555 {
 
     struct PinnedTools555 {
         lease: tools::ToolHostLease,
+        root_closed: bool,
         preflight: Option<(
             crate::execution_core::graph::ExecutionCommitService,
             harness_contract::execution_graph::ExecutionParentBinding,
@@ -17,7 +18,7 @@ mod pre_effect_admission_555 {
     impl ToolExecutor for PinnedTools555 {
         fn available_tool_names(&self) -> Vec<String> {
             let mut names = vec!["workspace_snapshot".into(), "read_file".into()];
-            if self.preflight.is_some() {
+            if self.preflight.is_some() || self.root_closed {
                 names.push("edit".into());
             }
             names
@@ -231,6 +232,7 @@ mod pre_effect_admission_555 {
         NativePreflightRefusal,
         AuthorizationGap,
         MixedAuthorizationGap,
+        RootGoalClosed,
     }
 
     async fn original_host_chain555(case: Case555) {
@@ -273,11 +275,20 @@ mod pre_effect_admission_555 {
         }
         let services = builder.build().unwrap();
         let provider_calls = Arc::new(AtomicUsize::new(0));
-        let policy = PermissionPolicy::new(if matches!(case, Case555::NativePreflightRefusal | Case555::BodyFailureBlockedWrite | Case555::ScopeRefusalBlockedWrite | Case555::BodyFailureBlockedChain) {
-            harness_contract::policy::PermissionMode::WorkspaceWrite
-        } else {
-            harness_contract::policy::PermissionMode::ReadOnly
-        });
+        let policy = PermissionPolicy::new(
+            if matches!(
+                case,
+                Case555::NativePreflightRefusal
+                    | Case555::BodyFailureBlockedWrite
+                    | Case555::ScopeRefusalBlockedWrite
+                    | Case555::BodyFailureBlockedChain
+                    | Case555::RootGoalClosed
+            ) {
+                harness_contract::policy::PermissionMode::WorkspaceWrite
+            } else {
+                harness_contract::policy::PermissionMode::ReadOnly
+            },
+        );
         let revision = policy.execution_policy_control().snapshot().revision;
         let session_store = Arc::new(crate::test_support::session_store());
         session_store
@@ -303,6 +314,7 @@ mod pre_effect_admission_555 {
             S01Client518(provider_calls.clone()),
             PinnedTools555 {
                 lease: host.host.pin_snapshot(),
+                root_closed: matches!(case, Case555::RootGoalClosed),
                 preflight: matches!(case, Case555::NativePreflightRefusal).then(|| {
                     (
                         services.commit_service().clone(),
@@ -343,6 +355,44 @@ mod pre_effect_admission_555 {
         let strategy = runtime
             .bind_turn_strategy_execution("471-turn", &graph.id)
             .unwrap();
+        let _root_scope = if matches!(case, Case555::RootGoalClosed) {
+            let objective = harness_contract::agent_action::root_objective_id(
+                &fixture.session.session_id,
+                "471-turn",
+            );
+            let goal: GoalContract = serde_json::from_value(serde_json::json!({
+                "id":format!("goal:{}",graph.id),"session_id":fixture.session.session_id,
+                "objective":"closed root must still publish a refusal transcript",
+                "criteria":[{"id":"checked","statement":"original work","status":"open"}],
+                "phase":"execution","spec_revision":1,"spec_digest":"root-closed-original",
+                "scope":"internal","completion":"open","revision":1,"user_sequence":1,
+                "execution_binding":{"objective_id":objective,"session_id":fixture.session.session_id,
+                    "turn_id":"471-turn","root_execution_id":graph.id,
+                    "agentic_program_id":harness_contract::agent_action::program_id_for_objective(&objective)}
+            })).unwrap();
+            let goal = services.goal_store().create(goal).unwrap();
+            services
+                .goal_store()
+                .complete(
+                    &goal.id,
+                    goal.revision,
+                    GoalCompletion::Cancelled,
+                    "original owner closed the Goal",
+                )
+                .unwrap();
+            Some(
+                runtime
+                    .cowd_bus()
+                    .unwrap()
+                    .enter_execution(crate::CowdExecutionContext {
+                        execution_id: graph.id.clone(),
+                        session_id: fixture.session.session_id.clone(),
+                        turn_id: "471-turn".into(),
+                    }),
+            )
+        } else {
+            None
+        };
         let lease = host.host.pin_snapshot();
         let advertised = lease
             .snapshot()
@@ -351,8 +401,14 @@ mod pre_effect_admission_555 {
             .into_iter()
             .filter(|definition| {
                 matches!(definition.name.as_str(), "workspace_snapshot" | "read_file")
-                    || (matches!(case, Case555::NativePreflightRefusal | Case555::BodyFailureBlockedWrite | Case555::ScopeRefusalBlockedWrite | Case555::BodyFailureBlockedChain)
-                        && definition.name == "edit")
+                    || (matches!(
+                        case,
+                        Case555::NativePreflightRefusal
+                            | Case555::BodyFailureBlockedWrite
+                            | Case555::ScopeRefusalBlockedWrite
+                            | Case555::BodyFailureBlockedChain
+                            | Case555::RootGoalClosed
+                    ) && definition.name == "edit")
             })
             .map(|definition| crate::ProviderToolDefinition {
                 name: definition.name,
@@ -362,7 +418,14 @@ mod pre_effect_admission_555 {
             .collect::<Vec<_>>();
         assert_eq!(
             advertised.len(),
-            if matches!(case, Case555::NativePreflightRefusal | Case555::BodyFailureBlockedWrite | Case555::ScopeRefusalBlockedWrite | Case555::BodyFailureBlockedChain) {
+            if matches!(
+                case,
+                Case555::NativePreflightRefusal
+                    | Case555::BodyFailureBlockedWrite
+                    | Case555::ScopeRefusalBlockedWrite
+                    | Case555::BodyFailureBlockedChain
+                    | Case555::RootGoalClosed
+            ) {
                 3
             } else {
                 2
@@ -416,6 +479,11 @@ mod pre_effect_admission_555 {
                 }
                 planned
             }
+            Case555::RootGoalClosed => vec![make_call(
+                "555-denied",
+                "edit",
+                serde_json::json!({"action":"write","path":"denied.txt","content":"must never execute"}),
+            )],
             Case555::AbsoluteRoot => vec![make_call(
                 "555-root",
                 "workspace_snapshot",
@@ -640,6 +708,112 @@ mod pre_effect_admission_555 {
             eprintln!("R1_HOST_619_ORIGINAL_DRIVE_FAILURE {body}");
         }
         driven.unwrap().unwrap();
+        if matches!(case, Case555::RootGoalClosed) {
+            let call = &calls[0];
+            let binding = call.binding.as_ref().unwrap();
+            let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+                &crate::tool_dispatch::ToolRequest {
+                    tool_use_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    input: call.input.clone(),
+                    depends_on: vec![],
+                },
+            );
+            request.session_id = Some(fixture.session.session_id.clone());
+            request.idempotency_key = binding.effect_idempotency_key();
+            request.step_binding = Some(binding.clone());
+            let context = crate::CowdExecutionContext {
+                execution_id: registered.id.clone(),
+                session_id: fixture.session.session_id.clone(),
+                turn_id: "471-turn".into(),
+            };
+            let descriptor = host
+                .host
+                .pin_snapshot()
+                .describe_effect(&call.name, &serde_json::from_str(&call.input).unwrap());
+            let error = services
+                .commit_service()
+                .preflight_fresh_root_tool(&request, &descriptor, &context)
+                .unwrap_err();
+            assert!(error
+                .pre_effect_refusal_for(&call.id, &call.name, &call.input, Some(binding))
+                .is_some());
+            assert!(crate::ToolError::new(error.to_string())
+                .pre_effect_refusal_for(&call.id, &call.name, &call.input, Some(binding))
+                .is_none());
+            assert!(error
+                .pre_effect_refusal_for("foreign-call", &call.name, &call.input, Some(binding))
+                .is_none());
+            assert!(error
+                .pre_effect_refusal_for(&call.id, "foreign-tool", &call.input, Some(binding))
+                .is_none());
+            assert!(error
+                .pre_effect_refusal_for(&call.id, &call.name, "{}", Some(binding))
+                .is_none());
+            for dimension in ["turn", "execution", "attempt", "policy"] {
+                let mut foreign = binding.clone();
+                let snapshot = Arc::make_mut(&mut foreign.snapshot);
+                match dimension {
+                    "turn" => snapshot.identity.turn_id.push_str(":foreign"),
+                    "execution" => {
+                        snapshot.identity.execution_id = Some("foreign-execution".into())
+                    }
+                    "attempt" => snapshot.provider_attempt.attempt_id.push_str(":foreign"),
+                    _ => {
+                        snapshot
+                            .related_revisions
+                            .insert("policy".into(), "foreign".into());
+                    }
+                }
+                assert!(
+                    error
+                        .pre_effect_refusal_for(&call.id, &call.name, &call.input, Some(&foreign))
+                        .is_none(),
+                    "{dimension}"
+                );
+            }
+            let mut unknown = context.clone();
+            unknown.execution_id.push_str(":unavailable");
+            let unknown = services
+                .commit_service()
+                .preflight_fresh_root_tool(&request, &descriptor, &unknown)
+                .unwrap_err();
+            assert!(unknown
+                .pre_effect_refusal_for(&call.id, &call.name, &call.input, Some(binding))
+                .is_none());
+            let mut prior = request.clone();
+            let prior_binding = crate::step_snapshot::StepCallBinding::provider(
+                step.clone(),
+                "independent-prior-intent",
+            );
+            prior.tool_use_id = prior_binding.origin.call_id.clone();
+            prior.idempotency_key = prior_binding.effect_idempotency_key();
+            prior.step_binding = Some(prior_binding.clone());
+            services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: format!("execution-effect:{}", prior.idempotency_key),
+                    scope: crate::RuntimeEventScope::ExecutionNode,
+                    kind: "execution.effect.intent".into(),
+                    status: Some("inflight".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload: serde_json::json!({"negative_fixture":"unresolved original history"}),
+                })
+                .unwrap();
+            let prior_error = services
+                .commit_service()
+                .preflight_fresh_root_tool(&prior, &descriptor, &context)
+                .unwrap_err();
+            assert!(prior_error
+                .pre_effect_refusal_for(
+                    &prior.tool_use_id,
+                    &prior.tool_name,
+                    &prior.input,
+                    Some(&prior_binding)
+                )
+                .is_none());
+        }
         let committed = services.graph_state_store().load(&registered.id).unwrap();
         let original_result = &committed.node_results[&node.id];
         let result_json = serde_json::to_string_pretty(original_result).unwrap();
@@ -698,15 +872,25 @@ mod pre_effect_admission_555 {
         let refusals = source.payload["no_dispatch"]["calls"].as_array();
         let refused = matches!(
             case,
-            Case555::OutsideRoot | Case555::Mixed | Case555::NativePreflightRefusal
-                | Case555::AuthorizationGap | Case555::MixedAuthorizationGap
-                | Case555::BodyFailureBlockedWrite | Case555::ScopeRefusalBlockedWrite | Case555::BodyFailureBlockedChain
+            Case555::OutsideRoot
+                | Case555::Mixed
+                | Case555::NativePreflightRefusal
+                | Case555::RootGoalClosed
+                | Case555::AuthorizationGap
+                | Case555::MixedAuthorizationGap
+                | Case555::BodyFailureBlockedWrite
+                | Case555::ScopeRefusalBlockedWrite
+                | Case555::BodyFailureBlockedChain
         );
         assert_eq!(
             services.commit_service()
                 .authenticated_no_dispatch_sources(&committed, &node.id, &binding)
                 .unwrap().is_some(),
             refused,
+            "case={case:?} no_dispatch={} body_calls={} result={}",
+            source.payload["no_dispatch"],
+            host.entered.load(Ordering::SeqCst),
+            source.payload["result"],
         );
         if refused {
             let refusals = refusals.expect("original canonical NoDispatch fact");
@@ -722,12 +906,18 @@ mod pre_effect_admission_555 {
         } else {
             assert!(source.payload["no_dispatch"].is_null());
         }
-        let expected_body_calls =
-            if matches!(case, Case555::OutsideRoot | Case555::NativePreflightRefusal | Case555::AuthorizationGap | Case555::ScopeRefusalBlockedWrite) {
-                0
-            } else {
-                1
-            };
+        let expected_body_calls = if matches!(
+            case,
+            Case555::OutsideRoot
+                | Case555::NativePreflightRefusal
+                | Case555::AuthorizationGap
+                | Case555::ScopeRefusalBlockedWrite
+                | Case555::RootGoalClosed
+        ) {
+            0
+        } else {
+            1
+        };
         assert_eq!(host.entered.load(Ordering::SeqCst), expected_body_calls);
         for call in &calls {
             let key = call.binding.as_ref().unwrap().effect_idempotency_key();
@@ -820,6 +1010,11 @@ mod pre_effect_admission_555 {
     #[tokio::test]
     async fn real_host_555_relative_workspace_root_retains_existing_admission_and_receipt() {
         original_host_chain555(Case555::RelativeRoot).await;
+    }
+
+    #[tokio::test]
+    async fn root_goal_refusal_closes_original_host_binding_without_a_tool_body_or_provider() {
+        original_host_chain555(Case555::RootGoalClosed).await;
     }
 
     #[tokio::test]

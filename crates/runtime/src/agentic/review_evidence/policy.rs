@@ -546,6 +546,7 @@ pub(crate) fn committed_proof_sources(
 #[derive(Clone, Copy)]
 enum PinnedEventProjection {
     Effects,
+    EffectsAndPlans,
     ReceiptIndexEffects,
     ReadDelivery,
 }
@@ -642,7 +643,7 @@ fn pinned_stream_events(
                     continue;
                 }
             } else if event.kind == "tool.execution_plan.created" {
-                if event.payload["tasks"].as_array().is_some_and(|tasks| {
+                if !matches!(projection, PinnedEventProjection::EffectsAndPlans) && event.payload["tasks"].as_array().is_some_and(|tasks| {
                     tasks.iter().all(|task| {
                         task["tool_name"].as_str().is_some_and(goal_metadata_tool)
                             || task["effect"]["effect_kind"] == "read"
@@ -3393,17 +3394,18 @@ fn is_authenticated_control_effect(
 /// it through their Step binding. A malformed or absent binding names no
 /// authenticated control effect and therefore remains in the manifest.
 fn required_effect_identity(payload: &serde_json::Value) -> Option<String> {
+    // A governed plan Task's idempotency_key is a legacy plan correlation,
+    // not the Runtime effect identity. The original Step is canonical. A
+    // malformed claimed Step must never fall back to a control-looking key.
+    if let Some(step) = payload.get("step_binding") {
+        return serde_json::from_value::<crate::step_snapshot::StepCallBinding>(step.clone())
+            .ok()
+            .map(|step| step.effect_idempotency_key());
+    }
     payload["idempotency_key"]
         .as_str()
         .filter(|identity| !identity.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            serde_json::from_value::<crate::step_snapshot::StepCallBinding>(
-                payload["step_binding"].clone(),
-            )
-            .ok()
-            .map(|step| step.effect_idempotency_key())
-        })
+        .map(str::to_owned)
 }
 
 /// Remove only effects whose authenticated identity is a settled runtime
@@ -3413,9 +3415,17 @@ fn required_effect_identity(payload: &serde_json::Value) -> Option<String> {
 fn strip_authenticated_runtime_control_effects(
     required_effects: &mut std::collections::BTreeMap<String, serde_json::Value>,
     runtime_control_keys: &BTreeSet<String>,
+    lifecycle_keys: &std::collections::BTreeMap<String, String>,
 ) {
-    required_effects.retain(|_, payload| {
+    required_effects.retain(|event_id, payload| {
         required_effect_identity(payload)
+            .or_else(|| {
+                (!payload
+                    .as_object()
+                    .is_some_and(|fields| fields.contains_key("step_binding")))
+                .then(|| lifecycle_keys.get(event_id).cloned())
+                .flatten()
+            })
             .is_none_or(|identity| !runtime_control_keys.contains(&identity))
     });
 }
@@ -4318,7 +4328,13 @@ fn proof_input_snapshot_for_phase(
             .commit_cursor;
         start_cursor = start_cursor.min(cursor);
     }
-    let session_events = pinned_events(store, &session, &mut sources, start_cursor)?;
+    let session_events = pinned_stream_events(
+        store,
+        &session,
+        &mut sources,
+        start_cursor,
+        PinnedEventProjection::EffectsAndPlans,
+    )?;
     let strategy = session_events.iter().find(|event| {
         event.kind.starts_with("runtime.strategy.")
             && event.actor.as_deref() == Some("conversation_runtime.strategy_owner")
@@ -5057,6 +5073,58 @@ fn proof_input_snapshot_for_phase(
         live_identity,
         rebound_identity,
     )?;
+    // Graph lifecycle is not business work, but an unrelated graph advance
+    // cannot borrow the review's exemption. Keep the current revision in the
+    // original CAS even when this exact retirement has no semantic effect.
+    let mut absorbed_graph_sources = std::collections::BTreeMap::new();
+    for (source, pinned) in &inputs.source_revisions {
+        if !visited.contains(source) {
+            continue;
+        }
+        let current = *sources
+            .get(source)
+            .ok_or("proof graph source is not pinned")?;
+        if current == *pinned {
+            continue;
+        }
+        if reviewer_delivery_packet
+            .as_ref()
+            .is_none_or(|packet| packet.graph_id() != source)
+        {
+            if !super::current_review::graph_tail_preserves_work(
+                store,
+                source,
+                *pinned,
+                current,
+                &session_events,
+            )? {
+                return Err(format!(
+                    "proof foreign graph work changed; {}",
+                    super::describe_source_advance(store, source, *pinned)
+                ));
+            }
+            // Parent model/ToolBatch continuations are execution trace. Their
+            // real effects and immutable material are checked below; a raw
+            // lifecycle revision is not itself a new business effect.
+            continue;
+        }
+        if current_review_effect_key.is_none()
+            || !super::current_review::graph_tail_is_own_review_retirement(
+                store,
+                program,
+                source,
+                *pinned,
+                current,
+                reviewer_delivery_packet.as_ref(),
+            )?
+        {
+            return Err(format!(
+                "proof graph source changed outside its own review retirement; {}",
+                super::describe_source_advance(store, source, *pinned)
+            ));
+        }
+        absorbed_graph_sources.insert(source.clone(), *pinned);
+    }
     let deliveries = review_delivery_snapshot(
         store,
         program,
@@ -5440,7 +5508,7 @@ fn proof_input_snapshot_for_phase(
         let current = store
             .stream_revision(source)
             .map_err(|error| error.to_string())?;
-        if current != *revision {
+        if current != *revision && absorbed_graph_sources.get(source) != Some(revision) {
             return Err("proof external decision source changed".into());
         }
         sources.insert(source.clone(), current);
@@ -5463,6 +5531,7 @@ fn proof_input_snapshot_for_phase(
     );
     let mut relevant_writes = Vec::new();
     let mut runtime_control_keys = BTreeSet::new();
+    let mut lifecycle_keys = std::collections::BTreeMap::new();
     let mut last_effect_cursor = 0;
     for source in receipt_sources {
         let owners = candidate_sources.get(&source);
@@ -5770,6 +5839,9 @@ fn proof_input_snapshot_for_phase(
                     .map_err(|_| "root effect lifecycle has an invalid original Step")
                 })
                 .transpose()?;
+            if let Some(key) = &call_key {
+                lifecycle_keys.insert(event.event_id.clone(), key.clone());
+            }
             let auxiliary = call_key
                 .as_ref()
                 .map(|key| authenticated_process_for_key(store, key, &mut sources))
@@ -5883,7 +5955,11 @@ fn proof_input_snapshot_for_phase(
             ));
         }
     }
-    strip_authenticated_runtime_control_effects(&mut required_effects, &runtime_control_keys);
+    strip_authenticated_runtime_control_effects(
+        &mut required_effects,
+        &runtime_control_keys,
+        &lifecycle_keys,
+    );
     let effect_digest = super::proof_value_digest(&required_effects);
     let semantic_digest = super::proof_value_digest(&serde_json::json!({
         "domain":"cowd.proof.inputs.v2","goal_revision":proof.goal_spec_revision,
@@ -6601,6 +6677,7 @@ pub(crate) fn effect_review_snapshot(
 
 #[cfg(test)]
 mod tests {
+    include!("policy_control_identity_tests.rs");
     use super::*;
     use harness_contract::{policy::*, tool::*};
 
@@ -6685,7 +6762,11 @@ mod tests {
         ]);
         let controls = BTreeSet::from([control.to_string()]);
 
-        strip_authenticated_runtime_control_effects(&mut required, &controls);
+        strip_authenticated_runtime_control_effects(
+            &mut required,
+            &controls,
+            &std::collections::BTreeMap::new(),
+        );
 
         assert_eq!(
             required.keys().cloned().collect::<Vec<_>>(),
@@ -6695,6 +6776,43 @@ mod tests {
                 "physical-envelope".to_string(),
             ],
             "the manifest drops only identities already authenticated as controls",
+        );
+    }
+
+    #[test]
+    fn r1_authenticated_control_lifecycle_uses_original_plan_identity() {
+        let mut required = std::collections::BTreeMap::from([
+            (
+                "own-start".into(),
+                serde_json::json!({"tool_name":"task_withdraw"}),
+            ),
+            (
+                "own-end".into(),
+                serde_json::json!({"tool_name":"task_withdraw"}),
+            ),
+            (
+                "foreign-end".into(),
+                serde_json::json!({"tool_name":"task_withdraw"}),
+            ),
+            (
+                "business-end".into(),
+                serde_json::json!({"tool_name":"write_file"}),
+            ),
+        ]);
+        let aliases = std::collections::BTreeMap::from([
+            ("own-start".into(), "authenticated-control".into()),
+            ("own-end".into(), "authenticated-control".into()),
+            ("business-end".into(), "business-write".into()),
+        ]);
+        strip_authenticated_runtime_control_effects(
+            &mut required,
+            &BTreeSet::from(["authenticated-control".into()]),
+            &aliases,
+        );
+        assert_eq!(
+            required.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["business-end", "foreign-end"],
+            "a control name grants no exemption; the authenticated original call does"
         );
     }
 

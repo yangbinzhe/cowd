@@ -350,9 +350,7 @@ pub(crate) fn decode_terminal_payload(
             "terminal transcript final assistant row does not contain terminal text".to_string(),
         ));
     }
-    if terminal.token_usage_json.is_none() {
-        terminal.token_usage_json = token_usage_json.clone();
-    }
+    account_terminal_usage(&mut decoded, payload.get("token_usage").unwrap())?;
     Ok(DecodedTerminalPayload {
         text,
         token_usage_json,
@@ -362,6 +360,78 @@ pub(crate) fn decode_terminal_payload(
         terminal_presentation,
         goal_completion,
     })
+}
+
+// Session summaries sum message usage. The terminal aggregate includes child
+// executions and is cumulative, whereas transcript rows carry per-call usage.
+// Charge its remainder exactly once while retaining the original final call.
+fn account_terminal_usage(
+    transcript: &mut [DecodedTerminalTranscriptMessage],
+    aggregate: &serde_json::Value,
+) -> Result<(), (runtime::RuntimeSessionOutboxFailureClass, String)> {
+    let corrupt = |reason: &str| {
+        (
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            format!("terminal usage accounting: {reason}"),
+        )
+    };
+    let (last, preceding) = transcript
+        .split_last_mut()
+        .ok_or_else(|| corrupt("empty transcript"))?;
+    let provider_usage = last
+        .token_usage_json
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|_| corrupt("invalid original Provider usage"))?;
+    let mut remainder = aggregate
+        .as_object()
+        .cloned()
+        .ok_or_else(|| corrupt("missing aggregate"))?;
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ] {
+        let Some(total) = aggregate.get(field).and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let mut measured = 0u64;
+        for message in preceding.iter() {
+            if let Some(usage) = message.token_usage_json.as_deref() {
+                let usage: serde_json::Value = serde_json::from_str(usage)
+                    .map_err(|_| corrupt("invalid preceding Provider usage"))?;
+                measured = measured
+                    .checked_add(
+                        usage
+                            .get(field)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                    .ok_or_else(|| corrupt("message usage overflow"))?;
+            }
+        }
+        let remaining = total
+            .checked_sub(measured)
+            .ok_or_else(|| corrupt("aggregate is below measured calls"))?;
+        if provider_usage
+            .as_ref()
+            .and_then(|usage| usage.get(field))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|original| original > remaining)
+        {
+            return Err(corrupt("aggregate is below final Provider call"));
+        }
+        remainder.insert(field.into(), remaining.into());
+    }
+    remainder.insert("accounting_scope".into(), "terminal_remainder".into());
+    if let Some(provider_usage) = provider_usage {
+        remainder.insert("provider_call_usage".into(), provider_usage);
+    }
+    last.token_usage_json =
+        Some(serde_json::to_string(&remainder).map_err(|_| corrupt("encode remainder"))?);
+    Ok(())
 }
 
 fn decode_terminal_usage(
@@ -415,4 +485,216 @@ fn decode_terminal_usage(
             error.to_string(),
         )
     })
+}
+
+#[cfg(test)]
+mod terminal_accounting_tests {
+    use super::*;
+    fn rows() -> Vec<DecodedTerminalTranscriptMessage> {
+        [(10, 3), (6, 2)]
+            .into_iter()
+            .map(|(input, output)| DecodedTerminalTranscriptMessage {
+                role: "assistant".into(),
+                content_json: "[]".into(),
+                blocks_count: 0,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: Some(
+                    serde_json::json!({"input_tokens":input,"output_tokens":output}).to_string(),
+                ),
+            })
+            .collect()
+    }
+    fn usage(row: &DecodedTerminalTranscriptMessage) -> serde_json::Value {
+        serde_json::from_str(row.token_usage_json.as_deref().unwrap()).unwrap()
+    }
+    #[test]
+    fn terminal_accounting_includes_children_once_and_preserves_provider_usage() {
+        let mut transcript = rows();
+        account_terminal_usage(&mut transcript, &serde_json::json!({"input_tokens":26,"output_tokens":9,"cache_dimensions_known":false})).unwrap();
+        assert_eq!(
+            usage(&transcript[0]),
+            serde_json::json!({"input_tokens":10,"output_tokens":3})
+        );
+        assert_eq!(
+            usage(&transcript[1]),
+            serde_json::json!({"input_tokens":16,"output_tokens":6,
+            "cache_dimensions_known":false,"accounting_scope":"terminal_remainder",
+            "provider_call_usage":{"input_tokens":6,"output_tokens":2}})
+        );
+        assert_eq!(
+            usage(&transcript[0])["input_tokens"].as_u64().unwrap()
+                + usage(&transcript[1])["input_tokens"].as_u64().unwrap(),
+            26
+        );
+    }
+    #[test]
+    fn terminal_accounting_root_only_does_not_double_count_the_aggregate() {
+        let mut transcript = rows();
+        account_terminal_usage(
+            &mut transcript,
+            &serde_json::json!({"input_tokens":16,"output_tokens":5}),
+        )
+        .unwrap();
+        assert_eq!(usage(&transcript[1])["input_tokens"], 6);
+        assert_eq!(usage(&transcript[1])["output_tokens"], 2);
+        transcript[1].token_usage_json = None;
+        account_terminal_usage(
+            &mut transcript,
+            &serde_json::json!({"input_tokens":16,"output_tokens":5}),
+        )
+        .unwrap();
+        assert_eq!(usage(&transcript[1])["input_tokens"], 6);
+    }
+    #[test]
+    fn terminal_accounting_rejects_totals_below_original_calls() {
+        for total in [9, 15] {
+            assert!(account_terminal_usage(
+                &mut rows(),
+                &serde_json::json!({"input_tokens":total,"output_tokens":5})
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn terminal_accounting_decoder_wires_cumulative_totals_to_session_rows() {
+        let mut payload =
+            crate::current_terminal_fixture::current_payload("terminal", "ingress", 1, "done");
+        payload["token_usage"] =
+            serde_json::json!({"input_tokens":26,"output_tokens":9,"cache_dimensions_known":false});
+        payload["transcript"] = serde_json::json!([
+            {"role":"assistant","blocks":[{"type":"text","text":"working"}],"usage":{"input_tokens":10,"output_tokens":3}},
+            {"role":"assistant","blocks":[{"type":"text","text":"done"}],"usage":{"input_tokens":6,"output_tokens":2}}
+        ]);
+        let decoded = decode_terminal_payload(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        let rows = decoded.transcript.unwrap();
+        assert_eq!(usage(&rows[0])["input_tokens"], 10);
+        assert_eq!(usage(&rows[1])["input_tokens"], 16);
+        assert_eq!(usage(&rows[1])["provider_call_usage"]["input_tokens"], 6);
+        assert_eq!(usage(&rows[1])["output_tokens"], 6);
+        payload["token_usage"]["input_tokens"] = 15.into();
+        assert!(decode_terminal_payload(&serde_json::to_vec(&payload).unwrap()).is_err());
+    }
+    #[tokio::test]
+    async fn terminal_accounting_session_summary_counts_the_remainder_once() {
+        let store = crate::pg_test_support::session_store();
+        let session_id = "terminal-accounting-original";
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: session_id.into(),
+                platform: "test".into(),
+                chat_id: session_id.into(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".into(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".into(),
+            })
+            .await
+            .unwrap();
+        let mut transcript = rows();
+        account_terminal_usage(
+            &mut transcript,
+            &serde_json::json!({"input_tokens":26,"output_tokens":9}),
+        )
+        .unwrap();
+        let messages = transcript
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, row)| session::SessionMessage {
+                stable_message_id: format!("terminal-accounting:{sequence}"),
+                session_id: session_id.into(),
+                sequence,
+                role: row.role,
+                content_json: row.content_json,
+                blocks_count: row.blocks_count,
+                tool_use_id: row.tool_use_id,
+                tool_name: row.tool_name,
+                token_usage_json: row.token_usage_json,
+                created_at_ms: 1,
+            })
+            .collect::<Vec<_>>();
+        // The ordinary batch insert is a raw repository operation. Counters
+        // and exact replay belong to the original fenced terminal transaction.
+        let request = session::SessionRuntimeOutboxRequest {
+            input_id: "accounting-input".into(),
+            request_id: "accounting-request".into(),
+            turn_id: "accounting-turn".into(),
+            message_id: "accounting-ingress".into(),
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
+            task_route_hint: None,
+            created_at_ms: 100,
+            runtime_options_json: None,
+        };
+        store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                Some(r#"[{"type":"text","text":"input"}]"#),
+                100,
+                &request,
+            )
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("accounting-worker", 101, 10000, 1, &[])
+            .await
+            .unwrap()
+            .remove(0);
+        let token = claimed.claim_token.clone().unwrap();
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &request.request_id,
+                "accounting-worker",
+                1,
+                &token,
+                claimed.revision,
+                102,
+            )
+            .await
+            .unwrap();
+        let commit = session::SessionTerminalTranscriptCommit {
+            terminal_message_id: "terminal-accounting:1".into(),
+            ingress_message_id: request.message_id,
+            session_id: session_id.into(),
+            turn_id: request.turn_id,
+            messages,
+            runtime_commit_cursor: 42,
+            consumed_input_sequence: running.sequence,
+            created_at_ms: 103,
+            fence: session::SessionTerminalExecutionFence {
+                request_id: request.request_id,
+                input_sequence: running.sequence,
+                session_generation: 1,
+                claim_owner: "accounting-worker".into(),
+                claim_token: token,
+                claim_fence_epoch: running.claim_fence_epoch.unwrap(),
+            },
+        };
+        for replay in [false, true] {
+            let receipt = store
+                .commit_terminal_transcript_if_fenced(&commit)
+                .await
+                .unwrap();
+            assert_eq!(receipt.inserted, !replay);
+            let actual = store.get_session(session_id).await.unwrap().unwrap();
+            assert_eq!(
+                (
+                    actual.input_tokens,
+                    actual.output_tokens,
+                    actual.message_count
+                ),
+                (26, 9, 3)
+            );
+        }
+    }
 }

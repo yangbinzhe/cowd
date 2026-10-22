@@ -4912,6 +4912,69 @@ impl ExecutionCommitService {
         self.begin_tool_effect_scoped_observed(request, effect, root, scope, root_owner, None)
     }
 
+    // This call-bound token is evidence from a pre-dispatch refusal, never a
+    // durable NoDispatch fact. Graph publication and closure re-read the exact
+    // physical streams and carry their zero revisions in the original CAS.
+    fn pre_effect_refusal_error(
+        request: &crate::RuntimeToolExecutionRequest,
+        error: ExecutionCommitError,
+        known_refusal_without_history: bool,
+    ) -> crate::ToolError {
+        if known_refusal_without_history {
+            if let Some(binding) = request.step_binding.as_ref().filter(|binding| {
+                request.tool_use_id == binding.origin.call_id
+                    && request.idempotency_key == binding.effect_idempotency_key()
+            }) {
+                return crate::ToolError::from_pre_effect_refusal(
+                    PreEffectRefusal {
+                        call_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        input_sha256: crate::context_evidence::read_sha256(
+                            request.input.as_bytes(),
+                        ),
+                        effect_key: request.idempotency_key.clone(),
+                        binding: binding.clone(),
+                        reason: error.to_string(),
+                    },
+                    error.to_string(),
+                );
+            }
+        }
+        crate::ToolError::new(error.to_string())
+    }
+
+    pub(crate) fn preflight_fresh_root_tool(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        root: &crate::CowdExecutionContext,
+    ) -> Result<(), crate::ToolError> {
+        if self
+            .completed_tool_effect(request, effect)
+            .map_err(|error| crate::ToolError::new(error.to_string()))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let head = self
+            .event_store
+            .stream_revision(&format!("execution-effect:{}", request.idempotency_key))
+            .map_err(|error| crate::ToolError::new(error.to_string()))?;
+        let refusal = std::cell::Cell::new(false);
+        self.root_effect_authority_with_refusal(root, &|_| refusal.set(true))
+            .map(|_| ())
+            .map_err(|error| {
+                Self::pre_effect_refusal_error(
+                    request,
+                    error,
+                    head == 0
+                        && refusal.get()
+                        && request.session_id.as_deref() == Some(root.session_id.as_str())
+                        && request.parent_execution.is_none(),
+                )
+            })
+    }
+
     pub(crate) fn preflight_fresh_bound_tool(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
@@ -4928,41 +4991,16 @@ impl ExecutionCommitService {
             self.validate_system_tool_parent_scoped(request, None)
                 .map_err(|error| crate::ToolError::new(error.to_string()))
         } else {
-            let prior_intent = self
+            let head = self
                 .event_store
-                .event_by_idempotency_key(
-                    &format!("execution-effect:{}", request.idempotency_key),
-                    &format!("{}:intent", request.idempotency_key),
-                )
+                .stream_revision(&format!("execution-effect:{}", request.idempotency_key))
                 .map_err(|error| crate::ToolError::new(error.to_string()))?;
-            let refusal = std::cell::RefCell::new(None);
-            self.tool_effect_authority_with_refusal(request, &|message| {
-                *refusal.borrow_mut() = Some(message.to_string());
-            })
-            .map(|_| ())
-            .map_err(|error| {
-                if prior_intent.is_none() && refusal.borrow().is_some() {
-                    if let Some(binding) = request.step_binding.as_ref().filter(|binding| {
-                        request.tool_use_id == binding.origin.call_id
-                            && request.idempotency_key == binding.effect_idempotency_key()
-                    }) {
-                        return crate::ToolError::from_pre_effect_refusal(
-                            PreEffectRefusal {
-                                call_id: request.tool_use_id.clone(),
-                                tool_name: request.tool_name.clone(),
-                                input_sha256: crate::context_evidence::read_sha256(
-                                    request.input.as_bytes(),
-                                ),
-                                effect_key: request.idempotency_key.clone(),
-                                binding: binding.clone(),
-                                reason: error.to_string(),
-                            },
-                            error.to_string(),
-                        );
-                    }
-                }
-                crate::ToolError::new(error.to_string())
-            })
+            let refusal = std::cell::Cell::new(false);
+            self.tool_effect_authority_with_refusal(request, &|_| refusal.set(true))
+                .map(|_| ())
+                .map_err(|error| {
+                    Self::pre_effect_refusal_error(request, error, head == 0 && refusal.get())
+                })
         }
     }
 
@@ -11510,6 +11548,15 @@ mod recovery_physical_450_tests {
 
     #[test]
     fn r1_591_legacy_original_step_fences_primary_history_across_owner_indexes() {
+        original_step_primary_race(false);
+    }
+
+    #[test]
+    fn root_refusal_empty_cut_cannot_close_after_a_competing_original_call_intent() {
+        original_step_primary_race(true);
+    }
+
+    fn original_step_primary_race(concurrent: bool) {
         use crate::execution_core::graph::executors::agent_tool::{
             no_dispatch_calls, NoDispatchFact,
         };
@@ -11597,10 +11644,23 @@ mod recovery_physical_450_tests {
             request.session_id = Some("session-591".into());
             request.idempotency_key = binding.effect_idempotency_key();
             request.step_binding = Some(binding.clone());
-            assert!(matches!(
-                commits.begin_tool_effect(&request, &effect).unwrap(),
-                ToolEffectState::Fresh
-            ));
+            let admission = if concurrent {
+                // Deterministically insert the same canonical call's intent
+                // after the consumer captured an empty physical cut, before
+                // its publication CAS. No sleep or tool-name oracle.
+                let gate = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    let producer = scope.spawn(|| {
+                        gate.wait();
+                        commits.begin_tool_effect(&request, &effect)
+                    });
+                    gate.wait();
+                    producer.join().unwrap().unwrap()
+                })
+            } else {
+                commits.begin_tool_effect(&request, &effect).unwrap()
+            };
+            assert!(matches!(admission, ToolEffectState::Fresh));
             let intent = events
                 .event_by_idempotency_key(&primary, &format!("{}:intent", request.idempotency_key))
                 .unwrap()

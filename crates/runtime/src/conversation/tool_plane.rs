@@ -1607,6 +1607,30 @@ where
         {
             return replay_tool_output(crate::bound_tool_batch::retained_replay_outcome(outcome));
         }
+        if let Some(root) = root {
+            commit.preflight_fresh_root_tool(request, descriptor, root)?;
+        }
+        let retain_refusal = |error: ToolError| {
+            // A scope/resource wait can race closure of the original owner.
+            // The original NoDispatch consumer still proves the empty history
+            // under its source CAS; this token alone grants no closure.
+            if let Some(root) = root {
+                if let Err(refusal) = commit.preflight_fresh_root_tool(request, descriptor, root) {
+                    if refusal
+                        .pre_effect_refusal_for(
+                            &request.tool_use_id,
+                            &request.tool_name,
+                            &request.input,
+                            request.step_binding.as_ref(),
+                        )
+                        .is_some()
+                    {
+                        return refusal;
+                    }
+                }
+            }
+            error
+        };
         if request.tool_name == "execute_code" {
             let lease = self.tool_executor.bounded_process_lease(request)?;
             let authority = self.tool_executor.bounded_process_authority(request)?;
@@ -1627,7 +1651,8 @@ where
                 root.cloned(),
                 owner.cloned(),
             )
-            .await?;
+            .await
+            .map_err(&retain_refusal)?;
             return replay_tool_output(outcome);
         }
         if root.is_none() && descriptor.effect_kind != harness_contract::tool::ToolEffectKind::Read
@@ -1670,7 +1695,7 @@ where
         } else {
             commit.begin_bound_tool_effect(request, descriptor, &locked.scope)
         }
-        .map_err(|error| ToolError::new(error.to_string()))?;
+        .map_err(|error| retain_refusal(ToolError::new(error.to_string())))?;
         match state {
             crate::execution_core::graph::ToolEffectState::Completed(outcome) => {
                 return replay_tool_output(crate::bound_tool_batch::retained_replay_outcome(

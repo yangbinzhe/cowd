@@ -846,6 +846,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
         let terminal_ref = format!("agent-terminal:{}", packet.run_id());
+        // The fixture pause is inside the actual backend future, while its
+        // active-run cleanup and original AgentRuntime exit owner are alive.
+        // Business ToolHost receipts are already complete at this point.
+        #[cfg(any(test, feature = "test-fixtures"))]
+        let _fixture_exit_hold = super::exit_hold::enter(&packet).await;
         match status {
             AgentTerminalStatus::Completed => services.complete_agent_live_execution(
                 packet.run_id(),

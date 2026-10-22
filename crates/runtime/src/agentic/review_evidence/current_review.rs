@@ -18,6 +18,10 @@
 
 use std::collections::BTreeSet;
 
+#[path = "current_review_retirement.rs"]
+mod retirement;
+pub(crate) use retirement::{graph_tail_is_own_review_retirement, graph_tail_preserves_work};
+
 use harness_contract::agent::AgentTaskPacket;
 use harness_contract::agent_action::{
     AgentAction, AgentActorBinding, OBJECTIVE_REVIEW_TOOL_ID, TASK_REVIEW_TOOL_ID,
