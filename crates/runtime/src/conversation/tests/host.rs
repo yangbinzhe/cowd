@@ -688,3 +688,150 @@ fn same_state_publication_discovery_is_advisory_not_forced_business_debt() {
         state["remaining"][0]["publication_route"]);
     assert_eq!(context["final_wire_inventory"], "unknown_until_provider_compilation");
 }
+
+fn n1_host_admission_fixture() -> (
+    tempfile::TempDir,
+    std::sync::Arc<crate::RuntimeServices>,
+    std::sync::Arc<crate::runtime_event_store::EphemeralRuntimeEventStore>,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let backend =
+        std::sync::Arc::new(crate::runtime_event_store::EphemeralRuntimeEventStore::new());
+    let events = std::sync::Arc::new(crate::RuntimeEventStore::from_backend(backend.clone()));
+    let services = crate::RuntimeServices::test_builder(root.path().join("home"), workspace)
+        .runtime_event_store(events)
+        .build()
+        .unwrap();
+    (root, services, backend)
+}
+
+fn n1_host_admission_graph(objective: &str) -> harness_contract::execution_graph::ExecutionGraph {
+    use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec};
+    let mut graph = ExecutionGraph::new(objective);
+    crate::test_support::attach_execution_graph_lineage(&mut graph);
+    graph.nodes.push(ExecutionNodeSpec::new(
+        ExecutionNodeKind::Synthesize,
+        "synthesize",
+        "{}",
+    ));
+    graph
+}
+
+#[tokio::test]
+async fn n1_host_attachment_recovers_original_graph_without_registering_replacement() {
+    let (_root, services, _) = n1_host_admission_fixture();
+    let installed = std::cell::Cell::new(false);
+    let graph = n1_host_admission_graph("original Host graph");
+    let id = graph.id.clone();
+    let (registered, recovering) =
+        super::attach_conversation_graph(&services, graph, None, true, || installed.set(true))
+            .await
+            .unwrap();
+    assert!(!recovering);
+    assert!(installed.get());
+    assert_eq!(registered.id, id);
+    assert_eq!(registered.objective, "original Host graph");
+    let mut proposed = registered.clone();
+    proposed.objective = "replacement must not overwrite durable work".into();
+    installed.set(false);
+    let (recovered, recovering) =
+        super::attach_conversation_graph(&services, proposed, None, true, || installed.set(true))
+            .await
+            .unwrap();
+    assert!(recovering);
+    assert!(installed.get());
+    assert_eq!(recovered.id, id);
+    assert_eq!(recovered.objective, "original Host graph");
+    assert_eq!(recovered.lineage, registered.lineage);
+    services.shutdown_execution().await;
+}
+
+#[tokio::test]
+async fn n1_host_attachment_rejects_actual_corrupt_read_before_resolver_or_registration() {
+    use crate::RuntimeEventStoreBackend;
+    let (_root, services, backend) = n1_host_admission_fixture();
+    let graph = n1_host_admission_graph("corrupt durable source");
+    let id = graph.id.clone();
+    // Keep the genuine content/scope envelope. Inject an unsupported first
+    // record into the target stream below the graph writer, so the durable
+    // stream has no valid genesis while content authentication stays intact.
+    let donor = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+    crate::ExecutionCommitService::new(donor.clone())
+        .register_graph(graph.clone())
+        .unwrap();
+    let record = donor.list_stream(&id).unwrap().remove(0);
+    assert_eq!(record.payload["body"]["kind"], "inline");
+    backend
+        .append_transaction(crate::AppendTransactionRequest {
+            transaction_id: "n1-host-unsupported-genesis".into(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: id.clone(),
+                expected_revision: 0,
+            }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: id.clone(),
+                    scope: record.scope,
+                    kind: "execution_graph.unsupported_test_frame".into(),
+                    status: record.status,
+                    actor: record.actor,
+                    refs: record.refs,
+                    payload: record.payload,
+                },
+                idempotency_key: None,
+                schema_version: record.schema_version,
+            }],
+        })
+        .unwrap();
+    assert!(matches!(
+        services.graph_state_store().load_async(&id).await,
+        Err(crate::execution_core::graph::ExecutionStateStoreError::Corrupt { .. })
+    ));
+    let before = services.event_store().durable_commit_cursor().unwrap();
+    let result = super::attach_conversation_graph(&services, graph, None, true, || {
+        panic!("a failed source read must not install resolvers or register a graph")
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        services.event_store().durable_commit_cursor().unwrap(),
+        before
+    );
+    assert_eq!(services.event_store().stream_revision(&id).unwrap(), 1);
+    services.shutdown_execution().await;
+}
+
+#[tokio::test]
+async fn n1_host_attachment_rejects_foreign_root_before_recovery_mutation() {
+    let (_root, services, _) = n1_host_admission_fixture();
+    let (registered, _) = super::attach_conversation_graph(
+        &services,
+        n1_host_admission_graph("bound original root"),
+        None,
+        true,
+        || {},
+    )
+    .await
+    .unwrap();
+    let before = services.event_store().durable_commit_cursor().unwrap();
+    let mut foreign = registered.clone();
+    foreign.lineage.as_mut().unwrap().session_id = "another-session".into();
+    let result = super::attach_conversation_graph(&services, foreign, None, true, || {
+        panic!("foreign root identity must be rejected before resolver installation or recovery")
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        services.event_store().durable_commit_cursor().unwrap(),
+        before
+    );
+    let retained = services
+        .graph_state_store()
+        .load_async(&registered.id)
+        .await
+        .unwrap();
+    assert_eq!(retained.lineage, registered.lineage);
+    services.shutdown_execution().await;
+}

@@ -1524,54 +1524,39 @@ where
             .lock()
             .await
             .restore_controlled_recovery_claims_for_turn(&session_id, &turn_ref, &graph_id)?;
-        let persisted_graph = match services.graph_state_store().load_async(&graph_id).await {
-            Ok(graph) => Some(graph),
-            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => None,
-            Err(error) => return Err(RuntimeError::new(error.to_string())),
-        };
-        services
-            .model_step_executor()
-            .install_resolver(Arc::new(TurnModelResolver {
-                session_id: session_id.clone(),
-                graph_id: graph_id.clone(),
-                runtime: Arc::downgrade(&runtime),
-                state: Arc::downgrade(&state),
-                services: Arc::downgrade(&services),
-            }));
-        services
-            .tool_batch_executor()
-            .install_resolver(Arc::new(TurnToolResolver {
-                session_id: session_id.clone(),
-                graph_id: graph_id.clone(),
-                runtime: Arc::downgrade(&runtime),
-                state: Arc::downgrade(&state),
-                services: Arc::downgrade(&services),
-            }));
-        services
-            .synthesize_executor()
-            .install_resolver(Arc::new(TurnSynthesizeResolver {
-                session_id: session_id.clone(),
-                graph_id: graph_id.clone(),
-                runtime: Arc::downgrade(&runtime),
-                state: Arc::downgrade(&state),
-                services: Arc::downgrade(&services),
-            }));
-        let recovering = persisted_graph.is_some();
-        let mut registered = if recovering {
-            let recovered = services.execution_supervisor().recover_graph(&graph_id)
-                .await.map_err(|error| RuntimeError::new(error.to_string()))?;
-            if execution_role == TurnExecutionRole::RootTurn && ingress.is_none()
-                && (recovered.lineage != graph.lineage
-                    || recovered.parent_execution != graph.parent_execution)
-            {
-                return Err(RuntimeError::new("recovered direct root identity mismatch"));
-            }
-            recovered
-        } else {
-            services.execution_supervisor()
-                .register_continuation_graph(graph, continuation_actor)
-                .await.map_err(|error| RuntimeError::new(error.to_string()))?
-        };
+        let (mut registered, recovering) = attach_conversation_graph(
+            services.as_ref(), graph, continuation_actor,
+            execution_role == TurnExecutionRole::RootTurn && ingress.is_none(),
+            || {
+            services
+                .model_step_executor()
+                .install_resolver(Arc::new(TurnModelResolver {
+                    session_id: session_id.clone(),
+                    graph_id: graph_id.clone(),
+                    runtime: Arc::downgrade(&runtime),
+                    state: Arc::downgrade(&state),
+                    services: Arc::downgrade(&services),
+                }));
+            services
+                .tool_batch_executor()
+                .install_resolver(Arc::new(TurnToolResolver {
+                    session_id: session_id.clone(),
+                    graph_id: graph_id.clone(),
+                    runtime: Arc::downgrade(&runtime),
+                    state: Arc::downgrade(&state),
+                    services: Arc::downgrade(&services),
+                }));
+            services
+                .synthesize_executor()
+                .install_resolver(Arc::new(TurnSynthesizeResolver {
+                    session_id: session_id.clone(),
+                    graph_id: graph_id.clone(),
+                    runtime: Arc::downgrade(&runtime),
+                    state: Arc::downgrade(&state),
+                    services: Arc::downgrade(&services),
+                }));
+            },
+        ).await?;
         if execution_role == TurnExecutionRole::RootTurn && ingress.is_none() {
             let lineage = registered.lineage.as_ref().ok_or_else(|| {
                 RuntimeError::new("registered direct root requires lineage")
@@ -6934,4 +6919,48 @@ mod next_turn_contract_tests {
         assert!(refs["criteria"].is_null());
         assert_eq!(refs["coverage"]["accepted_results_omitted"], 0);
     }
+}
+
+/// The original Host admission boundary. Read errors and a foreign root must
+/// fail before installing resolvers or asking the execution owner to recover.
+/// Registration and recovery themselves remain with the execution supervisor.
+async fn attach_conversation_graph(
+    services: &crate::RuntimeServices,
+    graph: harness_contract::execution_graph::ExecutionGraph,
+    actor: Option<harness_contract::agent_action::AgentActorBinding>,
+    require_direct_root_identity: bool,
+    install_resolvers: impl FnOnce(),
+) -> Result<(harness_contract::execution_graph::ExecutionGraph, bool), RuntimeError> {
+    let graph_id = graph.id.clone();
+    let persisted = match services.graph_state_store().load_async(&graph_id).await {
+        Ok(graph) => Some(graph),
+        Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => None,
+        Err(error) => return Err(RuntimeError::new(error.to_string())),
+    };
+    let same_root = |stored: &harness_contract::execution_graph::ExecutionGraph| {
+        stored.lineage == graph.lineage && stored.parent_execution == graph.parent_execution
+    };
+    if require_direct_root_identity && persisted.as_ref().is_some_and(|stored| !same_root(stored)) {
+        return Err(RuntimeError::new("stored direct root identity mismatch"));
+    }
+    install_resolvers();
+    let recovering = persisted.is_some();
+    let attached = if recovering {
+        let recovered = services
+            .execution_supervisor()
+            .recover_graph(&graph_id)
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if require_direct_root_identity && !same_root(&recovered) {
+            return Err(RuntimeError::new("recovered direct root identity mismatch"));
+        }
+        recovered
+    } else {
+        services
+            .execution_supervisor()
+            .register_continuation_graph(graph, actor)
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+    };
+    Ok((attached, recovering))
 }
