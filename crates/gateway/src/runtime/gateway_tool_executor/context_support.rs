@@ -10,6 +10,155 @@ use super::*;
 #[serde(deny_unknown_fields)]
 struct EvidencePageCursor {
     version: u8,
+    query: Option<String>,
+    source: runtime::content_publication::PublicationContinuation,
+}
+
+pub(super) fn evidence_read_selection(
+    source: &harness_contract::context::ArtifactRef,
+    request: &EvidenceRetrieveToolRequest,
+) -> Result<
+    (
+        u64,
+        Option<runtime::content_publication::PublicationContinuation>,
+    ),
+    ToolError,
+> {
+    let cursor = request
+        .cursor
+        .as_deref()
+        .map(|value| {
+            let cursor: EvidencePageCursor = serde_json::from_str(value)
+                .map_err(|_| ToolError::new("invalid evidence cursor; restart reading"))?;
+            if cursor.version != 2
+                || cursor.query != request.query
+                || cursor.source.source != *source
+                || cursor.source.next_byte > source.bytes
+                || (cursor.source.next_byte != source.bytes && cursor.source.next_byte % 1500 != 0)
+            {
+                return Err(ToolError::new(
+                    "evidence cursor source/query changed; restart reading",
+                ));
+            }
+            Ok(cursor.source)
+        })
+        .transpose()?;
+    Ok((
+        request.limit.unwrap_or(8).clamp(1, 16) as u64 * 1500,
+        cursor,
+    ))
+}
+
+/// Pure projection over only the budgeted bytes that the original Runtime read.
+/// Query filtering never scans or materializes unread ranges.
+pub(super) fn publication_evidence_page(
+    page: &runtime::content_publication::AuthorizedPublicationPage,
+    request: &EvidenceRetrieveToolRequest,
+) -> Result<serde_json::Value, ToolError> {
+    use base64::Engine;
+    let terms = request
+        .query
+        .as_deref()
+        .unwrap_or_default()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    let chunks = page.body.chunks(1500).enumerate().filter_map(|(index,bytes)| {
+        let text = std::str::from_utf8(bytes).ok();
+        if !terms.is_empty() && !terms.iter().any(|term| String::from_utf8_lossy(bytes).to_lowercase().contains(term)) { return None; }
+        let (content,encoding) = match text {
+            Some(text)=>(text.to_owned(),"utf8"),
+            None=>(base64::engine::general_purpose::STANDARD.encode(bytes),"base64"),
+        };
+        let start=page.start + (index*1500) as u64;
+        Some(serde_json::json!({"index":start/1500,"byte_start":start,"byte_end":start+bytes.len() as u64,"encoding":encoding,"content":content}))
+    }).collect::<Vec<_>>();
+    let encoding = if chunks.iter().all(|chunk| chunk["encoding"] == "utf8") {
+        "utf8"
+    } else {
+        "per_chunk"
+    };
+    let next_cursor = page
+        .continuation
+        .as_ref()
+        .map(|source| {
+            serde_json::to_string(&EvidencePageCursor {
+                version: 2,
+                query: request.query.clone(),
+                source: source.clone(),
+            })
+        })
+        .transpose()
+        .map_err(|e| ToolError::new(e.to_string()))?;
+    let next_request = next_cursor.as_ref().map(|cursor| serde_json::json!({
+        "evidence_ref":request.evidence_ref,"query":request.query,"cursor":cursor,"limit":request.limit.unwrap_or(8).clamp(1,16)
+    }));
+    Ok(
+        serde_json::json!({"encoding":encoding,"chunks":chunks,"total_bytes":page.total_bytes,
+        "chunk_bytes":1500,"total_chunks":page.total_bytes.div_ceil(1500),
+        "truncated":next_cursor.is_some(),"next_cursor":next_cursor,"next_request":next_request,
+        "coverage":{"byte_start":page.start,"byte_end":page.end,"total_bytes":page.total_bytes,
+            "selection":if terms.is_empty(){"sequential_content"}else{"query_matching_chunks_in_read_range"},
+            "complete":page.start==0 && page.end==page.total_bytes && terms.is_empty()}}),
+    )
+}
+
+#[cfg(test)]
+mod evidence_paging_tests {
+    use super::*;
+    #[test]
+    fn bounded_read_selection_rejects_changed_identity_query_and_invalid_offsets() {
+        let source = harness_contract::context::ArtifactRef::durable(
+            "artifact://original",
+            "sha256:original",
+            9000,
+            "text/plain",
+            "session:s",
+        );
+        let mut request = EvidenceRetrieveToolRequest {
+            evidence_ref: source.selector.clone(),
+            query: Some("target".into()),
+            limit: Some(999),
+            cursor: None,
+        };
+        assert_eq!(evidence_read_selection(&source, &request).unwrap().0, 24000);
+        request.cursor = Some(
+            serde_json::to_string(&EvidencePageCursor {
+                version: 2,
+                query: Some("target".into()),
+                source: runtime::content_publication::PublicationContinuation {
+                    source: source.clone(),
+                    next_byte: 1500,
+                },
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            evidence_read_selection(&source, &request)
+                .unwrap()
+                .1
+                .unwrap()
+                .next_byte,
+            1500
+        );
+        let mut changed = source.clone();
+        changed.visibility_scope = "session:foreign".into();
+        assert!(evidence_read_selection(&changed, &request).is_err());
+        changed = source.clone();
+        changed.sha256 = "sha256:new".into();
+        assert!(evidence_read_selection(&changed, &request).is_err());
+        request.query = Some("other".into());
+        assert!(evidence_read_selection(&source, &request).is_err());
+        request.cursor = Some("malformed".into());
+        assert!(evidence_read_selection(&source, &request).is_err());
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResidentTextPageCursor {
+    version: u8,
     sha256: String,
     query: Option<String>,
     next_chunk: usize,
@@ -32,7 +181,7 @@ pub(super) fn evidence_content_page(
     let start = match request.cursor.as_deref() {
         None => 0,
         Some(value) => {
-            let cursor: EvidencePageCursor = serde_json::from_str(value).map_err(|_| {
+            let cursor: ResidentTextPageCursor = serde_json::from_str(value).map_err(|_| {
                 ToolError::new("invalid evidence cursor; use the returned next_request")
             })?;
             if cursor.version != 1 || cursor.sha256 != sha256 || cursor.query != request.query {
@@ -71,7 +220,7 @@ pub(super) fn evidence_content_page(
     }).collect::<Vec<_>>();
     let next_cursor = if let Some((index, _)) = matches.next() {
         Some(
-            serde_json::to_string(&EvidencePageCursor {
+            serde_json::to_string(&ResidentTextPageCursor {
                 version: 1,
                 sha256: sha256.to_string(),
                 query: request.query.clone(),
@@ -95,7 +244,7 @@ pub(super) fn evidence_content_page(
 }
 
 #[cfg(test)]
-mod evidence_paging_tests {
+mod resident_text_paging_tests {
     use super::*;
 
     fn request(query: Option<&str>) -> EvidenceRetrieveToolRequest {
@@ -158,7 +307,7 @@ mod evidence_paging_tests {
         assert!(evidence_content_page(&content, "hash", &input).is_err());
         input.query = None;
         input.cursor = Some(
-            serde_json::to_string(&EvidencePageCursor {
+            serde_json::to_string(&ResidentTextPageCursor {
                 version: 1,
                 sha256: "hash".into(),
                 query: None,

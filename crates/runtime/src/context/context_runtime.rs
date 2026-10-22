@@ -278,16 +278,6 @@ pub struct ContextOmission {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextLease {
-    pub source: ContextSourceKind,
-    pub min_tokens: u64,
-    pub target_tokens: u64,
-    pub max_tokens: u64,
-    pub priority: u8,
-    pub degradation: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentContextLease {
     pub parent_session_id: String,
     pub parent_agent_id: String,
@@ -384,10 +374,6 @@ pub struct ContextBudgetReport {
     pub expanded_count: usize,
     #[serde(default)]
     pub conflict_count: usize,
-    /// Legacy lease projection retained only for old evidence readers. The
-    /// adaptive allocator does not enforce these entries.
-    #[serde(default)]
-    pub leases: Vec<ContextLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,14 +556,10 @@ pub struct ContextSnapshotDiff {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBudgetAllocation {
     pub source: ContextSourceKind,
-    pub min_tokens: u64,
-    pub target_tokens: u64,
-    pub max_tokens: u64,
     pub used_tokens: u64,
     pub selected_count: usize,
     pub omitted_count: usize,
     pub exhausted: bool,
-    pub priority: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -960,7 +942,6 @@ impl ContextRuntimeKernel {
                 borrowed_budget_tokens: allocation.report.borrowed_budget_tokens,
                 expanded_count: allocation.report.expanded_count,
                 conflict_count: allocation.report.conflict_count,
-                leases: Vec::new(),
             },
             diagnostics,
             assembled,
@@ -1258,33 +1239,35 @@ impl ContextRuntimeKernel {
 
     pub fn budget_explanation(envelope: &ContextEnvelope) -> ContextBudgetExplanation {
         let mut allocations = Vec::new();
-        for lease in &envelope.budget.leases {
-            let used_tokens = envelope
+        // Report the actual adaptive selection by source; no second allocator.
+        for source in envelope
+            .selected
+            .iter()
+            .map(|item| item.source)
+            .chain(envelope.omitted.iter().map(|item| item.source))
+        {
+            if allocations
+                .iter()
+                .any(|entry: &ContextBudgetAllocation| entry.source == source)
+            {
+                continue;
+            }
+            let selected = envelope
                 .selected
                 .iter()
-                .filter(|item| item.source == lease.source)
-                .map(|item| item.token_estimate)
-                .sum::<u64>();
-            let selected_count = envelope
-                .selected
-                .iter()
-                .filter(|item| item.source == lease.source)
-                .count();
+                .filter(|item| item.source == source)
+                .collect::<Vec<_>>();
             let omitted_count = envelope
                 .omitted
                 .iter()
-                .filter(|item| item.source == lease.source)
+                .filter(|item| item.source == source)
                 .count();
             allocations.push(ContextBudgetAllocation {
-                source: lease.source,
-                min_tokens: lease.min_tokens,
-                target_tokens: lease.target_tokens,
-                max_tokens: lease.max_tokens,
-                used_tokens,
-                selected_count,
+                source,
+                used_tokens: selected.iter().map(|item| item.token_estimate).sum(),
+                selected_count: selected.len(),
                 omitted_count,
-                exhausted: omitted_count > 0 || used_tokens >= lease.max_tokens,
-                priority: lease.priority,
+                exhausted: omitted_count > 0,
             });
         }
         ContextBudgetExplanation {
@@ -1452,442 +1435,6 @@ impl ContextRuntimeKernel {
         )
     }
 
-    pub fn apply_leases(
-        items: Vec<ContextItem>,
-        leases: &[ContextLease],
-        dynamic_capacity_tokens: u64,
-    ) -> (Vec<ContextItem>, Vec<ContextOmission>) {
-        let mut ranked = items
-            .iter()
-            .enumerate()
-            .collect::<Vec<(usize, &ContextItem)>>();
-        ranked.sort_by(|(_, a), (_, b)| {
-            source_priority(b.source, leases)
-                .cmp(&source_priority(a.source, leases))
-                .then_with(|| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        let mut used_by_source = std::collections::BTreeMap::<String, u64>::new();
-        let mut selected = vec![false; items.len()];
-        let mut omission_reasons = vec![None::<String>; items.len()];
-        let mut used_total = 0u64;
-
-        // Every dynamic source must be explicitly admitted by the selected
-        // profile. A missing lease is a denial, never an implicit unlimited
-        // allocation. This keeps future ContextSourceKind additions safe by
-        // default until their profile policy is deliberately specified.
-        for (index, item) in items.iter().enumerate() {
-            if leases
-                .iter()
-                .find(|lease| lease.source == item.source)
-                .is_none_or(|lease| lease.max_tokens == 0)
-            {
-                omission_reasons[index] = Some("context source denied by profile".to_string());
-            }
-        }
-
-        // Three-stage admission: preserve each source's declared minimum,
-        // fill to target, then let every admitted source compete by the
-        // already-established score ordering up to its explicit maximum. The
-        // final provider packer applies candidate-specific hard capacity; it
-        // must not inherit an artificial "continuity only" reserve here.
-        for phase in [LeasePackingPhase::Minimum, LeasePackingPhase::Target] {
-            for (index, _) in &ranked {
-                select_context_item(
-                    *index,
-                    &items,
-                    leases,
-                    phase,
-                    dynamic_capacity_tokens,
-                    &mut used_total,
-                    &mut used_by_source,
-                    &mut selected,
-                    &mut omission_reasons,
-                );
-            }
-        }
-        for (index, _) in &ranked {
-            select_context_item(
-                *index,
-                &items,
-                leases,
-                LeasePackingPhase::Reserve,
-                dynamic_capacity_tokens,
-                &mut used_total,
-                &mut used_by_source,
-                &mut selected,
-                &mut omission_reasons,
-            );
-        }
-
-        let mut omitted = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            if selected[index] {
-                continue;
-            }
-            let reason = omission_reasons[index].clone().unwrap_or_else(|| {
-                let lease = leases.iter().find(|lease| lease.source == item.source);
-                let used = used_by_source
-                    .get(&context_source_key(item.source))
-                    .copied()
-                    .unwrap_or(0);
-                match lease {
-                    None | Some(ContextLease { max_tokens: 0, .. }) => {
-                        "context source denied by profile".to_string()
-                    }
-                    Some(lease) if used >= lease.max_tokens => {
-                        "context lease exhausted".to_string()
-                    }
-                    _ if used_total >= dynamic_capacity_tokens => {
-                        "global dynamic context budget exhausted".to_string()
-                    }
-                    _ => "context source target retained capacity for higher-ranked evidence"
-                        .to_string(),
-                }
-            });
-            omitted.push(ContextOmission {
-                source: item.source,
-                reason,
-                token_estimate: item.token_estimate,
-            });
-        }
-
-        let selected = selected
-            .into_iter()
-            .enumerate()
-            .filter(|(_, is_selected)| *is_selected)
-            .map(|(index, _)| items[index].clone())
-            .collect();
-        (selected, omitted)
-    }
-
-    pub fn default_leases(profile: ContextProfile, total_budget_tokens: u64) -> Vec<ContextLease> {
-        let budget = total_budget_tokens.max(1);
-        let pct = |basis_points: u64| budget.saturating_mul(basis_points) / 10_000;
-        let mut leases = match profile {
-            ContextProfile::SubAgent => vec![
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(1_000),
-                    pct(2_000),
-                    pct(3_000),
-                    95,
-                ),
-                context_lease(
-                    ContextSourceKind::Knowledge,
-                    pct(500),
-                    pct(1_200),
-                    pct(2_000),
-                    82,
-                ),
-                context_lease(ContextSourceKind::Fact, 0, pct(700), pct(1_200), 81),
-                context_lease(ContextSourceKind::Matrix, 0, pct(700), pct(1_200), 79),
-                context_lease(
-                    ContextSourceKind::Memory,
-                    pct(1_000),
-                    pct(2_000),
-                    pct(3_000),
-                    80,
-                ),
-                context_lease(ContextSourceKind::ToolTrace, 0, pct(1_000), pct(1_500), 70),
-                context_lease(ContextSourceKind::Workspace, 0, pct(800), pct(1_200), 65),
-                context_lease(ContextSourceKind::AgentPeer, 0, pct(500), pct(800), 40),
-            ],
-            ContextProfile::YoloGoal | ContextProfile::AutonomousGoal => vec![
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(1_500),
-                    pct(2_500),
-                    pct(3_500),
-                    100,
-                ),
-                context_lease(
-                    ContextSourceKind::ToolTrace,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    85,
-                ),
-                context_lease(
-                    ContextSourceKind::Knowledge,
-                    pct(500),
-                    pct(1_200),
-                    pct(2_000),
-                    82,
-                ),
-                context_lease(ContextSourceKind::Fact, 0, pct(800), pct(1_400), 81),
-                context_lease(ContextSourceKind::Matrix, 0, pct(800), pct(1_400), 80),
-                context_lease(
-                    ContextSourceKind::Memory,
-                    pct(1_000),
-                    pct(2_000),
-                    pct(3_000),
-                    80,
-                ),
-                context_lease(
-                    ContextSourceKind::Workspace,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    75,
-                ),
-                context_lease(ContextSourceKind::AgentPeer, 0, pct(1_000), pct(1_500), 55),
-            ],
-            ContextProfile::Review => vec![
-                context_lease(
-                    ContextSourceKind::ToolTrace,
-                    pct(1_000),
-                    pct(2_500),
-                    pct(3_500),
-                    100,
-                ),
-                context_lease(
-                    ContextSourceKind::Workspace,
-                    pct(1_000),
-                    pct(2_500),
-                    pct(3_500),
-                    95,
-                ),
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_000),
-                    85,
-                ),
-                context_lease(
-                    ContextSourceKind::Knowledge,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    88,
-                ),
-                context_lease(ContextSourceKind::Fact, 0, pct(1_000), pct(1_500), 86),
-                context_lease(ContextSourceKind::Matrix, 0, pct(1_000), pct(1_500), 84),
-                context_lease(
-                    ContextSourceKind::Memory,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_000),
-                    70,
-                ),
-                context_lease(ContextSourceKind::AgentPeer, 0, pct(1_000), pct(1_500), 65),
-            ],
-            ContextProfile::Resume => vec![
-                context_lease(
-                    ContextSourceKind::Handoff,
-                    pct(1_000),
-                    pct(2_000),
-                    pct(3_000),
-                    100,
-                ),
-                context_lease(
-                    ContextSourceKind::Conversation,
-                    pct(1_000),
-                    pct(2_000),
-                    pct(3_000),
-                    95,
-                ),
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_000),
-                    90,
-                ),
-                context_lease(
-                    ContextSourceKind::Knowledge,
-                    pct(500),
-                    pct(1_200),
-                    pct(2_000),
-                    84,
-                ),
-                context_lease(ContextSourceKind::Fact, 0, pct(800), pct(1_200), 82),
-                context_lease(ContextSourceKind::Matrix, 0, pct(800), pct(1_200), 80),
-                context_lease(
-                    ContextSourceKind::Memory,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    80,
-                ),
-                context_lease(ContextSourceKind::Workspace, 0, pct(800), pct(1_200), 60),
-            ],
-            ContextProfile::Collaboration => vec![
-                context_lease(
-                    ContextSourceKind::AgentPeer,
-                    pct(1_000),
-                    pct(2_500),
-                    pct(3_500),
-                    100,
-                ),
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_000),
-                    90,
-                ),
-                context_lease(
-                    ContextSourceKind::Knowledge,
-                    pct(500),
-                    pct(1_200),
-                    pct(2_000),
-                    84,
-                ),
-                context_lease(ContextSourceKind::Fact, 0, pct(800), pct(1_200), 82),
-                context_lease(ContextSourceKind::Matrix, 0, pct(800), pct(1_200), 80),
-                context_lease(
-                    ContextSourceKind::Memory,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    80,
-                ),
-                context_lease(ContextSourceKind::ToolTrace, 0, pct(1_000), pct(1_500), 70),
-                context_lease(ContextSourceKind::Workspace, 0, pct(1_000), pct(1_500), 65),
-            ],
-            ContextProfile::SurfaceQuickReply => vec![
-                context_lease(ContextSourceKind::Conversation, 0, pct(800), pct(1_200), 95),
-                context_lease(ContextSourceKind::Memory, 0, pct(700), pct(1_000), 85),
-                context_lease(ContextSourceKind::Knowledge, 0, pct(400), pct(700), 78),
-                context_lease(ContextSourceKind::Fact, 0, pct(300), pct(500), 76),
-                context_lease(ContextSourceKind::Matrix, 0, pct(300), pct(500), 74),
-                context_lease(ContextSourceKind::Task, 0, pct(500), pct(800), 75),
-                context_lease(ContextSourceKind::ToolTrace, 0, pct(400), pct(600), 60),
-                context_lease(ContextSourceKind::Workspace, 0, pct(300), pct(500), 40),
-                context_lease(ContextSourceKind::AgentPeer, 0, pct(200), pct(300), 30),
-            ],
-            ContextProfile::SurfaceTaskIntake => vec![
-                context_lease(
-                    ContextSourceKind::Conversation,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_000),
-                    95,
-                ),
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_000),
-                    90,
-                ),
-                context_lease(ContextSourceKind::Memory, 0, pct(1_000), pct(1_500), 80),
-                context_lease(ContextSourceKind::Knowledge, 0, pct(1_000), pct(1_500), 82),
-                context_lease(ContextSourceKind::Fact, 0, pct(700), pct(1_000), 81),
-                context_lease(ContextSourceKind::Matrix, 0, pct(700), pct(1_000), 79),
-                context_lease(ContextSourceKind::ToolTrace, 0, pct(700), pct(1_000), 60),
-                context_lease(ContextSourceKind::Workspace, 0, pct(700), pct(1_000), 55),
-            ],
-            ContextProfile::DeepInvestigation => vec![
-                context_lease(
-                    ContextSourceKind::ToolTrace,
-                    pct(1_000),
-                    pct(2_500),
-                    pct(3_500),
-                    100,
-                ),
-                context_lease(
-                    ContextSourceKind::Workspace,
-                    pct(1_000),
-                    pct(2_500),
-                    pct(3_500),
-                    95,
-                ),
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    90,
-                ),
-                context_lease(
-                    ContextSourceKind::Knowledge,
-                    pct(500),
-                    pct(2_000),
-                    pct(3_000),
-                    92,
-                ),
-                context_lease(
-                    ContextSourceKind::Fact,
-                    pct(300),
-                    pct(1_500),
-                    pct(2_500),
-                    90,
-                ),
-                context_lease(
-                    ContextSourceKind::Matrix,
-                    pct(300),
-                    pct(1_500),
-                    pct(2_500),
-                    88,
-                ),
-                context_lease(
-                    ContextSourceKind::Memory,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    80,
-                ),
-                context_lease(ContextSourceKind::AgentPeer, 0, pct(1_000), pct(1_500), 65),
-                // Deep investigation frequently resumes a compressed branch
-                // or follows evidence returned by another session. It must
-                // admit a bounded handoff packet explicitly; leaving this
-                // source absent would turn a valid checkpoint into a silent
-                // profile denial.
-                context_lease(ContextSourceKind::Handoff, 0, pct(1_000), pct(1_500), 72),
-            ],
-            ContextProfile::Cron | ContextProfile::MainTurn => vec![
-                context_lease(
-                    ContextSourceKind::Conversation,
-                    pct(1_000),
-                    pct(2_500),
-                    pct(3_500),
-                    95,
-                ),
-                context_lease(
-                    ContextSourceKind::Knowledge,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    88,
-                ),
-                context_lease(ContextSourceKind::Fact, 0, pct(1_000), pct(1_500), 86),
-                context_lease(ContextSourceKind::Matrix, 0, pct(1_000), pct(1_500), 84),
-                context_lease(
-                    ContextSourceKind::Memory,
-                    pct(1_000),
-                    pct(2_000),
-                    pct(3_000),
-                    85,
-                ),
-                context_lease(
-                    ContextSourceKind::Task,
-                    pct(500),
-                    pct(1_500),
-                    pct(2_500),
-                    80,
-                ),
-                context_lease(ContextSourceKind::ToolTrace, 0, pct(1_000), pct(1_500), 70),
-                context_lease(ContextSourceKind::Workspace, 0, pct(1_000), pct(1_500), 65),
-                context_lease(ContextSourceKind::AgentPeer, 0, pct(800), pct(1_200), 50),
-                context_lease(ContextSourceKind::Handoff, 0, pct(800), pct(1_200), 50),
-            ],
-        };
-        for source in ALL_CONTEXT_SOURCES {
-            if !leases.iter().any(|lease| lease.source == source) {
-                leases.push(context_lease(source, 0, 0, 0, 0));
-            }
-        }
-        leases
-    }
-
     pub fn child_identity_from_lease(lease: &AgentContextLease) -> ContextIdentity {
         ContextIdentity::sub_agent(
             lease.parent_session_id.clone(),
@@ -2041,108 +1588,6 @@ impl ContextRuntimeKernel {
         )];
         item
     }
-}
-
-const ALL_CONTEXT_SOURCES: [ContextSourceKind; 12] = [
-    ContextSourceKind::StableHead,
-    ContextSourceKind::RuntimeHeader,
-    ContextSourceKind::Conversation,
-    ContextSourceKind::Memory,
-    ContextSourceKind::Knowledge,
-    ContextSourceKind::Fact,
-    ContextSourceKind::Matrix,
-    ContextSourceKind::Task,
-    ContextSourceKind::ToolTrace,
-    ContextSourceKind::Workspace,
-    ContextSourceKind::AgentPeer,
-    ContextSourceKind::Handoff,
-];
-
-#[derive(Clone, Copy)]
-enum LeasePackingPhase {
-    Minimum,
-    Target,
-    Reserve,
-}
-
-fn context_source_key(source: ContextSourceKind) -> String {
-    format!("{source:?}")
-}
-
-#[allow(clippy::too_many_arguments)]
-fn select_context_item(
-    index: usize,
-    items: &[ContextItem],
-    leases: &[ContextLease],
-    phase: LeasePackingPhase,
-    dynamic_capacity_tokens: u64,
-    used_total: &mut u64,
-    used_by_source: &mut std::collections::BTreeMap<String, u64>,
-    selected: &mut [bool],
-    omission_reasons: &mut [Option<String>],
-) {
-    if selected[index] || omission_reasons[index].is_some() {
-        return;
-    }
-    let item = &items[index];
-    let Some(lease) = leases.iter().find(|lease| lease.source == item.source) else {
-        omission_reasons[index] = Some("context source denied by profile".to_string());
-        return;
-    };
-    if lease.max_tokens == 0 {
-        omission_reasons[index] = Some("context source denied by profile".to_string());
-        return;
-    }
-    let source_key = context_source_key(item.source);
-    let used_for_source = used_by_source.get(&source_key).copied().unwrap_or(0);
-    let phase_limit = match phase {
-        LeasePackingPhase::Minimum => lease.min_tokens,
-        LeasePackingPhase::Target => lease.target_tokens,
-        LeasePackingPhase::Reserve => lease.max_tokens,
-    };
-    if used_for_source >= phase_limit {
-        return;
-    }
-    if used_for_source.saturating_add(item.token_estimate) > lease.max_tokens {
-        omission_reasons[index] = Some("context lease exhausted".to_string());
-        return;
-    }
-    if used_total.saturating_add(item.token_estimate) > dynamic_capacity_tokens {
-        omission_reasons[index] = Some("global dynamic context budget exhausted".to_string());
-        return;
-    }
-
-    *used_total = used_total.saturating_add(item.token_estimate);
-    used_by_source.insert(
-        source_key,
-        used_for_source.saturating_add(item.token_estimate),
-    );
-    selected[index] = true;
-}
-
-fn context_lease(
-    source: ContextSourceKind,
-    min_tokens: u64,
-    target_tokens: u64,
-    max_tokens: u64,
-    priority: u8,
-) -> ContextLease {
-    ContextLease {
-        source,
-        min_tokens,
-        target_tokens,
-        max_tokens,
-        priority,
-        degradation: vec!["omit lower score context items".to_string()],
-    }
-}
-
-fn source_priority(source: ContextSourceKind, leases: &[ContextLease]) -> u8 {
-    leases
-        .iter()
-        .find(|lease| lease.source == source)
-        .map(|lease| lease.priority)
-        .unwrap_or(0)
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -2694,7 +2139,6 @@ mod tests {
                 .iter()
                 .any(|item| item.source == ContextSourceKind::Memory)
         );
-        assert!(envelope.budget.leases.is_empty());
     }
 
     #[test]
@@ -3130,101 +2574,6 @@ mod tests {
     }
 
     #[test]
-    fn lease_budget_omits_items_deterministically() {
-        let mut high = ContextItem::new(
-            "b-high",
-            ContextSourceKind::Memory,
-            ContextRole::Orientation,
-            "keep",
-        );
-        high.score = 0.9;
-        high.token_estimate = 4;
-        let mut low = ContextItem::new(
-            "a-low",
-            ContextSourceKind::Memory,
-            ContextRole::Orientation,
-            "omit",
-        );
-        low.score = 0.1;
-        low.token_estimate = 4;
-        let lease = ContextLease {
-            source: ContextSourceKind::Memory,
-            min_tokens: 0,
-            target_tokens: 4,
-            max_tokens: 4,
-            priority: 8,
-            degradation: vec!["omit lower score".to_string()],
-        };
-
-        let (selected, omitted) = ContextRuntimeKernel::apply_leases(vec![low, high], &[lease], 4);
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].id, "b-high");
-        assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0].reason, "context lease exhausted");
-    }
-
-    #[test]
-    fn default_profile_leases_prioritize_yolo_task_context() {
-        let leases = ContextRuntimeKernel::default_leases(ContextProfile::YoloGoal, 10_000);
-        let task = leases
-            .iter()
-            .find(|lease| lease.source == ContextSourceKind::Task)
-            .expect("task lease");
-        let peer = leases
-            .iter()
-            .find(|lease| lease.source == ContextSourceKind::AgentPeer)
-            .expect("peer lease");
-
-        assert!(task.priority > peer.priority);
-        assert!(task.max_tokens > peer.max_tokens);
-    }
-
-    #[test]
-    fn profile_leases_explicitly_deny_unlisted_dynamic_sources() {
-        let item = item_with_tokens(
-            "forged-static",
-            ContextSourceKind::StableHead,
-            ContextRole::Instruction,
-            10,
-        );
-        let leases = ContextRuntimeKernel::default_leases(ContextProfile::MainTurn, 1_000);
-        let (selected, omitted) = ContextRuntimeKernel::apply_leases(vec![item], &leases, 1_000);
-
-        assert!(selected.is_empty());
-        assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0].reason, "context source denied by profile");
-    }
-
-    #[test]
-    fn lease_packer_enforces_one_global_dynamic_capacity() {
-        let task = item_with_tokens("task", ContextSourceKind::Task, ContextRole::TaskState, 6);
-        let memory = item_with_tokens(
-            "memory",
-            ContextSourceKind::Memory,
-            ContextRole::Orientation,
-            6,
-        );
-        let leases = vec![
-            context_lease(ContextSourceKind::Task, 6, 8, 10, 100),
-            context_lease(ContextSourceKind::Memory, 6, 8, 10, 90),
-        ];
-        let (selected, omitted) =
-            ContextRuntimeKernel::apply_leases(vec![task, memory], &leases, 10);
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(
-            selected.iter().map(|item| item.token_estimate).sum::<u64>(),
-            6
-        );
-        assert!(
-            omitted
-                .iter()
-                .any(|item| item.reason == "global dynamic context budget exhausted")
-        );
-    }
-
-    #[test]
     fn build_envelope_applies_adaptive_selection_and_preserves_pinned_task() {
         let identity = ContextIdentity {
             session_id: "session-yolo".to_string(),
@@ -3266,7 +2615,6 @@ mod tests {
         assert_eq!(envelope.selected.len(), 1);
         assert_eq!(envelope.selected[0].id, "task-context");
         assert_eq!(envelope.omitted.len(), 1);
-        assert!(envelope.budget.leases.is_empty());
         assert!(envelope.budget.coverage_basis_points > 0);
     }
 

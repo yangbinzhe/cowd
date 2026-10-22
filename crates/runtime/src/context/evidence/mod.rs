@@ -334,6 +334,30 @@ pub(crate) fn read_sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+/// One decoder for original read acquisition and its compact receipt writer.
+/// An encoding label cannot silently change which bytes the receipt authenticates.
+pub(crate) fn read_chunk_bytes<'a>(
+    chunk: &'a serde_json::Value,
+    page: &serde_json::Value,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+    let content = chunk["content"].as_str()?;
+    match chunk["encoding"]
+        .as_str()
+        .or_else(|| page["encoding"].as_str())
+    {
+        None | Some("utf8") => Some(std::borrow::Cow::Borrowed(content.as_bytes())),
+        Some("base64") => {
+            use base64::Engine;
+            Some(std::borrow::Cow::Owned(
+                base64::engine::general_purpose::STANDARD
+                    .decode(content)
+                    .ok()?,
+            ))
+        }
+        Some(_) => None,
+    }
+}
+
 pub(crate) fn read_body_seal(tool_name: &str, output: &str) -> Option<ReadBodySeal> {
     let value: serde_json::Value = serde_json::from_str(output).ok()?;
     let hash = |value: &serde_json::Value| {
@@ -406,8 +430,21 @@ pub(crate) fn read_body_seal(tool_name: &str, output: &str) -> Option<ReadBodySe
             {
                 return None;
             }
-            let (body_sha256, body_bytes) = if let Some(content) = chunk["content"].as_str() {
-                (read_sha256(content.as_bytes()), content.len() as u64)
+            let (body_sha256, body_bytes) = if chunk["content"].is_string() {
+                let bytes = read_chunk_bytes(chunk, &value)?;
+                if let Some(width) = value["chunk_bytes"].as_u64() {
+                    let source_bytes = value["bytes"].as_u64()?;
+                    let start = index.checked_mul(width)?;
+                    if width != 1500
+                        || total_chunks != source_bytes.div_ceil(width)
+                        || chunk["byte_start"].as_u64()? != start
+                        || chunk["byte_end"].as_u64()? != start.checked_add(bytes.len() as u64)?
+                        || bytes.len() as u64 != (source_bytes.checked_sub(start)?).min(width)
+                    {
+                        return None;
+                    }
+                }
+                (read_sha256(&bytes), bytes.len() as u64)
             } else {
                 return None;
             };
@@ -1508,6 +1545,33 @@ mod tests {
         output["chunks"] =
             serde_json::json!([{"index":1,"content":"page"},{"index":1,"content":"page"}]);
         assert!(read_body_seal("read_ref", &output.to_string()).is_none());
+    }
+
+    #[test]
+    fn byte_paged_artifact_seal_decodes_actual_bytes_and_rejects_fabricated_coverage() {
+        let mut output = serde_json::json!({"kind":"evidence_retrieve","available":true,
+            "evidence_ref":"artifact://bytes","sha256":read_sha256(&[0,255,3]),"bytes":3,
+            "chunk_bytes":1500,"total_chunks":1,"encoding":"per_chunk",
+            "chunks":[{"index":0,"byte_start":0,"byte_end":3,"encoding":"base64","content":"AP8D"}]});
+        let seal = read_body_seal("evidence_retrieve", &output.to_string()).unwrap();
+        let ReadExtent::ArtifactChunks {
+            total_chunks,
+            chunks,
+        } = seal.extent
+        else {
+            panic!("wrong extent")
+        };
+        assert_eq!(total_chunks, 1);
+        assert_eq!(chunks[0].body_bytes, 3);
+        assert_eq!(chunks[0].body_sha256, read_sha256(&[0, 255, 3]));
+        output["chunks"][0]["byte_start"] = 1.into();
+        assert!(read_body_seal("evidence_retrieve", &output.to_string()).is_none());
+        output["chunks"][0]["byte_start"] = 0.into();
+        output["chunks"][0]["content"] = "AA==".into();
+        assert!(read_body_seal("evidence_retrieve", &output.to_string()).is_none());
+        output["chunks"][0]["content"] = "AP8D".into();
+        output["total_chunks"] = 2.into();
+        assert!(read_body_seal("evidence_retrieve", &output.to_string()).is_none());
     }
 
     #[test]

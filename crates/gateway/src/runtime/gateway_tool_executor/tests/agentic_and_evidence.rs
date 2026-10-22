@@ -359,7 +359,7 @@ async fn publication_creation_identity_gateway_case() {
         )
         .await
         .expect("published body");
-    assert_eq!(body, blocks[1]["text"].as_str().unwrap().as_bytes());
+    assert_eq!(&*body, blocks[1]["text"].as_str().unwrap().as_bytes());
     assert_ne!(published["sha256"], request["sha256"]);
     let stream = format!("session:{session_id}");
     let facts = || {
@@ -2679,4 +2679,107 @@ async fn an_unknown_tool_name_names_the_closest_registered_tool() {
         message.contains("Registered tools:"),
         "the full set stays visible so the model is not funnelled: {message}"
     );
+}
+
+#[tokio::test]
+async fn publication_reader_restores_all_binary_and_unicode_bytes_with_bounded_actual_pages() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let services = runtime::RuntimeServices::in_memory().unwrap();
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+    executor.bind_runtime_services(&services).unwrap();
+    for bytes in [
+        "中文 evidence 🙂".repeat(2000).into_bytes(),
+        (0..10007).map(|i| (i % 256) as u8).collect(),
+    ] {
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let artifact = services
+            .publish_authorized_content(
+                &bytes,
+                &digest,
+                "application/octet-stream",
+                "bounded-reader",
+            )
+            .await
+            .unwrap();
+        let mut request: EvidenceRetrieveToolRequest =
+            serde_json::from_value(serde_json::json!({"evidence_ref":artifact.selector,"limit":1}))
+                .unwrap();
+        let mut restored = Vec::new();
+        let mut pages = 0;
+        loop {
+            let output: serde_json::Value = serde_json::from_str(
+                &executor
+                    .execute_evidence_retrieve(request, Some("bounded-reader"), &[])
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(output["bytes"], bytes.len());
+            assert!(output["read_bytes"].as_u64().unwrap() <= 1500);
+            assert_eq!(output["coverage"]["byte_start"], restored.len());
+            for chunk in output["chunks"].as_array().unwrap() {
+                assert_eq!(chunk["byte_start"], restored.len());
+                let content = chunk["content"].as_str().unwrap();
+                if chunk["encoding"] == "base64" {
+                    restored.extend(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(content)
+                            .unwrap(),
+                    );
+                } else {
+                    restored.extend_from_slice(content.as_bytes());
+                }
+            }
+            assert_eq!(output["coverage"]["byte_end"], restored.len());
+            pages += 1;
+            assert!(pages < 100);
+            if output["next_request"].is_null() {
+                break;
+            }
+            assert_eq!(output["coverage"]["complete"], false);
+            request = serde_json::from_value(output["next_request"].clone()).unwrap();
+        }
+        assert!(pages > 1);
+        assert_eq!(restored, bytes);
+    }
+}
+
+#[tokio::test]
+async fn publication_query_without_match_keeps_unread_source_as_continuation() {
+    use sha2::{Digest, Sha256};
+    let services = runtime::RuntimeServices::in_memory().unwrap();
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+    executor.bind_runtime_services(&services).unwrap();
+    let bytes = format!("{}needle", "x".repeat(1500)).into_bytes();
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let artifact = services
+        .publish_authorized_content(&bytes, &digest, "text/plain", "query-reader")
+        .await
+        .unwrap();
+    let request = serde_json::from_value(
+        serde_json::json!({"evidence_ref":artifact.selector,"query":"needle","limit":1}),
+    )
+    .unwrap();
+    let first: serde_json::Value = serde_json::from_str(
+        &executor
+            .execute_evidence_retrieve(request, Some("query-reader"), &[])
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["chunks"], serde_json::json!([]));
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["coverage"]["complete"], false);
+    let next = serde_json::from_value(first["next_request"].clone()).unwrap();
+    let last: serde_json::Value = serde_json::from_str(
+        &executor
+            .execute_evidence_retrieve(next, Some("query-reader"), &[])
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(last["chunks"][0]["content"], "needle");
+    assert!(last["next_request"].is_null());
+    assert_eq!(last["coverage"]["complete"], false);
 }

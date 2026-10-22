@@ -16,6 +16,8 @@ type ResourceAdmissionObserver = Arc<dyn Fn(&ResourceAdmissionObservation) + Sen
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionResourceKind {
     SessionTurn,
+    /// Resident bytes reserved before Context content materialization.
+    ContextBytes,
     Provider,
     ProviderAccount(String),
     ProviderModel(String),

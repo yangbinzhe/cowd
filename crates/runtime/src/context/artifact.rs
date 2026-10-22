@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -504,6 +504,8 @@ struct ArtifactStoreInner {
     checkpoint_body_reads: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     staging_fault: Mutex<Option<StagingFault>>,
+    #[cfg(test)]
+    public_read_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 pub(crate) struct PreparedCheckpointGuard {
@@ -702,6 +704,8 @@ impl ArtifactStore {
                 checkpoint_body_reads: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 staging_fault: Mutex::new(None),
+                #[cfg(test)]
+                public_read_hook: Mutex::new(None),
             }),
         }
     }
@@ -946,6 +950,44 @@ impl ArtifactStore {
         .map_err(|error| ArtifactError::Blocking(error.to_string()))?
     }
 
+    /// Peak temporary storage for a public range verification. Compact objects
+    /// are bounded by the configured compact threshold; blob hashing streams.
+    #[cfg(test)]
+    pub(crate) fn set_public_read_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.public_read_hook.lock().unwrap() = Some(hook);
+    }
+
+    pub(crate) fn public_read_scratch_bytes(&self) -> u64 {
+        self.inner
+            .config
+            .compact_threshold_bytes
+            .saturating_add(64 * 1024)
+    }
+
+    pub(crate) fn read_public_range_blocking(
+        &self,
+        artifact: &ArtifactRef,
+        scope: &str,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>, ArtifactError> {
+        let current = self.resolve(&artifact.selector)?;
+        if current != *artifact
+            || (scope != current.visibility_scope && current.visibility_scope != "public")
+        {
+            return Err(ArtifactError::Unauthorized);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.inner.public_read_hook.lock().unwrap().clone() {
+            hook();
+        }
+        let bytes = self.read_blocking(artifact, scope, Some(range))?;
+        // A deleted/replaced record must not escape as a successful read.
+        if self.resolve(&artifact.selector)? != *artifact {
+            return Err(ArtifactError::Unauthorized);
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn read_session_content_by_digest_blocking(
         &self,
         session_id: &str,
@@ -1183,6 +1225,11 @@ impl ArtifactStore {
                         "compact artifact length mismatch".into(),
                     ));
                 }
+                if format!("sha256:{:x}", Sha256::digest(&body)) != record.sha256 {
+                    return Err(ArtifactError::Metadata(
+                        "artifact content digest mismatch".into(),
+                    ));
+                }
                 body[range.start as usize..range.end as usize].to_vec()
             }
             ArtifactObjectTier::Blob => {
@@ -1193,9 +1240,38 @@ impl ArtifactStore {
                         "blob artifact length mismatch".into(),
                     ));
                 }
-                file.seek(SeekFrom::Start(range.start))?;
-                let mut body = vec![0_u8; (range.end - range.start) as usize];
-                file.read_exact(&mut body)?;
+                // Hash and collect the selected range in one physical pass.
+                // No full-blob Vec and no hash/read time-of-check gap.
+                let mut digest = Sha256::new();
+                let mut scratch = [0_u8; 64 * 1024];
+                let mut body = Vec::with_capacity((range.end - range.start) as usize);
+                let mut position = 0_u64;
+                loop {
+                    let count = file.read(&mut scratch)?;
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&scratch[..count]);
+                    let next = position.checked_add(count as u64).ok_or_else(|| {
+                        ArtifactError::Metadata("artifact byte range overflow".into())
+                    })?;
+                    let start = position.max(range.start);
+                    let end = next.min(range.end);
+                    if start < end {
+                        body.extend_from_slice(
+                            &scratch[(start - position) as usize..(end - position) as usize],
+                        );
+                    }
+                    position = next;
+                }
+                if position != object.bytes
+                    || body.len() as u64 != range.end - range.start
+                    || format!("sha256:{:x}", digest.finalize()) != record.sha256
+                {
+                    return Err(ArtifactError::Metadata(
+                        "artifact content digest mismatch".into(),
+                    ));
+                }
                 body
             }
         };
@@ -2812,6 +2888,87 @@ mod tests {
         )
         .unwrap();
         (store, repository)
+    }
+
+    #[test]
+    fn bounded_public_ranges_verify_the_entire_source_and_never_adopt_private_prepared() {
+        for compact in [8, 1024] {
+            let root = tempfile::tempdir().unwrap();
+            let repository = std::sync::Arc::new(super::EphemeralArtifactRepository::default());
+            let store = super::ArtifactStore::new(
+                root.path(),
+                repository.clone(),
+                super::ArtifactStoreConfig {
+                    compact_threshold_bytes: compact,
+                    ..super::ArtifactStoreConfig::default()
+                },
+            )
+            .unwrap();
+            let artifact = r1_test_live(
+                &store,
+                "session:range",
+                "source",
+                b"original immutable content",
+            );
+            assert_eq!(
+                store
+                    .read_public_range_blocking(&artifact, "session:range", 0..4)
+                    .unwrap(),
+                b"orig"
+            );
+            assert!(store
+                .read_public_range_blocking(&artifact, "session:foreign", 0..4)
+                .is_err());
+            let id = super::parse_selector(&artifact.selector)
+                .unwrap()
+                .to_owned();
+            repository
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .get_mut(&id)
+                .unwrap()
+                .record_class = super::ArtifactRecordClass::PrivatePrepared;
+            assert!(store
+                .read_public_range_blocking(&artifact, "session:range", 0..4)
+                .is_err());
+            assert_eq!(
+                repository.state.lock().unwrap().records[&id].record_class,
+                super::ArtifactRecordClass::PrivatePrepared
+            );
+            repository
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .get_mut(&id)
+                .unwrap()
+                .record_class = super::ArtifactRecordClass::Live;
+            let object = repository.state.lock().unwrap().objects[&artifact.sha256].clone();
+            // Corruption outside the requested range must still be detected.
+            let corrupt = b"original immutable CONTENT";
+            assert_eq!(corrupt.len() as u64, artifact.bytes);
+            if compact == 8 {
+                std::fs::write(
+                    store.generation_path(&artifact.sha256, &object.generation),
+                    corrupt,
+                )
+                .unwrap();
+            } else {
+                repository
+                    .state
+                    .lock()
+                    .unwrap()
+                    .objects
+                    .get_mut(&artifact.sha256)
+                    .unwrap()
+                    .compact_body = Some(corrupt.to_vec());
+            }
+            assert!(store
+                .read_public_range_blocking(&artifact, "session:range", 0..4)
+                .is_err());
+        }
     }
 
     #[test]

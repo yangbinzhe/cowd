@@ -51,6 +51,7 @@ impl GatewayToolExecutor {
         if tool_name == "artifact_materialize" {
             let request: ArtifactMaterializeInput = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
+            self.ensure_publication_file_scope(&request.path, true, binding)?;
             let (artifact, bytes) = services
                 .read_authorized_publication(
                     &request.content_ref,
@@ -59,8 +60,7 @@ impl GatewayToolExecutor {
                     binding.authorized_scopes,
                 )
                 .await
-                .map_err(ToolError::new)?;
-            self.ensure_publication_file_scope(&request.path, true, binding)?;
+                .map_err(|error| ToolError::new(error.to_string()))?;
             let policy = self.tool_host.pin_snapshot().path_policy().clone();
             let path = request.path;
             let (target, created) = runtime::ToolExecutionPlane::adapt_blocking(move || {
@@ -100,7 +100,7 @@ impl GatewayToolExecutor {
                 services
                     .publish_authorized_content(&bytes, &sha256, &media_type, session_id)
                     .await
-                    .map_err(ToolError::new)?
+                    .map_err(|error| ToolError::new(error.to_string()))?
             }
             ArtifactPublishInput::MessageBlock {
                 message_id,
@@ -124,7 +124,7 @@ impl GatewayToolExecutor {
                 let encoded =
                     serde_json::to_vec(block).map_err(|error| ToolError::new(error.to_string()))?;
                 runtime::content_publication::verify_content_revision(&encoded, &sha256)
-                    .map_err(ToolError::new)?;
+                    .map_err(|error| ToolError::new(error.to_string()))?;
                 if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
                     return Err(ToolError::new(
                         "only an explicit text block can be published",
@@ -148,22 +148,24 @@ impl GatewayToolExecutor {
                         session_id,
                     )
                     .await
-                    .map_err(ToolError::new)?
+                    .map_err(|error| ToolError::new(error.to_string()))?
             }
             ArtifactPublishInput::Artifact {
                 content_ref,
                 sha256,
             } => {
                 services
-                    .read_authorized_publication(
+                    .read_authorized_publication_page(
                         &content_ref,
                         &sha256,
                         session_id,
                         binding.authorized_scopes,
+                        1,
+                        None,
                     )
                     .await
-                    .map_err(ToolError::new)?
-                    .0
+                    .map_err(|error| ToolError::new(error.to_string()))?
+                    .source
             }
         };
         if artifact.bytes == 0 {

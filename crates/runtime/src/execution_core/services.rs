@@ -3678,9 +3678,26 @@ impl RuntimeServices {
             "kind":"external_decision", "approval":request, "source_revision":source.expected_revision,
             "scope":"approval_decision_only"
         })).map_err(|error| error.to_string())?;
+        // The source revision and exact bytes identify this derived immutable
+        // content. Repeated authorized pages must not mint different selectors.
+        use sha2::{Digest, Sha256};
+        let identity = format!(
+            "approval_result_{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    "cowd.approval-result/v1",
+                    session_id,
+                    reference,
+                    &source.stream_id,
+                    source.expected_revision,
+                    format!("{:x}", Sha256::digest(&bytes)),
+                ))
+                .map_err(|error| error.to_string())?
+            )
+        );
         let content = self
             .artifact_store()
-            .write_bytes(
+            .write_bytes_with_identity(
                 harness_contract::context::ArtifactWriteDescriptor {
                     media_type: "application/json".into(),
                     visibility_scope: format!("session:{session_id}"),
@@ -3688,6 +3705,7 @@ impl RuntimeServices {
                     original_name: None,
                 },
                 &bytes,
+                identity,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -4268,6 +4286,26 @@ impl RuntimeServices {
                     | ExecutionResourceKind::ProviderTokenPool(_)
             )
         });
+        // Provider reload does not own the Context byte budget. Preserve its
+        // configured ceiling (including explicit absence), rather than resetting
+        // a narrowed content budget to the process default.
+        quotas.retain(|(kind, _)| *kind != ExecutionResourceKind::ContextBytes);
+        for current in self
+            .resource_manager
+            .snapshots()
+            .map_err(|e| e.to_string())?
+        {
+            if current.kind == ExecutionResourceKind::ContextBytes {
+                quotas.push((
+                    current.kind,
+                    ResourceQuota {
+                        minimum: current.minimum,
+                        target: current.target,
+                        maximum: current.maximum,
+                    },
+                ));
+            }
+        }
         quotas.extend(generation.quotas);
         let snapshots = self
             .resource_manager
@@ -5205,6 +5243,14 @@ fn install_builtin_executors(
 
 fn default_resource_quotas() -> Vec<(ExecutionResourceKind, ResourceQuota)> {
     vec![
+        (
+            ExecutionResourceKind::ContextBytes,
+            ResourceQuota {
+                minimum: 1,
+                target: crate::content_publication::PUBLICATION_RESIDENT_BYTES,
+                maximum: crate::content_publication::PUBLICATION_RESIDENT_BYTES,
+            },
+        ),
         (
             ExecutionResourceKind::SessionTurn,
             ResourceQuota {

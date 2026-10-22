@@ -769,9 +769,10 @@ pub(crate) fn compact_read_receipt(output: &str) -> String {
         .iter()
         .map(|chunk| {
             let content = chunk["content"].as_str()?;
+            let bytes = crate::context_evidence::read_chunk_bytes(chunk, &value)?;
             Some(
                 serde_json::json!({"index":chunk["index"], "characters":content.chars().count(),
-            "content_sha256":format!("{:x}", Sha256::digest(content.as_bytes()))}),
+            "body_bytes":bytes.len(), "content_sha256":format!("{:x}", Sha256::digest(&bytes))}),
             )
         })
         .collect::<Option<Vec<_>>>()

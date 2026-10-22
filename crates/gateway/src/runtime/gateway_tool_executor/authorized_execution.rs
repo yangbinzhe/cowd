@@ -337,34 +337,32 @@ impl GatewayToolExecutor {
             }))
             .map_err(|error| ToolError::new(error.to_string()));
         }
-        let bytes: Vec<u8> = store
-            .read(&artifact, &artifact.visibility_scope, None)
+        let (max_bytes, continuation) = evidence_read_selection(&artifact, &input)?;
+        let read = services
+            .read_authorized_publication_page(
+                &artifact.selector,
+                &artifact.sha256,
+                session_id.unwrap_or_default(),
+                &effective_scopes,
+                max_bytes,
+                continuation.as_ref(),
+            )
             .await
-            .map_err(|error| ToolError::new(format!("evidence_retrieve read failed: {error}")))?;
-        let (content, encoding) = match std::str::from_utf8(&bytes) {
-            Ok(text) => (text.to_string(), "utf8"),
-            Err(_) => {
-                if input.query.is_some() {
-                    return Err(ToolError::new("binary evidence does not support a text query; read without query or materialize the exact artifact"));
-                }
-                use base64::Engine;
-                (
-                    base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    "base64",
-                )
-            }
-        };
-        let page = evidence_content_page(&content, &artifact.sha256, &input)?;
+            .map_err(|e| ToolError::new(format!("evidence_retrieve read failed:{e}")))?;
+        let page = publication_evidence_page(&read, &input)?;
         serde_json::to_string_pretty(&serde_json::json!({
             "kind": "evidence_retrieve",
             "evidence_ref": input.evidence_ref,
             "available": true,
-            "bytes": bytes.len(),
+            "bytes": artifact.bytes,
+            "read_bytes": read.body.len(),
             "media_type": artifact.media_type,
-            "encoding": encoding,
+            "encoding": page["encoding"],
             "query": input.query,
             "sha256": artifact.sha256,
             "chunks": page["chunks"],
+            "total_bytes": page["total_bytes"],
+            "chunk_bytes": page["chunk_bytes"],
             "total_chunks": page["total_chunks"],
             "truncated": page["truncated"],
             "next_cursor": page["next_cursor"],

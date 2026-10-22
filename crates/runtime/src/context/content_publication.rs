@@ -104,6 +104,90 @@ pub fn verify_content_revision(bytes: &[u8], expected: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Immutable source identity plus the next unread byte. A continuation is never
+/// authorization; every call resolves the current record and checks its scope.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationContinuation {
+    pub source: ArtifactRef,
+    pub next_byte: u64,
+}
+
+/// Keeps original resident-byte admission alive while the returned body is in
+/// use. The same guard is moved into blocking IO, so cancelling the async waiter
+/// cannot return capacity before the physical read has exited.
+#[derive(Debug, thiserror::Error)]
+pub enum PublicationReadError {
+    #[error("context_capacity:{0}; use bounded publication pages")]
+    Capacity(String),
+    #[error("publication source rejected:{0}")]
+    Source(String),
+    #[error("publication read failed:{0}")]
+    Io(String),
+}
+impl From<String> for PublicationReadError {
+    fn from(value: String) -> Self {
+        Self::Source(value)
+    }
+}
+impl From<&str> for PublicationReadError {
+    fn from(value: &str) -> Self {
+        Self::Source(value.into())
+    }
+}
+
+pub struct AuthorizedPublicationBytes {
+    bytes: Vec<u8>,
+    _reservation: crate::execution_core::graph::ExecutionResourceLease,
+}
+
+impl std::fmt::Debug for AuthorizedPublicationBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedPublicationBytes")
+            .field("bytes", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsRef<[u8]> for AuthorizedPublicationBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::ops::Deref for AuthorizedPublicationBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Debug)]
+pub struct AuthorizedPublicationPage {
+    pub source: ArtifactRef,
+    pub start: u64,
+    pub end: u64,
+    pub total_bytes: u64,
+    pub continuation: Option<PublicationContinuation>,
+    pub body: AuthorizedPublicationBytes,
+}
+
+const PUBLICATION_PAGE_MAX_BYTES: u64 = 64 * 1024;
+pub(crate) const PUBLICATION_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+
+struct PublicationReadPin {
+    store: std::sync::Arc<crate::ArtifactStore>,
+    artifact: ArtifactRef,
+    owner: String,
+}
+impl Drop for PublicationReadPin {
+    fn drop(&mut self) {
+        if let Err(error) = self.store.unpin(&self.artifact, &self.owner) {
+            tracing::warn!(%error, "publication read pin release failed; pin retained");
+        }
+    }
+}
+
 impl crate::RuntimeServices {
     pub async fn publish_authorized_content(
         &self,
@@ -185,17 +269,17 @@ impl crate::RuntimeServices {
         Ok(artifact)
     }
 
-    pub async fn read_authorized_publication(
+    fn authorized_publication_source(
         &self,
         content_ref: &str,
         expected_sha256: &str,
         session_id: &str,
         authorized_scopes: &[String],
-    ) -> Result<(ArtifactRef, Vec<u8>), String> {
+    ) -> Result<ArtifactRef, String> {
         let artifact = self
             .artifact_store()
             .resolve(content_ref)
-            .map_err(|error| error.to_string())?;
+            .map_err(|e| e.to_string())?;
         if artifact.visibility_scope != format!("session:{session_id}")
             && !authorized_scopes
                 .iter()
@@ -203,14 +287,150 @@ impl crate::RuntimeServices {
         {
             return Err("content is outside authorized scope".into());
         }
-        let bytes = self
-            .artifact_store()
-            .read(&artifact, &artifact.visibility_scope, None)
+        if artifact.sha256.trim_start_matches("sha256:")
+            != expected_sha256.trim_start_matches("sha256:")
+        {
+            return Err("source_version_conflict".into());
+        }
+        Ok(artifact)
+    }
+
+    async fn read_publication_range(
+        &self,
+        artifact: &ArtifactRef,
+        range: std::ops::Range<u64>,
+        session_id: &str,
+    ) -> Result<AuthorizedPublicationBytes, PublicationReadError> {
+        let count = range
+            .end
+            .checked_sub(range.start)
+            .ok_or("invalid publication range")?;
+        // Covers returned bytes, UTF8/base64/JSON expansion and verification
+        // scratch before repository.object may materialize a compact body.
+        let resident = count
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(self.artifact_store().public_read_scratch_bytes()))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| PublicationReadError::Capacity("resident budget overflow".into()))?;
+        let kind = crate::execution_core::graph::ExecutionResourceKind::ContextBytes;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as u64;
+        let request = crate::execution_core::graph::ResourceAdmissionRequest::new(
+            crate::execution_core::graph::ExecutionServiceClass::Foreground,
+            [(kind.clone(), resident.max(1))],
+        )
+        .with_fairness_key(format!("context:{session_id}"))
+        .with_deadline_at_ms(now.saturating_add(5000));
+        let lease = match self
+            .resource_manager()
+            .admit(request)
             .await
-            .map_err(|error| error.to_string())?;
-        verify_content_revision(&bytes, expected_sha256)?;
+            .map_err(|e| PublicationReadError::Capacity(e.to_string()))?
+        {
+            crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } => lease,
+            _ => {
+                return Err(PublicationReadError::Capacity(
+                    "publication reservation not admitted".into(),
+                ))
+            }
+        };
+        let store = self.artifact_store().clone();
+        let artifact = artifact.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            // Resolve rejects PrivatePrepared before pin can adopt anything.
+            if store
+                .resolve(&artifact.selector)
+                .map_err(|e| e.to_string())?
+                != artifact
+            {
+                return Err("source_version_conflict".into());
+            }
+            let owner = format!("publication-read:{}", uuid::Uuid::new_v4());
+            store
+                .pin(&artifact, &owner, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS)
+                .map_err(|e| e.to_string())?;
+            let _pin = PublicationReadPin {
+                store: store.clone(),
+                artifact: artifact.clone(),
+                owner,
+            };
+            let bytes = store
+                .read_public_range_blocking(&artifact, &artifact.visibility_scope, range)
+                .map_err(|e| e.to_string())?;
+            Ok(AuthorizedPublicationBytes {
+                bytes,
+                _reservation: _lease,
+            })
+        })
+        .await
+        .map_err(|e| PublicationReadError::Io(e.to_string()))?
+        .map_err(PublicationReadError::Io)
+    }
+
+    pub async fn read_authorized_publication_page(
+        &self,
+        content_ref: &str,
+        expected_sha256: &str,
+        session_id: &str,
+        authorized_scopes: &[String],
+        max_bytes: u64,
+        continuation: Option<&PublicationContinuation>,
+    ) -> Result<AuthorizedPublicationPage, PublicationReadError> {
+        if max_bytes == 0 || max_bytes > PUBLICATION_PAGE_MAX_BYTES {
+            return Err("publication page max_bytes must be 1..=65536".into());
+        }
+        let artifact = self.authorized_publication_source(
+            content_ref,
+            expected_sha256,
+            session_id,
+            authorized_scopes,
+        )?;
+        let start = match continuation {
+            None => 0,
+            Some(cursor) if cursor.source == artifact && cursor.next_byte <= artifact.bytes => {
+                cursor.next_byte
+            }
+            Some(_) => return Err("publication continuation source revision/range changed".into()),
+        };
+        let end = start.saturating_add(max_bytes).min(artifact.bytes);
+        let body = self
+            .read_publication_range(&artifact, start..end, session_id)
+            .await?;
+        Ok(AuthorizedPublicationPage {
+            total_bytes: artifact.bytes,
+            source: artifact.clone(),
+            start,
+            end,
+            continuation: (end < artifact.bytes).then_some(PublicationContinuation {
+                source: artifact,
+                next_byte: end,
+            }),
+            body,
+        })
+    }
+
+    pub async fn read_authorized_publication(
+        &self,
+        content_ref: &str,
+        expected_sha256: &str,
+        session_id: &str,
+        authorized_scopes: &[String],
+    ) -> Result<(ArtifactRef, AuthorizedPublicationBytes), PublicationReadError> {
+        let artifact = self.authorized_publication_source(
+            content_ref,
+            expected_sha256,
+            session_id,
+            authorized_scopes,
+        )?;
+        let bytes = self
+            .read_publication_range(&artifact, 0..artifact.bytes, session_id)
+            .await?;
         Ok((artifact, bytes))
     }
+
 }
 
 #[cfg(test)]
@@ -311,6 +531,265 @@ pub(crate) mod tests {
         };
     }
 
+
+    fn resident_active(services: &crate::RuntimeServices) -> usize {
+        services
+            .resource_manager()
+            .snapshots()
+            .unwrap()
+            .iter()
+            .filter(|s| s.kind == crate::execution_core::graph::ExecutionResourceKind::ContextBytes)
+            .map(|s| s.active_leases)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn bounded_publication_pages_restore_exact_bytes_and_own_the_original_reservation() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let bytes = (0..530_017).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let artifact = services
+            .publish_authorized_content(&bytes, &digest, "application/octet-stream", "pages")
+            .await
+            .unwrap();
+        let mut next = None;
+        let mut restored = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = services
+                .read_authorized_publication_page(
+                    &artifact.selector,
+                    &digest,
+                    "pages",
+                    &[],
+                    65536,
+                    next.as_ref(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.start, restored.len() as u64);
+            assert_eq!(page.total_bytes, 530_017);
+            assert!(page.body.len() <= 65536);
+            assert!(resident_active(&services) > 0);
+            restored.extend_from_slice(&page.body);
+            next = page.continuation.clone();
+            drop(page);
+            assert_eq!(resident_active(&services), 0);
+            pages += 1;
+            if next.is_none() {
+                break;
+            }
+        }
+        assert_eq!(pages, 9);
+        assert_eq!(restored, bytes);
+    }
+
+    #[tokio::test]
+    async fn bounded_publication_rejects_changed_source_scope_and_invalid_selection_before_io() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let bytes = b"original authorised source";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let artifact = services
+            .publish_authorized_content(bytes, &digest, "text/plain", "source")
+            .await
+            .unwrap();
+        let page = services
+            .read_authorized_publication_page(&artifact.selector, &digest, "source", &[], 4, None)
+            .await
+            .unwrap();
+        let mut cursor = page.continuation.clone().unwrap();
+        drop(page);
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        services
+            .artifact_store()
+            .set_public_read_hook(Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        assert!(services
+            .read_authorized_publication_page(&artifact.selector, &digest, "foreign", &[], 4, None)
+            .await
+            .is_err());
+        assert!(services
+            .read_authorized_publication_page(&artifact.selector, "wrong", "source", &[], 4, None)
+            .await
+            .is_err());
+        assert!(services
+            .read_authorized_publication_page(
+                &artifact.selector,
+                &digest,
+                "source",
+                &[],
+                65537,
+                None
+            )
+            .await
+            .is_err());
+        cursor.source.sha256 = "sha256:other".into();
+        assert!(services
+            .read_authorized_publication_page(
+                &artifact.selector,
+                &digest,
+                "source",
+                &[],
+                4,
+                Some(&cursor)
+            )
+            .await
+            .is_err());
+        cursor.source = artifact.clone();
+        cursor.next_byte = artifact.bytes + 1;
+        assert!(services
+            .read_authorized_publication_page(
+                &artifact.selector,
+                &digest,
+                "source",
+                &[],
+                4,
+                Some(&cursor)
+            )
+            .await
+            .is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(resident_active(&services), 0);
+        let page = services
+            .read_authorized_publication_page(
+                &artifact.selector,
+                &digest,
+                "foreign",
+                &["session:source".into()],
+                4,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(&*page.body, b"orig");
+    }
+
+    #[test]
+    fn provider_reload_preserves_the_original_context_budget_ceiling() {
+        use crate::execution_core::graph::{ExecutionResourceKind, ResourceQuota};
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        services
+            .resource_manager()
+            .update_quota(
+                &ExecutionResourceKind::ContextBytes,
+                ResourceQuota::new(1, 2 * 1024 * 1024, 2 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        services
+            .replace_provider_resource_config(crate::ProviderResourceConfig::default())
+            .unwrap();
+        let current = services
+            .resource_manager()
+            .snapshot(&ExecutionResourceKind::ContextBytes)
+            .unwrap();
+        assert_eq!(current.target, 2 * 1024 * 1024);
+        assert_eq!(current.maximum, 2 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn required_publication_overflow_refuses_before_materializing_but_pages_remain_readable()
+    {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let bytes = vec![b'x'; 9 * 1024 * 1024];
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let artifact = services
+            .publish_authorized_content(&bytes, &digest, "text/plain", "large")
+            .await
+            .unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        services
+            .artifact_store()
+            .set_public_read_hook(Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        let error = services
+            .read_authorized_publication(&artifact.selector, &digest, "large", &[])
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, PublicationReadError::Capacity(_)),
+            "{error}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let page = services
+            .read_authorized_publication_page(&artifact.selector, &digest, "large", &[], 16, None)
+            .await
+            .unwrap();
+        assert_eq!(&*page.body, b"xxxxxxxxxxxxxxxx");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_or_panicked_publication_io_releases_only_after_physical_exit() {
+        for panic_after_release in [false, true] {
+            let services = crate::RuntimeServices::in_memory().unwrap();
+            let bytes = b"held physical read";
+            let digest = format!("{:x}", Sha256::digest(bytes));
+            let artifact = services
+                .publish_authorized_content(bytes, &digest, "text/plain", "hold")
+                .await
+                .unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let tx = Mutex::new(Some(entered_tx));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            let barrier = release.clone();
+            services
+                .artifact_store()
+                .set_public_read_hook(Arc::new(move || {
+                    tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    barrier.wait();
+                    assert!(!panic_after_release, "controlled read panic");
+                }));
+            let owner = services.clone();
+            let reference = artifact.clone();
+            let read = tokio::spawn(async move {
+                owner
+                    .read_authorized_publication_page(
+                        &reference.selector,
+                        &digest,
+                        "hold",
+                        &[],
+                        8,
+                        None,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(resident_active(&services) > 0);
+            read.abort();
+            assert!(read.await.unwrap_err().is_cancelled());
+            assert!(
+                resident_active(&services) > 0,
+                "cancelled async waiter must not free live IO capacity"
+            );
+            assert!(
+                services
+                    .artifact_store()
+                    .delete(&artifact, "session:hold")
+                    .is_err(),
+                "physical read pin prevents deletion"
+            );
+            release.wait();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while resident_active(&services) != 0 {
+                    services.resource_manager().wait_for_change().await;
+                }
+            })
+            .await
+            .unwrap();
+            services
+                .artifact_store()
+                .delete(&artifact, "session:hold")
+                .unwrap();
+        }
+    }
 
     #[test]
     fn own843_journal_source_view_fences_replace_read_and_head_fault_without_forwarding() {
