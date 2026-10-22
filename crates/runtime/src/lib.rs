@@ -198,6 +198,9 @@ mod session_history;
 #[cfg(test)]
 #[path = "agent/test_support.rs"]
 mod test_support;
+#[cfg(any(test, feature = "test-fixtures"))]
+#[path = "agent/test_support/failure_evidence.rs"]
+pub mod failure_evidence;
 pub use agentic::{
     AgentActionService, AgentActionServiceError, AgentMemberProjection, AgenticArtifactProjection,
     AgenticCompletionRequestProjection, AgenticDispatchContext, AgenticDispatchReceipt,

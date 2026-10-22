@@ -1,8 +1,15 @@
+mod coverage;
 mod current_review;
+mod identity;
+pub(crate) use identity::review_result_identity;
 mod policy;
 mod results;
 // The record-path entries re-verify a proof without a live action, so they
 // are the fixture and completion-lane entry points as well.
+#[cfg(test)]
+pub(crate) use coverage::evidence_contains;
+pub(crate) use coverage::validate_review_coverage;
+pub(crate) use current_review::CurrentReviewContext;
 #[allow(unused_imports)]
 pub(crate) use policy::{
     committed_proof_sources, completion_admission_context, effect_review_snapshot,
@@ -10,7 +17,6 @@ pub(crate) use policy::{
     validate_proof_inputs, validate_proof_inputs_for_action, CompletionAdmissionContext,
     ProofInputSnapshot,
 };
-pub(crate) use current_review::CurrentReviewContext;
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -214,18 +220,6 @@ pub(crate) fn required_review_conditions(
         .collect()
 }
 
-pub(crate) fn review_snapshot_key(
-    proof: &ObjectiveReviewVerification,
-) -> (Vec<String>, Option<String>) {
-    (
-        proof.effect_source_refs.clone(),
-        proof
-            .input_set
-            .as_ref()
-            .map(|inputs| inputs.semantic_digest.clone()),
-    )
-}
-
 /// The reference that names one material receipt.
 ///
 /// A receipt alias is only ever built from a genuine receipt. The delegated
@@ -250,75 +244,16 @@ pub(crate) fn receipt_alias(source: &str, event: &crate::DurableRuntimeEvent) ->
     format!("runtime-event:{}", event.event_id)
 }
 
-pub(crate) fn review_result_identity(
-    program: &AgenticProgramProjection,
-    reference: &str,
-) -> Result<String, String> {
-    let matches = program
-        .artifacts
-        .values()
-        .filter(|artifact| {
-            artifact.artifact_ref == reference
-                || artifact.content_ref == reference
-                || same_reference_spelling(&artifact.artifact_ref, reference)
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [] => Ok(reference.to_string()),
-        [artifact] => Ok(artifact.artifact_ref.clone()),
-        _ => {
-            let candidates = matches
-                .iter()
-                .map(|artifact| format!("{}=>{}", artifact.content_ref, artifact.artifact_ref))
-                .collect::<Vec<_>>()
-                .join(",");
-            Err(format!(
-                "proof artifact identity is ambiguous: reference {reference} matches {candidates}"
-            ))
-        }
-    }
-}
-
-/// The logical and content identities ONE Program artifact reference names.
-///
-/// A logical artifact ref ("artifact:<24 hex>") and a content selector
-/// ("artifact://art_...") are two identities of ONE artifact. A reader that
-/// resolves content needs the content; a reader that identifies the business
-/// artifact needs the logical identity. Both are returned, so the two
-/// namespaces are kept apart instead of one being dressed as the other.
-///
-/// A reference that names SEVERAL artifacts is refused: two logical
-/// identities over one content are never merged.
 pub(crate) fn bound_artifact_identities(
     program: &AgenticProgramProjection,
     reference: &str,
 ) -> Result<Vec<String>, String> {
-    let matches = program
-        .artifacts
-        .values()
-        .filter(|artifact| {
-            artifact.artifact_ref == reference
-                || artifact.content_ref == reference
-                || same_reference_spelling(&artifact.artifact_ref, reference)
-                || same_reference_spelling(&artifact.content_ref, reference)
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [] => Ok(Vec::new()),
-        [artifact] => Ok(vec![
-            artifact.artifact_ref.clone(),
-            artifact.content_ref.clone(),
-        ]),
-        _ => {
-            let candidates = matches
-                .iter()
-                .map(|artifact| format!("{}=>{}", artifact.content_ref, artifact.artifact_ref))
-                .collect::<Vec<_>>()
-                .join(",");
-            Err(format!(
-                "proof artifact identity is ambiguous: reference {reference} matches {candidates}"
-            ))
+    match identity::auxiliary_identity(program, reference)? {
+        identity::MaterialIdentity::Publication(reference) => {
+            let artifact = &program.artifacts[&reference];
+            Ok(vec![reference, artifact.content_ref.clone()])
         }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -377,21 +312,16 @@ mod bound_artifact_tests {
                 "artifact://art_99d6cafe58c24009872332b4880508a0".to_string(),
             ]
         );
-        // The content reference names the same artifact too.
-        assert_eq!(
-            bound_artifact_identities(&program, "artifact://art_99d6cafe58c24009872332b4880508a0")
-                .expect("one artifact"),
-            vec![
-                "artifact:5efe90ba23d164d6672da34f".to_string(),
-                "artifact://art_99d6cafe58c24009872332b4880508a0".to_string(),
-            ]
-        );
+        assert!(bound_artifact_identities(
+            &program,
+            "artifact://art_99d6cafe58c24009872332b4880508a0"
+        )
+        .expect("content does not select a publication")
+        .is_empty());
     }
 
-    /// Two logical identities over one content are NOT merged: the reference
-    /// is ambiguous and is refused.
     #[test]
-    fn r1_two_logical_identities_over_one_content_are_refused() {
+    fn r1_shared_content_is_auxiliary_but_not_an_unambiguous_business_result() {
         let program = program(vec![
             artifact(
                 "artifact:5efe90ba23d164d6672da34f",
@@ -402,9 +332,64 @@ mod bound_artifact_tests {
                 "artifact://art_99d6cafe58c24009872332b4880508a0",
             ),
         ]);
-        let error = bound_artifact_identities(&program, "artifact://art_99d6cafe58c24009872332b4880508a0")
+        let reference = "artifact://art_99d6cafe58c24009872332b4880508a0";
+        assert!(bound_artifact_identities(&program, reference)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            identity::auxiliary_identity(&program, reference).unwrap(),
+            identity::MaterialIdentity::Content(reference.into())
+        );
+        let error = review_result_identity(&program, reference)
             .expect_err("two logical identities over one content are ambiguous");
         assert!(error.contains("artifact identity is ambiguous"), "{error}");
+        assert_eq!(
+            review_result_identity(&program, "artifact:5efe90ba23d164d6672da34f").unwrap(),
+            "artifact:5efe90ba23d164d6672da34f"
+        );
+    }
+
+    #[test]
+    fn r1_auxiliary_content_does_not_select_publication_work() {
+        let program = program(vec![
+            artifact("artifact:original", "artifact://shared"),
+            artifact("artifact:stale", "artifact://shared"),
+            artifact("artifact:fresh", "artifact://shared"),
+        ]);
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let mut sources = BTreeMap::new();
+        let (tasks, publications, _) = selected_work(
+            &store,
+            &program,
+            None,
+            &["artifact://shared".into()],
+            &mut sources,
+        )
+        .unwrap();
+        assert!(tasks.is_empty());
+        assert!(publications.is_empty());
+        let (_, publications, _) = selected_work(
+            &store,
+            &program,
+            None,
+            &["artifact:fresh".into()],
+            &mut sources,
+        )
+        .unwrap();
+        assert_eq!(publications, vec!["artifact:fresh".to_string()]);
+        assert!(review_result_identity(&program, "artifact://shared").is_err());
+    }
+
+    #[test]
+    fn r1_auxiliary_receipt_does_not_select_a_content_publication() {
+        let program = program(vec![artifact("artifact:report", "tool://receipt")]);
+        assert_eq!(
+            identity::auxiliary_identity(&program, "tool://receipt").unwrap(),
+            identity::MaterialIdentity::Receipt("tool://receipt".into())
+        );
+        assert!(bound_artifact_identities(&program, "tool://receipt")
+            .unwrap()
+            .is_empty());
     }
 
     /// A reference this Program does not own binds nothing: it is not this
@@ -459,7 +444,7 @@ fn selected_work(
         .filter(|obligation| obligation.required)
         .map(|obligation| obligation.obligation_id.as_str())
         .collect::<BTreeSet<_>>();
-    let normalize = |reference: &str| review_result_identity(program, reference);
+    let normalize = |reference: &str| identity::auxiliary_reference(program, reference);
     let mut artifacts = references
         .iter()
         .map(|reference| normalize(reference))
@@ -468,7 +453,7 @@ fn selected_work(
     for task in program.tasks.values() {
         task_artifacts.insert(
             task.task_id.clone(),
-            task.artifact_refs.iter().cloned().collect::<BTreeSet<_>>(),
+            canonical_review_result_refs(program, &task.artifact_refs),
         );
     }
     let mut pending = program
@@ -477,8 +462,8 @@ fn selected_work(
         .filter(|task| {
             artifacts.contains(&task.task_id)
                 || task_artifacts[&task.task_id]
-                    .iter()
-                    .any(|reference| artifacts.contains(reference))
+                    .as_ref()
+                    .is_ok_and(|references| references.iter().any(|reference| artifacts.contains(reference)))
                 || task
                     .obligation_refs
                     .iter()
@@ -511,7 +496,13 @@ fn selected_work(
                 }
                 pending.extend(task.replacement_task_refs.iter().cloned());
             }
-            artifacts.extend(task_artifacts[&task.task_id].iter().cloned());
+            artifacts.extend(
+                task_artifacts[&task.task_id]
+                    .as_ref()
+                    .map_err(Clone::clone)?
+                    .iter()
+                    .cloned(),
+            );
             tasks.insert(reference, serde_json::json!({
             "team":task.team_id,"objective":task.objective,"acceptance":task.acceptance,
             "acceptance_checks":task.acceptance_checks,"criterion_source":task.criterion_source,
@@ -537,7 +528,11 @@ fn selected_work(
                         pending_artifacts.push(normalized);
                     }
                     if program.tasks.contains_key(dependency) {
-                        if !task_artifacts[dependency].contains(&artifact.artifact_ref) {
+                        if !task_artifacts[dependency]
+                            .as_ref()
+                            .map_err(Clone::clone)?
+                            .contains(&artifact.artifact_ref)
+                        {
                             results::authenticate_publication_task_link(
                                 store,
                                 program,
@@ -2014,11 +2009,17 @@ impl RuntimeServices {
             .map(|material| (material.reference.clone(), material.content.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut resolved_materials = material_contents.keys().cloned().collect::<BTreeSet<_>>();
-        let mut process_bodies = runs_by_result.values().flatten().cloned().collect::<Vec<_>>();
+        let mut process_bodies = runs_by_result
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut dependency_results = resolved;
         let mut actual_boundaries = Vec::new();
         let mut business_effect_targets = Vec::new();
-        let mut primary_seed_refs = result_refs.to_vec();
+        let mut primary_seed_refs = canonical_review_result_refs(program, result_refs)?
+            .into_iter()
+            .collect::<Vec<_>>();
         primary_seed_refs.extend(packets.iter().filter_map(|packet| {
             if !primary_packets.contains(packet.graph_id()) {
                 return None;
@@ -2116,11 +2117,14 @@ impl RuntimeServices {
             let previous_start_cursor = start_cursor;
             for mut material in std::mem::take(&mut dependency_results) {
                 for run in &material.process_runs {
-                    if !process_bodies.iter().any(|original| original.primary == run.primary) {
+                    if !process_bodies
+                        .iter()
+                        .any(|original| original.primary == run.primary)
+                    {
                         process_bodies.push(run.clone());
                     }
                 }
-                let identity = review_result_identity(program, &material.reference)?;
+                let identity = identity::auxiliary_reference(program, &material.reference)?;
                 let primary = primary_refs.contains(&identity);
                 if primary {
                     actual_boundaries.extend(material.input_boundaries.iter().cloned());
@@ -2169,7 +2173,8 @@ impl RuntimeServices {
                         }
                     }
                     for input in &material.primary_inputs {
-                        let Some(identity) = input.dependency_identity(program, &material.content, &material.process_runs)? else {
+                        let Some(identity) = input.dependency_identity(program)?
+                        else {
                             continue;
                         };
                         let metadata = results::resolve_result_metadata(
@@ -2381,10 +2386,12 @@ impl RuntimeServices {
                 }
                 for evidence in &packet.evidence_refs {
                     if evidence.evidence_ref.ref_type == "agent"
-                        && !program.artifacts.contains_key(&review_result_identity(
-                            program,
-                            &evidence.evidence_ref.id,
-                        )?)
+                        && !program
+                            .artifacts
+                            .contains_key(&identity::auxiliary_reference(
+                                program,
+                                &evidence.evidence_ref.id,
+                            )?)
                     {
                         return Err(
                             "recursive Agent material has no authenticated publication producer"
@@ -2414,7 +2421,7 @@ impl RuntimeServices {
                         .map_err(|error| error.to_string())?;
                     for reference in [&evidence.evidence_ref.id] {
                         auxiliary_refs.insert(reference.clone());
-                        let identity = review_result_identity(program, reference)?;
+                        let identity = identity::auxiliary_reference(program, reference)?;
                         if program.artifacts.contains_key(&identity)
                             || reference.starts_with("tool://")
                             || reference.starts_with("approval:v1:")
@@ -2470,15 +2477,14 @@ impl RuntimeServices {
                         .cloned(),
                 );
             }
-            let dependencies = result_refs
-                .iter()
-                .chain(&auxiliary_refs)
-                .cloned()
+            let dependencies = canonical_review_result_refs(program, result_refs)?
+                .into_iter()
+                .chain(auxiliary_refs.iter().cloned())
                 .collect::<Vec<_>>();
             pending_metadata.extend(
                 dependencies
                     .iter()
-                    .map(|reference| review_result_identity(program, reference))
+                    .map(|reference| identity::auxiliary_reference(program, reference))
                     .collect::<Result<Vec<_>, _>>()?,
             );
             while let Some(reference) = pending_metadata.pop_first() {
@@ -2494,7 +2500,7 @@ impl RuntimeServices {
                 };
                 pending_references.insert(reference);
                 for dependency in &artifact.relates_to {
-                    let identity = review_result_identity(program, dependency)?;
+                    let identity = identity::auxiliary_reference(program, dependency)?;
                     if primary {
                         primary_refs.insert(identity.clone());
                     }
@@ -2517,14 +2523,14 @@ impl RuntimeServices {
                 }
             }
             while let Some(reference) = pending_references.pop_first() {
-                let identity = review_result_identity(program, &reference)?;
+                let identity = identity::auxiliary_reference(program, &reference)?;
                 if !resolved_materials.insert(identity.clone())
                     && (!primary_refs.contains(&identity)
                         || expanded_primary_materials.contains(&identity))
                 {
                     continue;
                 }
-                let material = results::resolve_result(self, actor, program, &identity).await?;
+                let material = results::resolve_material(self, actor, program, &identity).await?;
                 material_contents.insert(identity, material.content.clone());
                 dependency_results.push(material);
             }
@@ -2559,9 +2565,9 @@ impl RuntimeServices {
                 .entry(source.clone())
                 .or_insert(current_revision);
             if material_revision != current_revision {
-                return Err(
-                    "recursive material enumeration cut changed; rebuild the whole review".into(),
-                );
+                return Err(format!(
+                    "recursive material enumeration cut changed: source={source} expected={material_revision} observed={current_revision} discovery_cursor={material_discovery_cursor}; rebuild the whole review"
+                ));
             }
             let mut offset = 0;
             loop {
@@ -2626,7 +2632,7 @@ impl RuntimeServices {
                             .insert(event.event_id.clone());
                         if matched && matched_receipt_events[&reference].len() > 1 {
                             return Err(
-                                "v2 selected read matches more than one material receipt".into(),
+                                "v2 selected read matches more than one material receipt".into()
                             );
                         }
                         let actual_read = if source.starts_with("execution-agent-receipts:") {
@@ -2731,85 +2737,160 @@ impl RuntimeServices {
                             {
                                 if let Some(selector) = output["evidence_ref"].as_str() {
                                     let session_events = results::result_source_events(
-                                        self.event_store(), &format!("session:{}", actor.session_id),
+                                        self.event_store(),
+                                        &format!("session:{}", actor.session_id),
                                         &mut material_revisions,
                                     )?;
-                                    let original_primary = if !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
+                                    let original_primary = if !event.payload
+                                        [crate::context_evidence::READ_ACQUISITION_FIELD]
+                                        .is_null()
+                                    {
                                         let seal = crate::context_evidence::decode_read_acquisition(
                                             &event.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
                                         ).map_err(str::to_string)?;
-                                        self.event_store().event_by_idempotency_key(&seal.primary_stream, &seal.primary_key)
+                                        self.event_store()
+                                            .event_by_idempotency_key(
+                                                &seal.primary_stream,
+                                                &seal.primary_key,
+                                            )
                                             .map_err(|error| error.to_string())?
                                             .ok_or("immutable material original primary missing")?
                                     } else {
-                                        let task = results::result_tool_plan(&session_events, &event)?
-                                            .ok_or("immutable material original governed plan missing")?;
-                                        results::original_tool_primary(self.event_store(), &event, task, &mut material_revisions)?
+                                        let task =
+                                            results::result_tool_plan(&session_events, &event)?
+                                                .ok_or(
+                                                "immutable material original governed plan missing",
+                                            )?;
+                                        results::original_tool_primary(
+                                            self.event_store(),
+                                            &event,
+                                            task,
+                                            &mut material_revisions,
+                                        )?
                                     };
                                     let seal = crate::context_evidence::decode_read_acquisition(
-                                        &original_primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
-                                    ).map_err(str::to_string)?;
-                                    let index = self.event_store().event_by_idempotency_key(&seal.index_stream, &seal.index_key)
+                                        &original_primary.payload
+                                            [crate::context_evidence::READ_ACQUISITION_FIELD],
+                                    )
+                                    .map_err(str::to_string)?;
+                                    let index = self
+                                        .event_store()
+                                        .event_by_idempotency_key(
+                                            &seal.index_stream,
+                                            &seal.index_key,
+                                        )
                                         .map_err(|error| error.to_string())?
                                         .ok_or("immutable material original index missing")?;
                                     let mut acquisition = policy::ActualInputSnapshot {
-                                        file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
-                                        sources: BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+                                        file_dependencies: Vec::new(),
+                                        immutable_inputs: Vec::new(),
+                                        sources: BTreeMap::new(),
+                                        material_events: Vec::new(),
+                                        canonical_facts: Vec::new(),
                                     };
-                                    let packet = packets.iter().find(|packet| packet.graph_id() == seal.graph_id
-                                        && packet.node_id() == seal.node_id && packet.attempt == seal.attempt);
+                                    let packet = packets.iter().find(|packet| {
+                                        packet.graph_id() == seal.graph_id
+                                            && packet.node_id() == seal.node_id
+                                            && packet.attempt == seal.attempt
+                                    });
                                     let input = policy::ActualImmutableInput::from_acquisition(
-                                        self.event_store(), program, &original_primary, &index,
-                                        &session_events, packet, ResultContentReaders {
+                                        self.event_store(),
+                                        program,
+                                        &original_primary,
+                                        &index,
+                                        &session_events,
+                                        packet,
+                                        ResultContentReaders {
                                             artifacts: Some(self.artifact_store().as_ref()),
-                                            history: self.session_history_reader().as_deref(), process_inputs: Some(&process_frame),
-                                        }, &mut acquisition,
+                                            history: self.session_history_reader().as_deref(),
+                                            process_inputs: Some(&process_frame),
+                                        },
+                                        &mut acquisition,
                                     )?;
                                     for original in [&original_primary, &index] {
-                                        results::pin_result_source(self.event_store(), &original.stream_id, &mut acquisition.sources)?;
-                                        acquisition.material_events.push(harness_contract::goal::ProofInputEvent {
-                                            stream_id: original.stream_id.clone(), sequence: original.sequence,
-                                            event_id: original.event_id.clone(), payload_digest: proof_value_digest(&original.payload),
-                                        });
+                                        results::pin_result_source(
+                                            self.event_store(),
+                                            &original.stream_id,
+                                            &mut acquisition.sources,
+                                        )?;
+                                        acquisition.material_events.push(
+                                            harness_contract::goal::ProofInputEvent {
+                                                stream_id: original.stream_id.clone(),
+                                                sequence: original.sequence,
+                                                event_id: original.event_id.clone(),
+                                                payload_digest: proof_value_digest(
+                                                    &original.payload,
+                                                ),
+                                            },
+                                        );
                                     }
                                     for material in acquisition.material_events {
-                                        if !material_events.contains(&material) { material_events.push(material); }
+                                        if !material_events.contains(&material) {
+                                            material_events.push(material);
+                                        }
                                     }
                                     for (source, revision) in acquisition.sources {
-                                        if material_revisions.insert(source, revision).is_some_and(|old| old != revision) {
+                                        if material_revisions
+                                            .insert(source, revision)
+                                            .is_some_and(|old| old != revision)
+                                        {
                                             return Err("immutable material acquisition source changed during enumeration".into());
                                         }
                                     }
-                                    let process_body = process_bodies.iter()
-                                        .find(|run| input.reference == input.content.selector && run.fact.body == input.content);
+                                    let process_body = process_bodies.iter().find(|run| {
+                                        input.reference == input.content.selector
+                                            && run.fact.body == input.content
+                                    });
                                     if let Some(run) = process_body {
-                                        let original = self.event_store().event_by_idempotency_key(
-                                            &run.primary.stream_id,
-                                            &format!("{}:receipt", run.fact.admission.binding.call_key),
-                                        ).map_err(|error| error.to_string())?
-                                            .ok_or("bounded process original body primary missing")?;
-                                        let authenticated = results::authenticate_bounded_process(self.event_store(), &original)?;
-                                        if authenticated.fact != run.fact || authenticated.primary != run.primary {
-                                            return Err("bounded process original body identity changed".into());
+                                        let original = self
+                                            .event_store()
+                                            .event_by_idempotency_key(
+                                                &run.primary.stream_id,
+                                                &format!(
+                                                    "{}:receipt",
+                                                    run.fact.admission.binding.call_key
+                                                ),
+                                            )
+                                            .map_err(|error| error.to_string())?
+                                            .ok_or(
+                                                "bounded process original body primary missing",
+                                            )?;
+                                        let authenticated = results::authenticate_bounded_process(
+                                            self.event_store(),
+                                            &original,
+                                        )?;
+                                        if authenticated.fact != run.fact
+                                            || authenticated.primary != run.primary
+                                        {
+                                            return Err(
+                                                "bounded process original body identity changed"
+                                                    .into(),
+                                            );
                                         }
                                         results::process_has_no_external_effects(&authenticated)?;
                                         for material in results::retain_process_execution(
-                                            self.event_store(), &authenticated, &mut material_revisions,
+                                            self.event_store(),
+                                            &authenticated,
+                                            &mut material_revisions,
                                         )? {
-                                            if !material_events.contains(&material) { material_events.push(material); }
+                                            if !material_events.contains(&material) {
+                                                material_events.push(material);
+                                            }
                                         }
                                     }
-                                    let physical_body = input.reference == input.content.selector
-                                        && (material_contents.values().any(|body| body == &input.content)
-                                            || process_body.is_some());
-                                    let identity = if physical_body { input.content.selector.clone() }
-                                        else { review_result_identity(program, &input.reference)? };
+                                    let dependency_identity = input.dependency_identity(program)?;
+                                    let physical_body = dependency_identity.is_none();
+                                    let identity = if physical_body {
+                                        input.content.selector.clone()
+                                    } else {
+                                        dependency_identity.ok_or("immutable dependency identity missing")?
+                                    };
                                     if primary && !physical_body {
                                         primary_refs.insert(identity.clone());
                                     }
                                     let material = if !physical_body {
                                         Some(
-                                            results::resolve_result(
+                                            results::resolve_material(
                                                 self, actor, program, &identity,
                                             )
                                             .await?,
@@ -3054,7 +3135,7 @@ impl RuntimeServices {
         }
         for reference in &auxiliary_refs {
             if reference.starts_with("approval:v1:") {
-                let decision = results::resolve_result(self, actor, program, reference).await?;
+                let decision = results::resolve_material(self, actor, program, reference).await?;
                 for source in decision.result_sources {
                     if verification
                         .result_source_revisions
@@ -3068,10 +3149,9 @@ impl RuntimeServices {
                 }
             }
         }
-        let dependencies = result_refs
-            .iter()
-            .chain(&auxiliary_refs)
-            .cloned()
+        let dependencies = canonical_review_result_refs(program, result_refs)?
+            .into_iter()
+            .chain(auxiliary_refs.iter().cloned())
             .collect::<Vec<_>>();
         let (task_refs, artifact_refs, _) = selected_work(
             self.event_store(),
@@ -3908,6 +3988,49 @@ mod tests {
             },
         );
         assert!(resolve_result_refs(&program, &["task:empty".to_string()]).is_empty());
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let mut sources = BTreeMap::new();
+        program.artifacts = canonical_alias_program_565().artifacts;
+        let task = program.tasks.get_mut("task:empty").unwrap();
+        task.status = crate::AgenticTaskStatus::Submitted;
+        task.artifact_refs = vec!["artifact://content-one".into()];
+        let original = program.clone();
+        let (tasks, artifacts, _) = selected_work(
+            &store, &program, None, &["task:empty".into()], &mut sources,
+        ).unwrap();
+        assert_eq!(tasks, vec!["task:empty".to_string()]);
+        assert_eq!(artifacts, vec!["artifact:one".to_string()]);
+        let (tasks, artifacts, _) = selected_work(
+            &store, &program, None, &["artifact://content-one".into()], &mut sources,
+        ).unwrap();
+        assert!(tasks.is_empty());
+        assert!(artifacts.is_empty());
+        let business = canonical_review_result_refs(
+            &program, &["artifact://content-one".into()],
+        ).unwrap().into_iter().collect::<Vec<_>>();
+        let (tasks, artifacts, _) = selected_work(
+            &store, &program, None, &business, &mut sources,
+        ).unwrap();
+        assert_eq!(tasks, vec!["task:empty".to_string()]);
+        assert_eq!(artifacts, vec!["artifact:one".to_string()]);
+        assert_eq!(program, original);
+        let mut second = program.artifacts["artifact:one"].clone();
+        second.artifact_ref = "artifact:two".into();
+        program.artifacts.insert(second.artifact_ref.clone(), second);
+        assert!(selected_work(
+            &store, &program, None, &["task:empty".into()], &mut sources,
+        ).unwrap_err().contains("ambiguous"));
+        let (tasks, artifacts, _) = selected_work(
+            &store, &program, None, &["artifact://content-one".into()], &mut sources,
+        ).unwrap();
+        assert!(tasks.is_empty());
+        assert!(artifacts.is_empty());
+        program.tasks.get_mut("task:empty").unwrap().artifact_refs = vec!["artifact:one".into()];
+        let (tasks, artifacts, _) = selected_work(
+            &store, &program, None, &["task:empty".into()], &mut sources,
+        ).unwrap();
+        assert_eq!(tasks, vec!["task:empty".to_string()]);
+        assert_eq!(artifacts, vec!["artifact:one".to_string()]);
     }
 
     fn canonical_alias_program_565() -> crate::AgenticProgramProjection {

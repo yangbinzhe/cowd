@@ -37,6 +37,65 @@ pub(crate) use commit_pipeline::receipt_replay_contract;
 use commit_pipeline::*;
 pub(crate) use tool_receipt_query::ToolReceiptQuery;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallbackDisposition {
+    Pending,
+    Commit,
+    Abort,
+}
+
+impl CallbackDisposition {
+    pub(super) fn from_result(node_id: &str, result: &ExecutionNodeResult) -> Self {
+        if !result.evidence_refs.is_empty() {
+            return Self::Commit;
+        }
+        let Some(failure) = result.failure.as_ref().filter(|failure| !failure.retryable) else {
+            return Self::Commit;
+        };
+        if failure.kind == "terminal_presentation_cancelled" {
+            return if result.status == ExecutionNodeStatus::Cancelled
+                && result.result_ref.is_none()
+                && failure.evidence_refs.is_empty()
+            {
+                Self::Abort
+            } else {
+                Self::Commit
+            };
+        }
+        if failure.kind == "execution_deadline_exceeded" {
+            return if result.status == ExecutionNodeStatus::Cancelled
+                && result
+                    .result_ref
+                    .as_ref()
+                    .and_then(|reference| {
+                        reference.strip_prefix(&format!("execution-deadline:{node_id}:"))
+                    })
+                    .and_then(|deadline| deadline.parse::<u64>().ok())
+                    .is_some()
+            {
+                Self::Abort
+            } else {
+                Self::Commit
+            };
+        }
+        if matches!(
+            result.status,
+            ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked
+        ) && result.result_ref.is_none()
+            && matches!(
+                failure.kind.as_str(),
+                "executor_error"
+                    | "effect_completion_uncertain"
+                    | "node_execution_isolated_failure"
+            )
+        {
+            Self::Abort
+        } else {
+            Self::Commit
+        }
+    }
+}
+
 /// Which authority published the process terminal that a receipt carries.
 ///
 /// A process terminal is a physical claim about a process tree, so exactly one
@@ -6672,22 +6731,27 @@ impl ExecutionCommitService {
         Ok(true)
     }
 
-    pub(super) fn binding_callback_kind(
+    pub(super) fn binding_callback_disposition(
         &self,
         graph: &ExecutionGraph,
         node: &str,
         binding: &ExecutionNodeBinding,
-    ) -> Result<Option<bool>, ExecutionCommitError> {
+    ) -> Result<CallbackDisposition, ExecutionCommitError> {
         if let Some((result, _)) = self.committed_node_attempt(graph, node, binding)? {
-            return Ok(Some(super::runner::outcome_aborts_publication(
-                node, &result,
-            )));
+            return Ok(CallbackDisposition::from_result(node, &result));
         }
         let store = ExecutionGraphStateStore::new(self.event_store.clone());
-        Ok(store
-            .binding_retirement_record(graph, node, binding)
-            .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?
-            .map(|_| true))
+        Ok(
+            if store
+                .binding_retirement_record(graph, node, binding)
+                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?
+                .is_some()
+            {
+                CallbackDisposition::Abort
+            } else {
+                CallbackDisposition::Pending
+            },
+        )
     }
 
     pub(super) fn authenticate_closed_binding(
@@ -9606,7 +9670,8 @@ impl ExecutionCommitService {
             let partial = retired
                 || completion.as_ref().is_some_and(|(result, _)| {
                     result.status != ExecutionNodeStatus::Completed
-                        || super::runner::outcome_aborts_publication(node, result)
+                        || CallbackDisposition::from_result(node, result)
+                            == CallbackDisposition::Abort
                 });
             let Some(leaf) = self.lease_recovery_leaf_sources_with_fact(
                 graph,
@@ -9669,9 +9734,14 @@ impl ExecutionCommitService {
             .binding_retirement_record(graph, node, binding)
             .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
         let retired = retirement.is_some();
-        let aborted = completion.as_ref().map_or(retired, |(result, _)| {
-            super::runner::outcome_aborts_publication(node, result)
-        });
+        let disposition = completion.as_ref().map_or(
+            if retired {
+                CallbackDisposition::Abort
+            } else {
+                CallbackDisposition::Pending
+            },
+            |(result, _)| CallbackDisposition::from_result(node, result),
+        );
         let Some(completion_source) = completion
             .as_ref()
             .map(|(_, record)| record)
@@ -9764,7 +9834,7 @@ impl ExecutionCommitService {
                 node,
                 binding,
                 &spec,
-                aborted
+                disposition == CallbackDisposition::Abort
                     || retired
                     || completion
                         .as_ref()
@@ -9776,7 +9846,7 @@ impl ExecutionCommitService {
             leaves
         };
         sources.extend(leaves);
-        if !aborted
+        if disposition == CallbackDisposition::Commit
             && spec.kind == ExecutionNodeKind::Synthesize
             && ticket.executor_kind == "synthesize"
         {
@@ -9788,7 +9858,7 @@ impl ExecutionCommitService {
         executor
             .validate(&spec)
             .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
-        if aborted {
+        if disposition == CallbackDisposition::Abort {
             executor
                 .cancel_bounded(&ticket, std::time::Duration::from_secs(5))
                 .await

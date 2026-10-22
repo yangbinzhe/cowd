@@ -447,6 +447,20 @@ impl RuntimeEventStore {
         )
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn fixture_evidence_page(
+        &self,
+        request: &FixtureEvidencePageRequest<'_>,
+    ) -> Result<FixtureEvidencePage, &'static str> {
+        if Instant::now() >= request.deadline {
+            return Err("Unavailable: deadline exhausted before read");
+        }
+        if request.max_events == 0 || request.max_bytes == 0 {
+            return Err("Unavailable: budget exhausted before read");
+        }
+        self.backend.fixture_evidence_page(request)
+    }
+
     pub fn position_page(
         &self,
         scope: RuntimeEventScope,

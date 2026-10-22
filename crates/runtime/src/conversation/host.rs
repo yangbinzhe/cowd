@@ -1193,35 +1193,22 @@ where
                 harness_contract::execution_graph::ExecutionServiceClass::Foreground;
         }
         if let Some(ingress) = &ingress {
-            let compiled_graph_id = graph.id.clone();
-            graph.id = crate::session_execution::session_ingress_graph_id(
+            let graph_id = crate::session_execution::session_ingress_graph_id(
                 &ingress.session_id,
                 &ingress.request_id,
                 &ingress.turn_id,
             );
+            ExecutionGraphCompiler
+                .bind_conversation_graph_identity(
+                    &mut graph,
+                    &graph_id,
+                    None,
+                    Some(&ingress.request_id),
+                )
+                .map_err(RuntimeError::new)?;
             graph.revision = 0;
             graph.node_results.clear();
             graph.recovery_cursor = Default::default();
-            let mut remapped_ids = std::collections::BTreeMap::new();
-            for node in &mut graph.nodes {
-                let suffix = node
-                    .id
-                    .strip_prefix(&format!("{compiled_graph_id}:"))
-                    .unwrap_or(&node.id)
-                    .to_string();
-                let previous = node.id.clone();
-                node.id = format!("{}:{suffix}", graph.id);
-                node.idempotency_key = format!("{}:{suffix}", ingress.request_id);
-                remapped_ids.insert(previous, node.id.clone());
-            }
-            for edge in &mut graph.edges {
-                if let Some(id) = remapped_ids.get(&edge.from) {
-                    edge.from.clone_from(id);
-                }
-                if let Some(id) = remapped_ids.get(&edge.to) {
-                    edge.to.clone_from(id);
-                }
-            }
             graph.node_statuses.clear();
             graph.lineage = Some(
                 harness_contract::execution_graph::ExecutionGraphLineage {
@@ -4389,40 +4376,33 @@ fn compile_retargeted_conversation_graph(
             objective: objective.to_string(),
             payload_ref: payload,
             target,
-            resource_scopes: Vec::new(),
+            resource_scopes: current
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == ExecutionNodeKind::Verify
+                        && node.executor_kind
+                        == crate::execution_core::graph::executors::CompileTargetGuardExecutor::KIND
+                        && node
+                            .acceptance
+                            .criteria
+                            .iter()
+                            .any(|criterion| criterion == "mutation_resources_must_be_leased")
+                })
+                .flat_map(|node| node.resource_scopes.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
         })
         .map_err(|error| RuntimeError::new(error.to_string()))?;
-    let replacement_graph_id = replacement.id.clone();
-    let replacement_parent_node_id = replacement
-        .nodes
-        .first()
-        .map(|node| node.id.clone())
-        .ok_or_else(|| RuntimeError::new("retargeted conversation graph has no root node"))?;
-    let mut remapped = BTreeMap::new();
-    for node in &mut replacement.nodes {
-        let previous = node.id.clone();
-        let suffix = previous
-            .strip_prefix(&format!("{replacement_graph_id}:"))
-            .unwrap_or(previous.as_str());
-        node.id = if previous == replacement_parent_node_id {
-            stable_parent_node_id.to_string()
-        } else {
-            format!("{}:{suffix}", current.id)
-        };
-        node.idempotency_key = ingress.map_or_else(
-            || node.id.clone(),
-            |ingress| format!("{}:{suffix}", ingress.request_id),
-        );
-        remapped.insert(previous, node.id.clone());
-    }
-    for edge in &mut replacement.edges {
-        if let Some(id) = remapped.get(&edge.from) {
-            edge.from.clone_from(id);
-        }
-        if let Some(id) = remapped.get(&edge.to) {
-            edge.to.clone_from(id);
-        }
-    }
+    ExecutionGraphCompiler
+        .bind_conversation_graph_identity(
+            &mut replacement,
+            &current.id,
+            Some(stable_parent_node_id),
+            ingress.map(|value| value.request_id.as_str()),
+        )
+        .map_err(RuntimeError::new)?;
     if let Some(dispatch) = current
         .nodes
         .iter()
@@ -4439,30 +4419,248 @@ fn compile_retargeted_conversation_graph(
             },
         );
     }
-    replacement.id.clone_from(&current.id);
     replacement.parent_execution = current.parent_execution.clone();
     replacement.lineage = current.lineage.clone();
     replacement.service_class = current.service_class;
-    for node in &mut replacement.nodes {
-        node.executor_kind = match node.kind {
-            ExecutionNodeKind::InlineModel => "inline_model".to_string(),
-            ExecutionNodeKind::ToolBatch => "tool_batch".to_string(),
-            ExecutionNodeKind::Verify => {
-                if node.executor_kind
-                    == crate::execution_core::graph::executors::CompileTargetGuardExecutor::KIND
-                {
-                    node.executor_kind.clone()
-                } else {
-                    crate::execution_core::graph::executors::VerifyNodeExecutor::KIND.to_string()
+    harness_contract::execution_graph::validate_execution_graph(&replacement)
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+    Ok(replacement)
+}
+
+#[cfg(test)]
+#[test]
+fn conversation_retarget_preserves_delegation_scopes_and_unique_node_identity() {
+    use crate::execution_core::RuntimeCompileTarget;
+    let targets = [
+        RuntimeCompileTarget::InlineModel,
+        RuntimeCompileTarget::EvidenceGraph,
+        RuntimeCompileTarget::ExecutionGraph,
+    ];
+    let ingress = TurnIngressRef {
+        request_id: "request".into(),
+        turn_id: "turn".into(),
+        message_id: "message".into(),
+        session_id: "session".into(),
+        primary_task_id: "task".into(),
+        root_task_id: "task".into(),
+        session_generation: 1,
+        input_sequence: 1,
+        claim_owner: "owner".into(),
+        claim_token: "token".into(),
+        claim_revision: 1,
+        handoff_id: None,
+    };
+    for source in targets {
+        for target in targets {
+            for scopes in [
+                vec!["workspace:.".to_string()],
+                vec!["read:input.txt".to_string()],
+                vec!["write:output.txt".to_string(), "read:input.txt".to_string()],
+                Vec::new(),
+            ] {
+                for ingress in [None, Some(&ingress)] {
+                    let mut current = ExecutionGraphCompiler
+                        .compile_conversation_turn(ExecutionCompileRequest {
+                            objective: "work".into(),
+                            payload_ref: "{}".into(),
+                            target: source,
+                            resource_scopes: scopes.clone(),
+                        })
+                        .unwrap();
+                    let parent = current.nodes[0].id.clone();
+                    let dispatch = ingress.map(|_| {
+                        let mut dispatch =
+                            harness_contract::execution_graph::ExecutionNodeSpec::new(
+                                ExecutionNodeKind::SessionDispatch,
+                                "session_dispatch",
+                                "dispatch-payload",
+                            );
+                        dispatch.id = format!("{}:dispatch", current.id);
+                        dispatch.idempotency_key = "request:dispatch".into();
+                        dispatch
+                    });
+                    if let Some(dispatch) = &dispatch {
+                        current.nodes.insert(0, dispatch.clone());
+                        current.edges.insert(
+                            0,
+                            ExecutionEdge {
+                                from: dispatch.id.clone(),
+                                to: parent.clone(),
+                                kind: ExecutionEdgeKind::DependsOn,
+                            },
+                        );
+                    }
+                    current
+                        .nodes
+                        .iter_mut()
+                        .find(|node| node.kind == ExecutionNodeKind::InlineModel)
+                        .unwrap()
+                        .resource_scopes = vec!["write:unrelated.txt".into()];
+                    for next_target in [target, source, target] {
+                        let replacement = compile_retargeted_conversation_graph(
+                            &current,
+                            "work",
+                            "session",
+                            ingress,
+                            next_target,
+                            &parent,
+                        )
+                        .unwrap();
+                        harness_contract::execution_graph::validate_execution_graph(&replacement)
+                            .unwrap();
+                        assert_eq!(replacement.id, current.id);
+                        assert_eq!(
+                            replacement.nodes[usize::from(dispatch.is_some())].id,
+                            parent
+                        );
+                        assert_eq!(
+                            replacement
+                                .nodes
+                                .iter()
+                                .map(|node| &node.id)
+                                .collect::<BTreeSet<_>>()
+                                .len(),
+                            replacement.nodes.len()
+                        );
+                        assert_eq!(
+                            replacement
+                                .nodes
+                                .iter()
+                                .map(|node| &node.idempotency_key)
+                                .collect::<BTreeSet<_>>()
+                                .len(),
+                            replacement.nodes.len()
+                        );
+                        assert_eq!(
+                            replacement
+                                .nodes
+                                .iter()
+                                .flat_map(|node| node.resource_scopes.iter().cloned())
+                                .collect::<BTreeSet<_>>(),
+                            scopes.iter().cloned().collect()
+                        );
+                        assert_eq!(replacement.edges.len(), replacement.nodes.len() - 1);
+                        for (edge, pair) in
+                            replacement.edges.iter().zip(replacement.nodes.windows(2))
+                        {
+                            assert_eq!(edge.from, pair[0].id);
+                            assert_eq!(edge.to, pair[1].id);
+                            assert_eq!(edge.kind, ExecutionEdgeKind::DependsOn);
+                        }
+                        if let Some(dispatch) = &dispatch {
+                            assert_eq!(&replacement.nodes[0], dispatch);
+                        }
+                        for node in replacement
+                            .nodes
+                            .iter()
+                            .filter(|node| node.kind != ExecutionNodeKind::SessionDispatch)
+                        {
+                            let payload: serde_json::Value =
+                                serde_json::from_str(&node.payload_ref).unwrap();
+                            assert_eq!(payload["ingress"], serde_json::to_value(ingress).unwrap());
+                            if let Some(ingress) = ingress {
+                                let suffix = if node.kind == ExecutionNodeKind::InlineModel {
+                                    "model"
+                                } else if node.acceptance.criteria.iter().any(|criterion| {
+                                    criterion == "mutation_resources_must_be_leased"
+                                }) {
+                                    "resource-constraint"
+                                } else if next_target == RuntimeCompileTarget::EvidenceGraph {
+                                    "evidence-constraint"
+                                } else {
+                                    "policy-constraint"
+                                };
+                                assert_eq!(
+                                    node.idempotency_key,
+                                    format!("{}:{suffix}", ingress.request_id)
+                                );
+                            } else {
+                                assert_eq!(node.idempotency_key, node.id);
+                            }
+                            if node.kind == ExecutionNodeKind::InlineModel {
+                                assert!(node.resource_scopes.is_empty());
+                            }
+                        }
+                        current = replacement;
+                    }
                 }
             }
-            ExecutionNodeKind::Synthesize => {
-                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string()
-            }
-            _ => node.executor_kind.clone(),
-        };
+        }
     }
-    Ok(replacement)
+}
+
+#[cfg(test)]
+#[test]
+fn conversation_retarget_does_not_promote_non_authorizing_scopes() {
+    use crate::execution_core::graph::executors::CompileTargetGuardExecutor;
+    use crate::execution_core::RuntimeCompileTarget;
+
+    for (kind, executor_kind, criterion) in [
+        (
+            ExecutionNodeKind::Verify,
+            "verify",
+            "mutation_resources_must_be_leased",
+        ),
+        (
+            ExecutionNodeKind::Verify,
+            CompileTargetGuardExecutor::KIND,
+            "evidence_read_before_synthesis",
+        ),
+        (
+            ExecutionNodeKind::InlineModel,
+            CompileTargetGuardExecutor::KIND,
+            "mutation_resources_must_be_leased",
+        ),
+    ] {
+        let mut current = ExecutionGraphCompiler
+            .compile_conversation_turn(ExecutionCompileRequest {
+                objective: "inspect".into(),
+                payload_ref: "{}".into(),
+                target: RuntimeCompileTarget::InlineModel,
+                resource_scopes: Vec::new(),
+            })
+            .unwrap();
+        let parent = current.nodes[0].id.clone();
+        let mut decoy =
+            harness_contract::execution_graph::ExecutionNodeSpec::new(kind, executor_kind, "decoy");
+        decoy.acceptance.criteria = vec![criterion.into()];
+        decoy.resource_scopes = vec!["workspace:.".into()];
+        current.nodes.push(decoy);
+        for target in [
+            RuntimeCompileTarget::InlineModel,
+            RuntimeCompileTarget::EvidenceGraph,
+            RuntimeCompileTarget::ExecutionGraph,
+        ] {
+            let replacement = compile_retargeted_conversation_graph(
+                &current, "inspect", "session", None, target, &parent,
+            )
+            .unwrap();
+            assert!(replacement
+                .nodes
+                .iter()
+                .all(|node| node.resource_scopes.is_empty()));
+        }
+        let mut dispatch = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            ExecutionNodeKind::SessionDispatch,
+            "session_dispatch",
+            "dispatch",
+        );
+        dispatch.id = parent.clone();
+        current.nodes.insert(0, dispatch);
+        let error = compile_retargeted_conversation_graph(
+            &current,
+            "inspect",
+            "session",
+            None,
+            RuntimeCompileTarget::ExecutionGraph,
+            &parent,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("duplicate execution node `{parent}`")
+        );
+    }
 }
 
 struct TurnGraphState {

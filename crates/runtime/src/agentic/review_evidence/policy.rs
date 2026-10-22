@@ -91,19 +91,6 @@ impl CompletionAdmissionContext {
     }
 }
 
-fn review_covers_reference(
-    program: &AgenticProgramProjection,
-    reviewed: &[String],
-    reference: &str,
-) -> bool {
-    let Ok(wanted) = super::review_result_identity(program, reference) else {
-        return false;
-    };
-    reviewed.iter().any(|reviewed| {
-        super::review_result_identity(program, reviewed)
-            .is_ok_and(|identity| identity == wanted)
-    })
-}
 
 pub(crate) fn completion_admission_context(
     store: &std::sync::Arc<RuntimeEventStore>,
@@ -226,53 +213,11 @@ pub(crate) fn completion_admission_context(
                     .is_some_and(|inputs| inputs.version == 2)
             })
             .ok_or_else(|| format!("completion context requires latest v2 proof:{condition}"))?;
-        let inputs = proof
-            .input_set
-            .as_ref()
-            .ok_or("completion context v2 inputs missing")?;
         super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)?;
-        if review.decision != "satisfied"
-            || review.spec_revision != goal.spec_revision
-            || review.input_manifest_digest != goal.spec_digest
-            || inputs.condition_ref.as_deref() != Some(condition.as_str())
-            || results.is_empty()
-            || review.evidence_refs.is_empty()
-            || review.producer_refs.is_empty()
-            || (proof.independence_required
-                && review.producer_refs.contains(&review.reviewer_actor))
-            || proof.producer_execution_ids.is_empty()
-            || proof.producer_execution_ids.iter().any(|producer| {
-                producer.is_empty()
-                    || (proof.independence_required && producer == &proof.reviewer_execution_id)
-            })
-        {
-            return Err(format!(
-                "completion context requires current satisfied review:{condition}"
-            ));
-        }
-        for reference in &results {
-            if !review_covers_reference(program, &review.result_refs, reference)
-                || !proof.reads.iter().any(|read| {
-                    review_covers_reference(
-                        program,
-                        std::slice::from_ref(&read.result_ref),
-                        reference,
-                    )
-                    && !read.sha256.is_empty()
-                    && !read.receipt_refs.is_empty()
-                    && (read.result_kind != harness_contract::goal::GoalResultKind::ToolEffect
-                        || !read.effect_observation_refs.is_empty())
-                })
-            {
-                return Err(format!(
-                    "completion context review does not cover result:{reference}"
-                ));
-            }
-        }
         let snapshot = validate_proof_inputs(store, program, Some(&goal), proof, readers)?;
-        if !snapshot.reviewer_matches(program, review) {
-            return Err("completion context review physical identity changed".into());
-        }
+        super::validate_review_coverage(
+            &goal, program, review, &results, &review.evidence_refs, &snapshot,
+        ).map_err(|error| format!("completion context review {condition}: {error}"))?;
         excluded_tasks = Some(match excluded_tasks {
             None => snapshot.retiring_optional_task_refs,
             Some(previous) => previous
@@ -319,9 +264,6 @@ pub(crate) fn completion_admission_context(
     }))
 }
 
-/// Re-verify a proof as a RECORD. A record carries no live action, so it
-/// re-derives no exemption: the review's own in-flight call is not excluded
-/// here, and a stored proof can never grant one.
 pub(crate) fn validate_proof_inputs(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -415,31 +357,6 @@ pub(crate) fn committed_proof_sources(
             .as_ref()
             .ok_or_else(|| format!("committed A unsupported required review {condition}"))?;
         super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)?;
-        if inputs.version != 2
-            || inputs.semantic_digest.is_empty()
-            || inputs.condition_ref.as_deref() != Some(condition.as_str())
-            || review.decision != "satisfied"
-            || review.spec_revision != goal.spec_revision
-            || review.input_manifest_digest != goal.spec_digest
-            || proof.goal_spec_revision != Some(goal.spec_revision)
-            || proof.goal_spec_digest.as_deref() != Some(goal.spec_digest.as_str())
-            || proof.reviewer_execution_id.is_empty()
-            || proof.producer_execution_ids.is_empty()
-            || inputs.material_events.is_empty()
-            || review.result_refs.is_empty()
-            || review.evidence_refs.is_empty()
-            || review.producer_refs.is_empty()
-            || proof.producer_execution_ids.iter().any(|producer| {
-                producer.is_empty()
-                    || (proof.independence_required && producer == &proof.reviewer_execution_id)
-            })
-            || (proof.independence_required
-                && review.producer_refs.contains(&review.reviewer_actor))
-        {
-            return Err(format!(
-                "committed A proof identity is invalid: {condition}"
-            ));
-        }
         let mut results = review.result_refs.clone();
         if goal.user_intent_criterion_id.as_ref() == Some(&condition) {
             let request = program
@@ -459,32 +376,6 @@ pub(crate) fn committed_proof_sources(
         {
             results.extend(obligation.artifact_refs.iter().cloned());
         }
-        for reference in results {
-            let identity = super::review_result_identity(program, &reference)?;
-            let covers = |refs: &[String]| {
-                refs.iter().any(|reference| {
-                    super::review_result_identity(program, reference)
-                        .is_ok_and(|current| current == identity)
-                })
-            };
-            if !covers(&review.result_refs)
-                || !covers(&inputs.result_refs)
-                || !proof.reads.iter().any(|read| {
-                    super::review_result_identity(program, &read.result_ref)
-                        .is_ok_and(|current| current == identity)
-                        && !read.sha256.is_empty()
-                        && !read.receipt_refs.is_empty()
-                        && (read.result_kind != harness_contract::goal::GoalResultKind::ToolEffect
-                            || !read.effect_observation_refs.is_empty())
-                })
-            {
-                return Err(format!(
-                    "committed A required result coverage missing: {condition}"
-                ));
-            }
-        }
-        // A committed record is re-verified without a live action, so it
-        // re-derives no exemption.
         let snapshot = proof_input_snapshot_for_phase(
             store,
             program,
@@ -494,8 +385,10 @@ pub(crate) fn committed_proof_sources(
             readers,
             None,
         )?;
-        if !snapshot.reviewer_matches(program, review)
-            || snapshot.semantic_digest != inputs.semantic_digest
+        super::validate_review_coverage(
+            goal, program, review, &results, &review.evidence_refs, &snapshot,
+        ).map_err(|error| format!("committed A review {condition}: {error}"))?;
+        if snapshot.semantic_digest != inputs.semantic_digest
             || snapshot.work_digest != proof.work_manifest_digest
             || proof.effect_manifest_digest.as_deref() != Some(snapshot.effects.digest.as_str())
         {
@@ -2302,16 +2195,22 @@ impl ActualImmutableInput {
             .filter(|reference| !reference.is_empty())
             .ok_or("immutable acquisition has no original requested reference")?;
         let source = &acquisition.body.source_ref;
-        let source_selector = if source.starts_with("artifact:")
-            && !source.starts_with("artifact://art_")
-            && !source.starts_with("artifact://sha256:")
+        let requested_identity = super::identity::auxiliary_identity(program, requested)?;
+        let source_identity = super::identity::auxiliary_identity(program, source)?;
+        if requested.starts_with("artifact:")
+            && !requested.starts_with("artifact://")
+            && !matches!(&requested_identity, super::identity::MaterialIdentity::Publication(_))
         {
-            let identity = super::review_result_identity(program, source)?;
-            program.artifacts.get(&identity).map_or(source.as_str(), |artifact| {
-                artifact.content_ref.as_str()
-            })
-        } else {
-            source.as_str()
+            return Err("immutable acquisition exact publication binding missing".into());
+        }
+        let source_selector = match &source_identity {
+            super::identity::MaterialIdentity::Publication(reference) => {
+                program.artifacts[reference].content_ref.as_str()
+            }
+            _ if source.starts_with("artifact:") && !source.starts_with("artifact://") => {
+                return Err("immutable acquisition sealed publication binding missing".into());
+            }
+            _ => source.as_str(),
         };
         let content = if source_selector.starts_with("artifact://") {
             readers.artifacts.ok_or("immutable acquisition Artifact owner unavailable")?
@@ -2333,26 +2232,19 @@ impl ActualImmutableInput {
             return Err("immutable acquisition conflicts with original content or grant".into());
         }
         let mut reference = requested.to_string();
-        let requested_identity = program.artifacts.values().any(|artifact| {
-            super::same_reference_spelling(&artifact.artifact_ref, requested)
-        });
-        let source_identity = program.artifacts.values().any(|artifact| {
-            super::same_reference_spelling(&artifact.artifact_ref, source)
-        });
-        if requested_identity {
-            reference = super::review_result_identity(program, requested)?;
+        if let super::identity::MaterialIdentity::Publication(publication) = &requested_identity {
+            reference = publication.clone();
             if program.artifacts[&reference].content_ref != content.selector
-                || source_identity && super::review_result_identity(program, source)? != reference
+                || matches!(&source_identity,
+                    super::identity::MaterialIdentity::Publication(source) if source != &reference)
             {
                 return Err("immutable acquisition exact reference conflicts with original content".into());
             }
-        } else if source_identity {
-            reference = super::review_result_identity(program, source)?;
+        } else if let super::identity::MaterialIdentity::Publication(publication) = &source_identity {
+            reference = publication.clone();
             if program.artifacts[&reference].content_ref != content.selector {
                 return Err("immutable acquisition sealed publication conflicts with content".into());
             }
-        } else if requested.starts_with("artifact:") && !requested.starts_with("artifact://") {
-            return Err("immutable acquisition exact publication binding missing".into());
         } else if requested == content.selector {
             let mut bound = BTreeSet::new();
             for evidence in packet.into_iter().flat_map(|packet| &packet.evidence_refs) {
@@ -2365,10 +2257,10 @@ impl ActualImmutableInput {
                 {
                     return Err("immutable acquisition packet grant conflicts with original content".into());
                 }
-                if program.artifacts.values().any(|artifact| {
-                    super::same_reference_spelling(&artifact.artifact_ref, &evidence.evidence_ref.id)
-                }) {
-                    bound.insert(super::review_result_identity(program, &evidence.evidence_ref.id)?);
+                if let super::identity::MaterialIdentity::Publication(publication) =
+                    super::identity::auxiliary_identity(program, &evidence.evidence_ref.id)?
+                {
+                    bound.insert(publication);
                 } else if evidence.evidence_ref.ref_type == "agent"
                     || evidence.evidence_ref.id.starts_with("artifact:")
                         && !evidence.evidence_ref.id.starts_with("artifact://")
@@ -2392,15 +2284,16 @@ impl ActualImmutableInput {
     pub(super) fn dependency_identity(
         &self,
         program: &AgenticProgramProjection,
-        body: &harness_contract::context::ArtifactRef,
-        process_runs: &[super::results::AuthenticatedProcessExecution],
     ) -> Result<Option<String>, String> {
-        if self.reference == self.content.selector
-            && (&self.content == body || process_runs.iter().any(|run| run.fact.body == self.content))
-        {
-            return Ok(None);
+        match super::identity::auxiliary_identity(program, &self.reference)? {
+            super::identity::MaterialIdentity::Content(selector) => {
+                if selector != self.content.selector {
+                    return Err("immutable input content reference conflicts with its acquisition".into());
+                }
+                Ok(None)
+            }
+            identity => Ok(Some(identity.reference().to_string())),
         }
-        super::review_result_identity(program, &self.reference).map(Some)
     }
 
     pub(super) fn validate_dependency(
@@ -2409,6 +2302,17 @@ impl ActualImmutableInput {
         reference: &str,
         dependency: &super::results::ResolvedReviewResult,
     ) -> Result<(), String> {
+        let identity = super::identity::auxiliary_identity(program, reference)?;
+        if dependency.reference != reference
+            || dependency.content.sha256.trim_start_matches("sha256:")
+                != self.content.sha256.trim_start_matches("sha256:")
+            || dependency.content.bytes != self.content.bytes
+            || (matches!(identity, super::identity::MaterialIdentity::Publication(_)
+                | super::identity::MaterialIdentity::Content(_))
+                && dependency.content != self.content)
+        {
+            return Err("immutable dependency conflicts with its authenticated acquisition".into());
+        }
         if program.artifacts.contains_key(reference)
             && !dependency.input_boundaries.iter().any(|boundary| {
                 boundary.source.stream_id.starts_with("agentic-program:")
@@ -3357,6 +3261,16 @@ fn review_write_outcome(
     ReviewWriteOutcome::Blocked
 }
 
+fn is_authenticated_control_effect(
+    identity: Option<&str>,
+    current_review_effect_key: Option<&str>,
+    settled_control_keys: &BTreeSet<String>,
+) -> bool {
+    identity.filter(|key| !key.is_empty()).is_some_and(|key| {
+        current_review_effect_key == Some(key) || settled_control_keys.contains(key)
+    })
+}
+
 /// Whether this intent is the reviewer's OWN admitted call.
 ///
 /// Two things have to hold, and they are two different facts:
@@ -4110,11 +4024,9 @@ fn proof_input_snapshot_for_phase(
     {
         return Err("proof Goal spec changed".into());
     }
-    let dependencies = inputs
-        .result_refs
-        .iter()
-        .chain(&inputs.auxiliary_refs)
-        .cloned()
+    let dependencies = super::canonical_review_result_refs(program, &inputs.result_refs)?
+        .into_iter()
+        .chain(inputs.auxiliary_refs.iter().cloned())
         .collect::<Vec<_>>();
     let mut sources = std::collections::BTreeMap::new();
     let (tasks, artifacts, own_work) =
@@ -5037,10 +4949,11 @@ fn proof_input_snapshot_for_phase(
             "application/octet-stream",
             format!("session:{}", program.session_id),
         );
+        let identity = super::review_result_identity(program, &read.result_ref)?;
         let metadata = super::results::resolve_result_metadata_for_phase(
             store,
             program,
-            &read.result_ref,
+            &identity,
             &content,
             Some(&inputs.source_revisions),
             readers,
@@ -5070,7 +4983,6 @@ fn proof_input_snapshot_for_phase(
             .cloned()
             .collect::<Vec<_>>();
         super::effect_observation_refs(&metadata, &delivered_files, Some(&file_claims))?;
-        let identity = super::review_result_identity(program, &read.result_ref)?;
         if metadata_identities
             .get(&identity)
             .is_some_and(|previous: &harness_contract::context::ArtifactRef| previous != &content)
@@ -5080,8 +4992,9 @@ fn proof_input_snapshot_for_phase(
         metadata_identities.insert(identity.clone(), metadata.content.clone());
         pending_metadata.push((identity, metadata));
     }
+    let primary_refs = result_identities.iter().cloned().collect::<Vec<_>>();
     let (_, primary_artifacts, _) =
-        super::selected_work(store, program, goal, &inputs.result_refs, &mut sources)?;
+        super::selected_work(store, program, goal, &primary_refs, &mut sources)?;
     let mut pending_primary_refs = primary_artifacts.into_iter().collect::<BTreeSet<_>>();
     let mut primary_producers = BTreeSet::new();
     let mut verified_metadata = BTreeSet::new();
@@ -5175,7 +5088,7 @@ fn proof_input_snapshot_for_phase(
                 }
             }
             for input in &metadata.primary_inputs {
-                let Some(reference) = input.dependency_identity(program, &metadata.content, &metadata.process_runs)? else {
+                let Some(reference) = input.dependency_identity(program)? else {
                     continue;
                 };
                 if !program.artifacts.contains_key(&reference)
@@ -5243,7 +5156,7 @@ fn proof_input_snapshot_for_phase(
             }
             if let Some(artifact) = program.artifacts.get(&identity) {
                 for reference in &artifact.relates_to {
-                    let reference = super::review_result_identity(program, reference)?;
+                    let reference = super::identity::auxiliary_reference(program, reference)?;
                     if program.artifacts.contains_key(&reference)
                         || reference.starts_with("tool://")
                         || reference.starts_with("approval:v1:")
@@ -5520,10 +5433,12 @@ fn proof_input_snapshot_for_phase(
                     continue;
                 }
                 ReviewWriteOutcome::Blocked => {
-                    return Err(
-                        "effect_review_pending: unknown required or possibly intersecting delegated write"
-                            .into(),
-                    );
+                    return Err(format!(
+                        "effect_review_pending: unknown required or possibly intersecting delegated write; source={source} identity={identity} tool={} required={required} disjoint={disjoint} receipt_present={} current_review={:?}",
+                        intent.payload["tool_name"].as_str().unwrap_or("unknown"),
+                        receipts.contains_key(identity),
+                        current_review_effect_key,
+                    ));
                 }
                 ReviewWriteOutcome::Settled => {}
             }
@@ -5738,7 +5653,11 @@ fn proof_input_snapshot_for_phase(
         }
     }
     relevant_writes.retain(|(_, _, call_key)| {
-        !call_key.as_ref().is_some_and(|key| runtime_control_keys.contains(key))
+        !is_authenticated_control_effect(
+            call_key.as_deref(),
+            current_review_effect_key.as_deref(),
+            &runtime_control_keys,
+        )
     });
     for dependency in &actual.file_dependencies {
         let target = &dependency.target;
@@ -5799,12 +5718,13 @@ fn proof_input_snapshot_for_phase(
         "required_scope_complete":inputs.required_scope_complete,
     }));
     for (source, revision) in &sources {
-        if store
+        let actual_revision = store
             .stream_revision(source)
-            .map_err(|error| error.to_string())?
-            != *revision
-        {
-            return Err("proof source changed during validation; retry current inputs".into());
+            .map_err(|error| error.to_string())?;
+        if actual_revision != *revision {
+            return Err(format!(
+                "proof source changed during validation; retry current inputs; source={source} expected={revision} actual={actual_revision} phase=final_source_fence"
+            ));
         }
     }
     let session_revision = *sources
@@ -6483,6 +6403,13 @@ mod tests {
     fn r1_only_the_applied_review_call_is_exempt() {
         let applied = "effect-identity-of-the-review-being-applied";
         let other = "effect-identity-of-the-second-unfinished-review";
+        let settled = BTreeSet::from(["settled-control".to_string()]);
+        assert!(is_authenticated_control_effect(Some(applied), Some(applied), &settled));
+        assert!(is_authenticated_control_effect(Some("settled-control"), None, &settled));
+        assert!(!is_authenticated_control_effect(Some(other), Some(applied), &settled));
+        assert!(!is_authenticated_control_effect(Some(applied), None, &settled));
+        assert!(!is_authenticated_control_effect(None, Some(applied), &settled));
+        assert!(!is_authenticated_control_effect(Some(""), Some(""), &settled));
 
         // The review's own call is in flight because the review is performing
         // it, and it can never settle the action it is.
@@ -6739,13 +6666,13 @@ mod tests {
             ("tool://receipt", "tool://receipt", true),
         ] {
             assert_eq!(
-                review_covers_reference(&program, &[reviewed.into()], required),
+                super::super::coverage::result_refs_cover(&program, &[reviewed.into()], required),
                 expected,
                 "reviewed={reviewed}, required={required}"
             );
         }
         program.artifacts.remove("artifact:old");
-        assert!(review_covers_reference(
+        assert!(super::super::coverage::result_refs_cover(
             &program,
             &["artifact:new".into()],
             "artifact://shared-bytes"
@@ -7034,7 +6961,31 @@ mod tests {
             content: content.clone(), reference: content.selector.clone(),
             acquisition: acquisition.clone(), acquisition_cursor: primary.commit_cursor,
         };
-        assert_eq!(input.dependency_identity(&program, &content, &[]).unwrap(), None);
+        assert_eq!(input.dependency_identity(&program).unwrap(), None);
+        input.reference = "artifact://unrelated-content".into();
+        assert_eq!(
+            input.dependency_identity(&program).unwrap_err(),
+            "immutable input content reference conflicts with its acquisition",
+        );
+        input.reference = content.selector.clone();
+        let mut dependency = super::super::results::ResolvedReviewResult {
+            origin: super::super::results::ResultOrigin::Strong,
+            result_sources: Vec::new(),
+            reference: content.selector.clone(),
+            content: content.clone(),
+            kind: harness_contract::goal::GoalResultKind::Content,
+            artifact_kinds: BTreeSet::new(),
+            producers: Vec::new(),
+            effect_cursor: None,
+            effect_sources: Vec::new(),
+            effect_scopes: Vec::new(),
+            effect_targets: Vec::new(),
+            unscoped_effect: false,
+            primary_inputs: Vec::new(),
+            input_boundaries: Vec::new(),
+            process_runs: Vec::new(),
+        };
+        input.validate_dependency(&program, &content.selector, &dependency).unwrap();
         for field in ["selector", "sha256", "bytes", "media_type", "visibility_scope"] {
             let mut other = content.clone();
             match field {
@@ -7045,10 +6996,22 @@ mod tests {
                 "visibility_scope" => other.visibility_scope = "public".into(),
                 _ => unreachable!(),
             }
-            assert!(input.dependency_identity(&program, &other, &[]).is_err(), "{field}");
+            assert_eq!(
+                input.dependency_identity(&program).unwrap(),
+                None,
+                "{field} must not infer a publication for an authenticated content input",
+            );
+            dependency.content = other;
+            assert_eq!(
+                input.validate_dependency(&program, &content.selector, &dependency).unwrap_err(),
+                "immutable dependency conflicts with its authenticated acquisition",
+                "{field}",
+            );
         }
+        dependency.content = content.clone();
+        input.validate_dependency(&program, &content.selector, &dependency).unwrap();
         input.reference = "artifact:foreign".into();
-        assert_eq!(input.dependency_identity(&program, &content, &[]).unwrap(), Some("artifact:foreign".into()));
+        assert_eq!(input.dependency_identity(&program).unwrap(), Some("artifact:foreign".into()));
         assert_eq!(input.acquisition_cursor, primary.commit_cursor);
         assert_eq!(input.acquisition, acquisition);
         assert!(read_original_scope(&primary, &descriptor, &acquisition)

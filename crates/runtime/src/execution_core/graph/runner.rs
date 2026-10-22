@@ -13,7 +13,8 @@ use thiserror::Error;
 use tokio::sync::{futures::OwnedNotified, oneshot, Mutex, Notify, OwnedMutexGuard};
 
 use super::commit_service::{
-    ExecutionCommitError, ExecutionCommitService, ExecutionEffectState, ExecutionTerminalCommit,
+    CallbackDisposition, ExecutionCommitError, ExecutionCommitService, ExecutionEffectState,
+    ExecutionTerminalCommit,
 };
 use super::events::{ExecutionBindingLeaseClosure, ExecutionNodeBinding};
 use super::recovery::{ExecutionGraphRecovery, ExecutionRecoveryError};
@@ -384,8 +385,8 @@ impl ExecutionGraphRunner {
         for (node_id, binding) in &retained {
             if self
                 .commit_service
-                .binding_callback_kind(&graph, node_id, binding)?
-                .is_none()
+                .binding_callback_disposition(&graph, node_id, binding)?
+                == CallbackDisposition::Pending
             {
                 return Err(ExecutionRecoveryError::LeaseReconciliation(
                     "original in-process execution owner is live".into(),
@@ -1265,49 +1266,6 @@ impl ExecutionGraphRunner {
             .map(|active| active.callback_gate.clone())
     }
 
-    /// Commit the node as cancelled, once, at the moment the cancellation is
-    /// issued. The transition is idempotent: a later terminal commit of the
-    /// same cancelled node stays legal.
-    async fn mark_node_cancelled(
-        &self,
-        graph_id: &str,
-        ticket: &NodeExecutionTicket,
-    ) -> Result<(), ExecutionRunnerError> {
-        // The node's own events can land while the cancellation is issued, so
-        // the transition is retried against the current revision. A failure
-        // here must never fail the cancellation itself: the node still commits
-        // its own terminal state when its execution ends.
-        for _ in 0..4 {
-            let graph = self.state_store.load_async(graph_id).await?;
-            let Some(status) = graph.node_statuses.get(&ticket.node_id).copied() else {
-                return Ok(());
-            };
-            if status.is_terminal() {
-                return Ok(());
-            }
-            match self.commit_service.transition_node(
-                &graph,
-                &ticket.node_id,
-                harness_contract::execution_graph::ExecutionNodeStatus::Cancelled,
-                None,
-                vec![],
-            ) {
-                Ok(_) => return Ok(()),
-                Err(commit_error) => {
-                    if commit_error.to_string().contains("StaleRevision") {
-                        continue;
-                    }
-                    tracing::warn!(graph_id, node_id = %ticket.node_id, error = %commit_error,
-                        "cancelled node transition failed; the node keeps its own terminal commit");
-                    return Ok(());
-                }
-            }
-        }
-        tracing::warn!(graph_id, node_id = %ticket.node_id,
-            "cancelled node transition raced with the node's own events");
-        Ok(())
-    }
-
     async fn cancel_and_drain_locked(
         &self,
         graph_id: &str,
@@ -1338,11 +1296,6 @@ impl ExecutionGraphRunner {
                 reason: "original cancellation budget expired; drain unconfirmed".into(),
             })??;
         }
-        // The node is cancelled from the moment the cancellation is issued.
-        // The caller that observes the death of the worker must already see
-        // the node as cancelled: the cancellation is the Runtime's decision,
-        // and the physical closure of what the node owned is a later fact.
-        self.mark_node_cancelled(graph_id, ticket).await?;
         if executor.cancellation_requires_quiescence(ticket) {
             use futures::FutureExt;
             match executor.cancel(ticket).now_or_never() {
@@ -1393,8 +1346,8 @@ impl ExecutionGraphRunner {
         };
         if self
             .commit_service
-            .binding_callback_kind(&graph, &ticket.node_id, &binding)?
-            == Some(false)
+            .binding_callback_disposition(&graph, &ticket.node_id, &binding)?
+            == CallbackDisposition::Commit
         {
             return self
                 .complete_callback_locked(graph_id, executor, ticket, None)
@@ -1431,10 +1384,10 @@ impl ExecutionGraphRunner {
             return Ok(());
         }
         let graph = self.state_store.load_async(graph_id).await?;
-        let Some(abort) =
+        let disposition =
             self.commit_service
-                .binding_callback_kind(&graph, &ticket.node_id, &binding)?
-        else {
+                .binding_callback_disposition(&graph, &ticket.node_id, &binding)?;
+        if disposition == CallbackDisposition::Pending {
             if requested_abort.is_some() {
                 return Ok(());
             }
@@ -1442,7 +1395,7 @@ impl ExecutionGraphRunner {
                 "callback has no canonical original outcome or retirement".into(),
             ));
         };
-        let result = if abort {
+        let result = if disposition == CallbackDisposition::Abort {
             self.cancel_and_drain_locked(graph_id, executor, ticket)
                 .await?;
             executor
@@ -1526,39 +1479,19 @@ impl ExecutionGraphRunner {
         result
     }
 
-    async fn active_after_abort_observed(
+    async fn complete_callback_observed(
         &self,
         graph_id: &str,
         executor: &Arc<dyn NodeExecutor>,
         ticket: &NodeExecutionTicket,
-        reason: &str,
+        requested_abort: Option<&str>,
     ) -> Result<(), ExecutionRunnerError> {
         let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
             return Ok(());
         };
         let _owner = gate.lock().await;
-        self.complete_callback_locked(graph_id, executor, ticket, Some(reason))
+        self.complete_callback_locked(graph_id, executor, ticket, requested_abort)
             .await
-    }
-
-    async fn active_after_commit_observed(
-        &self,
-        graph_id: &str,
-        executor: &Arc<dyn NodeExecutor>,
-        ticket: &NodeExecutionTicket,
-        abort_publication: bool,
-    ) -> Result<(), ExecutionRunnerError> {
-        let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
-            return Ok(());
-        };
-        let _owner = gate.lock().await;
-        self.complete_callback_locked(
-            graph_id,
-            executor,
-            ticket,
-            abort_publication.then_some("canonical_deadline_after_atomic_commit"),
-        )
-        .await
     }
 
     fn close_active_binding_leases(
@@ -1911,11 +1844,11 @@ impl ExecutionGraphRunner {
             match disposition {
                 TerminalCommitDisposition::Committed => {
                     durable_progress.notify_one();
-                    self.active_after_commit_observed(
+                    self.complete_callback_observed(
                         graph_id,
                         &executor,
                         &ticket,
-                        deadline_terminal,
+                        deadline_terminal.then_some("canonical_deadline_after_atomic_commit"),
                     )
                     .await?;
                     if deadline_terminal {
@@ -1926,11 +1859,11 @@ impl ExecutionGraphRunner {
                     return Ok(());
                 }
                 TerminalCommitDisposition::Superseded => {
-                    self.active_after_abort_observed(
+                    self.complete_callback_observed(
                         graph_id,
                         &executor,
                         &ticket,
-                        "graph_command_superseded_before_terminal_wave",
+                        Some("graph_command_superseded_before_terminal_wave"),
                     )
                     .await?;
                     self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
@@ -1938,11 +1871,11 @@ impl ExecutionGraphRunner {
                     return Ok(());
                 }
                 TerminalCommitDisposition::Failed(reason) => {
-                    self.active_after_abort_observed(
+                    self.complete_callback_observed(
                         graph_id,
                         &executor,
                         &ticket,
-                        "terminal_wave_commit_failed",
+                        Some("terminal_wave_commit_failed"),
                     )
                     .await?;
                     self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
@@ -1970,11 +1903,11 @@ impl ExecutionGraphRunner {
                     .map(|(executor, ticket, _)| (Arc::clone(executor), ticket.clone()));
                 drop(_coordination);
                 if let Some((executor, ticket)) = aborted {
-                    self.active_after_abort_observed(
+                    self.complete_callback_observed(
                         graph_id,
                         &executor,
                         &ticket,
-                        "graph_command_superseded_before_commit",
+                        Some("graph_command_superseded_before_commit"),
                     )
                     .await?;
                 }
@@ -2060,11 +1993,11 @@ impl ExecutionGraphRunner {
                     .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
                 drop(_coordination);
                 if let Some((executor, ticket)) = aborted {
-                    self.active_after_abort_observed(
+                    self.complete_callback_observed(
                         graph_id,
                         &executor,
                         &ticket,
-                        "graph_transition_commit_failed",
+                        Some("graph_transition_commit_failed"),
                     )
                     .await?;
                 }
@@ -2085,8 +2018,13 @@ impl ExecutionGraphRunner {
         self.converge_after_terminal_commit(graph_id).await?;
         durable_progress.notify_one();
         if let Some((executor, ticket)) = committed_executor {
-            self.active_after_commit_observed(graph_id, &executor, &ticket, deadline_terminal)
-                .await?;
+            self.complete_callback_observed(
+                graph_id,
+                &executor,
+                &ticket,
+                deadline_terminal.then_some("canonical_deadline_after_atomic_commit"),
+            )
+            .await?;
             if deadline_terminal {
                 executor.cancellation_finalized(&ticket);
             }
@@ -2222,12 +2160,12 @@ impl ExecutionGraphRunner {
                 if let Some((executor, ticket)) = pending {
                     self.active_cancel_observed(graph_id, &executor, &ticket)
                         .await?;
-                    self.active_after_abort_observed(
+                    self.complete_callback_observed(
                         graph_id,
                         &executor,
                         &ticket,
-                        "executor_failure_before_resource_release",
-                    )
+                        Some("executor_failure_before_resource_release"),
+            )
                     .await?;
                 }
                 self.take_bound_active_node(graph_id, &node_id, expected_binding)
@@ -2440,6 +2378,43 @@ impl ExecutionGraphRunner {
         deadline_at_ms: Option<u64>,
         scope_wait: Option<Duration>,
     ) -> Result<NodeResourceGuards, ExecutionRunnerError> {
+        if node.kind == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
+            || (node.kind == harness_contract::execution_graph::ExecutionNodeKind::Verify
+                && node.executor_kind == super::executors::CompileTargetGuardExecutor::KIND)
+        {
+            // ToolBatch is a durable orchestration container. Its tool
+            // leaves acquire the
+            // authoritative resource and scope leases. Holding a path
+            // lock here while synchronously awaiting a descendant that
+            // needs the same path creates a parent-waits-child / child-
+            // waits-parent deadlock. Keep validation at the container
+            // boundary, but defer ownership to the actual effect leaf.
+            for scope in &node.resource_scopes {
+                if let Some(path) = scope.strip_prefix("read:") {
+                    let _ = self.scoped_resource_for_path(&node.id, path, false)?;
+                } else if let Some(path) = scope.strip_prefix("write:") {
+                    let _ = self.scoped_resource_for_path(&node.id, path, true)?;
+                } else if let Some(path) = scope.strip_prefix("worktree:") {
+                    validate_worktree_path(&self.workspace_root, path).map_err(|reason| {
+                        ExecutionRunnerError::Resource {
+                            node_id: node.id.clone(),
+                            reason,
+                        }
+                    })?;
+                }
+            }
+            return Ok(NodeResourceGuards {
+                resource: None,
+                scope: None,
+                worktree: None,
+                original_binding: None,
+                admission_pending: false,
+                release_blocked: true,
+                callback_completed: false,
+                drain_completed: false,
+                owner_fence: None,
+            });
+        }
         let resource_kind = match node.kind {
             harness_contract::execution_graph::ExecutionNodeKind::AgentTask => {
                 Some(ExecutionResourceKind::Agent)
@@ -2447,44 +2422,11 @@ impl ExecutionGraphRunner {
             harness_contract::execution_graph::ExecutionNodeKind::Materialize => {
                 Some(ExecutionResourceKind::Tool)
             }
-            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
-                // ToolBatch is a durable orchestration container. Its tool
-                // leaves acquire the
-                // authoritative resource and scope leases. Holding a path
-                // lock here while synchronously awaiting a descendant that
-                // needs the same path creates a parent-waits-child / child-
-                // waits-parent deadlock. Keep validation at the container
-                // boundary, but defer ownership to the actual effect leaf.
-                for scope in &node.resource_scopes {
-                    if let Some(path) = scope.strip_prefix("read:") {
-                        let _ = self.scoped_resource_for_path(&node.id, path, false)?;
-                    } else if let Some(path) = scope.strip_prefix("write:") {
-                        let _ = self.scoped_resource_for_path(&node.id, path, true)?;
-                    } else if let Some(path) = scope.strip_prefix("worktree:") {
-                        validate_worktree_path(&self.workspace_root, path).map_err(|reason| {
-                            ExecutionRunnerError::Resource {
-                                node_id: node.id.clone(),
-                                reason,
-                            }
-                        })?;
-                    }
-                }
-                return Ok(NodeResourceGuards {
-                    resource: None,
-                    scope: None,
-                    worktree: None,
-                    original_binding: None,
-                    admission_pending: false,
-                    release_blocked: true,
-                    callback_completed: false,
-                    drain_completed: false,
-                    owner_fence: None,
-                });
-            }
             // InlineModel owns Provider admission in ConversationRuntime.
             // ToolBatch leaves own Tool admission in ToolExecutionPlane.
             // Deterministic control nodes do not consume either family.
             harness_contract::execution_graph::ExecutionNodeKind::InlineModel
+            | harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
             | harness_contract::execution_graph::ExecutionNodeKind::Verify
             | harness_contract::execution_graph::ExecutionNodeKind::Synthesize
             | harness_contract::execution_graph::ExecutionNodeKind::Approval
@@ -2838,11 +2780,11 @@ impl ExecutionGraphRunner {
         if let Some((executor, ticket, _)) = running.as_ref() {
             self.active_cancel_observed(graph_id, &executor, ticket)
                 .await?;
-            self.active_after_abort_observed(
+            self.complete_callback_observed(
                 graph_id,
                 &executor,
                 ticket,
-                "node_execution_isolated_failure",
+                Some("node_execution_isolated_failure"),
             )
             .await?;
         }
@@ -3743,33 +3685,6 @@ fn executor_error_node_id(error: &NodeExecutorError) -> &str {
     }
 }
 
-pub(super) fn outcome_aborts_publication(node_id: &str, result: &ExecutionNodeResult) -> bool {
-    if !result.evidence_refs.is_empty() {
-        return false;
-    }
-    let Some(failure) = result.failure.as_ref().filter(|failure| !failure.retryable) else {
-        return false;
-    };
-    if failure.kind == "execution_deadline_exceeded" {
-        return result.status == ExecutionNodeStatus::Cancelled
-            && result
-                .result_ref
-                .as_ref()
-                .and_then(|reference| {
-                    reference.strip_prefix(&format!("execution-deadline:{node_id}:"))
-                })
-                .and_then(|deadline| deadline.parse::<u64>().ok())
-                .is_some();
-    }
-    matches!(
-        result.status,
-        ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked
-    ) && result.result_ref.is_none()
-        && matches!(
-            failure.kind.as_str(),
-            "executor_error" | "effect_completion_uncertain" | "node_execution_isolated_failure"
-        )
-}
 
 fn failed_result(error: &NodeExecutorError) -> ExecutionNodeResult {
     ExecutionNodeResult {

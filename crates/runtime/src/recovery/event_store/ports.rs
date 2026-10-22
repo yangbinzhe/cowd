@@ -545,7 +545,33 @@ pub enum RuntimeBoundedEventLookup {
     Record { record: Box<RuntimeEventRecord>, encoded_bytes: usize },
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+pub struct FixtureEvidencePageRequest<'a> {
+    pub stream_id: &'a str,
+    pub after_sequence: u64,
+    pub through_sequence: u64,
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub deadline: std::time::Instant,
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub struct FixtureEvidencePage {
+    pub head: u64,
+    pub next_sequence: u64,
+    pub encoded_bytes: usize,
+    pub records: Vec<DurableRuntimeEvent>,
+    pub stop: Option<&'static str>,
+}
+
 pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_evidence_page(
+        &self,
+        _request: &FixtureEvidencePageRequest<'_>,
+    ) -> Result<FixtureEvidencePage, &'static str> {
+        Err("Unavailable: backend has no deadline-bounded fixture reader")
+    }
     fn bounded_event_by_idempotency_key(
         &self,
         stream: &str,

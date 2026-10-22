@@ -63,7 +63,7 @@ impl RuntimeServices {
         program: &AgenticProgramProjection,
         reference: &str,
     ) -> Result<ArtifactRef, String> {
-        let metadata = resolve_result(self, actor, program, reference).await?;
+        let metadata = resolve_material(self, actor, program, reference).await?;
         metadata.origin.require_strong()?;
         Ok(metadata.content)
     }
@@ -1759,29 +1759,18 @@ pub(super) async fn resolve_result(
     program: &AgenticProgramProjection,
     reference: &str,
 ) -> Result<ResolvedReviewResult, String> {
-    // Runtime spells a one-shot Task deliverable `artifact:<24 hex>` and repeats
-    // that spelling in the completion gap's `uncovered_result_refs`. That is a
-    // Program-logical key, not an ArtifactStore selector, so neither path used to
-    // reach it: refusing it told the model "no Runtime-resolved producer" about a
-    // result that was delivered and accepted, and rewriting it into a selector
-    // would ask the store for an id it never issued. Map it to the selector the
-    // Program recorded for it and keep the logical ref as the reviewed identity.
-    let logical_selector = match reference.split_once("://") {
-        Some(_) => None,
-        None => program
-            .artifacts
-            .get(reference)
-            .map(|artifact| artifact.content_ref.clone()),
-    };
-    let reference = reference.to_string();
-    let reference = reference.as_str();
-    // Every failure below names the reference being resolved. Run one30 cited
-    // three real `tool://` read_ref receipts, one resolution failed, and the model
-    // was told six words - "artifact does not exist" - with no reference, no
-    // selector and no next step. It then concluded the formal review step could
-    // not complete and wrote four final answers describing that blocker instead
-    // of fixing it. The store's error is a fact about a selector; the model needs
-    // to know which selector.
+    let reference = super::review_result_identity(program, reference)?;
+    resolve_material(services, actor, program, &reference).await
+}
+
+pub(super) async fn resolve_material(
+    services: &RuntimeServices,
+    actor: &AgentActorBinding,
+    program: &AgenticProgramProjection,
+    reference: &str,
+) -> Result<ResolvedReviewResult, String> {
+    let identity = super::identity::auxiliary_identity(program, reference)?;
+    let reference = identity.reference();
     let content = if reference.starts_with("approval:v1:") {
         services
             .approval_result_content(&actor.session_id, reference)
@@ -1803,11 +1792,7 @@ pub(super) async fn resolve_result(
             })?
     } else if reference.starts_with("tool://") {
         tool_content(services, program, &actor.session_id, reference).await?
-    } else if reference.starts_with("artifact://") || logical_selector.is_some() {
-        // A Program-logical ref carries no selector of its own; resolve the one
-        // the Program recorded for it. The logical ref stays the reviewed
-        // identity so the candidate match below still finds the artifact.
-        let selector = logical_selector.as_deref().unwrap_or(reference);
+    } else if let super::identity::MaterialIdentity::Content(selector) = &identity {
         services
             .artifact_store()
             .resolve(selector)
@@ -1846,11 +1831,12 @@ pub(super) fn pin_result_source(
     let revision = store
         .stream_revision(source)
         .map_err(|error| error.to_string())?;
-    if cuts
-        .insert(source.to_string(), revision)
-        .is_some_and(|old| old != revision)
-    {
-        return Err("result metadata source changed during resolution; rebuild the review".into());
+    if let Some(previous) = cuts.insert(source.to_string(), revision) {
+        if previous != revision {
+            return Err(format!(
+                "result metadata source changed during resolution; rebuild the review; source={source} expected={previous} actual={revision} phase=result_source_pin"
+            ));
+        }
     }
     Ok(revision)
 }
@@ -1958,19 +1944,36 @@ fn authenticate_callback_parent_chain(
                     && program.turn_id == binding.turn_id
             }) || !visited.contains(&binding.root_execution_id)
             {
-                return Err("result callback producer does not reach its bound Program root".into());
+                return Err(
+                    "result callback producer does not reach its bound Program root".into(),
+                );
             }
             return Ok(());
         };
-        pin_result_source(store, &format!("execution-lineage:{}", parent.execution_id), cuts)?;
-        if !graphs.child_links(&parent.execution_id).map_err(|error| error.to_string())?
-            .iter().any(|link| link.child_execution_id == execution && link.parent_node_id == parent.node_id)
+        pin_result_source(
+            store,
+            &format!("execution-lineage:{}", parent.execution_id),
+            cuts,
+        )?;
+        if !graphs
+            .child_links(&parent.execution_id)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|link| {
+                link.child_execution_id == execution && link.parent_node_id == parent.node_id
+            })
         {
             return Err("result callback producer lacks its original parent link".into());
         }
         pin_result_source(store, &parent.execution_id, cuts)?;
-        let original_parent = graphs.load(&parent.execution_id).map_err(|error| error.to_string())?;
-        if !original_parent.nodes.iter().any(|node| node.id == parent.node_id) {
+        let original_parent = graphs
+            .load(&parent.execution_id)
+            .map_err(|error| error.to_string())?;
+        if !original_parent
+            .nodes
+            .iter()
+            .any(|node| node.id == parent.node_id)
+        {
             return Err("result callback producer parent node is missing".into());
         }
         execution = parent.execution_id;
@@ -2371,24 +2374,33 @@ pub(super) fn original_tool_primary(
                     let (calls, _) = crate::host::decode_tool_batch(&ticket.payload_ref)
                         .map_err(|error| error.to_string())?;
                     let mut originals = calls.iter().filter(|call| call.id == step.origin.call_id);
-                    let call = originals.next().ok_or("graph-bound root output original batch call missing")?;
+                    let call = originals
+                        .next()
+                        .ok_or("graph-bound root output original batch call missing")?;
                     let input = harness_contract::step::parse_strict_json(&call.input)
                         .map_err(|error| error.to_string())?;
-                    if originals.next().is_some() || call.binding.as_ref() != Some(&step)
+                    if originals.next().is_some()
+                        || call.binding.as_ref() != Some(&step)
                         || task["tool_name"] != call.name
                         || harness_contract::step::canonical_digest("tool-effect-payload", &input)
-                            .map_err(|error| error.to_string())? != digest
+                            .map_err(|error| error.to_string())?
+                            != digest
                     {
-                        return Err("graph-bound root output original batch Step/input conflicts".into());
+                        return Err(
+                            "graph-bound root output original batch Step/input conflicts".into(),
+                        );
                     }
                 }
                 for original in process_ticket_start(store, graph, node, attempt, &primary)? {
                     pin_result_source(store, &original.stream_id, cuts)?;
                     if original.kind == "execution_node.transitioned" {
-                        let revision = original.payload["graph_revision"].as_u64()
+                        let revision = original.payload["graph_revision"]
+                            .as_u64()
                             .filter(|revision| *revision > 0)
                             .ok_or("graph-bound root output original start revision missing")?;
-                        let lineage = graph_state.lineage.as_ref()
+                        let lineage = graph_state
+                            .lineage
+                            .as_ref()
                             .ok_or("graph-bound root output original lineage missing")?;
                         let root_activity = format!("activity:execution:{graph}");
                         let expected = harness_contract::projection::RuntimeActivityBinding {
@@ -3450,6 +3462,14 @@ pub(super) fn resolve_result_metadata_for_phase(
     readers: super::ResultContentReaders<'_>,
     allow_history_growth: bool,
 ) -> Result<ResolvedReviewResult, String> {
+    let identity = super::identity::auxiliary_identity(program, reference)?;
+    let reference = identity.reference();
+    if reference.starts_with("artifact:")
+        && !reference.starts_with("artifact://")
+        && !matches!(identity, super::identity::MaterialIdentity::Publication(_))
+    {
+        return Err("result exact publication binding missing".into());
+    }
     let authenticated_content = match readers.artifacts {
         Some(artifacts) if content.selector.starts_with("artifact://") => {
             let original = artifacts
@@ -3467,6 +3487,13 @@ pub(super) fn resolve_result_metadata_for_phase(
         _ => content.clone(),
     };
     let content = &authenticated_content;
+    if let super::identity::MaterialIdentity::Content(selector) = &identity {
+        if !super::same_reference_spelling(selector, &content.selector) {
+            return Err(
+                "result content selector conflicts with its explicit content identity".into(),
+            );
+        }
+    }
     let mut cuts = std::collections::BTreeMap::new();
     let (programs, publications) = publication_sources(store, program, &mut cuts)?;
     let mut resolved = ResolvedReviewResult {
@@ -3576,23 +3603,8 @@ pub(super) fn resolve_result_metadata_for_phase(
         });
         resolved.result_sources.push(revision);
     } else {
-        let candidates = program
-            .artifacts
-            .values()
-            .filter(|artifact| {
-                !reference.starts_with("tool://")
-                    && if program.artifacts.contains_key(reference) {
-                        artifact.artifact_ref == reference
-                    } else {
-                        super::same_reference_spelling(&artifact.content_ref, reference)
-                            || artifact.content_ref == content.selector
-                    }
-            })
-            .collect::<Vec<_>>();
-        if candidates.len() > 1 {
-            return Err("result publication identity is ambiguous".into());
-        }
-        for artifact in candidates {
+        if let super::identity::MaterialIdentity::Publication(publication) = &identity {
+            let artifact = &program.artifacts[publication];
             if !super::same_reference_spelling(&artifact.content_ref, &content.selector) {
                 return Err(
                     "result content does not match its original Program publication".into(),
@@ -3682,34 +3694,55 @@ pub(super) fn resolve_result_metadata_for_phase(
                     | harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => None,
                     kind => return Err(format!("result callback unsupported original producer: graph={execution} node={node} kind={kind:?}")),
                 }
-            } else { None };
+            } else {
+                None
+            };
             let delegated_packet = if let Some(execution) = delegated_execution {
-                let parent = primary.as_ref().ok_or("result callback original primary missing")?;
+                let parent = primary
+                    .as_ref()
+                    .ok_or("result callback original primary missing")?;
                 let packet = result_packet(store, execution, program, &mut cuts)?;
-                let Some(scope) = packet.agentic_binding.as_ref() else { continue; };
-                if !programs.iter().any(|origin|
-                    origin.program_id == scope.program_id && origin.turn_id == binding.turn_id)
-                {
+                let Some(scope) = packet.agentic_binding.as_ref() else {
+                    continue;
+                };
+                if !programs.iter().any(|origin| {
+                    origin.program_id == scope.program_id && origin.turn_id == binding.turn_id
+                }) {
                     continue;
                 }
                 if Some(packet.run_id()) != binding.agent_run_id.as_deref()
                     || parent.payload["replay"]["parent_execution"]["node_id"] != packet.node_id()
                     || binding.agent_instance_id.as_deref() != Some(packet.agent_id())
-                    || packet.assignment.execution_identity.turn_id() != Some(binding.turn_id.as_str())
+                    || packet.assignment.execution_identity.turn_id()
+                        != Some(binding.turn_id.as_str())
                     || !super::binding_is_owned_by_root(&binding, Some(&binding.root_execution_id))
                 {
-                    return Err("result callback crosses its original delegated physical owner".into());
+                    return Err(
+                        "result callback crosses its original delegated physical owner".into(),
+                    );
                 }
-                authenticate_callback_parent_chain(store, packet.graph_id(), &binding, &programs, &mut cuts)?;
+                authenticate_callback_parent_chain(
+                    store,
+                    packet.graph_id(),
+                    &binding,
+                    &programs,
+                    &mut cuts,
+                )?;
                 Some(packet)
             } else {
                 if primary.is_none() && binding.agent_run_id.is_some() {
-                    return Err("result callback has no authenticated original primary owner".into());
+                    return Err(
+                        "result callback has no authenticated original primary owner".into(),
+                    );
                 }
                 if !programs.iter().any(|origin| {
                     origin.turn_id == binding.turn_id
-                        && origin.root_execution_id.as_deref() == Some(binding.root_execution_id.as_str())
-                }) || !super::binding_is_owned_by_root(&binding, Some(&binding.root_execution_id)) {
+                        && origin.root_execution_id.as_deref()
+                            == Some(binding.root_execution_id.as_str())
+                }) || !super::binding_is_owned_by_root(
+                    &binding,
+                    Some(&binding.root_execution_id),
+                ) {
                     continue;
                 }
                 None
@@ -3937,9 +3970,12 @@ pub(super) fn resolve_result_metadata_for_phase(
                 continue;
             }
             if delegated_packet.is_some() {
-                original_tool_primary(store, event,
+                original_tool_primary(
+                    store,
+                    event,
                     task.ok_or("delegated result callback lacks its original governed plan")?,
-                    &mut cuts)?;
+                    &mut cuts,
+                )?;
             }
             resolved.origin = resolved.origin.merge(match_origin);
             publication_cursor = publication_cursor.max(event.commit_cursor);
@@ -3950,13 +3986,19 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .iter()
                     .find(|reference| {
                         matches!(reference.kind.as_str(), "execution_graph" | "execution")
-                            && (super::packet_identity_matches(packet.graph_id(), packet.run_id(), &reference.id)
-                                || reference.id == binding.root_execution_id)
+                            && (super::packet_identity_matches(
+                                packet.graph_id(),
+                                packet.run_id(),
+                                &reference.id,
+                            ) || reference.id == binding.root_execution_id)
                     })
                     .ok_or("result Tool activity has no physical execution reference")?;
                 if Some(packet.run_id()) != binding.agent_run_id.as_deref()
-                    || !(super::packet_identity_matches(packet.graph_id(), packet.run_id(), &graph.id)
-                        || graph.id == binding.root_execution_id)
+                    || !(super::packet_identity_matches(
+                        packet.graph_id(),
+                        packet.run_id(),
+                        &graph.id,
+                    ) || graph.id == binding.root_execution_id)
                 {
                     return Err("result Tool activity does not match its physical producer".into());
                 }
@@ -4584,29 +4626,56 @@ mod tests {
             }
             original_calls.insert(call_id.to_string());
         }
-        assert_eq!(original_calls, BTreeSet::from([
-            "native-claim".to_string(), "native-preview-read".to_string(),
-            "native-full-read".to_string(), "native-publication-small".to_string(),
-            "native-submit".to_string(),
-        ]));
+        assert_eq!(
+            original_calls,
+            BTreeSet::from([
+                "native-claim".to_string(),
+                "native-preview-read".to_string(),
+                "native-full-read".to_string(),
+                "native-publication-small".to_string(),
+                "native-submit".to_string(),
+            ])
+        );
         let mut control_tools = BTreeSet::new();
         let mut control_index = None;
-        for control in store.list_stream(&index_source).unwrap().into_iter().filter(|event| {
-            event.kind == "execution.agent_tool.receipt"
-                && matches!(event.payload["outcome"]["tool_name"].as_str(), Some("task_claim" | "task_submit"))
-        }) {
+        for control in store
+            .list_stream(&index_source)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "execution.agent_tool.receipt"
+                    && matches!(
+                        event.payload["outcome"]["tool_name"].as_str(),
+                        Some("task_claim" | "task_submit")
+                    )
+            })
+        {
             let (descriptor, scope, intent) =
                 authenticate_effect_receipt(store, &control, &packet, &mut cuts).unwrap();
             if control_index.is_none() {
                 control_index = Some(control.clone());
             }
             assert!(descriptor.scopes[0].target.is_none());
-            let primary = store.event_by_idempotency_key(
-                &intent.stream_id,
-                &format!("{}:receipt", control.payload["idempotency_key"].as_str().unwrap()),
-            ).unwrap().unwrap();
+            let primary = store
+                .event_by_idempotency_key(
+                    &intent.stream_id,
+                    &format!(
+                        "{}:receipt",
+                        control.payload["idempotency_key"].as_str().unwrap()
+                    ),
+                )
+                .unwrap()
+                .unwrap();
             let (_, _, mut resolved) = purpose_projection_fixture();
-            project_result_effect(store, &mut resolved, &descriptor, &scope, &primary, &mut cuts).unwrap();
+            project_result_effect(
+                store,
+                &mut resolved,
+                &descriptor,
+                &scope,
+                &primary,
+                &mut cuts,
+            )
+            .unwrap();
             assert!(resolved.effect_targets.is_empty());
             assert!(resolved.effect_scopes.is_empty());
             assert_eq!(resolved.kind, GoalResultKind::Content);
@@ -4615,11 +4684,27 @@ mod tests {
             assert!(authenticate_effect_receipt(store, &foreign, &packet, &mut cuts).is_err());
             let mut foreign_scope = scope.clone();
             foreign_scope.descriptor_hash = "foreign".into();
-            assert!(project_result_effect(store, &mut resolved, &descriptor, &foreign_scope, &primary, &mut cuts).is_err());
+            assert!(project_result_effect(
+                store,
+                &mut resolved,
+                &descriptor,
+                &foreign_scope,
+                &primary,
+                &mut cuts
+            )
+            .is_err());
             control_tools.insert(descriptor.tool_id);
         }
-        assert_eq!(control_tools, BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()]));
-        for field in ["sequence_owner", "source_observation_wave_sequence", "effect_kind", "effect_scopes"] {
+        assert_eq!(
+            control_tools,
+            BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()])
+        );
+        for field in [
+            "sequence_owner",
+            "source_observation_wave_sequence",
+            "effect_kind",
+            "effect_scopes",
+        ] {
             let mut invalid = control_index.clone().unwrap();
             invalid.payload[field] = serde_json::Value::Null;
             assert!(authenticate_effect_receipt(store, &invalid, &packet, &mut cuts).is_err());
@@ -4673,21 +4758,36 @@ mod tests {
         metadata.origin.require_strong().unwrap();
         assert_eq!(metadata.content.selector, content.selector);
         assert_eq!(metadata.content.sha256, content.sha256);
-        assert!(metadata.producers.iter().any(|producer|
-            producer.packet.as_ref().is_some_and(|original|
-                original.graph_id() == packet.graph_id() && original.run_id() == packet.run_id())));
-        let publication: serde_json::Value = serde_json::from_str(
-            primary.payload["outcome"]["output"].as_str().unwrap()).unwrap();
-        let published = services.artifact_store().resolve(publication["content_ref"].as_str().unwrap()).unwrap();
-        let published_metadata = resolve_result_metadata(store, &program, &published.selector,
-            &published, None, super::super::ResultContentReaders {
+        assert!(metadata.producers.iter().any(|producer| producer
+            .packet
+            .as_ref()
+            .is_some_and(|original| original.graph_id() == packet.graph_id()
+                && original.run_id() == packet.run_id())));
+        let publication: serde_json::Value =
+            serde_json::from_str(primary.payload["outcome"]["output"].as_str().unwrap()).unwrap();
+        let published = services
+            .artifact_store()
+            .resolve(publication["content_ref"].as_str().unwrap())
+            .unwrap();
+        let published_metadata = resolve_result_metadata(
+            store,
+            &program,
+            &published.selector,
+            &published,
+            None,
+            super::super::ResultContentReaders {
                 artifacts: Some(services.artifact_store().as_ref()),
-                history: history.as_deref(), process_inputs: None,
-            }).unwrap();
+                history: history.as_deref(),
+                process_inputs: None,
+            },
+        )
+        .unwrap();
         published_metadata.origin.require_strong().unwrap();
-        assert!(published_metadata.producers.iter().any(|producer|
-            producer.packet.as_ref().is_some_and(|original|
-                original.graph_id() == packet.graph_id() && original.run_id() == packet.run_id())));
+        assert!(published_metadata.producers.iter().any(|producer| producer
+            .packet
+            .as_ref()
+            .is_some_and(|original| original.graph_id() == packet.graph_id()
+                && original.run_id() == packet.run_id())));
         if !negative {
             return;
         }
@@ -5159,27 +5259,38 @@ mod tests {
     fn r1_original_tool_plan_claim_requires_exact_call() {
         let store = crate::RuntimeEventStore::for_test();
         let append = |kind: &str, payload: serde_json::Value| {
-            store.append(crate::RuntimeEventInput {
-                stream_id: "session:claimed-plan".into(),
-                scope: crate::RuntimeEventScope::Tool,
-                kind: kind.into(),
-                status: None,
-                actor: Some("conversation_runtime".into()),
-                refs: Vec::new(),
-                payload,
-            }).unwrap()
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:claimed-plan".into(),
+                    scope: crate::RuntimeEventScope::Tool,
+                    kind: kind.into(),
+                    status: None,
+                    actor: Some("conversation_runtime".into()),
+                    refs: Vec::new(),
+                    payload,
+                })
+                .unwrap()
         };
-        append("tool.execution_plan.created", serde_json::json!({
-            "plan_id":"original-plan", "tasks":[{
-                "tool_call_id":"original-call", "tool_name":"read_file"
-            }]
-        }));
-        let original = append("tool.invocation.completed", serde_json::json!({
-            "governed_plan_id":"original-plan", "tool_call_id":"original-call",
-            "tool_name":"read_file"
-        }));
+        append(
+            "tool.execution_plan.created",
+            serde_json::json!({
+                "plan_id":"original-plan", "tasks":[{
+                    "tool_call_id":"original-call", "tool_name":"read_file"
+                }]
+            }),
+        );
+        let original = append(
+            "tool.invocation.completed",
+            serde_json::json!({
+                "governed_plan_id":"original-plan", "tool_call_id":"original-call",
+                "tool_name":"read_file"
+            }),
+        );
         let events = store.list_stream("session:claimed-plan").unwrap();
-        assert_eq!(result_tool_plan(&events, &original).unwrap().unwrap()["tool_call_id"], "original-call");
+        assert_eq!(
+            result_tool_plan(&events, &original).unwrap().unwrap()["tool_call_id"],
+            "original-call"
+        );
         for (field, value) in [
             ("governed_plan_id", serde_json::json!("missing-plan")),
             ("governed_plan_id", serde_json::json!("")),
@@ -5315,28 +5426,37 @@ mod tests {
                             resolver_id: "runtime.readonly".into(),
                             resolver_version: 1,
                         },
-                    },
-                ]).unwrap();
-                let host = tools::ToolHost::new("fresh-publication", root.path(),
-                    tools::ToolHostSnapshot::new(std::sync::Arc::new(catalog),
-                        std::sync::Arc::new(tools::lsp_client::LspRegistry::default()), None));
-                let descriptor = host.pin_snapshot().describe_effect("artifact_publish",
-                    &serde_json::json!({}));
+                    }])
+                    .unwrap();
+                let host = tools::ToolHost::new(
+                    "fresh-publication",
+                    root.path(),
+                    tools::ToolHostSnapshot::new(
+                        std::sync::Arc::new(catalog),
+                        std::sync::Arc::new(tools::lsp_client::LspRegistry::default()),
+                        None,
+                    ),
+                );
+                let descriptor = host
+                    .pin_snapshot()
+                    .describe_effect("artifact_publish", &serde_json::json!({}));
                 assert_eq!(descriptor.tool_id, "artifact_publish");
                 assert_eq!(descriptor.effect_kind, ToolEffectKind::Read);
                 assert!(!descriptor.uses_network && !descriptor.spawns_process);
-                store.append(crate::RuntimeEventInput {
-                    stream_id: "session:fresh-session".into(),
-                    scope: crate::RuntimeEventScope::Tool,
-                    kind: "tool.execution_plan.created".into(),
-                    status: Some("planned".into()),
-                    actor: Some("conversation_runtime".into()),
-                    refs: Vec::new(),
-                    payload: serde_json::json!({"plan_id":"old-plan", "tasks":[{
-                        "tool_call_id":"old-call", "tool_name":"artifact_publish",
-                        "effect":descriptor,
-                    }]}),
-                }).unwrap();
+                store
+                    .append(crate::RuntimeEventInput {
+                        stream_id: "session:fresh-session".into(),
+                        scope: crate::RuntimeEventScope::Tool,
+                        kind: "tool.execution_plan.created".into(),
+                        status: Some("planned".into()),
+                        actor: Some("conversation_runtime".into()),
+                        refs: Vec::new(),
+                        payload: serde_json::json!({"plan_id":"old-plan", "tasks":[{
+                            "tool_call_id":"old-call", "tool_name":"artifact_publish",
+                            "effect":descriptor,
+                        }]}),
+                    })
+                    .unwrap();
                 let mut raw = serde_json::json!({
                     "version":1, "tool_call_id":"old-call",
                     "ref_id":"tool://tool-raw-old-call-0123456789abcdef",
@@ -5422,17 +5542,29 @@ mod tests {
                     .find(|source| source.stream_id == "session:fresh-session")
                     .unwrap();
                 let events = store.list_stream("session:fresh-session").unwrap();
-                let old_position = events.iter().position(|event|
-                    event.kind == "tool.invocation.completed"
-                        && event.payload["tool_call_id"] == "old-call").unwrap();
-                let fact_position = events.iter().position(|event|
-                    event.kind == crate::content_publication::FRESH_OBJECT_KIND).unwrap();
-                let plan_position = events.iter().position(|event|
-                    event.kind == "tool.execution_plan.created"
-                        && event.payload["plan_id"] == "old-plan").unwrap();
+                let old_position = events
+                    .iter()
+                    .position(|event| {
+                        event.kind == "tool.invocation.completed"
+                            && event.payload["tool_call_id"] == "old-call"
+                    })
+                    .unwrap();
+                let fact_position = events
+                    .iter()
+                    .position(|event| event.kind == crate::content_publication::FRESH_OBJECT_KIND)
+                    .unwrap();
+                let plan_position = events
+                    .iter()
+                    .position(|event| {
+                        event.kind == "tool.execution_plan.created"
+                            && event.payload["plan_id"] == "old-plan"
+                    })
+                    .unwrap();
                 assert!(events[plan_position].commit_cursor < events[old_position].commit_cursor);
-                assert_eq!(tool_effect_from_store(store, &events[old_position]).unwrap(),
-                    Some(descriptor.clone()));
+                assert_eq!(
+                    tool_effect_from_store(store, &events[old_position]).unwrap(),
+                    Some(descriptor.clone())
+                );
                 assert_eq!(
                     session_cut.expected_revision,
                     events.last().unwrap().sequence
@@ -5546,26 +5678,53 @@ mod tests {
                     .remove("agent_run_id");
                 root_metadata[old_position].payload["_runtime_activity_binding"]["activity_id"] =
                     serde_json::json!("activity:execution:fresh-root:owner:old-call");
-                for defect in ["missing_plan", "missing_id", "wrong_call", "wrong_tool", "malformed"] {
+                for defect in [
+                    "missing_plan",
+                    "missing_id",
+                    "wrong_call",
+                    "wrong_tool",
+                    "malformed",
+                ] {
                     let mut invalid_events = root_metadata.clone();
                     match defect {
-                        "missing_plan" => { invalid_events.remove(plan_position); },
+                        "missing_plan" => {
+                            invalid_events.remove(plan_position);
+                        }
                         "missing_id" => {
-                            invalid_events[old_position].payload.as_object_mut().unwrap()
+                            invalid_events[old_position]
+                                .payload
+                                .as_object_mut()
+                                .unwrap()
                                 .remove("governed_plan_id");
-                        },
-                        "wrong_call" => invalid_events[plan_position].payload["tasks"][0]["tool_call_id"]
-                            = serde_json::json!("foreign-call"),
-                        "wrong_tool" => invalid_events[plan_position].payload["tasks"][0]["tool_name"]
-                            = serde_json::json!("foreign-tool"),
-                        "malformed" => invalid_events[plan_position].payload["tasks"][0]["effect"]
-                            = serde_json::Value::Null,
+                        }
+                        "wrong_call" => {
+                            invalid_events[plan_position].payload["tasks"][0]["tool_call_id"] =
+                                serde_json::json!("foreign-call")
+                        }
+                        "wrong_tool" => {
+                            invalid_events[plan_position].payload["tasks"][0]["tool_name"] =
+                                serde_json::json!("foreign-tool")
+                        }
+                        "malformed" => {
+                            invalid_events[plan_position].payload["tasks"][0]["effect"] =
+                                serde_json::Value::Null
+                        }
                         _ => unreachable!(),
                     }
                     backend.replace_read("session:fresh-session", Some(invalid_events));
                     for reader_store in [store, &cold_store] {
-                        assert!(resolve_result_metadata(reader_store, &program, reference,
-                            &placeholder, None, readers).is_err(), "descriptor {defect}");
+                        assert!(
+                            resolve_result_metadata(
+                                reader_store,
+                                &program,
+                                reference,
+                                &placeholder,
+                                None,
+                                readers
+                            )
+                            .is_err(),
+                            "descriptor {defect}"
+                        );
                     }
                 }
                 backend.replace_read("session:fresh-session", Some(root_metadata));
@@ -6660,7 +6819,15 @@ mod tests {
             target: Some("task_claim".into()),
         }];
         assert!(runtime_control_descriptor(&descriptor));
-        for field in ["file", "network", "process", "system", "target", "permission", "name"] {
+        for field in [
+            "file",
+            "network",
+            "process",
+            "system",
+            "target",
+            "permission",
+            "name",
+        ] {
             let mut invalid = descriptor.clone();
             match field {
                 "file" => invalid.scopes[0].resource = PermissionResource::File,

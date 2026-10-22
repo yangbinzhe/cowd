@@ -460,11 +460,33 @@ impl RuntimeRetirementAdmission {
 }
 
 impl AgentActionService {
+    fn native_retirement_original_model<'a>(
+        original: &'a harness_contract::execution_graph::ExecutionGraph,
+        child: &harness_contract::execution_graph::ExecutionGraph,
+    ) -> Result<&'a harness_contract::execution_graph::ExecutionNodeSpec, String> {
+        use harness_contract::execution_graph::ExecutionNodeKind;
+        let mut models = original.nodes.iter().filter(|node| {
+            node.kind == ExecutionNodeKind::InlineModel && node.executor_kind == "inline_model"
+        });
+        let base = models
+            .next()
+            .ok_or("runtime retirement Native original model missing")?;
+        if models.next().is_some() {
+            return Err("runtime retirement Native original model is ambiguous".into());
+        }
+        let mut retained = child.nodes.iter().filter(|node| node.id == base.id);
+        if retained.next() != Some(base) || retained.next().is_some() {
+            return Err("runtime retirement Native original model changed".into());
+        }
+        Ok(base)
+    }
+
     fn validate_native_retirement_target_guard(
         original: &harness_contract::execution_graph::ExecutionGraph,
         child: &harness_contract::execution_graph::ExecutionGraph,
         guard: &harness_contract::execution_graph::ExecutionNodeSpec,
     ) -> Result<(), String> {
+        use crate::execution_core::graph::executors::CompileTargetGuardExecutor;
         use crate::execution_core::graph::{ExecutionCompileRequest, ExecutionGraphCompiler};
         use crate::execution_core::RuntimeCompileTarget;
         use harness_contract::execution_graph::ExecutionNodeKind;
@@ -479,16 +501,16 @@ impl AgentActionService {
         {
             return Err("runtime retirement Native target guard owner changed".into());
         }
-        let base = original
+        let bootstrap = original
             .nodes
             .iter()
-            .find(|node| {
-                node.id == format!("{}:model", original.id)
-                    && node.kind == ExecutionNodeKind::InlineModel
-                    && node.executor_kind == "inline_model"
-            })
-            .ok_or("runtime retirement Native target guard original model missing")?;
-        if guard.payload_ref != base.payload_ref {
+            .filter(|node| node.kind != ExecutionNodeKind::SessionDispatch)
+            .collect::<Vec<_>>();
+        let base = Self::native_retirement_original_model(original, child)?;
+        if guard.kind != ExecutionNodeKind::Verify
+            || guard.executor_kind != CompileTargetGuardExecutor::KIND
+            || guard.payload_ref != base.payload_ref
+        {
             return Err("runtime retirement Native target guard payload changed".into());
         }
         let initial: serde_json::Value =
@@ -496,19 +518,16 @@ impl AgentActionService {
         let target: RuntimeCompileTarget =
             serde_json::from_value(initial["compile_target"].clone())
                 .map_err(|error| error.to_string())?;
-        if !matches!(
-            target,
-            RuntimeCompileTarget::EvidenceGraph | RuntimeCompileTarget::ExecutionGraph
-        ) {
-            return Err("runtime retirement Native target has no compiler guard".into());
-        }
-        let scopes = original
-            .nodes
+        let scopes = bootstrap
             .iter()
-            .find(|node| node.id == format!("{}:resource-constraint", original.id))
+            .find(|node| {
+                node.kind == ExecutionNodeKind::Verify
+                    && node.executor_kind == CompileTargetGuardExecutor::KIND
+                    && node.acceptance.criteria == ["mutation_resources_must_be_leased"]
+            })
             .map(|node| node.resource_scopes.clone())
             .unwrap_or_default();
-        let compiled = ExecutionGraphCompiler
+        let mut compiled = ExecutionGraphCompiler
             .compile_conversation_turn(ExecutionCompileRequest {
                 objective: original.objective.clone(),
                 payload_ref: base.payload_ref.clone(),
@@ -516,24 +535,61 @@ impl AgentActionService {
                 resource_scopes: scopes,
             })
             .map_err(|error| error.to_string())?;
-        let prefix = format!("{}:", original.id);
-        let suffix = guard
-            .id
-            .strip_prefix(&prefix)
-            .ok_or("runtime retirement Native target guard has a foreign node owner")?;
-        let mut expected = compiled
+        let root = bootstrap
+            .first()
+            .ok_or("runtime retirement Native bootstrap is empty")?;
+        let ingress = initial
+            .get("ingress")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value::<crate::host::TurnIngressRef>(value.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let initial_compile =
+            ingress.is_none() && base.idempotency_key == format!("{}:attempt", base.id);
+        ExecutionGraphCompiler.bind_conversation_graph_identity(
+            &mut compiled,
+            &original.id,
+            (!initial_compile).then_some(root.id.as_str()),
+            ingress.as_ref().map(|value| value.request_id.as_str()),
+        )?;
+        if !compiled.nodes.iter().eq(bootstrap.iter().copied()) {
+            return Err("runtime retirement Native target guard shape/criterion mismatch".into());
+        }
+        if let Some(dispatch) = original
             .nodes
             .iter()
-            .find(|node| {
-                node.id == format!("{}:{suffix}", compiled.id)
-                    && node.kind == ExecutionNodeKind::Verify
-            })
-            .cloned()
-            .ok_or("runtime retirement Native target guard is not compiler-authored")?;
-        expected.id.clone_from(&guard.id);
-        expected.idempotency_key = format!("{}:attempt", guard.id);
-        if expected != *guard {
-            return Err("runtime retirement Native target guard shape/criterion mismatch".into());
+            .find(|node| node.kind == ExecutionNodeKind::SessionDispatch)
+        {
+            compiled.nodes.insert(0, dispatch.clone());
+            compiled.edges.insert(
+                0,
+                harness_contract::execution_graph::ExecutionEdge {
+                    from: dispatch.id.clone(),
+                    to: root.id.clone(),
+                    kind: harness_contract::execution_graph::ExecutionEdgeKind::DependsOn,
+                },
+            );
+        }
+        harness_contract::execution_graph::validate_execution_graph(original)
+            .map_err(|error| error.to_string())?;
+        harness_contract::execution_graph::validate_execution_graph(child)
+            .map_err(|error| error.to_string())?;
+        if compiled.nodes != original.nodes
+            || compiled.edges.len() != original.edges.len()
+            || compiled
+                .edges
+                .iter()
+                .any(|edge| !original.edges.contains(edge))
+            || compiled
+                .nodes
+                .iter()
+                .any(|node| !child.nodes.contains(node))
+            || compiled
+                .edges
+                .iter()
+                .any(|edge| !child.edges.contains(edge))
+        {
+            return Err("runtime retirement Native target guard topology changed".into());
         }
         Ok(())
     }
@@ -620,14 +676,7 @@ impl AgentActionService {
         {
             return Err("runtime retirement Native original graph ownership changed".into());
         }
-        let base = child
-            .nodes
-            .iter()
-            .find(|node| node.id == format!("{}:model", child.id))
-            .ok_or("runtime retirement Native original model missing")?;
-        if !original.nodes.iter().any(|node| node == base) {
-            return Err("runtime retirement Native original model changed".into());
-        }
+        let base = Self::native_retirement_original_model(&original, child)?;
         let initial: serde_json::Value =
             serde_json::from_str(&base.payload_ref).map_err(|error| error.to_string())?;
         if base.kind != ExecutionNodeKind::InlineModel
@@ -3224,24 +3273,6 @@ impl AgentActionService {
                         "required review {condition} has no verification"
                     ))
                 })?;
-                let inputs = proof
-                    .input_set
-                    .as_ref()
-                    .filter(|inputs| inputs.version == 2)
-                    .ok_or_else(|| {
-                        AgentActionServiceError::Corrupt(format!(
-                            "unsupported required review {condition}"
-                        ))
-                    })?;
-                if review.decision != "satisfied"
-                    || review.spec_revision != prepared.goal.spec_revision
-                    || review.input_manifest_digest != prepared.goal.spec_digest
-                    || inputs.condition_ref.as_deref() != Some(condition.as_str())
-                {
-                    return Err(AgentActionServiceError::Corrupt(format!(
-                        "invalid required review {condition}"
-                    )));
-                }
                 let snapshot = super::review_evidence::validate_proof_inputs(
                     &self.store,
                     projection,
@@ -3250,27 +3281,6 @@ impl AgentActionService {
                     readers,
                 )
                 .map_err(AgentActionServiceError::EventStore)?;
-                if !snapshot.reviewer_matches(projection, review)
-                    || proof.goal_spec_revision != Some(prepared.goal.spec_revision)
-                    || proof.goal_spec_digest.as_deref() != Some(prepared.goal.spec_digest.as_str())
-                    || inputs.material_events.is_empty()
-                    || review.evidence_refs.is_empty()
-                    || review.producer_refs.is_empty()
-                    || review.result_refs.is_empty()
-                    || proof.producer_execution_ids.is_empty()
-                    || proof.reviewer_execution_id.is_empty()
-                    || proof.producer_execution_ids.iter().any(|producer| {
-                        producer.is_empty()
-                            || (proof.independence_required
-                                && producer == &proof.reviewer_execution_id)
-                    })
-                    || (proof.independence_required
-                        && review.producer_refs.contains(&review.reviewer_actor))
-                {
-                    return Err(AgentActionServiceError::Corrupt(format!(
-                        "invalid required review identity {condition}"
-                    )));
-                }
                 let mut required_results = review.result_refs.clone();
                 if prepared.goal.user_intent_criterion_id.as_ref() == Some(&condition) {
                     required_results.extend(crate::execution_core::goal::delivered_result_refs(
@@ -3284,36 +3294,12 @@ impl AgentActionService {
                 }) {
                     required_results.extend(obligation.artifact_refs.iter().cloned());
                 }
-                for reference in required_results {
-                    let identity =
-                        super::review_evidence::review_result_identity(projection, &reference)
-                            .map_err(AgentActionServiceError::Corrupt)?;
-                    let covers = |refs: &[String]| {
-                        refs.iter().any(|reference| {
-                            super::review_evidence::review_result_identity(projection, reference)
-                                .is_ok_and(|current| current == identity)
-                        })
-                    };
-                    if !covers(&review.result_refs)
-                        || !covers(&inputs.result_refs)
-                        || !proof.reads.iter().any(|read| {
-                            super::review_evidence::review_result_identity(
-                                projection,
-                                &read.result_ref,
-                            )
-                            .is_ok_and(|current| current == identity)
-                                && !read.sha256.is_empty()
-                                && !read.receipt_refs.is_empty()
-                                && (read.result_kind
-                                    != harness_contract::goal::GoalResultKind::ToolEffect
-                                    || !read.effect_observation_refs.is_empty())
-                        })
-                    {
-                        return Err(AgentActionServiceError::Corrupt(format!(
-                            "required result coverage missing for {condition}"
-                        )));
-                    }
-                }
+                super::review_evidence::validate_review_coverage(
+                    &prepared.goal, projection, review, &required_results,
+                    &prepared.goal.evidence_refs, &snapshot,
+                ).map_err(|error| AgentActionServiceError::Corrupt(
+                    format!("required review {condition}: {error}"),
+                ))?;
                 for source in snapshot.sources {
                     if current_sources
                         .insert(source.stream_id, source.expected_revision)
@@ -5236,11 +5222,18 @@ mod native_retirement_guard_tests {
     }
 
     #[test]
-    fn r1_native_retirement_accepts_real_evidence_and_execution_compiler_guards() {
+    fn r1_native_retirement_accepts_all_conversation_compiler_guards() {
         for (target, criteria) in [
             (
+                RuntimeCompileTarget::InlineModel,
+                vec!["mutation_resources_must_be_leased"],
+            ),
+            (
                 RuntimeCompileTarget::EvidenceGraph,
-                vec!["evidence_read_before_synthesis"],
+                vec![
+                    "evidence_read_before_synthesis",
+                    "mutation_resources_must_be_leased",
+                ],
             ),
             (
                 RuntimeCompileTarget::ExecutionGraph,
@@ -5270,8 +5263,158 @@ mod native_retirement_guard_tests {
     }
 
     #[test]
+    fn r1_native_retirement_accepts_stable_parent_and_ingress_guard_identity() {
+        for target in [
+            RuntimeCompileTarget::InlineModel,
+            RuntimeCompileTarget::EvidenceGraph,
+            RuntimeCompileTarget::ExecutionGraph,
+        ] {
+            for ingress in [false, true] {
+                let mut original = compiled_child(target);
+                let mut remapped = std::collections::BTreeMap::new();
+                let parent = format!("{}:model", original.id);
+                for (index, node) in original.nodes.iter_mut().enumerate() {
+                    let previous = node.id.clone();
+                    let suffix = previous.strip_prefix(&format!("{}:", original.id)).unwrap();
+                    if index == 0 {
+                        node.id.clone_from(&parent);
+                    } else if node.id == parent {
+                        node.id.push_str(":retarget");
+                    }
+                    node.idempotency_key = if ingress {
+                        format!("request:{suffix}")
+                    } else {
+                        node.id.clone()
+                    };
+                    if ingress {
+                        let mut payload: serde_json::Value =
+                            serde_json::from_str(&node.payload_ref).unwrap();
+                        payload["ingress"] = serde_json::json!({
+                            "request_id":"request", "turn_id":"guard-turn", "message_id":"message",
+                            "session_id":"guard-session", "primary_task_id":"guard-task", "root_task_id":"guard-root-task",
+                            "session_generation":1, "input_sequence":1, "claim_owner":"owner", "claim_token":"token", "claim_revision":1
+                        });
+                        node.payload_ref = payload.to_string();
+                    }
+                    remapped.insert(previous, node.id.clone());
+                }
+                for edge in &mut original.edges {
+                    edge.from = remapped[&edge.from].clone();
+                    edge.to = remapped[&edge.to].clone();
+                }
+                if ingress {
+                    let mut dispatch = harness_contract::execution_graph::ExecutionNodeSpec::new(
+                        ExecutionNodeKind::SessionDispatch,
+                        "session_dispatch",
+                        "dispatch",
+                    );
+                    dispatch.id = format!("{}:dispatch", original.id);
+                    original
+                        .edges
+                        .push(harness_contract::execution_graph::ExecutionEdge {
+                            from: dispatch.id.clone(),
+                            to: parent.clone(),
+                            kind: harness_contract::execution_graph::ExecutionEdgeKind::DependsOn,
+                        });
+                    original.nodes.insert(0, dispatch);
+                }
+                harness_contract::execution_graph::validate_execution_graph(&original).unwrap();
+                let base =
+                    AgentActionService::native_retirement_original_model(&original, &original)
+                        .unwrap();
+                assert_eq!(base.id, format!("{}:model:retarget", original.id));
+                for mutation in ["missing", "changed", "duplicate"] {
+                    let mut child = original.clone();
+                    let index = child
+                        .nodes
+                        .iter()
+                        .position(|node| node.id == base.id)
+                        .unwrap();
+                    match mutation {
+                        "missing" => {
+                            child.nodes.remove(index);
+                        }
+                        "changed" => child.nodes[index].payload_ref.push_str("foreign"),
+                        "duplicate" => child.nodes.push(base.clone()),
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(
+                        AgentActionService::native_retirement_original_model(&original, &child)
+                            .unwrap_err(),
+                        "runtime retirement Native original model changed"
+                    );
+                }
+                let mut ambiguous = original.clone();
+                let mut extra_model = base.clone();
+                extra_model.id.push_str(":extra");
+                ambiguous.nodes.push(extra_model);
+                assert_eq!(
+                    AgentActionService::native_retirement_original_model(&ambiguous, &ambiguous)
+                        .unwrap_err(),
+                    "runtime retirement Native original model is ambiguous"
+                );
+                for guard in original
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == ExecutionNodeKind::Verify)
+                {
+                    AgentActionService::validate_native_retirement_target_guard(
+                        &original, &original, guard,
+                    )
+                    .unwrap();
+                    for mutation in [
+                        "node",
+                        "idempotency",
+                        "criterion",
+                        "executor",
+                        "edge",
+                        "extra-node",
+                    ] {
+                        let mut forged = original.clone();
+                        let index = forged
+                            .nodes
+                            .iter()
+                            .position(|node| node.id == guard.id)
+                            .unwrap();
+                        match mutation {
+                            "node" => forged.nodes[index].id.push_str(":foreign"),
+                            "idempotency" => {
+                                forged.nodes[index].idempotency_key.push_str(":foreign")
+                            }
+                            "criterion" => forged.nodes[index]
+                                .acceptance
+                                .criteria
+                                .push("foreign".into()),
+                            "executor" => forged.nodes[index].executor_kind = "verify".into(),
+                            "edge" => {
+                                forged.edges.remove(0);
+                            }
+                            "extra-node" => {
+                                let mut extra = forged.nodes[index].clone();
+                                extra.id.push_str(":extra");
+                                forged.nodes.push(extra);
+                            }
+                            _ => unreachable!(),
+                        }
+                        assert!(
+                            AgentActionService::validate_native_retirement_target_guard(
+                                &forged,
+                                &forged,
+                                &forged.nodes[index]
+                            )
+                            .is_err(),
+                            "{target:?}/{ingress}/{mutation}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn r1_native_retirement_rejects_foreign_compiler_guard_executor_criterion_and_owner() {
         for target in [
+            RuntimeCompileTarget::InlineModel,
             RuntimeCompileTarget::EvidenceGraph,
             RuntimeCompileTarget::ExecutionGraph,
         ] {
@@ -5294,6 +5437,9 @@ mod native_retirement_guard_tests {
                     "lineage",
                     "graph",
                     "node",
+                    "kind",
+                    "idempotency",
+                    "edge",
                     "payload",
                 ] {
                     let mut before = original.clone();
@@ -5330,12 +5476,23 @@ mod native_retirement_guard_tests {
                         "lineage" => child.lineage.as_mut().unwrap().generation += 1,
                         "graph" => child.id.push_str(":foreign"),
                         "node" => child.nodes[index].id.push_str(":foreign"),
+                        "kind" => child.nodes[index].kind = ExecutionNodeKind::ToolBatch,
+                        "idempotency" => child.nodes[index].idempotency_key.push_str(":foreign"),
+                        "edge" => {
+                            child.edges.remove(0);
+                        }
                         "payload" => child.nodes[index].payload_ref = "foreign-payload".into(),
                         _ => unreachable!(),
                     }
                     if matches!(
                         mutation,
-                        "executor" | "legacy-verify" | "criterion" | "extra-criterion"
+                        "executor"
+                            | "legacy-verify"
+                            | "criterion"
+                            | "extra-criterion"
+                            | "node"
+                            | "kind"
+                            | "idempotency"
                     ) {
                         before.nodes[index] = child.nodes[index].clone();
                     }

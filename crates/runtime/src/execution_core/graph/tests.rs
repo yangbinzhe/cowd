@@ -1966,20 +1966,112 @@ fn conversation_compile_targets_have_distinct_initial_dags_and_constraints() {
     let evidence = compile(RuntimeCompileTarget::EvidenceGraph);
     let execution = compile(RuntimeCompileTarget::ExecutionGraph);
 
-    assert_eq!(inline.nodes.len(), 1);
-    assert_eq!(evidence.nodes.len(), 2);
+    assert_eq!(inline.nodes.len(), 2);
+    assert_eq!(evidence.nodes.len(), 3);
     assert_eq!(execution.nodes.len(), 3);
+    for (graph, suffixes) in [
+        (&inline, vec!["resource-constraint", "model"]),
+        (
+            &evidence,
+            vec!["evidence-constraint", "resource-constraint", "model"],
+        ),
+        (
+            &execution,
+            vec!["policy-constraint", "resource-constraint", "model"],
+        ),
+    ] {
+        let mut bound = graph.clone();
+        compiler
+            .bind_conversation_graph_identity(&mut bound, "ingress-graph", None, Some("request"))
+            .unwrap();
+        assert_eq!(bound.id, "ingress-graph");
+        for (node, suffix) in bound.nodes.iter().zip(&suffixes) {
+            assert_eq!(node.id, format!("ingress-graph:{suffix}"));
+            assert_eq!(node.idempotency_key, format!("request:{suffix}"));
+        }
+        assert_eq!(bound.edges.len(), suffixes.len() - 1);
+        for (edge, pair) in bound.edges.iter().zip(suffixes.windows(2)) {
+            assert_eq!(edge.from, format!("ingress-graph:{}", pair[0]));
+            assert_eq!(edge.to, format!("ingress-graph:{}", pair[1]));
+            assert_eq!(edge.kind, ExecutionEdgeKind::DependsOn);
+        }
+        assert_eq!(
+            bound
+                .nodes
+                .iter()
+                .map(|node| &node.resource_scopes)
+                .collect::<Vec<_>>(),
+            graph
+                .nodes
+                .iter()
+                .map(|node| &node.resource_scopes)
+                .collect::<Vec<_>>()
+        );
+    }
     assert!(evidence.nodes[0]
         .acceptance
         .criteria
         .contains(&"evidence_read_before_synthesis".to_string()));
-    assert!(execution.nodes.iter().any(|node| {
-        node.resource_scopes == ["write:src/lib.rs"]
-            && node
-                .acceptance
-                .criteria
-                .contains(&"mutation_resources_must_be_leased".to_string())
-    }));
+    for graph in [&inline, &evidence, &execution] {
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| !node.resource_scopes.is_empty())
+                .count(),
+            1
+        );
+        assert!(graph.nodes.iter().any(|node| {
+            node.kind == ExecutionNodeKind::Verify
+                && node.executor_kind == super::executors::CompileTargetGuardExecutor::KIND
+                && node.resource_scopes == ["write:src/lib.rs"]
+                && node
+                    .acceptance
+                    .criteria
+                    .contains(&"mutation_resources_must_be_leased".to_string())
+        }));
+        assert!(graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
+            .all(|node| node.resource_scopes.is_empty()));
+        assert_eq!(
+            graph.nodes.last().unwrap().kind,
+            ExecutionNodeKind::InlineModel
+        );
+        assert_eq!(graph.edges.len(), graph.nodes.len() - 1);
+        for (edge, pair) in graph.edges.iter().zip(graph.nodes.windows(2)) {
+            assert_eq!(edge.from, pair[0].id);
+            assert_eq!(edge.to, pair[1].id);
+            assert_eq!(edge.kind, ExecutionEdgeKind::DependsOn);
+        }
+    }
+}
+
+#[test]
+fn conversation_compilation_preserves_read_only_and_empty_delegation_boundaries() {
+    for target in [
+        RuntimeCompileTarget::InlineModel,
+        RuntimeCompileTarget::EvidenceGraph,
+        RuntimeCompileTarget::ExecutionGraph,
+    ] {
+        for scopes in [Vec::new(), vec!["read:input.txt".to_string()]] {
+            let graph = ExecutionGraphCompiler
+                .compile_conversation_turn(ExecutionCompileRequest {
+                    objective: "inspect".into(),
+                    payload_ref: "payload:turn".into(),
+                    target,
+                    resource_scopes: scopes.clone(),
+                })
+                .unwrap();
+            let retained = graph
+                .nodes
+                .iter()
+                .flat_map(|node| node.resource_scopes.iter().cloned())
+                .collect::<Vec<_>>();
+            assert_eq!(retained, scopes);
+        }
+    }
 }
 
 #[test]
@@ -4639,6 +4731,120 @@ async fn workspace_absolute_scope_is_normalized_before_locking() {
 }
 
 #[tokio::test]
+async fn compile_target_guard_skips_scope_locks_but_verify_and_effect_leaves_acquire_them() {
+    for (kind, executor_kind, skips_lock) in [
+        (
+            ExecutionNodeKind::Verify,
+            super::executors::CompileTargetGuardExecutor::KIND,
+            true,
+        ),
+        (ExecutionNodeKind::Verify, "test", false),
+        (ExecutionNodeKind::Materialize, "test", false),
+    ] {
+        let fixture = LeaseRecoveryFixture423::new();
+        fixture
+            .registry
+            .register(Arc::new(super::executors::CompileTargetGuardExecutor))
+            .unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(fixture.root.path())
+                .unwrap();
+        let request = ScopeLockRequest {
+            scope: ScopedResource::workspace(resolver.workspace_id()).unwrap(),
+            mode: ScopeLockMode::Write,
+        };
+        let held = fixture
+            .scopes
+            .try_acquire([request.clone()])
+            .unwrap()
+            .unwrap();
+        let mut graph = test_graph("guard versus effect lock ownership");
+        let mut spec = node("scoped");
+        spec.kind = kind;
+        spec.executor_kind = executor_kind.into();
+        spec.resource_scopes = vec!["write:.".into()];
+        spec.acceptance.criteria = vec!["mutation_resources_must_be_leased".into()];
+        graph.nodes.push(spec);
+        let graph = fixture.runner.register(graph).await.unwrap();
+        let ready = fixture
+            .runner
+            .pump_snapshot(&graph.id, &Default::default())
+            .await
+            .unwrap()
+            .ready;
+        let mut prepared = fixture
+            .runner
+            .prepare_ready_wave(&graph.id, ready)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 1);
+        let prepared = prepared.pop().unwrap();
+        if skips_lock {
+            let binding = prepared
+                .binding
+                .as_ref()
+                .expect("guard admits despite the held path lock");
+            assert!(binding.scope_lease_ref.is_none());
+            assert!(binding.worktree_lease_ref.is_none());
+            assert!(binding.resource_lease_refs.is_empty());
+            fixture
+                .runner
+                .execute_prepared_pump_node(&graph.id, prepared, Arc::new(Notify::new()))
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.state.load(&graph.id).unwrap().node_statuses["scoped"],
+                ExecutionNodeStatus::Completed
+            );
+            drop(held);
+        } else {
+            assert!(prepared.binding.is_none());
+            assert!(matches!(
+                fixture
+                    .runner
+                    .execute_prepared_pump_node(&graph.id, prepared, Arc::new(Notify::new()))
+                    .await,
+                Err(ExecutionRunnerError::ResourceDeferred { .. })
+            ));
+            assert_eq!(
+                fixture.state.load(&graph.id).unwrap().node_statuses["scoped"],
+                ExecutionNodeStatus::Ready
+            );
+            drop(held);
+            let ready = fixture
+                .runner
+                .pump_snapshot(&graph.id, &Default::default())
+                .await
+                .unwrap()
+                .ready;
+            let mut prepared = fixture
+                .runner
+                .prepare_ready_wave(&graph.id, ready)
+                .await
+                .unwrap();
+            assert_eq!(prepared.len(), 1);
+            let prepared = prepared.pop().unwrap();
+            assert!(prepared.binding.as_ref().unwrap().scope_lease_ref.is_some());
+            assert!(fixture
+                .scopes
+                .try_acquire([request.clone()])
+                .unwrap()
+                .is_none());
+            fixture
+                .runner
+                .execute_prepared_pump_node(&graph.id, prepared, Arc::new(Notify::new()))
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.state.load(&graph.id).unwrap().node_statuses["scoped"],
+                ExecutionNodeStatus::Completed
+            );
+        }
+        assert!(fixture.scopes.try_acquire([request]).unwrap().is_some());
+    }
+}
+
+#[tokio::test]
 async fn invalid_resource_scope_becomes_a_durable_node_blocker() {
     let (registry, state, commits) = harness();
     registry
@@ -4662,6 +4868,34 @@ async fn invalid_resource_scope_becomes_a_durable_node_blocker() {
         graph.node_results["root"].failure.as_ref().unwrap().kind,
         "resource_acquisition_failed"
     );
+}
+
+#[tokio::test]
+async fn compile_target_guard_still_rejects_invalid_resource_scopes() {
+    for scope in ["read:../outside", "write:../outside", "worktree:../outside"] {
+        let fixture = LeaseRecoveryFixture423::new();
+        fixture
+            .registry
+            .register(Arc::new(super::executors::CompileTargetGuardExecutor))
+            .unwrap();
+        let mut graph = test_graph("guard validates without leasing");
+        let mut guard = node("guard");
+        guard.kind = ExecutionNodeKind::Verify;
+        guard.executor_kind = super::executors::CompileTargetGuardExecutor::KIND.into();
+        guard.acceptance.criteria = vec!["mutation_resources_must_be_leased".into()];
+        guard.resource_scopes = vec![scope.into()];
+        graph.nodes.push(guard);
+        let graph_id = graph.id.clone();
+        let report = fixture.runner.start(graph).await.unwrap();
+        assert_eq!(report.blocked, 1);
+        let graph = fixture.state.load(&graph_id).unwrap();
+        assert_eq!(graph.node_statuses["guard"], ExecutionNodeStatus::Blocked);
+        assert_eq!(
+            graph.node_results["guard"].failure.as_ref().unwrap().kind,
+            "resource_acquisition_failed"
+        );
+        assert_eq!(fixture.scopes.active_lease_count().unwrap(), 0);
+    }
 }
 
 async fn run_verify_graph(evidence_id: Option<&str>, required: &str) -> (ExecutionGraph, usize) {
@@ -8086,6 +8320,7 @@ async fn r1_704_runtime_cancel_tree_retries_original_publication_before_terminal
         },
         publish: AtomicBool::new(false),
         polls: AtomicUsize::new(0),
+        recovery: None,
     });
     services
         .executor_registry()
@@ -8166,12 +8401,69 @@ struct RecoverableCallback704 {
     inner: PostCommitExecutor,
     publish: AtomicBool,
     polls: AtomicUsize,
+    recovery: Option<CallbackRecovery704>,
+}
+
+struct CallbackRecovery704 {
+    events: Arc<RuntimeEventStore>,
+    cancelled: bool,
+    crash: Option<(bool, Arc<Notify>)>,
+}
+
+impl CallbackRecovery704 {
+    async fn finish(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        if let Some((false, entered)) = &self.crash {
+            entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        let stream = format!(
+            "callback704:{}:{}:{}",
+            ticket.graph_id, ticket.node_id, ticket.attempt
+        );
+        self.events
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!("{stream}:finish"),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: stream.clone(),
+                    expected_revision: 0,
+                }],
+                events: vec![crate::RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream.clone(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "test.callback.receipt".into(),
+                        status: None,
+                        actor: None,
+                        refs: Vec::new(),
+                        payload: serde_json::json!({"ticket": ticket, "cancelled": self.cancelled}),
+                    },
+                    idempotency_key: Some(format!("{stream}:receipt")),
+                    schema_version: 1,
+                }],
+            })
+            .map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: error.to_string(),
+            })?;
+        if let Some((true, entered)) = &self.crash {
+            entered.notify_one();
+            return Err(NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "704 callback receipt durable but acknowledgement lost".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl NodeExecutor for RecoverableCallback704 {
     fn kind(&self) -> &str {
-        self.inner.kind()
+        match &self.recovery {
+            Some(recovery) if recovery.cancelled => "synthesize",
+            Some(_) => "inline_model",
+            None => self.inner.kind(),
+        }
     }
     fn validate(&self, spec: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
         self.inner.validate(spec)
@@ -8180,16 +8472,44 @@ impl NodeExecutor for RecoverableCallback704 {
         &self,
         context: NodeExecutionContext,
     ) -> Result<NodeExecutionTicket, NodeExecutorError> {
-        self.inner.start(context).await
+        let mut ticket = self.inner.start(context).await?;
+        ticket.executor_kind = self.kind().into();
+        Ok(ticket)
     }
     async fn poll_or_await(
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
         self.polls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.cancelled)
+        {
+            let mut result = completed_result(&ticket.node_id);
+            result.status = ExecutionNodeStatus::Cancelled;
+            result.result_ref = None;
+            result.failure = Some(harness_contract::execution_graph::ExecutionFailure {
+                kind: "terminal_presentation_cancelled".into(),
+                message: "terminal presentation cancelled".into(),
+                retryable: false,
+                evidence_refs: Vec::new(),
+            });
+            return Ok(NodeExecutionOutcome::new(result));
+        }
         self.inner.poll_or_await(ticket).await
     }
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        if let Some(recovery) = &self.recovery {
+            self.inner.after_commits.fetch_add(1, Ordering::SeqCst);
+            if recovery.cancelled {
+                return Err(NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: "cancelled synthesis has no transcript to commit".into(),
+                });
+            }
+            return recovery.finish(ticket).await;
+        }
         if !self.publish.load(Ordering::SeqCst) {
             return Err(NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -8197,6 +8517,24 @@ impl NodeExecutor for RecoverableCallback704 {
             });
         }
         self.inner.after_commit(ticket).await
+    }
+
+    async fn after_abort(
+        &self,
+        ticket: &NodeExecutionTicket,
+        reason: &str,
+    ) -> Result<(), NodeExecutorError> {
+        if let Some(recovery) = &self.recovery {
+            self.inner.after_aborts.fetch_add(1, Ordering::SeqCst);
+            if !recovery.cancelled {
+                return Err(NodeExecutorError::Cancel {
+                    node_id: ticket.node_id.clone(),
+                    reason: "committed publication must not become abort".into(),
+                });
+            }
+            return recovery.finish(ticket).await;
+        }
+        self.inner.after_abort(ticket, reason).await
     }
 }
 
@@ -8215,6 +8553,7 @@ async fn r1_704_hot_recovery_finishes_original_callback_without_stealing_or_reex
         },
         publish: AtomicBool::new(false),
         polls: AtomicUsize::new(0),
+        recovery: None,
     });
     registry.register(executor.clone()).unwrap();
     let workspace_id = format!("704-hot-{}", uuid::Uuid::new_v4());
@@ -8287,6 +8626,233 @@ async fn r1_704_hot_recovery_finishes_original_callback_without_stealing_or_reex
     assert!(stale.is_err());
     assert_eq!(state.load(&id).unwrap(), recovered);
     assert!(runner.recover_graph("foreign-704").await.is_err());
+}
+
+async fn cold_callback_recovery_704(after_effect: bool) {
+    for cancelled in [false, true] {
+        let backend = Arc::new(crate::runtime_event_store::EphemeralRuntimeEventStore::new());
+        let events = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
+        let state = ExecutionGraphStateStore::new(events.clone());
+        let commits = ExecutionCommitService::new(events.clone());
+        let entered = Arc::new(Notify::new());
+        let executor = Arc::new(RecoverableCallback704 {
+            inner: PostCommitExecutor {
+                after_commits: AtomicUsize::new(0),
+                after_aborts: AtomicUsize::new(0),
+                invalid_domain_event: false,
+                poll_error: false,
+            },
+            publish: AtomicBool::new(true),
+            polls: AtomicUsize::new(0),
+            recovery: Some(CallbackRecovery704 {
+                events: events.clone(),
+                cancelled,
+                crash: Some((after_effect, entered.clone())),
+            }),
+        });
+        let registry = Arc::new(NodeExecutorRegistry::new());
+        registry.register(executor.clone()).unwrap();
+        let mut graph = test_graph("704 cold original callback recovery");
+        let mut spec = node("cold704");
+        spec.kind = if cancelled {
+            ExecutionNodeKind::Synthesize
+        } else {
+            ExecutionNodeKind::InlineModel
+        };
+        spec.executor_kind = executor.kind().into();
+        graph.nodes.push(spec);
+        let graph_id = graph.id.clone();
+        let runner =
+            recovery_runner_475(registry.clone(), state.clone(), commits.clone(), &graph_id);
+        let driver = tokio::spawn({
+            let runner = runner.clone();
+            async move { runner.start(graph).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let before = state.load(&graph_id).unwrap();
+        let (_, binding, position) = state
+            .binding_starts_page(&graph_id, 0, before.revision)
+            .unwrap()
+            .1
+            .into_iter()
+            .next()
+            .unwrap();
+        let ticket = fixture_ticket_475(&before, "cold704", &binding);
+        let receipt_stream = format!("callback704:{graph_id}:cold704:{}", binding.attempt);
+        let original_effect = events
+            .list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket))
+            .unwrap();
+        assert_eq!(original_effect.len(), 2);
+        assert!(matches!(
+            commits.inspect_execution_effect(&ticket).unwrap(),
+            ExecutionEffectState::Completed(_)
+        ));
+        assert_eq!(
+            before.node_statuses["cold704"],
+            if cancelled {
+                ExecutionNodeStatus::Cancelled
+            } else {
+                ExecutionNodeStatus::Completed
+            }
+        );
+        assert!(!state
+            .binding_lease_closure(&before, "cold704", &binding, position)
+            .unwrap());
+        assert_eq!(
+            events.list_stream(&receipt_stream).unwrap().len(),
+            usize::from(after_effect)
+        );
+        assert_eq!(executor.polls.load(Ordering::SeqCst), 1);
+        let scopes = manual_scope_locks_475(&graph_id);
+        assert_eq!(
+            commits
+                .binding_callback_disposition(&before, "cold704", &binding)
+                .unwrap(),
+            if cancelled {
+                super::commit_service::CallbackDisposition::Abort
+            } else {
+                super::commit_service::CallbackDisposition::Commit
+            }
+        );
+        assert_eq!(
+            executor.inner.after_commits.load(Ordering::SeqCst),
+            usize::from(!cancelled)
+        );
+        assert_eq!(
+            executor.inner.after_aborts.load(Ordering::SeqCst),
+            usize::from(cancelled)
+        );
+        let fence =
+            super::events::ExecutionBindingLeaseClosure::fence_key(&before, "cold704", &binding);
+        assert!(scopes.try_recover_binding_owner(&fence).unwrap().is_none());
+        if after_effect {
+            let error = tokio::time::timeout(Duration::from_secs(5), driver)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("acknowledgement lost"));
+        } else {
+            driver.abort();
+            assert!(driver.await.unwrap_err().is_cancelled());
+        }
+        let old_registry = Arc::downgrade(&registry);
+        let old_executor = Arc::downgrade(&executor);
+        let old_events = Arc::downgrade(&events);
+        drop(runner);
+        drop(registry);
+        drop(executor);
+        drop(commits);
+        drop(state);
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while old_registry.upgrade().is_some()
+                || old_executor.upgrade().is_some()
+                || old_events.upgrade().is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let owner = scopes
+            .try_recover_binding_owner(&fence)
+            .unwrap()
+            .expect("original owner must be lost before rebuilding");
+        drop(owner);
+        drop(scopes);
+
+        let events = Arc::new(RuntimeEventStore::from_backend(backend));
+        let state = ExecutionGraphStateStore::new(events.clone());
+        let commits = ExecutionCommitService::new(events.clone());
+        let registry = Arc::new(NodeExecutorRegistry::new());
+        let executor = Arc::new(RecoverableCallback704 {
+            inner: PostCommitExecutor {
+                after_commits: AtomicUsize::new(0),
+                after_aborts: AtomicUsize::new(0),
+                invalid_domain_event: false,
+                poll_error: false,
+            },
+            publish: AtomicBool::new(true),
+            polls: AtomicUsize::new(0),
+            recovery: Some(CallbackRecovery704 {
+                events: events.clone(),
+                cancelled,
+                crash: None,
+            }),
+        });
+        registry.register(executor.clone()).unwrap();
+        let runner = recovery_runner_475(registry, state.clone(), commits.clone(), &graph_id);
+        let recovered =
+            tokio::time::timeout(Duration::from_secs(5), runner.recover_graph(&graph_id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(state
+            .binding_lease_closure(&recovered, "cold704", &binding, position)
+            .unwrap());
+        assert_eq!(recovered.node_statuses, before.node_statuses);
+        assert_eq!(
+            recovered.recovery_cursor.node_attempts,
+            before.recovery_cursor.node_attempts
+        );
+        assert_eq!(
+            events
+                .list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket))
+                .unwrap(),
+            original_effect
+        );
+        assert_eq!(events.list_stream(&receipt_stream).unwrap().len(), 1);
+        assert_eq!(executor.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            executor.inner.after_commits.load(Ordering::SeqCst),
+            usize::from(!cancelled)
+        );
+        assert_eq!(
+            executor.inner.after_aborts.load(Ordering::SeqCst),
+            usize::from(cancelled)
+        );
+        let stale = ExecutionNodeBinding {
+            attempt: binding.attempt + 1,
+            ..binding.clone()
+        };
+        assert!(commits
+            .binding_callback_disposition(&recovered, "cold704", &stale)
+            .is_err());
+        assert_eq!(runner.recover_graph(&graph_id).await.unwrap(), recovered);
+        assert_eq!(events.list_stream(&receipt_stream).unwrap().len(), 1);
+        assert_eq!(
+            executor.inner.after_commits.load(Ordering::SeqCst),
+            usize::from(!cancelled)
+        );
+        assert_eq!(
+            executor.inner.after_aborts.load(Ordering::SeqCst),
+            usize::from(cancelled)
+        );
+        assert!(runner
+            .command(
+                &graph_id,
+                ExecutionGraphCommand::Cancel {
+                    expected_revision: before.revision,
+                    reason: "late original notification".into(),
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(state.load(&graph_id).unwrap(), recovered);
+    }
+}
+
+#[tokio::test]
+async fn r1_704_cold_recovery_after_result_before_callback_preserves_original_binding() {
+    cold_callback_recovery_704(false).await;
+}
+
+#[tokio::test]
+async fn r1_704_cold_recovery_after_callback_before_confirmation_is_idempotent() {
+    cold_callback_recovery_704(true).await;
 }
 
 #[async_trait]
@@ -8425,6 +8991,15 @@ async fn r1_475_intent_only_command_crash_recovers_empty_binding_without_complet
         running_inline_attempt_450("475 actual command crash").await;
     let commits = ExecutionCommitService::new(events.clone());
     let state = ExecutionGraphStateStore::new(events.clone());
+    let binding = state
+        .current_binding(&running, "durable", ticket.attempt)
+        .unwrap();
+    assert_eq!(
+        commits
+            .binding_callback_disposition(&running, "durable", &binding)
+            .unwrap(),
+        super::commit_service::CallbackDisposition::Pending
+    );
     let cancelled = commits
         .apply_command(
             &running,
@@ -8435,6 +9010,12 @@ async fn r1_475_intent_only_command_crash_recovers_empty_binding_without_complet
         )
         .unwrap()
         .graph;
+    assert_eq!(
+        commits
+            .binding_callback_disposition(&cancelled, "durable", &binding)
+            .unwrap(),
+        super::commit_service::CallbackDisposition::Abort
+    );
     let registry = Arc::new(NodeExecutorRegistry::new());
     let executor = Arc::new(ScopedNodeExecutor::new("inline_model"));
     executor.install_resolver(Arc::new(PayloadScopedResolver {
@@ -8702,6 +9283,12 @@ async fn r1_475_wait_result_then_ready_or_paused_cancel_keeps_original_receipt()
             .unwrap()
             .unwrap();
         assert!(retirement.commit_cursor > receipt.commit_cursor);
+        assert_eq!(
+            commits
+                .binding_callback_disposition(&cancelled, "durable", &binding)
+                .unwrap(),
+            super::commit_service::CallbackDisposition::Commit
+        );
         drop(owner);
         let registry = Arc::new(NodeExecutorRegistry::new());
         registry.register(executor).unwrap();

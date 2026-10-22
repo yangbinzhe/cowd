@@ -146,112 +146,8 @@ pub(crate) fn delivered_result_refs(
         .collect()
 }
 
-/// Whether the accumulated evidence set contains a reference.
-///
-/// Runtime records a ref an Agent action changed as `agentic_changed:<ref>`, a
-/// provenance marker around the same underlying reference. A reviewer that
-/// cites the plain `message:<id>` is citing the same thing, and rejecting it
-/// taught the model nothing while keeping the Objective open.
-fn evidence_contains(evidence: &[String], reference: &str) -> bool {
-    evidence.iter().any(|candidate| {
-        candidate == reference
-            || candidate
-                .strip_prefix("agentic_changed:")
-                .is_some_and(|inner| inner == reference)
-    })
-}
-
-fn review_covers_current_goal(
-    goal: &GoalContract,
-    program: &AgenticProgramProjection,
-    review: &harness_contract::goal::ObjectiveReviewRecord,
-    result_refs: &[String],
-    evidence: &[String],
-    proof_inputs: Option<&crate::agentic::review_evidence::ProofInputSnapshot>,
-) -> bool {
-    review.spec_revision == goal.spec_revision
-        && review.input_manifest_digest == goal.spec_digest
-        && review.decision == "satisfied"
-        && review.verification.as_ref().is_some_and(|proof| {
-            if let Some(inputs) = &proof.input_set {
-                return inputs.version == 2
-                    && inputs.condition_ref.as_deref() == Some(review.criterion_ref.as_str())
-                    && proof.goal_spec_revision == Some(goal.spec_revision)
-                    && proof.goal_spec_digest.as_deref() == Some(goal.spec_digest.as_str())
-                    && proof_inputs.is_some_and(|snapshot| {
-                        snapshot.semantic_digest == inputs.semantic_digest
-                            && snapshot.reviewer_matches(program, review)
-                            && proof
-                                .result_source_revisions
-                                .iter()
-                                .all(|(stream, revision)| {
-                                    snapshot.sources.iter().any(|source| {
-                                        &source.stream_id == stream
-                                            && source.expected_revision == *revision
-                                    })
-                                })
-                    })
-                    && result_refs.iter().all(|reference| {
-                        crate::agentic::review_evidence::review_result_identity(program, reference)
-                            .is_ok_and(|identity| {
-                                inputs.result_refs.iter().any(|reference| {
-                                    crate::agentic::review_evidence::review_result_identity(
-                                        program, reference,
-                                    )
-                                    .is_ok_and(|current| current == identity)
-                                })
-                            })
-                    })
-                    && !proof.reviewer_execution_id.is_empty()
-                    && !proof.producer_execution_ids.is_empty()
-                    && proof.producer_execution_ids.iter().all(|producer| {
-                        !producer.is_empty()
-                            && (!proof.independence_required
-                                || producer != &proof.reviewer_execution_id)
-                    })
-                    && (!proof.independence_required
-                        || !review.producer_refs.contains(&review.reviewer_actor))
-                    && !inputs.material_events.is_empty()
-                    && result_refs.iter().all(|reference| {
-                        proof.reads.iter().any(|read| {
-                            crate::agentic::review_evidence::review_result_identity(
-                                program,
-                                &read.result_ref,
-                            )
-                            .is_ok_and(|identity| {
-                                crate::agentic::review_evidence::review_result_identity(
-                                    program, reference,
-                                )
-                                .is_ok_and(|expected| identity == expected)
-                            }) && !read.sha256.is_empty()
-                                && !read.receipt_refs.is_empty()
-                                && (read.result_kind
-                                    != harness_contract::goal::GoalResultKind::ToolEffect
-                                    || !read.effect_observation_refs.is_empty())
-                        })
-                    });
-            }
-            false
-        })
-        && !review.evidence_refs.is_empty()
-        && !review.producer_refs.is_empty()
-        && !review.result_refs.is_empty()
-        && !result_refs.is_empty()
-        && result_refs.iter().all(|reference| {
-            crate::agentic::review_evidence::review_result_identity(program, reference).is_ok_and(
-                |identity| {
-                    review.result_refs.iter().any(|reviewed| {
-                        crate::agentic::review_evidence::review_result_identity(program, reviewed)
-                            .is_ok_and(|expected| identity == expected)
-                    })
-                },
-            )
-        })
-        && review
-            .evidence_refs
-            .iter()
-            .all(|reference| evidence_contains(evidence, reference))
-}
+#[cfg(test)]
+use crate::agentic::review_evidence::evidence_contains;
 
 impl GoalStore {
     pub(crate) fn prepare_program_conclusion(
@@ -308,12 +204,6 @@ impl GoalStore {
         for review in &goal.reviews {
             evidence.extend(review.evidence_refs.iter().cloned());
         }
-        // The Goal's evidence is read as CONTENT. A logical artifact
-        // reference ("artifact:<24 hex>") is one artifact's business
-        // identity; the content it is bound to is what a reader can resolve.
-        // Keep BOTH identities, so a logical reference is never dressed as a
-        // content selector, and refuse a reference that names SEVERAL
-        // artifacts: two logical identities over one content are never merged.
         let mut evidence = evidence
             .iter()
             .map(|reference| {
@@ -334,6 +224,7 @@ impl GoalStore {
         apply_completion_criterion_state(&mut goal, &projection.progress, &evidence);
         let conditions = crate::agentic::review_evidence::required_review_conditions(&goal);
         let mut proof_inputs = std::collections::BTreeMap::new();
+        let mut assessments = std::collections::BTreeMap::new();
         let history = self
             .proof_session_queries
             .as_ref()
@@ -349,68 +240,60 @@ impl GoalStore {
             process_inputs: process_frame.as_ref(),
         };
         for condition in conditions {
-            let Some(review) = goal
-                .reviews
-                .iter()
-                .rev()
-                .find(|review| review.criterion_ref == condition)
-            else {
-                continue;
-            };
-            if review.decision != "satisfied"
-                || review.spec_revision != goal.spec_revision
-                || review.input_manifest_digest != goal.spec_digest
-            {
-                continue;
-            }
-            let Some(proof) = review.verification.as_ref().filter(|proof| {
-                proof
-                    .input_set
+            let assessment = (|| {
+                let review = goal
+                    .reviews
+                    .iter()
+                    .rev()
+                    .find(|review| review.criterion_ref == condition)
+                    .ok_or_else(|| "latest review missing".to_string())?;
+                let proof = review
+                    .verification
                     .as_ref()
-                    .is_some_and(|inputs| inputs.version == 2)
-            }) else {
-                continue;
-            };
-            match crate::agentic::review_evidence::validate_proof_inputs(
-                &self.event_store,
-                program,
-                Some(&goal),
-                proof,
-                readers,
-            ) {
-                Ok(snapshot) => {
-                    let mut results = review.result_refs.clone();
-                    if goal.user_intent_criterion_id.as_ref() == Some(&condition) {
-                        results.extend(delivered_result_refs(program, &goal, &request.result_refs));
-                    }
-                    for obligation in goal.obligations.iter().filter(|obligation| {
-                        obligation.required && obligation.obligation_id == condition
-                    }) {
-                        results.extend(obligation.artifact_refs.iter().cloned());
-                    }
-                    if review_covers_current_goal(
-                        &goal,
-                        program,
-                        review,
-                        &results,
-                        &evidence,
-                        Some(&snapshot),
-                    ) {
-                        proof_inputs.insert(
-                            crate::agentic::review_evidence::review_snapshot_key(proof),
-                            snapshot,
-                        );
-                    }
+                    .ok_or_else(|| "latest review proof missing".to_string())?;
+                let snapshot = crate::agentic::review_evidence::validate_proof_inputs(
+                    &self.event_store,
+                    program,
+                    Some(&goal),
+                    proof,
+                    readers,
+                )?;
+                let mut results = review.result_refs.clone();
+                if goal.user_intent_criterion_id.as_ref() == Some(&condition) {
+                    results.extend(delivered_result_refs(program, &goal, &request.result_refs));
                 }
-                Err(error) if error.contains("effect_review_pending") => return Err(error),
-                Err(_) => {}
+                for obligation in goal.obligations.iter().filter(|obligation| {
+                    obligation.required && obligation.obligation_id == condition
+                }) {
+                    results.extend(obligation.artifact_refs.iter().cloned());
+                }
+                crate::agentic::review_evidence::validate_review_coverage(
+                    &goal, program, review, &results, &evidence, &snapshot,
+                )
+                .map_err(|error| error.to_string())?;
+                proof_inputs.insert(condition.clone(), snapshot);
+                Ok::<(), String>(())
+            })();
+            if let Err(error) = &assessment {
+                if error.contains("effect_review_pending") {
+                    return Err(error.clone());
+                }
             }
+            assessments.insert(condition, assessment);
         }
 
         // A graph identity proves execution lineage, not semantic coverage of
         // the user's request. Consume the current, independently attributed
         // Objective review rather than manufacturing obligations from Tasks.
-        let mut gaps = Vec::new();
+        let mut gaps = assessments
+            .iter()
+            .filter_map(|(condition, outcome)| {
+                outcome
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("review_validation_failed:{condition}:{error}"))
+            })
+            .collect::<Vec<_>>();
         if let Some(participation) = goal.participation_requirement.as_ref() {
             let contributors = program
                 .tasks
@@ -442,46 +325,12 @@ impl GoalStore {
         // and the collaboration could never close (14 reviews, 0 verdicts).
         // The delivered result set is what accepted work produced; artifacts
         // committed by the Runtime-bound objective reviewer are excluded.
-        let delivered_result_refs = delivered_result_refs(program, &goal, &request.result_refs);
-        let reviewed = goal
-            .reviews
-            .iter()
-            .rev()
-            .find(|review| review.criterion_ref == intent)
-            .is_some_and(|review| {
-                review_covers_current_goal(
-                    &goal,
-                    program,
-                    review,
-                    &delivered_result_refs,
-                    &evidence,
-                    review.verification.as_ref().and_then(|proof| {
-                        proof_inputs
-                            .get(&crate::agentic::review_evidence::review_snapshot_key(proof))
-                    }),
-                )
-            });
+        let reviewed = assessments.get(&intent).is_some_and(Result::is_ok);
         for obligation in &goal.obligations {
             if obligation.required {
-                let current = goal
-                    .reviews
-                    .iter()
-                    .rev()
-                    .find(|review| review.criterion_ref == obligation.obligation_id)
-                    .is_some_and(|review| {
-                        review_covers_current_goal(
-                            &goal,
-                            program,
-                            review,
-                            &obligation.artifact_refs,
-                            &evidence,
-                            review.verification.as_ref().and_then(|proof| {
-                                proof_inputs.get(
-                                    &crate::agentic::review_evidence::review_snapshot_key(proof),
-                                )
-                            }),
-                        )
-                    });
+                let current = assessments
+                    .get(&obligation.obligation_id)
+                    .is_some_and(Result::is_ok);
                 if !current {
                     gaps.push(format!(
                         "obligation_review_required:{}",
@@ -560,27 +409,7 @@ impl GoalStore {
             .filter(|criterion| {
                 criterion.id != intent && criterion.status == AcceptanceStatus::Satisfied
             })
-            .filter(|criterion| {
-                !goal
-                    .reviews
-                    .iter()
-                    .rev()
-                    .find(|review| review.criterion_ref == criterion.id)
-                    .is_some_and(|review| {
-                        review_covers_current_goal(
-                            &goal,
-                            program,
-                            review,
-                            &review.result_refs,
-                            &evidence,
-                            review.verification.as_ref().and_then(|proof| {
-                                proof_inputs.get(
-                                    &crate::agentic::review_evidence::review_snapshot_key(proof),
-                                )
-                            }),
-                        )
-                    })
-            })
+            .filter(|criterion| !assessments.get(&criterion.id).is_some_and(Result::is_ok))
             .map(|criterion| criterion.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         for criterion in &mut goal.criteria {
@@ -1212,20 +1041,20 @@ mod tests {
 
     #[tokio::test]
     async fn historical_delegated_review_without_effect_sources_cannot_verify_goal() {
-        let (_, goals, actions, actor) = mechanical_fixture(true);
+        let (events, goals, actions, actor) = mechanical_fixture(true);
         let goal = goals.get("goal:root-completion").unwrap().unwrap();
         let program = actions.project(&actor.program_id).unwrap();
         let mut review = goal.reviews[0].clone();
         review.verification.as_mut().unwrap().producer_execution_ids =
             vec!["agent-run:historical".into()];
-        assert!(!review_covers_current_goal(
-            &goal,
+        assert!(crate::agentic::review_evidence::validate_proof_inputs(
+            &events,
             &program,
-            &review,
-            &review.result_refs,
-            &review.evidence_refs,
-            None
-        ));
+            Some(&goal),
+            review.verification.as_ref().unwrap(),
+            crate::agentic::review_evidence::ResultContentReaders::default(),
+        )
+        .is_err());
         crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
             |services, program, prepared, _| {
                 let goal = services

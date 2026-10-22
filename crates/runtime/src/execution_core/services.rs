@@ -780,6 +780,7 @@ pub struct RuntimeServices {
     cross_plane_connector_executor: Arc<ScopedNodeExecutor>,
     agent_task_executor: Arc<AgentTaskExecutor>,
     agent_runtime: Arc<AgentRuntime>,
+    agentic_actions: crate::AgentActionService,
     l4_promotion_service: Arc<crate::L4PromotionService>,
     knowledge_candidate_projector: Arc<crate::KnowledgeCandidateProjector>,
     outcome_service: Arc<crate::execution_core::OutcomeService>,
@@ -1307,12 +1308,21 @@ impl RuntimeServices {
                 defer_graph_producers,
             ));
         execution_supervisor.install_session_recovery_owner(Arc::clone(&event_store))?;
-        executor_registry.register(Arc::new(AgenticProgramWaitExecutor::new(
-            crate::AgentActionService::new(Arc::clone(&event_store))
-                .with_read_model(Arc::clone(&agentic_read_model))
+        let agentic_actions = crate::AgentActionService::new(Arc::clone(&event_store))
+            .with_graph_store(graph_state_store.clone())
+            .with_read_model(Arc::clone(&agentic_read_model))
+            .with_process_input_verifier(process_input_verifier.clone())
+            .with_artifact_store(Arc::clone(&artifact_store))
+            .with_session_query_slot(Arc::clone(&session_query_port));
+        let goal_store = Arc::new(
+            GoalStore::new(Arc::clone(&event_store))
                 .with_process_input_verifier(process_input_verifier.clone())
                 .with_artifact_store(Arc::clone(&artifact_store))
                 .with_session_query_slot(Arc::clone(&session_query_port)),
+        );
+        let objective_supervisor = Arc::new(ObjectiveSupervisor::new(Arc::clone(&goal_store)));
+        executor_registry.register(Arc::new(AgenticProgramWaitExecutor::new(
+            agentic_actions.clone(),
             graph_state_store.clone(),
             Arc::downgrade(&execution_supervisor),
         )))?;
@@ -1402,28 +1412,20 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
-            Arc::clone(&agentic_read_model),
+            agentic_actions.clone(),
             Arc::clone(&agent_runtime),
         )?);
         projection_lanes.push(agentic_program_wait_resolution_lane(
             Arc::clone(&event_store),
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
-            Arc::clone(&agentic_read_model),
-            Arc::clone(&artifact_store),
-            Arc::clone(&session_query_port),
+            agentic_actions.clone(),
+            Arc::clone(&objective_supervisor),
         )?);
         let event_reactor = Arc::new(
             crate::RuntimeEventReactor::sealed(Arc::clone(&event_store), projection_lanes)
                 .map_err(RuntimeServicesError::Invariant)?,
         );
-        let goal_store = Arc::new(
-            GoalStore::new(Arc::clone(&event_store))
-                .with_process_input_verifier(process_input_verifier.clone())
-                .with_artifact_store(Arc::clone(&artifact_store))
-                .with_session_query_slot(Arc::clone(&session_query_port)),
-        );
-        let objective_supervisor = Arc::new(ObjectiveSupervisor::new(Arc::clone(&goal_store)));
         let conflict_resolver = Arc::new(ConflictArbiter::new(
             Arc::clone(&mission_evidence),
             Arc::clone(&event_store),
@@ -1475,6 +1477,7 @@ impl RuntimeServices {
             cross_plane_connector_executor,
             agent_task_executor,
             agent_runtime,
+            agentic_actions,
             l4_promotion_service,
             knowledge_candidate_projector,
             outcome_service,
@@ -2285,16 +2288,7 @@ impl RuntimeServices {
     /// not receive direct event-store access.
     #[must_use]
     pub fn agent_action_service(&self) -> crate::AgentActionService {
-        crate::AgentActionService::new(Arc::clone(&self.event_store))
-            .with_process_input_verifier(
-                crate::agentic::review_evidence::ProcessInputVerifier::new(Arc::clone(
-                    &self.scope_locks,
-                )),
-            )
-            .with_graph_store(self.graph_state_store.clone())
-            .with_read_model(Arc::clone(&self.agentic_read_model))
-            .with_artifact_store(Arc::clone(&self.artifact_store))
-            .with_session_query_slot(Arc::clone(&self.session_query_port))
+        self.agentic_actions.clone()
     }
 
     /// Ask the sole ObjectiveSupervisor to reduce one durable Agentic
@@ -4635,9 +4629,8 @@ fn agentic_program_wait_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
-    read_model: Arc<crate::agentic::AgenticReadModel>,
-    artifacts: Arc<crate::ArtifactStore>,
-    session_queries: Arc<OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>>,
+    actions: crate::AgentActionService,
+    objective_supervisor: Arc<ObjectiveSupervisor>,
 ) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
         AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID,
@@ -4661,9 +4654,8 @@ fn agentic_program_wait_resolution_lane(
             let event_store = Arc::clone(&event_store);
             let graph_store = graph_store.clone();
             let supervisor = Arc::clone(&supervisor);
-            let read_model = Arc::clone(&read_model);
-            let artifacts = Arc::clone(&artifacts);
-            let session_queries = Arc::clone(&session_queries);
+            let actions = actions.clone();
+            let objective_supervisor = Arc::clone(&objective_supervisor);
             Box::pin(async move {
                 let checkpoint = event_store
                     .projection_checkpoint(AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID)
@@ -4714,16 +4706,6 @@ fn agentic_program_wait_resolution_lane(
                         }
                     }
                 }
-                let actions = crate::AgentActionService::new(Arc::clone(&event_store))
-                    .with_read_model(read_model)
-                    .with_artifact_store(Arc::clone(&artifacts))
-                    .with_session_query_slot(Arc::clone(&session_queries));
-                let objective_supervisor =
-                    crate::execution_core::goal::ObjectiveSupervisor::new(Arc::new(
-                        crate::execution_core::goal::GoalStore::new(Arc::clone(&event_store))
-                            .with_artifact_store(artifacts)
-                            .with_session_query_slot(session_queries),
-                    ));
                 let mut resolved = 0usize;
                 for program_id in &program_ids {
                     if actions.program_recovery_is_excluded(program_id)? {
@@ -4784,7 +4766,7 @@ fn agentic_settled_graph_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
-    read_model: Arc<crate::agentic::AgenticReadModel>,
+    actions: crate::AgentActionService,
     agent_runtime: Arc<AgentRuntime>,
 ) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
@@ -4800,7 +4782,7 @@ fn agentic_settled_graph_resolution_lane(
             let event_store = Arc::clone(&event_store);
             let graph_store = graph_store.clone();
             let supervisor = Arc::clone(&supervisor);
-            let read_model = Arc::clone(&read_model);
+            let actions = actions.clone();
             let agent_runtime = Arc::clone(&agent_runtime);
             Box::pin(async move {
                 let checkpoint = event_store
@@ -4844,8 +4826,6 @@ fn agentic_settled_graph_resolution_lane(
                 // A graph may settle before or after its Program root commits the
                 // durable wait. Reconcile both the transitioned graph and its
                 // linked Agent children so either event order closes the barrier.
-                let actions = crate::AgentActionService::new(Arc::clone(&event_store))
-                    .with_read_model(read_model);
                 let mut exit_errors = Vec::new();
                 for graph_id in &touched_graphs {
                     if let Err(error) = services.retry_agentic_run_exit(graph_id).await {

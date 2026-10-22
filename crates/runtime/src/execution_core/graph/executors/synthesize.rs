@@ -153,13 +153,6 @@ impl NodeExecutor for SynthesizeNodeExecutor {
         let outcome = match backend.synthesize(ticket).await {
             Ok(outcome) => outcome,
             Err(reason) if reason == "terminal_presentation_cancelled" => {
-                backend
-                    .after_abort(ticket, &reason)
-                    .await
-                    .map_err(|reason| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason,
-                    })?;
                 return Ok(NodeExecutionOutcome::new(
                     harness_contract::execution_graph::ExecutionNodeResult {
                         status: harness_contract::execution_graph::ExecutionNodeStatus::Cancelled,
@@ -312,6 +305,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::execution_core::graph::commit_service::CallbackDisposition;
 
     fn ticket() -> NodeExecutionTicket {
         NodeExecutionTicket {
@@ -333,6 +327,7 @@ mod tests {
         reason: &'static str,
         abort_fails: bool,
         aborts: std::sync::atomic::AtomicUsize,
+        commits: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -342,6 +337,11 @@ mod tests {
             _ticket: &NodeExecutionTicket,
         ) -> Result<NodeExecutionOutcome, String> {
             Err(self.reason.into())
+        }
+        async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), String> {
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("cancelled synthesis has no transcript to commit".into())
         }
         async fn after_abort(
             &self,
@@ -383,6 +383,7 @@ mod tests {
                 reason,
                 abort_fails,
                 aborts: std::sync::atomic::AtomicUsize::new(0),
+                commits: std::sync::atomic::AtomicUsize::new(0),
             });
             executor.install_resolver(Arc::new(RetirementCancellationResolver {
                 expected: expected.clone(),
@@ -395,7 +396,7 @@ mod tests {
                 Err(NodeExecutorError::Unavailable { .. })
             ));
             let result = executor.poll_or_await(&expected).await;
-            if reason == "terminal_presentation_cancelled" && !abort_fails {
+            if reason == "terminal_presentation_cancelled" {
                 let outcome = result.unwrap();
                 assert_eq!(outcome.result.status, ExecutionNodeStatus::Cancelled);
                 assert!(outcome.result.result_ref.is_none());
@@ -403,13 +404,55 @@ mod tests {
                 assert!(outcome.delivery_envelope.is_none());
                 assert!(outcome.domain_events.is_empty());
                 assert!(outcome.replan.is_none());
+                let unexpected_evidence = harness_contract::context::EvidenceAccessRef::unavailable(
+                    harness_contract::context::EvidenceRef::observed("test", "unexpected"),
+                    "text/plain",
+                    "test",
+                );
+                assert!(
+                    CallbackDisposition::from_result(
+                        &expected.node_id,
+                        &outcome.result,
+                    ) == CallbackDisposition::Abort
+                );
+                for mutation in [
+                    "kind",
+                    "evidence",
+                    "failure-evidence",
+                    "result",
+                    "retryable",
+                    "status",
+                ] {
+                    let mut result = outcome.result.clone();
+                    match mutation {
+                        "kind" => {
+                            result.failure.as_mut().unwrap().kind = "foreign_cancelled".into()
+                        }
+                        "evidence" => result.evidence_refs.push(unexpected_evidence.clone()),
+                        "failure-evidence" => result
+                            .failure
+                            .as_mut()
+                            .unwrap()
+                            .evidence_refs
+                            .push(unexpected_evidence.clone()),
+                        "result" => result.result_ref = Some("transcript:unexpected".into()),
+                        "retryable" => result.failure.as_mut().unwrap().retryable = true,
+                        "status" => result.status = ExecutionNodeStatus::Completed,
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        CallbackDisposition::from_result(
+                            &expected.node_id,
+                            &result,
+                        ) == CallbackDisposition::Commit,
+                        "{mutation}"
+                    );
+                }
             } else {
                 assert!(matches!(result, Err(NodeExecutorError::Poll { .. })));
             }
-            assert_eq!(
-                backend.aborts.load(std::sync::atomic::Ordering::SeqCst),
-                usize::from(reason == "terminal_presentation_cancelled")
-            );
+            assert_eq!(backend.aborts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(backend.commits.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 
@@ -418,97 +461,125 @@ mod tests {
         use harness_contract::execution_graph::{
             ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage, ExecutionNodeKind,
         };
-        let services = crate::RuntimeServices::in_memory().unwrap();
-        let mut graph = ExecutionGraph::new("Original synthesis cancellation receipt");
-        graph.lineage = Some(ExecutionGraphLineage {
-            session_id: "retirement-session".into(),
-            turn_id: "retirement-turn".into(),
-            root_task_id: "retirement-task".into(),
-            task_id: "retirement-task".into(),
-            generation: 1,
-        });
-        let node = ExecutionNodeSpec::new(
-            ExecutionNodeKind::Synthesize,
-            "synthesize",
-            "retirement-cancel",
-        );
-        let expected = NodeExecutionTicket {
-            graph_id: graph.id.clone(),
-            node_id: node.id.clone(),
-            executor_kind: "synthesize".into(),
-            service_class: graph.service_class,
-            attempt: 1,
-            idempotency_key: node.idempotency_key.clone(),
-            payload_ref: node.payload_ref.clone(),
-        };
-        graph.nodes.push(node);
-        let backend = Arc::new(RetirementCancellationBackend {
-            reason: "terminal_presentation_cancelled",
-            abort_fails: false,
-            aborts: std::sync::atomic::AtomicUsize::new(0),
-        });
-        services
-            .synthesize_executor()
-            .install_resolver(Arc::new(RetirementCancellationResolver {
-                expected: expected.clone(),
-                backend,
-            }));
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            services.execution_supervisor().submit_and_wait_terminal(
-                graph,
-                ExecutionGraphCommand::Start {
-                    expected_revision: 0,
+        for abort_fails in [false, true] {
+            let services = crate::RuntimeServices::in_memory().unwrap();
+            let mut graph = ExecutionGraph::new("Original synthesis cancellation receipt");
+            graph.lineage = Some(ExecutionGraphLineage {
+                session_id: "retirement-session".into(),
+                turn_id: "retirement-turn".into(),
+                root_task_id: "retirement-task".into(),
+                task_id: "retirement-task".into(),
+                generation: 1,
+            });
+            let node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::Synthesize,
+                "synthesize",
+                "retirement-cancel",
+            );
+            let expected = NodeExecutionTicket {
+                graph_id: graph.id.clone(),
+                node_id: node.id.clone(),
+                executor_kind: "synthesize".into(),
+                service_class: graph.service_class,
+                attempt: 1,
+                idempotency_key: node.idempotency_key.clone(),
+                payload_ref: node.payload_ref.clone(),
+            };
+            graph.nodes.push(node);
+            let backend = Arc::new(RetirementCancellationBackend {
+                reason: "terminal_presentation_cancelled",
+                abort_fails,
+                aborts: std::sync::atomic::AtomicUsize::new(0),
+                commits: std::sync::atomic::AtomicUsize::new(0),
+            });
+            services.synthesize_executor().install_resolver(Arc::new(
+                RetirementCancellationResolver {
+                    expected: expected.clone(),
+                    backend: backend.clone(),
                 },
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let graph = services
-            .graph_state_store()
-            .load(&expected.graph_id)
-            .unwrap();
-        assert_eq!(
-            graph.node_statuses[&expected.node_id],
-            ExecutionNodeStatus::Cancelled
-        );
-        assert!(graph.terminal_presentation.is_none());
-        let events = services
-            .event_store()
-            .list_stream(
-                &crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(&expected),
+            ));
+            let completed = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                services.execution_supervisor().submit_and_wait_terminal(
+                    graph,
+                    ExecutionGraphCommand::Start {
+                        expected_revision: 0,
+                    },
+                ),
             )
+            .await
             .unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind, "execution.effect.intent");
-        assert_eq!(events[1].kind, "execution.effect.receipt");
-        let graph_events = services
-            .event_store()
-            .list_stream(&expected.graph_id)
-            .unwrap();
-        let node_events = services
-            .event_store()
-            .list_stream(&format!("{}:node:{}", expected.graph_id, expected.node_id))
-            .unwrap();
-        let mut cancelled = node_events.iter().filter(|event| {
-            event.kind == "execution_node.transitioned" && event.payload["to"] == "cancelled"
-        });
-        let transition = cancelled.next().unwrap();
-        assert!(cancelled.next().is_none());
-        assert_eq!(events[1].transaction_id, transition.transaction_id);
-        assert_eq!(events[1].commit_cursor, transition.commit_cursor);
-        assert!(graph_events.iter().any(|event| {
-            event.transaction_id == transition.transaction_id
-                && event.commit_cursor == transition.commit_cursor
-        }));
-        assert_eq!(events[1].payload["result"]["status"], "cancelled");
-        assert!(
-            matches!(services.commit_service().inspect_execution_effect(&expected).unwrap(),
+            if abort_fails {
+                assert!(completed
+                    .unwrap_err()
+                    .to_string()
+                    .contains("abort not settled"));
+            } else {
+                completed.unwrap();
+            }
+            assert_eq!(backend.commits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(backend.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let graph = services
+                .graph_state_store()
+                .load(&expected.graph_id)
+                .unwrap();
+            assert_eq!(
+                graph.node_statuses[&expected.node_id],
+                ExecutionNodeStatus::Cancelled
+            );
+            assert!(graph.terminal_presentation.is_none());
+            let starts = services
+                .graph_state_store()
+                .binding_starts_page(&graph.id, 0, graph.revision)
+                .unwrap()
+                .1;
+            assert_eq!(starts.len(), 1);
+            let (node_id, binding, position) = &starts[0];
+            assert_eq!(
+                services
+                    .graph_state_store()
+                    .binding_lease_closure(&graph, node_id, binding, *position)
+                    .unwrap(),
+                !abort_fails
+            );
+            let events = services
+                .event_store()
+                .list_stream(
+                    &crate::execution_core::graph::ExecutionNodeBinding::effect_stream_id(
+                        &expected,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].kind, "execution.effect.intent");
+            assert_eq!(events[1].kind, "execution.effect.receipt");
+            let graph_events = services
+                .event_store()
+                .list_stream(&expected.graph_id)
+                .unwrap();
+            let node_events = services
+                .event_store()
+                .list_stream(&format!("{}:node:{}", expected.graph_id, expected.node_id))
+                .unwrap();
+            let mut cancelled = node_events.iter().filter(|event| {
+                event.kind == "execution_node.transitioned" && event.payload["to"] == "cancelled"
+            });
+            let transition = cancelled.next().unwrap();
+            assert!(cancelled.next().is_none());
+            assert_eq!(events[1].transaction_id, transition.transaction_id);
+            assert_eq!(events[1].commit_cursor, transition.commit_cursor);
+            assert!(graph_events.iter().any(|event| {
+                event.transaction_id == transition.transaction_id
+                    && event.commit_cursor == transition.commit_cursor
+            }));
+            assert_eq!(events[1].payload["result"]["status"], "cancelled");
+            assert!(
+                matches!(services.commit_service().inspect_execution_effect(&expected).unwrap(),
             crate::execution_core::graph::ExecutionEffectState::Completed(outcome)
                 if outcome.result.status == ExecutionNodeStatus::Cancelled)
-        );
-        services.shutdown_maintenance().await;
+            );
+            services.shutdown_maintenance().await;
+        }
     }
 
     #[async_trait::async_trait]

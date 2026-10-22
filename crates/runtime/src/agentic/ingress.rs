@@ -222,29 +222,9 @@ impl RuntimeServices {
         let mut unresolvable: Vec<String> = Vec::new();
         for evidence_ref in evidence_refs {
             let artifact = if let Some(evidence_id) = evidence_ref.strip_prefix("tool://") {
-                // A model cites the action-id shape it was handed
-                // (`tool-raw-<call_id>:<attempt>`); durable evidence ids never
-                // carry a colon. The attempt index cannot select different
-                // content - the call id alone names the one recorded receipt -
-                // so resolve that shape instead of refusing it. One live run
-                // lost its whole review Task to exactly this shape mismatch.
-                let mut resolved = self
+                let resolved = self
                     .session_evidence_access(&actor.session_id, evidence_id)
                     .await;
-                if matches!(resolved, Ok(None)) {
-                    let attempt_stripped = evidence_id
-                        .rsplit_once(':')
-                        .filter(|(_, suffix)| {
-                            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
-                        })
-                        .map(|(stem, _)| stem.to_string());
-                    if let Some(stem) = attempt_stripped {
-                        let stripped = self.session_evidence_access(&actor.session_id, &stem).await;
-                        if stripped.is_ok() {
-                            resolved = stripped;
-                        }
-                    }
-                }
                 let access = match resolved {
                     Ok(Some(access)) => access,
                     Ok(None) => {
@@ -905,7 +885,7 @@ pub(crate) fn objective_completion_waiting_gap(
 /// A satisfied ObjectiveReview is the single semantic proof consumed by the
 /// completion gate. Require it to cover the full result set of the active
 /// completion request; otherwise the Program would durably accept a partial
-/// verdict that can never satisfy `review_covers_current_goal`.
+/// verdict that can never satisfy `validate_review_coverage`.
 fn validate_current_objective_review_scope(
     program: &crate::AgenticProgramProjection,
     review_result_refs: &[String],
@@ -1341,10 +1321,6 @@ mod tests {
             "the refusal must name the canonical receipt: {error}"
         );
         assert!(error.contains("copy that exact reference"), "{error}");
-        // The action-id shape a tool result hands the model
-        // (`tool-raw-<call_id>:<attempt>`) names the same durable receipt: the
-        // attempt index cannot select different content, so it must resolve
-        // instead of costing the model its review Task.
         let attempt_form = AgentAction::TaskSubmit(TaskSubmitInput {
             task_ref: "task:1".to_string(),
             deliverable: None,
@@ -1352,20 +1328,16 @@ mod tests {
             evidence_refs: vec![format!("tool://tool-raw-chatcmpl-tool-aa0d514a557763e5:8")],
             unresolved: vec![],
         });
-        // The test's Runtime and the evidence facade use separate artifact
-        // stores, so a resolved shape fails later at content resolution. That
-        // is the proof we need: the refusal is no longer "no canonical durable
-        // receipt" - the action-id shape resolved to the recorded receipt.
         let attempt_error = services
             .validate_agent_action_evidence(&actor, &attempt_form)
             .await
-            .expect_err("the test stores are separate, so content resolution fails");
+            .expect_err("an invented attempt suffix must not alias another receipt");
         assert!(
-            !attempt_error.contains("no canonical durable receipt"),
-            "the action-id shape must resolve to the durable receipt: {attempt_error}"
+            attempt_error.contains("no canonical durable receipt"),
+            "{attempt_error}"
         );
         assert!(
-            attempt_error.contains("points to missing durable content"),
+            !attempt_error.contains("points to missing durable content"),
             "{attempt_error}"
         );
     }

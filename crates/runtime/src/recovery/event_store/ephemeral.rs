@@ -171,6 +171,33 @@ mod bounded_read_contract_tests {
     use super::*;
 
     #[test]
+    fn fixture_evidence_try_lock_and_bytes_reject_before_clone() {
+        let backend = Arc::new(EphemeralRuntimeEventStore::new());
+        let store = RuntimeEventStore::from_backend(backend.clone());
+        store.append(RuntimeEventInput {
+            stream_id:"agent:bounded".into(), scope:RuntimeEventScope::Agent,
+            kind:"agent.local_exit".into(), status:None, actor:None, refs:vec![],
+            payload:serde_json::json!({"body":"x".repeat(1024 * 1024)}),
+        }).unwrap();
+        let request = FixtureEvidencePageRequest {
+            stream_id:"agent:bounded", after_sequence:0, through_sequence:u64::MAX,
+            max_events:100, max_bytes:1024 * 1024,
+            deadline:Instant::now() + Duration::from_secs(5),
+        };
+        let guard = backend.state.lock().unwrap();
+        assert!(matches!(store.fixture_evidence_page(&request), Err("Unavailable: event store lock busy or poisoned")));
+        drop(guard);
+        let page = store.fixture_evidence_page(&request).unwrap();
+        assert!(page.records.is_empty());
+        assert_eq!(page.encoded_bytes, 0);
+        assert_eq!(page.next_sequence, 0);
+        assert_eq!(page.head, 1);
+        assert_eq!(page.stop, Some("bytes"));
+        let expired = FixtureEvidencePageRequest { deadline:Instant::now(), ..request };
+        assert!(store.fixture_evidence_page(&expired).is_err());
+    }
+
+    #[test]
     fn r1_bounded_history_ephemeral_sequence_and_recent_zero_budget_do_not_hydrate() {
         let backend = Arc::new(EphemeralRuntimeEventStore::new());
         let store = RuntimeEventStore::from_backend(backend.clone());
@@ -597,6 +624,51 @@ fn terminal_record(input: &SessionTerminalInput, cursor: u64) -> RuntimeSessionO
 }
 
 impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_evidence_page(
+        &self,
+        request: &FixtureEvidencePageRequest<'_>,
+    ) -> Result<FixtureEvidencePage, &'static str> {
+        if Instant::now() >= request.deadline {
+            return Err("Unavailable: deadline exhausted before lock");
+        }
+        let state = self.state.try_lock().map_err(|_| "Unavailable: event store lock busy or poisoned")?;
+        let positions = state.stream_positions.get(request.stream_id);
+        let head = positions.and_then(|positions| positions.last_key_value()).map_or(0, |(sequence, _)| *sequence);
+        let mut page = FixtureEvidencePage {
+            head, next_sequence: request.after_sequence, encoded_bytes: 0,
+            records: Vec::new(), stop: None,
+        };
+        let through = request.through_sequence.min(head);
+        if through <= request.after_sequence {
+            return Ok(page);
+        }
+        if let Some(positions) = positions {
+            for (sequence, position) in positions.range((
+                std::ops::Bound::Excluded(request.after_sequence),
+                std::ops::Bound::Included(through),
+            )) {
+                if Instant::now() >= request.deadline {
+                    page.stop = Some("deadline");
+                    break;
+                }
+                if page.records.len() >= request.max_events.min(100) {
+                    page.stop = Some("events");
+                    break;
+                }
+                let bytes = state.encoded_bytes[*position];
+                if bytes > request.max_bytes.min(1024 * 1024).saturating_sub(page.encoded_bytes) {
+                    page.stop = Some("bytes");
+                    break;
+                }
+                page.encoded_bytes += bytes;
+                page.records.push(state.events[*position].clone());
+                page.next_sequence = *sequence;
+            }
+        }
+        Ok(page)
+    }
+
     fn bounded_event_by_idempotency_key(
         &self,
         stream: &str,

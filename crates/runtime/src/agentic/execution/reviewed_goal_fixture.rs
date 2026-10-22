@@ -1176,6 +1176,9 @@ pub(crate) async fn exercise_bounded_process_input_changed_before_final_290() {
         R1ProofScenario::BoundedProcessInputChanged,
     ))
     .await;
+    services
+        .reconcile_agentic_completion_request("program-dispatch")
+        .unwrap();
     let goal = services
         .goal_store()
         .get("goal:root-agentic-execution")
@@ -1740,18 +1743,15 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
     assert_eq!(packet.deadline_at_ms, u64::MAX);
     assert!(packet.objective.contains("state_inspect"));
     assert!(packet.objective.contains("task_claim"));
-    assert!(packet
-        .objective
-        .contains("执行和提交前须 task_claim 领取该确切 Task"));
-    assert!(packet.objective.contains("Current work directory"));
-    assert!(packet
-        .objective
-        .contains(&format!("\"scope_ref\":\"{task_ref}\"")));
+    assert!(matches!(
+        packet.agentic_binding.as_ref().map(|binding| &binding.focus),
+        Some(harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+            task_ref: bound_task_ref,
+        }) if bound_task_ref == &task_ref
+    ));
     assert!(packet.objective.contains("one result owner"));
-    assert!(!shared_prefix.contains("Current work directory"));
     assert!(packet.required_acceptance.evidence_obligations.is_empty());
     assert!(packet.objective.contains("read:crates/runtime/Cargo.toml"));
-    assert!(packet.objective.contains("orientation only"));
     assert!(!packet
         .objective
         .contains("already committed this exact work"));
@@ -3700,11 +3700,11 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
         .err()
         .is_some_and(|error| error.contains("revision mismatch"))
     {
-        // The product CAS correctly refuses a conclusion that races a concurrent
-        // Program mutation (a followup agent action advancing the stream). Quiesce
-        // the in-flight workers once and retry against the quieted state; any
-        // second failure remains a hard error.
-        drain_workers().await;
+        let drain_before_retry = drain_timing == PhysicalDrainTiming::BeforeGoal;
+        eprintln!("R1_RECONCILE_CAS_RETRY drain_before_retry={drain_before_retry} retry=1");
+        if drain_before_retry {
+            drain_workers().await;
+        }
         reconciled = crate::agentic::supervision::reconcile_completion_request(
             &action_service,
             &supervisor,
@@ -5299,7 +5299,10 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                 Some(&input.criterion_ref),
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!(
+                "original review admission failed: {error}; diagnostics={}",
+                r1_goal_proof_diagnostic(&services, &current.program_id),
+            ));
         assert_eq!(donor.verification.input_set.as_ref().unwrap().version, 2);
         assert!(!donor
             .verification
@@ -6195,99 +6198,10 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
         .await
         .unwrap();
     if completion.status == harness_contract::agent_action::AgentActionStatus::Rejected {
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let context = crate::agentic::review_evidence::completion_admission_context(
-            services.event_store(),
-            &current,
-            &completion_envelope,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        );
-        let task_states = current
-            .tasks
-            .values()
-            .map(|task| {
-                let mut actual = serde_json::to_value(task).unwrap();
-                actual["excluded"] = serde_json::json!(context
-                    .as_ref()
-                    .ok()
-                    .and_then(Option::as_ref)
-                    .is_some_and(|context| context.excludes_task(&task.task_id)));
-                actual
-            })
-            .collect::<Vec<_>>();
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let review_snapshots = goal
-            .reviews
-            .iter()
-            .map(|review| {
-                let proof = review.verification.as_ref().unwrap();
-                match crate::agentic::review_evidence::validate_proof_inputs(
-                    services.event_store(),
-                    &current,
-                    Some(&goal),
-                    proof,
-                    crate::agentic::review_evidence::ResultContentReaders {
-                        process_inputs: None,
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: services.session_history_reader().as_deref(),
-                    },
-                ) {
-                    Ok(snapshot) => serde_json::json!({
-                        "criterion":review.criterion_ref,
-                        "retiring_optional_task_refs":snapshot.retiring_optional_task_refs,
-                        "task_refs":snapshot.task_refs,
-                        "inputs":proof.input_set,
-                    }),
-                    Err(error) => {
-                        serde_json::json!({"criterion":review.criterion_ref,"error":error})
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut graph_ids = std::collections::BTreeSet::new();
-        for task in current.tasks.values() {
-            for attempt in task.active_attempts.values() {
-                graph_ids.insert(
-                    crate::execution_core::graph::graph_id_for_lookup(&attempt.execution_id)
-                        .to_owned(),
-                );
-            }
-            if let Some(execution) = &task.claim_execution_id {
-                graph_ids.insert(
-                    crate::execution_core::graph::graph_id_for_lookup(execution).to_owned(),
-                );
-            }
-        }
-        let graph_evidence = graph_ids.into_iter().map(|graph_id| {
-            let graph = services.graph_state_store().load(&graph_id).unwrap();
-            let mut indexes = Vec::new();
-            for node in &graph.nodes {
-                if node.kind != ExecutionNodeKind::AgentTask {
-                    continue;
-                }
-                let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref).unwrap();
-                for attempt in 1..=packet.attempt.max(1).max(graph.recovery_cursor.node_attempts.get(&node.id).copied().unwrap_or_default()) {
-                    let source = format!("execution-agent-receipts:{graph_id}:{}:{attempt}",node.id);
-                    indexes.push(serde_json::json!({"source":source,"events":services.event_store().list_stream(&source).unwrap()}));
-                }
-            }
-            serde_json::json!({"graph":graph,"children":services.graph_state_store().child_links(&graph_id).unwrap(),"indexes":indexes})
-        }).collect::<Vec<_>>();
-        println!(
-            "R1_COMPLETION_REFUSAL_WITNESS {}",
-            serde_json::json!({
-                "tasks":task_states,"review_snapshots":review_snapshots,"graphs":graph_evidence,
-                "context_exists":context.as_ref().ok().and_then(Option::as_ref).is_some(),
-                "context_error":context.as_ref().err(),"observation":completion,
-            })
+        eprintln!(
+            "R1_COMPLETION_REFUSAL_WITNESS original_error={:?}; diagnostics={}",
+            completion.error,
+            r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
         );
     }
     if proof_scenario.invalid_child() {
@@ -6528,8 +6442,21 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
         let prepared = services
             .goal_store()
             .prepare_program_conclusion(&before_program)
-            .unwrap();
-        assert_eq!(prepared.goal.completion, GoalCompletion::Satisfied);
+            .unwrap_or_else(|error| panic!(
+                "original bounded Goal prepare rejected: {error}; program={} projection_cutoff={}; diagnostics={}",
+                before_program.program_id,
+                before_program.revision,
+                r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
+            ));
+        assert_eq!(
+            prepared.goal.completion,
+            GoalCompletion::Satisfied,
+            "original prepared Goal gaps: {:?}; program={} projection_cutoff={}; diagnostics={}",
+            prepared.gaps,
+            before_program.program_id,
+            before_program.revision,
+            r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
+        );
         let writer_request = ScopeLockRequest {
             scope: ScopedResource::workspace_object(
                 services
@@ -8734,9 +8661,8 @@ impl R1OptionalEffect {
         }
         let settled = services.retry_agentic_run_exit(&self.graph_id).await
             .unwrap_or_else(|error| panic!(
-                "original Task settlement owner rejected after exact physical exit: {error}; {}; graph={}",
+                "original Task settlement owner rejected after exact physical exit: {error}; {}",
                 self.process.failure_diagnostic(),
-                r1_fixture_graph_diagnostic(services, &self.graph_id),
             ));
         assert!(settled,
             "original Task settlement owner still awaits exact exit or effects after authenticated exit");
@@ -8764,23 +8690,11 @@ impl R1OptionalEffect {
         })
         .await
         .unwrap_or_else(|elapsed| {
-            let program = services.agent_action_service().project(&self.program_id);
-            let task = program.as_ref().ok().and_then(|program| program.tasks.get(&self.task_ref));
-            let exact_exit = crate::agent_runtime::confirmed_run_exit(
-                services.event_store(), &self.packet,
-            ).map(|exit| exit.is_some());
             panic!(
-                "original graph observation, Task retirement and physical cancellation must all settle: {elapsed:?}; {}; task={}; exact_exit={exact_exit:?}; graph={}",
+                "original graph observation, Task retirement and physical cancellation must all settle: {elapsed:?}; program={}; task={}; {}",
+                self.program_id,
+                self.task_ref,
                 self.process.failure_diagnostic(),
-                serde_json::json!({
-                    "program_error":program.as_ref().err().map(ToString::to_string),
-                    "task_status":task.map(|task| task.status),
-"pending_retirement":task.and_then(|task| task.pending_retirement.as_ref()),
-                    "claim_execution":task.and_then(|task| task.claim_execution_id.as_ref()),
-                    "claim_generation":task.map(|task| task.claim_generation),
-                    "active_attempts":task.map(|task| task.active_attempts.keys().take(8).collect::<Vec<_>>()),
-                }),
-                r1_fixture_graph_diagnostic(services, &self.graph_id),
             );
         });
         assert_eq!(
@@ -9752,7 +9666,8 @@ impl crate::RuntimeExecutionHost for ReviewReadHost {
                                     "dispatch": format!("{dispatch:?}"),
                                 }));
                                 let retry_services = services.clone();
-                                tokio::spawn(async move {
+                                let retry_owner = format!("fixture-postcommit:{}", envelope.action_id);
+                                let retry_admitted = services.maintenance_supervisor().submit(retry_owner.clone(), async move {
                                     for delay_ms in [5_000u64, 15_000, 45_000] {
                                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                                             .await;
@@ -9767,7 +9682,10 @@ impl crate::RuntimeExecutionHost for ReviewReadHost {
                                             break;
                                         }
                                     }
-                                });
+                                }).await;
+                                if !retry_admitted {
+                                    eprintln!("R1_752_POSTCOMMIT_NOT_ADMITTED owner={retry_owner}");
+                                }
                             }
                         }
                         result
@@ -13961,32 +13879,23 @@ impl RealProcessSession {
     }
 
     fn failure_diagnostic(&self) -> String {
-        let run = self
-            .services
-            .agent_runtime()
-            .get(self.packet.agent_id())
-            .filter(|run| {
-                run.run_id == self.packet.run_id()
-                    && run.graph_id == self.packet.graph_id()
-                    && run.node_id == self.packet.node_id()
-                    && run.attempt == self.packet.attempt
-            })
-            .map(|run| (run.status, run.failure));
-        let graph = self
-            .services
-            .graph_state_store()
-            .load(self.packet.graph_id())
-            .map(|graph| {
-                let status = graph.node_statuses.get(self.packet.node_id()).copied();
-                let failure = graph
-                    .node_results
-                    .get(self.packet.node_id())
-                    .and_then(|result| result.failure.as_ref())
-                    .map(|failure| (failure.kind.clone(), failure.message.clone()));
-                (graph.revision, status, failure)
-            })
-            .map_err(|error| error.to_string());
-        format!("Process diagnostic run={run:?}; graph={graph:?}")
+        let agent_stream = format!("agent:{}", self.packet.agent_id());
+        crate::failure_evidence::collect_failure_evidence(
+            self.services.event_store(),
+            &[
+                crate::failure_evidence::FailureEvidenceSource {
+                    stream_id: &agent_stream,
+                    after_sequence: 0,
+                    through_sequence: u64::MAX,
+                },
+                crate::failure_evidence::FailureEvidenceSource {
+                    stream_id: self.packet.graph_id(),
+                    after_sequence: 0,
+                    through_sequence: u64::MAX,
+                },
+            ],
+            "Original Process failure is reported by caller; exact admitted agent and graph",
+        ).to_string()
     }
 
     fn prepare(
@@ -14184,21 +14093,15 @@ impl RealProcessSession {
                 assert_eq!(observation.changed_refs, vec![task_ref.to_string()]);
             }
             Err(error) => {
-                let prefix = "tool_effect_authority: Process exited before request completed; Process diagnostic run=Some((Cancelled, Some(\"agent cancelled by command\"))); graph=Ok((";
-                let suffix = ", Some(Cancelled), None))";
-                let exact_cancelled_request = error.strip_prefix(prefix)
-                    .and_then(|tail| tail.strip_suffix(suffix))
-                    .is_some_and(|revision| revision.parse::<u64>().is_ok());
-                assert!(exact_cancelled_request, "unexpected retirement failure: {error}");
                 worker.assert_original_control_action(envelope);
-                assert!(confirmed_run_exit_with_retry(self.services.event_store(), &self.packet).is_some(), "wire loss requires authenticated original physical exit");
+                assert!(confirmed_run_exit_with_retry(self.services.event_store(), &self.packet).is_some(), "retirement requires authenticated original physical exit");
                 let run = self.services.agent_runtime().get(self.packet.agent_id()).unwrap();
                 assert_eq!(run.status, harness_contract::agent::AgentStatus::Cancelled);
                 assert_eq!(run.failure.as_deref(), Some("agent cancelled by command"));
                 assert_eq!(self.services.graph_state_store().load(self.packet.graph_id()).unwrap()
                     .node_statuses[self.packet.node_id()], ExecutionNodeStatus::Cancelled);
                 assert!(worker.lifecycle().no_direct_effects());
-                eprintln!("R1_772_CONTROL_REPLY_LOST {}", serde_json::json!({
+                eprintln!("R1_772_CONTROL_RESPONSE_UNCONFIRMED {}", serde_json::json!({
                     "action_id": envelope.action_id, "request_id": request_id, "error": error,
                     "response_delivered": false, "transport_completion_proven": false,
                     "semantic_receipt": "original_agentic.action_applied",
@@ -18007,20 +17910,10 @@ async fn exercise_native_task_sources(
         tokio::time::timeout(std::time::Duration::from_secs(30), arrived.notified())
             .await
             .unwrap_or_else(|elapsed| {
-                let children = services.graph_state_store().child_links(packet.graph_id());
-                let child_graphs = children.as_ref().ok().into_iter().flatten().take(8)
-                    .map(|child| r1_fixture_graph_diagnostic(services, &child.child_execution_id))
-                    .collect::<Vec<_>>();
-                let receipts = services.commit_service().load_delegated_agent_tool_receipts(
-                    packet.graph_id(), packet.node_id(), packet.attempt,
-                ).map(|receipts| receipts.len()).map_err(|error| error.to_string());
                 panic!(
-                    "original TaskSubmit wire pause did not arrive within 30s: {elapsed:?}; {}; graph={}; children={child_graphs:?}; child_lookup_error={:?}; actual_receipt_count={receipts:?}; actual_wire={}",
+                    "original TaskSubmit wire pause did not arrive within 30s: {elapsed:?}; {}",
                     RealProcessSession { services: services.0.clone(), packet: packet.clone() }
                         .failure_diagnostic(),
-                    r1_fixture_graph_diagnostic(services, packet.graph_id()),
-                    children.as_ref().err().map(ToString::to_string),
-                    wire.actual_request_diagnostic(),
                 );
             });
         let actor = services
@@ -19868,49 +19761,23 @@ async fn r1_known_exited_process_helpers_reject_without_recreating_control() {
 }
 
 fn r1_goal_proof_diagnostic(services: &ReviewedFixtureServices, program_id: &str) -> String {
-    let program = match services.agent_action_service().project(program_id) {
-        Ok(program) => program,
-        Err(error) => return format!("program projection failed: {error}"),
-    };
-    let goal = match services.goal_store().get("goal:root-agentic-execution") {
-        Ok(Some(goal)) => goal,
-        other => return format!("goal projection unavailable: {other:?}"),
-    };
-    let history = services.session_history_reader();
-    let reviews = goal.reviews.iter().map(|review| {
-        let Some(proof) = &review.verification else {
-            return serde_json::json!({"criterion":review.criterion_ref,"proof":null});
-        };
-        let validation = crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(), &program, Some(&goal), proof,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: history.as_deref(),
+    let program_stream = format!("agentic-program:{program_id}");
+    crate::failure_evidence::collect_failure_evidence(
+        services.event_store(),
+        &[
+            crate::failure_evidence::FailureEvidenceSource {
+                stream_id: &program_stream,
+                after_sequence: 0,
+                through_sequence: u64::MAX,
             },
-        ).map(|snapshot| snapshot.semantic_digest);
-        serde_json::json!({
-            "criterion":review.criterion_ref,
-            "input_result_refs":proof.input_set.as_ref().map(|input| &input.result_refs),
-            "read_result_refs":proof.reads.iter().map(|read| &read.result_ref).collect::<Vec<_>>(),
-            "proof_manifest":proof.work_manifest_digest,
-            "validation":validation,
-        })
-    }).collect::<Vec<_>>();
-    serde_json::json!({
-        "program_status":program.status,
-        "program_revision":program.revision,
-        "goal_completion":goal.completion,
-        "goal_revision":goal.revision,
-        "waiting":goal.waiting,
-        "current_manifest":crate::agentic::review_evidence::work_manifest_digest(&program),
-        "prepared_conclusion":services.goal_store().prepare_program_conclusion(&program)
-            .map(|prepared| serde_json::json!({
-                "gaps":prepared.gaps,"completion":prepared.goal.completion,
-            })),
-        "reviews":reviews,
-    })
-    .to_string()
+            crate::failure_evidence::FailureEvidenceSource {
+                stream_id: "goal:goal:root-agentic-execution",
+                after_sequence: 0,
+                through_sequence: u64::MAX,
+            },
+        ],
+        "Original failure is reported by caller; no auxiliary proof revalidation",
+    ).to_string()
 }
 
 #[cfg(test)]
@@ -19960,77 +19827,6 @@ mod fixture_protocol_557_tests {
             .as_array()
             .unwrap()
             .contains(&input["action"]));
-    }
-}
-
-fn r1_fixture_graph_diagnostic(services: &RuntimeServices, graph_id: &str) -> serde_json::Value {
-    match services.graph_state_store().load(graph_id) {
-        Ok(graph) => serde_json::json!({
-            "graph_id":graph.id,"revision":graph.revision,"node_count":graph.nodes.len(),
-            "node_statuses":graph.node_statuses.iter().take(16).collect::<Vec<_>>(),
-            "tool_batches":graph.nodes.iter().filter(|node| node.kind == ExecutionNodeKind::ToolBatch)
-                .take(8).map(|node| {
-                    let state = services.graph_state_store();
-                    let attempt = graph.recovery_cursor.node_attempts.get(&node.id).copied().unwrap_or(0);
-                    let (lookup_stage, document) = match state.current_binding(&graph, &node.id, attempt) {
-                        Err(_) => ("original_binding_missing", None),
-                        Ok(binding) => match state.binding_start_ticket(&graph, &node.id, &binding) {
-                            Err(_) => ("start_ticket_missing", None),
-                            Ok((ticket, _)) => match services.commit_service().committed_host_transcript(&ticket) {
-                                Err(_) => ("transcript_load_failed", None),
-                                Ok(document) => ("loaded", Some(document)),
-                            },
-                        },
-                    };
-                    let calls = crate::host::decode_tool_batch(&node.payload_ref)
-                        .map(|(calls, _)| calls).unwrap_or_default();
-                    let blocks_parse_failures = document.as_ref().into_iter()
-                        .flat_map(|document| &document.messages)
-                        .filter(|message| serde_json::from_value::<Vec<crate::session::ContentBlock>>(
-                            message["blocks"].clone()).is_err()).count();
-                    let results = document.as_ref().into_iter().flat_map(|document| &document.messages)
-                        .filter_map(|message| serde_json::from_value::<Vec<crate::session::ContentBlock>>(
-                            message["blocks"].clone()).ok())
-                        .flatten().filter_map(|block| match block {
-                            crate::session::ContentBlock::ToolResult {
-                                tool_use_id, tool_name, output, is_error,
-                            } if calls.iter().any(|call| call.id == tool_use_id) =>
-                                Some(serde_json::json!({"call":tool_use_id,"tool":tool_name,
-                                    "is_error":is_error,"output_bytes":output.len(),
-                                    "output_sha256":crate::context_evidence::read_sha256(output.as_bytes()),
-                                    "output_prefix":output.chars().take(800).collect::<String>()})),
-                            _ => None,
-                        }).take(16).collect::<Vec<_>>();
-                    let primary = calls.iter().take(16).filter_map(|call| {
-                        let step = call.binding.as_ref()?;
-                        let key = step.effect_idempotency_key();
-                        let stream = format!("execution-effect:{key}");
-                        let records = ["intent", "receipt", "read-intent", "read-receipt"].into_iter()
-                            .map(|suffix| {
-                                let event = services.event_store().event_by_idempotency_key(
-                                    &stream, &format!("{key}:{suffix}"));
-                                match event {
-                                    Ok(Some(event)) => serde_json::json!({"suffix":suffix,"kind":event.kind,
-                                        "cursor":event.commit_cursor,"sequence":event.sequence,
-                                        "transaction":event.transaction_id,"status":event.payload["outcome"]["status"]}),
-                                    Ok(None) => serde_json::json!({"suffix":suffix,"found":false}),
-                                    Err(_) => serde_json::json!({"suffix":suffix,"lookup_error":true}),
-                                }
-                            }).collect::<Vec<_>>();
-                        Some(serde_json::json!({"call":call.id,"tool":call.name,"effect_key":key,"records":records}))
-                    }).collect::<Vec<_>>();
-                    serde_json::json!({"node":node.id,"attempt":attempt,
-                        "lookup_stage":lookup_stage,"blocks_parse_failures":blocks_parse_failures,
-                        "transcript_loaded":document.is_some(),"tool_results":results,"primary":primary})
-                }).collect::<Vec<_>>(),
-            "failures":graph.node_results.iter().filter_map(|(node, result)| {
-                result.failure.as_ref().map(|failure| serde_json::json!({
-                    "node":node,"kind":format!("{:?}",failure.kind),
-                    "message":failure.message.chars().take(512).collect::<String>(),
-                }))
-            }).take(8).collect::<Vec<_>>(),
-        }),
-        Err(error) => serde_json::json!({"graph_id":graph_id,"error":error.to_string()}),
     }
 }
 

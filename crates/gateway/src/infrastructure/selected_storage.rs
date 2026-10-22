@@ -46,6 +46,7 @@ pub(crate) struct SelectedStorageTopology {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct TestPostgresNamespace {
+    preserve_failure: std::sync::atomic::AtomicBool,
     executor: PostgresExecutor,
     name: String,
     _permit: TestPostgresFixturePermit,
@@ -124,6 +125,9 @@ fn test_postgres_fixture_capacity() -> &'static (std::sync::Mutex<usize>, std::s
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for TestPostgresNamespace {
     fn drop(&mut self) {
+        if self.preserve_failure.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         // `name` is generated below and validated by `scoped_namespace`; it is
         // never caller-controlled. Cleanup is deliberately limited to this
         // fixture-owned schema and can therefore not touch public/user data.
@@ -141,6 +145,13 @@ impl Drop for TestPostgresNamespace {
 }
 
 impl SelectedStorageTopology {
+    #[cfg(test)]
+    pub(crate) fn preserve_failed_test_namespace(&self) -> Option<&str> {
+        let namespace = self.test_namespace.as_ref()?;
+        namespace.preserve_failure.store(true, std::sync::atomic::Ordering::Release);
+        Some(&namespace.name)
+    }
+
     pub(crate) fn artifact_maintenance_guard(&self) -> ArtifactMaintenanceGuard {
         ArtifactMaintenanceGuard {
             #[cfg(any(test, feature = "test-support"))]
@@ -224,6 +235,7 @@ impl SelectedStorageTopology {
             .map_err(stringify)?;
         let scoped = executor.scoped_namespace(&name).map_err(stringify)?;
         let guard = Arc::new(TestPostgresNamespace {
+            preserve_failure: std::sync::atomic::AtomicBool::new(false),
             executor,
             name,
             _permit: permit,

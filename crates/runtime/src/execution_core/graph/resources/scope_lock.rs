@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -737,6 +737,7 @@ fn try_process_locks(
         return Ok(Some(Vec::new()));
     };
     let mut targets = HashMap::<String, ScopeLockMode>::new();
+    let mut memberships = BTreeMap::<String, (bool, bool)>::new();
     for request in requests {
         match &request.scope {
             ScopedResource::Workspace { workspace_id } => {
@@ -748,11 +749,7 @@ fn try_process_locks(
                     request.mode,
                 );
                 if request.mode == ScopeLockMode::Read {
-                    merge_process_target(
-                        &mut targets,
-                        format!("workspace-writers:{workspace_id}"),
-                        ScopeLockMode::Write,
-                    );
+                    memberships.entry(workspace_id.clone()).or_default().0 = true;
                 }
             }
             ScopedResource::WorkspaceObject { identity } => {
@@ -762,11 +759,7 @@ fn try_process_locks(
                     ScopeLockMode::Read,
                 );
                 if request.mode == ScopeLockMode::Write {
-                    merge_process_target(
-                        &mut targets,
-                        format!("workspace-writers:{}", identity.workspace_id),
-                        ScopeLockMode::Read,
-                    );
+                    memberships.entry(identity.workspace_id.clone()).or_default().1 = true;
                 }
                 // The process-shared tier uses a conservative repository
                 // zone. It preserves parent/descendant exclusion without
@@ -800,30 +793,65 @@ fn try_process_locks(
     let mut targets = targets.into_iter().collect::<Vec<_>>();
     targets.sort_by(|left, right| left.0.cmp(&right.0));
     let mut locks = Vec::with_capacity(targets.len());
-    for (key, mode) in targets {
-        let path = lock_root.join(format!("{:016x}.lock", stable_key_hash(&key)));
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|source| scope_io(&path, source))?;
-        let acquired = match mode {
-            ScopeLockMode::Read => FileExt::try_lock_shared(&file),
-            ScopeLockMode::Write => FileExt::try_lock_exclusive(&file),
+    for (workspace_id, (reader, writer)) in memberships {
+        let Some(_transition) = try_process_lock(
+            lock_root,
+            &format!("workspace-transition:{workspace_id}"),
+            ScopeLockMode::Write,
+        )? else {
+            return Ok(None);
         };
-        match acquired {
-            Ok(()) => locks.push(file),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                for lock in locks.iter().rev() {
-                    let _ = FileExt::unlock(lock);
-                }
-                return Ok(None);
+        let reader_key = format!("workspace-readers:{workspace_id}");
+        let writer_key = format!("workspace-object-writers:{workspace_id}");
+        let mut probes = Vec::new();
+        for (needed, key) in [(writer, &reader_key), (reader, &writer_key)] {
+            if needed {
+                let Some(probe) = try_process_lock(lock_root, key, ScopeLockMode::Write)? else {
+                    return Ok(None);
+                };
+                probes.push(probe);
             }
-            Err(source) => return Err(scope_io(&path, source)),
+        }
+        drop(probes);
+        for (needed, key) in [(reader, &reader_key), (writer, &writer_key)] {
+            if needed {
+                let Some(membership) = try_process_lock(lock_root, key, ScopeLockMode::Read)? else {
+                    return Ok(None);
+                };
+                locks.push(membership);
+            }
         }
     }
+    for (key, mode) in targets {
+        let Some(file) = try_process_lock(lock_root, &key, mode)? else {
+            return Ok(None);
+        };
+        locks.push(file);
+    }
     Ok(Some(locks))
+}
+
+fn try_process_lock(
+    lock_root: &Path,
+    key: &str,
+    mode: ScopeLockMode,
+) -> Result<Option<File>, ScopeLockError> {
+    let path = lock_root.join(format!("{:016x}.lock", stable_key_hash(key)));
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| scope_io(&path, source))?;
+    let acquired = match mode {
+        ScopeLockMode::Read => FileExt::try_lock_shared(&file),
+        ScopeLockMode::Write => FileExt::try_lock_exclusive(&file),
+    };
+    match acquired {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(source) => Err(scope_io(&path, source)),
+    }
 }
 
 fn merge_process_target(
@@ -1343,6 +1371,229 @@ mod tests {
             Err(ScopeLockError::TimedOut { .. })
         ));
     }
+
+    #[test]
+    fn persistent_workspace_readers_share_and_exclude_object_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ScopeLockManager::persistent(temp.path()).unwrap();
+        let second = ScopeLockManager::persistent(temp.path()).unwrap();
+        let read = request(ScopedResource::workspace("workspace").unwrap(), ScopeLockMode::Read);
+        let write = request(workspace_object("src/lib.rs"), ScopeLockMode::Write);
+        let first_read = first.try_acquire([read.clone()]).unwrap().unwrap();
+        let same_manager_read = first.try_acquire([read.clone()]).unwrap().unwrap();
+        let second_read = second.try_acquire([read.clone()]).unwrap().unwrap();
+        assert!(second.try_acquire([write.clone()]).unwrap().is_none());
+        assert!(second.try_acquire([request(
+            ScopedResource::workspace("workspace").unwrap(), ScopeLockMode::Write,
+        )]).unwrap().is_none());
+        drop(first_read);
+        drop(same_manager_read);
+        assert!(first.try_acquire([write.clone()]).unwrap().is_none());
+        drop(second_read);
+        let writer = second.try_acquire([write]).unwrap().unwrap();
+        assert!(first.try_acquire([read.clone()]).unwrap().is_none());
+        let other_writer = first.try_acquire([request(
+            workspace_object("tests/e2e.rs"), ScopeLockMode::Write,
+        )]).unwrap().unwrap();
+        drop(writer);
+        assert!(second.try_acquire([read.clone()]).unwrap().is_none());
+        drop(other_writer);
+        assert!(second.try_acquire([read]).unwrap().is_some());
+    }
+
+    #[test]
+    fn persistent_scope_groups_release_after_real_child_exit() {
+        use std::io::{BufRead, Write};
+        use std::process::{Child, Command, Stdio};
+        use std::sync::mpsc;
+        use std::thread::JoinHandle;
+
+        const ROLE: &str = "COWD_SCOPE_GATE_ROLE";
+        const ROOT: &str = "COWD_SCOPE_GATE_ROOT";
+        const CASE: &str = "COWD_SCOPE_GATE_CASE";
+
+        struct HeldChild {
+            child: Child,
+            reader: Option<JoinHandle<()>>,
+            reaped: bool,
+        }
+
+        impl HeldChild {
+            fn kill_and_wait(&mut self) {
+                assert!(self.child.try_wait().unwrap().is_none());
+                self.child.kill().unwrap();
+                let status = self.child.wait().unwrap();
+                self.reaped = true;
+                assert!(!status.success());
+                self.reader.take().unwrap().join().unwrap();
+            }
+        }
+
+        impl Drop for HeldChild {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    let _ = self.child.kill();
+                    self.reaped = self.child.wait().is_ok();
+                }
+                if self.reaped {
+                    if let Some(reader) = self.reader.take() {
+                        let _ = reader.join();
+                    }
+                }
+            }
+        }
+
+        let read = request(
+            ScopedResource::workspace("workspace").unwrap(),
+            ScopeLockMode::Read,
+        );
+        let write = request(workspace_object("src/lib.rs"), ScopeLockMode::Write);
+        if let Some(role) = std::env::var_os(ROLE) {
+            let root = std::env::var_os(ROOT).expect("child lock root");
+            let case = std::env::var(CASE).expect("child case identity");
+            let manager = ScopeLockManager::persistent(PathBuf::from(root)).unwrap();
+            let selected = match role.to_str().expect("child role encoding") {
+                "reader" => read,
+                "writer" => write,
+                other => panic!("unexpected child role: {other}"),
+            };
+            let _held = manager.try_acquire([selected]).unwrap().unwrap();
+            {
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "\nREADY {case} {}", role.to_str().unwrap()).unwrap();
+                stdout.flush().unwrap();
+            }
+            loop {
+                std::thread::park();
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let case = Uuid::new_v4().to_string();
+        let manager = ScopeLockManager::persistent(directory.path()).unwrap();
+        let module = module_path!().split_once("::").unwrap().1;
+        let selector = format!(
+            "{module}::persistent_scope_groups_release_after_real_child_exit"
+        );
+        for role in ["reader", "writer"] {
+            let mut held = HeldChild {
+                child: Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(&selector)
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(ROLE, role)
+                    .env(ROOT, directory.path())
+                    .env(CASE, &case)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap(),
+                reader: None,
+                reaped: false,
+            };
+            let stdout = held.child.stdout.take().unwrap();
+            let expected = format!("READY {case} {role}");
+            let (sender, receiver) = mpsc::channel();
+            held.reader = Some(std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(line) if line == expected => {
+                            let _ = sender.send(());
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            }));
+            receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| panic!("{role} child did not hold its lock: {error}"));
+            assert!(held.child.try_wait().unwrap().is_none());
+
+            if role == "reader" {
+                let compatible = manager.try_acquire([read.clone()]).unwrap().unwrap();
+                assert!(manager.try_acquire([write.clone()]).unwrap().is_none());
+                drop(compatible);
+                assert!(manager.try_acquire([write.clone()]).unwrap().is_none());
+                held.kill_and_wait();
+                let recovered = manager.try_acquire([write.clone()]).unwrap().unwrap();
+                drop(recovered);
+            } else {
+                let compatible = manager
+                    .try_acquire([request(
+                        workspace_object("tests/e2e.rs"),
+                        ScopeLockMode::Write,
+                    )])
+                    .unwrap()
+                    .unwrap();
+                assert!(manager.try_acquire([read.clone()]).unwrap().is_none());
+                drop(compatible);
+                assert!(manager.try_acquire([read.clone()]).unwrap().is_none());
+                held.kill_and_wait();
+                let recovered = manager.try_acquire([read.clone()]).unwrap().unwrap();
+                drop(recovered);
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_mixed_membership_is_atomic_and_released_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ScopeLockManager::persistent(temp.path()).unwrap();
+        let second = ScopeLockManager::persistent(temp.path()).unwrap();
+        let read = request(ScopedResource::workspace("workspace").unwrap(), ScopeLockMode::Read);
+        let write = request(workspace_object("src/lib.rs"), ScopeLockMode::Write);
+        let mixed = first.try_acquire([read.clone(), write.clone()]).unwrap().unwrap();
+        assert!(second.try_acquire([read.clone()]).unwrap().is_none());
+        assert!(second.try_acquire([request(
+            workspace_object("tests/e2e.rs"), ScopeLockMode::Write,
+        )]).unwrap().is_none());
+        drop(mixed);
+        let object_reader = second.try_acquire([request(
+            workspace_object("src/lib.rs"), ScopeLockMode::Read,
+        )]).unwrap().unwrap();
+        assert!(first.try_acquire([read.clone(), write.clone()]).unwrap().is_none());
+        let root_reader = second.try_acquire([read.clone()]).unwrap().unwrap();
+        drop(root_reader);
+        drop(object_reader);
+        assert!(second.try_acquire([read, write]).unwrap().is_some());
+    }
+
+    #[test]
+    fn persistent_membership_failure_releases_prior_workspaces_and_global_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ScopeLockManager::persistent(temp.path()).unwrap();
+        let second = ScopeLockManager::persistent(temp.path()).unwrap();
+        let workspace_read = request(
+            ScopedResource::workspace("workspace").unwrap(), ScopeLockMode::Read,
+        );
+        let held = second.try_acquire([request(
+            workspace_object("src/lib.rs"), ScopeLockMode::Write,
+        )]).unwrap().unwrap();
+        assert!(first.try_acquire([
+            request(ScopedResource::workspace("ahead").unwrap(), ScopeLockMode::Read),
+            workspace_read.clone(),
+        ]).unwrap().is_none());
+        assert!(second.try_acquire([request(
+            ScopedResource::workspace("ahead").unwrap(), ScopeLockMode::Write,
+        )]).unwrap().is_some());
+        drop(held);
+        let exclusive = second.try_acquire([request(
+            ScopedResource::workspace("workspace").unwrap(), ScopeLockMode::Write,
+        )]).unwrap().unwrap();
+        assert!(first.try_acquire([workspace_read.clone()]).unwrap().is_none());
+        drop(exclusive);
+        let recovered_writer = first.try_acquire([request(
+            workspace_object("src/lib.rs"), ScopeLockMode::Write,
+        )]).unwrap().unwrap();
+        assert!(second.try_acquire([workspace_read.clone()]).unwrap().is_none());
+        drop(recovered_writer);
+        assert!(second.try_acquire([workspace_read]).unwrap().is_some());
+    }
+
     #[test]
     fn try_acquire_normalizes_conflicts_and_releases_at_scope_exit() {
         let manager = ScopeLockManager::new();

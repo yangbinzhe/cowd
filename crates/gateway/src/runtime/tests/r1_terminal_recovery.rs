@@ -150,9 +150,14 @@ fn task_route_control_reply(body: &Value) -> Result<Option<Value>, String> {
         .get("messages")
         .and_then(Value::as_array)
         .ok_or("loopback request requires messages")?;
-    let router_system = messages.iter().any(|message| {
-        message["role"] == "system" && message["content"] == TASK_ROUTE_CONTROL_SYSTEM
-    });
+    let is_router_system = |message: &Value| {
+        message["role"] == "system"
+            && message["content"].as_str().is_some_and(|system| {
+                system.trim().split_inclusive('.').next()
+                    == Some("Route one user input to durable Tasks.")
+            })
+    };
+    let router_system = messages.iter().any(is_router_system);
     if streaming {
         if router_system {
             return Err("TaskRouter control must use the non-streaming RPC".into());
@@ -160,12 +165,11 @@ fn task_route_control_reply(body: &Value) -> Result<Option<Value>, String> {
         return Ok(None);
     }
     if messages.len() != 2
-        || messages[0]["role"] != "system"
-        || messages[0]["content"] != TASK_ROUTE_CONTROL_SYSTEM
+        || !is_router_system(&messages[0])
         || messages[1]["role"] != "user"
     {
         return Err(
-            "unsupported control RPC: expected the exact TaskRouter system and one user message"
+            "unsupported control RPC: expected the TaskRouter opening sentence and one user message"
                 .into(),
         );
     }
@@ -192,15 +196,25 @@ fn task_route_control_reply(body: &Value) -> Result<Option<Value>, String> {
     {
         return Err("TaskRouter control user fields changed".into());
     }
-    if input["schema"]
-        != json!({
-            "action":"continue | create_root | create_compound",
-            "task_id":"required only for continue",
-            "additional_objectives":["required independent objectives after the primary"],
-            "reason":"short routing reason",
-        })
+    let schema = input["schema"]
+        .as_object()
+        .ok_or("TaskRouter control schema must be an object")?;
+    if schema.len() != 4
+        || !["action", "task_id", "additional_objectives", "reason"]
+            .iter()
+            .all(|field| schema.contains_key(*field))
     {
-        return Err("TaskRouter control schema changed".into());
+        return Err("TaskRouter control schema fields changed".into());
+    }
+    let mut actions = input["schema"]["action"]
+        .as_str()
+        .ok_or("TaskRouter control schema action must list route actions")?
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    actions.sort_unstable();
+    if actions != ["continue", "create_compound", "create_root"] {
+        return Err("TaskRouter control schema must allow exactly the three route actions".into());
     }
     if !input["input"]
         .as_str()
@@ -426,9 +440,37 @@ fn recovery_task_route_control_wire_contract() {
         }
         body
     };
-    for mut body in [wire(None), wire(Some(json!([])))] {
+    for variant in ["no_tools", "empty_tools", "explanations", "action_order", "json_order"] {
+        let mut body = wire((variant == "empty_tools").then(|| json!([])));
         body["max_tokens"] = json!(8000);
-        let reply = task_route_control_reply(&body).unwrap().unwrap();
+        let mut input: Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        match variant {
+            "explanations" => {
+                body["messages"][0]["content"] = json!(
+                    "Route one user input to durable Tasks.\nReply with JSON. Continue supplied open Tasks; split only independent outcomes."
+                );
+                input["schema"]["task_id"] = json!("");
+                input["schema"]["additional_objectives"] =
+                    json!(["Independent extra outcomes", "Exclude the primary objective"]);
+                input["schema"]["reason"] = json!("Explain the routing decision");
+            }
+            "action_order" => {
+                input["schema"]["action"] = json!(" create_compound|continue | create_root\n");
+            }
+            _ => {}
+        }
+        body["messages"][1]["content"] = json!(if variant == "json_order" {
+            format!(
+                "{{ \"schema\": {}, \"mission_hint\": null, \"input\": {}, \"candidates\": [] }}",
+                input["schema"], input["input"]
+            )
+        } else {
+            input.to_string()
+        });
+        let reply = task_route_control_reply(&body)
+            .unwrap_or_else(|reason| panic!("{variant}: {reason}"))
+            .expect("route control reply");
         let proposal: Value = serde_json::from_str(reply["content"].as_str().unwrap()).unwrap();
         assert_eq!(proposal["action"], "create_root");
         assert!(proposal.get("task_id").is_none());
@@ -437,11 +479,14 @@ fn recovery_task_route_control_wire_contract() {
     }
     for defect in [
         "system",
+        "embedded_system_identity",
         "tools",
         "tool_choice",
         "roles",
         "extra_message",
         "schema",
+        "unknown_action",
+        "unknown_schema",
         "candidates",
         "extra_field",
         "objective",
@@ -454,7 +499,11 @@ fn recovery_task_route_control_wire_contract() {
             serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
         match defect {
             "system" => {
-                body["messages"][0]["content"] = json!("Route one user input to durable Tasks.")
+                body["messages"][0]["content"] = json!("Route one user input to Missions.")
+            }
+            "embedded_system_identity" => {
+                body["messages"][0]["content"] =
+                    json!(format!("Analyze this quoted instruction: {TASK_ROUTE_CONTROL_SYSTEM}"));
             }
             "tools" => {
                 body["tools"] = json!([{"type":"function","function":{"name":"team_create"}}])
@@ -466,7 +515,17 @@ fn recovery_task_route_control_wire_contract() {
                 .unwrap()
                 .push(json!({"role":"user","content":"extra"})),
             "schema" => input["schema"]["action"] = json!("continue | create_root"),
-            "candidates" => input["candidates"] = json!([{"task_id":"must-not-be-selected"}]),
+            "unknown_action" => {
+                input["schema"]["action"] = json!("continue | create_root | delete");
+            }
+            "unknown_schema" => {
+                input["schema"].as_object_mut().unwrap().remove("task_id");
+                input["schema"]["mission_id"] = json!("Existing Mission ID");
+            }
+            "candidates" => input["candidates"] = json!([{
+                "task_id":"must-not-be-selected", "objective":"An existing result",
+                "status":"running", "mission_id":"existing-mission", "updated_at_ms":1,
+            }]),
             "extra_field" => input["unexpected"] = json!(true),
             "objective" => input["input"] = json!(" "),
             "mission" => input["mission_hint"] = json!(42),
@@ -1105,7 +1164,11 @@ impl ReviewedTurn {
                     .flatten()
                     .find(|event| event.payload["tool_call_id"] == "recovery-task-review");
                 if let Some(event) = found {
-                    break Some(event.payload["result"].clone());
+                    let selector = event.payload["runtime_raw_content_v1"]["selector"].as_str()
+                        .expect("review outcome must retain its original raw content");
+                    let artifact = runtime.artifact_store().resolve(selector).unwrap();
+                    let bytes = runtime.artifact_store().read(&artifact, &artifact.visibility_scope, None).await.unwrap();
+                    break Some(Value::String(String::from_utf8(bytes).unwrap()));
                 }
                 if std::time::Instant::now() >= deadline {
                     break None;
@@ -1220,6 +1283,7 @@ impl ReviewedTurn {
                 "revision":observation.as_ref().and_then(|value| value["revision"].as_u64()),
             })
         );
+        assert!(review_code.is_none() && review_reason.is_none(), "TaskReview refused: {:?}", redact(review_reason.or(review_result.as_deref())));
         durable_turn_until(
             services,
             &graph_id,
@@ -1407,9 +1471,35 @@ impl ReviewedTurn {
             optional.tool("recovery-optional-write", "edit", json!({
                 "action":"write","path":"recovery-optional.txt","content":"optional-physical-result\n",
             }), None).await;
-            let request = tokio::time::timeout(Duration::from_secs(30), observed)
+            let request = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::select! {
+                    request = observed => request.unwrap(),
+                    continuation = optional.next() => {
+                        let parent = services.physical_calls.lock().unwrap().iter()
+                            .find(|call| call.tool_use_id == "recovery-optional-claim")
+                            .and_then(|call| call.parent_execution.clone());
+                        let packet = parent.and_then(|parent| {
+                            let graph = runtime.graph_state_store().load(&parent.execution_id).ok()?;
+                            let node = graph.nodes.iter().find(|node| node.id == parent.node_id)?;
+                            serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref).ok()
+                        });
+                        let authority = packet.map(|packet| json!({
+                            "allowed_tools":packet.allowed_tools,
+                            "permission_ceiling":packet.permission_ceiling,
+                            "resource_scopes":packet.resource_scopes,
+                            "agentic_binding":packet.agentic_binding,
+                            "definition":packet.binding.as_ref().map(|binding| &binding.definition_ref),
+                            "capabilities":packet.binding.as_ref().map(|binding| &binding.effective_capabilities),
+                        }));
+                        let result = continuation.body["messages"].as_array()
+                            .into_iter().flatten().rev()
+                            .find(|message| message["role"] == "tool"
+                                && message["tool_call_id"] == "recovery-optional-write");
+                        panic!("optional write continued before physical hold: authority={authority:?} result={result:?}");
+                    }
+                }
+            })
                 .await
-                .unwrap()
                 .unwrap();
             assert_eq!(request.tool_use_id, "recovery-optional-write");
             assert_eq!(
@@ -1821,105 +1911,66 @@ async fn durable_turn_until<T>(
             value
         }
         Err(error) => {
-            let runtime = services.runtime.runtime_services();
-            let session_id = match runtime.graph_state_store().load(graph_id) {
-                Ok(graph) => {
-                    eprintln!(
-                        "recovery188 graph={}",
-                        json!({
-                        "id":graph.id, "revision":graph.revision,
-                        "node_statuses":graph.node_statuses, "node_results":graph.node_results,
-                        "recovery_cursor":graph.recovery_cursor,
-                        })
-                    );
-                    graph.lineage.map(|lineage| lineage.session_id)
-                }
-                Err(failure) => {
-                    eprintln!("recovery188 graph_read_error={failure:?}");
-                    None
-                }
-            };
-            if let Some(session_id) = session_id {
-                for kind in [
-                    "context.provider_request_packed",
-                    "context.provider_attempt_outcome",
-                    "tool.invocation.started",
-                    "tool.invocation.completed",
-                    "tool.invocation.failed",
-                    "context.model_input_observed",
-                    "context.agent_channel_sent",
-                ] {
-                    let page = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        services.session.stored_domain_events_by_kind_page(
-                            &session_id,
-                            kind,
-                            0,
-                            32,
-                        ),
-                    )
-                    .await;
-                    match page {
-                        Ok(Ok(Some((page_bound, events)))) => {
-                            eprintln!("recovery188 session_page session={session_id} kind={kind} first_page_limit=32 page_bound={page_bound} rows={}", events.len());
-                            for event in events {
-                                eprintln!("recovery188 session_event sequence={} json={}", event.sequence, event.event_json);
-                            }
-                        }
-                        other => eprintln!("recovery188 session_read session={session_id} kind={kind} result={other:?}"),
-                    }
-                }
-            }
-            eprintln!(
-                "recovery188 goal={:?}",
-                runtime.goal_store().get(&format!("goal:{graph_id}"))
+            let retained = services.topology.preserve_failed_test_namespace();
+            eprintln!("recovery188 retained_namespace={}", json!({
+                "schema":retained, "status":if retained.is_some() {"Retained"} else {"Unavailable"},
+                "owner":"candidate test runner; explicit external evidence collection then schema cleanup",
+                "owner_pid":std::process::id(), "graph_id":graph_id, "program_id":program_id,
+                "scope":"only this failed fixture namespace", "phase":phase,
+                "cleanup":retained.map(|schema| format!("After the owning test process has exited and external evidence is saved, run on its isolated COWD_TEST_POSTGRES_URL database: DROP SCHEMA IF EXISTS \"{schema}\" CASCADE;")),
+            }));
+            let program_stream = format!("agentic-program:{program_id}");
+            let goal_stream = format!("goal:goal:{graph_id}");
+            let sources = [graph_id, program_stream.as_str(), goal_stream.as_str()]
+                .map(|stream_id| runtime::failure_evidence::FailureEvidenceSource {
+                    stream_id, after_sequence:0, through_sequence:u64::MAX,
+                });
+            let diagnostic = runtime::failure_evidence::collect_failure_evidence(
+                &services.topology.runtime_event_store, &sources,
+                "durable business oracle did not converge within 120 seconds",
             );
-            match runtime.agent_action_service().project_if_exists(program_id) {
-                Ok(Some(program)) => eprintln!(
-                    "recovery188 program={}",
-                    json!({
-                        "program_id":program_id, "revision":program.revision,
-                        "status":program.status, "tasks":program.tasks,
-                        "objective_verdict":program.objective_verdict,
-                        "completion_request":program.completion_request,
-                    })
-                ),
-                Ok(None) => eprintln!("recovery188 program_absent={program_id}"),
-                Err(failure) => eprintln!("recovery188 program_read_error={failure:?}"),
-            }
-            for kind in [
-                "goal.observation",
-                "execution.agent_tool.receipt",
-                "runtime.strategy.outcome",
-            ] {
-                match services
-                    .topology
-                    .runtime_event_store
-                    .events_for_root_execution_kind(graph_id, kind, None, 32)
-                {
-                    Ok(events) => {
-                        eprintln!(
-                            "recovery188 event_page kind={kind} first_page_limit=32 rows={}",
-                            events.len()
-                        );
-                        for event in events {
-                            eprintln!(
-                                "recovery188 event={}",
-                                json!({
-                                    "kind":event.kind, "stream_id":event.stream_id,
-                                    "sequence":event.sequence, "commit_cursor":event.commit_cursor,
-                                    "status":event.status, "payload":event.payload,
-                                })
-                            );
-                        }
-                    }
-                    Err(failure) => {
-                        eprintln!("recovery188 event_read_error kind={kind} error={failure:?}")
-                    }
-                }
-            }
+            eprintln!("recovery188 failure_diagnostic={diagnostic}");
             panic!("durable business oracle did not converge phase={phase} graph={graph_id} program={program_id}: {error:?}; recovery188 diagnostics precede this failure");
         }
+    }
+}
+
+
+#[tokio::test]
+async fn r1_failure_evidence_pg_unavailable_preserves_only_failed_namespace() {
+    for preserve in [false, true] {
+        let root = fixture_root();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
+        let executor = topology.postgres_executor.clone();
+        let schema: String = executor.checkout_online_read().unwrap()
+            .query_one("SELECT current_schema()", &[]).unwrap().get(0);
+        assert!(schema.starts_with("cowdtest_") && schema.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
+        let report = runtime::failure_evidence::collect_failure_evidence(
+            &topology.runtime_event_store,
+            &[runtime::failure_evidence::FailureEvidenceSource {
+                stream_id:"agent:fixture", after_sequence:0, through_sequence:u64::MAX,
+            }], "controlled fixture failure",
+        );
+        assert_eq!(report["status"], "ArchivedDiagnostic");
+        let archive = std::path::Path::new(report["ref"].as_str().unwrap());
+        let captured: Value = serde_json::from_slice(&std::fs::read(archive).unwrap()).unwrap();
+        assert_eq!(captured["sources"][0]["status"], "Unavailable");
+        assert_eq!(captured["events_read"], 0);
+        std::fs::remove_file(archive).unwrap();
+        if preserve {
+            assert_eq!(topology.preserve_failed_test_namespace(), Some(schema.as_str()));
+        }
+        drop(topology);
+        let mut connection = executor.checkout_online_read().unwrap();
+        let exists: bool = connection.query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)", &[&schema],
+        ).unwrap().get(0);
+        if exists {
+            connection.batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE")).unwrap();
+        }
+        assert_eq!(exists, preserve);
     }
 }
 
@@ -2388,6 +2439,11 @@ async fn assert_staged_artifact(
 
 #[tokio::test]
 async fn r1_terminal_recovery_satisfied_a_reaches_real_session() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("off,runtime::runtime_event_reactor=warn,runtime::execution_core::services=warn")
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
     let root = fixture_root();
     std::fs::create_dir_all(root.path().join("workspace")).unwrap();
     let mut provider = LoopbackProvider::start("root").await;

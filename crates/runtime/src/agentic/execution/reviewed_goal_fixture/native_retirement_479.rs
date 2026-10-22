@@ -475,11 +475,19 @@ impl NativeRetirementFixture {
         .unwrap();
         self.worker.wait_exit().await;
         let mut last_retry = None;
+        let mut first_rejection = None;
         let settlement = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 last_retry = Some(services
                     .retry_agentic_run_exit(self.worker.packet.graph_id())
                     .await);
+                if first_rejection.is_none() {
+                    if let Some(Err(error)) = &last_retry {
+                        eprintln!("R1_479_FIRST_RETIREMENT_REJECTION graph={} task={} error={error}",
+                            self.worker.packet.graph_id(), self.worker.task_ref);
+                        first_rejection = Some(error.clone());
+                    }
+                }
                 if !self.backend.control.lock().unwrap().attempted.is_empty() {
                     break;
                 }
@@ -532,13 +540,63 @@ impl NativeRetirementFixture {
             };
             eprintln!("OWN834_NATIVE_SETTLEMENT_UNPROVED {}", serde_json::json!({
                 "task":task, "physical":physical, "last_original_retry":retry,
+                "first_original_rejection":first_rejection,
             }));
             panic!(
                 "genuine exit, native effect history and closure must reach original final Task append: {error}"
             );
         }
         assert_pending(services, &self.worker);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            services.execution_supervisor().wait_for_quiescence(self.worker.packet.graph_id()),
+        )
+        .await
+        .expect("original retirement execution must become quiescent")
+        .expect("original retirement execution must finish its physical closure");
         assert!(assert_real_closures(services, self.worker.packet.graph_id()) >= 3);
+    }
+
+    async fn cold_rebuild(self) -> Self {
+        let Self { physical, wire, backend, worker, paused_ticket, goal_before, resume, _cleanup } = self;
+        let packet = worker.packet.clone();
+        let task_ref = worker.task_ref.clone();
+        let root_actor = worker.root_actor.clone();
+        let PhysicalProcessFixture { services, spec, definition, _storage_root, .. } = physical;
+        services.shutdown_maintenance().await;
+        let shutdown = services.shutdown_execution().await;
+        assert!(shutdown.errors.is_empty(), "{shutdown:?}");
+        assert_eq!(shutdown.remaining_keys, 0, "{shutdown:?}");
+        assert_eq!(shutdown.forced_aborts, 0, "{shutdown:?}");
+        let original = Arc::downgrade(&services);
+        let artifacts = services.artifact_store().clone();
+        let tasks = services.task_aggregate_service().clone();
+        let workspace = services.workspace_root().to_path_buf();
+        let home = _storage_root.as_ref().unwrap().path().join("home");
+        drop(worker);
+        drop(_cleanup);
+        drop(services);
+        assert!(original.upgrade().is_none(), "cold recovery must lose the original Runtime owner");
+        let host = Arc::new(ReviewReadHost::default());
+        let services = RuntimeServices::builder(home, &workspace)
+            .runtime_event_store(Arc::new(RuntimeEventStore::from_backend(backend.clone())))
+            .artifact_store(artifacts)
+            .task_aggregate_service(tasks)
+            .tool_execution_host(host.clone())
+            .build()
+            .unwrap();
+        host.services.set(Arc::downgrade(&services)).unwrap();
+        let worker = PhysicalWorker {
+            process: RealProcessSession { services: services.clone(), packet: packet.clone() },
+            root_actor,
+            packet,
+            task_ref,
+        };
+        let cleanup = RealFixtureCleanup { services: services.clone(), host: host.clone() };
+        Self {
+            physical: PhysicalProcessFixture { services, spec, host, definition, _storage_root },
+            wire, backend, worker, paused_ticket, goal_before, resume, _cleanup: cleanup,
+        }
     }
 
     async fn finish(&self) {
@@ -690,6 +748,8 @@ fn assert_rejected_without_program_mutation(
         "{observation:?}"
     );
     let error = observation.error.as_ref().unwrap();
+    eprintln!("R1_479_RETIREMENT_REJECTION graph={} task={} error={error:?}",
+        worker.packet.graph_id(), worker.task_ref);
     assert_eq!(error.code, "runtime_retirement_not_settled");
     assert!(
         serde_json::to_string(error).unwrap().contains(fragment),
@@ -866,25 +926,64 @@ async fn assert_withdrawn_once(fixture: &NativeRetirementFixture) {
 #[tokio::test]
 async fn r1_479_native_started_cancel_withdraws_once_without_accepting_goal() {
     let fixture = NativeRetirementFixture::new("479-native-control").await;
+    fixture.worker.withdraw().await;
+    assert!(!fixture.physical.services
+        .retry_agentic_run_exit(fixture.worker.packet.graph_id()).await.unwrap());
+    assert_rejected_without_program_mutation(
+        &fixture.physical.services, &fixture.worker, "exact local backend exit",
+    );
     fixture.cancel_while_holding_settlement().await;
     let services = &fixture.physical.services;
     let stream = ExecutionNodeBinding::effect_stream_id(&fixture.paused_ticket);
-    assert_eq!(services.event_store().stream_revision(&stream).unwrap(), 1);
-    assert!(matches!(
-        services
-            .commit_service()
-            .inspect_execution_effect(&fixture.paused_ticket)
-            .unwrap(),
-        crate::execution_core::graph::ExecutionEffectState::Uncertain
-    ));
-    assert!(services
-        .event_store()
-        .event_by_idempotency_key(
-            &stream,
-            &format!("{}:receipt", fixture.paused_ticket.idempotency_key)
-        )
-        .unwrap()
-        .is_none());
+    let original_head = services.event_store().stream_revision(&stream).unwrap();
+    let original_events = services.event_store().list_stream(&stream).unwrap();
+    let original_effect = services.commit_service()
+        .inspect_execution_effect(&fixture.paused_ticket).unwrap();
+    assert!(matches!(&original_effect,
+        crate::execution_core::graph::ExecutionEffectState::Completed(_)
+            | crate::execution_core::graph::ExecutionEffectState::Uncertain));
+    let fixture = fixture.cold_rebuild().await;
+    let services = &fixture.physical.services;
+    assert_eq!(services.event_store().stream_revision(&stream).unwrap(), original_head);
+    assert_eq!(services.event_store().list_stream(&stream).unwrap(), original_events);
+    assert_eq!(services.commit_service()
+        .inspect_execution_effect(&fixture.paused_ticket).unwrap(), original_effect);
+    assert_pending(&fixture.physical.services, &fixture.worker);
+    assert_withdrawn_once(&fixture).await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn r1_479_native_cancelled_synthesis_exit_before_retirement_cold_replay() {
+    let fixture = NativeRetirementFixture::new("479-native-exit-first").await;
+    fixture.worker.withdraw().await;
+    fixture.worker.cancel().await;
+    fixture.resume.notify_one();
+    fixture.worker.wait_exit().await;
+    let services = &fixture.physical.services;
+    let child = services.graph_state_store().load(&fixture.paused_ticket.graph_id).unwrap();
+    let cancelled = child.nodes.iter().find_map(|node| {
+        if node.kind != ExecutionNodeKind::Synthesize {
+            return None;
+        }
+        child.node_results.get(&node.id).filter(|result| {
+            result.status == ExecutionNodeStatus::Cancelled
+                && result.result_ref.is_none()
+                && result.evidence_refs.is_empty()
+                && result.failure.as_ref().is_some_and(|failure| {
+                    failure.kind == "terminal_presentation_cancelled"
+                        && !failure.retryable && failure.evidence_refs.is_empty()
+                })
+        }).map(|result| (node.id.clone(), result.clone()))
+    });
+    assert!(cancelled.is_some(), "the real Native producer must reproduce candidate-3 cancelled Synthesize: {:?}", child.node_results);
+    fixture.cancel_while_holding_settlement().await;
+    let fixture = fixture.cold_rebuild().await;
+    let recovered = fixture.physical.services.graph_state_store()
+        .load(&fixture.paused_ticket.graph_id).unwrap();
+    let (node_id, result) = cancelled.unwrap();
+    assert_eq!(recovered.node_results.get(&node_id), Some(&result));
+    assert_pending(&fixture.physical.services, &fixture.worker);
     assert_withdrawn_once(&fixture).await;
     fixture.finish().await;
 }

@@ -2977,14 +2977,6 @@ impl AgentRuntime {
             // The revision the cancellation was accepted at is the one that is
             // durable: the commit service wrote it with the snapshot.
             cancellation_revision = Some(cancellation.accepted_revision);
-            // The graph node that owns this run is cancelled by the same
-            // authority, and the transition is committed before the worker is
-            // torn down: a caller that observes the death of the worker must
-            // already see the node as cancelled, because the cancellation is
-            // the Runtime's decision and the death of the process is only its
-            // consequence. The transition is idempotent and never touches the
-            // executor, so the in-flight work of the node is not truncated.
-            self.cancel_run_graph_node(&cancelling).await;
             // The authenticated exit of the cancelled run is published next to
             // the kill, not after it: the owner publishes when it returns, and
             // the cancelling authority covers the case where the owner can no
@@ -3096,72 +3088,6 @@ impl AgentRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
             .and_then(|record| record.snapshot.clone())
-    }
-
-    /// Commit the cancellation of the graph node that owns a cancelled run.
-    ///
-    /// The node and the run are two views of the same Runtime decision, so
-    /// the authority that cancels the run commits the node as cancelled too.
-    /// The transition is idempotent: `from == to` is a legal transition, and a
-    /// node that already reached a terminal state keeps exactly the state it
-    /// has. This path never cancels the executor, so the work that the node
-    /// still owns is never truncated by the transition.
-    async fn cancel_run_graph_node(&self, snapshot: &AgentRunSnapshot) {
-        let Some(services) = self.services() else {
-            return;
-        };
-        for _ in 0..4 {
-            let graph = match services
-                .graph_state_store()
-                .load_async(snapshot.graph_id.clone())
-                .await
-            {
-                Ok(graph) => graph,
-                Err(error) => {
-                    tracing::warn!(
-                        graph_id = %snapshot.graph_id,
-                        node_id = %snapshot.node_id,
-                        %error,
-                        "cancelled run has no readable graph; the node keeps its own terminal commit"
-                    );
-                    return;
-                }
-            };
-            let Some(status) = graph.node_statuses.get(&snapshot.node_id).copied() else {
-                return;
-            };
-            if status.is_terminal() {
-                return;
-            }
-            match services
-                .commit_service()
-                .transition_node_async(
-                    graph,
-                    snapshot.node_id.clone(),
-                    ExecutionNodeStatus::Cancelled,
-                    None,
-                    Vec::new(),
-                )
-                .await
-            {
-                Ok(_) => return,
-                Err(error) if is_stale_graph_revision(&error) => continue,
-                Err(error) => {
-                    tracing::warn!(
-                        graph_id = %snapshot.graph_id,
-                        node_id = %snapshot.node_id,
-                        %error,
-                        "cancelled node transition failed; the node keeps its own terminal commit"
-                    );
-                    return;
-                }
-            }
-        }
-        tracing::warn!(
-            graph_id = %snapshot.graph_id,
-            node_id = %snapshot.node_id,
-            "cancelled node transition raced with the node's own events"
-        );
     }
 
     /// Commit the authenticated exit fact of a cancelled run.
@@ -4074,19 +4000,6 @@ const CANCELLED_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs
 /// How many times a cancellation continues on a newer legal revision of its
 /// run before the caller is told the cancellation was not accepted.
 const CANCEL_REVISION_ATTEMPTS: u32 = 4;
-
-/// Whether a graph commit failed only because the graph moved on.
-fn is_stale_graph_revision(error: &crate::execution_core::graph::ExecutionCommitError) -> bool {
-    use crate::execution_core::graph::ExecutionCommitError;
-    use harness_contract::execution_graph::ExecutionTransitionError;
-    use crate::runtime_event_store::RuntimeEventStoreError;
-    match error {
-        ExecutionCommitError::StaleRevision { .. } => true,
-        ExecutionCommitError::Transition(ExecutionTransitionError::StaleRevision { .. }) => true,
-        ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision { .. }) => true,
-        _ => false,
-    }
-}
 
 fn agent_stream_id(agent_id: &str) -> String {
     format!("agent:{agent_id}")

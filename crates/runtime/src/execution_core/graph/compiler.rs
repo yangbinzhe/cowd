@@ -31,6 +31,61 @@ pub enum ExecutionCompileError {
 pub struct ExecutionGraphCompiler;
 
 impl ExecutionGraphCompiler {
+    pub(crate) fn bind_conversation_graph_identity(
+        &self,
+        graph: &mut ExecutionGraph,
+        graph_id: &str,
+        stable_parent_node_id: Option<&str>,
+        ingress_request_id: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(parent) = stable_parent_node_id {
+            if !matches!(
+                parent.strip_prefix(&format!("{graph_id}:")),
+                Some("model" | "resource-constraint" | "evidence-constraint" | "policy-constraint")
+            ) {
+                return Err("conversation strategy parent has a foreign identity".into());
+            }
+        }
+        let prefix = format!("{}:", graph.id);
+        let mut remapped = std::collections::BTreeMap::new();
+        for (index, node) in graph.nodes.iter_mut().enumerate() {
+            let previous = node.id.clone();
+            let suffix = previous
+                .strip_prefix(&prefix)
+                .ok_or("conversation compiler node has a foreign identity")?;
+            node.id = format!("{graph_id}:{suffix}");
+            if let Some(parent) = stable_parent_node_id {
+                if index == 0 {
+                    node.id = parent.to_string();
+                } else if node.id == parent {
+                    node.id.push_str(":retarget");
+                }
+            }
+            node.idempotency_key = if let Some(request_id) = ingress_request_id {
+                format!("{request_id}:{suffix}")
+            } else if stable_parent_node_id.is_some() {
+                node.id.clone()
+            } else {
+                format!("{}:attempt", node.id)
+            };
+            remapped.insert(previous, node.id.clone());
+        }
+        for edge in &mut graph.edges {
+            edge.from = remapped
+                .get(&edge.from)
+                .cloned()
+                .ok_or("conversation edge has a foreign source")?;
+            edge.to = remapped
+                .get(&edge.to)
+                .cloned()
+                .ok_or("conversation edge has a foreign target")?;
+        }
+        graph.id = graph_id.to_string();
+        harness_contract::execution_graph::validate_execution_graph(graph)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Compile the durable bootstrap graph for a provider-driven conversation turn.
     ///
     /// Target-specific guard nodes persist the initial constraints while the model
@@ -69,16 +124,20 @@ impl ExecutionGraphCompiler {
                     "permission_and_policy_gate_required",
                     &[],
                 ),
-                target_guard(
-                    &graph.id,
-                    "resource-constraint",
-                    &request.payload_ref,
-                    "mutation_resources_must_be_leased",
-                    &request.resource_scopes,
-                ),
                 model,
             ],
         };
+        if target == RuntimeCompileTarget::ExecutionGraph || !request.resource_scopes.is_empty() {
+            let guard = target_guard(
+                &graph.id,
+                "resource-constraint",
+                &request.payload_ref,
+                "mutation_resources_must_be_leased",
+                &request.resource_scopes,
+            );
+            let model_index = graph.nodes.len() - 1;
+            graph.nodes.insert(model_index, guard);
+        }
         graph.edges = dependencies(&graph.nodes);
         compile_model_work_graph(graph)
     }
