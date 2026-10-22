@@ -389,6 +389,25 @@ impl BoundedProcessAuthority {
         Ok(())
     }
 
+    pub(crate) fn check_settlement(
+        &self,
+        request: &RuntimeToolExecutionRequest,
+    ) -> Result<(), crate::ToolError> {
+        // Session/managed immutable context checks remain. Only fresh Root /
+        // Program running authority is replaced by the original admission.
+        self.check_context(request)?;
+        let effect = &request
+            .compiled_invocation
+            .as_ref()
+            .ok_or_else(|| crate::ToolError::new("Process settlement compiled effect missing"))?
+            .effect;
+        self.services
+            .commit_service()
+            .bounded_process_settlement_binding(request, effect)
+            .map(|_| ())
+            .map_err(|error| crate::ToolError::new(error.to_string()))
+    }
+
     pub(crate) fn begin(
         &mut self,
         request: &RuntimeToolExecutionRequest,
@@ -480,7 +499,7 @@ impl BoundedProcessAuthority {
                 "bounded process lifecycle already finalized",
             ));
         }
-        self.check(request)?;
+        self.check_settlement(request)?;
         if self.managed_started {
             self.services
                 .complete_managed_agent_effect(

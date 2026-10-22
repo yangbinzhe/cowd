@@ -809,6 +809,140 @@ pub(crate) mod bounded_process_tests {
         }
     }
 
+    #[tokio::test]
+    async fn original_process_terminal_settles_after_root_cancel_without_fresh_admission() {
+        original_cancelled_process_outcome().await;
+    }
+
+    // Obtain a real local terminal through the original production Process owner.
+    // Physical-fact counterexamples need no delegated Agent/Goal fixture.
+    pub(super) async fn original_cancelled_process_outcome(
+    ) -> (crate::RuntimeToolExecutionOutcome, ToolEffectDescriptor) {
+        let fixture = owned_fixture();
+        let request = request(
+            &fixture.host,
+            json!({"language":"python","code":"print(1515)","input_files":[],"timeout_ms":5000}),
+        );
+        let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        let mut authority = crate::tool_host::BoundedProcessAuthority::bind(
+            fixture.services.clone(),
+            request.clone(),
+        )
+        .unwrap();
+        let (entered, release) = authority.observe_checkpoint_for_test("after_terminal");
+        let service = fixture.services.commit_service().clone();
+        let execution = {
+            let plane = fixture.services.tool_execution_plane().clone();
+            let service = service.clone();
+            let lease = fixture.host.pin_snapshot();
+            let root = fixture.root.clone();
+            let owner = fixture.owner.clone();
+            let request = request.clone();
+            let effect = effect.clone();
+            tokio::spawn(async move {
+                crate::bound_tool_batch::execute_bounded_process_owned(
+                    lease,
+                    plane,
+                    authority,
+                    service,
+                    request,
+                    effect,
+                    Some(root),
+                    Some((owner, 1)),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let graph = fixture
+            .services
+            .graph_state_store()
+            .load(&fixture.root.execution_id)
+            .unwrap();
+        service
+            .apply_command(
+                &graph,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: graph.revision,
+                    reason: "original Process already returned; cancel before receipt".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            service.bounded_process_binding(&request, &effect).is_err(),
+            "fresh Process authority stays closed"
+        );
+        release.send(()).unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), execution)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(ExecutionCommitService::lease_recovery_process_closed(
+            &outcome, &effect
+        ));
+        let actual = outcome
+            .observed_evidence
+            .iter()
+            .find_map(|observed| match &observed.target {
+                harness_contract::context::EvidenceTargetIdentity::ToolExecution { execution } => {
+                    Some(execution)
+                }
+                _ => None,
+            })
+            .expect("original Process fact");
+        assert!(
+            matches!(
+                actual.terminal,
+                harness_contract::context::ToolExecutionTerminal::Settled {
+                    exit_code: Some(0),
+                    ..
+                }
+            ),
+            "{:?}",
+            actual.terminal
+        );
+        let body = fixture
+            .services
+            .artifact_store()
+            .read(&actual.body, &actual.body.visibility_scope, None)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["stdout_utf8"], "1515\n");
+        let cursor = fixture.store.durable_commit_cursor().unwrap();
+        let replay = service
+            .completed_tool_effect(&request, &effect)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.output, outcome.output);
+        let authority = crate::tool_host::BoundedProcessAuthority::bind(
+            fixture.services.clone(),
+            request.clone(),
+        )
+        .unwrap();
+        let replay = crate::bound_tool_batch::execute_bounded_process_owned(
+            fixture.host.pin_snapshot(),
+            fixture.services.tool_execution_plane().clone(),
+            authority,
+            service,
+            request,
+            effect.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.output, outcome.output);
+        assert_eq!(fixture.services.tool_execution_plane().stats().submitted, 1);
+        assert_eq!(fixture.store.durable_commit_cursor().unwrap(), cursor);
+        assert_eq!(fixture.services.tool_execution_plane().stats().active, 0);
+        (outcome, effect)
+    }
+
     #[test]
     fn canonical_process_domains_preserve_original_raw_and_descriptor_hashes_291() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2135,7 +2269,9 @@ mod scope_commit_tests {
 
     #[test]
     fn root_read_and_write_fix_original_owner_scope_and_atomic_index() {
-        for read in [false, true] {
+        for (read, cancel_before_receipt) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let (store, service, graph, root, owner) = root_fixture();
             let workspace = tempfile::tempdir().unwrap();
             std::fs::write(workspace.path().join("proof.txt"), "before").unwrap();
@@ -2201,6 +2337,56 @@ mod scope_commit_tests {
                 evidence_ref: "scope2-output".into(),
                 observed_evidence: vec![],
             };
+            if cancel_before_receipt {
+                service
+                    .apply_command(
+                        &graph,
+                        &ExecutionGraphCommand::Cancel {
+                            expected_revision: graph.revision,
+                            reason: "cancel after original physical effect".into(),
+                        },
+                    )
+                    .unwrap();
+                assert!(admit(&owner, 1).is_err());
+                let suffix = if read { "read-intent" } else { "intent" };
+                let intent = store
+                    .event_by_idempotency_key(
+                        &format!("execution-effect:{}", request.idempotency_key),
+                        &format!("{}:{suffix}", request.idempotency_key),
+                    )
+                    .unwrap()
+                    .unwrap();
+                for change in ["transaction", "attempt", "node", "actor"] {
+                    let mut forged = intent.clone();
+                    match change {
+                        "transaction" => {
+                            forged.transaction_id = "uncommitted-foreign-intent".into()
+                        }
+                        "attempt" => forged.payload["root_effect_owner"]["attempt"] = 2.into(),
+                        "node" => {
+                            forged.payload["root_effect_owner"]["binding"]["node_id"] =
+                                "foreign-node".into()
+                        }
+                        _ => forged.actor = Some("foreign-writer".into()),
+                    }
+                    assert!(
+                        service
+                            .root_intent_owner(&request, effect, &root, &scope, &forged)
+                            .is_err(),
+                        "{change}"
+                    );
+                }
+                let mut wrong_request = request.clone();
+                wrong_request.authorized_scopes.push("write:foreign".into());
+                assert!(service
+                    .root_intent_owner(&wrong_request, effect, &root, &scope, &intent)
+                    .is_err());
+                let mut wrong_scope = scope.clone();
+                wrong_scope.complete = !scope.complete;
+                assert!(service
+                    .root_intent_owner(&request, effect, &root, &wrong_scope, &intent)
+                    .is_err());
+            }
             if read {
                 service
                     .commit_root_read_acquisition(&request, &outcome, effect, &root, &scope)
@@ -2279,15 +2465,17 @@ mod scope_commit_tests {
                 .query_completed_agent_tool_effect(&query)
                 .unwrap()
                 .is_some());
-            service
-                .transition_node(
-                    &graph,
-                    "scope2-node",
-                    ExecutionNodeStatus::Cancelled,
-                    None,
-                    vec![],
-                )
-                .unwrap();
+            if !cancel_before_receipt {
+                service
+                    .transition_node(
+                        &graph,
+                        "scope2-node",
+                        ExecutionNodeStatus::Cancelled,
+                        None,
+                        vec![],
+                    )
+                    .unwrap();
+            }
             assert!(service
                 .completed_tool_effect(&request, effect)
                 .unwrap()
@@ -3148,6 +3336,12 @@ impl ExecutionCommitService {
         let mut receipt_keys = Vec::with_capacity(receipts.len());
         let mut staged = BTreeMap::new();
         for (request, outcome) in receipts {
+            if outcome.tool_use_id != request.tool_use_id || outcome.tool_name != request.tool_name
+            {
+                return Err(ExecutionCommitError::InvalidCommand(
+                    "read outcome belongs to a different original call".into(),
+                ));
+            }
             let identity = json!([receipt_replay_contract(request)?, request.tool_name,
                 request.input, request.observation_wave_sequence, request.authorized_scopes,
                 request.authorization, bounded_tool_effect_outcome(outcome)]);
@@ -3171,6 +3365,13 @@ impl ExecutionCommitService {
                 .event_by_idempotency_key(&stream_id, &receipt_key)?
             {
                 validate_readonly_tool_receipt(request, &existing.payload)?;
+                if existing.payload["outcome"]
+                    != serde_json::to_value(bounded_tool_effect_outcome(outcome))?
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "read terminal outcome collision".into(),
+                    ));
+                }
                 if let Some(effect) = effect {
                     self.validate_terminal_scope(request, effect, &existing, true)?;
                 } else if existing.payload["resolved_effect_scope"]["version"] == 2 {
@@ -3188,17 +3389,9 @@ impl ExecutionCommitService {
                 let scope = scope.ok_or_else(|| {
                     ExecutionCommitError::InvalidCommand("root read receipt has no scope".into())
                 })?;
-                let sources = self.root_effect_authority(&root)?;
                 let (owner, attempt) =
                     self.root_intent_owner(request, &effect, &root, scope, intent)?;
-                let revision = self.authenticated_root_owner(&root, &owner, attempt)?;
-                if !sources.iter().any(|source| {
-                    source.stream_id == root.execution_id && source.expected_revision == revision
-                }) {
-                    return Err(ExecutionCommitError::InvalidCommand(
-                        "root read owner changed during receipt snapshot".into(),
-                    ));
-                }
+                let sources = self.root_receipt_sources(&root, &owner)?;
                 for source in sources {
                     if expected_streams
                         .insert(source.stream_id, source.expected_revision)
@@ -3405,6 +3598,36 @@ impl ExecutionCommitService {
         effect: &ToolEffectDescriptor,
         intent: &crate::DurableRuntimeEvent,
     ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        self.process_effect_sources(request, effect, intent, false)
+    }
+
+    fn settled_process_sources(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        intent: &crate::DurableRuntimeEvent,
+    ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        self.process_effect_sources(request, effect, intent, true)
+    }
+
+    fn process_effect_sources(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        intent: &crate::DurableRuntimeEvent,
+        settling: bool,
+    ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        if intent.payload["replay"] != receipt_replay_contract(request)?
+            || intent.actor.as_deref() != Some("governed_tool")
+            || intent.schema_version != 1
+            || tool_effect_refs(request)
+                .iter()
+                .any(|reference| !intent.refs.contains(reference))
+        {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "Process differs from its original admitted call/Step/attempt".into(),
+            ));
+        }
         validate_mutation_tool_fingerprint(request, effect, &intent.payload, "intent")?;
         validate_replay_effect_scope(&intent.payload, effect)?;
         if !intent.payload["root_effect_owner"].is_null() {
@@ -3412,6 +3635,9 @@ impl ExecutionCommitService {
             let scope = serde_json::from_value(intent.payload["resolved_effect_scope"].clone())?;
             let (owner, attempt) =
                 self.root_intent_owner(request, effect, &root, &scope, intent)?;
+            if settling {
+                return self.root_receipt_sources(&root, &owner);
+            }
             let sources = self.root_effect_authority(&root)?;
             let revision = self.authenticated_root_owner(&root, &owner, attempt)?;
             if !sources.iter().any(|source| {
@@ -3424,7 +3650,9 @@ impl ExecutionCommitService {
             self.validate_system_tool_parent_scoped(request, Some(&root))?;
             Ok(sources)
         } else {
-            self.validate_system_tool_parent_scoped(request, None)?;
+            if !settling {
+                self.validate_system_tool_parent_scoped(request, None)?;
+            }
             let parent = request.parent_execution.as_ref().ok_or_else(|| {
                 ExecutionCommitError::InvalidCommand(
                     "bounded process has neither original root owner nor parent".into(),
@@ -3434,7 +3662,14 @@ impl ExecutionCommitService {
                 .effect_authority_graphs
                 .load(&parent.execution_id)
                 .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
-            if graph.node_statuses.get(&parent.node_id) != Some(&ExecutionNodeStatus::Running)
+            if request.session_id.as_deref()
+                != graph
+                    .lineage
+                    .as_ref()
+                    .map(|lineage| lineage.session_id.as_str())
+                || (!settling
+                    && graph.node_statuses.get(&parent.node_id)
+                        != Some(&ExecutionNodeStatus::Running))
                 || request.parent_execution_attempt.is_none_or(|attempt| {
                     attempt == 0
                         || graph
@@ -3449,7 +3684,14 @@ impl ExecutionCommitService {
                     "bounded process original parent attempt is no longer running".into(),
                 ));
             }
-            self.tool_effect_authority(request)
+            if settling {
+                Ok(vec![ExpectedStreamRevision {
+                    stream_id: graph.id,
+                    expected_revision: graph.revision,
+                }])
+            } else {
+                self.tool_effect_authority(request)
+            }
         }
     }
 
@@ -3553,6 +3795,47 @@ impl ExecutionCommitService {
             .event_by_idempotency_key(&stream, &format!("{}:intent", request.idempotency_key))?
             .ok_or_else(|| invalid("bounded process has no original intent".into()))?;
         self.bounded_process_sources(request, effect, &intent)?;
+        self.process_binding_from_intent(request, effect, &intent, &input)
+    }
+
+    pub(crate) fn bounded_process_settlement_binding(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+    ) -> Result<harness_contract::context::ToolExecutionBinding, ExecutionCommitError> {
+        let invalid = ExecutionCommitError::InvalidCommand;
+        let stream = format!("execution-effect:{}", request.idempotency_key);
+        let intent = self
+            .event_store
+            .event_by_idempotency_key(&stream, &format!("{}:intent", request.idempotency_key))?
+            .ok_or_else(|| invalid("Process settlement has no original intent".into()))?;
+        self.settled_process_sources(request, effect, &intent)?;
+        let input = harness_contract::step::parse_strict_json(&request.input)
+            .map_err(|error| invalid(error.to_string()))?;
+        let binding = self.process_binding_from_intent(request, effect, &intent, &input)?;
+        let admission = self
+            .event_store
+            .event_by_idempotency_key(
+                &stream,
+                &format!("{}:process-admission", request.idempotency_key),
+            )?
+            .ok_or_else(|| invalid("Process settlement has no original admission".into()))?;
+        if admission.payload["admission"]["binding"] != serde_json::to_value(&binding)? {
+            return Err(invalid(
+                "Process settlement original admission binding conflict".into(),
+            ));
+        }
+        Ok(binding)
+    }
+
+    fn process_binding_from_intent(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        intent: &crate::DurableRuntimeEvent,
+        input: &serde_json::Value,
+    ) -> Result<harness_contract::context::ToolExecutionBinding, ExecutionCommitError> {
+        let invalid = ExecutionCommitError::InvalidCommand;
         let packet_digest = if let Some(parent) = &request.parent_execution {
             let graph = self
                 .effect_authority_graphs
@@ -3707,7 +3990,8 @@ impl ExecutionCommitService {
             )?
             .ok_or_else(|| invalid("terminal process has no original admission".into()))?;
         if admission.payload["admission"] != serde_json::to_value(completed.admission())?
-            || completed.admission().binding != self.bounded_process_binding(request, effect)?
+            || completed.admission().binding
+                != self.bounded_process_settlement_binding(request, effect)?
         {
             return Err(invalid(
                 "private terminal/admission authority mismatch".into(),
@@ -4467,24 +4751,18 @@ impl ExecutionCommitService {
         effect: &ToolEffectDescriptor,
         receipt: &crate::DurableRuntimeEvent,
     ) -> Result<(), ExecutionCommitError> {
-        if receipt.payload["resolved_effect_scope"]["version"] == 2 {
-            if receipt.payload["replay"]["session_id"] != serde_json::to_value(&request.session_id)?
-                || receipt.payload["replay"]["invocation"]["effect"]
-                    != serde_json::to_value(effect)?
+        if receipt.payload["resolved_effect_scope"]["version"] == 2
+            && (receipt.payload["replay"] != receipt_replay_contract(request)?
                 || request
                     .compiled_invocation
                     .as_ref()
-                    .is_none_or(|invocation| invocation.effect != *effect)
-                || request.step_binding.as_ref().is_none_or(|binding| {
-                    serde_json::to_value(&binding.origin)
-                        .map_or(true, |origin| receipt.payload["replay"]["origin"] != origin)
-                })
-            {
-                return Err(ExecutionCommitError::InvalidCommand(
-                    "terminal receipt original invocation identity conflict".into(),
-                ));
-            }
+                    .is_none_or(|invocation| invocation.effect != *effect))
+        {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "terminal receipt original invocation identity conflict".into(),
+            ));
         }
+
         Ok(())
     }
 
@@ -4618,41 +4896,16 @@ impl ExecutionCommitService {
             let intent = intent.as_ref().ok_or_else(|| {
                 ExecutionCommitError::InvalidCommand("root receipt has no intent".into())
             })?;
-            let source = reader
-                .event(
-                    &node_stream_id(graph_id, node_id),
-                    &format!("{graph_id}:{node_id}:{}", owner.revision),
-                )?
-                .ok_or_else(|| {
-                    ExecutionCommitError::InvalidCommand(
-                        "root receipt original node activity missing".into(),
-                    )
-                })?;
-            let graph_fence = reader.fence(&intent.transaction_id, graph_id)?;
-            if root_record
-                .as_object()
-                .is_none_or(|record| record.len() != 3)
-                || !replay["parent_execution"].is_null()
-                || owner.agent_run_id.is_some()
-                || context.execution_id != graph_id
-                || context.session_id != owner.session_id
-                || context.turn_id != owner.turn_id
-                || replay["session_id"] != owner.session_id
-                || source.activity_binding().as_ref() != Some(&owner)
-                || source.kind != "execution_node.transitioned"
-                || source.actor.as_deref() != Some("execution_commit_service")
-                || source.scope != RuntimeEventScope::ExecutionNode
-                || source.schema_version != 1
-                || source.status.as_deref() != Some("running")
-                || source.payload["to"] != "running"
-                || source.commit_cursor > intent.commit_cursor
-                || graph_fence.is_none_or(|fence| fence.expected_revision != revision)
-                || owner.revision > revision
-            {
-                return Err(ExecutionCommitError::InvalidCommand(
-                    "root receipt original owner or authority provenance conflict".into(),
-                ));
-            }
+            self.validate_root_intent_provenance(
+                &context,
+                &owner,
+                u32::try_from(attempt).map_err(|_| {
+                    ExecutionCommitError::InvalidCommand("root attempt overflow".into())
+                })?,
+                revision,
+                intent,
+                reader,
+            )?;
         }
         let index_stream = format!("execution-agent-receipts:{graph_id}:{node_id}:{attempt}");
         let index = reader
@@ -4731,6 +4984,172 @@ impl ExecutionCommitService {
         Ok(graph.revision)
     }
 
+    // Admission authorizes new work. Settlement authenticates the immutable
+    // start and intent that already authorized the operation; cancellation
+    // cannot make an observed physical fact disappear.
+    fn validate_root_intent_provenance(
+        &self,
+        root: &crate::CowdExecutionContext,
+        owner: &harness_contract::projection::RuntimeActivityBinding,
+        attempt: u32,
+        revision: u64,
+        intent: &crate::DurableRuntimeEvent,
+        reader: &mut impl TerminalScopeReader,
+    ) -> Result<(), ExecutionCommitError> {
+        let denied = || {
+            ExecutionCommitError::InvalidCommand("root original intent provenance conflict".into())
+        };
+        owner.validate().map_err(|_| denied())?;
+        let node = owner.node_id.as_deref().ok_or_else(denied)?;
+        let source = reader
+            .event(
+                &node_stream_id(&root.execution_id, node),
+                &format!("{}:{node}:{}", root.execution_id, owner.revision),
+            )?
+            .ok_or_else(denied)?;
+        let start = reader
+            .event(
+                &root.execution_id,
+                &format!("{}:revision:{}", root.execution_id, owner.revision),
+            )?
+            .ok_or_else(denied)?;
+        let graph_owner = start.activity_binding().ok_or_else(denied)?;
+        let graph_fence = reader
+            .fence(&intent.transaction_id, &root.execution_id)?
+            .ok_or_else(denied)?;
+        let primary_fence = reader
+            .fence(&intent.transaction_id, &intent.stream_id)?
+            .ok_or_else(denied)?;
+        let key = intent.payload["idempotency_key"]
+            .as_str()
+            .ok_or_else(denied)?;
+        let suffix = if intent.kind == "execution.read.intent" {
+            "read-intent"
+        } else {
+            "intent"
+        };
+        if intent.payload["root_effect_owner"]
+            .as_object()
+            .is_none_or(|record| record.len() != 3)
+            || intent.payload["root_effect_context"] != serde_json::to_value(root)?
+            || intent.stream_id != format!("execution-effect:{key}")
+            || intent.idempotency_key.as_deref() != Some(format!("{key}:{suffix}").as_str())
+            || intent.sequence != 1
+            || primary_fence.committed_revision != 1
+            || owner.fence != owner.revision
+            || attempt == 0
+            || revision == 0
+            || owner.revision > revision
+            || owner.root_execution_id != root.execution_id
+            || owner.session_id != root.session_id
+            || owner.turn_id != root.turn_id
+            || owner.agent_run_id.is_some()
+            || intent.payload["replay"]["session_id"] != owner.session_id
+            || !intent.payload["replay"]["parent_execution"].is_null()
+            || intent.actor.as_deref() != Some("governed_tool")
+            || intent.schema_version != 1
+            || intent.scope != RuntimeEventScope::ExecutionNode
+            || intent.status.as_deref() != Some("inflight")
+            || !matches!(
+                intent.kind.as_str(),
+                "execution.effect.intent" | "execution.read.intent"
+            )
+            || graph_fence.expected_revision != revision
+            || primary_fence.expected_revision != 0
+            || source.activity_binding().as_ref() != Some(owner)
+            || source.kind != "execution_node.transitioned"
+            || source.actor.as_deref() != Some("execution_commit_service")
+            || source.scope != RuntimeEventScope::ExecutionNode
+            || source.schema_version != 1
+            || source.status.as_deref() != Some("running")
+            || source.payload["to"] != "running"
+            || source.payload["graph_id"] != root.execution_id
+            || source.payload["node_id"] != node
+            || source.payload["graph_revision"] != owner.revision
+            || source.commit_cursor > intent.commit_cursor
+            || source.transaction_id != start.transaction_id
+            || source.commit_cursor != start.commit_cursor
+            || source.transaction_index <= start.transaction_index
+            || start.sequence != owner.revision
+            || start.actor.as_deref() != Some("execution_commit_service")
+            || start.schema_version != 2
+            || start.scope != RuntimeEventScope::ExecutionGraph
+            || graph_owner.root_execution_id != root.execution_id
+            || graph_owner.node_id.is_some()
+            || graph_owner.session_id != owner.session_id
+            || graph_owner.turn_id != owner.turn_id
+            || graph_owner.root_task_id != owner.root_task_id
+            || graph_owner.task_id != owner.task_id
+            || graph_owner.generation != owner.generation
+            || graph_owner.revision != owner.revision
+            || graph_owner.fence != owner.revision
+            || graph_owner.parent_activity_id.is_some()
+        {
+            return Err(denied());
+        }
+        let event: ExecutionGraphEvent = serde_json::from_value(
+            self.event_store
+                .resolve_graph_record(&start)
+                .map_err(ExecutionCommitError::InvalidCommand)?,
+        )?;
+        if event.kind() != start.kind {
+            return Err(denied());
+        }
+        let matches = match event {
+            ExecutionGraphEvent::NodeTransitioned {
+                node_id, to, delta, ..
+            } => {
+                node_id == node
+                    && to == ExecutionNodeStatus::Running
+                    && delta.recovery_cursor.node_attempts.get(node) == Some(&attempt)
+            }
+            ExecutionGraphEvent::NodesStarted { bindings, .. } => bindings
+                .get(node)
+                .is_some_and(|binding| binding.attempt == attempt),
+            ExecutionGraphEvent::Checkpoint { cause, graph, .. } => {
+                matches!(
+                    cause.as_str(),
+                    "execution_graph.nodes_started" | "execution_graph.node_transitioned"
+                ) && graph.parent_execution.is_none()
+                    && graph.node_statuses.get(node) == Some(&ExecutionNodeStatus::Running)
+                    && graph.recovery_cursor.node_attempts.get(node) == Some(&attempt)
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    fn root_receipt_sources(
+        &self,
+        root: &crate::CowdExecutionContext,
+        owner: &harness_contract::projection::RuntimeActivityBinding,
+    ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        let graph = self
+            .effect_authority_graphs
+            .load(&root.execution_id)
+            .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+        if graph.parent_execution.is_some()
+            || graph.lineage.as_ref().is_none_or(|lineage| {
+                lineage.session_id != owner.session_id
+                    || lineage.turn_id != owner.turn_id
+                    || lineage.root_task_id != owner.root_task_id
+                    || lineage.task_id != owner.task_id
+                    || lineage.generation != owner.generation
+            })
+        {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "root receipt lineage changed".into(),
+            ));
+        }
+        Ok(vec![ExpectedStreamRevision {
+            stream_id: graph.id,
+            expected_revision: graph.revision,
+        }])
+    }
+
     fn root_intent_owner(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
@@ -4752,6 +5171,12 @@ impl ExecutionCommitService {
             .event_store
             .transaction_stream_revision_exact(&intent.transaction_id, &root.execution_id)?;
         if record.as_object().is_none_or(|record| record.len() != 3)
+            || intent.kind
+                != if effect.effect_kind == ToolEffectKind::Read {
+                    "execution.read.intent"
+                } else {
+                    "execution.effect.intent"
+                }
             || revision == 0
             || request.parent_execution.is_some()
             || graph_fence.is_none_or(|fence| fence.expected_revision != revision)
@@ -4771,7 +5196,14 @@ impl ExecutionCommitService {
                 "root original intent identity conflict".into(),
             ));
         }
-        self.authenticated_root_owner(root, &owner, attempt)?;
+        self.validate_root_intent_provenance(
+            root,
+            &owner,
+            attempt,
+            revision,
+            intent,
+            &mut StoredTerminalScopeReader(&self.event_store),
+        )?;
         Ok((owner, attempt))
     }
 
@@ -4878,7 +5310,14 @@ impl ExecutionCommitService {
         scope: &harness_contract::goal::ProofEffectScope,
     ) -> Result<(), ExecutionCommitError> {
         Self::validate_bound_effect_scope(effect, scope)?;
-        if self.completed_tool_effect(request, effect)?.is_some() {
+        if let Some(original) = self.completed_tool_effect(request, effect)? {
+            if serde_json::to_value(original)?
+                != serde_json::to_value(bounded_tool_effect_outcome(outcome))?
+            {
+                return Err(ExecutionCommitError::InvalidCommand(
+                    "root read terminal outcome collision".into(),
+                ));
+            }
             return Ok(());
         }
         let intent = self
@@ -5297,6 +5736,11 @@ impl ExecutionCommitService {
         if effect.effect_kind == ToolEffectKind::Read {
             return Ok(());
         }
+        if outcome.tool_use_id != request.tool_use_id || outcome.tool_name != request.tool_name {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "terminal outcome belongs to a different original call".into(),
+            ));
+        }
         // Same optimistic-concurrency retry as the read wave: concurrent effect
         // receipts from one Agent share its `execution-agent-receipts:*` stream,
         // so a stale-revision CAS is retryable (the receipt keys are stable).
@@ -5346,6 +5790,15 @@ impl ExecutionCommitService {
             })?;
         validate_mutation_tool_fingerprint(request, effect, &intent.payload, "intent")?;
         validate_replay_effect_scope(&intent.payload, effect)?;
+        if intent.payload["replay"] != receipt_replay_contract(request)?
+            || tool_effect_refs(request)
+                .iter()
+                .any(|reference| !intent.refs.contains(reference))
+        {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "receipt differs from original admitted call/Step/attempt".into(),
+            ));
+        }
         let root_owner = if !intent.payload["root_effect_owner"].is_null() {
             let root: crate::CowdExecutionContext =
                 serde_json::from_value(intent.payload["root_effect_context"].clone())?;
@@ -5358,18 +5811,10 @@ impl ExecutionCommitService {
         let root_sources = root_owner
             .as_ref()
             .map(|(root, scope)| {
-                let sources = self.root_effect_authority(root)?;
                 let (owner, attempt) =
                     self.root_intent_owner(request, effect, root, scope, &intent)?;
-                let revision = self.authenticated_root_owner(root, &owner, attempt)?;
-                if !sources.iter().any(|source| {
-                    source.stream_id == root.execution_id && source.expected_revision == revision
-                }) {
-                    return Err(ExecutionCommitError::InvalidCommand(
-                        "root write owner changed during receipt snapshot".into(),
-                    ));
-                }
-                Ok((sources, owner, attempt))
+                let sources = self.root_receipt_sources(root, &owner)?;
+                Ok::<_, ExecutionCommitError>((sources, owner, attempt))
             })
             .transpose()?;
         let mut expected_streams = BTreeMap::<String, u64>::new();
@@ -5388,7 +5833,7 @@ impl ExecutionCommitService {
                 ProcessTerminalAuthority::BoundedProcess(_) => {
                     crate::tool_host::check_bounded_process_commit_authority(request)
                         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
-                    for source in self.bounded_process_sources(request, effect, &intent)? {
+                    for source in self.settled_process_sources(request, effect, &intent)? {
                         expected_streams.insert(source.stream_id, source.expected_revision);
                     }
                 }
@@ -5402,7 +5847,7 @@ impl ExecutionCommitService {
                     // snapshot and the same durable admission as the bounded
                     // process: without them the receipt can never be settled.
                     Self::validate_host_process_outcome(outcome)?;
-                    for source in self.bounded_process_sources(request, effect, &intent)? {
+                    for source in self.settled_process_sources(request, effect, &intent)? {
                         expected_streams.insert(source.stream_id, source.expected_revision);
                     }
                     let admission_key = format!("{}:process-admission", request.idempotency_key);
@@ -11846,7 +12291,8 @@ mod recovery_physical_450_tests {
     #[tokio::test]
     async fn r1_450_original_process_fact_unknown_or_unreaped_cannot_close_binding() {
         use harness_contract::context::{EvidenceTargetIdentity, ToolExecutionTerminal};
-        let (original, effect) = super::super::tests::recover_real_bound_leaf_450(true).await;
+        let (original, effect) =
+            super::bounded_process_tests::original_cancelled_process_outcome().await;
         assert!(ExecutionCommitService::lease_recovery_process_closed(
             &original, &effect
         ));

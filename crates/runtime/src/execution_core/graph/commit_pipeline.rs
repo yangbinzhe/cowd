@@ -540,6 +540,24 @@ pub(super) fn validate_mutation_tool_fingerprint(
     Ok(())
 }
 
+pub(super) fn receipt_step_digest(
+    binding: &crate::step_snapshot::StepCallBinding,
+) -> Result<String, ExecutionCommitError> {
+    // Hash the typed, persisted representation without converting valid i64
+    // expiry / u64 revisions through the JSON safe-number normalizer.
+    receipt_identity_digest(b"tool-effect-step-snapshot-v1\0", &binding.snapshot)
+}
+
+fn receipt_identity_digest<T: serde::Serialize>(
+    domain: &[u8],
+    identity: &T,
+) -> Result<String, ExecutionCommitError> {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(serde_json::to_vec(identity)?);
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
 pub(crate) fn receipt_replay_contract(
     request: &crate::RuntimeToolExecutionRequest,
 ) -> Result<serde_json::Value, ExecutionCommitError> {
@@ -562,6 +580,12 @@ pub(crate) fn receipt_replay_contract(
     stored_invocation.intent.normalized_input = serde_json::Value::Null;
     Ok(
         json!({"session_id":request.session_id,"parent_execution":request.parent_execution,
+        "parent_execution_attempt":request.parent_execution_attempt,
+        "authorization_digest":receipt_identity_digest(b"tool-effect-authorization-v1\0",&request.authorization)?,
+        "authorized_scopes":request.authorized_scopes,
+        "policy_revision":request.policy_revision,"sandbox_posture":request.sandbox_posture,
+        "observation_wave_sequence":request.observation_wave_sequence,
+        "step_snapshot_digest":receipt_step_digest(binding)?,
         "call_id":request.tool_use_id,"origin":binding.origin,"payload_digest":payload,"invocation":stored_invocation}),
     )
 }

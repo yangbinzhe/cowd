@@ -1900,7 +1900,9 @@ pub(crate) async fn execute_bounded_process_observed(
                 let monitor = authority.monitor(&request,cancellation.clone())?;
                 let completed = prepared.run(admission, &cancellation);
                 drop(monitor);
-                if let Err(error)=authority.check(&request) {
+                #[cfg(test)]
+                authority.checkpoint_for_test("after_terminal");
+                if let Err(error)=authority.check_settlement(&request) {
                     let archived=handle.block_on(service.archive_bounded_process_body(&request,&completed,&artifacts));
                     let reason=match archived {
                         Ok(body)=>format!("actual process terminal archived at {}; original authority revoked: {error}",body.selector),

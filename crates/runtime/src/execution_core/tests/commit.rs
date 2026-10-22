@@ -1100,6 +1100,9 @@ fn readonly_wave_receipts_commit_atomically_and_replay_idempotently() {
     service
         .commit_readonly_tool_receipts(&receipts)
         .expect("idempotent replay");
+    let mut conflicting = receipts.clone();
+    conflicting[0].1.output = Some("foreign outcome".into());
+    assert!(service.commit_readonly_tool_receipts(&conflicting).is_err());
     assert_eq!(
         store
             .list_stream("execution-effect:idem-read-1")
@@ -1623,6 +1626,15 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
         ),
         "committed replay needs no fresh effect authority"
     );
+    let mut wrong_attempt = pending.clone();
+    wrong_attempt.parent_execution_attempt = Some(2);
+    assert!(service
+        .commit_tool_effect(
+            &wrong_attempt,
+            &effect,
+            &outcome("pending-after-review", "settled")
+        )
+        .is_err());
     // Cancellation does not erase an already admitted external effect. Its
     // original receipt may still settle and make the retained source readable.
     service
@@ -1805,13 +1817,58 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
             .unwrap(),
         ToolEffectState::Completed(_)
     ));
-    service
+    let actual = outcome("root-pending", "settled after cancel");
+    assert!(service
         .commit_tool_effect(
             &pending,
             &effect,
-            &outcome("root-pending", "settled after cancel"),
+            &outcome("foreign-call", "settled after cancel")
         )
+        .is_err());
+    // Persisted admission cannot be borrowed by a new call, different Step,
+    // input, attempt or descriptor after cancellation.
+    assert!(service.commit_tool_effect(&late, &effect, &actual).is_err());
+    let mut wrong = pending.clone();
+    wrong.input = "{\"path\":\"foreign\"}".into();
+    assert!(service
+        .commit_tool_effect(&wrong, &effect, &actual)
+        .is_err());
+    wrong = pending.clone();
+    let original = wrong.step_binding.take().unwrap();
+    let mut snapshot = (*original.snapshot).clone();
+    snapshot.identity.turn_id.push_str(":foreign");
+    wrong.step_binding = Some(crate::step_snapshot::StepCallBinding::persisted(
+        original.origin,
+        Arc::new(snapshot),
+    ));
+    assert!(service
+        .commit_tool_effect(&wrong, &effect, &actual)
+        .is_err());
+    wrong = pending.clone();
+    wrong.parent_execution_attempt = Some(2);
+    assert!(service
+        .commit_tool_effect(&wrong, &effect, &actual)
+        .is_err());
+    let mut wrong_effect = effect.clone();
+    wrong_effect.descriptor_hash.push_str(":foreign");
+    assert!(service
+        .commit_tool_effect(&pending, &wrong_effect, &actual)
+        .is_err());
+    service
+        .commit_tool_effect(&pending, &effect, &actual)
         .unwrap();
+    let cursor = store.durable_commit_cursor().unwrap();
+    service
+        .commit_tool_effect(&pending, &effect, &actual)
+        .unwrap();
+    assert_eq!(store.durable_commit_cursor().unwrap(), cursor);
+    assert!(service
+        .commit_tool_effect(
+            &pending,
+            &effect,
+            &outcome("root-pending", "forged outcome")
+        )
+        .is_err());
     assert!(matches!(
         service
             .begin_root_tool_effect(&pending, &effect, &context, &scope, &owner, attempt)

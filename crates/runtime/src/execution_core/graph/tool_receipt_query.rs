@@ -1,5 +1,6 @@
 use super::{
-    receipt_payload_matches, ExecutionCommitError, ExecutionCommitService, ToolReceiptReplay,
+    receipt_payload_matches, receipt_step_digest, ExecutionCommitError, ExecutionCommitService,
+    ToolReceiptReplay,
 };
 use crate::step_snapshot::StepCallBinding;
 use harness_contract::execution_graph::ExecutionParentBinding;
@@ -669,6 +670,8 @@ impl ExecutionCommitService {
                 || !original_parent_matches
                 || replay["call_id"] != query.tool_use_id
                 || replay["origin"] != json!(binding.origin)
+                || (receipt.payload["resolved_effect_scope"]["version"] == 2
+                    && replay["step_snapshot_digest"] != json!(receipt_step_digest(binding)?))
                 || receipt.payload["tool_name"] != query.tool_name
                 || receipt_payload_matches(query.input, &receipt.payload)? != Some(true)
             {
