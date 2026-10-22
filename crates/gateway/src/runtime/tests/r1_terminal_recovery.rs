@@ -282,8 +282,25 @@ impl LoopbackProvider {
                             let mut bytes = Vec::new();
                             let body = loop {
                                 let mut buffer = [0_u8; 8192];
-                                let count = socket.read(&mut buffer).await.unwrap();
-                                assert!(count > 0 && bytes.len() < 16 * 1024 * 1024);
+                                let count = match socket.read(&mut buffer).await {
+                                    Ok(count) => count,
+                                    Err(error) => {
+                                        eprintln!(
+                                            "recovery188 provider_connection_read_failed bytes={} error={error}",
+                                            bytes.len()
+                                        );
+                                        return;
+                                    }
+                                };
+                                if count == 0 {
+                                    eprintln!(
+                                        "recovery188 provider_connection_closed bytes={} abandoned_request={}",
+                                        bytes.len(),
+                                        !bytes.is_empty()
+                                    );
+                                    return;
+                                }
+                                assert!(bytes.len() < 16 * 1024 * 1024);
                                 bytes.extend_from_slice(&buffer[..count]);
                                 if let Some(offset) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                                     let headers = String::from_utf8_lossy(&bytes[..offset]);
@@ -352,7 +369,9 @@ impl LoopbackProvider {
                         });
                     }
                     finished = connections.join_next(), if !connections.is_empty() => {
-                        finished.unwrap().unwrap();
+                        if let Some(Err(error)) = finished {
+                            eprintln!("recovery188 provider_connection_failed error={error}");
+                        }
                     }
                 }
             }
