@@ -108,6 +108,9 @@ impl AssessmentSourceFrame {
         program: &AgenticProgramProjection,
         projection: &GoalProjection,
     ) -> Result<Self, AssessmentReadError> {
+        program
+            .validate_team_quantity_contract()
+            .map_err(AssessmentReadError::Source)?;
         let goal = &projection.goal;
         let root = program
             .root_execution_id
@@ -443,6 +446,9 @@ pub(crate) enum CompletionTerminalAction {
 pub(crate) fn root_agentic_terminal_action(
     program: &crate::AgenticProgramProjection,
 ) -> Option<CompletionTerminalAction> {
+    if program.validate_team_quantity_contract().is_err() {
+        return None;
+    }
     if !matches!(
         program.status,
         crate::AgenticProgramStatus::Open | crate::AgenticProgramStatus::Waiting
@@ -605,6 +611,9 @@ fn render_completion_view(
     if assessment.blocked == Some(ClosureBlock::RequiredGoalObligations) {
         blocked = serde_json::json!({"reason":"required_goal_obligations_open", "obligation_refs":assessment.required_obligation_refs});
     }
+    if assessment.blocked == Some(ClosureBlock::TeamQuantityUnknown) {
+        blocked = serde_json::json!({"reason":"team_quantity_unknown"});
+    }
     let current = assessment.current();
     let satisfied = &assessment.satisfied;
 
@@ -614,6 +623,11 @@ fn render_completion_view(
         "readiness":"requires_bound_goal_verification",
         "blocked":blocked,
         "suggestions":["Topology is optional unless required by the bound user participation contract. Completion remains a governed request, not a count-derived verdict."],
+        "team_quantity": {
+            "minimum":program.required_team_count, "exact":program.exact_team_count,
+            "provenance_version":program.team_count_contract_version,
+            "valid":program.validate_team_quantity_contract().is_ok()
+        },
         "completion_gap": completion_gap,
         "facts": {
             "teams": teams,
@@ -668,6 +682,7 @@ enum ClosureBlock {
     TasksNotAccepted,
     ReviewReadinessUnknown,
     RequiredGoalObligations,
+    TeamQuantityUnknown,
 }
 
 struct CompletionFacts {
@@ -752,7 +767,9 @@ impl CompletionAssessment {
         if !facts.issue_blockers.is_empty() {
             remaining.push(ClosureStep::ClassifyIssues);
         }
-        let blocked = if facts.pending > 0 {
+        let blocked = if program.validate_team_quantity_contract().is_err() {
+            Some(ClosureBlock::TeamQuantityUnknown)
+        } else if facts.pending > 0 {
             Some(ClosureBlock::TasksNotAccepted)
         } else if gap.is_none()
             && facts.required_teams == 0

@@ -3522,7 +3522,7 @@ fn seed_teams(projection: &mut crate::agentic::program::AgenticProgramProjection
 }
 
 #[test]
-fn the_operator_team_count_is_a_ceiling_only_when_it_was_named() {
+fn an_explicit_exact_team_count_is_a_ceiling() {
     let mut projection =
         crate::agentic::program::AgenticProgramProjection::empty("program-1", "objective-1");
     projection.required_team_count = 3;
@@ -3544,21 +3544,18 @@ fn the_operator_team_count_is_a_ceiling_only_when_it_was_named() {
     );
 }
 
-/// The correction that matters: `required_team_count` is ALSO non-zero when the
-/// runtime infers a structural minimum from independent workstreams, and the
-/// model is explicitly left free to choose a larger topology. Only a NAMED count
-/// (`exact_team_count: Some`) may be a ceiling.
+/// An explicit minimum permits alternative authorized topology above its floor.
 #[test]
-fn an_inferred_team_minimum_is_a_floor_and_not_a_ceiling() {
+fn an_explicit_team_minimum_is_a_floor_and_not_a_ceiling() {
     let mut projection =
         crate::agentic::program::AgenticProgramProjection::empty("program-1", "objective-1");
     projection.required_team_count = 3; // a real floor ...
-    projection.exact_team_count = None; // ... but nobody named a number
+    projection.exact_team_count = None; // ... without an exact upper bound
     seed_teams(&mut projection, 5);
 
     assert!(
         validate_transition(&projection, &team_create("t6", 3, None), 0, None).is_none(),
-        "an inferred minimum must not cap the model's topology choice"
+        "an explicit minimum must not cap the model's topology choice"
     );
 
     // A truly autonomous objective has neither floor nor ceiling.
@@ -5404,4 +5401,118 @@ fn bound_goal_assessment_is_lazy_and_root_only() {
         .actionable
         .iter()
         .all(|action| !action.contains("request Objective completion")));
+}
+
+#[test]
+fn team_quantity_admission_uses_original_journal_and_cold_projection() {
+    for (minimum, exact, admitted) in [(3, None, 4), (3, Some(3), 3), (0, None, 4), (0, Some(0), 0)]
+    {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = AgentActionService::new(Arc::clone(&store));
+        for index in 0..4 {
+            let action = team_create(&format!("quantity-{index}"), minimum, exact);
+            let receipt = service.apply(&action).unwrap();
+            if index < admitted {
+                assert_eq!(
+                    receipt.status,
+                    AgentActionStatus::Applied,
+                    "{minimum}/{exact:?}: {receipt:?}"
+                );
+            } else {
+                assert_eq!(receipt.status, AgentActionStatus::Rejected, "{receipt:?}");
+                assert_eq!(
+                    receipt.error.as_ref().unwrap().code,
+                    "team_ceiling_reached",
+                    "{receipt:?}"
+                );
+            }
+        }
+        if admitted > 0 {
+            let hot = service.project("program-1").unwrap();
+            assert_eq!(
+                (
+                    hot.required_team_count,
+                    hot.exact_team_count,
+                    hot.team_count_contract_version
+                ),
+                (minimum, exact, 1)
+            );
+            assert_eq!(hot.teams.len(), admitted);
+            let cold = AgentActionService::new(store).project("program-1").unwrap();
+            assert_eq!(cold, hot);
+        } else {
+            assert!(
+                service.project("program-1").is_err(),
+                "rejected first Team must not bootstrap a Program"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_team_quantity_and_forbidden_team_are_distinct_from_zero_minimum() {
+    let mut projection = crate::AgenticProgramProjection::empty("program-1", "objective-1");
+    projection.exact_team_count = Some(0);
+    assert_eq!(
+        validate_transition(&projection, &team_create("forbidden", 0, Some(0)), 0, None)
+            .unwrap()
+            .0,
+        "team_ceiling_reached"
+    );
+    projection.exact_team_count = None;
+    assert!(validate_transition(
+        &projection,
+        &team_create("optional-reviewer", 0, None),
+        0,
+        None
+    )
+    .is_none());
+    projection.team_count_contract_version = 0;
+    assert_eq!(
+        validate_transition(&projection, &team_create("unknown", 0, None), 0, None)
+            .unwrap()
+            .0,
+        "team_quantity_unknown"
+    );
+    projection.team_count_contract_version = 2;
+    projection.exact_team_count = Some(0);
+    assert!(projection.validate_team_quantity_contract().is_err());
+}
+
+#[test]
+fn opened_quantity_decoder_rejects_malformed_present_authority() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    service
+        .apply(&team_create("valid-open", 3, Some(3)))
+        .unwrap();
+    let opened = store
+        .list_stream("agentic-program:program-1")
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == PROGRAM_OPENED_EVENT_KIND)
+        .unwrap();
+    for (field, value) in [
+        ("exact_team_count", json!(999)),
+        ("exact_team_count", json!("3")),
+        ("team_count_contract_version", json!("1")),
+        ("required_team_count", json!(-1)),
+    ] {
+        let mut corrupted = opened.clone();
+        corrupted.payload[field] = value;
+        assert!(
+            projection_from_opened("program-1", &corrupted).is_err(),
+            "{field}"
+        );
+    }
+    let mut legacy = opened;
+    legacy
+        .payload
+        .as_object_mut()
+        .unwrap()
+        .remove("team_count_contract_version");
+    let legacy = projection_from_opened("program-1", &legacy).unwrap();
+    assert_eq!(legacy.team_count_contract_version, 0);
+    assert_eq!(legacy.exact_team_count, Some(3));
+    assert!(legacy.validate_team_quantity_contract().is_ok());
 }

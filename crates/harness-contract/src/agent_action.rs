@@ -567,10 +567,8 @@ pub struct AgentActorBinding {
     /// inherited by delegated actors and never accepted in model tool JSON.
     #[serde(default)]
     pub required_team_count: u8,
-    /// The operator's NAMED Team count. Present exactly when the operator named
-    /// one; it is the only source of a binding team contract, so it is also the
-    /// only case that may become a binding CEILING. A prose "use teams" hint
-    /// never raises this, and the model stays free to choose the topology.
+    /// Only an explicit exact quantity imposes a ceiling. Some(0) prohibits
+    /// Teams; None permits additional Teams above the frozen minimum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_team_count: Option<u8>,
     /// Trusted immutable preview of the user Objective. It is persisted when

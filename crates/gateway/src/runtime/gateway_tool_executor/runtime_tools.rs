@@ -699,16 +699,20 @@ impl GatewayToolExecutor {
             })?;
             let actor = match binding.parent_execution {
                 Some(parent) => {
-                    let trusted_root = binding.execution_decision.and_then(|decision| {
-                        (decision.execution_graph_ref.as_deref()
-                            == Some(parent.execution_id.as_str())
-                            && decision.session_ref.as_deref() == binding.session_id
-                            && decision
-                                .turn_ref
-                                .as_deref()
-                                .is_some_and(|turn| !turn.is_empty()))
-                        .then(|| root_agent_action_actor(binding))
-                    });
+                    let trusted_root = binding
+                        .execution_decision
+                        .and_then(|decision| {
+                            (decision.execution_graph_ref.as_deref()
+                                == Some(parent.execution_id.as_str())
+                                && decision.session_ref.as_deref() == binding.session_id
+                                && decision
+                                    .turn_ref
+                                    .as_deref()
+                                    .is_some_and(|turn| !turn.is_empty()))
+                            .then(|| root_agent_action_actor(binding))
+                        })
+                        .transpose()
+                        .map_err(ToolError::new)?;
                     services
                         .resolve_agent_action_actor(parent, trusted_root)
                         .await

@@ -50,6 +50,7 @@ pub(crate) fn prepare(
     let source = crate::AgentActionService::new(Arc::clone(store))
         .project(source_id)
         .map_err(|e| e.to_string())?;
+    source.validate_team_quantity_contract()?;
     let source_stream = format!("agentic-program:{source_id}");
     let cursor = store
         .list_stream_page_desc(&source_stream, 1, 0)?
@@ -61,6 +62,7 @@ pub(crate) fn prepare(
         || source.turn_id != binding.source_turn_id
         || source.root_execution_id.as_deref() != Some(binding.source_root_id.as_str())
         || cursor != Some(binding.delivery_revision)
+        || actor.exact_team_count != source.exact_team_count
         || actor.required_team_count != source.required_team_count
         || actor.objective_summary != source.objective_summary
     {
@@ -85,6 +87,8 @@ pub(crate) fn prepare(
         "program_id": seed.program_id, "objective_id": seed.objective_id,
         "session_id": seed.session_id, "turn_id": seed.turn_id,
         "root_execution_id": seed.root_execution_id, "required_team_count": seed.required_team_count,
+        "exact_team_count": seed.exact_team_count,
+        "team_count_contract_version": seed.team_count_contract_version,
         "objective_summary": seed.objective_summary, "model_lease": seed.model_lease,
         "permission_ceiling": seed.permission_ceiling, "resource_scopes": seed.resource_scopes,
         "continuation_seed": seed,
@@ -319,6 +323,43 @@ mod tests {
     }
 
     #[test]
+    fn continuation_seed_preserves_minimum_exact_and_forbidden_quantity() {
+        for (minimum, exact) in [(3, None), (3, Some(3)), (0, None), (0, Some(0))] {
+            let mut original = super::super::program::AgenticProgramProjection::empty(
+                "old-program",
+                "old-objective",
+            );
+            original.required_team_count = minimum;
+            original.exact_team_count = exact;
+            let binding = harness_contract::turn::CollaborationContinuationBinding {
+                source_session_id: "continuation-session".into(),
+                source_turn_id: "old-turn".into(),
+                source_root_id: "old-root".into(),
+                team_set_ref: "agentic_program:old-program".into(),
+                delivery_revision: 1,
+                result_refs: vec![],
+                current_ingress: "current-ingress".into(),
+                candidate_revision: 1,
+                binding_digest: "bound-identity".into(),
+                authorization: ContinuationAuthorization::Authorized,
+                authorization_revision: 1,
+                handoff_id: None,
+            };
+            let seed =
+                revision_seed(&original, &binding, &actor("next-turn", "next-root")).unwrap();
+            assert_eq!(
+                (
+                    seed.required_team_count,
+                    seed.exact_team_count,
+                    seed.team_count_contract_version
+                ),
+                (minimum, exact, 1)
+            );
+            assert!(seed.validate_team_quantity_contract().is_ok());
+        }
+    }
+
+    #[test]
     fn unfinished_continuation_is_atomic_fenced_and_recoverable() {
         let store = Arc::new(RuntimeEventStore::for_test());
         let commits = crate::ExecutionCommitService::new(Arc::clone(&store));
@@ -357,6 +398,20 @@ mod tests {
         assert!(
             commits.register_graph(next.clone()).is_err(),
             "cannot register an unfinished continuation without inherited Program facts"
+        );
+        let mut changed_quantity = current.clone();
+        changed_quantity.exact_team_count = Some(changed_quantity.required_team_count);
+        assert!(
+            commits
+                .register_graph_with_continuation(next.clone(), Some(changed_quantity))
+                .is_err(),
+            "continuation cannot turn the original minimum into an exact ceiling"
+        );
+        assert!(
+            crate::AgentActionService::new(Arc::clone(&store))
+                .project(&current.program_id)
+                .is_err(),
+            "rejected continuation must leave no target Program"
         );
         let receipt = commits
             .register_graph_with_continuation(next.clone(), Some(current.clone()))

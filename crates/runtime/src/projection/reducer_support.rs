@@ -1137,6 +1137,8 @@ fn agentic_collaboration_projection(
                     turn_id: program.turn_id.clone(),
                     root_execution_id: program.root_execution_id.clone(),
                     required_team_count: program.required_team_count,
+                    exact_team_count: program.exact_team_count,
+                    team_count_contract_version: program.team_count_contract_version,
                     model_lease: program.model_lease.clone(),
                     permission_ceiling: program.permission_ceiling,
                     resource_scopes: program.resource_scopes.clone(),

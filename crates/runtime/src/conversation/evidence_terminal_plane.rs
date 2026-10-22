@@ -1810,7 +1810,7 @@ where
         turn_ref: &str,
         execution_graph_ref: &str,
     ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
-        let recovered = self.recover_turn_strategy_identity(turn_ref, execution_graph_ref);
+        let recovered = self.recover_turn_strategy_identity(turn_ref, execution_graph_ref)?;
         let recovered_identity = recovered.is_some();
         let (state, should_emit, previous) = {
             let mut guard = self
@@ -1831,9 +1831,7 @@ where
                 state.selected_candidate = recovered.selected_candidate;
                 state.status = recovered.status;
                 state.resource_snapshot = recovered.resource_snapshot;
-                if recovered.collaboration_obligation.is_some() {
-                    state.decision.collaboration_obligation = recovered.collaboration_obligation;
-                }
+                state.decision.collaboration_obligation = recovered.collaboration_obligation;
                 state.decision.decision_id = recovered.decision_id;
                 state.decision.decision_revision = recovered.revision;
                 state.decision.lease.lease_id = recovered.decision_lease;
@@ -1901,8 +1899,10 @@ where
         &self,
         turn_ref: &str,
         execution_graph_ref: &str,
-    ) -> Option<RecoveredTurnStrategyIdentity> {
-        let store = self.runtime_event_store.as_ref()?;
+    ) -> Result<Option<RecoveredTurnStrategyIdentity>, RuntimeError> {
+        let Some(store) = self.runtime_event_store.as_ref() else {
+            return Ok(None);
+        };
         let session_id = self.session_id().to_string();
         let events = store
             .list_stream(&format!("session:{session_id}"))
@@ -1910,8 +1910,8 @@ where
                 tracing::warn!(%error, session_id, turn_ref, "failed to inspect durable strategy identity");
                 error
             })
-            .ok()?;
-        events
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let event = events
             .into_iter()
             .rev()
             .filter(|event| {
@@ -1923,65 +1923,69 @@ where
                         | "runtime.strategy.outcome"
                 )
             })
-            .find_map(|event| {
-                let payload = event.payload;
-                if payload.get("turn_ref").and_then(serde_json::Value::as_str) != Some(turn_ref)
-                    || payload
+            .find(|event| {
+                event
+                    .payload
+                    .get("turn_ref")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(turn_ref)
+                    && event
+                        .payload
                         .get("execution_graph_ref")
                         .and_then(serde_json::Value::as_str)
-                        != Some(execution_graph_ref)
-                {
-                    return None;
+                        == Some(execution_graph_ref)
+            });
+        let Some(event) = event else {
+            return Ok(None);
+        };
+        let recovered = (|| {
+            let payload = event.payload;
+            let collaboration_obligation = match payload.get("collaboration_obligation") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let obligation: harness_contract::strategy::CollaborationExecutionObligation =
+                        serde_json::from_value(value.clone()).ok()?;
+                    obligation.validate().ok()?;
+                    Some(obligation)
                 }
-                let pattern = match payload
-                    .get("selected_pattern")
-                    .and_then(serde_json::Value::as_str)?
-                {
-                    "direct" => harness_contract::core::ExecutionPattern::Direct,
-                    "explore" => harness_contract::core::ExecutionPattern::Explore,
-                    "execute" => harness_contract::core::ExecutionPattern::Execute,
-                    "deliberate" => harness_contract::core::ExecutionPattern::Deliberate,
-                    "collaborate" => harness_contract::core::ExecutionPattern::Collaborate,
-                    "supervise" => harness_contract::core::ExecutionPattern::Supervise,
-                    _ => return None,
-                };
-                Some(RecoveredTurnStrategyIdentity {
-                    decision_id: payload.get("decision_id")?.as_str()?.to_string(),
-                    decision_lease: payload.get("decision_lease")?.as_str()?.to_string(),
-                    revision: payload.get("decision_revision")?.as_u64()?,
-                    policy_version: payload.get("policy_version")?.as_str()?.to_string(),
-                    selected_candidate: serde_json::from_value(
-                        payload.get("selected_candidate")?.clone(),
-                    )
-                    .ok()?,
-                    status: serde_json::from_value(payload.get("status")?.clone()).ok()?,
-                    resource_snapshot: serde_json::from_value(
-                        payload.get("resource_snapshot")?.clone(),
-                    )
-                    .ok()?,
-                    candidate_estimates: serde_json::from_value(
-                        payload.get("candidate_estimates")?.clone(),
-                    )
-                    .ok()?,
-                    collaboration_obligation: payload
-                        .get("collaboration_obligation")
-                        .filter(|value| !value.is_null())
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .and_then(|obligation: harness_contract::strategy::CollaborationExecutionObligation| {
-                            // Only an operator-named obligation is honoured on
-                            // recovery. A persisted pre-G1 inferred obligation
-                            // (`exact_team_count == None`) is discarded so an
-                            // upgrade cannot resurrect a forced topology.
-                            obligation
-                                .validate()
-                                .ok()
-                                .filter(|_| obligation.exact_team_count.is_some())
-                                .map(|()| obligation)
-                        }),
-                    pattern,
-                })
+            };
+            let pattern = match payload
+                .get("selected_pattern")
+                .and_then(serde_json::Value::as_str)?
+            {
+                "direct" => harness_contract::core::ExecutionPattern::Direct,
+                "explore" => harness_contract::core::ExecutionPattern::Explore,
+                "execute" => harness_contract::core::ExecutionPattern::Execute,
+                "deliberate" => harness_contract::core::ExecutionPattern::Deliberate,
+                "collaborate" => harness_contract::core::ExecutionPattern::Collaborate,
+                "supervise" => harness_contract::core::ExecutionPattern::Supervise,
+                _ => return None,
+            };
+            Some(RecoveredTurnStrategyIdentity {
+                decision_id: payload.get("decision_id")?.as_str()?.to_string(),
+                decision_lease: payload.get("decision_lease")?.as_str()?.to_string(),
+                revision: payload.get("decision_revision")?.as_u64()?,
+                policy_version: payload.get("policy_version")?.as_str()?.to_string(),
+                selected_candidate: serde_json::from_value(
+                    payload.get("selected_candidate")?.clone(),
+                )
+                .ok()?,
+                status: serde_json::from_value(payload.get("status")?.clone()).ok()?,
+                resource_snapshot: serde_json::from_value(
+                    payload.get("resource_snapshot")?.clone(),
+                )
+                .ok()?,
+                candidate_estimates: serde_json::from_value(
+                    payload.get("candidate_estimates")?.clone(),
+                )
+                .ok()?,
+                collaboration_obligation,
+                pattern,
             })
+        })();
+        recovered.map(Some).ok_or_else(|| {
+            RuntimeError::new("durable strategy identity or Team quantity provenance is invalid")
+        })
     }
 
     pub(super) fn revise_active_turn_strategy(

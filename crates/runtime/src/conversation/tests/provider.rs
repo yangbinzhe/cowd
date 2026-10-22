@@ -4317,6 +4317,7 @@ fn explicit_team_obligation_is_durable_and_recoverable() {
     );
     let recovered = runtime
         .recover_turn_strategy_identity("provider-turn", "provider-graph")
+        .expect("valid durable strategy identity")
         .expect("recover frozen strategy identity");
     assert_eq!(
         recovered
@@ -5912,4 +5913,63 @@ mod r1_native_real_wire {
             Some(owner)
         );
     }
+}
+
+#[test]
+fn durable_strategy_quantity_refuses_invalid_latest_instead_of_falling_back() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let runtime = ConversationRuntime::new(
+        Session::new(),
+        MockApi,
+        CollaborationAvailableExecutor,
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_runtime_event_store(Arc::clone(&store));
+    runtime
+        .begin_turn_strategy("quantity-turn", "启动至少三个团队")
+        .unwrap();
+    runtime
+        .bind_turn_strategy_execution("quantity-turn", "quantity-root")
+        .unwrap();
+    let recovered = runtime
+        .recover_turn_strategy_identity("quantity-turn", "quantity-root")
+        .unwrap()
+        .unwrap();
+    let minimum = recovered.collaboration_obligation.unwrap();
+    assert_eq!(
+        (
+            minimum.minimum_team_count,
+            minimum.exact_team_count,
+            minimum.team_count_contract_version
+        ),
+        (3, None, 1)
+    );
+    let event = store
+        .list_stream(&format!("session:{}", runtime.session_id()))
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == "runtime.strategy.selected")
+        .unwrap();
+    let mut payload = event.payload;
+    payload["collaboration_obligation"]["team_count_contract_version"] = serde_json::json!(0);
+    store
+        .append(crate::RuntimeEventInput {
+            stream_id: event.stream_id,
+            scope: event.scope,
+            kind: event.kind,
+            status: event.status,
+            actor: event.actor,
+            refs: event.refs,
+            payload,
+        })
+        .unwrap();
+    assert!(runtime
+        .recover_turn_strategy_identity("quantity-turn", "quantity-root")
+        .is_err());
+    assert!(runtime
+        .bind_turn_strategy_execution("quantity-turn", "quantity-root")
+        .is_err());
 }

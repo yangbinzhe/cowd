@@ -40,7 +40,7 @@
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         };
 
-        let actor = root_agent_action_actor(binding);
+        let actor = root_agent_action_actor(binding).unwrap();
         assert_eq!(
             actor.resource_scopes,
             vec![
@@ -441,4 +441,60 @@
                 .as_deref()
                 .is_some_and(|error| error.contains("requires signed Runtime authorization")));
         }
+    }
+
+    #[test]
+    fn root_actor_preserves_frozen_team_quantity_without_manufacturing_a_ceiling() {
+        for (prompt, minimum, exact) in [
+            ("启动至少三个团队", 3, None),
+            ("启动恰好三个团队", 3, Some(3)),
+            ("不要创建任何团队", 0, Some(0)),
+            ("无需创建团队", 0, None),
+        ] {
+            let decision = runtime::build_runtime_execution_decision(prompt, None);
+            let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
+                tool_lease: None,
+                action_id: None,
+                session_id: Some("quantity-session"),
+                authorized_scopes: &[],
+                memory_context: None,
+                reality_context: None,
+                model_lease: Some("local-contract-only"),
+                parent_execution: None,
+                execution_decision: Some(&decision),
+                permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            })
+            .unwrap();
+            assert_eq!(
+                (actor.required_team_count, actor.exact_team_count),
+                (minimum, exact),
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_actor_refuses_unproven_or_missing_frozen_team_obligation() {
+        let mut decision = runtime::build_runtime_execution_decision("启动至少三个团队", None);
+        decision
+            .collaboration_obligation
+            .as_mut()
+            .unwrap()
+            .team_count_contract_version = 0;
+        let mut missing = decision.clone();
+        missing.collaboration_obligation = None;
+        let bind = |decision| RuntimeToolExecutionBinding {
+            tool_lease: None,
+            action_id: None,
+            session_id: Some("quantity-session"),
+            authorized_scopes: &[],
+            memory_context: None,
+            reality_context: None,
+            model_lease: Some("local-contract-only"),
+            parent_execution: None,
+            execution_decision: Some(decision),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        };
+        assert!(root_agent_action_actor(bind(&decision)).is_err());
+        assert!(root_agent_action_actor(bind(&missing)).is_err());
     }

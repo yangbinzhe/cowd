@@ -2763,6 +2763,7 @@ impl AgentActionService {
                         "root_execution_id": envelope.actor.root_execution_id,
                         "required_team_count": envelope.actor.required_team_count,
                         "exact_team_count": envelope.actor.exact_team_count,
+                        "team_count_contract_version": 1,
                         "objective_summary": envelope.actor.objective_summary,
                         "model_lease": envelope.actor.model_lease,
                         "permission_ceiling": envelope.actor.permission_ceiling,
@@ -4126,17 +4127,29 @@ fn projection_from_opened(
         .get("root_execution_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    projection.required_team_count = opened
-        .payload
-        .get("required_team_count")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-        .unwrap_or_default();
-    projection.exact_team_count = opened
-        .payload
-        .get("exact_team_count")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok());
+    // Absence is the explicit historical schema. A malformed present field
+    // must not silently erase an exact ceiling or impersonate that schema.
+    projection.required_team_count = serde_json::from_value(
+        opened
+            .payload
+            .get("required_team_count")
+            .cloned()
+            .unwrap_or(json!(0)),
+    )?;
+    projection.team_count_contract_version = serde_json::from_value(
+        opened
+            .payload
+            .get("team_count_contract_version")
+            .cloned()
+            .unwrap_or(json!(0)),
+    )?;
+    projection.exact_team_count = serde_json::from_value(
+        opened
+            .payload
+            .get("exact_team_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )?;
     projection.objective_summary = opened
         .payload
         .get("objective_summary")

@@ -744,6 +744,10 @@ pub struct AgenticCollaborationProgramProjectionV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_execution_id: Option<String>,
     pub required_team_count: u8,
+    #[serde(default)]
+    pub exact_team_count: Option<u8>,
+    #[serde(default)]
+    pub team_count_contract_version: u8,
     pub model_lease: String,
     pub permission_ceiling: crate::policy::PermissionMode,
     #[serde(default)]

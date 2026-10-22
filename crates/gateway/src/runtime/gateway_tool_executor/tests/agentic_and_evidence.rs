@@ -517,7 +517,8 @@ async fn publication_creation_identity_gateway_case() {
         parent_execution: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-    });
+    })
+    .unwrap();
     let mut adjudication = harness_contract::agent_action::MessagePublishInput {
         topic_ref: "topic:program".into(),
         summary: Some("disclose the sourced limitation".into()),
@@ -819,7 +820,7 @@ async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
         "receipt must echo the Runtime-parsed physical content_ref"
     );
 
-    let actor = root_agent_action_actor(binding);
+    let actor = root_agent_action_actor(binding).unwrap();
     let before_rejected_external_write = services
         .agent_action_service()
         .project(&actor.program_id)
@@ -1383,7 +1384,8 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
         parent_execution: Some(&parent),
         execution_decision: Some(&decision),
         ..binding
-    });
+    })
+    .unwrap();
     let root_action =
         |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
             action_id: action_id.into(),
@@ -1590,7 +1592,7 @@ async fn context_program_discovery_uses_one_authorized_revision_and_real_request
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
     let actor = services
-        .resolve_agent_action_actor(&parent, Some(root_agent_action_actor(binding)))
+        .resolve_agent_action_actor(&parent, Some(root_agent_action_actor(binding).unwrap()))
         .await
         .expect("authenticated actor");
     let actions = services.agent_action_service();

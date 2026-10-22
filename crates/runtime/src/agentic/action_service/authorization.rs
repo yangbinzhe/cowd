@@ -76,15 +76,11 @@ pub(super) fn validate_transition_with_admission_contexts(
     match &envelope.action {
         AgentAction::StateInspect(_) => None,
         AgentAction::TeamCreate(_) => {
-            // Only an operator-named Team count is a binding ceiling. Since
-            // prose inference was removed, `required_team_count > 0` and
-            // `exact_team_count == Some` hold together for exactly that case;
-            // autonomous work leaves `required_team_count == 0` and is never
-            // capped, so the model keeps its full topology choice.
-            if let Some(ceiling) = projection
-                .exact_team_count
-                .filter(|_| projection.required_team_count > 0)
-            {
+            if let Err(reason) = projection.validate_team_quantity_contract() {
+                return Some(("team_quantity_unknown", reason));
+            }
+            // Minimums leave additional Teams free; exact zero forbids the first.
+            if let Some(ceiling) = projection.exact_team_count {
                 if projection.teams.len() >= usize::from(ceiling) {
                     return Some((
                         "team_ceiling_reached",

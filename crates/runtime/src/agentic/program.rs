@@ -41,9 +41,11 @@ pub struct AgenticProgramProjection {
     pub turn_id: String,
     pub root_execution_id: Option<String>,
     pub required_team_count: u8,
-    /// The operator's NAMED Team count; `None` when the operator named none.
-    /// Only a named count is a binding ceiling.
+    /// Explicit exact quantity; None leaves topology above the minimum free.
+    /// Some(0) is an explicit prohibition.
     pub exact_team_count: Option<u8>,
+    #[serde(default)]
+    pub team_count_contract_version: u8,
     pub objective_summary: String,
     pub model_lease: String,
     pub permission_ceiling: harness_contract::policy::PermissionMode,
@@ -119,6 +121,22 @@ impl AgenticProgramProjection {
         }
     }
 
+    /// Validate original frozen quantity authority, including recovered journals.
+    /// An unknown legacy minimum cannot become either an exact cap or no constraint.
+    pub(crate) fn validate_team_quantity_contract(&self) -> Result<(), String> {
+        if self.team_count_contract_version > 1
+            || (self.team_count_contract_version == 0 && self.exact_team_count.is_none())
+        {
+            return Err("Team quantity provenance is unknown".into());
+        }
+        if let Some(exact) = self.exact_team_count {
+            if exact != self.required_team_count || self.teams.len() > usize::from(exact) {
+                return Err("frozen exact Team quantity is inconsistent with Program facts".into());
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn empty(program_id: impl Into<String>, objective_id: impl Into<String>) -> Self {
         Self {
@@ -129,6 +147,7 @@ impl AgenticProgramProjection {
             root_execution_id: None,
             required_team_count: 0,
             exact_team_count: None,
+            team_count_contract_version: 1,
             objective_summary: String::new(),
             model_lease: "default".to_string(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,

@@ -1288,18 +1288,15 @@ where
             resolved_objective = source.objective_summary.clone();
             graph.objective = resolved_objective.clone();
             let mut turn_state = state.lock().await;
-            // Only an operator-named Team requirement survives a continuation.
-            // A pre-G1 inferred minimum has `exact_team_count == None` and is
-            // dropped, so an upgrade cannot resurrect a forced topology.
-            let continued_required_team_count = if source.exact_team_count.is_some() {
-                source.required_team_count
-            } else {
-                0
-            };
+            // Unknown historical minima must not resurrect inferred topology.
+            // Versioned explicit minima and exact/prohibited bounds survive unchanged.
+            source.validate_team_quantity_contract().map_err(RuntimeError::new)?;
+            let continued_required_team_count = source.required_team_count;
             if continued_required_team_count > 0 {
                 turn_state.collaboration_obligation = Some(harness_contract::strategy::CollaborationExecutionObligation {
+                    team_count_contract_version: 1,
                     minimum_team_count: continued_required_team_count,
-                    exact_team_count: Some(continued_required_team_count),
+                    exact_team_count: source.exact_team_count,
                 });
             }
             let mut item = ContextItem::new(
@@ -1320,7 +1317,7 @@ where
                 program_id: harness_contract::agent_action::program_id_for_objective(&objective_id), objective_id,
                 session_id: session_id.clone(), turn_id: turn_ref.clone(), root_execution_id: Some(graph.id.clone()),
                 required_team_count: continued_required_team_count, objective_summary: source.objective_summary.clone(),
-                exact_team_count: source.exact_team_count.filter(|_| continued_required_team_count > 0),
+                exact_team_count: source.exact_team_count,
                 model_lease: runtime.lock().await.current_model().unwrap_or("default").to_string(),
                 permission_ceiling: Some(policy.permission_mode),
                 resource_scopes: root_delegation_resource_scopes(evaluation_control.as_ref(), Some(&policy)),
@@ -1372,7 +1369,12 @@ where
                 spec_digest: format!("{:x}", Sha256::digest(resolved_objective.as_bytes())),
                 review_refs: Vec::new(),
                 waiting: None,
-                participation_requirement: strategy.decision.collaboration_obligation.as_ref().map(|obligation| {
+                participation_requirement: continuation_source.as_ref()
+                    .filter(|source| source.required_team_count > 0)
+                    .map(|source| harness_contract::goal::ParticipationRequirement {
+                        minimum_team_count: source.required_team_count,
+                        source_ref: format!("agentic-program:{}@{}", source.program_id, source.revision),
+                    }).or_else(|| strategy.decision.collaboration_obligation.as_ref().map(|obligation| {
                     harness_contract::goal::ParticipationRequirement {
                         minimum_team_count: obligation.required_team_count(),
                         source_ref: ingress.as_ref().map_or_else(
@@ -1380,7 +1382,7 @@ where
                             |value| format!("session_message:{}", value.message_id),
                         ),
                     }
-                }),
+                })),
                 obligations: Vec::new(),
                 recovery: None,
                 terminal: None,
@@ -3479,6 +3481,7 @@ fn test_collaboration_obligation(
     minimum_team_count: u8,
 ) -> harness_contract::strategy::CollaborationExecutionObligation {
     harness_contract::strategy::CollaborationExecutionObligation {
+        team_count_contract_version: 1,
         minimum_team_count,
         exact_team_count: None,
     }

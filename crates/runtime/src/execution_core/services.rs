@@ -2349,6 +2349,7 @@ impl RuntimeServices {
                     return Err("agent_actor_program_binding_mismatch".to_string());
                 }
                 root.required_team_count = program.required_team_count;
+                root.exact_team_count = program.exact_team_count;
                 root.objective_summary = program.objective_summary;
                 root.model_lease = program.model_lease;
                 root.permission_ceiling = Some(program.permission_ceiling);
@@ -2505,7 +2506,7 @@ impl RuntimeServices {
             turn_id: projection.turn_id,
             root_execution_id: projection.root_execution_id,
             required_team_count: projection.required_team_count,
-            exact_team_count: None,
+            exact_team_count: projection.exact_team_count,
             objective_summary: projection.objective_summary,
             model_lease: projection.model_lease,
             permission_ceiling: Some(projection.permission_ceiling),

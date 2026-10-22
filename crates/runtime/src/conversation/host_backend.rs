@@ -2279,11 +2279,11 @@ where
                                         .count();
                                     let mut outstanding: Vec<String> = Vec::new();
                                     if program.teams.len()
-                                        < usize::from(program.required_team_count.max(1))
+                                        < usize::from(program.required_team_count)
                                     {
                                         outstanding.push("team".to_string());
                                     }
-                                    if published == 0 {
+                                    if published == 0 && program.required_team_count > 0 {
                                         outstanding.push("publish_task".to_string());
                                     }
                                     if claimed < published {
@@ -5231,6 +5231,7 @@ mod safety_fuse_streak_tests {
         use super::collaboration_ceiling_reached;
         use harness_contract::strategy::CollaborationExecutionObligation;
         let obligation = CollaborationExecutionObligation {
+            team_count_contract_version: 1,
             minimum_team_count: 3,
             exact_team_count: None,
         };
@@ -5274,6 +5275,7 @@ mod safety_fuse_streak_tests {
         use harness_contract::strategy::CollaborationExecutionObligation;
         use std::time::Duration;
         let obligation = CollaborationExecutionObligation {
+            team_count_contract_version: 1,
             minimum_team_count: 3,
             exact_team_count: None,
         };
@@ -5544,6 +5546,7 @@ mod own865_execution_health_tests {
         let made_progress = std::mem::take(&mut stored_progress);
         assert!(!stored_progress);
         let obligation = harness_contract::strategy::CollaborationExecutionObligation {
+            team_count_contract_version: 1,
             minimum_team_count: 1,
             exact_team_count: None,
         };

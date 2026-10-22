@@ -230,7 +230,17 @@ fn serialize_agent_action_receipt(
 
 fn root_agent_action_actor(
     binding: RuntimeToolExecutionBinding<'_>,
-) -> harness_contract::agent_action::AgentActorBinding {
+) -> Result<harness_contract::agent_action::AgentActorBinding, String> {
+    if let Some(decision) = binding.execution_decision {
+        if let Some(obligation) = &decision.collaboration_obligation {
+            obligation.validate()?;
+            if decision.strategy.understanding.forbids_team {
+                return Err("Team prohibition conflicts with a collaboration obligation".into());
+            }
+        } else if decision.strategy.understanding.required_team_count > 0 {
+            return Err("explicit Team minimum has no frozen obligation".into());
+        }
+    }
     let session_id = binding.session_id.unwrap_or("standalone-session");
     let turn_id = binding
         .execution_decision
@@ -242,12 +252,17 @@ fn root_agent_action_actor(
         .execution_decision
         .and_then(|decision| decision.collaboration_obligation.as_ref())
         .map_or(0, |obligation| obligation.required_team_count());
-    // The ceiling needs the operator's NAMED count; it is `None` when the
-    // operator named none and the model chooses the topology freely.
+    // Only an exact request has a ceiling; an explicit prohibition is zero.
     let exact_team_count = binding
         .execution_decision
         .and_then(|decision| decision.collaboration_obligation.as_ref())
-        .and_then(|obligation| obligation.exact_team_count);
+        .and_then(|obligation| obligation.exact_team_count)
+        .or_else(|| {
+            binding
+                .execution_decision
+                .filter(|decision| decision.strategy.understanding.forbids_team)
+                .map(|_| 0)
+        });
     let mut resource_scopes = binding.authorized_scopes.to_vec();
     if let Some(decision) = binding.execution_decision {
         resource_scopes.extend(
@@ -262,7 +277,7 @@ fn root_agent_action_actor(
     resource_scopes.sort();
     resource_scopes.dedup();
     let actor_id = format!("root:{session_id}");
-    harness_contract::agent_action::AgentActorBinding {
+    Ok(harness_contract::agent_action::AgentActorBinding {
         objective_id,
         program_id,
         session_id: session_id.to_string(),
@@ -281,7 +296,7 @@ fn root_agent_action_actor(
         execution_id: None,
         team_id: None,
         agent_id: None,
-    }
+    })
 }
 
 fn is_gateway_context_tool(tool_name: &str) -> bool {

@@ -468,14 +468,21 @@ fn narrative_generation_without_an_artifact_is_not_a_workspace_write() {
 
 #[test]
 fn artifact_actions_cannot_borrow_objects_from_another_clause() {
-    for prompt in [
-        "请用一句话说明当前工作目录的名称；这是连通性检查，不需要创建团队。",
-        "Describe the current directory; there is no need to create a team.",
-        "检查当前文件夹；不要创建团队",
+    for (prompt, forbidden) in [
+        (
+            "请用一句话说明当前工作目录的名称；这是连通性检查，不需要创建团队。",
+            false,
+        ),
+        (
+            "Describe the current directory; there is no need to create a team.",
+            false,
+        ),
+        ("检查当前文件夹；不要创建团队", true),
     ] {
         let understanding = understand(&StrategyInput::from_prompt(prompt));
         assert!(!understanding.requires_write, "{prompt}");
-        assert!(understanding.forbids_team, "{prompt}");
+        assert_eq!(understanding.forbids_team, forbidden, "{prompt}");
+        assert_eq!(understanding.required_team_count, 0, "{prompt}");
     }
 
     for prompt in [
@@ -1558,7 +1565,7 @@ fn explicit_workspace_sources_become_root_evidence_constraints() {
 #[test]
 fn explicit_collaboration_obligation_freezes_exact_cardinality() {
     let understanding = understand(&StrategyInput::from_prompt(
-        "启动三个研究团队，分别检查三个证据域",
+        "启动恰好三个研究团队，分别检查三个证据域",
     ));
     let obligation = CollaborationExecutionObligation::for_explicit_request(&understanding)
         .expect("explicit Team obligation");
@@ -1577,7 +1584,7 @@ fn inferred_workstreams_cannot_create_a_collaboration_obligation() {
 }
 
 #[test]
-fn singular_explicit_team_freezes_one_exact_team() {
+fn singular_explicit_team_freezes_one_minimum_team() {
     let understanding = understand(&StrategyInput::from_prompt(
         "请启动一个协作团队审查架构并给出工具证据",
     ));
@@ -1586,7 +1593,7 @@ fn singular_explicit_team_freezes_one_exact_team() {
     let obligation = CollaborationExecutionObligation::for_explicit_request(&understanding)
         .expect("explicit Team obligation");
     assert_eq!(obligation.minimum_team_count, 1);
-    assert_eq!(obligation.exact_team_count, Some(1));
+    assert_eq!(obligation.exact_team_count, None);
 }
 
 #[test]
@@ -1786,4 +1793,72 @@ fn affirmative_work_survives_unrelated_negative_actions() {
     ));
     assert_eq!(teams.required_team_count, 2);
     assert!(teams.requests_multi_agent);
+}
+
+#[test]
+fn team_quantity_contract_preserves_minimum_exact_forbidden_and_optional() {
+    for (prompt, minimum, exact, forbidden) in [
+        ("至少三个团队并行检查", 3, None, false),
+        ("启动三个团队并行检查", 3, None, false),
+        ("start at least three teams", 3, None, false),
+        ("启动恰好3个团队", 3, Some(3), false),
+        ("start exactly three teams", 3, Some(3), false),
+        ("start exactly three research teams", 3, Some(3), false),
+        ("初始合同恰好只有两个 required Team", 2, Some(2), false),
+        ("恰好 3 个 turn-scoped custom Team", 3, Some(3), false),
+        ("不要创建任何团队", 0, Some(0), true),
+        ("exactly zero teams", 0, Some(0), true),
+        ("至少0个团队；必要时可以启动一个评审团队", 0, None, false),
+        ("至少0个团队；必须启动三个团队", 3, None, false),
+        ("启动至少三个团队，可以 optionally 附带图表", 3, None, false),
+        ("无需创建团队，更无需恰好零个团队", 0, None, false),
+        (
+            "at least zero teams; optionally create one reviewer team",
+            0,
+            None,
+            false,
+        ),
+        ("无需创建团队", 0, None, false),
+        ("no need to create teams", 0, None, false),
+        ("检查这个模块", 0, None, false),
+    ] {
+        let understanding = understand(&StrategyInput::from_prompt(prompt));
+        assert_eq!(
+            (
+                understanding.required_team_count,
+                understanding.exact_team_count,
+                understanding.forbids_team
+            ),
+            (minimum, exact, forbidden),
+            "{prompt}"
+        );
+        let obligation = CollaborationExecutionObligation::for_explicit_request(&understanding);
+        if minimum > 0 {
+            let obligation = obligation.unwrap();
+            assert_eq!(
+                (obligation.minimum_team_count, obligation.exact_team_count),
+                (minimum, exact)
+            );
+            let restored: CollaborationExecutionObligation =
+                serde_json::from_value(serde_json::to_value(&obligation).unwrap()).unwrap();
+            assert_eq!(restored, obligation);
+            assert!(restored.validate().is_ok());
+        } else {
+            assert!(
+                obligation.is_err(),
+                "zero quantity is not completion debt: {prompt}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unversioned_inferred_minimum_is_not_restored_as_explicit_authority() {
+    let legacy: CollaborationExecutionObligation =
+        serde_json::from_value(serde_json::json!({"minimum_team_count":3})).unwrap();
+    assert!(legacy.validate().is_err());
+    let exact: CollaborationExecutionObligation =
+        serde_json::from_value(serde_json::json!({"minimum_team_count":3,"exact_team_count":3}))
+            .unwrap();
+    assert!(exact.validate().is_ok());
 }

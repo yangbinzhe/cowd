@@ -66,6 +66,9 @@ pub struct TaskUnderstanding {
     /// cardinality parsing is only the ingress fallback used to populate it.
     #[serde(default)]
     pub required_team_count: u8,
+    /// Only an explicit exact quantity imposes an upper bound. Some(0) prohibits Teams.
+    #[serde(default)]
+    pub exact_team_count: Option<u8>,
     #[serde(default)]
     pub forbids_team: bool,
     pub requests_deep_plan: bool,
@@ -90,6 +93,9 @@ pub struct TaskUnderstanding {
 /// weaken or bypass the minimum encoded here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationExecutionObligation {
+    /// Version 1 distinguishes an explicit minimum from historical inferred topology.
+    #[serde(default)]
+    pub team_count_contract_version: u8,
     pub minimum_team_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_team_count: Option<u8>,
@@ -106,8 +112,9 @@ impl CollaborationExecutionObligation {
             );
         }
         let minimum_team_count = understanding.required_team_count;
-        let exact_team_count = Some(understanding.required_team_count);
+        let exact_team_count = understanding.exact_team_count;
         let obligation = Self {
+            team_count_contract_version: 1,
             minimum_team_count,
             exact_team_count,
         };
@@ -116,6 +123,11 @@ impl CollaborationExecutionObligation {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.team_count_contract_version > 1
+            || (self.team_count_contract_version == 0 && self.exact_team_count.is_none())
+        {
+            return Err("Team quantity provenance is unknown".to_string());
+        }
         if self.minimum_team_count == 0 {
             return Err("collaboration obligation requires at least one Team".to_string());
         }
@@ -2429,8 +2441,16 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     // A request may mention teams solely to prohibit them. Treating every
     // occurrence of "team" as an affirmative collaboration request turns a
     // user-selected single-agent execution mode into its opposite.
-    let forbids_team = explicitly_forbids_collaboration(&normalized);
-    let affirmative_collaboration = affirmative_collaboration_text(&affirmative_actions);
+    let collaboration_constraints = affirmative_collaboration_text(&normalized);
+    let affirmative_collaboration = affirmative_action_clauses(&collaboration_constraints);
+    let exact_text = affirmative_collaboration
+        .replace(['*', '`'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let named_exact_team_count = explicit_exact_team_count(&exact_text, TEAM_COUNTS);
+    let forbids_team =
+        explicitly_forbids_collaboration(&normalized) || named_exact_team_count == Some(0);
     // Binding team topology comes only from an operator-named count. A bare
     // request to "use teams" (no countable noun) is a capability hint the model
     // may honour, not a framework-inferred obligation, so it never raises
@@ -2514,6 +2534,11 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         requests_parallelism,
         requests_multi_agent,
         required_team_count,
+        exact_team_count: if forbids_team {
+            Some(0)
+        } else {
+            named_exact_team_count
+        },
         forbids_team,
         requests_deep_plan,
         requests_deliberation,
@@ -2571,19 +2596,12 @@ fn explicitly_forbids_collaboration(normalized: &str) -> bool {
             "不要启动任何团队",
             "禁止创建团队",
             "不启动团队",
-            "无需团队",
-            "不需要团队",
-            "无需创建团队",
-            "不需要创建团队",
-            "不必创建团队",
             "单 agent",
             "单agent",
             "单人执行",
             "don't use team",
             "do not use team",
             "do not start a team",
-            "no need to create a team",
-            "no need to create teams",
             "single agent",
             "single-agent",
         ],
@@ -2599,7 +2617,35 @@ fn explicitly_forbids_collaboration(normalized: &str) -> bool {
 fn affirmative_collaboration_text(normalized: &str) -> String {
     normalized
         .split(['。', '.', '；', ';', '！', '!', '？', '?', '\n'])
-        .filter(|clause| !is_non_prescriptive_topology_clause(clause))
+        .filter(|clause| {
+            !is_non_prescriptive_topology_clause(clause)
+                && ![
+                    "必要时可以",
+                    "optionally",
+                    "please optionally",
+                    "无需",
+                    "更无需",
+                    "不需要",
+                    "不必",
+                    "no need",
+                    "there is no need",
+                    "do not need",
+                ]
+                .iter()
+                .any(|prefix| clause.trim_start().starts_with(prefix))
+                && !contains_any(
+                    clause,
+                    &[
+                        "无需团队",
+                        "不需要团队",
+                        "无需创建团队",
+                        "不需要创建团队",
+                        "不必创建团队",
+                        "no need to create a team",
+                        "no need to create teams",
+                    ],
+                )
+        })
         .collect::<Vec<_>>()
         .join(";")
 }
@@ -3377,6 +3423,18 @@ fn explicit_workstream_count(normalized: &str) -> u8 {
     requested
 }
 
+const TEAM_COUNTS: &[(&str, &str, u8)] = &[
+    ("一", "one", 1),
+    ("二", "two", 2),
+    ("两", "two", 2),
+    ("三", "three", 3),
+    ("四", "four", 4),
+    ("五", "five", 5),
+    ("六", "six", 6),
+    ("七", "seven", 7),
+    ("八", "eight", 8),
+];
+
 /// Return the explicit number of Team entities requested by the user.
 ///
 /// This is deliberately distinct from Agent/workstream cardinality: two
@@ -3390,28 +3448,18 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
     let affirmative = affirmative_collaboration_text(&markdown_stripped);
     let normalized = affirmative.split_whitespace().collect::<Vec<_>>().join(" ");
     let normalized = affirmative_collaboration_text(&normalized);
-    const COUNTS: &[(&str, &str, u8)] = &[
-        ("一", "one", 1),
-        ("二", "two", 2),
-        ("两", "two", 2),
-        ("三", "three", 3),
-        ("四", "four", 4),
-        ("五", "five", 5),
-        ("六", "six", 6),
-        ("七", "seven", 7),
-        ("八", "eight", 8),
-    ];
+    let counts = TEAM_COUNTS;
     // `恰好`/`正好`/`exactly` is a stronger cardinality contract than the
     // permissive natural-language heuristics below.  In long prompts those
     // heuristics can otherwise connect an unrelated later number to a distant
     // `Team` token and silently inflate the requested topology.  Preserve the
     // first explicit exact contract: it is the user's unambiguous instruction.
-    if let Some(exact) = explicit_exact_team_count(&normalized, COUNTS) {
+    if let Some(exact) = explicit_exact_team_count(&normalized, counts) {
         return exact;
     }
     let ordinal_count = explicit_team_ordinal_count(&normalized);
     let mut cardinal_normalized = normalized.clone();
-    for (chinese, _, count) in COUNTS {
+    for (chinese, _, count) in counts {
         for role in ["团队", "研究团队", "协作团队"] {
             cardinal_normalized = cardinal_normalized
                 .replace(&format!("第{chinese}个{role}"), "")
@@ -3427,7 +3475,7 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
     // Team entity and must never bind a topology.
     let english_normalized = strip_modifier_english_team(&cardinal_normalized);
     let mut requested = 0_u8;
-    for (chinese, english, count) in COUNTS.iter().rev() {
+    for (chinese, english, count) in counts.iter().rev() {
         let arabic = count.to_string();
         let chinese_match = ["团队", "研究团队", "协作团队"].iter().any(|role| {
             [
@@ -3495,26 +3543,46 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
 
 fn explicit_exact_team_count(normalized: &str, counts: &[(&str, &str, u8)]) -> Option<u8> {
     let mut first_match: Option<(usize, u8)> = None;
-    for (chinese, english, count) in counts {
+    for (chinese, english, count) in std::iter::once(&("零", "zero", 0)).chain(counts.iter()) {
         let arabic = count.to_string();
-        let patterns = [
-            format!("恰好{chinese}个 team"),
-            format!("正好{chinese}个 team"),
-            format!("恰好{chinese}个团队"),
-            format!("正好{chinese}个团队"),
-            format!("恰好{arabic}个team"),
-            format!("正好{arabic}个team"),
-            format!("恰好 {arabic} 个 team"),
-            format!("正好 {arabic} 个 team"),
-            format!("exactly {english} teams"),
-            format!("exactly {arabic} teams"),
-            format!("exactly {english} team"),
-            format!("exactly {arabic} team"),
-        ];
-        for pattern in patterns {
-            if let Some(offset) = normalized.find(&pattern) {
-                if first_match.map_or(true, |(first_offset, _)| offset < first_offset) {
-                    first_match = Some((offset, *count));
+        for prefix in ["恰好", "正好", "仅", "只有", "恰好只有"] {
+            for number in [*chinese, arabic.as_str()] {
+                for noun in [
+                    "团队",
+                    "研究团队",
+                    "协作团队",
+                    "team",
+                    "required team",
+                    "turn-scoped custom team",
+                ] {
+                    for pattern in [
+                        format!("{prefix}{number}个{noun}"),
+                        format!("{prefix}{number}个 {noun}"),
+                        format!("{prefix} {number} 个 {noun}"),
+                    ] {
+                        if let Some(offset) = normalized.find(&pattern) {
+                            if first_match.map_or(true, |(first, _)| offset < first) {
+                                first_match = Some((offset, *count));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for prefix in ["exactly", "only"] {
+            for number in [*english, arabic.as_str()] {
+                for noun in [
+                    "team",
+                    "research team",
+                    "review team",
+                    "collaboration team",
+                    "required team",
+                ] {
+                    if let Some(offset) = normalized.find(&format!("{prefix} {number} {noun}")) {
+                        if first_match.map_or(true, |(first, _)| offset < first) {
+                            first_match = Some((offset, *count));
+                        }
+                    }
                 }
             }
         }
