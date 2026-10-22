@@ -38,6 +38,7 @@ pub const CORE_HUMAN_CAPABILITIES: &[&str] = &[
     "runtime.task.read",
     "runtime.task.write",
     "session.outcome.write",
+    "session.read",
     "skill.revision.manage",
     "surface.dispatch",
     "work_context.read",

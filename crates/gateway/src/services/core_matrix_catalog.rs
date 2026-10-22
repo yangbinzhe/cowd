@@ -29,33 +29,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::core_platform_operations::{
-    AppendApplicationExecutionSummaryOutput, ApprovalDecideInput, ApprovalDecideOutput,
-    ApprovalSubmitInput, ApprovalSubmitOutput, ConnectorSurfaceDispatchBatchInput,
-    ConnectorSurfaceDispatchBatchOutput, CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput,
-    CrossPlaneDispatchInput, CrossPlaneDispatchOutput, PlatformGovernanceSnapshotInput,
-    PlatformGovernanceSnapshotOutput, RuntimeCancelStructuredTaskInput,
-    RuntimeCancelStructuredTaskOutput, RuntimeExecutionProjectionChangesInput,
-    RuntimeExecutionProjectionChangesOutput, RuntimeExecutionProjectionSnapshotInput,
-    RuntimeExecutionProjectionSnapshotOutput, RuntimeStartGoalInput, RuntimeStartGoalOutput,
-    RuntimeStartStructuredTaskInput, RuntimeStartStructuredTaskOutput, SurfaceOutboxListInput,
-    SurfaceOutboxListOutput, WorkContextInspectStructuredTaskResultInput,
-    WorkContextInspectStructuredTaskResultOutput, WorkContextInspectTaskTerminalInput,
-    WorkContextInspectTaskTerminalOutput, WorkContextRecordTaskTerminalInput,
-    WorkContextRecordTaskTerminalOutput, WorkContextStructuredEvidenceItemInput,
-    WorkContextStructuredEvidenceItemOutput, WorkContextTaskExistsInput,
-    WorkContextTaskExistsOutput, ACTION_PLAN_OPERATION_ID, APPROVAL_DECIDE_OPERATION_ID,
-    APPROVAL_SUBMIT_OPERATION_ID, CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
-    CROSS_PLANE_DISPATCH_OPERATION_ID, PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
-    RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID, RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
-    RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID, RUNTIME_START_GOAL_OPERATION_ID,
-    RUNTIME_START_STRUCTURED_TASK_OPERATION_ID, SURFACE_OUTBOX_LIST_OPERATION_ID,
-    WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
-    WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
-    WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
-    WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
-    WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID, WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
-};
 use super::{matrix_app_reality::MatrixAppRealityError, ContextService};
 use matrix_repository::MatrixStore;
 
@@ -274,160 +247,21 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
             "skill.entity_impact_batch",
             OperationKindV1::Query,
         ),
-        platform_definition::<CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput>(
-            ACTION_PLAN_OPERATION_ID,
-            "core.cross_plane.read",
-            "cross_plane.plan.governed",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<SurfaceOutboxListInput, SurfaceOutboxListOutput>(
-            SURFACE_OUTBOX_LIST_OPERATION_ID,
-            "core.surface.outbox.read",
-            "surface.outbox.query.governed",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<RuntimeStartGoalInput, RuntimeStartGoalOutput>(
-            RUNTIME_START_GOAL_OPERATION_ID,
-            "runtime.task.write",
-            "runtime.goal.start",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<RuntimeStartStructuredTaskInput, RuntimeStartStructuredTaskOutput>(
-            RUNTIME_START_STRUCTURED_TASK_OPERATION_ID,
-            "runtime.task.write",
-            "runtime.structured_task.start",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<RuntimeCancelStructuredTaskInput, RuntimeCancelStructuredTaskOutput>(
-            RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID,
-            "runtime.task.write",
-            "runtime.structured_task.cancel",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<ApprovalSubmitInput, ApprovalSubmitOutput>(
-            APPROVAL_SUBMIT_OPERATION_ID,
-            "approval.submit",
-            "approval.submit",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<ApprovalDecideInput, ApprovalDecideOutput>(
-            APPROVAL_DECIDE_OPERATION_ID,
-            "approval.respond",
-            "approval.decide",
-            OperationKindV1::Command,
-            OperationDelegationV1::User,
-        ),
-        platform_definition::<CrossPlaneDispatchInput, CrossPlaneDispatchOutput>(
-            CROSS_PLANE_DISPATCH_OPERATION_ID,
-            "cross_plane.dispatch",
-            "cross_plane.dispatch.governed",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<
-            ConnectorSurfaceDispatchBatchInput,
-            ConnectorSurfaceDispatchBatchOutput,
-        >(
-            CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
-            "surface.dispatch",
-            "surface.dispatch.governed",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<WorkContextTaskExistsInput, WorkContextTaskExistsOutput>(
-            WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
-            "runtime.task.read",
-            "task.exists",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<
-            WorkContextInspectTaskTerminalInput,
-            WorkContextInspectTaskTerminalOutput,
-        >(
-            WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
-            "runtime.task.read",
-            "task.terminal.inspect",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<
-            WorkContextRecordTaskTerminalInput,
-            WorkContextRecordTaskTerminalOutput,
-        >(
-            WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
-            "work_context.write",
-            "task.terminal.observe",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<
-            WorkContextStructuredEvidenceItemInput,
-            WorkContextStructuredEvidenceItemOutput,
-        >(
-            WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
-            "work_context.read",
-            "context.structured_evidence.read",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<
-            WorkContextInspectStructuredTaskResultInput,
-            WorkContextInspectStructuredTaskResultOutput,
-        >(
-            WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
-            "runtime.task.read",
-            "runtime.structured_task_result.inspect",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<
-            cowd_app_protocol::ApplicationExecutionSummaryIntentV1,
-            AppendApplicationExecutionSummaryOutput,
-        >(
-            WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
-            "session.outcome.write",
-            "session.application_execution_summary.append",
-            OperationKindV1::Command,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<PlatformGovernanceSnapshotInput, PlatformGovernanceSnapshotOutput>(
-            PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
-            "platform.governance.read",
-            "platform.governance.snapshot",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
     ]
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
-    values.extend(runtime_projection_definitions()?);
-    values.push(platform_definition::<
-        cowd_app_protocol::SessionTerminalReceiptReadInputV1,
-        harness_contract::live::SessionMessageReceiptContext,
-    >(
-        super::core_platform_operations::SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
-        "session.read",
-        "session.terminal_receipt.read",
-        OperationKindV1::Query,
-        OperationDelegationV1::User,
-    )?);
-    values.push(platform_definition::<
-        cowd_app_protocol::SessionTerminalReceiptAckInputV1,
-        harness_contract::live::SessionMessageAck,
-    >(
-        super::core_platform_operations::SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
-        "session.read",
-        "session.terminal_receipt.ack",
-        OperationKindV1::Command,
-        OperationDelegationV1::User,
-    )?);
+    values.extend(
+        super::core_platform_operations::platform_operations()
+            .map_err(CoreMatrixCatalogError::Invalid)?
+            .iter()
+            .cloned()
+            .map(|definition| CoreMatrixOperationDefinition {
+                short_id: definition.operation_id,
+                descriptor: definition.descriptor,
+                input_schema: definition.input_schema,
+                output_schema: definition.output_schema,
+            }),
+    );
     sort_and_validate_definitions(&mut values)?;
     Ok(values)
 }
@@ -444,8 +278,9 @@ fn sort_and_validate_definitions(
         .iter()
         .map(|operation| format!("{CORE_PREFIX}{operation}"))
         .chain(
-            super::core_platform_operations::PLATFORM_OPERATION_IDS
-                .iter()
+            super::core_platform_operations::platform_operation_ids()
+                .map_err(CoreMatrixCatalogError::Invalid)?
+                .into_iter()
                 .map(|operation| operation.to_string()),
         )
         .collect::<Vec<_>>();
@@ -467,99 +302,6 @@ fn validate_definition_ids(
         ));
     }
     Ok(())
-}
-
-fn runtime_projection_definitions(
-) -> Result<Vec<CoreMatrixOperationDefinition>, CoreMatrixCatalogError> {
-    [
-        platform_definition::<
-            RuntimeExecutionProjectionSnapshotInput,
-            RuntimeExecutionProjectionSnapshotOutput,
-        >(
-            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
-            "runtime.task.read",
-            "runtime.execution_projection.snapshot",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-        platform_definition::<
-            RuntimeExecutionProjectionChangesInput,
-            RuntimeExecutionProjectionChangesOutput,
-        >(
-            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
-            "runtime.task.read",
-            "runtime.execution_projection.changes",
-            OperationKindV1::Query,
-            OperationDelegationV1::Either,
-        ),
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn platform_definition<I: JsonSchema, O: JsonSchema>(
-    operation_id: &'static str,
-    core_capability: &'static str,
-    audit_classification: &'static str,
-    kind: OperationKindV1,
-    delegation: OperationDelegationV1,
-) -> Result<CoreMatrixOperationDefinition, CoreMatrixCatalogError> {
-    let input_schema = canonicalize(
-        serde_json::to_value(schema_for!(I))
-            .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?,
-    );
-    let output_schema = canonicalize(
-        serde_json::to_value(schema_for!(O))
-            .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?,
-    );
-    let descriptor = OperationDescriptorV1 {
-        operation_id: operation_id.to_owned(),
-        kind,
-        input_schema_digest: schema_digest(&input_schema)?,
-        output_schema_digest: schema_digest(&output_schema)?,
-        required_capabilities: vec![core_capability.to_owned()],
-        delegation,
-        tenant_scoped: false,
-        workspace_scoped: true,
-        read_only: kind == OperationKindV1::Query,
-        idempotency: if kind == OperationKindV1::Query {
-            IdempotencySemanticsV1::ReadOnly
-        } else {
-            IdempotencySemanticsV1::Required
-        },
-        default_deadline_ms: if kind == OperationKindV1::Query {
-            10_000
-        } else {
-            30_000
-        },
-        maximum_deadline_ms: if kind == OperationKindV1::Query {
-            30_000
-        } else {
-            120_000
-        },
-        maximum_request_bytes: 1024 * 1024,
-        maximum_response_bytes: if operation_id
-            == super::core_platform_operations::SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID
-        {
-            16 * 1024 * 1024 + 64 * 1024
-        } else {
-            4 * 1024 * 1024
-        },
-        maximum_frame_bytes: 1024 * 1024,
-        streaming: false,
-        replay_window_seconds: None,
-        degraded_read_allowed: false,
-        audit_classification: audit_classification.to_owned(),
-    };
-    descriptor
-        .validate()
-        .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?;
-    Ok(CoreMatrixOperationDefinition {
-        short_id: operation_id,
-        descriptor,
-        input_schema,
-        output_schema,
-    })
 }
 
 pub(crate) fn projected_catalog(
@@ -1081,8 +823,8 @@ mod tests {
             .iter()
             .map(|definition| (definition.descriptor.operation_id.as_str(), definition))
             .collect::<BTreeMap<_, _>>();
-        let mut operation_ids =
-            super::super::core_platform_operations::BUSINESS_OPERATION_IDS.to_vec();
+        let mut operation_ids = super::super::core_platform_operations::business_operation_ids()
+            .expect("business operation registry");
         operation_ids.sort_unstable();
         let mut schema_files = Vec::<(String, Vec<u8>)>::new();
         let mut operations = Vec::new();
@@ -1204,8 +946,6 @@ mod tests {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        assert_eq!(authority.len(), 62);
-        assert_eq!(dispatcher_ids.len(), 42);
         assert_eq!(authority_ids, dispatcher_ids);
         let platform_authority_ids = authority
             .iter()
@@ -1213,11 +953,15 @@ mod tests {
             .map(|definition| definition.descriptor.operation_id.as_str())
             .collect::<BTreeSet<_>>();
         let platform_dispatcher_ids =
-            super::super::core_platform_operations::PLATFORM_OPERATION_IDS
+            super::super::core_platform_operations::platform_operation_ids()
+                .expect("platform operation registry")
                 .into_iter()
                 .collect::<BTreeSet<_>>();
-        assert_eq!(platform_dispatcher_ids.len(), 20);
         assert_eq!(platform_authority_ids, platform_dispatcher_ids);
+        assert_eq!(
+            authority.len(),
+            dispatcher_ids.len() + platform_dispatcher_ids.len()
+        );
         assert!(platform_dispatcher_ids
             .iter()
             .all(|operation_id| super::super::core_platform_operations::supports(operation_id)));
@@ -1306,8 +1050,10 @@ mod tests {
             fs::create_dir_all(root).expect("create Runtime projection schema export root");
         }
         for operation_id in [
-            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
-            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+            super::super::core_platform_operations::
+                RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+            super::super::core_platform_operations::
+                RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
         ] {
             let definition = authority
                 .iter()

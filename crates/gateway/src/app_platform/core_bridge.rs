@@ -1573,6 +1573,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn verified_app_binding_derives_receipt_frame_policy_from_registry_not_app_name() {
+        let authority = core_matrix_catalog::definitions().expect("definitions");
+        let business_ids = core_platform_operations::business_operation_ids()
+            .expect("business operation ids")
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let definitions = authority
+            .iter()
+            .filter(|definition| business_ids.contains(definition.descriptor.operation_id.as_str()))
+            .collect::<Vec<_>>();
+        let manifest = fixture_business_manifest(&definitions);
+        let (app_operation_id, definition) = manifest
+            .core_bridge_requirements
+            .iter()
+            .find_map(|edge| {
+                (edge.core_operation_id
+                    == core_platform_operations::SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID)
+                    .then(|| {
+                        (
+                            edge.app_operation_id.clone(),
+                            authority
+                                .iter()
+                                .find(|definition| {
+                                    definition.descriptor.operation_id == edge.core_operation_id
+                                })
+                                .expect("receipt ACK authority"),
+                        )
+                    })
+            })
+            .expect("receipt ACK signed edge");
+        let mut envelope = fixture_envelope(
+            &definition.descriptor,
+            vec!["fixture.invoke".to_owned(), "session.read".to_owned()],
+        );
+        envelope.operation_id = app_operation_id;
+        envelope.principal.delegation = DelegationKindV1::User;
+        envelope.payload = serde_json::json!({
+            "message_id": "message-1",
+            "message_sequence": "1",
+            "runtime_commit_cursor": "9007199254740993",
+            "content_digest": format!("session-public-v1:sha256:{}", "a".repeat(64)),
+        });
+        let verified = runtime::VerifiedPrincipal::from_test_claims(
+            harness_contract::security::PrincipalClaims {
+                principal_id: envelope.principal.subject.clone(),
+                tenant_id: envelope.principal.tenant_id.clone(),
+                grant_id: envelope.principal.grant_id.clone(),
+                kind: harness_contract::security::PrincipalKind::Human,
+                scopes: Vec::new(),
+                capabilities: envelope.principal.granted_capabilities.clone(),
+                assurance: harness_contract::security::PrincipalAssurance::HumanInteractive,
+                issuer: "test.core-bridge".to_owned(),
+                issued_at_ms: now_unix_ms(),
+                expires_at_ms: envelope.principal.expires_at_unix_ms,
+                credential_fingerprint: "receipt-frame-policy".to_owned(),
+                credential_epoch: envelope.principal.credential_epoch,
+                profile_revision: envelope.principal.authorization_revision,
+                app_profiles: BTreeMap::new(),
+            },
+        );
+        let bindings = core_platform_operations::CorePlatformBindings::default();
+        assert!(
+            bindings
+                .bind_verified_app_request(&verified, &envelope, "fixture", &manifest, None)
+                .is_err(),
+            "the APP operation name must not hide the registered Host frame policy"
+        );
+        bindings
+            .bind_verified_app_request(
+                &verified,
+                &envelope,
+                "fixture",
+                &manifest,
+                Some("frame-reference"),
+            )
+            .expect("registered receipt ACK frame policy admits the bound source");
+    }
+
     fn base_request(
         method: Method,
         uri: &str,
@@ -1919,9 +1998,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_uds_h2_dispatches_all_fourteen_core_business_operations() {
+    async fn real_uds_h2_dispatches_all_registered_non_frame_core_business_operations() {
         let authority = core_matrix_catalog::definitions().expect("definitions");
-        let business_ids = core_platform_operations::BUSINESS_OPERATION_IDS
+        let business_ids = core_platform_operations::non_frame_operation_ids()
+            .expect("non-frame operation registry")
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         let mut definitions = authority
@@ -1933,7 +2013,7 @@ mod tests {
                 .operation_id
                 .cmp(&right.descriptor.operation_id)
         });
-        assert_eq!(definitions.len(), 14);
+        assert_eq!(definitions.len(), business_ids.len());
         let manifest = fixture_business_manifest(&definitions);
         let (_bundle, app_platform, manifest) = admitted_test_platform(manifest);
         let generation = GenerationId(
@@ -2012,7 +2092,7 @@ mod tests {
             (core_platform_operations::WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID, serde_json::json!({"schema_version":1,"session_id":"session-uds","summary":{"schema_version":1,"summary_id":"uds-summary","kind":"task","status":"succeeded","title":"UDS complete","summary":"All effects reached Core authority.","domain":"test","refs":[],"evidence_refs":[],"metric_refs":[],"counters":[],"occurred_at_ms":1}})),
             (core_platform_operations::PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID, serde_json::json!({})),
         ];
-        assert_eq!(fixtures.len(), 14);
+        assert_eq!(fixtures.len(), business_ids.len());
         let mut query_seed = None;
         let mut command_seed = None;
         let mut cancellation_seed = None;

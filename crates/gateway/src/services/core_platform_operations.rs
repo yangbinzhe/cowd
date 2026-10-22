@@ -3,11 +3,12 @@
 
 use cowd_app_protocol::{
     AppId, AppInvocationEnvelopeV1, ApplicationExecutionSummaryIntentV1,
-    ApplicationExecutionSummaryReceiptV1, ProtocolValidate,
+    ApplicationExecutionSummaryReceiptV1, IdempotencySemanticsV1, OperationDelegationV1,
+    OperationDescriptorV1, OperationKindV1, ProtocolValidate, Sha256Digest,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -62,60 +63,529 @@ pub(crate) const SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID: &str =
 pub(crate) const SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID: &str =
     "core.session.terminal_receipt.ack";
 
-fn frame_scoped_operation(operation: &str) -> bool {
-    matches!(
-        operation,
-        SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID
-            | SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID
-            | RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID
-            | RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID
-    )
+#[derive(Debug, Clone)]
+pub(crate) struct CorePlatformOperationDefinition {
+    pub(crate) operation_id: &'static str,
+    pub(crate) descriptor: OperationDescriptorV1,
+    pub(crate) input_schema: Value,
+    pub(crate) output_schema: Value,
+    handler: CorePlatformHandler,
+    frame_policy: CorePlatformFramePolicy,
+    business: bool,
 }
 
-pub(crate) const PLATFORM_OPERATION_IDS: [&str; 20] = [
-    SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
-    SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
-    ACTION_PLAN_OPERATION_ID,
-    SURFACE_OUTBOX_LIST_OPERATION_ID,
-    RUNTIME_START_GOAL_OPERATION_ID,
-    RUNTIME_START_STRUCTURED_TASK_OPERATION_ID,
-    RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID,
-    APPROVAL_SUBMIT_OPERATION_ID,
-    APPROVAL_DECIDE_OPERATION_ID,
-    CROSS_PLANE_DISPATCH_OPERATION_ID,
-    CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
-    WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
-    WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
-    WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
-    WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
-    WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
-    WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
-    PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
-    RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
-    RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CorePlatformHandler {
+    TerminalReceiptRead,
+    TerminalReceiptAck,
+    ActionPlan,
+    SurfaceOutboxList,
+    StartGoal,
+    StartStructuredTask,
+    CancelStructuredTask,
+    ApprovalSubmit,
+    ApprovalDecide,
+    CrossPlaneDispatch,
+    SurfaceDispatchBatch,
+    TaskExists,
+    InspectTaskTerminal,
+    RecordTaskTerminal,
+    StructuredEvidenceItem,
+    InspectStructuredTaskResult,
+    AppendApplicationExecutionSummary,
+    GovernanceSnapshot,
+    RuntimeProjectionSnapshot,
+    RuntimeProjectionChanges,
+}
 
-pub(crate) const BUSINESS_OPERATION_IDS: [&str; 16] = [
-    SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
-    SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
-    RUNTIME_START_GOAL_OPERATION_ID,
-    RUNTIME_START_STRUCTURED_TASK_OPERATION_ID,
-    RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID,
-    APPROVAL_SUBMIT_OPERATION_ID,
-    APPROVAL_DECIDE_OPERATION_ID,
-    CROSS_PLANE_DISPATCH_OPERATION_ID,
-    CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
-    WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
-    WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
-    WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
-    WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
-    WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
-    WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
-    PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorePlatformFramePolicy {
+    None,
+    ExactFrameSource,
+    ExactFrameSourceAck,
+}
+
+#[derive(Debug)]
+enum CoreTypedInput {
+    TerminalReceiptRead(cowd_app_protocol::SessionTerminalReceiptReadInputV1),
+    TerminalReceiptAck(cowd_app_protocol::SessionTerminalReceiptAckInputV1),
+    ActionPlan(CrossPlaneActionPlanInput),
+    SurfaceOutboxList(SurfaceOutboxListInput),
+    StartGoal(RuntimeStartGoalInput),
+    StartStructuredTask(RuntimeStartStructuredTaskInput),
+    CancelStructuredTask(RuntimeCancelStructuredTaskInput),
+    ApprovalSubmit(ApprovalSubmitInput),
+    ApprovalDecide(ApprovalDecideInput),
+    CrossPlaneDispatch(CrossPlaneDispatchInput),
+    SurfaceDispatchBatch(ConnectorSurfaceDispatchBatchInput),
+    TaskExists(WorkContextTaskExistsInput),
+    InspectTaskTerminal(WorkContextInspectTaskTerminalInput),
+    RecordTaskTerminal(WorkContextRecordTaskTerminalInput),
+    StructuredEvidenceItem(WorkContextStructuredEvidenceItemInput),
+    InspectStructuredTaskResult(WorkContextInspectStructuredTaskResultInput),
+    AppendApplicationExecutionSummary(ApplicationExecutionSummaryIntentV1),
+    GovernanceSnapshot(PlatformGovernanceSnapshotInput),
+    RuntimeProjectionSnapshot(RuntimeExecutionProjectionSnapshotInput),
+    RuntimeProjectionChanges(RuntimeExecutionProjectionChangesInput),
+}
+
+impl CorePlatformOperationDefinition {
+    fn decode_input(&self, payload: &Value) -> Result<CoreTypedInput, String> {
+        macro_rules! decode {
+            ($variant:ident, $type:ty) => {
+                serde_json::from_value::<$type>(payload.clone())
+                    .map(CoreTypedInput::$variant)
+                    .map_err(|error| format!("invalid `{}` input: {error}", self.operation_id))
+            };
+        }
+        match self.handler {
+            CorePlatformHandler::TerminalReceiptRead => decode!(
+                TerminalReceiptRead,
+                cowd_app_protocol::SessionTerminalReceiptReadInputV1
+            ),
+            CorePlatformHandler::TerminalReceiptAck => decode!(
+                TerminalReceiptAck,
+                cowd_app_protocol::SessionTerminalReceiptAckInputV1
+            ),
+            CorePlatformHandler::ActionPlan => decode!(ActionPlan, CrossPlaneActionPlanInput),
+            CorePlatformHandler::SurfaceOutboxList => {
+                decode!(SurfaceOutboxList, SurfaceOutboxListInput)
+            }
+            CorePlatformHandler::StartGoal => decode!(StartGoal, RuntimeStartGoalInput),
+            CorePlatformHandler::StartStructuredTask => {
+                decode!(StartStructuredTask, RuntimeStartStructuredTaskInput)
+            }
+            CorePlatformHandler::CancelStructuredTask => {
+                decode!(CancelStructuredTask, RuntimeCancelStructuredTaskInput)
+            }
+            CorePlatformHandler::ApprovalSubmit => {
+                decode!(ApprovalSubmit, ApprovalSubmitInput)
+            }
+            CorePlatformHandler::ApprovalDecide => {
+                decode!(ApprovalDecide, ApprovalDecideInput)
+            }
+            CorePlatformHandler::CrossPlaneDispatch => {
+                decode!(CrossPlaneDispatch, CrossPlaneDispatchInput)
+            }
+            CorePlatformHandler::SurfaceDispatchBatch => {
+                decode!(SurfaceDispatchBatch, ConnectorSurfaceDispatchBatchInput)
+            }
+            CorePlatformHandler::TaskExists => {
+                decode!(TaskExists, WorkContextTaskExistsInput)
+            }
+            CorePlatformHandler::InspectTaskTerminal => {
+                decode!(InspectTaskTerminal, WorkContextInspectTaskTerminalInput)
+            }
+            CorePlatformHandler::RecordTaskTerminal => {
+                decode!(RecordTaskTerminal, WorkContextRecordTaskTerminalInput)
+            }
+            CorePlatformHandler::StructuredEvidenceItem => decode!(
+                StructuredEvidenceItem,
+                WorkContextStructuredEvidenceItemInput
+            ),
+            CorePlatformHandler::InspectStructuredTaskResult => decode!(
+                InspectStructuredTaskResult,
+                WorkContextInspectStructuredTaskResultInput
+            ),
+            CorePlatformHandler::AppendApplicationExecutionSummary => decode!(
+                AppendApplicationExecutionSummary,
+                ApplicationExecutionSummaryIntentV1
+            ),
+            CorePlatformHandler::GovernanceSnapshot => {
+                decode!(GovernanceSnapshot, PlatformGovernanceSnapshotInput)
+            }
+            CorePlatformHandler::RuntimeProjectionSnapshot => decode!(
+                RuntimeProjectionSnapshot,
+                RuntimeExecutionProjectionSnapshotInput
+            ),
+            CorePlatformHandler::RuntimeProjectionChanges => decode!(
+                RuntimeProjectionChanges,
+                RuntimeExecutionProjectionChangesInput
+            ),
+        }
+    }
+}
+
+static PLATFORM_OPERATIONS: OnceLock<Result<Vec<CorePlatformOperationDefinition>, String>> =
+    OnceLock::new();
+
+pub(crate) fn platform_operations() -> Result<&'static [CorePlatformOperationDefinition], String> {
+    match PLATFORM_OPERATIONS.get_or_init(build_platform_operations) {
+        Ok(operations) => Ok(operations),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+pub(crate) fn platform_operation_ids() -> Result<Vec<&'static str>, String> {
+    Ok(platform_operations()?
+        .iter()
+        .map(|definition| definition.operation_id)
+        .collect())
+}
+
+pub(crate) fn business_operation_ids() -> Result<Vec<&'static str>, String> {
+    Ok(platform_operations()?
+        .iter()
+        .filter(|definition| definition.business)
+        .map(|definition| definition.operation_id)
+        .collect())
+}
+
+pub(crate) fn bound_operation_ids() -> Result<Vec<&'static str>, String> {
+    Ok(platform_operations()?
+        .iter()
+        .filter(|definition| {
+            !matches!(
+                definition.handler,
+                CorePlatformHandler::ActionPlan | CorePlatformHandler::SurfaceOutboxList
+            )
+        })
+        .map(|definition| definition.operation_id)
+        .collect())
+}
+
+pub(crate) fn non_frame_operation_ids() -> Result<Vec<&'static str>, String> {
+    Ok(platform_operations()?
+        .iter()
+        .filter(|definition| {
+            definition.frame_policy == CorePlatformFramePolicy::None
+                && !matches!(
+                    definition.handler,
+                    CorePlatformHandler::ActionPlan | CorePlatformHandler::SurfaceOutboxList
+                )
+        })
+        .map(|definition| definition.operation_id)
+        .collect())
+}
 
 pub(crate) fn supports(operation_id: &str) -> bool {
-    PLATFORM_OPERATION_IDS.contains(&operation_id)
+    platform_operation(operation_id).is_some()
+}
+
+fn platform_operation(operation_id: &str) -> Option<&'static CorePlatformOperationDefinition> {
+    platform_operations()
+        .ok()?
+        .iter()
+        .find(|definition| definition.operation_id == operation_id)
+}
+
+fn build_platform_operations() -> Result<Vec<CorePlatformOperationDefinition>, String> {
+    [
+        platform_definition::<
+            cowd_app_protocol::SessionTerminalReceiptReadInputV1,
+            harness_contract::live::SessionMessageReceiptContext,
+        >(
+            SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+            CorePlatformHandler::TerminalReceiptRead,
+            "session.read",
+            "session.terminal_receipt.read",
+            OperationKindV1::Query,
+            OperationDelegationV1::User,
+            CorePlatformFramePolicy::ExactFrameSource,
+            true,
+        ),
+        platform_definition::<
+            cowd_app_protocol::SessionTerminalReceiptAckInputV1,
+            harness_contract::live::SessionMessageAck,
+        >(
+            SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+            CorePlatformHandler::TerminalReceiptAck,
+            "session.read",
+            "session.terminal_receipt.ack",
+            OperationKindV1::Command,
+            OperationDelegationV1::User,
+            CorePlatformFramePolicy::ExactFrameSourceAck,
+            true,
+        ),
+        platform_definition::<CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput>(
+            ACTION_PLAN_OPERATION_ID,
+            CorePlatformHandler::ActionPlan,
+            "core.cross_plane.read",
+            "cross_plane.plan.governed",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            false,
+        ),
+        platform_definition::<SurfaceOutboxListInput, SurfaceOutboxListOutput>(
+            SURFACE_OUTBOX_LIST_OPERATION_ID,
+            CorePlatformHandler::SurfaceOutboxList,
+            "core.surface.outbox.read",
+            "surface.outbox.query.governed",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            false,
+        ),
+        platform_definition::<RuntimeStartGoalInput, RuntimeStartGoalOutput>(
+            RUNTIME_START_GOAL_OPERATION_ID,
+            CorePlatformHandler::StartGoal,
+            "runtime.task.write",
+            "runtime.goal.start",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<RuntimeStartStructuredTaskInput, RuntimeStartStructuredTaskOutput>(
+            RUNTIME_START_STRUCTURED_TASK_OPERATION_ID,
+            CorePlatformHandler::StartStructuredTask,
+            "runtime.task.write",
+            "runtime.structured_task.start",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<RuntimeCancelStructuredTaskInput, RuntimeCancelStructuredTaskOutput>(
+            RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID,
+            CorePlatformHandler::CancelStructuredTask,
+            "runtime.task.write",
+            "runtime.structured_task.cancel",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<ApprovalSubmitInput, ApprovalSubmitOutput>(
+            APPROVAL_SUBMIT_OPERATION_ID,
+            CorePlatformHandler::ApprovalSubmit,
+            "approval.submit",
+            "approval.submit",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<ApprovalDecideInput, ApprovalDecideOutput>(
+            APPROVAL_DECIDE_OPERATION_ID,
+            CorePlatformHandler::ApprovalDecide,
+            "approval.respond",
+            "approval.decide",
+            OperationKindV1::Command,
+            OperationDelegationV1::User,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<CrossPlaneDispatchInput, CrossPlaneDispatchOutput>(
+            CROSS_PLANE_DISPATCH_OPERATION_ID,
+            CorePlatformHandler::CrossPlaneDispatch,
+            "cross_plane.dispatch",
+            "cross_plane.dispatch.governed",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<
+            ConnectorSurfaceDispatchBatchInput,
+            ConnectorSurfaceDispatchBatchOutput,
+        >(
+            CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
+            CorePlatformHandler::SurfaceDispatchBatch,
+            "surface.dispatch",
+            "surface.dispatch.governed",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<WorkContextTaskExistsInput, WorkContextTaskExistsOutput>(
+            WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
+            CorePlatformHandler::TaskExists,
+            "runtime.task.read",
+            "task.exists",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<
+            WorkContextInspectTaskTerminalInput,
+            WorkContextInspectTaskTerminalOutput,
+        >(
+            WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
+            CorePlatformHandler::InspectTaskTerminal,
+            "runtime.task.read",
+            "task.terminal.inspect",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<
+            WorkContextRecordTaskTerminalInput,
+            WorkContextRecordTaskTerminalOutput,
+        >(
+            WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
+            CorePlatformHandler::RecordTaskTerminal,
+            "work_context.write",
+            "task.terminal.observe",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<
+            WorkContextStructuredEvidenceItemInput,
+            WorkContextStructuredEvidenceItemOutput,
+        >(
+            WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
+            CorePlatformHandler::StructuredEvidenceItem,
+            "work_context.read",
+            "context.structured_evidence.read",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<
+            WorkContextInspectStructuredTaskResultInput,
+            WorkContextInspectStructuredTaskResultOutput,
+        >(
+            WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
+            CorePlatformHandler::InspectStructuredTaskResult,
+            "runtime.task.read",
+            "runtime.structured_task_result.inspect",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<
+            ApplicationExecutionSummaryIntentV1,
+            AppendApplicationExecutionSummaryOutput,
+        >(
+            WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
+            CorePlatformHandler::AppendApplicationExecutionSummary,
+            "session.outcome.write",
+            "session.application_execution_summary.append",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<PlatformGovernanceSnapshotInput, PlatformGovernanceSnapshotOutput>(
+            PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
+            CorePlatformHandler::GovernanceSnapshot,
+            "platform.governance.read",
+            "platform.governance.snapshot",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::None,
+            true,
+        ),
+        platform_definition::<
+            RuntimeExecutionProjectionSnapshotInput,
+            RuntimeExecutionProjectionSnapshotOutput,
+        >(
+            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+            CorePlatformHandler::RuntimeProjectionSnapshot,
+            "runtime.task.read",
+            "runtime.execution_projection.snapshot",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::ExactFrameSource,
+            false,
+        ),
+        platform_definition::<
+            RuntimeExecutionProjectionChangesInput,
+            RuntimeExecutionProjectionChangesOutput,
+        >(
+            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+            CorePlatformHandler::RuntimeProjectionChanges,
+            "runtime.task.read",
+            "runtime.execution_projection.changes",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+            CorePlatformFramePolicy::ExactFrameSource,
+            false,
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn platform_definition<I: JsonSchema, O: JsonSchema>(
+    operation_id: &'static str,
+    handler: CorePlatformHandler,
+    core_capability: &'static str,
+    audit_classification: &'static str,
+    kind: OperationKindV1,
+    delegation: OperationDelegationV1,
+    frame_policy: CorePlatformFramePolicy,
+    business: bool,
+) -> Result<CorePlatformOperationDefinition, String> {
+    let input_schema = canonicalize(
+        serde_json::to_value(schemars::schema_for!(I)).map_err(|error| error.to_string())?,
+    );
+    let output_schema = canonicalize(
+        serde_json::to_value(schemars::schema_for!(O)).map_err(|error| error.to_string())?,
+    );
+    let read_only = kind == OperationKindV1::Query;
+    let descriptor = OperationDescriptorV1 {
+        operation_id: operation_id.to_owned(),
+        kind,
+        input_schema_digest: schema_digest(&input_schema)?,
+        output_schema_digest: schema_digest(&output_schema)?,
+        required_capabilities: vec![core_capability.to_owned()],
+        delegation,
+        tenant_scoped: false,
+        workspace_scoped: true,
+        read_only,
+        idempotency: if read_only {
+            IdempotencySemanticsV1::ReadOnly
+        } else {
+            IdempotencySemanticsV1::Required
+        },
+        default_deadline_ms: if read_only { 10_000 } else { 30_000 },
+        maximum_deadline_ms: if read_only { 30_000 } else { 120_000 },
+        maximum_request_bytes: 1024 * 1024,
+        maximum_response_bytes: if operation_id == SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID {
+            16 * 1024 * 1024 + 64 * 1024
+        } else {
+            4 * 1024 * 1024
+        },
+        maximum_frame_bytes: 1024 * 1024,
+        streaming: false,
+        replay_window_seconds: None,
+        degraded_read_allowed: false,
+        audit_classification: audit_classification.to_owned(),
+    };
+    descriptor.validate().map_err(|error| error.to_string())?;
+    Ok(CorePlatformOperationDefinition {
+        operation_id,
+        descriptor,
+        input_schema,
+        output_schema,
+        handler,
+        frame_policy,
+        business,
+    })
+}
+
+fn schema_digest(schema: &Value) -> Result<Sha256Digest, String> {
+    let bytes = serde_json::to_vec(schema).map_err(|error| error.to_string())?;
+    Ok(Sha256Digest(format!("sha256:{:x}", Sha256::digest(bytes))))
+}
+
+fn canonicalize(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize).collect()),
+        other => other,
+    }
+}
+
+fn frame_scoped_operation(operation: &str) -> bool {
+    platform_operation(operation)
+        .is_some_and(|definition| definition.frame_policy != CorePlatformFramePolicy::None)
 }
 
 const REQUEST_PRINCIPAL_TTL: Duration = Duration::from_secs(300);
@@ -212,6 +682,8 @@ impl CorePlatformBindings {
             })
             .collect::<BTreeMap<_, _>>();
         let mut allowed_core_operations = BTreeMap::new();
+        let mut requires_frame = false;
+        let mut receipt_ack_intent = None;
         for edge in manifest
             .core_bridge_requirements
             .iter()
@@ -247,26 +719,22 @@ impl CorePlatformBindings {
                     granted_capabilities,
                 },
             );
+            if let Some(platform_operation) = platform_operation(&edge.core_operation_id) {
+                requires_frame |= platform_operation.frame_policy != CorePlatformFramePolicy::None;
+                if platform_operation.handler == CorePlatformHandler::TerminalReceiptAck {
+                    receipt_ack_intent =
+                        Some(
+                            serde_json::from_value::<
+                                cowd_app_protocol::SessionTerminalReceiptAckInputV1,
+                            >(envelope.payload.clone())
+                            .map_err(|_| "invalid explicit receipt ACK intent")?,
+                        );
+                }
+            }
         }
-        let requires_frame = envelope.operation_id.ends_with(".terminal_receipt.read")
-            || envelope.operation_id.ends_with(".terminal_receipt.ack")
-            || envelope
-                .payload
-                .get("execution_id")
-                .is_some_and(|value| !value.is_null());
         if requires_frame && frame_reference.is_none() {
             return Err("current Host frame source is required".into());
         }
-        let receipt_ack_intent = if envelope.operation_id.ends_with(".terminal_receipt.ack") {
-            Some(
-                serde_json::from_value::<cowd_app_protocol::SessionTerminalReceiptAckInputV1>(
-                    envelope.payload.clone(),
-                )
-                .map_err(|_| "invalid explicit receipt ACK intent")?,
-            )
-        } else {
-            None
-        };
         self.insert_bound_principal(
             principal,
             &envelope.request_id,
@@ -1001,10 +1469,11 @@ pub(crate) async fn dispatch(
     operation_id: &str,
     payload: &Value,
 ) -> Result<Value, String> {
-    match operation_id {
-        ACTION_PLAN_OPERATION_ID => {
-            let input = serde_json::from_value::<CrossPlaneActionPlanInput>(payload.clone())
-                .map_err(|error| format!("invalid cross-plane action plan input: {error}"))?;
+    let definition = platform_operation(operation_id)
+        .ok_or_else(|| format!("unknown Core platform operation `{operation_id}`"))?;
+    let input = definition.decode_input(payload)?;
+    match (definition.handler, input) {
+        (CorePlatformHandler::ActionPlan, CoreTypedInput::ActionPlan(input)) => {
             let output = crate::api_routes::cross_plane_routes::core_action_plan(
                 state,
                 envelope.principal.subject.clone(),
@@ -1013,77 +1482,21 @@ pub(crate) async fn dispatch(
             .await;
             serde_json::to_value(output).map_err(|error| error.to_string())
         }
-        SURFACE_OUTBOX_LIST_OPERATION_ID => {
-            let input = serde_json::from_value::<SurfaceOutboxListInput>(payload.clone())
-                .map_err(|error| format!("invalid Surface outbox list input: {error}"))?;
+        (CorePlatformHandler::SurfaceOutboxList, CoreTypedInput::SurfaceOutboxList(input)) => {
             surface_outbox_list(state, input)
                 .and_then(|output| serde_json::to_value(output).map_err(|error| error.to_string()))
         }
-        operation_id if supports(operation_id) => {
+        (_, input) => {
             dispatch_bound_host_operation(
                 state,
                 envelope,
                 app_id,
                 originating_app_operation_id,
-                operation_id,
-                payload,
+                definition,
+                input,
             )
             .await
         }
-        _ => Err(format!("unknown Core platform operation `{operation_id}`")),
-    }
-}
-
-fn validate_typed_input(operation_id: &str, payload: &Value) -> Result<Value, String> {
-    macro_rules! typed {
-        ($ty:ty) => {{
-            let input = serde_json::from_value::<$ty>(payload.clone())
-                .map_err(|error| format!("invalid `{operation_id}` input: {error}"))?;
-            serde_json::to_value(input).map_err(|error| error.to_string())
-        }};
-    }
-    match operation_id {
-        RUNTIME_START_GOAL_OPERATION_ID => typed!(RuntimeStartGoalInput),
-        RUNTIME_START_STRUCTURED_TASK_OPERATION_ID => typed!(RuntimeStartStructuredTaskInput),
-        RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID => typed!(RuntimeCancelStructuredTaskInput),
-        APPROVAL_SUBMIT_OPERATION_ID => typed!(ApprovalSubmitInput),
-        APPROVAL_DECIDE_OPERATION_ID => typed!(ApprovalDecideInput),
-        CROSS_PLANE_DISPATCH_OPERATION_ID => typed!(CrossPlaneDispatchInput),
-        CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID => typed!(ConnectorSurfaceDispatchBatchInput),
-        WORK_CONTEXT_TASK_EXISTS_OPERATION_ID => typed!(WorkContextTaskExistsInput),
-        WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID => {
-            typed!(WorkContextInspectTaskTerminalInput)
-        }
-        WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID => {
-            typed!(WorkContextRecordTaskTerminalInput)
-        }
-        WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID => {
-            typed!(WorkContextStructuredEvidenceItemInput)
-        }
-        WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID => {
-            typed!(WorkContextInspectStructuredTaskResultInput)
-        }
-        WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID => {
-            typed!(ApplicationExecutionSummaryIntentV1)
-        }
-        PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID => {
-            let _: PlatformGovernanceSnapshotInput = serde_json::from_value(payload.clone())
-                .map_err(|error| format!("invalid `{operation_id}` input: {error}"))?;
-            Ok(Value::Null)
-        }
-        SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID => {
-            typed!(cowd_app_protocol::SessionTerminalReceiptReadInputV1)
-        }
-        SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID => {
-            typed!(cowd_app_protocol::SessionTerminalReceiptAckInputV1)
-        }
-        RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID => {
-            typed!(RuntimeExecutionProjectionSnapshotInput)
-        }
-        RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID => {
-            typed!(RuntimeExecutionProjectionChangesInput)
-        }
-        _ => Err(format!("unknown Core platform operation `{operation_id}`")),
     }
 }
 
@@ -1092,25 +1505,17 @@ async fn dispatch_bound_host_operation(
     envelope: &AppInvocationEnvelopeV1,
     app_id: &str,
     originating_app_operation_id: &str,
-    operation_id: &str,
-    payload: &Value,
+    definition: &CorePlatformOperationDefinition,
+    input: CoreTypedInput,
 ) -> Result<Value, String> {
+    let operation_id = definition.operation_id;
     let binding = state.services.core_platform_bindings.resolve(
         envelope,
         app_id,
         originating_app_operation_id,
         operation_id,
     )?;
-    let payload = validate_typed_input(operation_id, payload)?;
-    validate_frame_operation(
-        state,
-        envelope,
-        app_id,
-        originating_app_operation_id,
-        operation_id,
-        &payload,
-    )
-    .await?;
+    validate_bound_frame_operation(state, app_id, definition, &binding, &input).await?;
     if operation_id != RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID
         && envelope.expected_revision.is_some()
     {
@@ -1118,115 +1523,55 @@ async fn dispatch_bound_host_operation(
             "`{operation_id}` does not accept expected_revision"
         ));
     }
-    match operation_id {
-        SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID | SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID => {
-            terminal_receipt_operation(state, &binding, app_id, operation_id, &payload).await
+    match input {
+        CoreTypedInput::TerminalReceiptRead(_) | CoreTypedInput::TerminalReceiptAck(_) => {
+            terminal_receipt_operation(state, &binding, input).await
         }
-        RUNTIME_START_GOAL_OPERATION_ID => encode(
-            start_goal(
-                state,
-                envelope,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        RUNTIME_START_STRUCTURED_TASK_OPERATION_ID => encode(
-            start_structured_task(
-                state,
-                envelope,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID => encode(
-            cancel_structured_task(
-                state,
-                envelope,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        APPROVAL_SUBMIT_OPERATION_ID => encode(
-            approval_submit(
-                state,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        APPROVAL_DECIDE_OPERATION_ID => encode(
-            approval_decide(
-                state,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        CROSS_PLANE_DISPATCH_OPERATION_ID => encode(
-            cross_plane_dispatch(
-                state,
-                envelope,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID => encode(
-            surface_dispatch_batch(state, serde_json::from_value(payload).map_err(json_error)?)
-                .await?,
-        ),
-        WORK_CONTEXT_TASK_EXISTS_OPERATION_ID => encode(task_exists(
-            state,
-            serde_json::from_value(payload).map_err(json_error)?,
-        )?),
-        WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID => encode(
-            inspect_task_terminal(state, serde_json::from_value(payload).map_err(json_error)?)
-                .await?,
-        ),
-        WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID => encode(
-            record_task_terminal(state, serde_json::from_value(payload).map_err(json_error)?)
-                .await?,
-        ),
-        WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID => encode(structured_evidence_item(
-            state,
-            serde_json::from_value(payload).map_err(json_error)?,
-        )?),
-        WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID => encode(
-            inspect_structured_task_result(
-                state,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID => encode(
-            append_application_execution_summary(
-                state,
-                envelope,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID => encode(governance_snapshot(state)),
-        RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID => encode(
-            runtime_execution_projection_snapshot(
-                state,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID => encode(
-            runtime_execution_projection_changes(
-                state,
-                &binding,
-                serde_json::from_value(payload).map_err(json_error)?,
-            )
-            .await?,
-        ),
-        _ => Err(format!("unknown Core platform operation `{operation_id}`")),
+        CoreTypedInput::StartGoal(input) => encode(start_goal(state, envelope, input).await?),
+        CoreTypedInput::StartStructuredTask(input) => {
+            encode(start_structured_task(state, envelope, &binding, input).await?)
+        }
+        CoreTypedInput::CancelStructuredTask(input) => {
+            encode(cancel_structured_task(state, envelope, &binding, input).await?)
+        }
+        CoreTypedInput::ApprovalSubmit(input) => {
+            encode(approval_submit(state, &binding, input).await?)
+        }
+        CoreTypedInput::ApprovalDecide(input) => {
+            encode(approval_decide(state, &binding, input).await?)
+        }
+        CoreTypedInput::CrossPlaneDispatch(input) => {
+            encode(cross_plane_dispatch(state, envelope, input).await?)
+        }
+        CoreTypedInput::SurfaceDispatchBatch(input) => {
+            encode(surface_dispatch_batch(state, input).await?)
+        }
+        CoreTypedInput::TaskExists(input) => encode(task_exists(state, input)?),
+        CoreTypedInput::InspectTaskTerminal(input) => {
+            encode(inspect_task_terminal(state, input).await?)
+        }
+        CoreTypedInput::RecordTaskTerminal(input) => {
+            encode(record_task_terminal(state, input).await?)
+        }
+        CoreTypedInput::StructuredEvidenceItem(input) => {
+            encode(structured_evidence_item(state, input)?)
+        }
+        CoreTypedInput::InspectStructuredTaskResult(input) => {
+            encode(inspect_structured_task_result(state, &binding, input).await?)
+        }
+        CoreTypedInput::AppendApplicationExecutionSummary(input) => {
+            encode(append_application_execution_summary(state, envelope, &binding, input).await?)
+        }
+        CoreTypedInput::GovernanceSnapshot(_) => encode(governance_snapshot(state)),
+        CoreTypedInput::RuntimeProjectionSnapshot(input) => {
+            encode(runtime_execution_projection_snapshot(state, &binding, input).await?)
+        }
+        CoreTypedInput::RuntimeProjectionChanges(input) => {
+            encode(runtime_execution_projection_changes(state, &binding, input).await?)
+        }
+        CoreTypedInput::ActionPlan(_) | CoreTypedInput::SurfaceOutboxList(_) => {
+            Err("Core platform direct handler reached the bound dispatcher".to_owned())
+        }
     }
 }
 
@@ -1263,34 +1608,52 @@ pub(crate) async fn validate_frame_operation(
     operation_id: &str,
     payload: &Value,
 ) -> Result<(), String> {
-    if !frame_scoped_operation(operation_id) {
+    let definition = platform_operation(operation_id)
+        .ok_or_else(|| format!("unknown Core platform operation `{operation_id}`"))?;
+    if definition.frame_policy == CorePlatformFramePolicy::None {
         return Ok(());
     }
+    let input = definition.decode_input(payload)?;
     let binding = state.services.core_platform_bindings.resolve(
         envelope,
         app_id,
         originating_app_operation_id,
         operation_id,
     )?;
+    validate_bound_frame_operation(state, app_id, definition, &binding, &input).await
+}
+
+async fn validate_bound_frame_operation(
+    state: &AppState,
+    app_id: &str,
+    definition: &CorePlatformOperationDefinition,
+    binding: &CoreBoundPrincipal,
+    input: &CoreTypedInput,
+) -> Result<(), String> {
+    if definition.frame_policy == CorePlatformFramePolicy::None {
+        return Ok(());
+    }
     let reference = binding
         .frame_reference
         .as_deref()
         .ok_or("Host frame source required")?;
     let principal = crate::api_routes::AuthenticatedPrincipal(binding.principal.clone());
     let (authority, source) = resolve_host_frame(state, &principal, app_id, reference).await?;
-    if matches!(
-        operation_id,
-        RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID
-            | RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID
-    ) && payload.get("execution_id").and_then(Value::as_str)
-        != Some(source.execution_id.as_str())
-    {
-        return Err("execution is outside the exact frame source".into());
+    if let CoreTypedInput::RuntimeProjectionSnapshot(input) = input {
+        if input.execution_id != source.execution_id {
+            return Err("execution is outside the exact frame source".into());
+        }
     }
-    if operation_id == SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID {
-        let input: cowd_app_protocol::SessionTerminalReceiptAckInputV1 =
-            serde_json::from_value(payload.clone()).map_err(json_error)?;
-        if binding.receipt_ack_intent.as_ref() != Some(&input) {
+    if let CoreTypedInput::RuntimeProjectionChanges(input) = input {
+        if input.execution_id != source.execution_id {
+            return Err("execution is outside the exact frame source".into());
+        }
+    }
+    if definition.frame_policy == CorePlatformFramePolicy::ExactFrameSourceAck {
+        let CoreTypedInput::TerminalReceiptAck(input) = input else {
+            return Err("terminal ACK frame policy received a different typed input".into());
+        };
+        if binding.receipt_ack_intent.as_ref() != Some(input) {
             return Err("Core ACK differs from explicit signed APP ACK intent".into());
         }
         let context = state
@@ -1449,55 +1812,61 @@ async fn current_frame(
 async fn terminal_receipt_operation(
     state: &AppState,
     binding: &CoreBoundPrincipal,
-    _app_id: &str,
-    operation_id: &str,
-    payload: &Value,
+    input: CoreTypedInput,
 ) -> Result<Value, String> {
     let (authority, source) = current_frame(state, binding).await?;
     let mut discovered = None;
-    let message_id = if operation_id == SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID {
-        let input: cowd_app_protocol::SessionTerminalReceiptReadInputV1 =
-            serde_json::from_value(payload.clone()).map_err(json_error)?;
-        match input {
-            cowd_app_protocol::SessionTerminalReceiptReadInputV1::Message { message_id } => {
-                message_id
-            }
-            cowd_app_protocol::SessionTerminalReceiptReadInputV1::BoundSourceTerminal {} => {
-                let runtime = state
-                    .services
-                    .runtime
-                    .as_ref()
-                    .ok_or("Runtime delivery authority unavailable")?;
-                let port = runtime.runtime_services().session_terminal_delivery();
-                let session_id = source.session_id.clone();
-                let execution_id = source.execution_id.clone();
-                let turn_id = source.turn_id.clone();
-                discovered = tokio::task::spawn_blocking(move || {
-                    port.for_execution(&session_id, &execution_id, &turn_id)
-                })
-                .await
-                .map_err(|_| "Runtime terminal discovery unavailable")?
-                .map_err(|_| "Runtime terminal discovery failed")?;
-                current_frame(state, binding).await?;
-                let Some(record) = discovered.as_ref() else {
-                    return encode(harness_contract::live::SessionMessageReceiptContext::Unavailable {
-                        reason: harness_contract::live::SessionMessageReceiptUnavailableReason::UnboundOrInvalidated,
-                    });
-                };
-                if record.session_id != source.session_id
-                    || record.execution_id.as_deref() != Some(source.execution_id.as_str())
-                    || record.turn_id.as_deref() != Some(source.turn_id.as_str())
-                    || record.message_id.is_empty()
-                {
-                    return Err("Runtime terminal discovery returned a foreign source".into());
+    let (operation_id, message_id, ack_input) = match input {
+        CoreTypedInput::TerminalReceiptRead(input) => {
+            let message_id = match input {
+                cowd_app_protocol::SessionTerminalReceiptReadInputV1::Message { message_id } => {
+                    message_id
                 }
-                record.message_id.clone()
-            }
+                cowd_app_protocol::SessionTerminalReceiptReadInputV1::BoundSourceTerminal {} => {
+                    let runtime = state
+                        .services
+                        .runtime
+                        .as_ref()
+                        .ok_or("Runtime delivery authority unavailable")?;
+                    let port = runtime.runtime_services().session_terminal_delivery();
+                    let session_id = source.session_id.clone();
+                    let execution_id = source.execution_id.clone();
+                    let turn_id = source.turn_id.clone();
+                    discovered = tokio::task::spawn_blocking(move || {
+                        port.for_execution(&session_id, &execution_id, &turn_id)
+                    })
+                    .await
+                    .map_err(|_| "Runtime terminal discovery unavailable")?
+                    .map_err(|_| "Runtime terminal discovery failed")?;
+                    current_frame(state, binding).await?;
+                    let Some(record) = discovered.as_ref() else {
+                        return encode(harness_contract::live::SessionMessageReceiptContext::Unavailable {
+                            reason: harness_contract::live::SessionMessageReceiptUnavailableReason::UnboundOrInvalidated,
+                        });
+                    };
+                    if record.session_id != source.session_id
+                        || record.execution_id.as_deref() != Some(source.execution_id.as_str())
+                        || record.turn_id.as_deref() != Some(source.turn_id.as_str())
+                        || record.message_id.is_empty()
+                    {
+                        return Err("Runtime terminal discovery returned a foreign source".into());
+                    }
+                    record.message_id.clone()
+                }
+            };
+            (SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID, message_id, None)
         }
-    } else {
-        let input: cowd_app_protocol::SessionTerminalReceiptAckInputV1 =
-            serde_json::from_value(payload.clone()).map_err(json_error)?;
-        input.message_id
+        CoreTypedInput::TerminalReceiptAck(input) => {
+            let message_id = input.message_id.clone();
+            (
+                SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+                message_id,
+                Some(input),
+            )
+        }
+        _ => {
+            return Err("terminal receipt handler received a different typed input".to_owned());
+        }
     };
     if message_id.is_empty() || message_id.len() > 256 || message_id.chars().any(char::is_control) {
         return Err("invalid terminal message identity".into());
@@ -1574,8 +1943,7 @@ async fn terminal_receipt_operation(
         current_frame(state, binding).await?;
         return encode(context.context);
     }
-    let input: cowd_app_protocol::SessionTerminalReceiptAckInputV1 =
-        serde_json::from_value(payload.clone()).map_err(json_error)?;
+    let input = ack_input.ok_or("terminal ACK handler omitted its typed input")?;
     let cursor =
         harness_contract::live::ReceiptCursor::parse(&input.runtime_commit_cursor)?.value()?;
     match &context.context {
@@ -3597,10 +3965,20 @@ mod tests {
     #[test]
     fn r1_client_receipt_exact_client_overlay_only() {
         let input = serde_json::json!({"message_id":"message","client_id":"forged","source":{"session_id":"foreign"}});
-        assert!(validate_typed_input(SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID, &input).is_err());
+        assert!(
+            platform_operation(SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID)
+                .expect("receipt read registration")
+                .decode_input(&input)
+                .is_err()
+        );
         let input = serde_json::json!({"message_id":"message","message_sequence":"1","runtime_commit_cursor":"9007199254740993",
             "content_digest":format!("session-public-v1:sha256:{}", "a".repeat(64)), "client_id":"forged"});
-        assert!(validate_typed_input(SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID, &input).is_err());
+        assert!(
+            platform_operation(SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID)
+                .expect("receipt ACK registration")
+                .decode_input(&input)
+                .is_err()
+        );
     }
 
     #[test]
@@ -3608,10 +3986,15 @@ mod tests {
         for value in ["9007199254740993", "9223372036854775807"] {
             let input = serde_json::json!({"message_id":"message","message_sequence":value,"runtime_commit_cursor":value,
                 "content_digest":format!("session-public-v1:sha256:{}", "a".repeat(64))});
-            let validated =
-                validate_typed_input(SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID, &input).unwrap();
-            assert_eq!(validated["runtime_commit_cursor"], value);
-            assert_eq!(validated["message_sequence"], value);
+            let validated = platform_operation(SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID)
+                .expect("receipt ACK registration")
+                .decode_input(&input)
+                .unwrap();
+            let CoreTypedInput::TerminalReceiptAck(validated) = validated else {
+                panic!("receipt ACK registration decoded a different handler input");
+            };
+            assert_eq!(validated.runtime_commit_cursor, value);
+            assert_eq!(validated.message_sequence, value);
         }
     }
 
@@ -3792,14 +4175,95 @@ mod tests {
 
     #[test]
     fn platform_dispatch_vocabulary_is_closed_and_unique() {
-        let ids = PLATFORM_OPERATION_IDS
-            .into_iter()
+        let operations = platform_operations().expect("platform operation registry");
+        let ids = operations
+            .iter()
+            .map(|definition| definition.operation_id)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ids.len(), 20);
+        assert_eq!(ids.len(), operations.len());
         assert!(supports(ACTION_PLAN_OPERATION_ID));
         assert!(supports(SURFACE_OUTBOX_LIST_OPERATION_ID));
         assert!(!supports("core.matrix.health"));
         assert!(!supports("example.report.list"));
+    }
+
+    #[test]
+    fn platform_registry_binds_schema_digests_handlers_and_frame_policy() {
+        let operations = platform_operations().expect("platform operation registry");
+        let ids = operations
+            .iter()
+            .map(|definition| definition.operation_id)
+            .collect::<BTreeSet<_>>();
+        let handlers = operations
+            .iter()
+            .map(|definition| definition.handler)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            handlers.len(),
+            operations.len(),
+            "each public operation must have one distinct typed handler"
+        );
+        for definition in operations {
+            assert_eq!(definition.descriptor.operation_id, definition.operation_id);
+            assert_eq!(
+                definition.descriptor.input_schema_digest,
+                schema_digest(&definition.input_schema).expect("input schema digest")
+            );
+            assert_eq!(
+                definition.descriptor.output_schema_digest,
+                schema_digest(&definition.output_schema).expect("output schema digest")
+            );
+            definition
+                .descriptor
+                .validate()
+                .expect("registered descriptor validates");
+        }
+        let frame_operations = operations
+            .iter()
+            .filter(|definition| definition.frame_policy != CorePlatformFramePolicy::None)
+            .map(|definition| definition.operation_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            frame_operations,
+            BTreeSet::from([
+                SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID,
+                SESSION_TERMINAL_RECEIPT_ACK_OPERATION_ID,
+                RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+                RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+            ])
+        );
+        let bound_ids = bound_operation_ids()
+            .expect("bound operation registry")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let non_frame_ids = non_frame_operation_ids()
+            .expect("non-frame operation registry")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(non_frame_ids.is_subset(&bound_ids));
+        assert_eq!(
+            bound_ids,
+            non_frame_ids
+                .union(&frame_operations)
+                .copied()
+                .collect::<BTreeSet<_>>()
+        );
+        let direct_ids = ids.difference(&bound_ids).copied().collect::<BTreeSet<_>>();
+        assert_eq!(
+            direct_ids,
+            BTreeSet::from([ACTION_PLAN_OPERATION_ID, SURFACE_OUTBOX_LIST_OPERATION_ID])
+        );
+        let mutated_schema = serde_json::json!({
+            "type": "object",
+            "properties": {"unregistered": {"type": "string"}},
+            "required": ["unregistered"],
+            "additionalProperties": false,
+        });
+        assert_ne!(
+            schema_digest(&mutated_schema).expect("mutated schema digest"),
+            operations[0].descriptor.input_schema_digest,
+            "a schema mutation must alter the descriptor-bound digest"
+        );
     }
 
     #[test]
@@ -3903,7 +4367,7 @@ mod tests {
     }
 
     #[test]
-    fn all_business_operation_inputs_are_closed_and_dispatchable() {
+    fn all_bound_operation_inputs_are_closed_and_dispatchable() {
         let evidence = serde_json::to_value(MatrixEvidencePacket::new("typed Core evidence"))
             .expect("evidence packet");
         let fixtures = vec![
@@ -3981,9 +4445,16 @@ mod tests {
                 serde_json::json!({"execution_id":"execution-1","after_revision":0,"after_cursor":0,"wait_ms":1}),
             ),
         ];
-        assert_eq!(fixtures.len(), PLATFORM_OPERATION_IDS.len() - 2);
+        assert_eq!(
+            fixtures.len(),
+            bound_operation_ids()
+                .expect("bound operation registry")
+                .len()
+        );
         for (operation_id, payload) in fixtures {
-            validate_typed_input(operation_id, &payload)
+            platform_operation(operation_id)
+                .expect("registered operation")
+                .decode_input(&payload)
                 .unwrap_or_else(|error| panic!("{operation_id} fixture rejected: {error}"));
             let mut tampered = payload;
             tampered
@@ -3991,7 +4462,10 @@ mod tests {
                 .expect("object payload")
                 .insert("unsigned_extra".to_owned(), Value::Bool(true));
             assert!(
-                validate_typed_input(operation_id, &tampered).is_err(),
+                platform_operation(operation_id)
+                    .expect("registered operation")
+                    .decode_input(&tampered)
+                    .is_err(),
                 "{operation_id} accepted an unknown field"
             );
         }
