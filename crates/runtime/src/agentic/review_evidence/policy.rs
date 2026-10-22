@@ -647,6 +647,19 @@ fn pinned_stream_events(
                         task["tool_name"].as_str().is_some_and(goal_metadata_tool)
                             || task["effect"]["effect_kind"] == "read"
                     })
+                })
+                // The review control call is this proof's subject, not
+                // background metadata. The proof is assembled while that call
+                // is in flight, so this plan is the only record of the exact
+                // call that the effect exemption may name.
+                && !event.payload["tasks"].as_array().is_some_and(|tasks| {
+                    tasks.iter().any(|task| {
+                        matches!(
+                            task["tool_name"].as_str(),
+                            Some(harness_contract::agent_action::TASK_REVIEW_TOOL_ID)
+                                | Some(harness_contract::agent_action::OBJECTIVE_REVIEW_TOOL_ID)
+                        )
+                    })
                 }) {
                     continue;
                 }
@@ -3374,6 +3387,39 @@ fn is_authenticated_control_effect(
     })
 }
 
+/// The exact effect identity carried by one proof-manifest entry.
+///
+/// Receipts and intents carry the identity directly. Governed plan tasks carry
+/// it through their Step binding. A malformed or absent binding names no
+/// authenticated control effect and therefore remains in the manifest.
+fn required_effect_identity(payload: &serde_json::Value) -> Option<String> {
+    payload["idempotency_key"]
+        .as_str()
+        .filter(|identity| !identity.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            serde_json::from_value::<crate::step_snapshot::StepCallBinding>(
+                payload["step_binding"].clone(),
+            )
+            .ok()
+            .map(|step| step.effect_idempotency_key())
+        })
+}
+
+/// Remove only effects whose authenticated identity is a settled runtime
+/// control. A business write with the same shape, a control-looking payload
+/// without an authenticated identity, and every unrelated effect stay in the
+/// digest.
+fn strip_authenticated_runtime_control_effects(
+    required_effects: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    runtime_control_keys: &BTreeSet<String>,
+) {
+    required_effects.retain(|_, payload| {
+        required_effect_identity(payload)
+            .is_none_or(|identity| !runtime_control_keys.contains(&identity))
+    });
+}
+
 /// Whether this intent is the reviewer's OWN admitted call.
 ///
 /// Two things have to hold, and they are two different facts:
@@ -5621,10 +5667,19 @@ fn proof_input_snapshot_for_phase(
         }
         if event.kind == "tool.execution_plan.created" {
             if let Some(packet) = delegated_plan_callback_owner(
-                event, &session_events, &related_roots, &delegated_session_packets,
+                event,
+                &session_events,
+                &related_roots,
+                &delegated_session_packets,
             ) {
-                if authenticated_delegated_plan_settled(store, event, &session_events, packet, &mut sources)? {
-                    required_effects.insert(event.event_id.clone(), event.payload.clone());
+                if let Some(effects) = authenticated_delegated_plan_settled(
+                    store,
+                    event,
+                    &session_events,
+                    packet,
+                    &mut sources,
+                )? {
+                    required_effects.extend(effects);
                     continue;
                 }
             }
@@ -5828,6 +5883,7 @@ fn proof_input_snapshot_for_phase(
             ));
         }
     }
+    strip_authenticated_runtime_control_effects(&mut required_effects, &runtime_control_keys);
     let effect_digest = super::proof_value_digest(&required_effects);
     let semantic_digest = super::proof_value_digest(&serde_json::json!({
         "domain":"cowd.proof.inputs.v2","goal_revision":proof.goal_spec_revision,
@@ -5893,15 +5949,17 @@ fn authenticated_delegated_plan_settled(
     events: &[crate::DurableRuntimeEvent],
     packet: &harness_contract::agent::AgentTaskPacket,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<bool, String> {
+) -> Result<Option<std::collections::BTreeMap<String, serde_json::Value>>, String> {
     if plan.actor.as_deref() != Some("conversation_runtime")
-        || plan.schema_version != 1 || plan.scope != crate::RuntimeEventScope::Tool
+        || plan.schema_version != 1
+        || plan.scope != crate::RuntimeEventScope::Tool
         || plan.status.as_deref() != Some("planned")
         || plan.stream_id != format!("session:{}", packet.session_id())
     {
-        return Ok(false);
+        return Ok(None);
     }
-    let tasks = plan.payload["tasks"].as_array()
+    let tasks = plan.payload["tasks"]
+        .as_array()
         .ok_or("delegated tool plan lacks its original tasks")?;
     for task in tasks {
         if task["tool_name"].as_str().is_some_and(goal_metadata_tool)
@@ -5909,14 +5967,21 @@ fn authenticated_delegated_plan_settled(
         {
             continue;
         }
-        let callbacks = events.iter().filter(|terminal| {
-            terminal.kind == "tool.invocation.completed"
-                && terminal.payload["governed_plan_id"] == plan.payload["plan_id"]
-                && terminal.payload["tool_call_id"] == task["tool_call_id"]
-        }).collect::<Vec<_>>();
-        if callbacks.len() != 1 { return Ok(false); }
+        let callbacks = events
+            .iter()
+            .filter(|terminal| {
+                terminal.kind == "tool.invocation.completed"
+                    && terminal.payload["governed_plan_id"] == plan.payload["plan_id"]
+                    && terminal.payload["tool_call_id"] == task["tool_call_id"]
+            })
+            .collect::<Vec<_>>();
+        if callbacks.len() != 1 {
+            return Ok(None);
+        }
         let terminal = callbacks[0];
-        let Some(binding) = terminal.activity_binding() else { return Ok(false); };
+        let Some(binding) = terminal.activity_binding() else {
+            return Ok(None);
+        };
         let step: crate::step_snapshot::StepCallBinding =
             serde_json::from_value(task["step_binding"].clone())
                 .map_err(|_| "delegated callback plan lacks its original Step")?;
@@ -5936,16 +6001,46 @@ fn authenticated_delegated_plan_settled(
             || binding.tool_contract_id.as_deref() != task["tool_name"].as_str()
             || step.snapshot.identity.run_ref.as_deref() != Some(packet.run_id())
             || step.snapshot.identity.execution_id.as_deref() != Some(packet.run_id())
-            || step.snapshot.identity.attempt.is_some_and(|attempt| attempt != packet.attempt)
+            || step
+                .snapshot
+                .identity
+                .attempt
+                .is_some_and(|attempt| attempt != packet.attempt)
             || step.snapshot.identity.actor_ref.as_deref()
                 != Some(packet.assignment.execution_identity.principal_id())
             || !super::binding_is_owned_by_root(&binding, Some(packet.graph_id()))
         {
-            return Ok(false);
+            return Ok(None);
         }
         super::results::original_tool_primary(store, terminal, task, sources)?;
     }
-    Ok(true)
+    Ok(Some(delegated_plan_required_effects(plan)?))
+}
+
+/// Project a settled delegated plan at Task granularity.
+///
+/// The plan itself lives on the Session stream and contains every call in the
+/// batch. Its envelope is not an effect: only the non-metadata, non-read Tasks
+/// are proof material, and each remains independently addressed by its call.
+fn delegated_plan_required_effects(
+    plan: &crate::DurableRuntimeEvent,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+    let tasks = plan.payload["tasks"]
+        .as_array()
+        .ok_or("delegated tool plan lacks its original tasks")?;
+    tasks
+        .iter()
+        .filter(|task| {
+            !task["tool_name"].as_str().is_some_and(goal_metadata_tool)
+                && task["effect"]["effect_kind"] != "read"
+        })
+        .map(|task| {
+            let call = task["tool_call_id"]
+                .as_str()
+                .ok_or("delegated effect task lacks its call identity")?;
+            Ok((format!("{}:{call}", plan.event_id), task.clone()))
+        })
+        .collect()
 }
 
 fn delegated_plan_callback_owner<'packet>(
@@ -6508,6 +6603,150 @@ pub(crate) fn effect_review_snapshot(
 mod tests {
     use super::*;
     use harness_contract::{policy::*, tool::*};
+
+    #[test]
+    fn r1_review_control_plan_survives_the_effects_projection() {
+        let store = RuntimeEventStore::for_test();
+        let plan = |tool_name: &str, effect_kind: &str| crate::RuntimeEventInput {
+            stream_id: "session:review-control-plan".into(),
+            scope: crate::RuntimeEventScope::Session,
+            kind: "tool.execution_plan.created".into(),
+            status: Some("planned".into()),
+            actor: Some("conversation_runtime".into()),
+            refs: vec![],
+            payload: serde_json::json!({
+                "plan_id": format!("plan-{tool_name}"),
+                "tasks": [{
+                    "tool_name": tool_name,
+                    "tool_call_id": format!("call-{tool_name}"),
+                    "effect": {"effect_kind": effect_kind},
+                    "normalized_input": {},
+                    "step_binding": {},
+                }],
+            }),
+        };
+        store.append(plan("objective_review", "write")).unwrap();
+        store.append(plan("task_review", "write")).unwrap();
+        store.append(plan("objective_update", "write")).unwrap();
+        store.append(plan("read_file", "read")).unwrap();
+
+        let mut sources = std::collections::BTreeMap::new();
+        let effects =
+            pinned_events(&store, "session:review-control-plan", &mut sources, 0).unwrap();
+        let kept = effects
+            .iter()
+            .filter(|event| event.kind == "tool.execution_plan.created")
+            .map(|event| {
+                event.payload["tasks"][0]["tool_name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            kept,
+            BTreeSet::from([
+                "objective_review".to_string(),
+                "task_review".to_string(),
+            ]),
+            "only plans carrying a review control call survive an otherwise metadata/read projection",
+        );
+    }
+
+    #[test]
+    fn r1_only_authenticated_runtime_control_effects_leave_the_effect_digest() {
+        let control = "settled-runtime-control";
+        let business = "ordinary-business-write";
+        let unauthenticated_lookalike = "unauthenticated-control-lookalike";
+        let mut required = std::collections::BTreeMap::from([
+            (
+                "control-intent".to_string(),
+                serde_json::json!({"idempotency_key": control, "effect_kind": "write"}),
+            ),
+            (
+                "control-receipt".to_string(),
+                serde_json::json!({"idempotency_key": control, "effect_kind": "write"}),
+            ),
+            (
+                "business-intent".to_string(),
+                serde_json::json!({"idempotency_key": business, "effect_kind": "write"}),
+            ),
+            (
+                "lookalike".to_string(),
+                serde_json::json!({
+                    "idempotency_key": unauthenticated_lookalike,
+                    "effect_kind": "write",
+                }),
+            ),
+            (
+                "physical-envelope".to_string(),
+                serde_json::json!({"status": "closed"}),
+            ),
+        ]);
+        let controls = BTreeSet::from([control.to_string()]);
+
+        strip_authenticated_runtime_control_effects(&mut required, &controls);
+
+        assert_eq!(
+            required.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "business-intent".to_string(),
+                "lookalike".to_string(),
+                "physical-envelope".to_string(),
+            ],
+            "the manifest drops only identities already authenticated as controls",
+        );
+    }
+
+    #[test]
+    fn r1_settled_delegated_plan_keeps_task_effects_not_the_session_envelope() {
+        let plan = crate::DurableRuntimeEvent {
+            event_id: "plan-event".into(),
+            stream_id: "session:delegated".into(),
+            sequence: 4,
+            scope: crate::RuntimeEventScope::Tool,
+            kind: "tool.execution_plan.created".into(),
+            status: Some("planned".into()),
+            actor: Some("conversation_runtime".into()),
+            refs: vec![],
+            payload: serde_json::json!({
+                "plan_id": "delegated-plan",
+                "tasks": [
+                    {
+                        "tool_name": "task_submit",
+                        "tool_call_id": "business-call",
+                        "effect": {"effect_kind": "write"},
+                    },
+                    {
+                        "tool_name": "objective_update",
+                        "tool_call_id": "metadata-call",
+                        "effect": {"effect_kind": "write"},
+                    },
+                    {
+                        "tool_name": "read_file",
+                        "tool_call_id": "read-call",
+                        "effect": {"effect_kind": "read"},
+                    },
+                ],
+            }),
+            created_at_ms: 0,
+            commit_cursor: 4,
+            transaction_id: "tx".into(),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: None,
+        };
+
+        let effects = delegated_plan_required_effects(&plan).unwrap();
+        assert_eq!(
+            effects.keys().cloned().collect::<Vec<_>>(),
+            vec!["plan-event:business-call".to_string()],
+        );
+        assert_eq!(
+            effects["plan-event:business-call"], plan.payload["tasks"][0],
+            "the manifest carries the authenticated Task rather than the whole Session plan",
+        );
+    }
 
     /// The review cannot be required to settle the control action it is.
     ///
@@ -8452,9 +8691,20 @@ mod own872_plan_owner_tests {
                     && event.activity_binding().is_some_and(|binding| binding.root_execution_id == packet.graph_id()))
                 { continue; }
                 let original = delegated_plan_callback_owner(plan, &events, &roots, &packets).unwrap();
-                assert!(authenticated_delegated_plan_settled(store, plan, &events, original, &mut Default::default()).unwrap());
+                let effects = authenticated_delegated_plan_settled(
+                    store, plan, &events, original, &mut Default::default(),
+                ).unwrap().expect("the authenticated plan is settled");
                 let original_task = plan.payload["tasks"].as_array().unwrap().iter()
                     .find(|original| original["tool_call_id"] == task["tool_call_id"]).unwrap();
+                assert_eq!(
+                    effects.get(&format!(
+                        "{}:{}",
+                        plan.event_id,
+                        original_task["tool_call_id"].as_str().unwrap(),
+                    )),
+                    Some(original_task),
+                    "only the authenticated Task, never the whole Session plan, is an effect",
+                );
                 let step: crate::step_snapshot::StepCallBinding =
                     serde_json::from_value(original_task["step_binding"].clone()).unwrap();
                 let key = step.effect_idempotency_key();
@@ -8497,8 +8747,8 @@ mod own872_plan_owner_tests {
                     let settled = delegated_plan_callback_owner(&invalid_plan, &events, &roots, &packets)
                         .map(|original| authenticated_delegated_plan_settled(
                             store, &invalid_plan, &events, original, &mut Default::default(),
-                        )).unwrap_or(Ok(false));
-                    assert!(!matches!(settled, Ok(true)), "{fault}");
+                        )).unwrap_or(Ok(None));
+                    assert!(!matches!(settled, Ok(Some(_))), "{fault}");
                 }
                 assert!(delegated_plan_callback_owner(plan, &events, &roots, &Default::default()).is_none());
                 let position = events.iter().position(|terminal|
@@ -8528,7 +8778,7 @@ mod own872_plan_owner_tests {
                     let settled = delegated_plan_callback_owner(plan, &invalid, &roots, &packets)
                         .map(|original| authenticated_delegated_plan_settled(
                             store, plan, &invalid, original, &mut Default::default(),
-                        ).unwrap()).unwrap_or(false);
+                        ).unwrap().is_some()).unwrap_or(false);
                     assert!(!settled, "{fault}");
                 }
                 checked.insert(task["tool_name"].as_str().unwrap().to_string());

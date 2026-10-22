@@ -640,6 +640,20 @@ mod tests {
         })
     }
 
+    fn objective_review_task(call_id: &str) -> Value {
+        serde_json::json!({
+            "tool_name": "objective_review",
+            "tool_call_id": call_id,
+            "normalized_input": {
+                "criterion_ref": "user_intent",
+                "decision": "satisfied",
+                "result_refs": ["artifact:one"],
+                "evidence_refs": ["artifact://read"],
+            },
+            "step_binding": step_binding(call_id),
+        })
+    }
+
     fn plan_event(tasks: Value) -> crate::DurableRuntimeEvent {
         crate::DurableRuntimeEvent {
             event_id: "plan-event".into(),
@@ -667,6 +681,17 @@ mod tests {
             reason: "independently read".into(),
             operator_requirement: None,
             evidence_refs: vec!["artifact://read".into()],
+        })
+    }
+
+    fn objective_review_action() -> AgentAction {
+        AgentAction::ObjectiveReview(harness_contract::agent_action::ObjectiveReviewInput {
+            criterion_ref: "user_intent".into(),
+            decision: harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
+            result_refs: vec!["artifact:one".into()],
+            evidence_refs: vec!["artifact://read".into()],
+            reason_ref: String::new(),
+            reason: "independently read".into(),
         })
     }
 
@@ -762,6 +787,46 @@ mod tests {
             effect_key(&second),
             "the other unfinished review keeps its own identity"
         );
+    }
+
+    /// An objective review executes its criterion Task and therefore runs
+    /// under TaskExecute rather than TaskReview focus. The focus shape does
+    /// not change which exact call is the review; changing the focused Task or
+    /// the actor still resolves to nothing.
+    #[test]
+    fn r1_a_objective_review_exempts_its_own_call_under_task_execute_focus() {
+        let mut packet = packet();
+        packet.agentic_binding.as_mut().unwrap().focus =
+            harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                task_ref: "task:one".into(),
+            };
+        let task = objective_review_task("call-one");
+        let key = effect_key(&task);
+        let events = [plan_event(serde_json::json!([task]))];
+        let action = objective_review_action();
+        let reviewer = actor();
+        let context = CurrentReviewContext {
+            action_id: &key,
+            action: &action,
+            actor: &reviewer,
+        };
+        assert_eq!(resolve(&events, &packet, &context), Some(key.clone()));
+
+        let mut other_focus = packet.clone();
+        other_focus.agentic_binding.as_mut().unwrap().focus =
+            harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                task_ref: "task:other".into(),
+            };
+        assert_eq!(resolve(&events, &other_focus, &context), None);
+
+        let mut foreign = reviewer.clone();
+        foreign.execution_id = Some("other-graph".into());
+        let foreign_context = CurrentReviewContext {
+            action_id: &key,
+            action: &action,
+            actor: &foreign,
+        };
+        assert_eq!(resolve(&events, &packet, &foreign_context), None);
     }
 
     /// A forged invocation id, an action the call did not perform, another
