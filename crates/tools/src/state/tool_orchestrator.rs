@@ -2547,21 +2547,20 @@ mod tests {
             );
             assert_eq!(read.effect_kind, ToolEffectKind::Read);
             let definition = crate::RuntimeToolDefinition {
-                name: "task_claim".into(),
+                name: "snapshot_probe_tool".into(),
                 description: Some("frozen control registration".into()),
                 input_schema: serde_json::json!({"type":"object"}),
                 required_permission: ToolPermissionMode::ReadOnly,
-                effect_resolver: resolver.clone(),
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "runtime.readonly".into(),
+                    resolver_version: 2,
+                },
             };
             let mut historical = definition.clone();
             historical.effect_resolver.resolver_version = 1;
-            assert!(crate::ToolCatalog::builtin()
-                .with_runtime_tools(vec![historical.clone()])
-                .is_err());
-            let old_catalog = crate::ToolCatalog {
-                plugin_tools: vec![],
-                runtime_tools: vec![historical],
-            };
+            let old_catalog = crate::ToolCatalog::builtin()
+                .with_runtime_tools(vec![historical])
+                .unwrap();
             let new_catalog = crate::ToolCatalog::builtin()
                 .with_runtime_tools(vec![definition])
                 .unwrap();

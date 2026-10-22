@@ -524,9 +524,7 @@ impl ToolHostLease {
         let definition = self
             .snapshot
             .catalog
-            .definitions(None)
-            .into_iter()
-            .find(|definition| definition.name == canonical_id)
+            .definition(&canonical_id)
             .ok_or_else(|| ToolHostError::ToolNotFound(canonical_id.clone()))?;
         validate_schema_value(
             &definition.input_schema,
@@ -1298,6 +1296,104 @@ mod tests {
         assert_eq!(before.revision(), 1);
         assert_eq!(before.snapshot().descriptor_set_hash, old_hash);
         assert_eq!(after.revision(), 2);
+    }
+
+    #[test]
+    fn pinned_lease_keeps_old_schema_and_resolver_while_new_lease_gets_new_generation() {
+        use crate::permissions::PermissionMode;
+        use harness_contract::tool::ToolEffectResolverSpec;
+
+        let runtime_tool = |schema: Value, resolver_version: u32| crate::RuntimeToolDefinition {
+            name: "generation_probe_tool".into(),
+            description: Some("pinned generation probe".into()),
+            input_schema: schema,
+            required_permission: PermissionMode::ReadOnly,
+            effect_resolver: ToolEffectResolverSpec {
+                resolver_id: "runtime.readonly".into(),
+                resolver_version,
+            },
+        };
+        let old_schema = json!({
+            "type": "object",
+            "properties": {"old_field": {"type": "string"}},
+            "required": ["old_field"],
+        });
+        let new_schema = json!({
+            "type": "object",
+            "properties": {"new_field": {"type": "string"}},
+            "required": ["new_field"],
+        });
+        let old_catalog = ToolCatalog::builtin()
+            .with_runtime_tools(vec![runtime_tool(old_schema.clone(), 1)])
+            .unwrap();
+        let new_catalog = ToolCatalog::builtin()
+            .with_runtime_tools(vec![runtime_tool(new_schema.clone(), 2)])
+            .unwrap();
+        let host = ToolHost::new(
+            "generation-workspace",
+            "/tmp/generation-workspace",
+            ToolHostSnapshot::new(Arc::new(old_catalog), Arc::new(LspRegistry::new()), None),
+        )
+        .with_authorization_lease_verifier(Arc::new(|_| true));
+        let old_lease = host.pin_snapshot();
+
+        host.replace_snapshot(ToolHostSnapshot::new(
+            Arc::new(new_catalog),
+            Arc::new(LspRegistry::new()),
+            None,
+        ));
+        let new_lease = host.pin_snapshot();
+
+        assert_eq!(
+            old_lease
+                .snapshot()
+                .catalog
+                .definition("generation_probe_tool")
+                .unwrap()
+                .input_schema,
+            old_schema
+        );
+        assert_eq!(
+            new_lease
+                .snapshot()
+                .catalog
+                .definition("generation_probe_tool")
+                .unwrap()
+                .input_schema,
+            new_schema
+        );
+        assert_eq!(
+            old_lease
+                .snapshot()
+                .catalog
+                .effect_resolver("generation_probe_tool")
+                .resolver_version,
+            1
+        );
+        assert_eq!(
+            new_lease
+                .snapshot()
+                .catalog
+                .effect_resolver("generation_probe_tool")
+                .resolver_version,
+            2
+        );
+        assert_ne!(
+            old_lease.snapshot().descriptor_set_hash,
+            new_lease.snapshot().descriptor_set_hash
+        );
+        old_lease
+            .validate_input("generation_probe_tool", &json!({"old_field": "yes"}))
+            .unwrap();
+        assert!(old_lease
+            .validate_input("generation_probe_tool", &json!({"new_field": "no"}))
+            .is_err());
+        new_lease
+            .validate_input("generation_probe_tool", &json!({"new_field": "yes"}))
+            .unwrap();
+        assert!(new_lease
+            .validate_input("generation_probe_tool", &json!({"old_field": "no"}))
+            .is_err());
     }
 
     #[test]

@@ -66,7 +66,10 @@ impl ToolRegistry {
 #[derive(Debug, Clone)]
 pub struct ToolCatalog {
     plugin_tools: Vec<PluginTool>,
-    runtime_tools: Vec<RuntimeToolDefinition>,
+    entries: Vec<ToolCatalogEntry>,
+    entry_order: Vec<usize>,
+    canonical_index: BTreeMap<String, usize>,
+    identity_index: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +86,57 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCatalogSource {
+    Builtin,
+    Runtime,
+    Plugin,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCatalogEntry {
+    definition: ToolDefinition,
+    raw_description: Option<String>,
+    search_description: String,
+    permission: PermissionMode,
+    effect_resolver: ToolEffectResolverSpec,
+    source: ToolCatalogSource,
+    model_exposed: bool,
+    plugin_index: Option<usize>,
+}
+
+impl ToolCatalogSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Runtime => "runtime",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
+fn insert_catalog_entry(
+    entries: &mut Vec<ToolCatalogEntry>,
+    canonical_index: &mut BTreeMap<String, usize>,
+    identity_index: &mut BTreeMap<String, usize>,
+    entry: ToolCatalogEntry,
+) -> Result<(), String> {
+    let name = entry.definition.name.clone();
+    let identity = tool_name_identity(&name);
+    if let Some(existing_index) = identity_index.get(&identity) {
+        let existing = &entries[*existing_index].definition.name;
+        return Err(format!(
+            "{} tool `{name}` conflicts with canonical tool identity `{existing}`",
+            entry.source.label(),
+        ));
+    }
+    let index = entries.len();
+    canonical_index.insert(name, index);
+    identity_index.insert(identity, index);
+    entries.push(entry);
+    Ok(())
 }
 
 fn tool_name_identity(value: &str) -> String {
@@ -122,106 +176,192 @@ fn model_facing_description(description: Option<&str>, schema: &Value) -> Option
 impl ToolCatalog {
     #[must_use]
     pub fn builtin() -> Self {
-        Self {
-            plugin_tools: Vec::new(),
-            runtime_tools: Vec::new(),
-        }
+        Self::from_parts(Vec::new(), Vec::new()).expect("the builtin catalog is valid")
     }
 
     pub fn with_plugin_tools(plugin_tools: Vec<PluginTool>) -> Result<Self, String> {
-        let builtin_names = mvp_tool_specs()
-            .into_iter()
-            .map(|spec| spec.name.to_string())
-            .collect::<BTreeSet<_>>();
-        let mut seen_identities = builtin_names
-            .iter()
-            .map(|name| (tool_name_identity(name), name.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut seen_plugin_names = BTreeSet::new();
+        Self::from_parts(plugin_tools, Vec::new())
+    }
 
-        for tool in &plugin_tools {
-            let name = tool.definition().name.clone();
+    fn from_parts(
+        plugin_tools: Vec<PluginTool>,
+        runtime_tools: Vec<RuntimeToolDefinition>,
+    ) -> Result<Self, String> {
+        let mut catalog = Self {
+            plugin_tools,
+            entries: Vec::new(),
+            entry_order: Vec::new(),
+            canonical_index: BTreeMap::new(),
+            identity_index: BTreeMap::new(),
+        };
+        catalog.rebuild_index(&runtime_tools)?;
+        Ok(catalog)
+    }
+
+    /// Build the one immutable generation consumed by every catalog query.
+    ///
+    /// Runtime definitions are consumed only while building this generation.
+    /// The plugin implementation vector remains for execution; reads never
+    /// rescan either source.
+    fn rebuild_index(&mut self, runtime_tools: &[RuntimeToolDefinition]) -> Result<(), String> {
+        let mut entries = Vec::new();
+        let mut canonical_index = BTreeMap::new();
+        let mut identity_index = BTreeMap::new();
+
+        for spec in mvp_tool_specs() {
+            let name = spec.name.to_string();
+            let model_description =
+                model_facing_description(Some(&spec.description), &spec.input_schema);
+            let search_description = model_description
+                .clone()
+                .unwrap_or_else(|| spec.description.to_string());
+            let entry = ToolCatalogEntry {
+                definition: ToolDefinition {
+                    name: name.clone(),
+                    description: model_description,
+                    input_schema: spec.input_schema,
+                },
+                raw_description: Some(spec.description.to_string()),
+                search_description,
+                permission: spec.required_permission,
+                effect_resolver: builtin_effect_resolver_spec(&name),
+                source: ToolCatalogSource::Builtin,
+                model_exposed: true,
+                plugin_index: None,
+            };
+            insert_catalog_entry(
+                &mut entries,
+                &mut canonical_index,
+                &mut identity_index,
+                entry,
+            )?;
+        }
+
+        for (plugin_index, tool) in self.plugin_tools.iter().enumerate() {
+            let definition = tool.definition();
+            let name = definition.name.clone();
             if !is_canonical_tool_name(&name) {
                 return Err(format!(
                     "plugin tool `{name}` must use one lowercase snake_case identity"
                 ));
             }
-            if builtin_names.contains(&name) {
-                return Err(format!(
-                    "plugin tool `{name}` conflicts with a built-in tool name"
-                ));
-            }
-            if !seen_plugin_names.insert(name.clone()) {
+            if let Some(existing) = canonical_index.get(&name) {
+                let source = entries[*existing].source;
+                if source == ToolCatalogSource::Builtin {
+                    return Err(format!(
+                        "plugin tool `{name}` conflicts with a built-in tool name"
+                    ));
+                }
                 return Err(format!("duplicate plugin tool name `{name}`"));
             }
-            let identity = tool_name_identity(&name);
-            if let Some(existing) = seen_identities.insert(identity, name.clone()) {
-                return Err(format!(
-                    "plugin tool `{name}` conflicts with canonical tool identity `{existing}`"
-                ));
-            }
+            let model_description = model_facing_description(
+                definition.description.as_deref(),
+                &definition.input_schema,
+            );
+            let search_description = model_description
+                .clone()
+                .or_else(|| definition.description.clone())
+                .unwrap_or_default();
+            let permission = permission_mode_from_plugin(tool.required_permission())?;
+            let entry = ToolCatalogEntry {
+                definition: ToolDefinition {
+                    name: name.clone(),
+                    description: model_description,
+                    input_schema: definition.input_schema.clone(),
+                },
+                raw_description: definition.description.clone(),
+                search_description,
+                permission,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "plugin.unknown".to_string(),
+                    resolver_version: 1,
+                },
+                source: ToolCatalogSource::Plugin,
+                model_exposed: true,
+                plugin_index: Some(plugin_index),
+            };
+            insert_catalog_entry(
+                &mut entries,
+                &mut canonical_index,
+                &mut identity_index,
+                entry,
+            )?;
         }
 
-        Ok(Self {
-            plugin_tools,
-            runtime_tools: Vec::new(),
-        })
-    }
-
-    pub fn with_runtime_tools(
-        mut self,
-        runtime_tools: Vec<RuntimeToolDefinition>,
-    ) -> Result<Self, String> {
-        let mut seen_names = mvp_tool_specs()
-            .into_iter()
-            .map(|spec| spec.name.to_string())
-            .chain(
-                self.plugin_tools
-                    .iter()
-                    .map(|tool| tool.definition().name.clone()),
-            )
-            .collect::<BTreeSet<_>>();
-        let mut seen_identities = seen_names
-            .iter()
-            .map(|name| (tool_name_identity(name), name.clone()))
-            .collect::<BTreeMap<_, _>>();
-
-        for tool in &runtime_tools {
-            if !is_canonical_tool_name(&tool.name) {
+        for tool in runtime_tools {
+            let name = tool.name.clone();
+            if !is_canonical_tool_name(&name) {
                 return Err(format!(
-                    "runtime tool `{}` must use one lowercase snake_case identity",
-                    tool.name
+                    "runtime tool `{name}` must use one lowercase snake_case identity"
                 ));
             }
-            if !seen_names.insert(tool.name.clone()) {
+            if canonical_index.contains_key(&name) {
                 return Err(format!(
-                    "runtime tool `{}` conflicts with an existing tool name",
-                    tool.name
+                    "runtime tool `{name}` conflicts with an existing tool name"
                 ));
             }
-            let identity = tool_name_identity(&tool.name);
-            if let Some(existing) = seen_identities.insert(identity, tool.name.clone()) {
-                return Err(format!(
-                    "runtime tool `{}` conflicts with canonical tool identity `{existing}`",
-                    tool.name
-                ));
-            }
-            let descriptor = crate::tool_orchestrator::resolve_registered_tool_effect(
+            let model_description =
+                model_facing_description(tool.description.as_deref(), &tool.input_schema);
+            let search_description = model_description.clone().unwrap_or_default();
+            let resolver = crate::tool_orchestrator::resolve_registered_tool_effect(
                 &tool.effect_resolver,
                 &tool.name,
                 &Value::Object(serde_json::Map::new()),
                 kernel_permission_mode(tool.required_permission),
             );
-            if descriptor.effect_kind == ToolEffectKind::Unknown {
+            if resolver.effect_kind == ToolEffectKind::Unknown {
                 return Err(format!(
                     "runtime tool `{}` declares unsupported effect resolver `{}`",
                     tool.name, tool.effect_resolver.resolver_id
                 ));
             }
+            let entry = ToolCatalogEntry {
+                definition: ToolDefinition {
+                    name: name.clone(),
+                    description: model_description,
+                    input_schema: tool.input_schema.clone(),
+                },
+                raw_description: tool.description.clone(),
+                search_description,
+                permission: tool.required_permission,
+                effect_resolver: tool.effect_resolver.clone(),
+                source: ToolCatalogSource::Runtime,
+                model_exposed: !name.starts_with("mcp__"),
+                plugin_index: None,
+            };
+            insert_catalog_entry(
+                &mut entries,
+                &mut canonical_index,
+                &mut identity_index,
+                entry,
+            )?;
         }
 
-        self.runtime_tools = runtime_tools;
-        Ok(self)
+        self.entries = entries;
+        self.entry_order = [
+            ToolCatalogSource::Builtin,
+            ToolCatalogSource::Runtime,
+            ToolCatalogSource::Plugin,
+        ]
+        .into_iter()
+        .flat_map(|source| {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(move |(_, entry)| entry.source == source)
+                .map(|(index, _)| index)
+        })
+        .collect();
+        self.canonical_index = canonical_index;
+        self.identity_index = identity_index;
+        Ok(())
+    }
+
+    pub fn with_runtime_tools(
+        self,
+        runtime_tools: Vec<RuntimeToolDefinition>,
+    ) -> Result<Self, String> {
+        Self::from_parts(self.plugin_tools, runtime_tools)
     }
 
     /// Append runtime-provided tools without replacing definitions already
@@ -230,9 +370,23 @@ impl ToolCatalog {
         self,
         additional_tools: Vec<RuntimeToolDefinition>,
     ) -> Result<Self, String> {
-        let mut runtime_tools = self.runtime_tools.clone();
+        let mut runtime_tools = self.runtime_definitions();
         runtime_tools.extend(additional_tools);
-        self.with_runtime_tools(runtime_tools)
+        Self::from_parts(self.plugin_tools, runtime_tools)
+    }
+
+    fn runtime_definitions(&self) -> Vec<RuntimeToolDefinition> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.source == ToolCatalogSource::Runtime)
+            .map(|entry| RuntimeToolDefinition {
+                name: entry.definition.name.clone(),
+                description: entry.raw_description.clone(),
+                input_schema: entry.definition.input_schema.clone(),
+                required_permission: entry.permission,
+                effect_resolver: entry.effect_resolver.clone(),
+            })
+            .collect()
     }
 
     pub fn normalize_allowed_tools(
@@ -243,16 +397,10 @@ impl ToolCatalog {
             return Ok(None);
         }
 
-        let builtin_specs = mvp_tool_specs();
-        let canonical_names = builtin_specs
+        let canonical_names = self
+            .entries
             .iter()
-            .map(|spec| spec.name.to_string())
-            .chain(
-                self.plugin_tools
-                    .iter()
-                    .map(|tool| tool.definition().name.clone()),
-            )
-            .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
+            .map(|entry| entry.definition.name.clone())
             .collect::<Vec<_>>();
         let mut allowed = BTreeSet::new();
         for value in values {
@@ -275,49 +423,15 @@ impl ToolCatalog {
 
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
-            .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-            .map(|spec| ToolDefinition {
-                name: spec.name.to_string(),
-                description: model_facing_description(Some(&spec.description), &spec.input_schema),
-                input_schema: spec.input_schema,
-            });
-        let runtime = self
-            .runtime_tools
+        self.entry_order
             .iter()
-            // PLAN B-4: externally discovered MCP tools (`mcp__server__tool`) are
-            // NOT part of the provider tool array. Activating one used to rewrite
-            // the tools array and invalidate the prompt cache from the tools
-            // onward, and it is the one confirmed real prefix-split source. They
-            // stay resolvable by name for `mcp(action=call)` and by orchestration,
-            // which is the only route the model needs.
-            .filter(|tool| !tool.name.starts_with("mcp__"))
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
-            .map(|tool| ToolDefinition {
-                name: tool.name.clone(),
-                description: model_facing_description(
-                    tool.description.as_deref(),
-                    &tool.input_schema,
-                ),
-                input_schema: tool.input_schema.clone(),
-            });
-        let plugin = self
-            .plugin_tools
-            .iter()
-            .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+            .filter_map(|index| self.entries.get(*index))
+            .filter(|entry| entry.model_exposed)
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
             })
-            .map(|tool| ToolDefinition {
-                name: tool.definition().name.clone(),
-                description: model_facing_description(
-                    tool.definition().description.as_deref(),
-                    &tool.definition().input_schema,
-                ),
-                input_schema: tool.definition().input_schema.clone(),
-            });
-        builtin.chain(runtime).chain(plugin).collect()
+            .map(|entry| entry.definition.clone())
+            .collect()
     }
 
     #[must_use]
@@ -325,88 +439,42 @@ impl ToolCatalog {
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
     ) -> Vec<KernelToolDefinition> {
-        let builtin = mvp_tool_specs()
-            .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-            .map(|spec| KernelToolDefinition {
-                name: spec.name.to_string(),
-                description: model_facing_description(Some(&spec.description), &spec.input_schema),
-                input_schema: spec.input_schema,
-                required_permission: kernel_permission_mode(spec.required_permission),
-            });
-        let runtime = self
-            .runtime_tools
+        self.entry_order
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
-            .map(|tool| KernelToolDefinition {
-                name: tool.name.clone(),
-                description: model_facing_description(
-                    tool.description.as_deref(),
-                    &tool.input_schema,
-                ),
-                input_schema: tool.input_schema.clone(),
-                required_permission: kernel_permission_mode(tool.required_permission),
-            });
-        let plugin = self
-            .plugin_tools
-            .iter()
-            .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+            .filter_map(|index| self.entries.get(*index))
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
             })
-            .filter_map(|tool| {
-                permission_mode_from_plugin(tool.required_permission())
-                    .ok()
-                    .map(|permission| KernelToolDefinition {
-                        name: tool.definition().name.clone(),
-                        description: model_facing_description(
-                            tool.definition().description.as_deref(),
-                            &tool.definition().input_schema,
-                        ),
-                        input_schema: tool.definition().input_schema.clone(),
-                        required_permission: kernel_permission_mode(permission),
-                    })
-            });
-        builtin.chain(runtime).chain(plugin).collect()
+            .map(|entry| KernelToolDefinition {
+                name: entry.definition.name.clone(),
+                description: entry.definition.description.clone(),
+                input_schema: entry.definition.input_schema.clone(),
+                required_permission: kernel_permission_mode(entry.permission),
+            })
+            .collect()
     }
 
     pub fn permission_specs(
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
     ) -> Result<Vec<(String, PermissionMode)>, String> {
-        let builtin = mvp_tool_specs()
-            .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-            .map(|spec| (spec.name.to_string(), spec.required_permission));
-        let runtime = self
-            .runtime_tools
+        Ok(self
+            .entry_order
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
-            .map(|tool| (tool.name.clone(), tool.required_permission));
-        let plugin = self
-            .plugin_tools
-            .iter()
-            .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+            .filter_map(|index| self.entries.get(*index))
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
             })
-            .map(|tool| {
-                permission_mode_from_plugin(tool.required_permission())
-                    .map(|permission| (tool.definition().name.clone(), permission))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(builtin.chain(runtime).chain(plugin).collect())
+            .map(|entry| (entry.definition.name.clone(), entry.permission))
+            .collect())
     }
 
     #[must_use]
     pub fn required_permission(&self, name: &str) -> Option<KernelToolPermissionMode> {
         let name = self.canonical_name(name)?;
-        self.permission_specs(None)
-            .ok()?
-            .into_iter()
-            .find_map(|(candidate, permission)| {
-                (candidate == name).then_some(kernel_permission_mode(permission))
-            })
+        self.entries
+            .get(*self.canonical_index.get(&name)?)
+            .map(|entry| kernel_permission_mode(entry.permission))
     }
 
     #[must_use]
@@ -417,33 +485,24 @@ impl ToolCatalog {
                 resolver_version: 1,
             };
         };
-        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return builtin_effect_resolver_spec(&name);
-        }
-        if let Some(tool) = self.runtime_tools.iter().find(|tool| tool.name == name) {
-            return tool.effect_resolver.clone();
-        }
-        let source = if self.has_runtime_tool(&name) {
-            "runtime"
-        } else if self
-            .plugin_tools
-            .iter()
-            .any(|tool| tool.definition().name == name)
-        {
-            "plugin"
-        } else {
-            "unregistered"
-        };
-        harness_contract::tool::ToolEffectResolverSpec {
-            resolver_id: format!("{source}.unknown"),
-            resolver_version: 1,
-        }
+        self.canonical_index
+            .get(&name)
+            .and_then(|index| self.entries.get(*index))
+            .map(|entry| entry.effect_resolver.clone())
+            .unwrap_or(harness_contract::tool::ToolEffectResolverSpec {
+                resolver_id: "unregistered.unknown".to_string(),
+                resolver_version: 1,
+            })
     }
 
     #[must_use]
     pub fn has_runtime_tool(&self, name: &str) -> bool {
-        self.canonical_name(name)
-            .is_some_and(|name| self.runtime_tools.iter().any(|tool| tool.name == name))
+        self.canonical_name(name).is_some_and(|name| {
+            self.canonical_index
+                .get(&name)
+                .and_then(|index| self.entries.get(*index))
+                .is_some_and(|entry| entry.source == ToolCatalogSource::Runtime)
+        })
     }
 
     #[must_use]
@@ -454,27 +513,14 @@ impl ToolCatalog {
     #[must_use]
     pub(crate) fn descriptor_ref(&self, name: &str) -> Option<ToolDescriptorRef> {
         let name = self.canonical_name(name)?;
-        let definition = self
-            .definitions(None)
-            .into_iter()
-            .find(|item| item.name == name)?;
-        let source = if self.runtime_tools.iter().any(|tool| tool.name == name) {
-            "runtime"
-        } else if self
-            .plugin_tools
-            .iter()
-            .any(|tool| tool.definition().name == name)
-        {
-            "plugin"
-        } else {
-            "builtin"
-        };
+        let entry = self.entries.get(*self.canonical_index.get(&name)?)?;
+        let source = entry.source.label();
         Some(ToolDescriptorRef {
-            canonical_id: definition.name.clone(),
-            display_name: definition.name,
+            canonical_id: entry.definition.name.clone(),
+            display_name: entry.definition.name.clone(),
             source: source.to_string(),
-            schema_hash: value_hash(&definition.input_schema),
-            required_permission: self.required_permission(&name)?,
+            schema_hash: value_hash(&entry.definition.input_schema),
+            required_permission: kernel_permission_mode(entry.permission),
             permission_source: format!("{source}_manifest"),
             health: ToolDescriptorHealth::Healthy,
         })
@@ -484,9 +530,17 @@ impl ToolCatalog {
         let name = self
             .canonical_name(name)
             .ok_or_else(|| format!("unsupported tool: {name}"))?;
+        let entry = self.entries.get(
+            *self
+                .canonical_index
+                .get(&name)
+                .ok_or_else(|| format!("unsupported tool: {name}"))?,
+        );
+        let plugin_index = entry
+            .and_then(|entry| entry.plugin_index)
+            .ok_or_else(|| format!("unsupported tool: {name}"))?;
         self.plugin_tools
-            .iter()
-            .find(|tool| tool.definition().name == name)
+            .get(plugin_index)
             .ok_or_else(|| format!("unsupported tool: {name}"))?
             .execute(input)
             .map_err(|error| error.to_string())
@@ -507,36 +561,15 @@ impl ToolCatalog {
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
-        let builtin = mvp_tool_specs().into_iter().map(|spec| SearchableToolSpec {
-            name: spec.name.to_string(),
-            description: model_facing_description(Some(&spec.description), &spec.input_schema)
-                .unwrap_or_else(|| spec.description.to_string()),
-        });
-        let runtime = self
-            .runtime_tools
+        self.entry_order
             .iter()
-            // PLAN B-4: an MCP tool is not part of the provider array, so it must
-            // not be offered as an activation candidate either - "activating" it
-            // is exactly the tool-array rewrite that broke the prompt cache. It is
-            // reached through `mcp(action=call)`.
-            .filter(|tool| !tool.name.starts_with("mcp__"))
-            .map(|tool| SearchableToolSpec {
-                name: tool.name.clone(),
-                description: model_facing_description(
-                    tool.description.as_deref(),
-                    &tool.input_schema,
-                )
-                .unwrap_or_default(),
-            });
-        let plugin = self.plugin_tools.iter().map(|tool| SearchableToolSpec {
-            name: tool.definition().name.clone(),
-            description: model_facing_description(
-                tool.definition().description.as_deref(),
-                &tool.definition().input_schema,
-            )
-            .unwrap_or_else(|| tool.definition().description.clone().unwrap_or_default()),
-        });
-        builtin.chain(runtime).chain(plugin).collect()
+            .filter_map(|index| self.entries.get(*index))
+            .filter(|entry| entry.model_exposed)
+            .map(|entry| SearchableToolSpec {
+                name: entry.definition.name.clone(),
+                description: entry.search_description.clone(),
+            })
+            .collect()
     }
 
     #[must_use]
@@ -553,36 +586,27 @@ impl ToolCatalog {
     /// never resolve the same provider token differently.
     #[must_use]
     pub fn canonical_name(&self, requested: &str) -> Option<String> {
-        // Keep this path schema-free: it runs for every authorization and
-        // execution boundary, so cloning JSON schemas here would turn alias
-        // normalization into avoidable per-call context and allocation cost.
-        let canonical_names = mvp_tool_specs()
-            .into_iter()
-            .map(|spec| spec.name.to_string())
-            .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
-            .chain(
-                self.plugin_tools
-                    .iter()
-                    .map(|tool| tool.definition().name.clone()),
-            )
-            .collect::<Vec<_>>();
-        if canonical_names.iter().any(|name| name == requested) {
+        if self.canonical_index.contains_key(requested) {
             return Some(requested.to_string());
         }
-        let identity = tool_name_identity(requested);
-        let mut matches = canonical_names
-            .into_iter()
-            .filter(|name| tool_name_identity(name) == identity);
-        let resolved = matches.next()?;
-        matches.next().is_none().then_some(resolved)
+        self.identity_index
+            .get(&tool_name_identity(requested))
+            .and_then(|index| self.entries.get(*index))
+            .map(|entry| entry.definition.name.clone())
     }
 
     #[must_use]
     pub fn tool_ids(&self) -> BTreeSet<String> {
-        self.definitions(None)
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect()
+        self.canonical_index.keys().cloned().collect()
+    }
+
+    #[must_use]
+    pub(crate) fn definition(&self, name: &str) -> Option<&ToolDefinition> {
+        let name = self.canonical_name(name)?;
+        self.canonical_index
+            .get(&name)
+            .and_then(|index| self.entries.get(*index))
+            .map(|entry| &entry.definition)
     }
 }
 
@@ -854,6 +878,193 @@ mod tests {
             );
         }
         assert_eq!(catalog.canonical_name("shell-command"), None);
+    }
+
+    #[test]
+    fn every_catalog_query_consumes_the_same_canonical_generation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"subject": {"type": "string"}},
+            "required": ["subject"],
+        });
+        let catalog = ToolCatalog::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "index_probe_tool".into(),
+                description: Some("indexed probe".into()),
+                input_schema: schema.clone(),
+                required_permission: PermissionMode::WorkspaceWrite,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "runtime.readonly".into(),
+                    resolver_version: 7,
+                },
+            }])
+            .unwrap();
+
+        assert_eq!(
+            catalog.canonical_name("INDEX-PROBE-TOOL").as_deref(),
+            Some("index_probe_tool")
+        );
+        assert_eq!(
+            catalog.definition("index_probe_tool").unwrap().input_schema,
+            schema
+        );
+        assert_eq!(
+            catalog
+                .definitions(None)
+                .into_iter()
+                .find(|definition| definition.name == "index_probe_tool")
+                .unwrap()
+                .input_schema,
+            schema
+        );
+        assert_eq!(
+            catalog
+                .kernel_definitions(None)
+                .into_iter()
+                .find(|definition| definition.name == "index_probe_tool")
+                .unwrap()
+                .required_permission,
+            KernelToolPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            catalog.required_permission("index_probe_tool"),
+            Some(KernelToolPermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            catalog
+                .permission_specs(None)
+                .unwrap()
+                .into_iter()
+                .find(|(name, _)| name == "index_probe_tool"),
+            Some((
+                "index_probe_tool".to_string(),
+                PermissionMode::WorkspaceWrite
+            ))
+        );
+        assert_eq!(
+            catalog.effect_resolver("index_probe_tool"),
+            ToolEffectResolverSpec {
+                resolver_id: "runtime.readonly".into(),
+                resolver_version: 7,
+            }
+        );
+        let descriptor = catalog.descriptor_ref("index_probe_tool").unwrap();
+        assert_eq!(descriptor.schema_hash, value_hash(&schema));
+        assert_eq!(
+            descriptor.required_permission,
+            KernelToolPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(descriptor.source, "runtime");
+        assert_eq!(
+            catalog.entries.len(),
+            catalog.canonical_index.len(),
+            "the ordered generation contains exactly one publishable entry per name"
+        );
+        assert_eq!(
+            catalog.entries.len(),
+            catalog.identity_index.len(),
+            "the alias index contains exactly one publishable entry per normalized identity"
+        );
+
+        let description = catalog
+            .definition("index_probe_tool")
+            .unwrap()
+            .description
+            .clone();
+        let extended = catalog
+            .clone()
+            .extend_runtime_tools(vec![RuntimeToolDefinition {
+                name: "second_index_probe".into(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                required_permission: PermissionMode::ReadOnly,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "runtime.readonly".into(),
+                    resolver_version: 1,
+                },
+            }])
+            .unwrap();
+        assert_eq!(
+            extended.definition("index_probe_tool").unwrap().description,
+            description,
+            "extending a runtime generation must not re-render an existing model contract",
+        );
+    }
+
+    #[test]
+    fn canonical_identity_collision_is_rejected_before_a_generation_is_published() {
+        let error = ToolCatalog::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "websearch".into(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                required_permission: PermissionMode::ReadOnly,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "runtime.readonly".into(),
+                    resolver_version: 1,
+                },
+            }])
+            .expect_err("a normalized collision must not create a second publishable identity");
+
+        assert!(error.contains("canonical tool identity"), "{error}");
+        assert!(error.contains("web_search"), "{error}");
+    }
+
+    #[test]
+    fn plugin_and_runtime_entries_share_the_index_with_stable_exposure_order() {
+        let plugin = PluginTool::new(
+            "plugin-index",
+            "Index plugin",
+            plugins::PluginToolDefinition {
+                name: "plugin_index_tool".into(),
+                description: Some("plugin indexed tool".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            "/bin/true",
+            Vec::new(),
+            plugins::PluginToolPermission::WorkspaceWrite,
+            None,
+        );
+        let catalog = ToolCatalog::with_plugin_tools(vec![plugin])
+            .unwrap()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_index_tool".into(),
+                description: Some("runtime indexed tool".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+                required_permission: PermissionMode::ReadOnly,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "runtime.readonly".into(),
+                    resolver_version: 1,
+                },
+            }])
+            .unwrap();
+
+        assert_eq!(
+            catalog.required_permission("plugin-index-tool"),
+            Some(KernelToolPermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            catalog.required_permission("runtime-index-tool"),
+            Some(KernelToolPermissionMode::ReadOnly)
+        );
+        let definitions = catalog
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let runtime = definitions
+            .iter()
+            .position(|name| name == "runtime_index_tool")
+            .unwrap();
+        let plugin = definitions
+            .iter()
+            .position(|name| name == "plugin_index_tool")
+            .unwrap();
+        assert!(
+            runtime < plugin,
+            "runtime definitions retain precedence before plugin definitions"
+        );
+        assert_eq!(catalog.entry_order.len(), catalog.entries.len());
     }
 
     #[test]
