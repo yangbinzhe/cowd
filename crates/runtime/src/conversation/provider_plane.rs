@@ -1580,30 +1580,19 @@ where
                 .input_total_tokens()
                 .saturating_add(request.budget.protocol_overhead_tokens)
                 .saturating_add(request.budget.requested_output_tokens);
-            let demands = self.api_client.provider_name_for_model(model).map_or_else(
-                || {
-                    vec![(
-                        crate::execution_core::graph::ExecutionResourceKind::Provider,
-                        1,
-                    )]
-                },
-                |provider_name| {
-                    self.provider_resource_config
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .admission_demands(&provider_name, model, estimated_tokens)
-                },
-            );
-            let admission = crate::execution_core::graph::ResourceAdmissionRequest::new(
+            let admission = crate::provider_resources::provider_leaf_admission(
+                &self
+                    .provider_resource_config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                self.api_client.provider_name_for_model(model).as_deref(),
+                model,
+                estimated_tokens,
                 self.execution_service_class,
-                demands,
-            )
-            .with_parent_class_ceiling(self.execution_service_class)
-            .with_deadline_at_ms(
+                self.session_id(),
                 now_ms()
                     .saturating_add(provider_admission_timeout_ms(self.execution_service_class)),
-            )
-            .with_fairness_key(format!("session:{}", self.session_id()));
+            );
             let acquire = manager.admit(admission);
             let lease = tokio::select! {
                 () = self.cancellation_token.cancelled() => {

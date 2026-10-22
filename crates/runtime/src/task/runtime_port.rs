@@ -252,21 +252,50 @@ impl TaskRuntimePort {
             .execution_policy
             .binding
             .as_ref()
-            .map(|binding| binding.execution.session_id.as_str())
-            .ok_or_else(|| "Task admission requires an execution policy binding".to_string())?;
+            .map(|binding| binding.execution.session_id.clone())
+            .ok_or("Task admission requires an execution policy binding")?;
         let blocks = self
             .session_policy_admission_blocks
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(transition_id) = blocks.get(policy_session_id) {
-            return Err(format!(
-                "Session `{policy_session_id}` Task admission is frozen by policy transition `{transition_id}`"
-            ));
+        if let Some(transition_id) = blocks.get(&policy_session_id) {
+            return Err(format!("Session `{policy_session_id}` Task admission is frozen by policy transition `{transition_id}`"));
         }
-        let mission_id = command.mission_id.clone();
-        let evidence_refs = command.evidence_refs.clone();
-        self.ensure_mission_active(&mission_id, &evidence_refs)?;
-        let result = self.tasks.create(command)?;
+        let result = if command.spec.application_provenance.is_some() {
+            // Keep both the original source owner and its published map entry
+            // stable through the original Task backend transaction. Checking a
+            // cloned snapshot before starting that transaction is insufficient.
+            let policies = self
+                .session_policies
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let source = policies
+                .get(&policy_session_id)
+                .ok_or("structured Task source policy unavailable")?;
+            source.with_snapshot(|current| {
+                let bound = &command
+                    .spec
+                    .execution_policy
+                    .binding
+                    .as_ref()
+                    .ok_or("structured Task policy unbound")?
+                    .execution;
+                if *bound
+                    != harness_contract::policy::ExecutionPolicyBinding::bind(
+                        &policy_session_id,
+                        current,
+                        bound.permission_ceiling,
+                    )
+                {
+                    return Err("structured Task admission source policy changed".into());
+                }
+                self.ensure_mission_active(&command.mission_id, &command.evidence_refs)?;
+                self.tasks.create(command)
+            })?
+        } else {
+            self.ensure_mission_active(&command.mission_id, &command.evidence_refs)?;
+            self.tasks.create(command)?
+        };
         drop(blocks);
         self.finish_mutation(result)
     }
@@ -371,7 +400,7 @@ impl TaskRuntimePort {
         spec: TaskPhaseSpec,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
-        self.require_visible_task(task_id)?;
+        self.require_non_structured_task(task_id)?;
         let result = self
             .tasks
             .start_phase(task_id, expected_revision, spec, evidence_refs)?;
@@ -389,6 +418,13 @@ impl TaskRuntimePort {
         value: impl Into<String>,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
+        let kind = kind.into();
+        if kind.starts_with("application_structured_") {
+            return Err(
+                "structured execution receipts may only be published by the original Runtime leaf"
+                    .into(),
+            );
+        }
         self.require_visible_task(task_id)?;
         let result = self.tasks.record_phase_artifact(
             task_id,
@@ -402,6 +438,39 @@ impl TaskRuntimePort {
         self.finish_mutation(result)
     }
 
+    pub(crate) fn record_structured_phase_artifact(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+        phase_id: &str,
+        kind: &str,
+        label: String,
+        value: String,
+    ) -> Result<crate::TaskCommandOutcome, String> {
+        if !matches!(
+            kind,
+            "application_structured_attempt.v1"
+                | "application_structured_prepared_result.v1"
+                | "application_structured_result.v1"
+        ) {
+            return Err("unknown internal structured receipt kind".into());
+        }
+        let task = self.require_visible_task(task_id)?;
+        if task.application_provenance.is_none() {
+            return Err("structured receipt requires an admitted application Task".into());
+        }
+        let result = self.tasks.record_phase_artifact(
+            task_id,
+            expected_revision,
+            phase_id,
+            kind,
+            label,
+            value,
+            Vec::new(),
+        )?;
+        self.finish_mutation(result)
+    }
+
     pub fn review_phase(
         &self,
         task_id: &str,
@@ -411,7 +480,7 @@ impl TaskRuntimePort {
         completed: bool,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
-        self.require_visible_task(task_id)?;
+        self.require_non_structured_task(task_id)?;
         let result = self.tasks.review_phase(
             task_id,
             expected_revision,
@@ -431,11 +500,42 @@ impl TaskRuntimePort {
         evidence_refs: Vec<EvidenceRef>,
         note: impl Into<String>,
     ) -> Result<crate::TaskCommandOutcome, String> {
-        self.require_visible_task(task_id)?;
+        self.require_non_structured_task(task_id)?;
         let result =
             self.tasks
                 .transition(task_id, expected_revision, status, evidence_refs, note)?;
         self.finish_mutation(result)
+    }
+
+    pub(crate) fn review_structured_phase(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+        phase_id: &str,
+    ) -> Result<crate::TaskCommandOutcome, String> {
+        self.finish_mutation(self.tasks.review_phase(
+            task_id,
+            expected_revision,
+            phase_id,
+            "original Graph schema-validated result committed",
+            true,
+            Vec::new(),
+        )?)
+    }
+
+    pub(crate) fn transition_structured_from_graph(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+        status: TaskStatus,
+    ) -> Result<crate::TaskCommandOutcome, String> {
+        self.finish_mutation(self.tasks.transition(
+            task_id,
+            expected_revision,
+            status,
+            Vec::new(),
+            "original structured Graph execution projection",
+        )?)
     }
 
     pub fn record_failure(
@@ -445,7 +545,7 @@ impl TaskRuntimePort {
         reason: impl Into<String>,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
-        self.require_visible_task(task_id)?;
+        self.require_non_structured_task(task_id)?;
         let result =
             self.tasks
                 .record_failure(task_id, expected_revision, reason, evidence_refs)?;
@@ -529,7 +629,7 @@ impl TaskRuntimePort {
     }
 
     fn project_task_evidence(&self, task_id: &str, limit: usize) -> Result<usize, String> {
-        self.require_visible_task(task_id)?;
+        self.require_non_structured_task(task_id)?;
         let records = self.tasks.pending_outbox(Some(task_id), limit)?;
         self.project_evidence_records(records)
     }
@@ -650,6 +750,32 @@ impl TaskRuntimePort {
     ///
     /// Recovery is deliberately outside read paths: queries remain bounded by
     /// requested data while startup drains the durable evidence outbox.
+    pub(crate) fn request_structured_cancel(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+    ) -> Result<crate::TaskCommandOutcome, String> {
+        self.require_visible_task(task_id)?;
+        self.finish_mutation(
+            self.tasks
+                .request_structured_cancel(task_id, expected_revision)?,
+        )
+    }
+
+    pub(crate) fn confirm_structured_registration(
+        &self,
+        task: &TaskAggregate,
+        registration: &harness_contract::task::TaskStructuredRegistration,
+        receipt: harness_contract::task::TaskGraphRegistrationReceipt,
+    ) -> Result<crate::TaskCommandOutcome, String> {
+        self.finish_mutation(self.tasks.confirm_structured_registration(
+            &task.task_id,
+            task.revision,
+            registration,
+            receipt,
+        )?)
+    }
+
     pub fn recover(&self) -> Result<(), String> {
         const RECOVERY_BATCH_SIZE: usize = 256;
         loop {
@@ -677,6 +803,13 @@ impl TaskRuntimePort {
                 "task `{}` backend returned a command receipt inconsistent with its committed aggregate/outbox",
                 result.aggregate.task_id
             ));
+        }
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if result.aggregate.structured_registration.is_some() && result.aggregate.revision == 1 {
+            self.tasks.structured_checkpoint_for_test(
+                &result.aggregate.task_id,
+                super::StructuredTaskFaultPoint::AfterTaskCommitBeforeEvidence,
+            )?;
         }
         self.project_task_evidence(&result.aggregate.task_id, 256)?;
         Ok(crate::TaskCommandOutcome {
@@ -707,6 +840,17 @@ impl TaskRuntimePort {
     fn mission_is_visible(&self, mission_id: &str) -> bool {
         mission_id == self.missions.default_mission_id()
             || self.missions.aggregate(mission_id).is_some()
+    }
+
+    fn require_non_structured_task(&self, task_id: &str) -> Result<TaskAggregate, String> {
+        let task = self.require_visible_task(task_id)?;
+        if task.structured_registration.is_some() {
+            return Err(
+                "structured execution lifecycle is owned by the original Task/Graph boundary"
+                    .into(),
+            );
+        }
+        Ok(task)
     }
 
     fn require_visible_task(&self, task_id: &str) -> Result<TaskAggregate, String> {

@@ -1425,7 +1425,7 @@ impl RuntimeServices {
         Ok(assignment)
     }
     pub async fn recover_execution_graphs_on_startup(
-        &self,
+        self: &Arc<Self>,
     ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
         let excluded_sessions = BTreeSet::new();
         self.recover_execution_graphs_on_startup_excluding_sessions(&excluded_sessions)
@@ -1436,7 +1436,7 @@ impl RuntimeServices {
     /// A graph owned by an excluded Session remains byte-for-byte unchanged and
     /// is reported as deferred so a later partitioned pass can resume it.
     pub async fn recover_execution_graphs_on_startup_excluding_sessions(
-        &self,
+        self: &Arc<Self>,
         excluded_sessions: &BTreeSet<String>,
     ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
         self.ensure_mutation_allowed()?;
@@ -1527,6 +1527,19 @@ impl RuntimeServices {
         }
         if !report.errors.is_empty() {
             return Ok(report);
+        }
+
+        // Partition validation remains first. Then consume original Task
+        // registration/prepared-result obligations before generic Graph lease
+        // recovery can classify an uncommitted Provider callback as unknown.
+        // Excluded Sessions remain untouched, including Tasks without a Graph.
+        let mut structured_after = String::new();
+        while let Some(after) = self
+            .recover_structured_task_page_excluding(&structured_after, 256, excluded_sessions)
+            .await
+            .map_err(RuntimeServicesError::Task)?
+        {
+            structured_after = after;
         }
 
         let mut terminal_cursor = None;

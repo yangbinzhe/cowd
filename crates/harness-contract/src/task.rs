@@ -464,6 +464,8 @@ pub struct TaskGraphRef {
 /// cannot author or replace any field in this binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TaskApplicationProvenance {
+    /// Runtime-selected model frozen before durable Task admission.
+    pub model: String,
     pub producer_id: String,
     pub workspace_id: String,
     pub surface: String,
@@ -484,6 +486,7 @@ pub struct TaskApplicationProvenance {
 impl TaskApplicationProvenance {
     pub fn validate(&self) -> Result<(), String> {
         for (field, value) in [
+            ("model", self.model.as_str()),
             ("producer_id", self.producer_id.as_str()),
             ("workspace_id", self.workspace_id.as_str()),
             ("surface", self.surface.as_str()),
@@ -556,6 +559,124 @@ impl TaskApplicationProvenance {
     }
 }
 
+/// The original Graph registration transaction, independent of Task evidence projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGraphRegistrationReceipt {
+    pub event_id: String,
+    pub transaction_id: String,
+    pub commit_cursor: u64,
+    pub graph_revision: u64,
+}
+
+/// Read-only reverse provenance for an authenticated structured result. These
+/// references point to the original Task/Graph and artifact owners; this DTO
+/// does not admit work or publish another result truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskStructuredResultReceipt {
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+    pub binding_digest: String,
+    pub result_artifact: ArtifactRef,
+    pub registration: TaskGraphRegistrationReceipt,
+    pub source_session_id: String,
+    pub source_turn_id: String,
+    pub application: TaskApplicationProvenance,
+}
+
+/// A durable command obligation in the original Task aggregate. Graph remains
+/// the sole execution lifecycle owner; this records only registration delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskStructuredRegistration {
+    pub graph_id: String,
+    pub node_id: String,
+    pub generation: u64,
+    pub binding_digest: String,
+    pub input_digest: String,
+    pub schema_digest: String,
+    pub receipt: Option<TaskGraphRegistrationReceipt>,
+    pub cancel_requested: bool,
+}
+
+impl TaskStructuredRegistration {
+    pub fn pending(task: &TaskAggregate) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        let provenance = task
+            .application_provenance
+            .as_ref()
+            .ok_or("structured registration requires application provenance")?;
+        provenance.validate()?;
+        if task.kind != TaskKind::Root
+            || task.origin != TaskOrigin::System
+            || task
+                .execution_policy
+                .binding
+                .as_ref()
+                .is_none_or(|binding| binding.execution.session_id != task.origin_session_id)
+            || provenance.instruction_ref.visibility_scope
+                != format!("session:{}", task.origin_session_id)
+        {
+            return Err("structured Task source Session/origin/policy conflict".into());
+        }
+        let identity = serde_json::to_vec(&(
+            "cowd.task.structured-binding/v1",
+            &task.task_id,
+            &task.mission_id,
+            task.kind,
+            task.origin,
+            &task.origin_session_id,
+            &task.origin_turn_id,
+            &task.root_task_id,
+            &task.parent_task_id,
+            &task.predecessor_task_id,
+            &task.objective,
+            &task.execution_policy,
+            provenance,
+        ))
+        .map_err(|error| error.to_string())?;
+        // Stable by Task, not payload: a changed payload must conflict with the
+        // original graph identity instead of allocating an alternative graph.
+        let graph_id = format!(
+            "structured-task:{:x}",
+            Sha256::digest(task.task_id.as_bytes())
+        );
+        Ok(Self {
+            node_id: format!("{graph_id}:result"),
+            graph_id,
+            generation: 1,
+            binding_digest: format!("sha256:{:x}", Sha256::digest(identity)),
+            input_digest: provenance.input_ref.sha256.clone(),
+            schema_digest: provenance.result_schema_digest.clone(),
+            receipt: None,
+            cancel_requested: false,
+        })
+    }
+
+    pub fn validate_for(&self, task: &TaskAggregate) -> Result<(), String> {
+        let mut expected = Self::pending(task)?;
+        expected.receipt = self.receipt.clone();
+        expected.cancel_requested = self.cancel_requested;
+        if *self != expected {
+            return Err(
+                "structured Task registration differs from immutable input/source/policy".into(),
+            );
+        }
+        if let Some(receipt) = &self.receipt {
+            if receipt.event_id.trim().is_empty()
+                || receipt.transaction_id.trim().is_empty()
+                || receipt.commit_cursor == 0
+                || receipt.graph_revision != 1
+            {
+                return Err("structured Graph registration receipt is incomplete".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TaskAggregate {
     pub task_id: String,
@@ -586,6 +707,8 @@ pub struct TaskAggregate {
     pub graph_refs: Vec<TaskGraphRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_provenance: Option<TaskApplicationProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_registration: Option<TaskStructuredRegistration>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -605,6 +728,12 @@ impl TaskAggregate {
         self.execution_policy.validate_bound()?;
         if let Some(provenance) = &self.application_provenance {
             provenance.validate()?;
+            self.structured_registration
+                .as_ref()
+                .ok_or("structured Task lacks its durable Graph registration obligation")?
+                .validate_for(self)?;
+        } else if self.structured_registration.is_some() {
+            return Err("non-structured Task carries a structured registration".into());
         }
         validate_task_lineage(
             self.kind,
@@ -752,6 +881,14 @@ pub struct TaskCommandOutcome {
     pub command_receipt: TaskCommandReceipt,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskStructuredCancellationOutcome {
+    pub task: TaskAggregate,
+    pub cancellation_requested: bool,
+    pub cancellation_settled: bool,
+    pub pending_reason: Option<String>,
+}
+
 impl std::ops::Deref for TaskCommandOutcome {
     type Target = TaskAggregate;
 
@@ -798,6 +935,7 @@ mod execution_policy_tests {
             )
         };
         let mut provenance = TaskApplicationProvenance {
+            model: "test-model".into(),
             producer_id: "app:fixture".into(),
             workspace_id: "workspace-fixture".into(),
             surface: "app".into(),

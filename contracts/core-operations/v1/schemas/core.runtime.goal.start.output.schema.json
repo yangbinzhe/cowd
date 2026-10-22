@@ -298,6 +298,16 @@
             "null"
           ]
         },
+        "structured_registration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskStructuredRegistration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "task_id": {
           "type": "string"
         },
@@ -338,6 +348,10 @@
         },
         "instruction_ref": {
           "$ref": "#/$defs/ArtifactRef"
+        },
+        "model": {
+          "description": "Runtime-selected model frozen before durable Task admission.",
+          "type": "string"
         },
         "producer_id": {
           "type": "string"
@@ -385,6 +399,7 @@
         }
       },
       "required": [
+        "model",
         "producer_id",
         "workspace_id",
         "surface",
@@ -489,6 +504,35 @@
         "graph_id",
         "revision",
         "linked_at_ms"
+      ],
+      "type": "object"
+    },
+    "TaskGraphRegistrationReceipt": {
+      "additionalProperties": false,
+      "description": "The original Graph registration transaction, independent of Task evidence projection.",
+      "properties": {
+        "commit_cursor": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "graph_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transaction_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "transaction_id",
+        "commit_cursor",
+        "graph_revision"
       ],
       "type": "object"
     },
@@ -692,6 +736,55 @@
         "failed"
       ],
       "type": "string"
+    },
+    "TaskStructuredRegistration": {
+      "additionalProperties": false,
+      "description": "A durable command obligation in the original Task aggregate. Graph remains\nthe sole execution lifecycle owner; this records only registration delivery.",
+      "properties": {
+        "binding_digest": {
+          "type": "string"
+        },
+        "cancel_requested": {
+          "type": "boolean"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "graph_id": {
+          "type": "string"
+        },
+        "input_digest": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskGraphRegistrationReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "graph_id",
+        "node_id",
+        "generation",
+        "binding_digest",
+        "input_digest",
+        "schema_digest",
+        "cancel_requested"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

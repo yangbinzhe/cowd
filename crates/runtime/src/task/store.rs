@@ -102,6 +102,35 @@ pub trait TaskStoreBackend: std::fmt::Debug + Send + Sync {
             .find(|task| task.task_id == task_id))
     }
 
+    /// Bounded keyset page of original structured obligations, independently
+    /// of evidence-outbox projected state. Includes confirmed, nonterminal
+    /// Tasks so a crash between confirmation and wake is recoverable.
+    fn original_creation_evidence(
+        &self,
+        _task_id: &str,
+    ) -> Result<Option<TaskEvidenceOutboxRecord>, String> {
+        Err("Task backend does not expose bounded original creation evidence".into())
+    }
+
+    fn structured_recovery_candidates(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskAggregate>, String> {
+        let mut tasks = self
+            .list()?
+            .into_iter()
+            .filter(|task| {
+                task.structured_registration.is_some()
+                    && !task.status.is_terminal()
+                    && task.task_id.as_str() > after
+            })
+            .collect::<Vec<_>>();
+        tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        tasks.truncate(limit);
+        Ok(tasks)
+    }
+
     fn bind_turn(&self, binding: &TaskTurnBinding) -> Result<TaskTurnBinding, String>;
 
     fn create_with_origin_binding(
@@ -275,6 +304,18 @@ impl EphemeralTaskStore {
 }
 
 impl TaskStoreBackend for EphemeralTaskStore {
+    fn original_creation_evidence(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskEvidenceOutboxRecord>, String> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .evidence_outbox
+            .get(&format!("task-outbox:{task_id}:1"))
+            .cloned())
+    }
     fn list(&self) -> Result<Vec<TaskAggregate>, String> {
         Ok(self.state.lock().unwrap().tasks.values().cloned().collect())
     }
@@ -348,6 +389,13 @@ impl TaskStoreBackend for EphemeralTaskStore {
                 .tasks
                 .get(id)
                 .ok_or_else(|| format!("task `{id}` not found"))?;
+            if task.structured_registration.is_some()
+                && task.mission_id != command.target_mission_id
+            {
+                return Err(
+                    "structured Task mission is frozen by its original Graph binding".into(),
+                );
+            }
             let expected = command
                 .expected_task_revisions
                 .get(id)
@@ -454,13 +502,26 @@ impl TaskStoreBackend for EphemeralTaskStore {
         let mut state = self.state.lock().unwrap();
         let current = state.tasks.get(id).cloned();
         let actual = current.as_ref().map_or(0, |v| v.revision);
+        let next = updater(current.clone())?;
+        if current.as_ref() == Some(&next) {
+            validate_task_aggregate_for_backend(&next)?;
+            let original = state
+                .evidence_outbox
+                .get(&format!("task-outbox:{id}:{}", next.revision))
+                .cloned()
+                .ok_or("idempotent Task replay has no original outbox")?;
+            return Ok(TaskMutationResult::from_backend_commit(
+                next,
+                mutation,
+                Some(original),
+            ));
+        }
         if actual != mutation.expected_revision {
             return Err(format!(
                 "task `{id}` revision conflict: expected {}, actual {actual}",
                 mutation.expected_revision
             ));
         }
-        let next = updater(current.clone())?;
         validate_backend_mutation(id, current.as_ref(), &next, mutation)?;
         Ok(Self::mutation_result(&mut state, next, mutation))
     }
@@ -514,9 +575,22 @@ impl TaskStoreBackend for EphemeralTaskStore {
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredTaskFaultPoint {
+    AfterTaskCommitBeforeEvidence,
+    BeforeGraphRegistration,
+    AfterGraphRegistrationBeforeConfirmation,
+    AfterConfirmationBeforeWake,
+    BeforeTaskResultProjection,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskAggregateService {
     backend: Arc<dyn TaskStoreBackend>,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    structured_faults:
+        Arc<std::sync::Mutex<std::collections::BTreeMap<String, (StructuredTaskFaultPoint, u64)>>>,
 }
 
 impl TaskAggregateService {
@@ -527,7 +601,44 @@ impl TaskAggregateService {
 
     #[must_use]
     pub fn from_backend(backend: Arc<dyn TaskStoreBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            #[cfg(any(test, feature = "test-fixtures"))]
+            structured_faults: Default::default(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn inject_structured_fault_for_test(&self, task_id: &str, point: StructuredTaskFaultPoint) {
+        assert!(self
+            .structured_faults
+            .lock()
+            .unwrap()
+            .insert(task_id.into(), (point, 0))
+            .is_none());
+    }
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn structured_fault_hits_for_test(&self, task_id: &str) -> u64 {
+        self.structured_faults
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .map_or(0, |(_, hits)| *hits)
+    }
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) fn structured_checkpoint_for_test(
+        &self,
+        task_id: &str,
+        point: StructuredTaskFaultPoint,
+    ) -> Result<(), String> {
+        let mut faults = self.structured_faults.lock().unwrap();
+        if let Some((expected, hits)) = faults.get_mut(task_id) {
+            if *expected == point {
+                *hits += 1;
+                return Err(format!("structured_fault_injected:{point:?}"));
+            }
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<TaskAggregate>, String> {
@@ -604,8 +715,11 @@ impl TaskAggregateService {
                 .iter()
                 .find(|task| &task.task_id == task_id)
                 .ok_or_else(|| format!("task `{task_id}` not found"))?;
-            let allowed = task.mission_assignment != TaskMissionAssignment::ExplicitLocked
-                || command.assignment == TaskMissionAssignment::ExplicitLocked;
+            let frozen_structured = task.structured_registration.is_some()
+                && task.mission_id != command.target_mission_id;
+            let allowed = !frozen_structured
+                && (task.mission_assignment != TaskMissionAssignment::ExplicitLocked
+                    || command.assignment == TaskMissionAssignment::ExplicitLocked);
             command
                 .expected_task_revisions
                 .insert(task.task_id.clone(), task.revision);
@@ -615,8 +729,13 @@ impl TaskAggregateService {
                 target_mission_id: command.target_mission_id.clone(),
                 current_revision: task.revision,
                 allowed,
-                reason: (!allowed)
-                    .then(|| "explicitly locked Task requires an explicit assignment".to_string()),
+                reason: if frozen_structured {
+                    Some("structured Task mission is frozen by its original Graph binding".into())
+                } else {
+                    (!allowed).then(|| {
+                        "explicitly locked Task requires an explicit assignment".to_string()
+                    })
+                },
             });
         }
         let preview = TaskMissionAssignmentPreview {
@@ -659,6 +778,116 @@ impl TaskAggregateService {
         limit: usize,
     ) -> Result<Vec<MissionOrganizationDecision>, String> {
         self.backend.organization_decisions(status, limit)
+    }
+
+    pub(crate) fn original_creation_receipt(
+        &self,
+        task_id: &str,
+    ) -> Result<TaskCommandReceipt, String> {
+        let record = self
+            .backend
+            .original_creation_evidence(task_id)?
+            .ok_or("Task original creation evidence missing")?;
+        if record.task_id != task_id
+            || record.revision != 1
+            || record.event_kind != "task.created"
+            || record.status != TaskStatus::Running
+        {
+            return Err("Task original creation evidence conflict".into());
+        }
+        Ok(TaskCommandReceipt {
+            task_id: record.task_id,
+            accepted_revision: record.revision,
+            status: record.status,
+            outbox_id: record.outbox_id,
+            evidence_refs: record.evidence_refs,
+        })
+    }
+
+    pub(crate) fn structured_recovery_candidates(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskAggregate>, String> {
+        self.backend.structured_recovery_candidates(after, limit)
+    }
+
+    pub(crate) fn request_structured_cancel(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+    ) -> Result<TaskMutationResult, String> {
+        self.update_existing(
+            task_id,
+            expected_revision,
+            "task.structured.cancel_requested".into(),
+            Vec::new(),
+            |task| {
+                if task.revision != expected_revision {
+                    return Err("structured cancellation Task revision conflict".into());
+                }
+                let registration = task
+                    .structured_registration
+                    .as_mut()
+                    .ok_or("Task is not structured")?;
+                if task.status.is_terminal() || registration.cancel_requested {
+                    return Ok(());
+                }
+                registration.cancel_requested = true;
+                task.revision = task
+                    .revision
+                    .checked_add(1)
+                    .ok_or("Task revision overflow")?;
+                task.updated_at_ms = now_ms();
+                Ok(())
+            },
+        )
+    }
+
+    pub(crate) fn confirm_structured_registration(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+        expected: &harness_contract::task::TaskStructuredRegistration,
+        receipt: harness_contract::task::TaskGraphRegistrationReceipt,
+    ) -> Result<TaskMutationResult, String> {
+        self.update_existing(
+            task_id,
+            expected_revision,
+            "task.graph_registered".into(),
+            Vec::new(),
+            |task| {
+                let registration = task
+                    .structured_registration
+                    .as_mut()
+                    .ok_or("Task has no structured registration")?;
+                let mut pending = registration.clone();
+                pending.receipt = None;
+                let mut original = expected.clone();
+                original.receipt = None;
+                if pending != original {
+                    return Err("structured registration generation/binding conflict".into());
+                }
+                if let Some(existing) = &registration.receipt {
+                    if existing != &receipt {
+                        return Err("structured Graph receipt conflict".into());
+                    }
+                    return Ok(());
+                }
+                registration.receipt = Some(receipt.clone());
+                task.graph_refs.push(TaskGraphRef {
+                    graph_id: registration.graph_id.clone(),
+                    revision: receipt.graph_revision,
+                    linked_at_ms: now_ms(),
+                });
+                task.revision = task
+                    .revision
+                    .checked_add(1)
+                    .ok_or("Task revision overflow")?;
+                task.updated_at_ms = now_ms();
+                Ok(())
+            },
+        )
     }
 
     pub fn create(&self, command: TaskCreateCommand) -> Result<TaskMutationResult, String> {
@@ -1180,7 +1409,7 @@ fn validate_required(field: &str, value: &str) -> Result<(), String> {
     }
 }
 
-fn prepare_task_creation(
+pub(super) fn prepare_task_creation(
     command: TaskCreateCommand,
 ) -> Result<(TaskAggregate, TaskMutation), String> {
     crate::task::validate_create_command(&command)?;
@@ -1218,7 +1447,7 @@ fn prepare_task_creation(
             })
             .collect()
     };
-    let aggregate = TaskAggregate {
+    let mut aggregate = TaskAggregate {
         task_id: command.task_id.clone(),
         mission_id: command.mission_id,
         kind: command.kind,
@@ -1243,9 +1472,16 @@ fn prepare_task_creation(
         strategy_ref: None,
         graph_refs: Vec::new(),
         application_provenance: command.spec.application_provenance,
+        structured_registration: None,
         created_at_ms: now,
         updated_at_ms: now,
     };
+    if aggregate.application_provenance.is_some() {
+        aggregate.structured_registration = Some(
+            harness_contract::task::TaskStructuredRegistration::pending(&aggregate)?,
+        );
+    }
+    aggregate.validate()?;
     let mutation = TaskMutation {
         expected_revision: 0,
         event_kind: "task.created".to_string(),

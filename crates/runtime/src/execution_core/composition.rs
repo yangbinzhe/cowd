@@ -346,6 +346,7 @@ impl RuntimeServicesBuilder {
             "Runtime service graph assembly completed"
         );
         services.install_graph_settled_observer()?;
+        crate::task::structured::install(&services);
         crate::execution_core::graph::executors::agent_tool::AgentToolBatchResolver::install(
             &services,
         );

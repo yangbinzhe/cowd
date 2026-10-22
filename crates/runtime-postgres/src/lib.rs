@@ -260,7 +260,7 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
 const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     id: "runtime_task.current-baseline",
     domain: TASK_DOMAIN,
-    version: 1,
+    version: 2,
     description: "initialize current clean runtime_task schema",
     statements: &[
         r#"DO $clean$ BEGIN IF EXISTS(SELECT 1 FROM cowd_schema_migrations WHERE domain='runtime_task' AND id<>'runtime_task.current-baseline') OR to_regclass('runtime_tasks') IS NOT NULL THEN RAISE EXCEPTION 'unsupported runtime_task catalog; initialize an explicitly selected clean namespace'; END IF; END $clean$"#,
@@ -312,6 +312,8 @@ const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
                 updated_at_ms BIGINT NOT NULL,
                 record_json JSONB NOT NULL
         )"#,
+        r#"CREATE INDEX idx_runtime_tasks_structured_recovery
+            ON runtime_tasks(task_id) WHERE record_json ? 'structured_registration' AND status NOT IN ('completed','cancelled','failed')"#,
         r#"CREATE INDEX idx_runtime_tasks_status_created
             ON runtime_tasks(status, created_at_ms DESC, task_id DESC)"#,
         r#"CREATE INDEX idx_runtime_task_evidence_outbox_pending

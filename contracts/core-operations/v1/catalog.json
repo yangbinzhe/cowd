@@ -1,6 +1,6 @@
 {
   "authority": "cowd-core",
-  "catalog_digest": "sha256:ba6290d9a073fc3d8dc7d33ed17da1f053c4fff030dc9475e00699441b153fa2",
+  "catalog_digest": "sha256:6c6543b80eccb50d6d2986a46880aa678397c672da1279ac1436571d02542474",
   "operations": [
     {
       "audit_classification": "approval.decide",
@@ -153,7 +153,7 @@
       "maximum_response_bytes": 4194304,
       "operation_id": "core.runtime.goal.start",
       "output_schema": {
-        "digest": "sha256:202bfc0c0b062b9663a788a3b0f0d7f2cc77dec7151f03c161580b594378202c",
+        "digest": "sha256:c2b77cab38401db15d4c66e617799402b542ed0b5c4d10468fb7d12f622ebf7c",
         "path": "schemas/core.runtime.goal.start.output.schema.json"
       },
       "read_only": false,
@@ -180,7 +180,7 @@
       "maximum_response_bytes": 4194304,
       "operation_id": "core.runtime.structured_task.cancel",
       "output_schema": {
-        "digest": "sha256:ce687dadae93c71444ea72a362d55ab148355a9dc0d58e0ff0f9b492a680824a",
+        "digest": "sha256:1f904478bbc64d93fd8eb08f76d64e76d1851ccf33764f897569f8dcd4cd5f77",
         "path": "schemas/core.runtime.structured_task.cancel.output.schema.json"
       },
       "read_only": false,
@@ -207,7 +207,7 @@
       "maximum_response_bytes": 4194304,
       "operation_id": "core.runtime.structured_task.start",
       "output_schema": {
-        "digest": "sha256:537bdb5ad775c4c68fc63a9711813643e2ff402164f4dee8931dd294d58082cd",
+        "digest": "sha256:f9ebae3039e6d3447a797cc3de280dc03a56c0010eaa92dd5f9815f3d75fd035",
         "path": "schemas/core.runtime.structured_task.start.output.schema.json"
       },
       "read_only": false,
@@ -342,7 +342,7 @@
       "maximum_response_bytes": 4194304,
       "operation_id": "core.work_context.structured_task_result.inspect",
       "output_schema": {
-        "digest": "sha256:1606f3d00308882c808cf0d5f874320a486bda59b43de40b86370df03e594e54",
+        "digest": "sha256:7e696b819e6693b2dc22019b02db7a1eaeb64f0b41d8d56e592c44fbe424df27",
         "path": "schemas/core.work_context.structured_task_result.inspect.output.schema.json"
       },
       "read_only": true,

@@ -55,6 +55,35 @@ impl TaskStoreBackend for PostgresTaskStore {
         rows.iter().map(task_record_from_row).collect()
     }
 
+    fn original_creation_evidence(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskEvidenceOutboxRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|e| e.to_string())?;
+        connection.query_opt("SELECT record_json FROM runtime_task_evidence_outbox WHERE task_id=$1 AND revision=1", &[&task_id])
+            .map_err(|e|e.to_string())?.as_ref().map(task_outbox_from_row).transpose()
+    }
+
+    fn structured_recovery_candidates(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskAggregate>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit).map_err(|_| "structured recovery page too large")?;
+        let rows = connection.query(
+            "SELECT record_json FROM runtime_tasks WHERE record_json ? 'structured_registration' AND status NOT IN ('completed','cancelled','failed') AND task_id > $1 ORDER BY task_id LIMIT $2",
+            &[&after, &limit],
+        ).map_err(|error| error.to_string())?;
+        rows.iter().map(task_record_from_row).collect()
+    }
+
     fn get(&self, task_id: &str) -> Result<Option<TaskAggregate>, String> {
         let mut connection = self
             .executor

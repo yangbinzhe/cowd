@@ -9,6 +9,7 @@ pub mod lifecycle;
 pub mod router;
 pub mod runtime_port;
 mod store;
+pub(crate) mod structured;
 
 pub use aggregate::*;
 pub use lifecycle::*;

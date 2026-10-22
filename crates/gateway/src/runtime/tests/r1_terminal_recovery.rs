@@ -4250,6 +4250,36 @@ impl RecoveryServices {
         notification_reader: Option<Arc<runtime::RuntimeEventStore>>,
         candidate_graph: Option<String>,
     ) -> Self {
+        Self::start_composed(
+            root,
+            topology,
+            providers,
+            notification_reader,
+            candidate_graph,
+            None,
+        )
+        .await
+    }
+
+    async fn start_with_single_provider_slot(
+        root: &Path,
+        topology: SelectedStorageTopology,
+        providers: Arc<runtime::ProviderRegistry>,
+    ) -> Self {
+        let mut config = runtime::ProviderResourceConfig::default();
+        config.global = runtime::ProviderQuotaPolicy::new(1, 1, 1, 0);
+        config.fallback = runtime::ProviderQuotaPolicy::new(1, 1, 1, 0);
+        Self::start_composed(root, topology, providers, None, None, Some(config)).await
+    }
+
+    async fn start_composed(
+        root: &Path,
+        topology: SelectedStorageTopology,
+        providers: Arc<runtime::ProviderRegistry>,
+        notification_reader: Option<Arc<runtime::RuntimeEventStore>>,
+        candidate_graph: Option<String>,
+        provider_config: Option<runtime::ProviderResourceConfig>,
+    ) -> Self {
         use crate::services::session_service::{
             activation::SessionActivationCoordinator, presence::SessionPresenceLedger,
             repository::SessionRepository,
@@ -4299,6 +4329,7 @@ impl RecoveryServices {
         });
         let config_home = root.join("home");
         let services = runtime::RuntimeServices::builder(&config_home, root.join("workspace"))
+            .provider_resource_config(provider_config.unwrap_or_default())
             .provider_registry(providers.clone())
             .tool_execution_host(recording_host)
             .runtime_event_store(topology.runtime_event_store.clone())
@@ -4467,6 +4498,328 @@ impl RecoveryServices {
         assert!(connector_witness.upgrade().is_none());
         lease
     }
+}
+
+async fn n3_reply_under_single_provider_lease(
+    provider: &mut LoopbackProvider,
+    services: &RecoveryServices,
+) {
+    let request = provider.next().await;
+    let runtime = services.runtime.runtime_services();
+    let capacity = runtime
+        .resource_manager()
+        .snapshot(&runtime::execution_core::graph::ExecutionResourceKind::Provider)
+        .unwrap();
+    assert_eq!(capacity.effective_limit, 1);
+    assert_eq!(capacity.active_leases, 1);
+    assert_eq!(request.body["stream"], false);
+    let prompt: Value = serde_json::from_str(
+        request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        prompt["untrusted_application_input"],
+        json!({"request":"bounded result"})
+    );
+    assert_eq!(
+        prompt["instruction"],
+        "Return one JSON object with value 37"
+    );
+    request
+        .reply
+        .send(json!({"role":"assistant","content":"{\"value\":37}"}))
+        .unwrap();
+}
+
+// Full Runtime/PG recovery assets: compile during development, execute at N8.
+// Each fault destroys old adapters; production recovery, not a second APP start,
+// owns registration, the original attempt and the result projection.
+async fn n3_structured_recovery_case(point: runtime::task::StructuredTaskFaultPoint) {
+    use crate::services::{EnsureSessionRequest, SessionSource};
+    use harness_contract::task::*;
+    use sha2::{Digest, Sha256};
+    let root = fixture_root();
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let providers = provider_registry(&[&provider]);
+    let topology = SelectedStorageTopology::compose_for_test(
+        &root.path().join("home"),
+        &root.path().join("workspace"),
+    )
+    .unwrap();
+    let services =
+        RecoveryServices::start_with_single_provider_slot(root.path(), topology, providers.clone())
+            .await;
+    let session_id = format!("structured-recovery:{}", uuid::Uuid::new_v4());
+    let mut session_request =
+        EnsureSessionRequest::new(&session_id, Some("test-model".into()), SessionSource::Tui);
+    session_request.owner_principal_id = Some("recovery-operator".into());
+    services
+        .session
+        .create_user_session(session_request)
+        .await
+        .unwrap();
+    let runtime = services.runtime.runtime_services();
+    let task_id = format!("task-structured-{}", uuid::Uuid::new_v4());
+    let schema = json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false});
+    let schema_bytes = cowd_app_protocol::canonical_result_schema_bytes(&schema).unwrap();
+    let bodies = [
+        (
+            "instruction",
+            b"Return one JSON object with value 37".to_vec(),
+            "text/plain",
+        ),
+        (
+            "input",
+            br#"{"request":"bounded result"}"#.to_vec(),
+            "application/json",
+        ),
+        ("schema", schema_bytes.clone(), "application/schema+json"),
+    ];
+    let mut refs = Vec::new();
+    for (name, bytes, media) in bodies {
+        let reference = runtime
+            .artifact_store()
+            .write_bytes_with_identity(
+                runtime::ArtifactWriteDescriptor {
+                    media_type: media.into(),
+                    visibility_scope: format!("session:{session_id}"),
+                    expected_bytes: Some(bytes.len() as u64),
+                    original_name: Some(name.into()),
+                },
+                &bytes,
+                format!("{task_id}-{name}"),
+            )
+            .await
+            .unwrap();
+        runtime
+            .artifact_store()
+            .pin(
+                &reference,
+                &format!("runtime.structured-task:{task_id}"),
+                runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+            )
+            .unwrap();
+        refs.push(reference);
+    }
+    let mut spec = TaskSpec::new("Return the original schema-validated application result");
+    spec.application_provenance = Some(TaskApplicationProvenance {
+        model: "test-model".into(),
+        producer_id: "app:structured-recovery".into(),
+        workspace_id: "workspace:recovery".into(),
+        surface: "panel".into(),
+        request_id: format!("request:{task_id}"),
+        request_idempotency_key: Some(format!("once:{task_id}")),
+        result_contract_id: "result:structured".into(),
+        result_schema_id: "schema:structured".into(),
+        result_schema_version: 1,
+        result_schema_digest: format!("{:x}", Sha256::digest(&schema_bytes)),
+        result_max_bytes: 1024,
+        instruction_ref: refs[0].clone(),
+        input_ref: refs[1].clone(),
+        result_schema_ref: refs[2].clone(),
+        request_digest: format!("{:x}", Sha256::digest(task_id.as_bytes())),
+    });
+    let spec = runtime
+        .task_runtime_port()
+        .bind_task_spec(&session_id, None, spec)
+        .unwrap();
+    let command = TaskCreateCommand {
+        task_id: task_id.clone(),
+        mission_id: runtime.mission_runtime().default_mission_id().into(),
+        kind: TaskKind::Root,
+        origin: TaskOrigin::System,
+        origin_session_id: session_id.clone(),
+        origin_turn_id: format!("application-turn:{task_id}"),
+        root_task_id: task_id.clone(),
+        parent_task_id: None,
+        predecessor_task_id: None,
+        mission_assignment: TaskMissionAssignment::ExplicitLocked,
+        mission_assigned_by: "gateway.application_structured_task".into(),
+        spec,
+        evidence_refs: Vec::new(),
+    };
+    runtime
+        .task_aggregate_service()
+        .inject_structured_fault_for_test(&task_id, point);
+    let creation = runtime.create_structured_task(command.clone()).await;
+    if point == runtime::task::StructuredTaskFaultPoint::AfterTaskCommitBeforeEvidence {
+        assert!(creation.unwrap_err().contains("structured_fault_injected"));
+    } else {
+        creation.unwrap();
+        if point == runtime::task::StructuredTaskFaultPoint::BeforeTaskResultProjection {
+            runtime.register_structured_task(&task_id).await.unwrap();
+            n3_reply_under_single_provider_lease(&mut provider, &services).await;
+            durable_until(|| {
+                (runtime
+                    .task_aggregate_service()
+                    .structured_fault_hits_for_test(&task_id)
+                    > 0)
+                .then_some(())
+            })
+            .await;
+        } else {
+            assert!(runtime
+                .register_structured_task(&task_id)
+                .await
+                .unwrap_err()
+                .contains("structured_fault_injected"));
+        }
+    }
+    assert!(
+        runtime
+            .task_aggregate_service()
+            .structured_fault_hits_for_test(&task_id)
+            > 0,
+        "fault must hit its original owner"
+    );
+    let before = runtime
+        .task_aggregate_service()
+        .get(&task_id)
+        .unwrap()
+        .unwrap();
+    let before_binding = before.structured_registration.clone().unwrap();
+    let original_creation_outbox: String = services
+        .topology
+        .postgres_executor
+        .checkout_online_read()
+        .unwrap()
+        .query_one(
+            "SELECT outbox_id FROM runtime_task_evidence_outbox WHERE task_id=$1 AND revision=1",
+            &[&task_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(before.status, TaskStatus::Running);
+    if point == runtime::task::StructuredTaskFaultPoint::AfterConfirmationBeforeWake {
+        assert!(before_binding.receipt.is_some());
+    }
+    drop(runtime);
+    // stop() drops every old domain adapter. start() runs the real ordered
+    // recovery barrier and release_recovered_producers before returning.
+    let lease = services.stop().await;
+    let topology = lease.rebuild().unwrap();
+    drop(lease);
+    let services =
+        RecoveryServices::start_with_single_provider_slot(root.path(), topology, providers).await;
+    if point != runtime::task::StructuredTaskFaultPoint::BeforeTaskResultProjection {
+        n3_reply_under_single_provider_lease(&mut provider, &services).await;
+    }
+    let runtime = services.runtime.runtime_services();
+    let completed = durable_until(|| {
+        runtime
+            .task_aggregate_service()
+            .get(&task_id)
+            .unwrap()
+            .filter(|task| task.status == TaskStatus::Completed)
+    })
+    .await;
+    let binding = completed.structured_registration.as_ref().unwrap();
+    assert_eq!(binding.graph_id, before_binding.graph_id);
+    assert_eq!(binding.binding_digest, before_binding.binding_digest);
+    if before_binding.receipt.is_some() {
+        assert_eq!(binding.receipt, before_binding.receipt);
+    }
+    assert!(binding.receipt.is_some());
+    let graph = runtime.graph_state_store().load(&binding.graph_id).unwrap();
+    assert_eq!(
+        graph.recovery_cursor.node_attempts.get(&binding.node_id),
+        Some(&1)
+    );
+    let artifacts = completed
+        .phases
+        .iter()
+        .flat_map(|phase| &phase.artifacts)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "application_structured_attempt.v1")
+            .count(),
+        1
+    );
+    let result = artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "application_structured_result.v1")
+        .unwrap();
+    let value: Value = serde_json::from_str(&result.value).unwrap();
+    assert_eq!(value["result"], json!({"value":37}));
+    assert_eq!(value["attempt"], 1);
+    assert_eq!(value["graph_id"], binding.graph_id);
+    assert_eq!(value["usage"]["input_tokens"], 13);
+    assert_eq!(value["usage"]["output_tokens"], 7);
+    runtime
+        .validate_structured_result_identity(
+            &completed,
+            &binding.graph_id,
+            &binding.node_id,
+            1,
+            &binding.binding_digest,
+            &result.value,
+        )
+        .unwrap();
+    let replay = runtime
+        .create_structured_task(command.clone())
+        .await
+        .unwrap();
+    assert_eq!(replay.command_receipt.accepted_revision, 1);
+    assert_eq!(replay.command_receipt.outbox_id, original_creation_outbox);
+    for fault in ["input", "schema", "producer", "source"] {
+        let mut changed = command.clone();
+        let provenance = changed.spec.application_provenance.as_mut().unwrap();
+        match fault {
+            "input" => provenance.input_ref.sha256 = format!("sha256:{}", "d".repeat(64)),
+            "schema" => provenance.result_schema_digest = "d".repeat(64),
+            "producer" => provenance.producer_id = "app:foreign".into(),
+            _ => changed.origin_turn_id = "foreign-turn".into(),
+        }
+        assert!(
+            runtime.create_structured_task(changed).await.is_err(),
+            "{fault}"
+        );
+    }
+    assert!(
+        provider.requests.is_empty(),
+        "recovery/replay/foreign inputs must not create another Provider call"
+    );
+    drop(runtime);
+    let _lease = services.stop().await;
+}
+
+#[tokio::test]
+async fn n3_task_committed_before_evidence_recovers_without_app_resubmission() {
+    n3_structured_recovery_case(
+        runtime::task::StructuredTaskFaultPoint::AfterTaskCommitBeforeEvidence,
+    )
+    .await;
+}
+#[tokio::test]
+async fn n3_evidence_projected_before_graph_recovers_without_app_resubmission() {
+    n3_structured_recovery_case(runtime::task::StructuredTaskFaultPoint::BeforeGraphRegistration)
+        .await;
+}
+#[tokio::test]
+async fn n3_graph_committed_before_confirmation_recovers_same_graph() {
+    n3_structured_recovery_case(
+        runtime::task::StructuredTaskFaultPoint::AfterGraphRegistrationBeforeConfirmation,
+    )
+    .await;
+}
+#[tokio::test]
+async fn n3_confirmation_before_wake_recovers_through_original_supervisor() {
+    n3_structured_recovery_case(
+        runtime::task::StructuredTaskFaultPoint::AfterConfirmationBeforeWake,
+    )
+    .await;
+}
+#[tokio::test]
+async fn n3_artifact_and_graph_result_restart_projects_without_another_provider() {
+    n3_structured_recovery_case(
+        runtime::task::StructuredTaskFaultPoint::BeforeTaskResultProjection,
+    )
+    .await;
 }
 
 #[tokio::test]

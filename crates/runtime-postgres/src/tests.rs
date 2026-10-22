@@ -3787,3 +3787,115 @@ fn n2_checked_source_commit_survives_response_loss_and_rejects_related_write() {
     drop(store);
     drop(std::mem::ManuallyDrop::into_inner(fixture));
 }
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn structured_task_pending_registration_is_atomic_indexed_and_survives_reconnect() {
+    use harness_contract::{context::ArtifactRef, task::TaskApplicationProvenance};
+    let fixture = PostgresTestScope::new();
+    let backend = PostgresTaskStore::new(fixture.reconnect()).unwrap();
+    let executor = backend.executor().clone();
+    let tasks = backend.clone().into_task_service();
+    let mut spec = policy_bound_task_spec("structured-pg", "Return a schema-validated result");
+    let artifact = |name: &str, media: &str| {
+        ArtifactRef::durable(
+            name,
+            format!("sha256:{}", "a".repeat(64)),
+            32,
+            media,
+            "session:structured-pg",
+        )
+    };
+    spec.application_provenance = Some(TaskApplicationProvenance {
+        model: "test-model".into(),
+        producer_id: "app:pg".into(),
+        workspace_id: "workspace:pg".into(),
+        surface: "panel".into(),
+        request_id: "request:pg".into(),
+        request_idempotency_key: Some("once:pg".into()),
+        result_contract_id: "result:pg".into(),
+        result_schema_id: "schema:pg".into(),
+        result_schema_version: 1,
+        result_schema_digest: "b".repeat(64),
+        result_max_bytes: 1024,
+        instruction_ref: artifact("artifact://pg-instruction", "text/plain"),
+        input_ref: artifact("artifact://pg-input", "application/json"),
+        result_schema_ref: artifact("artifact://pg-schema", "application/schema+json"),
+        request_digest: "c".repeat(64),
+    });
+    let command = TaskCreateCommand {
+        task_id: "task-structured-pg".into(),
+        root_task_id: "task-structured-pg".into(),
+        mission_id: "mission:pg".into(),
+        kind: TaskKind::Root,
+        origin: TaskOrigin::System,
+        origin_session_id: "structured-pg".into(),
+        origin_turn_id: "turn:pg".into(),
+        parent_task_id: None,
+        predecessor_task_id: None,
+        mission_assignment: TaskMissionAssignment::ExplicitLocked,
+        mission_assigned_by: "gateway.application_structured_task".into(),
+        spec,
+        evidence_refs: Vec::new(),
+    };
+    let created = tasks.create(command.clone()).unwrap();
+    let pending = created.aggregate.structured_registration.as_ref().unwrap();
+    assert!(pending.receipt.is_none());
+    assert_eq!(pending.generation, 1);
+    assert_eq!(pending.input_digest, format!("sha256:{}", "a".repeat(64)));
+    assert_eq!(pending.schema_digest, "b".repeat(64));
+    let mut connection = executor.checkout_online_read().unwrap();
+    let row=connection.query_one("SELECT (SELECT count(*) FROM runtime_tasks WHERE task_id='task-structured-pg'), (SELECT count(*) FROM runtime_task_evidence_outbox WHERE task_id='task-structured-pg' AND projected_at_ms IS NULL), (SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='idx_runtime_tasks_structured_recovery')",&[]).unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, i64>(1), 1);
+    assert_eq!(row.get::<_, i64>(2), 1);
+    drop(connection);
+    tasks
+        .mark_outbox_projected(&created.outbox.unwrap().outbox_id, 123)
+        .unwrap();
+    let reopened = PostgresTaskStore::new(fixture.reconnect()).unwrap();
+    assert_eq!(
+        reopened.structured_recovery_candidates("", 1).unwrap(),
+        vec![created.aggregate.clone()]
+    );
+    let service = reopened.into_task_service();
+    assert_eq!(
+        service.create(command.clone()).unwrap().aggregate,
+        created.aggregate
+    );
+    let reassignment = harness_contract::mission::TaskMissionAssignmentCommand {
+        operation_id: "foreign-structured-mission-move".into(),
+        workspace_id: "workspace:pg".into(),
+        task_ids: vec![created.aggregate.task_id.clone()],
+        target_mission_id: "foreign-mission".into(),
+        assignment: TaskMissionAssignment::ExplicitLocked,
+        actor: "operator".into(),
+        expected_task_revisions: std::collections::BTreeMap::from([(
+            created.aggregate.task_id.clone(),
+            created.aggregate.revision,
+        )]),
+        evidence_refs: Vec::new(),
+    };
+    assert!(service.assign_mission_batch(&reassignment).is_err());
+    assert_eq!(
+        service.get("task-structured-pg").unwrap().unwrap(),
+        created.aggregate
+    );
+    let mut changed = command;
+    changed
+        .spec
+        .application_provenance
+        .as_mut()
+        .unwrap()
+        .input_ref
+        .sha256 = format!("sha256:{}", "d".repeat(64));
+    assert!(service.create(changed).is_err());
+    assert_eq!(
+        service.get("task-structured-pg").unwrap().unwrap(),
+        created.aggregate
+    );
+    assert!(backend
+        .structured_recovery_candidates("task-structured-pg", 1)
+        .unwrap()
+        .is_empty());
+}

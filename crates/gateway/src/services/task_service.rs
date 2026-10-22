@@ -25,6 +25,7 @@ pub(crate) struct TaskService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     port: Option<runtime::TaskRuntimePort>,
+    runtime: Option<Arc<runtime::RuntimeServices>>,
 }
 
 impl TaskService {
@@ -33,12 +34,14 @@ impl TaskService {
             label: "task",
             owner: "Runtime Task aggregate port",
             port: None,
+            runtime: None,
         }
     }
 
     pub(crate) fn with_runtime(runtime_services: Arc<runtime::RuntimeServices>) -> Self {
         Self {
             port: Some(runtime_services.task_runtime_port()),
+            runtime: Some(runtime_services),
             ..Self::new()
         }
     }
@@ -168,7 +171,7 @@ impl TaskService {
     /// provenance; the application payload never crosses this boundary as a
     /// `TaskSpec`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create_application_structured(
+    pub(crate) async fn create_application_structured(
         &self,
         task_id: String,
         mission_id: String,
@@ -184,21 +187,25 @@ impl TaskService {
         let spec = self
             .port()?
             .bind_task_spec(&origin_session_id, None, spec)?;
-        self.port()?.create(TaskCreateCommand {
-            root_task_id: task_id.clone(),
-            task_id,
-            mission_id,
-            kind: TaskKind::Root,
-            origin: TaskOrigin::System,
-            origin_session_id,
-            origin_turn_id,
-            parent_task_id: None,
-            predecessor_task_id: None,
-            mission_assignment: TaskMissionAssignment::ExplicitLocked,
-            mission_assigned_by: "gateway.application_structured_task".to_string(),
-            spec,
-            evidence_refs,
-        })
+        self.runtime
+            .as_ref()
+            .ok_or("structured Runtime unavailable")?
+            .create_structured_task(TaskCreateCommand {
+                root_task_id: task_id.clone(),
+                task_id,
+                mission_id,
+                kind: TaskKind::Root,
+                origin: TaskOrigin::System,
+                origin_session_id,
+                origin_turn_id,
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: TaskMissionAssignment::ExplicitLocked,
+                mission_assigned_by: "gateway.application_structured_task".to_string(),
+                spec,
+                evidence_refs,
+            })
+            .await
     }
 
     pub(crate) fn start_phase(

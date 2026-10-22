@@ -1845,6 +1845,7 @@ fn startup_banner_shows_yolo_task_summary() {
         strategy_ref: None,
         graph_refs: Vec::new(),
         application_provenance: None,
+        structured_registration: None,
         created_at_ms: 1,
         updated_at_ms: 1,
     };

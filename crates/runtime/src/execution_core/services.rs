@@ -1061,6 +1061,7 @@ impl RuntimeServices {
             false,
         )?);
         services.install_graph_settled_observer()?;
+        crate::task::structured::install(&services);
         crate::execution_core::graph::executors::agent_tool::AgentToolBatchResolver::install(
             &services,
         );
@@ -1640,6 +1641,16 @@ impl RuntimeServices {
     pub async fn release_recovered_producers(
         self: &Arc<Self>,
     ) -> Result<usize, RuntimeServicesError> {
+        // Restore original Task registration/result obligations before taking
+        // the deferred Graph snapshot and validating executor bindings.
+        let mut structured_after = String::new();
+        while let Some(after) = self
+            .recover_structured_task_page(&structured_after, 256)
+            .await
+            .map_err(RuntimeServicesError::Task)?
+        {
+            structured_after = after;
+        }
         let Some(deferred) = self.execution_supervisor.deferred_recovered_graphs() else {
             return Ok(0);
         };
@@ -3866,7 +3877,7 @@ impl RuntimeServices {
     /// Revision races are harmless: the next drain observation reloads
     /// canonical state and retries only live attempts.
     pub async fn cancel_attempts_for_session_policy_revision(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         policy_revision: u64,
         reason: &str,
@@ -3917,6 +3928,13 @@ impl RuntimeServices {
                             && binding.execution.policy_revision == policy_revision
                     });
             if task.status.is_terminal() || !still_bound_to_old_revision {
+                continue;
+            }
+            if task.structured_registration.is_some() {
+                self.cancel_structured_task(&task.task_id, task.revision)
+                    .await
+                    .map_err(RuntimeServicesError::Task)?;
+                cancelled = cancelled.saturating_add(1);
                 continue;
             }
             match self.task_runtime_port().transition(
@@ -4871,10 +4889,23 @@ fn agentic_settled_graph_resolution_lane(
                     }
                     last_exit_retry_ms = retry_now_ms;
                 }
+                let structured_after = checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.payload.get("structured_after"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let next_structured_after = services
+                    .recover_structured_task_page(structured_after, batch_size.max(1))
+                    .await?;
                 if !exit_errors.is_empty() {
                     return Err(exit_errors.join("; "));
                 }
-                if page.scanned_commits == 0 && managed_after.is_empty() && !managed_backlog {
+                if page.scanned_commits == 0
+                    && managed_after.is_empty()
+                    && !managed_backlog
+                    && structured_after.is_empty()
+                    && next_structured_after.is_none()
+                {
                     return Ok(crate::RuntimeProjectionPass::default());
                 }
                 // The checkpoint advances only after every matching join was
@@ -4887,6 +4918,7 @@ fn agentic_settled_graph_resolution_lane(
                             "source_cursor": page.scanned_through_cursor,
                             "resolved_graphs": touched_graphs.len(),
                             "managed_after": next_managed_after,
+                            "structured_after": next_structured_after,
                             "last_exit_retry_ms": last_exit_retry_ms,
                         }),
                         now_ms(),
@@ -4895,7 +4927,7 @@ fn agentic_settled_graph_resolution_lane(
                 let mut pass =
                     crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
                         .with_matches(page.matched_events);
-                pass.backlog |= managed_backlog;
+                pass.backlog |= managed_backlog || next_structured_after.is_some();
                 Ok(pass)
             })
         },

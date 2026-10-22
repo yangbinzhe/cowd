@@ -175,6 +175,20 @@ impl SessionExecutionPolicyControl {
             .clone()
     }
 
+    /// Hold the original effective-policy source while a synchronous domain
+    /// transaction commits its authorization binding. Never cross a Provider
+    /// await with this read set.
+    pub(crate) fn with_snapshot<T>(
+        &self,
+        operation: impl FnOnce(&SessionExecutionPolicy) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let current = self
+            .policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operation(&current)
+    }
+
     /// Publish every policy dimension atomically. Equal revisions are
     /// accepted only for the same snapshot so turn preparation is idempotent
     /// without allowing a stale writer to roll state backwards.
@@ -1020,6 +1034,83 @@ mod tests {
         assert_eq!(
             turn_snapshot.authorize("edit", "{}", None),
             PermissionOutcome::Allow
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_policy_source_fence_tests {
+    use super::*;
+
+    #[test]
+    fn policy_replacement_waits_for_the_original_task_transaction_read_set() {
+        use harness_contract::task::*;
+        use std::sync::{mpsc, TryLockError};
+        let policy = SessionExecutionPolicy::from_profile(
+            harness_contract::policy::AutonomyProfileId::Supervised,
+            1,
+            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        let source = SessionExecutionPolicyControl::from_policy(policy);
+        let writer = source.clone();
+        let (go, started) = mpsc::channel();
+        let (probe, observed) = mpsc::channel();
+        let task_store = crate::TaskAggregateService::for_test();
+        let replacement = std::thread::spawn(move || {
+            started.recv().unwrap();
+            // Independent concurrent writer probes the real owner, rather
+            // than deriving an expected policy from the production reader.
+            let held = matches!(writer.policy.try_write(), Err(TryLockError::WouldBlock));
+            probe.send(held).unwrap();
+            let mut next = writer.snapshot();
+            next.revision = 2;
+            writer.replace(next).unwrap()
+        });
+        let created = source
+            .with_snapshot(|current| {
+                go.send(()).unwrap();
+                assert!(
+                    observed.recv().unwrap(),
+                    "policy writer crossed the active Task read set"
+                );
+                let mut spec = TaskSpec::new("source-fenced Task transaction");
+                spec.execution_policy = spec.execution_policy.bind(
+                    harness_contract::policy::ExecutionPolicyBinding::bind(
+                        "source-fence-session",
+                        current,
+                        PermissionMode::ReadOnly,
+                    ),
+                );
+                task_store.create(TaskCreateCommand {
+                    task_id: "source-fence-task".into(),
+                    mission_id: "mission".into(),
+                    kind: TaskKind::Root,
+                    origin: TaskOrigin::System,
+                    origin_session_id: "source-fence-session".into(),
+                    origin_turn_id: "source-turn".into(),
+                    root_task_id: "source-fence-task".into(),
+                    parent_task_id: None,
+                    predecessor_task_id: None,
+                    mission_assignment: TaskMissionAssignment::Default,
+                    mission_assigned_by: "runtime-test".into(),
+                    spec,
+                    evidence_refs: Vec::new(),
+                })
+            })
+            .unwrap()
+            .aggregate;
+        assert_eq!(replacement.join().unwrap(), 2);
+        assert_eq!(source.revision(), 2);
+        let durable = task_store.get("source-fence-task").unwrap().unwrap();
+        assert_eq!(durable, created);
+        assert_eq!(
+            durable
+                .execution_policy
+                .binding
+                .unwrap()
+                .execution
+                .policy_revision,
+            1
         );
     }
 }

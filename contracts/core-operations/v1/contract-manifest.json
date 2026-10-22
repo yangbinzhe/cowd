@@ -1,7 +1,7 @@
 {
   "catalog": {
     "path": "catalog.json",
-    "sha256": "sha256:943d27c07806d9ed08e9bb5f38dc73aca21a33df93702d8266a3a8c2f356ad09"
+    "sha256": "sha256:42e731effadb5f936b539ec4c44fad0d973665021e7f54242befb9e448a071f3"
   },
   "contract_id": "cowd.core-business-operations.v1",
   "schema_version": 1,
@@ -52,7 +52,7 @@
     },
     {
       "path": "schemas/core.runtime.goal.start.output.schema.json",
-      "sha256": "sha256:8b23f77efb1fb90e8bc96826783d1bf79aadaa28e02f85d15ddae4226dbba7e2"
+      "sha256": "sha256:199ca69685f488da9ef56f0856d25c5a3a6eadd2d675fbf00b5ae8c2f3e2a031"
     },
     {
       "path": "schemas/core.runtime.structured_task.cancel.input.schema.json",
@@ -60,7 +60,7 @@
     },
     {
       "path": "schemas/core.runtime.structured_task.cancel.output.schema.json",
-      "sha256": "sha256:3032ec9e3409836b053013f202795752232dee11cac19e914a1701e54b69c723"
+      "sha256": "sha256:c157ed8f0180dde5010882dc218e3e48b5b7cc35ecbb164c11e0152fdf2bdba7"
     },
     {
       "path": "schemas/core.runtime.structured_task.start.input.schema.json",
@@ -68,7 +68,7 @@
     },
     {
       "path": "schemas/core.runtime.structured_task.start.output.schema.json",
-      "sha256": "sha256:4a9605d41308ee22342341a6a6dcba4a48dfcd93bb71bd0b27c758b8c9d2bb83"
+      "sha256": "sha256:80fc0f0fd49815056d38f6b3faabf619886359de0ce3af590ae6b6d5331a00bd"
     },
     {
       "path": "schemas/core.session.terminal_receipt.ack.input.schema.json",
@@ -108,7 +108,7 @@
     },
     {
       "path": "schemas/core.work_context.structured_task_result.inspect.output.schema.json",
-      "sha256": "sha256:7faa3597533dc2e3c4cab98f84584c59ddda6218b586b14b65d6075d26240e89"
+      "sha256": "sha256:ce310e4ac441fec8f82b936090f1841ea7dce67fb896984132e016a02dcad4d0"
     },
     {
       "path": "schemas/core.work_context.task.exists.input.schema.json",

@@ -1,5 +1,47 @@
 {
   "$defs": {
+    "ArtifactRef": {
+      "description": "Backend-neutral reference to bytes managed by the Runtime artifact plane.\n\nThe selector is the only public locator. Physical paths, database keys, and\ncompact/blob tier choices are adapter-private and must never cross a\nRuntime or Gateway contract.",
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "durability": {
+          "$ref": "#/$defs/EvidenceDurability"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "selector": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "visibility_scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "selector",
+        "sha256",
+        "bytes",
+        "media_type",
+        "durability",
+        "visibility_scope"
+      ],
+      "type": "object"
+    },
+    "EvidenceDurability": {
+      "enum": [
+        "pending",
+        "durable",
+        "unavailable"
+      ],
+      "type": "string"
+    },
     "StructuredTaskContractProjection": {
       "additionalProperties": false,
       "properties": {
@@ -30,6 +72,9 @@
     "StructuredTaskResultProjection": {
       "additionalProperties": false,
       "properties": {
+        "execution_receipt": {
+          "$ref": "#/$defs/TaskStructuredResultReceipt"
+        },
         "model": {
           "type": "string"
         },
@@ -54,6 +99,7 @@
         }
       },
       "required": [
+        "execution_receipt",
         "result",
         "result_digest",
         "result_contract",
@@ -83,6 +129,111 @@
       ],
       "type": "object"
     },
+    "TaskApplicationProvenance": {
+      "description": "Immutable Gateway-authored provenance for an application-owned structured\ntask.  The application can request a registered result contract, but it\ncannot author or replace any field in this binding.",
+      "properties": {
+        "input_ref": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "instruction_ref": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "model": {
+          "description": "Runtime-selected model frozen before durable Task admission.",
+          "type": "string"
+        },
+        "producer_id": {
+          "type": "string"
+        },
+        "request_digest": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "request_idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result_contract_id": {
+          "type": "string"
+        },
+        "result_max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result_schema_digest": {
+          "type": "string"
+        },
+        "result_schema_id": {
+          "type": "string"
+        },
+        "result_schema_ref": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "result_schema_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "surface": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "producer_id",
+        "workspace_id",
+        "surface",
+        "request_id",
+        "result_contract_id",
+        "result_schema_id",
+        "result_schema_version",
+        "result_schema_digest",
+        "result_max_bytes",
+        "instruction_ref",
+        "input_ref",
+        "result_schema_ref",
+        "request_digest"
+      ],
+      "type": "object"
+    },
+    "TaskGraphRegistrationReceipt": {
+      "additionalProperties": false,
+      "description": "The original Graph registration transaction, independent of Task evidence projection.",
+      "properties": {
+        "commit_cursor": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "graph_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transaction_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "transaction_id",
+        "commit_cursor",
+        "graph_revision"
+      ],
+      "type": "object"
+    },
     "TaskStatus": {
       "enum": [
         "pending",
@@ -94,6 +245,53 @@
         "failed"
       ],
       "type": "string"
+    },
+    "TaskStructuredResultReceipt": {
+      "additionalProperties": false,
+      "description": "Read-only reverse provenance for an authenticated structured result. These\nreferences point to the original Task/Graph and artifact owners; this DTO\ndoes not admit work or publish another result truth.",
+      "properties": {
+        "application": {
+          "$ref": "#/$defs/TaskApplicationProvenance"
+        },
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "binding_digest": {
+          "type": "string"
+        },
+        "graph_id": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "registration": {
+          "$ref": "#/$defs/TaskGraphRegistrationReceipt"
+        },
+        "result_artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "source_session_id": {
+          "type": "string"
+        },
+        "source_turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "graph_id",
+        "node_id",
+        "attempt",
+        "binding_digest",
+        "result_artifact",
+        "registration",
+        "source_session_id",
+        "source_turn_id",
+        "application"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

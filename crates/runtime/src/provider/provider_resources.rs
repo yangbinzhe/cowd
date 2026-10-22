@@ -513,3 +513,29 @@ mod tests {
         assert_eq!(leases.len(), MIN_DEGRADED_FOREGROUND_REQUESTS);
     }
 }
+
+/// Shared Provider-leaf admission policy. InlineModel parents do not acquire
+/// these demands; exactly the actual Provider caller holds the returned lease.
+pub(crate) fn provider_leaf_admission(
+    config: &ProviderResourceConfig,
+    provider: Option<&str>,
+    model: &str,
+    estimated_tokens: u64,
+    class: crate::execution_core::graph::ExecutionServiceClass,
+    session_id: &str,
+    deadline_at_ms: u64,
+) -> crate::execution_core::graph::ResourceAdmissionRequest {
+    let demands = provider.map_or_else(
+        || {
+            vec![(
+                crate::execution_core::graph::ExecutionResourceKind::Provider,
+                1,
+            )]
+        },
+        |provider| config.admission_demands(provider, model, estimated_tokens),
+    );
+    crate::execution_core::graph::ResourceAdmissionRequest::new(class, demands)
+        .with_parent_class_ceiling(class)
+        .with_deadline_at_ms(deadline_at_ms)
+        .with_fairness_key(format!("session:{session_id}"))
+}
