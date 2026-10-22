@@ -395,7 +395,9 @@ fn delegated_inspection_and_action_receipts_keep_root_closure_as_background() {
             .contains("read-only background"));
         assert_eq!(
             page["program_progress"]["next_rungs"],
-            serde_json::Value::Array(crate::host::closure_rungs_for_program(&program)),
+            serde_json::Value::Array(
+                crate::execution_core::goal::assessment::closure_rungs_for_program(&program)
+            ),
         );
         let expected_action = match mode {
             AgentAttemptMode::Execute => "task_submit",
@@ -920,7 +922,9 @@ fn read_model_large_histories_preserve_warm_identity_and_exact_one_and_ten_event
 
 #[test]
 fn read_snapshot_corruption_rebuilds_from_journal_and_repairs_the_checkpoint() {
-    let store = Arc::new(RuntimeEventStore::for_test());
+    use crate::RuntimeEventStoreBackend;
+    let backend = Arc::new(crate::runtime_event_store::EphemeralRuntimeEventStore::new());
+    let store = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
     let service = AgentActionService::new(Arc::clone(&store));
     service
         .apply(&root(
@@ -969,9 +973,21 @@ fn read_snapshot_corruption_rebuilds_from_journal_and_repairs_the_checkpoint() {
             }
             _ => unreachable!(),
         }
-        store
+        // Fault injection targets storage below the trusted content writer.
+        // The production port correctly refuses malformed envelopes before
+        // they can become a cache-recovery input.
+        backend
             .put_projection_checkpoint(&checkpoint_id, source_cursor, &payload, now_ms())
             .unwrap();
+        let injected = backend
+            .projection_checkpoint(&checkpoint_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            injected.payload, payload,
+            "{case}: corruption must actually reach storage"
+        );
+        assert_eq!(injected.source_cursor, source_cursor, "{case}");
         let restarted = AgentActionService::new(Arc::clone(&store));
         let rebuilt = restarted.project_snapshot("program-1").unwrap();
         assert_eq!(
@@ -991,9 +1007,9 @@ fn read_snapshot_corruption_rebuilds_from_journal_and_repairs_the_checkpoint() {
         assert!(matches!(
             store.compare_and_repair_projection_checkpoint(
                 &checkpoint_id,
-                0,
+                repaired.source_cursor,
                 repaired.revision - 1,
-                &json!(null),
+                &repaired.payload,
                 now_ms(),
             ),
             Err(RuntimeEventStoreError::StaleRevision { .. })
@@ -1526,7 +1542,9 @@ fn a_program_level_read_names_the_outstanding_rungs() {
         .flatten()
         .expect("program projection");
     assert_eq!(
-        serde_json::Value::Array(crate::host::closure_rungs_for_program(&program)),
+        serde_json::Value::Array(
+            crate::execution_core::goal::assessment::closure_rungs_for_program(&program)
+        ),
         page["next_rungs"].clone(),
         "both paths must render the same rungs"
     );
@@ -2084,7 +2102,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             borrowed_artifact.strip_prefix("artifact:").unwrap()
         );
         let projection = service.project(&program_id).unwrap();
-        assert!(super::actionable(&projection, false).iter().any(|instruction| {
+        assert!(super::actionable(&projection, false, None).iter().any(|instruction| {
             instruction.contains(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT)
         }));
         assert_eq!(
@@ -4066,7 +4084,11 @@ fn reopened_program_receipts_never_advertise_the_exit_action() {
     program.tasks.insert("task:1".to_string(), task);
     program.unresolved = vec!["original_intent_review_required:user_intent".to_string()];
 
-    let actions = super::actionable(&program, false);
+    let actions = super::actionable(
+        &program,
+        false,
+        program.unresolved.first().map(String::as_str),
+    );
     assert!(
         actions
             .iter()
@@ -4088,7 +4110,11 @@ fn reopened_program_receipts_never_advertise_the_exit_action() {
 
     // Once the gaps clear, the exit action is advertised again.
     program.unresolved.clear();
-    let actions = super::actionable(&program, false);
+    let actions = super::actionable(
+        &program,
+        false,
+        program.unresolved.first().map(String::as_str),
+    );
     assert!(
         actions
             .iter()
@@ -4204,7 +4230,21 @@ fn a_satisfied_review_retires_the_gap_it_was_sent_to_close() {
         projection.unresolved
     );
 
-    let actions = super::actionable(&projection, false);
+    let assessment =
+        crate::execution_core::goal::assessment::read_bound_goal_assessment(&store, &projection)
+            .unwrap();
+    assert_eq!(
+        assessment.gap(),
+        None,
+        "current Goal review clears the historical waiting gap"
+    );
+    let projection_again = service.project("program-1").unwrap();
+    assert_eq!(
+        serde_json::to_value(&projection_again).unwrap(),
+        serde_json::to_value(&projection).unwrap(),
+        "reading Goal assessment must not rewrite Program contents at the same revision"
+    );
+    let actions = super::actionable(&projection, false, None);
     assert!(
         !actions
             .iter()
@@ -4284,7 +4324,11 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
             .to_string(),
     ];
 
-    let actions = super::actionable(&program, false);
+    let actions = super::actionable(
+        &program,
+        false,
+        program.unresolved.first().map(String::as_str),
+    );
     assert!(
         actions
             .iter()
@@ -4292,11 +4336,11 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
         "the exit must be reachable once the gaps are gone: {actions:?}"
     );
     assert!(
-        actions
+        !actions
             .iter()
             .any(|action| action
                 .starts_with("Every gap recorded by the last reopen is now resolved")),
-        "the program must say the reopen's gaps are resolved: {actions:?}"
+        "Program history alone must not certify current Goal gaps as resolved: {actions:?}"
     );
     assert!(
         !actions
@@ -4310,7 +4354,11 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
     // current state is what once told a model to keep resolving a criterion it
     // had already satisfied.
     program.unresolved = vec!["criterion_unsatisfied:second_criterion".to_string()];
-    let actions = super::actionable(&program, false);
+    let actions = super::actionable(
+        &program,
+        false,
+        program.unresolved.first().map(String::as_str),
+    );
     let current = actions
         .iter()
         .find(|action| action.contains("Resolve the recorded gaps"))
@@ -4567,7 +4615,11 @@ fn invented_criterion_is_durably_labeled_for_author_and_reviewer() {
         "the invented standard must be labelled where it was written: {:?}",
         program.program_warnings
     );
-    let actions = super::actionable(&program, false);
+    let actions = super::actionable(
+        &program,
+        false,
+        program.unresolved.first().map(String::as_str),
+    );
     assert!(
         actions
             .iter()
@@ -5094,7 +5146,11 @@ fn the_review_guidance_fires_on_the_prefixed_gap_the_runtime_actually_emits() {
     program.unresolved = vec![
         "objective_completion_gap:original_intent_review_required:user_intent; uncovered_result_refs: artifact:a, artifact:b; criterion_unsatisfied:user_intent".to_string(),
     ];
-    let actions = super::actionable(&program, false);
+    let actions = super::actionable(
+        &program,
+        false,
+        program.unresolved.first().map(String::as_str),
+    );
     assert!(
         actions
             .iter()
@@ -5264,4 +5320,88 @@ fn every_decline_reason_has_a_distinct_stable_name() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn pure_program_cache_rejects_legacy_goal_derived_snapshot() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    service
+        .apply(&root(
+            "pure-cache",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "team".into(),
+                mission: "deliver".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap();
+    let checkpoint = store
+        .projection_checkpoint(&read_model_projection_id("program-1"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.payload["schema_version"], 3);
+    assert!(super::decode_read_snapshot(&checkpoint, "program-1", &store).is_some());
+    let mut legacy = checkpoint;
+    legacy.payload["schema_version"] = serde_json::json!(2);
+    assert!(
+        super::decode_read_snapshot(&legacy, "program-1", &store).is_none(),
+        "Goal-derived cache requires reconstruction from original Program events"
+    );
+}
+
+#[test]
+fn bound_goal_assessment_is_lazy_and_root_only() {
+    use crate::execution_core::goal::assessment::AssessmentReadError;
+    let program = crate::AgenticProgramProjection::empty("program-1", "objective-1");
+    let initial = AgentActionObservation {
+        receipt_id: "observation:local".into(),
+        action_id: "inspect".into(),
+        action: "state_inspect".into(),
+        program_id: "program-1".into(),
+        revision: 1,
+        status: AgentActionStatus::Observed,
+        duplicate: false,
+        changed_refs: vec![],
+        actionable: vec!["bound work only".into()],
+        projection: Some(
+            json!({"program_progress":{"next_rungs":[{"step":"independent_review"}]}}),
+        ),
+        error: None,
+    };
+    for kind in [AgentActorKind::Agent, AgentActorKind::TeamLead] {
+        let mut actor = root(
+            "inspect",
+            AgentAction::StateInspect(StateInspectInput::default()),
+        )
+        .actor;
+        actor.kind = kind;
+        let mut observation = initial.clone();
+        attach_completion_assessment(&mut observation, &actor, &program, || {
+            panic!("a leaf must not evaluate root-private Goal sources")
+        });
+        assert_eq!(
+            serde_json::to_value(observation).unwrap(),
+            serde_json::to_value(&initial).unwrap()
+        );
+    }
+    let actor = root(
+        "inspect",
+        AgentAction::StateInspect(StateInspectInput::default()),
+    )
+    .actor;
+    let mut observation = initial;
+    attach_completion_assessment(&mut observation, &actor, &program, || {
+        Err(AssessmentReadError::Source(
+            "root source unavailable".into(),
+        ))
+    });
+    assert_eq!(
+        observation.projection.as_ref().unwrap()["completion_assessment"]["status"],
+        "unknown"
+    );
+    assert!(observation
+        .actionable
+        .iter()
+        .all(|action| !action.contains("request Objective completion")));
 }

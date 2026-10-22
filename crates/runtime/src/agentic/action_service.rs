@@ -2096,7 +2096,8 @@ impl AgentActionService {
                 .get("entity_ref")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            return applied_observation(envelope, &projection, entity_ref, true).map(Some);
+            return applied_observation(&self.store, envelope, &projection, entity_ref, true)
+                .map(Some);
         }
 
         Ok(None)
@@ -2257,7 +2258,7 @@ impl AgentActionService {
                 .as_ref()
                 .map(|root| {
                     crate::execution_core::goal::GoalStore::new(Arc::clone(&self.store))
-                        .get(&format!("goal:{root}"))
+                        .projection(&format!("goal:{root}"))
                 })
                 .transpose()
                 .map_err(AgentActionServiceError::Corrupt)?
@@ -2278,7 +2279,12 @@ impl AgentActionService {
                             ));
                         }
                     };
-                let mut observation = inspected_observation(&self.store, envelope, &projection, goal.as_ref());
+                let mut observation = inspected_observation(
+                    &self.store,
+                    envelope,
+                    &projection,
+                    goal.as_ref().map(|projection| &projection.goal),
+                );
                 observation.projection = Some(json!({
                     "advisory_only": true,
                     "instruction": "These are structural observations from independent completed Turns, not prescribed plans, quality guarantees, executable definitions, or capability grants. Adopt, adapt, or ignore them. Inspect Runtime capabilities before using any suggested tool or skill.",
@@ -2289,9 +2295,32 @@ impl AgentActionService {
                         "evidence_summary": pattern.evidence_summary,
                     })).collect::<Vec<_>>(),
                 }));
+                attach_completion_assessment(
+                    &mut observation,
+                    &envelope.actor,
+                    &projection,
+                    || {
+                        crate::execution_core::goal::assessment::assess_bound_goal_projection(
+                            &projection,
+                            goal.as_ref(),
+                        )
+                    },
+                );
                 return Ok(observation);
             }
-            return Ok(inspected_observation(&self.store, envelope, &projection, goal.as_ref()));
+            let mut observation = inspected_observation(
+                &self.store,
+                envelope,
+                &projection,
+                goal.as_ref().map(|projection| &projection.goal),
+            );
+            attach_completion_assessment(&mut observation, &envelope.actor, &projection, || {
+                crate::execution_core::goal::assessment::assess_bound_goal_projection(
+                    &projection,
+                    goal.as_ref(),
+                )
+            });
+            return Ok(observation);
         }
         let mut review_source = None;
         if let AgentAction::TaskReview(input) = &envelope.action {
@@ -2838,7 +2867,7 @@ impl AgentActionService {
             }
         }
         projection = self.project_snapshot(&envelope.actor.program_id)?;
-        applied_observation(envelope, &projection, entity_ref, false)
+        applied_observation(&self.store, envelope, &projection, entity_ref, false)
     }
 
     /// Durable head revision of one Program's journal, without folding it.
@@ -2870,27 +2899,16 @@ impl AgentActionService {
         let durable_revision = self.store.stream_revision(&stream_id)?;
         if let Some(mut cached) = self.read_model.get(program_id) {
             if cached.revision == durable_revision {
-                // The Program stream did not move, but the Goal stream may have:
-                // a satisfied ObjectiveReview lives on the Goal, and it is
-                // exactly what retires a recorded completion gap. Refresh the
-                // derived field before serving the cached projection.
-                let gaps = self.current_completion_gaps(&cached);
-                if gaps != cached.unresolved {
-                    Arc::make_mut(&mut cached).unresolved = gaps;
-                    self.remember_projection(&cached);
-                }
                 return Ok(cached);
             }
             if cached.revision < durable_revision {
                 self.catch_up_projection(Arc::make_mut(&mut cached), &stream_id, durable_revision)?;
-                self.refresh_completion_gaps(Arc::make_mut(&mut cached));
                 self.remember_projection(&cached);
                 return Ok(cached);
             }
         }
         if let Some(mut persisted) = self.persisted_projection(program_id, durable_revision)? {
             self.catch_up_projection(&mut persisted, &stream_id, durable_revision)?;
-            self.refresh_completion_gaps(&mut persisted);
             let persisted = Arc::new(persisted);
             self.remember_projection(&persisted);
             return Ok(persisted);
@@ -2906,7 +2924,6 @@ impl AgentActionService {
         let mut projection = projection_from_opened(program_id, opened)?;
         apply_projection_events(&mut projection, events)?;
         self.catch_up_projection(&mut projection, &stream_id, durable_revision)?;
-        self.refresh_completion_gaps(&mut projection);
         let projection = Arc::new(projection);
         self.remember_projection(&projection);
         Ok(projection)
@@ -3003,10 +3020,6 @@ impl AgentActionService {
                 )));
             }
         }
-        let gaps = completion_gaps_from_goal(&snapshot, goal);
-        if snapshot.unresolved != gaps {
-            Arc::make_mut(&mut snapshot).unresolved = gaps;
-        }
         if cached_revision.is_none_or(|revision| revision < snapshot.revision) {
             self.read_model.put(Arc::clone(&snapshot));
         }
@@ -3101,7 +3114,7 @@ impl AgentActionService {
                 return;
             }
         };
-        let payload = json!({"schema_version":2,"session_id":projection.session_id,"body":body});
+        let payload = json!({"schema_version":3,"session_id":projection.session_id,"body":body});
         // Concurrent Program readers race the same snapshot row. Re-read the
         // authoritative row revision and retry the CAS instead of dropping the
         // snapshot on the first stale revision.
@@ -3414,10 +3427,14 @@ impl AgentActionService {
     ) -> Result<AgenticProgramProjection, AgentActionServiceError> {
         self.ensure_recovery_session_admitted(&projection.session_id)?;
         self.ensure_recovery_session_admitted(&prepared.goal.session_id)?;
+        prepared
+            .source_frame
+            .verify_program(projection)
+            .map_err(|error| AgentActionServiceError::Corrupt(error.to_string()))?;
         let original_revision = projection.revision;
         let own_stream = program_stream(&projection.program_id);
         if prepared.goal.completion == harness_contract::goal::GoalCompletion::Satisfied
-            && !prepared.policy_sources.iter().any(|source| {
+            && !prepared.source_frame.sources().any(|source| {
                 source.stream_id == own_stream && source.expected_revision == original_revision
             })
         {
@@ -3440,7 +3457,7 @@ impl AgentActionService {
             process_inputs: process_frame.as_ref(),
         };
         if prepared.goal.completion == harness_contract::goal::GoalCompletion::Satisfied {
-            let mut current_sources = std::collections::BTreeMap::new();
+            let mut current_sources = prepared.source_frame.clone();
             let request = projection.completion_request.as_ref().ok_or_else(|| {
                 AgentActionServiceError::Corrupt("missing completion request before A".into())
             })?;
@@ -3503,14 +3520,16 @@ impl AgentActionService {
             }
             if let Some(context) = context {
                 for source in context.sources() {
-                    current_sources.insert(
-                        source.stream_id.clone(),
-                        if source.stream_id == own_stream {
-                            original_revision
-                        } else {
-                            source.expected_revision
-                        },
-                    );
+                    current_sources
+                        .pin(ExpectedStreamRevision {
+                            stream_id: source.stream_id.clone(),
+                            expected_revision: if source.stream_id == own_stream {
+                                original_revision
+                            } else {
+                                source.expected_revision
+                            },
+                        })
+                        .map_err(|error| AgentActionServiceError::EventStore(error.to_string()))?;
                 }
             }
             if prepared.goal.criteria.iter().any(|criterion| {
@@ -3575,28 +3594,16 @@ impl AgentActionService {
                     format!("required review {condition}: {error}"),
                 ))?;
                 for source in snapshot.sources {
-                    if current_sources
-                        .insert(
-                            source.stream_id.clone(),
-                            if source.stream_id == own_stream {
+                    current_sources
+                        .pin(ExpectedStreamRevision {
+                            expected_revision: if source.stream_id == own_stream {
                                 original_revision
                             } else {
                                 source.expected_revision
                             },
-                        )
-                        .is_some_and(|previous| {
-                            previous
-                                != if source.stream_id == own_stream {
-                                    original_revision
-                                } else {
-                                    source.expected_revision
-                                }
+                            stream_id: source.stream_id,
                         })
-                    {
-                        return Err(AgentActionServiceError::EventStore(
-                            "proof sources changed between required reviews before A".into(),
-                        ));
-                    }
+                        .map_err(|error| AgentActionServiceError::EventStore(error.to_string()))?;
                 }
             }
             let stored_goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
@@ -3605,6 +3612,9 @@ impl AgentActionService {
                 .ok_or_else(|| {
                     AgentActionServiceError::Corrupt("prepared Goal disappeared before A".into())
                 })?;
+            current_sources
+                .verify_goal(&stored_goal)
+                .map_err(|error| AgentActionServiceError::Corrupt(error.to_string()))?;
             let terminal = prepared.goal.terminal.as_ref().ok_or_else(|| {
                 AgentActionServiceError::Corrupt("Satisfied A has no terminal".into())
             })?;
@@ -3638,26 +3648,7 @@ impl AgentActionService {
                     "prepared Goal, review or request identity changed before A".into(),
                 ));
             }
-            for source in &prepared.policy_sources {
-                let revision = source.expected_revision;
-                if let Some(previous) = current_sources.insert(source.stream_id.clone(), revision) {
-                    if previous != revision {
-                        return Err(RuntimeEventStoreError::StaleRevision {
-                            stream_id: source.stream_id.clone(),
-                            expected: revision,
-                            actual: previous,
-                        }
-                        .into());
-                    }
-                }
-            }
-            prepared.policy_sources = current_sources
-                .into_iter()
-                .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
-                    stream_id,
-                    expected_revision,
-                })
-                .collect();
+            prepared.source_frame = current_sources;
         }
         let request = projection
             .completion_request
@@ -3689,35 +3680,21 @@ impl AgentActionService {
                 }),
             )
         };
-        let mut expected_streams = prepared.policy_sources;
-        expected_streams.extend([
-            ExpectedStreamRevision {
+        prepared
+            .source_frame
+            .pin(ExpectedStreamRevision {
                 stream_id: program_stream_id.clone(),
                 expected_revision: projection.revision,
-            },
-            ExpectedStreamRevision {
+            })
+            .map_err(|error| AgentActionServiceError::EventStore(error.to_string()))?;
+        prepared
+            .source_frame
+            .pin(ExpectedStreamRevision {
                 stream_id: goal_stream_id,
                 expected_revision: prepared.expected_stream_revision,
-            },
-        ]);
-        let mut unique_sources = std::collections::BTreeMap::new();
-        for source in expected_streams {
-            if unique_sources
-                .insert(source.stream_id, source.expected_revision)
-                .is_some_and(|previous| previous != source.expected_revision)
-            {
-                return Err(AgentActionServiceError::EventStore(
-                    "conclusion source changed before A".into(),
-                ));
-            }
-        }
-        let expected_streams = unique_sources
-            .into_iter()
-            .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
-                stream_id,
-                expected_revision,
             })
-            .collect();
+            .map_err(|error| AgentActionServiceError::EventStore(error.to_string()))?;
+        let expected_streams = prepared.source_frame.into_sources();
         let transaction = AppendTransactionRequest {
             transaction_id: format!(
                 "program-conclusion:{}:{}",
@@ -4120,53 +4097,6 @@ impl AgentActionService {
     }
 }
 
-impl AgentActionService {
-    /// Recompute the gaps that still block completion from Goal truth.
-    ///
-    /// A reopen event records what one completion request was missing at one
-    /// revision. Treating that record as current state strands the program: the
-    /// model satisfies the criterion and records the review, and the framework
-    /// keeps repeating `criterion_unsatisfied` while suppressing the exit
-    /// action, so completion can never be requested again. Deriving the field
-    /// from the Goal keeps the projection a projection of current facts.
-    fn refresh_completion_gaps(&self, projection: &mut AgenticProgramProjection) {
-        projection.unresolved = self.current_completion_gaps(projection);
-    }
-
-    fn current_completion_gaps(&self, projection: &AgenticProgramProjection) -> Vec<String> {
-        let Some(root_execution_id) = projection.root_execution_id.as_deref() else {
-            return Vec::new();
-        };
-        let goal_store = crate::execution_core::GoalStore::new(Arc::clone(&self.store));
-        let Ok(Some(goal)) = goal_store.projection(&format!("goal:{root_execution_id}")) else {
-            return Vec::new();
-        };
-        completion_gaps_from_goal(projection, Some(&goal.goal))
-    }
-}
-
-fn completion_gaps_from_goal(
-    projection: &AgenticProgramProjection,
-    goal: Option<&harness_contract::goal::GoalContract>,
-) -> Vec<String> {
-    let Some(goal) = goal else {
-        return Vec::new();
-    };
-    if goal.completion != harness_contract::goal::GoalCompletion::Open {
-        // The Goal already reached a terminal completion; nothing is pending.
-        return Vec::new();
-    }
-    let satisfied = crate::agentic::ingress::current_reviews_satisfy_the_goal(&goal);
-    let uncovered = crate::agentic::ingress::uncovered_delivered_result_refs(projection, &goal);
-    crate::agentic::ingress::objective_completion_waiting_gap(
-        goal.waiting.as_ref(),
-        satisfied,
-        &uncovered,
-    )
-    .map(|gap| vec![gap])
-    .unwrap_or_default()
-}
-
 fn projection_from_opened(
     program_id: &str,
     opened: &crate::DurableRuntimeEvent,
@@ -4329,7 +4259,7 @@ fn apply_projection_events(
                     .cloned()
                     .unwrap_or_else(|| json!([])),
             )?;
-            // Recomputed from Goal truth by the caller once the fold finishes.
+            // Current Goal gaps are an explicit assessment, never a read-time Program mutation.
             projection.unresolved = Vec::new();
             projection.revision = event.sequence;
             continue;
@@ -4510,6 +4440,7 @@ fn entity_ref(envelope: &AgentActionEnvelope) -> Option<String> {
 }
 
 fn applied_observation(
+    store: &Arc<RuntimeEventStore>,
     envelope: &AgentActionEnvelope,
     projection: &AgenticProgramProjection,
     entity_ref: Option<String>,
@@ -4528,7 +4459,7 @@ fn applied_observation(
             })
         });
     let changed_refs = entity_ref.into_iter().collect::<Vec<_>>();
-    Ok(AgentActionObservation {
+    let mut observation = AgentActionObservation {
         receipt_id: format!(
             "receipt:{}:{}",
             envelope.actor.program_id, envelope.action_id
@@ -4557,7 +4488,11 @@ fn applied_observation(
             "artifact_access": artifact_access,
         })),
         error: None,
-    })
+    };
+    attach_completion_assessment(&mut observation, &envelope.actor, projection, || {
+        crate::execution_core::goal::assessment::read_bound_goal_assessment(store, projection)
+    });
+    Ok(observation)
 }
 
 pub(super) fn readable_topic_refs(
@@ -4706,8 +4641,9 @@ fn inspected_observation(
     // already has from the page that produced this revision.
     if !unchanged && input.entry_ref.is_none() && input.scope_ref.is_none() {
         if let Some(object) = value.as_object_mut() {
-            let rungs =
-                serde_json::Value::Array(crate::host::closure_rungs_for_program(projection));
+            let rungs = serde_json::Value::Array(
+                crate::execution_core::goal::assessment::closure_rungs_for_program(projection),
+            );
             if matches!(
                 envelope.actor.kind,
                 AgentActorKind::Agent | AgentActorKind::TeamLead
@@ -5174,7 +5110,7 @@ fn actionable_for_actor(
     if !matches!(actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead)
         || projection.status != super::program::AgenticProgramStatus::Open
     {
-        return actionable(projection, duplicate);
+        return actionable(projection, duplicate, None);
     }
     let mut actions = Vec::new();
     if duplicate {
@@ -5221,7 +5157,12 @@ fn actionable_for_actor(
     actions
 }
 
-fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<String> {
+fn actionable(
+    projection: &AgenticProgramProjection,
+    duplicate: bool,
+    completion_gap: Option<&str>,
+) -> Vec<String> {
+    let goal_gaps = completion_gap.into_iter().collect::<Vec<_>>();
     let mut actions = Vec::new();
     if duplicate {
         actions.push("idempotent replay: no state was duplicated".to_string());
@@ -5249,13 +5190,13 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         }
         super::program::AgenticProgramStatus::Open => {}
     }
-    if !projection.unresolved.is_empty() {
-        // `unresolved` is recomputed from Goal truth, so this names what is
+    if !goal_gaps.is_empty() {
+        // Explicit assessment supplies current Goal gaps separately; this names what is
         // still missing rather than what one reopen happened to record. The
         // reopen event's own wording is history and is shown separately:
         // presenting it as the current state is what once told a model to keep
         // resolving a criterion it had already satisfied.
-        actions.push(format!("The previous completion request was reopened. Resolve the recorded gaps before requesting completion again: {}", projection.unresolved.join("; ")));
+        actions.push(format!("The previous completion request was reopened. Resolve the recorded gaps before requesting completion again: {}", goal_gaps.join("; ")));
         if !projection.last_reopen_gaps.is_empty() {
             actions.push(format!(
                 "For reference, the last reopen recorded: {}",
@@ -5271,7 +5212,7 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         // without ever issuing a review, because the only instruction it got
         // was a gap string it could not act on. Match the marker wherever it
         // appears in the assembled gap.
-        let review_required = projection.unresolved.iter().any(|gap| {
+        let review_required = goal_gaps.iter().any(|gap| {
             gap.contains("original_intent_review_required:")
                 || gap.contains("criterion_review_required:")
         });
@@ -5286,8 +5227,7 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
             ));
             // Name the exact refs that still have no review, so the model does
             // not have to parse them out of the gap string itself.
-            let uncovered = projection
-                .unresolved
+            let uncovered = goal_gaps
                 .iter()
                 .filter_map(|gap| gap.split("uncovered_result_refs:").nth(1))
                 .flat_map(|tail| tail.split(';').next().unwrap_or("").split(','))
@@ -5307,15 +5247,6 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         // looped until the observation window expired. While gaps remain, the
         // gap guidance above is the entire instruction.
         return actions;
-    }
-    // No gap remains. The program was reopened at least once (history is
-    // recorded), so the model needs to be told the exit is reachable again
-    // rather than left to infer it.
-    if !projection.last_reopen_gaps.is_empty() {
-        actions.push(
-            "Every gap recorded by the last reopen is now resolved; request Objective completion."
-                .into(),
-        );
     }
     // A Task no Agent will settle is a fact the root must be able to read. Runtime
     // used to keep it private in the dispatch starvation ledger, so the model had no
@@ -5417,7 +5348,7 @@ fn action_key(action_id: &str) -> String {
 
 fn read_model_projection_id(program_id: &str) -> String {
     format!(
-        "runtime:agentic-read-model:v1:{:x}",
+        "runtime:agentic-read-model:v2:{:x}",
         Sha256::digest(program_id.as_bytes())
     )
 }
@@ -5428,7 +5359,7 @@ fn decode_read_snapshot(
     store: &RuntimeEventStore,
 ) -> Option<AgenticProgramProjection> {
     let payload = &checkpoint.payload;
-    if payload["schema_version"] != 2 {
+    if payload["schema_version"] != 3 {
         return None;
     }
     let session = payload["session_id"].as_str()?;
@@ -5817,4 +5748,61 @@ fn agentic_program_is_quiescent(projection: &AgenticProgramProjection) -> bool {
         })
         .count()
         <= BLOCKED_EXIT_MAX_REMAINING_WORK
+}
+
+/// Attach explicit cross-source assessment without mutating the Program read
+/// model. A committed action stays Applied even if its subsequent read fails.
+fn attach_completion_assessment(
+    observation: &mut AgentActionObservation,
+    actor: &harness_contract::agent_action::AgentActorBinding,
+    program: &AgenticProgramProjection,
+    assessment: impl FnOnce() -> Result<
+        crate::execution_core::goal::assessment::BoundGoalAssessment,
+        crate::execution_core::goal::assessment::AssessmentReadError,
+    >,
+) {
+    if !matches!(
+        actor.kind,
+        AgentActorKind::Root | AgentActorKind::Supervisor
+    ) {
+        return;
+    }
+    match assessment() {
+        Ok(assessment) => {
+            let view = assessment.view(program);
+            if let Some(value) = observation
+                .projection
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                value.insert(
+                    "completion_assessment".into(),
+                    view["completion_assessment"].clone(),
+                );
+                value.insert("next_rungs".into(), view["remaining"].clone());
+            }
+            if let Some(gap) = assessment.gap() {
+                observation.actionable = actionable(program, observation.duplicate, Some(gap));
+            } else if !view["blocked"].is_null() {
+                observation.actionable = vec![format!(
+                    "Continue the original bound work; completion is not ready: {}",
+                    view["blocked"]
+                )];
+            }
+        }
+        Err(error) => {
+            if let Some(value) = observation
+                .projection
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                value.insert(
+                    "completion_assessment".into(),
+                    json!({"status":"unknown","error":error.to_string()}),
+                );
+                value.remove("next_rungs");
+            }
+            observation.actionable = vec![format!("Completion assessment is unavailable: {error}. Inspect the original bound sources; no completion readiness is established.")];
+        }
+    }
 }

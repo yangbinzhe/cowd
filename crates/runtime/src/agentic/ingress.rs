@@ -746,32 +746,24 @@ pub fn agentic_program_completion_gap(
 ) -> Option<String> {
     let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
     let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
-    let program = services
+    let program = match services
         .agent_action_service()
         .project_if_exists(&program_id)
-        .ok()
-        .flatten()?;
-    let root_execution_id = program.root_execution_id.as_deref()?;
-    let goal_id = format!("goal:{root_execution_id}");
-    if let Some(goal) = services.goal_store().projection(&goal_id).ok().flatten() {
-        let bound_to_turn = goal.goal.execution_binding.as_ref().is_some_and(|binding| {
-            binding.objective_id == objective_id
-                && binding.agentic_program_id == program.program_id
-                && binding.session_id == session_id
-                && binding.turn_id == turn_id
-                && binding.root_execution_id == root_execution_id
-        });
-        if bound_to_turn && goal.goal.completion == harness_contract::goal::GoalCompletion::Open {
-            let current_reviews_satisfied = current_reviews_satisfy_the_goal(&goal.goal);
-            let uncovered_result_refs = uncovered_delivered_result_refs(&program, &goal.goal);
-            if let Some(gap) = objective_completion_waiting_gap(
-                goal.goal.waiting.as_ref(),
-                current_reviews_satisfied,
-                &uncovered_result_refs,
-            ) {
-                return Some(gap);
+    {
+        Ok(Some(program)) => program,
+        Ok(None) => return None,
+        Err(error) => return Some(format!("completion_assessment_unknown:{error}")),
+    };
+    match crate::execution_core::goal::assessment::read_bound_goal_assessment(
+        services.event_store(),
+        &program,
+    ) {
+        Ok(assessment) => {
+            if let Some(gap) = assessment.gap() {
+                return Some(gap.to_string());
             }
         }
+        Err(error) => return Some(format!("completion_assessment_unknown:{error}")),
     }
     if program.status != crate::AgenticProgramStatus::Open {
         return None;
@@ -780,107 +772,8 @@ pub fn agentic_program_completion_gap(
     crate::agentic::supervision::completion_gap(&program, &input)
 }
 
-/// Whether the Goal's own records say every current criterion is semantically
-/// reviewed and satisfied. Extracted so the Program projection and the ingress
-/// gap path cannot disagree about what "satisfied" means.
-pub(crate) fn current_reviews_satisfy_the_goal(
-    goal: &harness_contract::goal::GoalContract,
-) -> bool {
-    goal.blockers.is_empty()
-        && goal.unresolved.is_empty()
-        && goal.obligations.iter().all(|obligation| {
-            !obligation.required
-                || obligation.state == harness_contract::goal::ObjectiveObligationState::Satisfied
-        })
-        && goal
-            .criteria
-            .iter()
-            .all(|criterion| match criterion.status {
-                harness_contract::goal::AcceptanceStatus::Satisfied => goal
-                    .reviews
-                    .iter()
-                    .rev()
-                    .find(|review| review.criterion_ref == criterion.id)
-                    .is_some_and(|review| {
-                        review.decision == "satisfied"
-                            && review.spec_revision == goal.spec_revision
-                            && review.input_manifest_digest == goal.spec_digest
-                    }),
-                harness_contract::goal::AcceptanceStatus::Waived => true,
-                _ => false,
-            })
-}
-
-/// Delivered result references no current review covers.
-///
-/// One live loop had the root cite four artifacts per request while the
-/// recorded review covered three; nothing told the model which ref was
-/// missing, so it re-issued the same partial review until the observation
-/// window expired. Extracted so the Program projection derives the same set
-/// from the same rule instead of freezing whatever the reopen event happened
-/// to say.
-pub(crate) fn uncovered_delivered_result_refs(
-    program: &crate::AgenticProgramProjection,
-    goal: &harness_contract::goal::GoalContract,
-) -> Vec<String> {
-    let intent = goal.user_intent_criterion_id.clone().unwrap_or_default();
-    let covered = goal
-        .reviews
-        .iter()
-        .rev()
-        .find(|review| review.criterion_ref == intent)
-        .map(|review| review.result_refs.clone())
-        .unwrap_or_default();
-    // The objective reviewer's own report is evidence of review, not a
-    // delivered result: naming it as uncovered sends the model into an
-    // unbounded review-regress. Filter it out with the same delivered-set rule
-    // the conclusion gate uses.
-    let goal_artifacts = goal
-        .evidence_refs
-        .iter()
-        .filter(|reference| reference.starts_with("artifact:"))
-        .cloned()
-        .collect::<Vec<_>>();
-    let delivered =
-        crate::execution_core::goal::delivered_result_refs(program, goal, &goal_artifacts);
-    goal.evidence_refs
-        .iter()
-        .filter(|reference| reference.starts_with("artifact:"))
-        .filter(|reference| delivered.contains(reference))
-        .filter(|reference| !covered.contains(reference))
-        .cloned()
-        .collect::<Vec<_>>()
-}
-
-/// A `completion_gap` that no longer describes reality must not be reported as
-/// one. Shared with the Program projection so a satisfied review clears the
-/// gap everywhere at once instead of only on the ingress path.
-pub(crate) fn objective_completion_waiting_gap(
-    waiting: Option<&harness_contract::goal::WaitDescriptor>,
-    current_reviews_satisfied: bool,
-    uncovered_result_refs: &[String],
-) -> Option<String> {
-    let waiting = waiting.filter(|waiting| waiting.reason_code == "completion_gap")?;
-    let review_only = !waiting.required_refs.is_empty()
-        && waiting.required_refs.iter().all(|reference| {
-            reference.starts_with("original_intent_review_required:")
-                || reference.starts_with("criterion_review_required:")
-                || reference.starts_with("criterion_unsatisfied:")
-                || reference
-                    == "cannot satisfy a goal until every current criterion has semantic review or required durable evidence"
-        });
-    if current_reviews_satisfied && review_only {
-        return None;
-    }
-    let mut gap = format!("objective_completion_gap:{}", waiting.reason);
-    if !uncovered_result_refs.is_empty() {
-        gap.push_str(&format!(
-            "; uncovered_result_refs: {}",
-            uncovered_result_refs.join(", ")
-        ));
-    }
-    Some(gap)
-}
+#[cfg(test)]
+use crate::execution_core::goal::assessment::objective_completion_waiting_gap;
 
 /// A satisfied ObjectiveReview is the single semantic proof consumed by the
 /// completion gate. Require it to cover the full result set of the active

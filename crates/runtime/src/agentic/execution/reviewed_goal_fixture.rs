@@ -6354,9 +6354,13 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                 2
             );
         }
-        assert!(prepared.policy_sources.iter().any(|source| source.stream_id
-            == format!("agentic-program:{}", current.program_id)
-            && source.expected_revision == current.revision));
+        assert!(prepared
+            .source_frame
+            .sources()
+            .any(
+                |source| source.stream_id == format!("agentic-program:{}", current.program_id)
+                    && source.expected_revision == current.revision
+            ));
         NATIVE_A_PROBE.with(|slot| {
             slot.borrow_mut().take().unwrap()(&services.0, &current, prepared, &completion_envelope)
         });
@@ -6385,7 +6389,7 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
         let source = optional.index.clone();
         let before_revision = services.event_store().stream_revision(&source).unwrap();
         assert!(
-            prepared.policy_sources.iter().any(|expected| {
+            prepared.source_frame.sources().any(|expected| {
                 expected.stream_id == source && expected.expected_revision == before_revision
             }),
             "prepared A must carry the actual optional source fence"
@@ -6846,7 +6850,7 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                 .status,
             crate::AgenticProgramStatus::Verified
         );
-        assert!(crate::agentic::current_reviews_satisfy_the_goal(&goal));
+        assert!(crate::execution_core::goal::assessment::current_reviews_satisfy_the_goal(&goal));
         let conditions = crate::agentic::review_evidence::required_review_conditions(&goal);
         assert!(!conditions.is_empty());
         for condition in conditions {

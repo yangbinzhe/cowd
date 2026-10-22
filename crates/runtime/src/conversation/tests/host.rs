@@ -521,21 +521,11 @@ fn an_unfinished_root_program_keeps_the_action_channel_until_a_durable_terminal(
     }
 }
 
-/// The integration rung must follow the operator's requirement, not the runtime's
-/// more permissive view of what counts as delivered.
-///
-/// Run one24 published three accepted Tasks, each with its own per-file report
-/// artifact. `completion_ready_result_artifact_refs` was therefore non-empty, the
-/// rung was never advertised, and the model closed the Objective with no synthesis
-/// - while the operator had asked for "最终 artifact 综合三项事实" and the harness's
-/// `synthesized_final_artifact_present` check correctly refused the run.
-///
-/// Two layers must not disagree about what the operator asked for, so the rule here
-/// mirrors the harness's: an artifact synthesizes only when it hangs off an accepted
-/// Task and `relates_to` at least two of them.
+/// Multiple accepted deliveries alone do not create an extra business Task.
+/// The original Goal's explicit review gap still prevents completion.
 #[test]
-fn three_per_task_reports_are_not_a_synthesis() {
-    use super::delivered_results_are_synthesized;
+fn multiple_results_do_not_create_synthesis_debt_or_discharge_goal_review() {
+    use super::agentic_closure_view;
     use crate::{AgenticProgramProjection, AgenticTaskProjection, AgenticTaskStatus};
 
     let mut program = AgenticProgramProjection::empty("program", "objective");
@@ -598,13 +588,15 @@ fn three_per_task_reports_are_not_a_synthesis() {
             },
         );
     }
-    assert!(
-        !delivered_results_are_synthesized(&program),
-        "three per-Task reports relate to nothing, so they are not a synthesis"
-    );
+    let view = agentic_closure_view(&program, None);
+    assert!(!view["remaining"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["step"] == "publish_integration_task"));
+    assert_eq!(view["exit_ready"], false);
 
-    // A fourth artifact hosted on one Task and relating to two of them is a
-    // synthesis, and the obligation is discharged.
+    // Even a plausible integrated Artifact does not replace the original review.
     program.artifacts.insert(
         "artifact:synthesis".to_string(),
         crate::AgenticArtifactProjection {
@@ -624,10 +616,21 @@ fn three_per_task_reports_are_not_a_synthesis() {
         .expect("task 0")
         .artifact_refs
         .push("artifact:synthesis".to_string());
-    assert!(
-        delivered_results_are_synthesized(&program),
-        "an artifact hosted on an accepted Task and relating to two of them synthesizes"
+    let view = agentic_closure_view(
+        &program,
+        Some("original_intent_review_required:user_intent"),
     );
+    assert!(view["remaining"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["step"] == "objective_review"));
+    assert!(!view["remaining"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["step"] == "objective_complete_request"));
+    assert_eq!(view["exit_ready"], false);
 }
 
 #[test]

@@ -1037,13 +1037,17 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
                 None => PreparedContentRoot::Absent,
                 Some(checkpoint) => {
                     let payload = &checkpoint.payload;
-                    let program = projection_id.starts_with("runtime:agentic-read-model:v1:");
+                    let program_schema =
+                        RuntimeEventStore::program_read_model_checkpoint_schema(projection_id);
+                    let program = program_schema.is_some();
                     let schema = if program {
                         payload["schema_version"].as_u64()
                     } else {
                         payload["schema"].as_u64()
                     };
-                    let valid_schema = if projection_id.starts_with("projection-history:") {
+                    let valid_schema = if let Some(expected) = program_schema {
+                        schema == Some(expected)
+                    } else if projection_id.starts_with("projection-history:") {
                         matches!(schema, Some(3 | 4 | 5 | 6))
                             && (schema != Some(6) || payload["source_fence"].is_object())
                     } else {

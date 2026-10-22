@@ -3276,6 +3276,78 @@ mod pg_root_checkout_453_tests {
             runtime::PreparedContentRoot::Absent);
     }
 
+    #[test]
+    fn n2_pg_program_cache_versions_keep_exact_schema_scope_and_source() {
+        use sha2::{Digest, Sha256};
+        let fixture = PostgresTestScope::new();
+        let backend = single_connection_store(&fixture);
+        let (mut artifact, _) = storage_pair("program-cache-991");
+        artifact.media_type = "application/json".into();
+        for (version, expected_schema) in [(1, 2), (2, 3)] {
+            let projection_id = format!(
+                "runtime:agentic-read-model:v{version}:{:x}",
+                Sha256::digest(b"program-cache-991")
+            );
+            let origin = runtime::PreparedArtifactOrigin::CheckpointBody {
+                projection_id: projection_id.clone(),
+                source_cursor: 7,
+            };
+            let payload = serde_json::json!({
+                "schema_version":expected_schema, "session_id":"session-453",
+                "body":{"content_schema":2,"sha256":artifact.sha256,"bytes":artifact.bytes,
+                    "body":{"kind":"artifact_ref","artifact":artifact}},
+            });
+            let saved = backend
+                .compare_and_put_projection_checkpoint(&projection_id, 7, 0, &payload, 0)
+                .unwrap();
+            assert_eq!(
+                backend.prepared_content_root(&origin, &artifact).unwrap(),
+                runtime::PreparedContentRoot::Checkpoint
+            );
+            let foreign_source = runtime::PreparedArtifactOrigin::CheckpointBody {
+                projection_id: projection_id.clone(),
+                source_cursor: 8,
+            };
+            assert_eq!(
+                backend
+                    .prepared_content_root(&foreign_source, &artifact)
+                    .unwrap(),
+                runtime::PreparedContentRoot::Blocked
+            );
+            let mut foreign_scope = artifact.clone();
+            foreign_scope.visibility_scope = "session:foreign".into();
+            assert_eq!(
+                backend
+                    .prepared_content_root(&origin, &foreign_scope)
+                    .unwrap(),
+                runtime::PreparedContentRoot::Blocked
+            );
+            let mut crossed = payload;
+            crossed["schema_version"] = serde_json::json!(if expected_schema == 2 { 3 } else { 2 });
+            backend
+                .compare_and_put_projection_checkpoint(
+                    &projection_id,
+                    7,
+                    saved.revision,
+                    &crossed,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(
+                backend.prepared_content_root(&origin, &artifact).unwrap(),
+                runtime::PreparedContentRoot::Blocked,
+                "another known cache schema must not authenticate this owner version"
+            );
+            backend
+                .delete_projection_checkpoint(&projection_id)
+                .unwrap();
+            assert_eq!(
+                backend.prepared_content_root(&origin, &artifact).unwrap(),
+                runtime::PreparedContentRoot::Absent
+            );
+        }
+    }
+
     fn storage_pair(call: &str) -> (runtime::ArtifactRef, AppendTransactionRequest) {
         let artifact = runtime::ArtifactRef {
             selector: format!("artifact://art_{call}"),

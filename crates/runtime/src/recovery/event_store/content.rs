@@ -41,6 +41,18 @@ impl PreparedHistoryCheckpoint {
 }
 
 impl RuntimeEventStore {
+    /// Exact versions of the derived Program cache. Durable Program events
+    /// retain their original schema; unknown cache owners never authenticate.
+    pub fn program_read_model_checkpoint_schema(projection_id: &str) -> Option<u64> {
+        if projection_id.starts_with("runtime:agentic-read-model:v1:") {
+            Some(2)
+        } else if projection_id.starts_with("runtime:agentic-read-model:v2:") {
+            Some(3)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn prepare_history_checkpoint(
         &self, projection_id: &str, source_cursor: u64, expected_revision: u64,
         identity: &str, mut payload: serde_json::Value, encoded: &serde_json::Value,
@@ -934,7 +946,8 @@ impl RuntimeEventStore {
         payload: &serde_json::Value, prepared_body: Option<&serde_json::Value>,
     ) -> RuntimeEventStoreResult<()> {
         let goal = projection_id.strip_prefix("goal-projection:");
-        let program = projection_id.starts_with("runtime:agentic-read-model:v1:");
+        let program_schema = Self::program_read_model_checkpoint_schema(projection_id);
+        let program = program_schema.is_some();
         let history = projection_id.starts_with("projection-history:");
         if goal.is_none() && !program && !history {
             if payload["body"]["content_schema"] == CONTENT_SCHEMA {
@@ -959,7 +972,9 @@ impl RuntimeEventStore {
         } else {
             payload["schema"].as_u64()
         };
-        let valid_schema = if history {
+        let valid_schema = if let Some(expected) = program_schema {
+            schema == Some(expected)
+        } else if history {
             matches!(schema, Some(3 | 4 | 5 | 6))
         } else {
             schema == Some(u64::from(CONTENT_SCHEMA))
@@ -991,7 +1006,8 @@ impl RuntimeEventStore {
                 && body["program_id"].as_str().is_some_and(|identity| {
                     projection_id
                         == format!(
-                            "runtime:agentic-read-model:v1:{:x}",
+                            "runtime:agentic-read-model:v{}:{:x}",
+                            if program_schema == Some(3) { 2 } else { 1 },
                             Sha256::digest(identity.as_bytes())
                         )
                 })

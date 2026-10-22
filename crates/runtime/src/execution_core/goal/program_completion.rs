@@ -7,7 +7,7 @@ pub(crate) struct PreparedProgramConclusion {
     pub expected_stream_revision: u64,
     pub event: RuntimeTransactionEventInput,
     pub gaps: Vec<String>,
-    pub policy_sources: Vec<crate::ExpectedStreamRevision>,
+    pub source_frame: AssessmentSourceFrame,
 }
 
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
@@ -165,21 +165,9 @@ impl GoalStore {
         let projection = self
             .projection(&format!("goal:{root}"))?
             .ok_or("missing bound Goal")?;
+        let mut source_frame =
+            AssessmentSourceFrame::new(program, &projection).map_err(|error| error.to_string())?;
         let mut goal = projection.goal;
-        let binding = goal
-            .execution_binding
-            .as_ref()
-            .ok_or("missing Goal execution binding")?;
-        if binding.root_execution_id != root
-            || binding.agentic_program_id != program.program_id
-            || binding.objective_id != program.objective_id
-            || binding.session_id != program.session_id
-            || binding.turn_id != program.turn_id
-            || goal.completion != GoalCompletion::Open
-            || goal.terminal.is_some()
-        {
-            return Err("completion request does not match the open bound Goal".into());
-        }
         let mut evidence = goal.evidence_refs.clone();
         evidence.extend(projection.progress.evidence_refs.iter().cloned());
         evidence.extend(request.evidence_refs.iter().cloned());
@@ -507,27 +495,15 @@ impl GoalStore {
             expected_stream_revision: projection.stream_revision,
             event,
             gaps,
-            policy_sources: {
-                let mut sources = std::collections::BTreeMap::new();
+            source_frame: {
                 for snapshot in proof_inputs.into_values() {
                     for source in snapshot.sources {
-                        if sources
-                            .insert(source.stream_id, source.expected_revision)
-                            .is_some_and(|revision| revision != source.expected_revision)
-                        {
-                            return Err("proof source changed during conclusion preparation".into());
-                        }
+                        source_frame
+                            .pin(source)
+                            .map_err(|error| error.to_string())?;
                     }
                 }
-                sources
-                    .into_iter()
-                    .map(
-                        |(stream_id, expected_revision)| crate::ExpectedStreamRevision {
-                            stream_id,
-                            expected_revision,
-                        },
-                    )
-                    .collect()
+                source_frame
             },
         })
     }
@@ -1111,7 +1087,7 @@ mod tests {
             let source = source.clone();
             let revision = *revision;
             assert_eq!(services.event_store().stream_revision(&source).unwrap(), revision);
-            assert!(prepared.policy_sources.iter().any(|cut| cut.stream_id == source && cut.expected_revision == revision));
+            assert!(prepared.source_frame.sources().any(|cut| cut.stream_id == source && cut.expected_revision == revision));
             crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
                 Some(&goal), proof, readers).expect("actual current approval is accepted");
             let mut missing = proof.clone();

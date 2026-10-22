@@ -9,7 +9,9 @@ use std::sync::{Arc, OnceLock};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
+pub(crate) mod assessment;
 pub mod policy;
+pub(crate) use assessment::AssessmentSourceFrame;
 mod program_completion;
 pub(crate) use program_completion::delivered_result_refs;
 pub mod supervisor;

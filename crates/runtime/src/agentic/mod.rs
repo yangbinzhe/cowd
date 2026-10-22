@@ -21,16 +21,18 @@ mod topic;
 pub(crate) mod topic_delivery;
 mod work_market;
 
-pub use action_service::{AgentActionService, AgentActionServiceError};
-pub(crate) use action_service::{
-    validate_receipt_index_record, AgenticTopicObservationAck, AgenticWaitDisposition, TopicObservationKind,
+#[cfg(test)]
+pub(crate) use crate::execution_core::goal::assessment::{
+    current_reviews_satisfy_the_goal, uncovered_delivered_result_refs,
 };
+pub(crate) use action_service::{
+    validate_receipt_index_record, AgenticTopicObservationAck, AgenticWaitDisposition,
+    TopicObservationKind,
+};
+pub use action_service::{AgentActionService, AgentActionServiceError};
 pub(crate) use execution::start_agentic_claim_heartbeat;
 pub use execution::{AgenticDispatchContext, AgenticDispatchReceipt};
-pub(crate) use ingress::{
-    agentic_program_completion_gap, current_reviews_satisfy_the_goal,
-    uncovered_delivered_result_refs,
-};
+pub(crate) use ingress::agentic_program_completion_gap;
 pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,
     AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,

@@ -581,14 +581,13 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 match row {
                     None => PreparedContentRoot::Absent,
                     Some(row) => {
-                        let schema: Option<Value> = row.get(
-                            if projection_id.starts_with("runtime:agentic-read-model:v1:") {
-                                2
-                            } else {
-                                1
-                            },
-                        );
-                        let valid_schema = if projection_id.starts_with("projection-history:") {
+                        let program_schema =
+                            RuntimeEventStore::program_read_model_checkpoint_schema(projection_id);
+                        let schema: Option<Value> =
+                            row.get(if program_schema.is_some() { 2 } else { 1 });
+                        let valid_schema = if let Some(expected) = program_schema {
+                            schema.as_ref().and_then(Value::as_u64) == Some(expected)
+                        } else if projection_id.starts_with("projection-history:") {
                             matches!(schema.as_ref().and_then(Value::as_u64), Some(3 | 4 | 5 | 6))
                                 && (schema != Some(serde_json::json!(6)) || row.get::<_, bool>(5))
                         } else {

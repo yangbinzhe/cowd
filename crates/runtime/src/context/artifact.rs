@@ -136,7 +136,8 @@ impl PreparedArtifactOrigin {
             } => {
                 i64::try_from(*source_cursor).map_err(|_| "prepared cursor overflow")?;
                 if !projection_id.starts_with("goal-projection:")
-                    && !projection_id.starts_with("runtime:agentic-read-model:v1:")
+                    && crate::RuntimeEventStore::program_read_model_checkpoint_schema(projection_id)
+                        .is_none()
                     && !projection_id.starts_with("projection-history:")
                 {
                     return Err("unsupported prepared checkpoint owner".into());

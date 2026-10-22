@@ -2620,51 +2620,16 @@ fn bound_goal_context(
     session_id: &str,
     turn_id: &str,
 ) -> serde_json::Value {
-    let Some(root) = program.root_execution_id.as_deref() else {
-        return serde_json::json!({"status":"unknown","reason":"missing_root_binding"});
-    };
-    let projection = match services.goal_store().projection(&format!("goal:{root}")) {
-        Ok(Some(projection)) => projection,
-        Ok(None) => return serde_json::json!({"status":"absent","goal_ref":format!("goal:{root}")}),
-        Err(error) => return serde_json::json!({"status":"unavailable","reason":error.to_string()}),
-    };
-    let goal = &projection.goal;
-    if !goal.execution_binding.as_ref().is_some_and(|binding| {
-        binding.agentic_program_id == program.program_id
-            && binding.objective_id == program.objective_id
-            && binding.session_id == session_id
-            && binding.turn_id == turn_id
-            && binding.root_execution_id == root
-            && program.session_id == session_id
-            && program.turn_id == turn_id
-    }) {
-        return serde_json::json!({"status":"binding_mismatch","goal_ref":goal.id});
+    if program.session_id != session_id || program.turn_id != turn_id {
+        return serde_json::json!({"status":"binding_mismatch"});
     }
-    serde_json::json!({
-        "status":"known",
-        "goal_ref":goal.id,
-        "stream_revision":projection.stream_revision,
-        "spec_revision":goal.spec_revision,
-        "spec_digest":goal.spec_digest,
-        "completion":goal.completion,
-        "user_intent_criterion_ref":goal.user_intent_criterion_id,
-        "source_intent_ref":goal.source_intent_ref,
-        "participation_requirement":goal.participation_requirement,
-        "criteria":goal.criteria.iter().map(|criterion| serde_json::json!({
-            "criterion_ref":criterion.id,
-            "status":format!("{:?}",criterion.status).to_lowercase(),
-        })).collect::<Vec<_>>(),
-        "required_obligations":goal.obligations.iter().filter(|obligation| obligation.required)
-            .collect::<Vec<_>>(),
-        "blockers":goal.blockers,
-        "unresolved":goal.unresolved,
-        "waiting":goal.waiting,
-        "review_readiness":{
-            "current_reviews_satisfied":crate::agentic::current_reviews_satisfy_the_goal(goal),
-            "uncovered_result_refs":crate::agentic::uncovered_delivered_result_refs(program, goal),
-            "note":"Snapshot of existing ingress review predicates, not Goal satisfaction or a CAS grant.",
-        },
-    })
+    match crate::execution_core::goal::assessment::read_bound_goal_assessment(
+        services.event_store(),
+        program,
+    ) {
+        Ok(assessment) => assessment.goal_context(program),
+        Err(error) => serde_json::json!({"status":"unavailable","reason":error.to_string()}),
+    }
 }
 
 #[must_use]
@@ -2685,40 +2650,16 @@ pub(super) fn agentic_turn_framing(
     let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
     match services.agent_action_service().project_if_exists(&program_id) {
         Ok(Some(program)) => {
-            let completion_gap =
-                crate::agentic::agentic_program_completion_gap(services, session_id, turn_id);
-            let mut view = agentic_closure_view(&program, completion_gap.as_deref());
-            let goal = bound_goal_context(&program, services, session_id, turn_id);
-            if goal["status"] != "known" {
-                view["blocked"] = serde_json::json!({"reason":"goal_context_unavailable","goal":goal});
-                view["current"] = serde_json::json!("blocked");
-                view["remaining"] = serde_json::json!([]);
-            } else {
-                let open_required = goal["required_obligations"].as_array().into_iter().flatten()
-                    .filter(|obligation| obligation["state"] != "satisfied").cloned().collect::<Vec<_>>();
-                if open_required.is_empty()
-                    && goal["completion"] == "open"
-                    && view["blocked"]["reason"] == "objective_review_readiness_unknown"
-                    && goal["review_readiness"]["current_reviews_satisfied"] == true
-                    && goal["review_readiness"]["uncovered_result_refs"].as_array().is_some_and(Vec::is_empty)
-                {
-                    view["blocked"] = serde_json::Value::Null;
-                    view["current"] = serde_json::json!("objective_complete_request");
-                    if let Some(remaining) = view["remaining"].as_array_mut() {
-                        remaining.push(serde_json::json!({"step":"objective_complete_request",
-                            "actionability":"request_governed_verification",
-                            "hint":"Current ingress review predicates are ready at this snapshot. Request verification with the actual result refs; independent review, work manifest and Goal CAS still determine the outcome. This is not acceptance."}));
-                    }
-                }
-                if !open_required.is_empty() {
-                    view["blocked"] = serde_json::json!({"reason":"required_goal_obligations_open","obligations":open_required});
-                    view["current"] = serde_json::json!("blocked");
-                    if let Some(remaining) = view["remaining"].as_array_mut() {
-                        remaining.retain(|entry| entry["step"] != "objective_complete_request");
-                    }
-                }
-                view["goal"] = goal;
-            }
+            let mut view = match crate::execution_core::goal::assessment::read_bound_goal_assessment(
+                services.event_store(),
+                &program,
+            ) {
+                Ok(assessment) => assessment.view(&program),
+                Err(error) => crate::execution_core::goal::assessment::unknown_completion_view(
+                    &program,
+                    &error.to_string(),
+                ),
+            };
             view["program_source"] = serde_json::json!({"program_ref":program.program_id,"revision":program.revision});
             if let Some(object) = view.as_object_mut() {
                 object.insert("budgets".to_string(), budgets);
@@ -2810,50 +2751,18 @@ pub(super) fn scope_turn_framing_for_role(
     framing
 }
 
-/// The outstanding closure rungs as the model reads them, from the one function
-/// that computes them.
-///
-/// The barrier path renders these inside the checkpoint projection. The polling
-/// path (`state_inspect`) used to render nothing but bounded state pages, so a
-/// root that stopped consulting the barrier and polled instead lost the only
-/// authoritative statement of what to do next: one live run polled the same
-/// generic query five times while two of its Tasks sat Submitted and unreviewed,
-/// because nothing on the polling path ever said the next rung was
-/// `independent_review`. Both paths now read this one function, so they cannot
-/// disagree about what is outstanding.
-///
-/// `completion_gap` is deliberately not threaded here: every rung is derived from
-/// the Program projection alone, so passing `None` yields the identical rungs
-/// while keeping this callable from a layer that has no Goal store.
-#[must_use]
-pub(crate) fn closure_rungs_for_program(
-    program: &crate::AgenticProgramProjection,
-) -> Vec<serde_json::Value> {
-    agentic_closure_view(program, None)["remaining"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-}
+#[cfg(test)]
+use crate::execution_core::goal::assessment::completion_view as agentic_closure_view;
+#[cfg(test)]
+use crate::execution_core::goal::assessment::root_agentic_terminal_action;
+use crate::execution_core::goal::assessment::CompletionTerminalAction as RootAgenticTerminalAction;
 
-/// One-line summary used by the root re-drive and the deferred-protocol
-/// continuation so the model sees the outstanding rungs without parsing a whole
-/// checkpoint blob.
-#[must_use]
 pub(super) fn outstanding_closure_steps(program: &crate::AgenticProgramProjection) -> Vec<String> {
-    // Callers without Goal access see Program rungs only; the checkpoint and
-    // budgets views carry the authoritative completion gap.
-    agentic_closure_view(program, None)["remaining"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    row.get("step")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::execution_core::goal::assessment::CompletionAssessment::for_program(program, None)
+        .remaining_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 pub(super) fn root_agentic_program_projection(
@@ -2866,40 +2775,24 @@ pub(super) fn root_agentic_program_projection(
     services.agent_action_service().project(&program_id).ok()
 }
 
-/// The root Program has a narrow, factual closure boundary that is distinct
-/// from ordinary model planning.  It exists to keep the action advertised to
-/// the root model consistent with Objective admission: accepted delivery work
-/// without a dependency-backed integration Artifact still needs a synthesis
-/// Task, while a proven integration Artifact needs the completion request.
-///
-/// This does not encode roles, Team assignment, Task contents, or a workflow
-/// template.  Those remain model decisions.  It prevents only the impossible
-/// state where the model is told to request completion before the verifier can
-/// accept any of its result references.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum RootAgenticTerminalAction {
-    PublishIntegration { prerequisite_task_refs: Vec<String> },
-    RequestObjectiveCompletion { result_artifact_refs: Vec<String> },
-}
-
 impl RootAgenticTerminalAction {
     fn checkpoint_next_actions(&self) -> Vec<&'static str> {
         match self {
-            Self::PublishIntegration { .. } => vec!["publish_integration_task"],
+            Self::RegisterDelivery { .. } => vec!["register_delivery"],
             Self::RequestObjectiveCompletion { .. } => vec!["objective_complete_request"],
         }
     }
 
     fn checkpoint_detail(&self) -> serde_json::Value {
         match self {
-            Self::PublishIntegration {
+            Self::RegisterDelivery {
                 prerequisite_task_refs,
             } => serde_json::json!({
-                "kind": "publish_integration_task",
+                "kind": "register_delivery",
                 "prerequisite_task_refs": prerequisite_task_refs.iter().take(32).collect::<Vec<_>>(),
                 "total_prerequisites":prerequisite_task_refs.len(),
                 "directory_request":{"name":"state_inspect","input":{}},
-                "requirement": "Publish one genuine synthesis Task with depends_on covering these accepted deliveries. Choose its Team, author, objective, acceptance criterion, and evidence semantics yourself; its accepted Artifact must be the final result.",
+                "requirement": "Register the actual result and its authenticated delivery lineage. Follow the original Goal requirements; accepted Task counts do not require an additional synthesis Task.",
             }),
             Self::RequestObjectiveCompletion {
                 result_artifact_refs,
@@ -2908,323 +2801,9 @@ impl RootAgenticTerminalAction {
                 "eligible_result_artifact_refs": result_artifact_refs.iter().take(32).collect::<Vec<_>>(),
                 "total_eligible_results":result_artifact_refs.len(),
                 "directory_request":{"name":"state_inspect","input":{}},
-                "requirement": "When the original objective is supported, request Objective completion using an eligible accepted integration Artifact and real evidence. Continue inspecting sources and resolving or disclosing issues when needed. Accepted tasks alone do not certify the original objective.",
+                "requirement": "When the original objective is supported, request Objective completion using an eligible accepted result and real evidence. Continue inspecting sources and resolving or disclosing issues when needed. Accepted tasks alone do not certify the original objective.",
             }),
         }
-    }
-}
-
-/// Always-on closure view: where the Program stands on the framework-owned
-/// rungs, and exactly what is still outstanding.
-///
-/// Unlike `root_agentic_terminal_action`, which returns `None` while work is
-/// outstanding, this is defined for **every** state — including the stalled one,
-/// which is exactly when the model most needs to know what is left. It carries
-/// no roles, Team assignment, Task contents or workflow template: only durable
-/// facts the Program already records, plus the step names the runtime itself
-/// advertises. The model still decides how to satisfy each remaining rung.
-/// Whether the delivered results have been synthesized by one artifact.
-///
-/// Mirrors the harness's `synthesized_final_artifact_findings` exactly, because
-/// the two layers must not disagree about what the operator asked for. An artifact
-/// synthesizes when it hangs off an accepted Task - that Task is the synthesis's
-/// host, not one of the things it synthesizes - and `relates_to` at least two
-/// accepted Tasks, counting the host.
-fn delivered_results_are_synthesized(program: &crate::AgenticProgramProjection) -> bool {
-    let accepted = program
-        .tasks
-        .values()
-        .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
-        .collect::<Vec<_>>();
-    if accepted.len() <= 1 {
-        return true;
-    }
-    program.artifacts.values().any(|artifact| {
-        let hosted = accepted
-            .iter()
-            .any(|task| task.artifact_refs.contains(&artifact.artifact_ref));
-        if !hosted {
-            return false;
-        }
-        accepted
-            .iter()
-            .filter(|task| artifact.relates_to.contains(&task.task_id))
-            .count()
-            >= 2
-    })
-}
-
-fn agentic_closure_view(
-    program: &crate::AgenticProgramProjection,
-    completion_gap: Option<&str>,
-) -> serde_json::Value {
-    let tasks = program.tasks.values().collect::<Vec<_>>();
-    let published = tasks.len();
-    let active_tasks = tasks.iter().filter(|task| !task.status.is_retired()).collect::<Vec<_>>();
-    let unclaimed = active_tasks.iter().filter(|task| matches!(task.status,
-        crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Rework)).count();
-    let submitted = active_tasks.iter().filter(|task| task.status == crate::AgenticTaskStatus::Submitted).count();
-    let pending = active_tasks.iter().filter(|task| task.status != crate::AgenticTaskStatus::Accepted).count();
-    let claimed = tasks.iter().filter(|task| task.claimant.is_some()).count();
-    let reviewed = tasks
-        .iter()
-        .filter(|task| task.reviewed_by.is_some())
-        .count();
-    let accepted = tasks
-        .iter()
-        .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
-        .count();
-    let teams = program.teams.len();
-    let required_teams = usize::from(program.required_team_count);
-    // The unclassified-issue count comes from the Task-recorded issues that
-    // `issues::completion_gap` reads, NOT from `program.unresolved` (which is
-    // derived from Goal-level gaps). Run one19 had the two disagree: this view
-    // reported `satisfied: [... classify_issues]` and `facts.unresolved: 0`
-    // while the same object reported `completion_gap:
-    // issue_requires_classification` and two entries in
-    // `unclassified_issue_refs`. A model told the gap is both closed and open
-    // concludes the Objective is done and writes its final answer, which is
-    // exactly what it did - seven times.
-    let issue_blockers = crate::agentic::issues::open_issue_blockers(program);
-    let unclassified = issue_blockers.len();
-
-    let mut remaining: Vec<serde_json::Value> = Vec::new();
-    if teams < required_teams {
-        remaining.push(serde_json::json!({
-            "step": "team", "outstanding": required_teams - teams,
-            "hint": "Runtime requires at least this many Teams; names/roles are yours."
-        }));
-    }
-    if published == 0 && required_teams > 0 {
-        remaining.push(serde_json::json!({"step": "publish_task", "requirement":"required_participation"}));
-    }
-    if unclaimed > 0 {
-        remaining.push(serde_json::json!({
-            "step": "claim_task", "outstanding": unclaimed
-        }));
-    }
-    if submitted > 0 {
-        remaining.push(serde_json::json!({
-            "step": "independent_review", "outstanding": submitted,
-            "hint": "A different Agent must review each submitted Task."
-        }));
-    }
-    let mut blocked = serde_json::Value::Null;
-    if pending > 0 {
-        blocked = serde_json::json!({"reason":"tasks_not_accepted","outstanding":pending,
-            "hint":"Advance the actual Task state; task_review cannot close an unsubmitted Task. Retired Tasks are not accepted results."});
-    }
-    if required_teams == 0 && active_tasks.is_empty() && program.artifacts.is_empty() {
-        remaining.push(serde_json::json!({"step":"register_delivery","closing_tool":"artifact_commit",
-            "hint":"No Program deliverable is registered. For a real file, discover artifact_publish using tool_search(query=artifact_publish) if deferred; read the actual file, then artifact_publish(source=file,path,sha256,media_type) and artifact_commit(content_ref=<returned immutable selector>,kind,title). For actual response Text use artifact_commit(content_ref=message://current,kind,title). File/tool receipts alone are not registration; never guess a selector or force a Team/Task.",
-            "publication_route":{"discovery_tool":"tool_search","query":"artifact_publish",
-                "file_publication_tool":"artifact_publish","file_source":"file",
-                "file_fields":["path","sha256","media_type"],
-                "registration_tool":"artifact_commit","selector":"returned content_ref",
-                "body_alternative":"actual response Text + artifact_commit(content_ref=message://current,kind,title)",
-                "execution":"explicit_authorized_calls_only","exposure":"requires_actual_native_schema"}}));
-    }
-    // The integration obligation is a durable structural fact the Program
-    // already records, so it belongs in this always-on view. It used to live
-    // only in `root_agentic_terminal_action`, which returns None while a
-    // completion gap is open - so precisely when the model still had work to
-    // do, the one rung that names the synthesis Task was invisible to it. One
-    // live 1-Team run reached a satisfied verdict with three accepted Tasks
-    // and no integration Artifact; everything else passed, and the only thing
-    // missing was this advertisement.
-    // An integration Task is owed whenever the delivered results have not been
-    // synthesized, which is the operator's own requirement: the 1-Team scenario
-    // asks for "最终 artifact 综合三项事实".
-    //
-    // The condition used to be `completion_ready_result_artifact_refs(program)
-    // .is_empty()`, which answers a different question - whether the per-Task
-    // artifacts are individually deliverable. Run one24 published three accepted
-    // Tasks, each with its own report artifact, so that set was non-empty, the
-    // rung was never advertised, and the model closed the Objective with no
-    // synthesis at all. The verifier accepted it. The harness's
-    // `synthesized_final_artifact_present` check did not, and it was right.
-    //
-    // The rule now mirrors the harness: with two or more accepted Tasks, an
-    // artifact synthesizes only if it hangs off an accepted Task and `relates_to`
-    // at least two of them. Anything less leaves the Tasks unsynthesized.
-    if accepted >= 2 && accepted == published && !delivered_results_are_synthesized(program) {
-        remaining.push(serde_json::json!({
-            "step": "publish_integration_task",
-            "outstanding": accepted,
-            "hint": "Publish one genuine synthesis Task with depends_on covering these accepted deliveries. Choose its Team, author, objective, acceptance criterion, and evidence semantics yourself; its accepted Artifact must be the final result."
-        }));
-    }
-    if !issue_blockers.is_empty() {
-        remaining.push(serde_json::json!({
-            "step": "classify_issues", "outstanding": unclassified,
-            "issue_refs": issue_blockers.iter().map(|(reference, _)| reference.clone()).collect::<Vec<_>>(),
-            "hint": "Completion is rejected while any entry stays unclassified; dispose them through one message_publish.issue_dispositions."
-        }));
-    }
-    if program.completion_request.is_none() {
-        // While the Goal verifier still records a completion gap, advertising
-        // the exit action is a lie the model will act on: one live run was told
-        // to request completion while the Goal gate required an Objective
-        // review, and it looped on rejected requests until the window expired.
-        if completion_gap.is_none() && remaining.is_empty() && blocked.is_null()
-            && !program.artifacts.is_empty() {
-            remaining.push(serde_json::json!({
-            "step": "objective_complete_request",
-            "hint": "The Objective cannot close without this action; accepted Tasks alone do not certify it."
-        }));
-        }
-    }
-    if let Some(gap) = completion_gap {
-        // The rung must name the action that closes THIS gap. Every gap used to
-        // be rendered as `objective_review`, so an `issue_requires_classification`
-        // gap was advertised as a review while the completion-gap guidance in the
-        // same envelope asked for `message_publish`. The model was handed two
-        // mutually exclusive instructions for one gap and satisfied neither.
-        let kind = crate::agentic::issues::completion_gap_kind(gap);
-        let hint = if kind.is_issue_gap() {
-            format!(
-                "The Goal verifier records a completion gap, so the Objective is not closable yet: {gap}. \
-                 Close it by classifying EVERY unclassified issue_ref listed above through ONE \
-                 `message_publish` call carrying `issue_dispositions`. Each entry needs the exact \
-                 `issue:` reference, a disposition of `must_resolve`, `disclose` or `resolved`, a \
-                 durable `reason_ref`, and `evidence_refs` drawn from artifact://, tool://, task:, \
-                 issue: or program: (the issue's own source Task ref is durable). Do not request \
-                 completion until this clears."
-            )
-        } else {
-            "The Goal verifier records a completion gap, so the Objective is not closable yet. Close this gap first; do not re-request completion until it clears. Close it by having an Agent READ the delivered results itself in its own execution and then call objective_review: a read by another Agent, by the root, or by an earlier attempt of the same Agent does not count, and submitting the review before those reads only burns the retry budget.".to_string()
-        };
-        let needs_independent_actor = kind.closing_tool() == "objective_review";
-        let optional_route = needs_independent_actor.then(|| serde_json::json!({
-            "status":"requires_explicit_independent_actor",
-            "team_observation":if program.teams.is_empty() {"absent"} else {"present_admission_unverified"},
-            "strategy":"Use a suitable existing Team or explicitly choose a minimal reviewer-only Team, subject to user constraints and authorization. Minimum zero Teams is not a prohibition. This is an optional execution carrier, not a new business deliverable.",
-            "admission":"If chosen and authorized, team_create only when needed; agent_invite a distinct read-capable Agent; task_publish(purpose=exploration) with the original criterion and actual current registered result refs. Existing membership alone does not prove reviewer eligibility.",
-            "review":"The distinct admitted Agent must really claim the Task and read the current result refs in its own execution, then objective_review with complete current results, read evidence and durable reason.",
-            "retirement":"After recorded control work, explicitly task_withdraw with truthful reason_ref/evidence_refs, or task_release if work remains. Retired is not Accepted; do not delete the Task or create a redundant report.",
-            "completion":"Independent review does not complete the Goal. Preserve original criterion, manifest and real Goal verifier/CAS; objective_complete_request remains governed.",
-            "execution":"optional_explicit_authorized_calls_only",
-            "prohibitions":["no_auto_create","no_self_review","no_auto_accept","no_manifest_rewrite"],
-            "exposure":"requires_actual_native_schema_and_actor_authorization"
-        }));
-        remaining.push(serde_json::json!({
-            "step": kind.closure_step(),
-            "outstanding_gap": gap,
-            "closing_tool": kind.closing_tool(),
-            "actionability":if needs_independent_actor { "requires_explicit_independent_actor" } else { "requires_actor_and_reads" },
-            "optional_route":optional_route,
-            "hint": hint
-        }));
-    }
-
-    if completion_gap.is_none() && required_teams == 0 && active_tasks.is_empty()
-        && !program.artifacts.is_empty() && program.completion_request.is_none() {
-        blocked = serde_json::json!({"reason":"objective_review_readiness_unknown",
-            "hint":"A registered artifact and no reported gap do not prove current original-intent review. Inspect the bound Goal and current review evidence first. If review is missing, a suitable existing Team or explicitly chosen minimal reviewer-only Team with a distinct admitted Agent and typed Exploration Task is an optional authorized route, not business Task debt. Do not auto-create, self-review, autoaccept or infer success."});
-    }
-    if !blocked.is_null() {
-        remaining.retain(|entry| entry["step"] != "objective_complete_request");
-    }
-    let current = if !blocked.is_null() {
-        "blocked"
-    } else if program.completion_request.is_some() {
-        "completion_requested"
-    } else if remaining.is_empty() {
-        "goal_verification_required"
-    } else {
-        remaining
-            .first()
-            .and_then(|step| step.get("step"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-    };
-
-    // What is already satisfied. Naming it is as load-bearing as naming what is
-    // missing: it is what tells the model "do not redo this" and, when the list
-    // is complete, that the exit condition has been reached and it may verify
-    // through the one action that closes the Objective.
-    let mut satisfied: Vec<&'static str> = Vec::new();
-    if teams >= required_teams {
-        satisfied.push("team");
-    }
-    if published > 0 {
-        satisfied.push("publish_task");
-    }
-    if unclaimed == 0 && pending == 0 && published > 0 {
-        satisfied.push("claim_task");
-    }
-    if reviewed >= published && accepted == published && published > 0 {
-        satisfied.push("independent_review");
-    }
-    if accepted >= published && published > 0 {
-        satisfied.push("accepted_task");
-    }
-    if issue_blockers.is_empty() {
-        satisfied.push("classify_issues");
-    }
-
-    serde_json::json!({
-        "current": current,
-        "exit_ready": false,
-        "readiness":"requires_bound_goal_verification",
-        "blocked":blocked,
-        "suggestions":["Topology is optional unless required by the bound user participation contract. Completion remains a governed request, not a count-derived verdict."],
-        "completion_gap": completion_gap,
-        "facts": {
-            "teams": teams,
-            "required_teams": required_teams,
-            "tasks_published": published,
-            "tasks_claimed": claimed,
-            "tasks_reviewed": reviewed,
-            "tasks_accepted": accepted,
-            "unresolved": program.unresolved.len(),
-            "unclassified_issues": unclassified,
-            "issue_refs": issue_blockers
-                .iter()
-                .map(|(reference, _)| reference.clone())
-                .collect::<Vec<_>>(),
-        },
-        "satisfied": satisfied,
-        "remaining": remaining,
-    })
-}
-
-pub(super) fn root_agentic_terminal_action(
-    program: &crate::AgenticProgramProjection,
-) -> Option<RootAgenticTerminalAction> {
-    if !matches!(
-        program.status,
-        crate::AgenticProgramStatus::Open | crate::AgenticProgramStatus::Waiting
-    ) {
-        return None;
-    }
-    if !program.unresolved.is_empty() || crate::agentic::issues::completion_gap(program).is_some() {
-        return None;
-    }
-    let prerequisite_task_refs = program
-        .tasks
-        .values()
-        .filter(|task| !task.status.is_retired())
-        .map(|task| task.task_id.clone())
-        .collect::<Vec<_>>();
-    if prerequisite_task_refs.is_empty()
-        || program.tasks.values().any(|task| {
-            !task.status.is_retired() && task.status != crate::AgenticTaskStatus::Accepted
-        })
-    {
-        return None;
-    }
-
-    let result_artifact_refs =
-        crate::agentic::supervision::completion_ready_result_artifact_refs(program);
-    if result_artifact_refs.is_empty() {
-        Some(RootAgenticTerminalAction::PublishIntegration {
-            prerequisite_task_refs,
-        })
-    } else {
-        Some(RootAgenticTerminalAction::RequestObjectiveCompletion {
-            result_artifact_refs,
-        })
     }
 }
 
@@ -3292,7 +2871,16 @@ fn compact_agentic_program_checkpoint(
 ) -> String {
     // Window size bounds materialization, never the authoritative directory.
     const METADATA_WINDOW: usize = 32;
-    let terminal_action = root_agentic_terminal_action(program);
+    let goal_assessment = services.map(|services| {
+        crate::execution_core::goal::assessment::read_bound_goal_assessment(
+            services.event_store(),
+            program,
+        )
+    });
+    let terminal_action = goal_assessment.as_ref().and_then(|result| match result {
+        Ok(assessment) => assessment.terminal_action(program),
+        Err(_) => None,
+    });
     let preview_ref =
         program
             .final_artifact_ref
@@ -3330,13 +2918,17 @@ fn compact_agentic_program_checkpoint(
     // Program task state alone cannot see it, and a checkpoint that claims
     // readiness while the Goal gate still waits sends the model into a
     // request/reject loop.
-    let completion_gap = services.and_then(|services| {
-        crate::agentic::agentic_program_completion_gap(
-            services,
-            &program.session_id,
-            &program.turn_id,
-        )
-    });
+    let closure = match goal_assessment.as_ref() {
+        Some(Ok(assessment)) => assessment.view(program),
+        Some(Err(error)) => crate::execution_core::goal::assessment::unknown_completion_view(
+            program,
+            &error.to_string(),
+        ),
+        None => crate::execution_core::goal::assessment::unknown_completion_view(
+            program,
+            "bound Goal reader is unavailable",
+        ),
+    };
     let teams = program
         .teams
         .values()
@@ -3491,7 +3083,7 @@ fn compact_agentic_program_checkpoint(
         "unresolved_count": program.unresolved.len(),
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
-        "closure": agentic_closure_view(program, completion_gap.as_deref()),
+        "closure": closure,
         "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Completion is rejected while any entry remains in `unclassified_issue_refs`: classify EVERY issue_ref there through one message_publish.issue_dispositions (must_resolve, disclose, or resolved) with durable reasons/evidence (a tool://artifact:// receipt OR the issue's own source_ref, its Runtime-created anchor). Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective. When `closure.exit_ready` is true every Runtime condition already holds: call `objective_complete_request` yourself to close out the Objective - Runtime verifies it and rejects it if any condition regressed, so you never risk a premature or unverifiable exit. Tasks named in `closure.satisfied` are finished; do not re-review, re-submit or re-commit them. Your job at that point is the exit decision, not more work.",
     })
     .to_string()
@@ -3611,7 +3203,7 @@ fn closure_view_blocks_exit_while_the_goal_completion_gap_remains() {
 
 #[test]
 #[cfg(test)]
-fn closure_view_names_the_integration_task_while_a_completion_gap_is_open() {
+fn closure_view_preserves_goal_gap_without_count_derived_synthesis() {
     // The rung used to live only in `root_agentic_terminal_action`, which
     // returns None while the Goal records a completion gap. A run with two
     // accepted deliveries and no integration Artifact was therefore never told
@@ -3690,8 +3282,8 @@ fn closure_view_names_the_integration_task_while_a_completion_gap_is_open() {
         .filter_map(|step| step.get("step").and_then(serde_json::Value::as_str))
         .collect::<Vec<_>>();
     assert!(
-        steps.contains(&"publish_integration_task"),
-        "two accepted deliveries with no integration Artifact must name the synthesis rung: {steps:?}"
+        !steps.contains(&"publish_integration_task"),
+        "accepted delivery counts must not invent a synthesis Task: {steps:?}"
     );
     assert!(
         steps.contains(&"objective_review"),

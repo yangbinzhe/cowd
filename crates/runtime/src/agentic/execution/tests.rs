@@ -23,7 +23,7 @@ fn copy_prepared_conclusion(
         expected_stream_revision: prepared.expected_stream_revision,
         event: prepared.event.clone(),
         gaps: prepared.gaps.clone(),
-        policy_sources: prepared.policy_sources.clone(),
+        source_frame: prepared.source_frame.clone(),
     }
 }
 
@@ -926,7 +926,7 @@ async fn r1_proof_exact_a_identity_survives_later_nonproof_events() {
             prepared.event.event.kind = event_kind.into();
             prepared.event.event.status = Some(status.into());
             prepared.goal.reviews.clear();
-            prepared.policy_sources.clear();
+            prepared.source_frame.clear_sources_for_test();
             prepared.event.event.payload["goal"] = serde_json::to_value(&prepared.goal).unwrap();
             let after = services
                 .agent_action_service()
@@ -4281,8 +4281,8 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
     for source in required_policy_sources {
         assert!(
             prepared
-                .policy_sources
-                .iter()
+                .source_frame
+                .sources()
                 .any(|revision| { revision.stream_id == source && revision.expected_revision > 0 }),
             "completion must fence the original policy source: {source}"
         );

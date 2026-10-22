@@ -1780,7 +1780,7 @@ mod bounded_program_reader_429_tests {
         let roots = BTreeSet::from(["root-429".into()]);
         let through = services.event_store().durable_commit_cursor().unwrap();
         let checkpoint = format!(
-            "runtime:agentic-read-model:v1:{:x}",
+            "runtime:agentic-read-model:v2:{:x}",
             sha2::Sha256::digest(b"owned-429")
         );
         let before = serde_json::to_value(
@@ -1992,7 +1992,7 @@ mod bounded_program_reader_429_tests {
         .unwrap();
         assert_eq!(live[0].revision, original_program.revision + 1);
         let checkpoint = format!(
-            "runtime:agentic-read-model:v1:{:x}",
+            "runtime:agentic-read-model:v2:{:x}",
             sha2::Sha256::digest(b"owned-429")
         );
         let checkpoint_before = serde_json::to_value(
@@ -2101,7 +2101,7 @@ mod bounded_program_reader_429_tests {
         .unwrap();
         assert_eq!(old[0].revision, 2);
         let checkpoint = format!(
-            "runtime:agentic-read-model:v1:{:x}",
+            "runtime:agentic-read-model:v2:{:x}",
             sha2::Sha256::digest(b"owned-429")
         );
         let before = serde_json::to_value(
