@@ -3,6 +3,7 @@ use std::path::{Component, Path};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::digest::canonical_digest_v1;
 use crate::{
@@ -656,6 +657,7 @@ pub struct AppResultContractV1 {
     pub schema_id: String,
     pub schema_version: u16,
     pub schema_digest: Sha256Digest,
+    pub schema: Value,
     pub max_bytes: u64,
 }
 
@@ -686,6 +688,20 @@ impl AppResultContractV1 {
         }
         self.schema_digest
             .validate_value("presentation.result_contracts.schema_digest")?;
+        crate::validate_result_schema(&self.schema).map_err(|reason| {
+            ProtocolValidationError::InvalidField {
+                field: "presentation.result_contracts.schema",
+                reason,
+            }
+        })?;
+        let expected_schema_digest =
+            canonical_digest_v1("cowd.app.result-schema.v1", &self.schema)?;
+        if self.schema_digest != expected_schema_digest {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "presentation.result_contracts.schema_digest",
+                reason: "does not match the canonical embedded result schema".to_owned(),
+            });
+        }
         if self.max_bytes == 0 || self.max_bytes > 64 * 1024 * 1024 {
             return Err(ProtocolValidationError::InvalidField {
                 field: "presentation.result_contracts.max_bytes",

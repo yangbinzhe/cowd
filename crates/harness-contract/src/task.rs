@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::context::ArtifactRef;
 use crate::policy::ExecutionPolicyBinding;
 use crate::reality::EvidenceRef;
 
@@ -466,11 +467,17 @@ pub struct TaskApplicationProvenance {
     pub producer_id: String,
     pub workspace_id: String,
     pub surface: String,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_idempotency_key: Option<String>,
     pub result_contract_id: String,
     pub result_schema_id: String,
     pub result_schema_version: u16,
     pub result_schema_digest: String,
     pub result_max_bytes: u64,
+    pub instruction_ref: ArtifactRef,
+    pub input_ref: ArtifactRef,
+    pub result_schema_ref: ArtifactRef,
     pub request_digest: String,
 }
 
@@ -480,10 +487,20 @@ impl TaskApplicationProvenance {
             ("producer_id", self.producer_id.as_str()),
             ("workspace_id", self.workspace_id.as_str()),
             ("surface", self.surface.as_str()),
+            ("request_id", self.request_id.as_str()),
             ("result_contract_id", self.result_contract_id.as_str()),
             ("result_schema_id", self.result_schema_id.as_str()),
         ] {
             validate_identity(field, value)?;
+        }
+        if self
+            .request_idempotency_key
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 256)
+        {
+            return Err(
+                "request_idempotency_key must contain 1..=256 bytes when present".to_string(),
+            );
         }
         if self.result_schema_version == 0 || self.result_max_bytes == 0 {
             return Err(
@@ -497,6 +514,43 @@ impl TaskApplicationProvenance {
             if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(format!("{field} must be a 64-character hexadecimal digest"));
             }
+        }
+        for (field, reference, maximum_bytes) in [
+            ("instruction_ref", &self.instruction_ref, 12 * 1024),
+            ("input_ref", &self.input_ref, 96 * 1024),
+            ("result_schema_ref", &self.result_schema_ref, 64 * 1024),
+        ] {
+            let digest = reference
+                .sha256
+                .strip_prefix("sha256:")
+                .unwrap_or(&reference.sha256);
+            if !reference.is_durable()
+                || reference.selector.trim().is_empty()
+                || reference.media_type.trim().is_empty()
+                || reference.visibility_scope.trim().is_empty()
+                || reference.bytes == 0
+                || reference.bytes > maximum_bytes
+                || digest.len() != 64
+                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "{field} must identify one bounded durable authorized artifact"
+                ));
+            }
+        }
+        if !self.instruction_ref.media_type.starts_with("text/plain")
+            || self.input_ref.media_type != "application/json"
+            || self.result_schema_ref.media_type != "application/schema+json"
+            || self.instruction_ref.visibility_scope != self.input_ref.visibility_scope
+            || self.instruction_ref.visibility_scope != self.result_schema_ref.visibility_scope
+            || self.instruction_ref.selector == self.input_ref.selector
+            || self.instruction_ref.selector == self.result_schema_ref.selector
+            || self.input_ref.selector == self.result_schema_ref.selector
+        {
+            return Err(
+                "structured Task artifact media types, scope or selectors are inconsistent"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -708,7 +762,9 @@ impl std::ops::Deref for TaskCommandOutcome {
 
 #[cfg(test)]
 mod execution_policy_tests {
-    use super::{TaskContinuationPolicy, TaskExecutionPolicy};
+    use super::{
+        ArtifactRef, TaskApplicationProvenance, TaskContinuationPolicy, TaskExecutionPolicy,
+    };
 
     #[test]
     fn legacy_yolo_is_migrated_at_deserialization_and_never_serialized_again() {
@@ -726,5 +782,54 @@ mod execution_policy_tests {
         let serialized = serde_json::to_value(policy).expect("serialize canonical Task policy");
         assert!(serialized.get("yolo_mode").is_none());
         assert_eq!(serialized["continuation"], "continue_until_blocked");
+    }
+
+    #[test]
+    fn structured_provenance_requires_bounded_durable_input_and_frozen_schema_refs() {
+        let artifact_digest = format!("sha256:{}", "a".repeat(64));
+        let schema_contract_digest = "b".repeat(64);
+        let artifact = |name: &str, bytes: u64, digest: &str, media_type: &str| {
+            ArtifactRef::durable(
+                format!("artifact://{name}"),
+                digest,
+                bytes,
+                media_type,
+                "session:structured",
+            )
+        };
+        let mut provenance = TaskApplicationProvenance {
+            producer_id: "app:fixture".into(),
+            workspace_id: "workspace-fixture".into(),
+            surface: "app".into(),
+            request_id: "request-fixture".into(),
+            request_idempotency_key: Some("idempotency-fixture".into()),
+            result_contract_id: "fixture.result".into(),
+            result_schema_id: "fixture.result.schema".into(),
+            result_schema_version: 1,
+            result_schema_digest: schema_contract_digest.clone(),
+            result_max_bytes: 4096,
+            instruction_ref: artifact(
+                "instruction",
+                16,
+                &artifact_digest,
+                "text/plain; charset=utf-8",
+            ),
+            input_ref: artifact("input", 32, &artifact_digest, "application/json"),
+            result_schema_ref: artifact("schema", 64, &artifact_digest, "application/schema+json"),
+            request_digest: "c".repeat(64),
+        };
+        provenance
+            .validate()
+            .expect("contract and content identities are independently validated");
+
+        provenance.result_schema_digest = "not-a-digest".into();
+        assert!(provenance.validate().is_err());
+
+        provenance.result_schema_ref.bytes = 64 * 1024 + 1;
+        assert!(provenance.validate().is_err());
+
+        provenance.result_schema_ref.bytes = 64;
+        provenance.input_ref.durability = crate::context::EvidenceDurability::Pending;
+        assert!(provenance.validate().is_err());
     }
 }

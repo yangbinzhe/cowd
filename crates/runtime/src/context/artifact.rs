@@ -793,6 +793,23 @@ impl ArtifactStore {
         &self,
         descriptor: ArtifactWriteDescriptor,
     ) -> Result<Box<dyn ArtifactWriteSink>, ArtifactError> {
+        self.begin_with_identity(descriptor, None).await
+    }
+
+    async fn begin_with_identity(
+        &self,
+        descriptor: ArtifactWriteDescriptor,
+        artifact_id: Option<String>,
+    ) -> Result<Box<dyn ArtifactWriteSink>, ArtifactError> {
+        if artifact_id.as_deref().is_some_and(|artifact_id| {
+            artifact_id.is_empty()
+                || artifact_id.len() > 128
+                || !artifact_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }) {
+            return Err(ArtifactError::InvalidSelector);
+        }
         if descriptor
             .expected_bytes
             .is_some_and(|bytes| bytes > self.inner.config.max_object_bytes)
@@ -818,6 +835,7 @@ impl ArtifactStore {
             file: Some(file),
             hasher: Sha256::new(),
             bytes: 0,
+            artifact_id,
             closed: false,
         }))
     }
@@ -828,6 +846,19 @@ impl ArtifactStore {
         payload: &[u8],
     ) -> Result<ArtifactRef, ArtifactError> {
         let mut writer = self.begin(descriptor).await?;
+        writer.write_chunk(payload).await?;
+        writer.finish().await
+    }
+
+    pub async fn write_bytes_with_identity(
+        &self,
+        descriptor: ArtifactWriteDescriptor,
+        payload: &[u8],
+        artifact_id: impl Into<String>,
+    ) -> Result<ArtifactRef, ArtifactError> {
+        let mut writer = self
+            .begin_with_identity(descriptor, Some(artifact_id.into()))
+            .await?;
         writer.write_chunk(payload).await?;
         writer.finish().await
     }
@@ -1811,6 +1842,7 @@ struct LocalArtifactWriter {
     file: Option<tokio::fs::File>,
     hasher: Sha256,
     bytes: u64,
+    artifact_id: Option<String>,
     closed: bool,
 }
 
@@ -1877,8 +1909,18 @@ impl ArtifactWriteSink for LocalArtifactWriter {
         let bytes = self.bytes;
         let sha256 = format!("sha256:{:x}", self.hasher.clone().finalize());
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            store.publish_staged(descriptor, staging, bytes, sha256)
+        let artifact_id = self.artifact_id.take();
+        tokio::task::spawn_blocking(move || match artifact_id {
+            Some(artifact_id) => store.publish_staged_with_identity(
+                descriptor,
+                staging,
+                bytes,
+                sha256,
+                artifact_id,
+                None,
+                None,
+            ),
+            None => store.publish_staged(descriptor, staging, bytes, sha256),
         })
         .await
         .map_err(|error| ArtifactError::Blocking(error.to_string()))?
@@ -3106,6 +3148,7 @@ mod tests {
                 file: Some(file),
                 hasher: Sha256::new(),
                 bytes: 0,
+                artifact_id: None,
                 closed: false,
             };
             let error = match stage {
@@ -4475,6 +4518,37 @@ mod process_closure_storage_428_tests {
         }
         assert!(store
             .read_process_closure_blocking(&reference, &record.visibility_scope, origin)
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod structured_artifact_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn same_structured_artifact_identity_is_idempotent_and_conflicts_on_changed_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::for_test_default(root.path());
+        let descriptor = ArtifactWriteDescriptor {
+            media_type: "application/json".into(),
+            visibility_scope: "session:structured-identity".into(),
+            expected_bytes: Some(2),
+            original_name: Some("input.json".into()),
+        };
+        let first = store
+            .write_bytes_with_identity(descriptor.clone(), br#"{}"#, "task_identity_input")
+            .await
+            .unwrap();
+        let replay = store
+            .write_bytes_with_identity(descriptor.clone(), br#"{}"#, "task_identity_input")
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+
+        assert!(store
+            .write_bytes_with_identity(descriptor, br#"[]"#, "task_identity_input")
+            .await
             .is_err());
     }
 }

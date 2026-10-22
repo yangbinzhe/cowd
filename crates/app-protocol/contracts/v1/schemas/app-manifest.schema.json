@@ -140,6 +140,7 @@
           "format": "uint64",
           "minimum": 0
         },
+        "schema": true,
         "schema_digest": {
           "type": "string"
         },
@@ -159,6 +160,7 @@
         "schema_id",
         "schema_version",
         "schema_digest",
+        "schema",
         "max_bytes"
       ]
     },

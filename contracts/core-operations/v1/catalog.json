@@ -1,6 +1,6 @@
 {
   "authority": "cowd-core",
-  "catalog_digest": "sha256:906199833265faeec201464108ade872f6064abcbc8e1f976813965f66be4adc",
+  "catalog_digest": "sha256:ba6290d9a073fc3d8dc7d33ed17da1f053c4fff030dc9475e00699441b153fa2",
   "operations": [
     {
       "audit_classification": "approval.decide",
@@ -153,7 +153,7 @@
       "maximum_response_bytes": 4194304,
       "operation_id": "core.runtime.goal.start",
       "output_schema": {
-        "digest": "sha256:5814fc6350b6a9e82bf081fbfbc9b03fc354b4aa6b89757ab5d942f2222229da",
+        "digest": "sha256:202bfc0c0b062b9663a788a3b0f0d7f2cc77dec7151f03c161580b594378202c",
         "path": "schemas/core.runtime.goal.start.output.schema.json"
       },
       "read_only": false,
@@ -180,7 +180,7 @@
       "maximum_response_bytes": 4194304,
       "operation_id": "core.runtime.structured_task.cancel",
       "output_schema": {
-        "digest": "sha256:595cdc98da290fad8a5629a9cddf7ae5c0bdcfaf592f369a2be67cda541c2657",
+        "digest": "sha256:ce687dadae93c71444ea72a362d55ab148355a9dc0d58e0ff0f9b492a680824a",
         "path": "schemas/core.runtime.structured_task.cancel.output.schema.json"
       },
       "read_only": false,
@@ -207,7 +207,7 @@
       "maximum_response_bytes": 4194304,
       "operation_id": "core.runtime.structured_task.start",
       "output_schema": {
-        "digest": "sha256:18353b9519ea7e394eb367814dbe7169d872cf1f280c1049d75c0474acf29b0f",
+        "digest": "sha256:537bdb5ad775c4c68fc63a9711813643e2ff402164f4dee8931dd294d58082cd",
         "path": "schemas/core.runtime.structured_task.start.output.schema.json"
       },
       "read_only": false,

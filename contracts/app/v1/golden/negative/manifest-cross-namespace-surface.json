@@ -41,7 +41,7 @@
     "files": {
       "bin/reference-worker": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "manifest_digest": "sha256:087b2ac54a6f68d07b0b49a9e3b8338aa10f1a2c202611a614c66bc0c9031a94"
+    "manifest_digest": "sha256:7ff2010047addaefb5acfdf2da24d30ce9b7e1e407ae290a7a452e9303e5d74e"
   },
   "operation_catalog_digest": "sha256:30b980c401f6c1de232ff9e977febc0b72941ee1baf52d8fb9c2c4213e732c5c",
   "presentation": {
@@ -52,7 +52,19 @@
       {
         "contract_id": "reference-app.result.v1",
         "max_bytes": 262144,
-        "schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "type": "object"
+        },
+        "schema_digest": "sha256:3c27bd5e2370b74a9ce8e3061d258ca31b62d60c702686b085c8488fc9a5d954",
         "schema_id": "cowd.reference.result.v1",
         "schema_version": 1
       }
@@ -87,7 +99,7 @@
     "key_id": "release-key-1",
     "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "signature": "base64url-signature",
-    "signed_digest": "sha256:087b2ac54a6f68d07b0b49a9e3b8338aa10f1a2c202611a614c66bc0c9031a94"
+    "signed_digest": "sha256:7ff2010047addaefb5acfdf2da24d30ce9b7e1e407ae290a7a452e9303e5d74e"
   },
   "surfaces": {
     "tui_view": true,

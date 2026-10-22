@@ -701,6 +701,12 @@ fn reference_manifest() -> AppManifestV1 {
     let digest = Sha256Digest(
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
     );
+    let result_schema = json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false,
+    });
     let app_id = AppId("reference-app".to_owned());
     let operation_catalog_digest =
         app_operation_catalog_digest_v1(&app_id, &reference_app_operations())
@@ -768,7 +774,9 @@ fn reference_manifest() -> AppManifestV1 {
                 contract_id: "reference-app.result.v1".to_owned(),
                 schema_id: "cowd.reference.result.v1".to_owned(),
                 schema_version: 1,
-                schema_digest: digest.clone(),
+                schema_digest: canonical_result_schema_digest(&result_schema)
+                    .expect("result schema digest"),
+                schema: result_schema,
                 max_bytes: 256 * 1024,
             }],
             tui_views: vec![AppTuiViewDescriptorV1 {

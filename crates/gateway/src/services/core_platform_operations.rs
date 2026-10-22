@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use harness_contract::context::ArtifactWriteDescriptor;
 use harness_contract::reality::EvidenceRef;
 use matrix_core::MatrixEvidencePacket;
 use runtime::{
@@ -1191,13 +1192,14 @@ async fn dispatch_bound_host_operation(
             state,
             serde_json::from_value(payload).map_err(json_error)?,
         )?),
-        WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID => {
-            encode(inspect_structured_task_result(
+        WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID => encode(
+            inspect_structured_task_result(
                 state,
                 &binding,
                 serde_json::from_value(payload).map_err(json_error)?,
-            )?)
-        }
+            )
+            .await?,
+        ),
         WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID => encode(
             append_application_execution_summary(
                 state,
@@ -2453,6 +2455,34 @@ fn protocol_digest_hex(digest: &cowd_app_protocol::Sha256Digest) -> &str {
     digest.0.strip_prefix("sha256:").unwrap_or(&digest.0)
 }
 
+fn validate_frozen_result_schema(
+    schema_bytes: &[u8],
+    schema_ref: &harness_contract::context::ArtifactRef,
+    schema_contract_digest: &str,
+    result: &Value,
+) -> Result<Value, String> {
+    let content_digest = format!("{:x}", Sha256::digest(schema_bytes));
+    let expected_content_digest = schema_ref
+        .sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(&schema_ref.sha256);
+    if schema_bytes.len() as u64 != schema_ref.bytes || content_digest != expected_content_digest {
+        return Err("frozen structured result schema bytes changed".to_owned());
+    }
+    let schema: Value = serde_json::from_slice(schema_bytes)
+        .map_err(|error| format!("frozen structured result schema is invalid: {error}"))?;
+    cowd_app_protocol::validate_result_schema(&schema)
+        .map_err(|error| format!("frozen structured result schema is invalid: {error}"))?;
+    let canonical_schema_digest = cowd_app_protocol::canonical_result_schema_digest(&schema)
+        .map_err(|error| format!("frozen structured result schema digest is invalid: {error}"))?;
+    if protocol_digest_hex(&canonical_schema_digest) != schema_contract_digest {
+        return Err("frozen structured result schema contract digest changed".to_owned());
+    }
+    cowd_app_protocol::validate_result_value(&schema, result)
+        .map_err(|error| format!("structured result schema validation failed: {error}"))?;
+    Ok(schema)
+}
+
 fn structured_task_provenance(
     task: &runtime::TaskAggregate,
     binding: &CoreBoundPrincipal,
@@ -2545,7 +2575,7 @@ struct StoredStructuredTaskResult {
     usage: StructuredTaskUsageProjection,
 }
 
-fn inspect_structured_task_result(
+async fn inspect_structured_task_result(
     state: &AppState,
     binding: &CoreBoundPrincipal,
     request: WorkContextInspectStructuredTaskResultInput,
@@ -2559,18 +2589,6 @@ fn inspect_structured_task_result(
         .get(&request.task_id)?
         .ok_or_else(|| "structured task was not found".to_owned())?;
     let provenance = structured_task_provenance(&task, binding)?;
-    let contract =
-        registered_result_contract(state, &binding.producer_id, &provenance.result_contract_id)?;
-    if contract.schema_id != provenance.result_schema_id
-        || contract.schema_version != provenance.result_schema_version
-        || protocol_digest_hex(&contract.schema_digest) != provenance.result_schema_digest
-        || contract.max_bytes != provenance.result_max_bytes
-    {
-        return Err(
-            "structured task result contract no longer matches the registered application contract"
-                .to_owned(),
-        );
-    }
     let Some((phase_id, artifact)) = task.phases.iter().rev().find_map(|phase| {
         phase
             .artifacts
@@ -2595,17 +2613,35 @@ fn inspect_structured_task_result(
         || stored.producer_id != provenance.producer_id
         || stored.workspace_id != provenance.workspace_id
         || stored.surface != provenance.surface
-        || stored.result_contract.contract_id != contract.contract_id
-        || stored.result_contract.schema_id != contract.schema_id
-        || stored.result_contract.schema_version != contract.schema_version
-        || stored.result_contract.schema_digest != protocol_digest_hex(&contract.schema_digest)
+        || stored.result_contract.contract_id != provenance.result_contract_id
+        || stored.result_contract.schema_id != provenance.result_schema_id
+        || stored.result_contract.schema_version != provenance.result_schema_version
+        || stored.result_contract.schema_digest != provenance.result_schema_digest
     {
         return Err(
             "structured result provenance or registered contract binding is invalid".to_owned(),
         );
     }
+    let artifacts = state
+        .services
+        .artifact_store()
+        .ok_or_else(|| "Runtime artifact store is not configured".to_owned())?;
+    let schema_bytes = artifacts
+        .read(
+            &provenance.result_schema_ref,
+            &provenance.result_schema_ref.visibility_scope,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    validate_frozen_result_schema(
+        &schema_bytes,
+        &provenance.result_schema_ref,
+        &provenance.result_schema_digest,
+        &stored.result,
+    )?;
     let bytes = serde_json::to_vec(&stored.result).map_err(|error| error.to_string())?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > contract.max_bytes
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > provenance.result_max_bytes
         || format!("{:x}", Sha256::digest(bytes)) != stored.result_digest
     {
         return Err("structured result size or digest validation failed".to_owned());
@@ -2684,29 +2720,109 @@ async fn start_structured_task(
     }
     let contract =
         registered_result_contract(state, &binding.producer_id, &request.result_contract_id)?;
-    let request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "request_id": envelope.request_id,
+        "idempotency_key": envelope.idempotency_key,
+        "request": request,
+    }))
+    .map_err(|error| error.to_string())?;
     if request_bytes.len() > 96 * 1024 {
         return Err("structured task request exceeds the 96 KiB Core limit".to_owned());
     }
     let mission_id = resolve_mission(state, request.mission.clone())?;
+    let artifacts = state
+        .services
+        .artifact_store()
+        .ok_or_else(|| "Runtime artifact store is not configured".to_owned())?;
+    let artifact_scope = format!("session:{}", request.source_session_id);
+    let instruction_bytes = request.instruction.as_bytes();
+    let input_bytes = serde_json::to_vec(&request.input).map_err(|error| error.to_string())?;
+    let result_schema_bytes = cowd_app_protocol::canonical_result_schema_bytes(&contract.schema)
+        .map_err(|error| format!("invalid result schema: {error}"))?;
+    let artifact_id = |kind: &str| {
+        let task_digest = format!("{:x}", Sha256::digest(request.task_id.as_bytes()));
+        format!("task_{task_digest}_{kind}")
+    };
+    let instruction_ref = artifacts
+        .write_bytes_with_identity(
+            ArtifactWriteDescriptor {
+                media_type: "text/plain; charset=utf-8".into(),
+                visibility_scope: artifact_scope.clone(),
+                expected_bytes: Some(instruction_bytes.len() as u64),
+                original_name: Some("structured-task-instruction.txt".into()),
+            },
+            instruction_bytes,
+            artifact_id("instruction"),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let input_ref = artifacts
+        .write_bytes_with_identity(
+            ArtifactWriteDescriptor {
+                media_type: "application/json".into(),
+                visibility_scope: artifact_scope.clone(),
+                expected_bytes: Some(input_bytes.len() as u64),
+                original_name: Some("structured-task-input.json".into()),
+            },
+            &input_bytes,
+            artifact_id("input"),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let result_schema_ref = artifacts
+        .write_bytes_with_identity(
+            ArtifactWriteDescriptor {
+                media_type: "application/schema+json".into(),
+                visibility_scope: artifact_scope,
+                expected_bytes: Some(result_schema_bytes.len() as u64),
+                original_name: Some("result-schema.json".into()),
+            },
+            &result_schema_bytes,
+            artifact_id("schema"),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     let provenance = harness_contract::task::TaskApplicationProvenance {
         producer_id: binding.producer_id.clone(),
         workspace_id: binding.workspace_id.clone(),
         surface: binding.surface.clone(),
+        request_id: envelope.request_id.clone(),
+        request_idempotency_key: envelope.idempotency_key.clone(),
         result_contract_id: contract.contract_id.clone(),
         result_schema_id: contract.schema_id.clone(),
         result_schema_version: contract.schema_version,
         result_schema_digest: protocol_digest_hex(&contract.schema_digest).to_owned(),
         result_max_bytes: contract.max_bytes,
+        instruction_ref,
+        input_ref,
+        result_schema_ref,
         request_digest: format!("{:x}", Sha256::digest(&request_bytes)),
     };
-    let task = state.services.task.create_application_structured(
+    let artifact_refs = [
+        &provenance.instruction_ref,
+        &provenance.input_ref,
+        &provenance.result_schema_ref,
+    ];
+    let pin_owner = format!("runtime.structured-task:{}", request.task_id);
+    for reference in artifact_refs {
+        if let Err(error) = artifacts.pin(
+            reference,
+            &pin_owner,
+            runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+        ) {
+            for pinned in artifact_refs {
+                let _ = artifacts.unpin(pinned, &pin_owner);
+            }
+            return Err(format!("structured task artifact pin failed: {error}"));
+        }
+    }
+    let task = match state.services.task.create_application_structured(
         request.task_id.clone(),
         mission_id,
         request.source_session_id.clone(),
         request.source_turn_id.clone(),
         request.objective.clone(),
-        provenance,
+        provenance.clone(),
         vec![EvidenceRef::observed(
             "application_structured_intent",
             format!(
@@ -2714,7 +2830,15 @@ async fn start_structured_task(
                 binding.producer_id, envelope.request_id, contract.contract_id
             ),
         )],
-    )?;
+    ) {
+        Ok(task) => task,
+        Err(error) => {
+            for reference in artifact_refs {
+                let _ = artifacts.unpin(reference, &pin_owner);
+            }
+            return Err(error);
+        }
+    };
     let terminal = task.status.is_terminal()
         || task
             .phases
@@ -2752,6 +2876,7 @@ async fn start_structured_task(
                 runtime,
                 model,
                 request,
+                result_schema: contract.schema,
                 inflight: Arc::clone(
                     &state
                         .services
@@ -2780,6 +2905,7 @@ struct CoreStructuredTaskWorker {
     runtime: Arc<runtime::RuntimeServices>,
     model: String,
     request: RuntimeStartStructuredTaskInput,
+    result_schema: Value,
     inflight: Arc<Mutex<BTreeSet<String>>>,
     cancellations: Arc<Mutex<BTreeSet<String>>>,
 }
@@ -2915,6 +3041,8 @@ impl CoreStructuredTaskWorker {
             prompt, max_tokens)).await.map_err(|_| "structured_task_provider_timeout".to_owned())??;
         self.ensure_not_cancelled()?;
         let result = parse_structured_json(&completion.text)?;
+        cowd_app_protocol::validate_result_value(&self.result_schema, &result)
+            .map_err(|error| format!("structured_task_result_schema_violation:{error}"))?;
         let result_bytes = serde_json::to_vec(&result).map_err(|error| error.to_string())?;
         if u64::try_from(result_bytes.len()).unwrap_or(u64::MAX) > provenance.result_max_bytes {
             return Err("structured_task_result_exceeds_registered_limit".to_owned());
@@ -3711,6 +3839,67 @@ mod tests {
         .expect("typed outbox input");
         assert_eq!(input.offset, 0);
         assert_eq!(input.limit, 50);
+    }
+
+    #[test]
+    fn frozen_result_schema_validates_content_and_contract_identity_independently() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false,
+        });
+        let schema_bytes =
+            cowd_app_protocol::canonical_result_schema_bytes(&schema).expect("schema bytes");
+        let content_digest = format!("sha256:{:x}", Sha256::digest(&schema_bytes));
+        let contract_digest =
+            cowd_app_protocol::canonical_result_schema_digest(&schema).expect("contract digest");
+        let schema_ref = harness_contract::context::ArtifactRef::durable(
+            "artifact://structured-result-schema",
+            content_digest.clone(),
+            schema_bytes.len() as u64,
+            "application/schema+json",
+            "session:structured",
+        );
+        let result = serde_json::json!({"answer": "ready"});
+        validate_frozen_result_schema(
+            &schema_bytes,
+            &schema_ref,
+            protocol_digest_hex(&contract_digest),
+            &result,
+        )
+        .expect("independent content and contract digests");
+
+        assert!(validate_frozen_result_schema(
+            &schema_bytes,
+            &schema_ref,
+            protocol_digest_hex(&contract_digest),
+            &serde_json::json!({"answer": 1}),
+        )
+        .is_err());
+
+        let changed_schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "integer"}},
+            "required": ["answer"],
+            "additionalProperties": false,
+        });
+        let changed_bytes = cowd_app_protocol::canonical_result_schema_bytes(&changed_schema)
+            .expect("changed schema bytes");
+        let changed_ref = harness_contract::context::ArtifactRef::durable(
+            "artifact://structured-result-schema",
+            format!("sha256:{:x}", Sha256::digest(&changed_bytes)),
+            changed_bytes.len() as u64,
+            "application/schema+json",
+            "session:structured",
+        );
+        assert!(validate_frozen_result_schema(
+            &changed_bytes,
+            &changed_ref,
+            protocol_digest_hex(&contract_digest),
+            &serde_json::json!({"answer": 1}),
+        )
+        .is_err());
     }
 
     #[test]

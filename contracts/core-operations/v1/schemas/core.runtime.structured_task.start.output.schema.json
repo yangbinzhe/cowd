@@ -9,6 +9,40 @@
       ],
       "type": "string"
     },
+    "ArtifactRef": {
+      "description": "Backend-neutral reference to bytes managed by the Runtime artifact plane.\n\nThe selector is the only public locator. Physical paths, database keys, and\ncompact/blob tier choices are adapter-private and must never cross a\nRuntime or Gateway contract.",
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "durability": {
+          "$ref": "#/$defs/EvidenceDurability"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "selector": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "visibility_scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "selector",
+        "sha256",
+        "bytes",
+        "media_type",
+        "durability",
+        "visibility_scope"
+      ],
+      "type": "object"
+    },
     "AutonomyProfileId": {
       "enum": [
         "cautious",
@@ -16,6 +50,14 @@
         "stewarded",
         "autonomous",
         "yolo"
+      ],
+      "type": "string"
+    },
+    "EvidenceDurability": {
+      "enum": [
+        "pending",
+        "durable",
+        "unavailable"
       ],
       "type": "string"
     },
@@ -291,11 +333,26 @@
     "TaskApplicationProvenance": {
       "description": "Immutable Gateway-authored provenance for an application-owned structured\ntask.  The application can request a registered result contract, but it\ncannot author or replace any field in this binding.",
       "properties": {
+        "input_ref": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "instruction_ref": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
         "producer_id": {
           "type": "string"
         },
         "request_digest": {
           "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "request_idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "result_contract_id": {
           "type": "string"
@@ -310,6 +367,9 @@
         },
         "result_schema_id": {
           "type": "string"
+        },
+        "result_schema_ref": {
+          "$ref": "#/$defs/ArtifactRef"
         },
         "result_schema_version": {
           "format": "uint16",
@@ -328,11 +388,15 @@
         "producer_id",
         "workspace_id",
         "surface",
+        "request_id",
         "result_contract_id",
         "result_schema_id",
         "result_schema_version",
         "result_schema_digest",
         "result_max_bytes",
+        "instruction_ref",
+        "input_ref",
+        "result_schema_ref",
         "request_digest"
       ],
       "type": "object"

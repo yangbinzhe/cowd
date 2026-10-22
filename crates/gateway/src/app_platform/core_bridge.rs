@@ -1405,6 +1405,10 @@ mod tests {
     fn fixture_business_manifest(
         definitions: &[&core_matrix_catalog::CoreMatrixOperationDefinition],
     ) -> AppManifestV1 {
+        let result_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": true,
+        });
         let mut manifest = fixture_manifest(definitions[0]);
         manifest.capabilities = vec!["fixture.invoke".to_owned(), "fixture.review".to_owned()];
         manifest.authorization_profiles[0].capabilities = manifest.capabilities.clone();
@@ -1431,10 +1435,9 @@ mod tests {
                 contract_id: "fixture.result".to_owned(),
                 schema_id: "fixture.result.schema".to_owned(),
                 schema_version: 1,
-                schema_digest: Sha256Digest(
-                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_owned(),
-                ),
+                schema_digest: cowd_app_protocol::canonical_result_schema_digest(&result_schema)
+                    .expect("fixture result schema digest"),
+                schema: result_schema,
                 max_bytes: 64 * 1024,
             }],
             tui_views: Vec::new(),

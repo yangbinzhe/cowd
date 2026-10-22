@@ -1061,6 +1061,57 @@ fn result_contracts_are_signed_namespaced_bounded_and_canonical() {
         .bind_canonical_signed_digest()
         .expect("bind unbounded contract");
     assert!(unbounded.validate().is_err());
+
+    let mut schema_tamper = valid_manifest();
+    schema_tamper
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .result_contracts[0]
+        .schema["properties"]["answer"]["type"] = json!("integer");
+    schema_tamper
+        .bind_canonical_signed_digest()
+        .expect("bind schema tamper");
+    assert!(schema_tamper.validate().is_err());
+
+    let mut unsupported_keyword = valid_manifest();
+    let contract = &mut unsupported_keyword
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .result_contracts[0];
+    contract.schema["pattern"] = json!("^[a-z]+$");
+    contract.schema_digest = canonical_result_schema_digest(&contract.schema)
+        .expect("canonical unsupported schema digest");
+    unsupported_keyword
+        .bind_canonical_signed_digest()
+        .expect("bind unsupported schema");
+    assert!(unsupported_keyword.validate().is_err());
+
+    let mut unsupported_dialect = valid_manifest();
+    let contract = &mut unsupported_dialect
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .result_contracts[0];
+    contract.schema["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+    contract.schema_digest = canonical_result_schema_digest(&contract.schema)
+        .expect("canonical unsupported dialect digest");
+    unsupported_dialect
+        .bind_canonical_signed_digest()
+        .expect("bind unsupported dialect");
+    assert!(unsupported_dialect.validate().is_err());
+
+    let result_manifest = valid_manifest();
+    let schema = &result_manifest
+        .presentation
+        .as_ref()
+        .expect("presentation")
+        .result_contracts[0]
+        .schema;
+    validate_result_value(schema, &json!({"answer": "ready"})).expect("valid result");
+    assert!(validate_result_value(schema, &json!({"answer": 1})).is_err());
+    assert!(validate_result_value(schema, &json!({"answer": "ready", "extra": true})).is_err());
 }
 
 #[test]
@@ -1217,6 +1268,12 @@ fn signed_tui_descriptor_is_the_only_transport_authority() {
 fn valid_manifest() -> AppManifestV1 {
     let app_id = AppId("reference-app".to_owned());
     let operations = valid_app_operations();
+    let result_schema = json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false,
+    });
     let mut manifest = AppManifestV1 {
         schema_version: 1,
         app_id: app_id.clone(),
@@ -1281,7 +1338,9 @@ fn valid_manifest() -> AppManifestV1 {
                 contract_id: "reference-app.result.v1".to_owned(),
                 schema_id: "cowd.reference.result.v1".to_owned(),
                 schema_version: 1,
-                schema_digest: digest(),
+                schema_digest: canonical_result_schema_digest(&result_schema)
+                    .expect("result schema digest"),
+                schema: result_schema,
                 max_bytes: 256 * 1024,
             }],
             tui_views: vec![AppTuiViewDescriptorV1 {
