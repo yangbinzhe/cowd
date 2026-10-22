@@ -16,10 +16,12 @@
 //! re-derives the identity from the action it is actually applying, and an
 //! entry without that context exempts nothing.
 
+use std::collections::BTreeSet;
+
+use harness_contract::agent::AgentTaskPacket;
 use harness_contract::agent_action::{
     AgentAction, AgentActorBinding, OBJECTIVE_REVIEW_TOOL_ID, TASK_REVIEW_TOOL_ID,
 };
-use harness_contract::agent::AgentTaskPacket;
 use serde_json::Value;
 
 /// The review action that is being applied, with the durable invocation id
@@ -104,46 +106,8 @@ pub(crate) fn program_events_after_cut(
     pinned: u64,
     through: u64,
 ) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
-    let count = through
-        .checked_sub(pinned)
-        .ok_or("review Program cut moved backwards")?;
-    if count > 1024 {
-        return Err("review Program tail event budget exhausted; rebuild original proof".into());
-    }
-    let mut events = Vec::new();
-    let mut after = pinned;
-    let mut bytes = 0usize;
-    while after < through {
-        let page = store.list_stream_after(
-            source,
-            after,
-            through,
-            64,
-            (4 * 1024 * 1024usize).saturating_sub(bytes),
-        )?;
-        if page.is_empty() {
-            return Err("review Program tail is incomplete".into());
-        }
-        for event in page {
-            if event.stream_id != source || event.sequence != after + 1 || event.sequence > through
-            {
-                return Err("review Program tail identity or sequence changed".into());
-            }
-            bytes = bytes
-                .checked_add(
-                    serde_json::to_vec(&event)
-                        .map_err(|error| error.to_string())?
-                        .len(),
-                )
-                .ok_or("review Program tail byte budget overflow")?;
-            if bytes > 4 * 1024 * 1024 {
-                return Err("review Program tail byte budget exhausted".into());
-            }
-            after = event.sequence;
-            events.push(event);
-        }
-    }
-    Ok(events)
+    crate::execution_core::goal::assessment::read_bounded_event_tail(store, source, pinned, through)
+        .map_err(|error| error.to_string())
 }
 
 /// One governed tool call of the Session's plans, with the identity the
@@ -186,7 +150,19 @@ pub(crate) fn select_current_review_effect_key(
             Ok(Some(live))
         }
         (Some(ReviewActionIdentity::Live(_)), live, _) => Ok(live),
-        (Some(ReviewActionIdentity::Applied(_)), _, rebound) | (None, _, rebound) => Ok(rebound),
+        (Some(ReviewActionIdentity::Applied(context)), _, rebound) => {
+            if rebound
+                .as_deref()
+                .is_some_and(|rebound| rebound != context.action_id)
+            {
+                return Err(
+                    "proof review call identity differs from the durable applied review action"
+                        .into(),
+                );
+            }
+            Ok(Some(context.action_id.to_owned()))
+        }
+        (None, _, rebound) => Ok(rebound),
     }
 }
 
@@ -241,22 +217,53 @@ pub(crate) fn rebind_current_review_effect_key(
     if original_action_id != Some(carried) {
         return Ok(None);
     }
-    let mut rebound = Vec::new();
-    for candidate in plan_candidates(session_events) {
-        if candidate.effect_key != carried
-            || !matches!(
-                candidate.tool_name.as_str(),
-                TASK_REVIEW_TOOL_ID | OBJECTIVE_REVIEW_TOOL_ID
-            )
-            || !step_belongs_to_packet(&candidate.step, packet)
+    let mut rebound = BTreeSet::new();
+    for event in session_events {
+        if event.kind != "tool.execution_plan.created"
+            || event.actor.as_deref() != Some("conversation_runtime")
+            || event.scope != crate::RuntimeEventScope::Tool
         {
             continue;
         }
-        rebound.push(candidate.effect_key);
+        let Some(tasks) = event.payload["tasks"].as_array() else {
+            continue;
+        };
+        for task in tasks {
+            let Ok(step) = serde_json::from_value::<crate::step_snapshot::StepCallBinding>(
+                task["step_binding"].clone(),
+            ) else {
+                continue;
+            };
+            let effect_key = step.effect_idempotency_key();
+            if task["tool_name"]
+                .as_str()
+                .is_some_and(|tool| matches!(tool, TASK_REVIEW_TOOL_ID | OBJECTIVE_REVIEW_TOOL_ID))
+                && effect_key == carried
+                && step_belongs_to_packet(&step, packet)
+            {
+                rebound.insert(effect_key);
+                continue;
+            }
+            if task["tool_name"].as_str() != Some("agent_action_batch")
+                || !step_belongs_to_packet(&step, packet)
+            {
+                continue;
+            }
+            if let Some(actions) = task["normalized_input"]["actions"].as_array() {
+                for (index, inner) in actions.iter().enumerate() {
+                    if inner["tool"].as_str().is_some_and(|tool| {
+                        matches!(tool, TASK_REVIEW_TOOL_ID | OBJECTIVE_REVIEW_TOOL_ID)
+                    }) && format!("{effect_key}:{index}") == carried
+                    {
+                        rebound.insert(format!("{effect_key}:{index}"));
+                    }
+                }
+            }
+        }
     }
     match rebound.len() {
         0 => Ok(None),
-        1 => Ok(Some(rebound.remove(0))),
+        1 => Ok(rebound.pop_first()),
         _ => Err("current review call is ambiguous".into()),
     }
 }
@@ -312,29 +319,25 @@ pub(crate) fn resolve_current_review_effect_key(
                 continue;
             }
             // A batch child presents the parent's identity plus its own index,
-            // exactly as the producer builds it. The in-flight effect is the
-            // batch call itself, so that is what would be excluded - and only
-            // when the batch carries that one action. A batch with siblings
-            // would exempt their effects too, so it is not exempt at all and
-            // the siblings keep blocking until they really land.
+            // exactly as the producer builds it. Exempt only that child: a
+            // legal multi-action batch keeps every sibling effect blocking.
             if task["tool_name"].as_str() != Some("agent_action_batch") {
                 continue;
             }
             let Some(actions) = task["normalized_input"]["actions"].as_array() else {
                 continue;
             };
-            if actions.len() != 1 {
-                continue;
+            for (index, inner) in actions.iter().enumerate() {
+                let child_effect_key = format!("{effect_key}:{index}");
+                if inner["tool"].as_str() != Some(expected_tool)
+                    || child_effect_key != context.action_id
+                    || !step_belongs_to_reviewer(&step, packet, context.actor)
+                    || !action_matches(&inner["input"], context.action)
+                {
+                    continue;
+                }
+                resolved.push(child_effect_key);
             }
-            let inner = &actions[0];
-            if inner["tool"].as_str() != Some(expected_tool)
-                || format!("{effect_key}:0") != context.action_id
-                || !step_belongs_to_reviewer(&step, packet, context.actor)
-                || !action_matches(&inner["input"], context.action)
-            {
-                continue;
-            }
-            resolved.push(effect_key);
         }
     }
     match resolved.len() {
@@ -373,7 +376,12 @@ fn step_belongs_to_reviewer(
 ) -> bool {
     step_belongs_to_packet(step, packet)
         && actor.session_id == packet.session_id()
-        && actor.turn_id == packet.assignment.execution_identity.turn_id().unwrap_or_default()
+        && actor.turn_id
+            == packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap_or_default()
         && packet
             .agentic_binding
             .as_ref()
@@ -706,7 +714,8 @@ mod tests {
         packet: &AgentTaskPacket,
         context: &CurrentReviewContext<'_>,
     ) -> Option<String> {
-        resolve_current_review_effect_key(events, packet, context).expect("an unambiguous resolution")
+        resolve_current_review_effect_key(events, packet, context)
+            .expect("an unambiguous resolution")
     }
 
     /// A stored candidate is only the review's own call when it is the
@@ -717,7 +726,10 @@ mod tests {
         let packet = packet();
         let applied = review_task("call-a");
         let other = review_task("call-b");
-        let events = [plan_event(serde_json::json!([applied.clone(), other.clone()]))];
+        let events = [plan_event(serde_json::json!([
+            applied.clone(),
+            other.clone()
+        ]))];
         let applied_key = effect_key(&applied);
         let other_key = effect_key(&other);
 
@@ -772,7 +784,10 @@ mod tests {
     fn r1_second_unfinished_review_in_the_same_run_is_not_exempt() {
         let first = review_task("call-a");
         let second = review_task("call-b");
-        let events = [plan_event(serde_json::json!([first.clone(), second.clone()]))];
+        let events = [plan_event(serde_json::json!([
+            first.clone(),
+            second.clone()
+        ]))];
         let packet = packet();
         let action = review_action();
         let context = CurrentReviewContext {
@@ -981,10 +996,9 @@ mod tests {
         );
     }
 
-    /// A batch carries its children under the parent's identity. A batch with
-    /// siblings would exempt their effects too, so it is not exempt at all and
-    /// the siblings keep blocking. A batch with exactly one action is that
-    /// action, and the excluded effect is the batch call itself.
+    /// A batch carries its children under the parent's identity. The review
+    /// child has its own composite effect identity and may be exempt without
+    /// hiding any sibling's ordinary effect.
     #[test]
     fn r1_batch_siblings_are_not_exempt() {
         let packet = packet();
@@ -1019,9 +1033,16 @@ mod tests {
             action: &action,
             actor: &actor(),
         };
-        assert!(
-            resolve(&sibling_events, &packet, &sibling_context).is_none(),
-            "a batch with siblings is not exempt"
+        let review_child_key = format!("{sibling_key}:0");
+        assert_eq!(
+            resolve(&sibling_events, &packet, &sibling_context),
+            Some(review_child_key.clone()),
+            "the review child in a legal multi-action batch is exempt"
+        );
+        assert_ne!(
+            review_child_key,
+            format!("{sibling_key}:1"),
+            "the sibling effect keeps its own identity and remains blocking"
         );
 
         let alone = batch(serde_json::json!([review]));
@@ -1034,8 +1055,8 @@ mod tests {
         };
         assert_eq!(
             resolve(&alone_events, &packet, &alone_context),
-            Some(alone_key.clone()),
-            "a batch that carries exactly one action is that action"
+            Some(format!("{alone_key}:0")),
+            "a one-child batch still exempts only that child"
         );
 
         let missing_child = CurrentReviewContext {
@@ -1046,6 +1067,48 @@ mod tests {
         assert!(
             resolve(&alone_events, &packet, &missing_child).is_none(),
             "a child index that does not exist names no call"
+        );
+    }
+
+    #[test]
+    fn r1_applied_batch_rebinds_only_the_review_child() {
+        let packet = packet();
+        let task = review_task("call-review");
+        let review = serde_json::json!({"tool": "task_review", "input": task["normalized_input"]});
+        let sibling = serde_json::json!({
+            "tool": "task_submit",
+            "input": {"task_ref": "task:two", "artifact_refs": ["artifact://x"]},
+        });
+        let batch = serde_json::json!({
+            "tool_name": "agent_action_batch",
+            "tool_call_id": "call-batch",
+            "normalized_input": {"actions": [review, sibling]},
+            "step_binding": step_binding("call-batch"),
+        });
+        let events = [plan_event(serde_json::json!([batch.clone()]))];
+        let parent = effect_key(&batch);
+        let review_child = format!("{parent}:0");
+        assert_eq!(
+            rebind_current_review_effect_key(
+                &events,
+                &packet,
+                Some(&review_child),
+                Some(&review_child),
+            )
+            .expect("applied batch review rebinds"),
+            Some(review_child.clone())
+        );
+        let sibling_child = format!("{parent}:1");
+        assert_eq!(
+            rebind_current_review_effect_key(
+                &events,
+                &packet,
+                Some(&sibling_child),
+                Some(&sibling_child),
+            )
+            .expect("sibling lookup is unambiguous"),
+            None,
+            "the ordinary sibling keeps blocking"
         );
     }
 

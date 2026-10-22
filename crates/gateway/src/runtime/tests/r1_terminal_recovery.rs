@@ -2510,6 +2510,103 @@ async fn assert_staged_artifact(
 }
 
 #[tokio::test]
+async fn r1_normal_business_chain_reaches_real_session() {
+    // B layer: the ordinary business chain the framework exists to serve.
+    //
+    // The producer writes one real file and submits the real artifact, the
+    // independent reviewer reads both and issues the verdict, the root opens
+    // the criterion team, the reviewer settles the criterion, and the runtime
+    // materializes the result into the ORIGINAL Session. There is no optional
+    // draining write, no service rebuild, no lost ACK and no reordered
+    // stream here: those are the X layer and they have their own cases.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("off,runtime::runtime_event_reactor=warn,runtime::execution_core::services=warn")
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let root = fixture_root();
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let mut producer = LoopbackProvider::start("producer").await;
+    let mut reviewer = LoopbackProvider::start("reviewer").await;
+    let providers = provider_registry(&[&provider, &producer, &reviewer]);
+    let topology = SelectedStorageTopology::compose_for_test(
+        &root.path().join("home"),
+        &root.path().join("workspace"),
+    )
+    .unwrap();
+    let services = RecoveryServices::start(root.path(), topology, providers.clone()).await;
+    let mut turn = ReviewedTurn::produce(
+        &services,
+        &mut provider,
+        &mut producer,
+        &mut reviewer,
+        true,
+        false,
+    )
+    .await;
+    let candidate = turn.candidate.take().unwrap();
+    let (ticket, staged, release) = drive_final_until(&mut provider, candidate).await.unwrap();
+    assert_staged_artifact(&services, &turn, &staged).await;
+    assert_eq!(ticket.executor_kind, "synthesize");
+    // The physical effect happened exactly once, with the real content.
+    let physical = services.physical_calls.lock().unwrap().clone();
+    let writes = physical
+        .iter()
+        .filter(|call| call.tool_use_id == "recovery-write")
+        .collect::<Vec<_>>();
+    assert_eq!(writes.len(), 1, "the real file write must happen exactly once");
+    assert!(writes[0].input.contains("recovery-effect-once"));
+    // The independent reviewer really read the artifact and the physical file.
+    assert!(
+        physical
+            .iter()
+            .any(|call| call.tool_name == "read_file"
+                && call.input.contains("recovery-effect.txt")),
+        "the reviewer must read the physical file, not only the report"
+    );
+    // Deliver into the ORIGINAL Session and prove the A/B results landed.
+    release.send(()).unwrap();
+    let (record, mut barrier) = turn
+        .delivery_barrier(&services, &mut provider, Point::BeforeSessionCommit)
+        .await;
+        // A completion request is applied by the Program owner, and the lane
+        // that releases the Agentic barrier is the only thing that drives the
+        // Goal afterwards. Read the lane the production health port already
+        // exposes, so "the normal chain stopped" cannot silently mean "the
+        // lane is wedged".
+        let lane = services
+            .runtime
+            .runtime_services()
+            .event_reactor_health()
+            .unwrap()
+            .lanes
+            .into_iter()
+            .find(|lane| lane.projection_id == "runtime:agentic-program-wait-resolver:v1")
+            .expect("the Agentic barrier lane must be registered");
+        eprintln!(
+            "recovery188 barrier_lane worker_running={} total_passes={} lag_commits={} consecutive_failures={} last_error={:?}",
+            lane.worker_running, lane.total_passes, lane.lag_commits,
+            lane.consecutive_failures, lane.last_error
+        );
+    barrier.release(Release::Continue).unwrap();
+    turn.assert_materialized(&services, &record).await;
+    assert_eq!(
+        services
+            .runtime
+            .runtime_services()
+            .goal_store()
+            .get(&turn.goal.id)
+            .unwrap()
+            .unwrap()
+            .completion,
+        harness_contract::goal::GoalCompletion::Satisfied
+    );
+    drop(services.stop().await);
+}
+
+
+#[tokio::test]
 async fn n1_b_reviewed_file_reaches_real_session_without_recovery_faults() {
     let root = fixture_root();
     std::fs::create_dir_all(root.path().join("workspace")).unwrap();

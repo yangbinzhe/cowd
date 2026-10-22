@@ -9,6 +9,10 @@ use super::GoalProjection;
 use crate::AgenticCompletionRequestProjection;
 use crate::{AgenticProgramProjection, ExpectedStreamRevision};
 
+const ASSESSMENT_TAIL_MAX_EVENTS: u64 = 1024;
+const ASSESSMENT_TAIL_PAGE_EVENTS: usize = 64;
+const ASSESSMENT_TAIL_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AssessmentReadError {
     Identity(&'static str),
@@ -27,7 +31,11 @@ impl std::fmt::Display for AssessmentReadError {
             Self::Identity(reason) => write!(output, "assessment identity: {reason}"),
             Self::Encoding(reason) => write!(output, "assessment encoding: {reason}"),
             Self::Source(reason) => write!(output, "assessment source unavailable: {reason}"),
-            Self::ConflictingSource { stream_id, expected, observed } => write!(
+            Self::ConflictingSource {
+                stream_id,
+                expected,
+                observed,
+            } => write!(
                 output,
                 "assessment source changed: source={stream_id} expected={expected} actual={observed}"
             ),
@@ -64,6 +72,71 @@ impl AssessmentSourcePins {
     pub(crate) fn into_sources(self) -> Vec<ExpectedStreamRevision> {
         self.0.into_values().collect()
     }
+}
+
+/// Read one operation-local append-only tail under a single event-count and
+/// byte budget. Callers still enforce their own semantic identity over the
+/// returned records; this helper only unifies the resource admission policy.
+pub(crate) fn read_bounded_event_tail(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    pinned: u64,
+    through: u64,
+) -> Result<Vec<crate::DurableRuntimeEvent>, AssessmentReadError> {
+    let count = through
+        .checked_sub(pinned)
+        .ok_or(AssessmentReadError::Source(
+            "assessment source cut moved backwards".into(),
+        ))?;
+    if count > ASSESSMENT_TAIL_MAX_EVENTS {
+        return Err(AssessmentReadError::Source(
+            "assessment tail event budget exhausted; rebuild original source frame".into(),
+        ));
+    }
+    let mut events = Vec::new();
+    let mut after = pinned;
+    let mut bytes = 0usize;
+    while after < through {
+        let page = store
+            .list_stream_after(
+                source,
+                after,
+                through,
+                ASSESSMENT_TAIL_PAGE_EVENTS,
+                ASSESSMENT_TAIL_MAX_BYTES.saturating_sub(bytes),
+            )
+            .map_err(AssessmentReadError::Source)?;
+        if page.is_empty() {
+            return Err(AssessmentReadError::Source(
+                "assessment tail is incomplete".into(),
+            ));
+        }
+        for event in page {
+            if event.stream_id != source || event.sequence != after + 1 || event.sequence > through
+            {
+                return Err(AssessmentReadError::Source(
+                    "assessment tail identity or sequence changed".into(),
+                ));
+            }
+            bytes = bytes
+                .checked_add(
+                    serde_json::to_vec(&event)
+                        .map_err(|error| AssessmentReadError::Encoding(error.to_string()))?
+                        .len(),
+                )
+                .ok_or(AssessmentReadError::Source(
+                    "assessment tail byte budget overflow".into(),
+                ))?;
+            if bytes > ASSESSMENT_TAIL_MAX_BYTES {
+                return Err(AssessmentReadError::Source(
+                    "assessment tail byte budget exhausted".into(),
+                ));
+            }
+            after = event.sequence;
+            events.push(event);
+        }
+    }
+    Ok(events)
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +423,39 @@ mod tests {
             BoundGoalAssessment::NotApplicable
         ));
         assert!(assess_bound_goal_projection(&program, Some(&goal)).is_err());
+    }
+
+    #[test]
+    fn bounded_tail_uses_one_resource_policy_and_fails_closed_above_its_budget() {
+        let store = crate::RuntimeEventStore::for_test();
+        for index in 0..70 {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "assessment:tail".into(),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "assessment.process".into(),
+                    status: None,
+                    actor: Some("assessor".into()),
+                    refs: vec![],
+                    payload: serde_json::json!({"index": index}),
+                })
+                .unwrap();
+        }
+        let head = store.stream_revision("assessment:tail").unwrap();
+        assert_eq!(
+            read_bounded_event_tail(&store, "assessment:tail", 0, head)
+                .unwrap()
+                .len(),
+            70,
+            "the old eight-record liveness barrier no longer truncates a valid tail"
+        );
+        assert!(
+            read_bounded_event_tail(&store, "assessment:tail", 0, 1025)
+                .unwrap_err()
+                .to_string()
+                .contains("event budget exhausted"),
+            "a revision gap beyond the shared event budget fails closed"
+        );
     }
 
     #[test]

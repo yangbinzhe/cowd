@@ -1,5 +1,5 @@
 #[test]
-fn applied_review_uses_authenticated_rebound_without_rescuing_failed_live_identity() {
+fn r1_a_applied_review_recognises_its_own_call() {
     let action = AgentAction::TaskReview(TaskReviewInput {
         task_ref: "task".into(),
         decision: TaskReviewDecision::Accept,
@@ -24,11 +24,29 @@ fn applied_review_uses_authenticated_rebound_without_rescuing_failed_live_identi
         select_current_review_effect_key(
             Some(ReviewActionIdentity::Applied(&applied)),
             None,
-            Some("authenticated".into())
+            Some("original".into())
         )
         .unwrap(),
-        Some("authenticated".into())
+        Some("original".into()),
+        "the durable action that carries the proof is the applied review's own call"
     );
+}
+
+#[test]
+fn r1_a_live_review_that_authenticates_to_nothing_exempts_nothing() {
+    let action = AgentAction::TaskReview(TaskReviewInput {
+        task_ref: "task".into(),
+        decision: TaskReviewDecision::Accept,
+        reason: "actual independent evidence".into(),
+        operator_requirement: None,
+        evidence_refs: vec![],
+    });
+    let actor = actor();
+    let live = CurrentReviewContext {
+        action_id: "original",
+        action: &action,
+        actor: &actor,
+    };
     assert_eq!(
         select_current_review_effect_key(
             Some(ReviewActionIdentity::Live(&live)),
@@ -36,18 +54,59 @@ fn applied_review_uses_authenticated_rebound_without_rescuing_failed_live_identi
             Some("historical".into())
         )
         .unwrap(),
-        None
+        None,
+        "a stored candidate cannot replace a live call that authenticates to nothing"
     );
-    assert!(select_current_review_effect_key(
-        Some(ReviewActionIdentity::Live(&live)),
-        Some("current".into()),
-        Some("different".into())
-    )
-    .is_err());
+}
+
+#[test]
+fn r1_a_live_review_binds_to_the_call_it_performs() {
+    let action = AgentAction::TaskReview(TaskReviewInput {
+        task_ref: "task".into(),
+        decision: TaskReviewDecision::Accept,
+        reason: "actual independent evidence".into(),
+        operator_requirement: None,
+        evidence_refs: vec![],
+    });
+    let actor = actor();
+    let live = CurrentReviewContext {
+        action_id: "original",
+        action: &action,
+        actor: &actor,
+    };
     assert_eq!(
-        select_current_review_effect_key(Some(ReviewActionIdentity::Applied(&applied)), None, None)
+        select_current_review_effect_key(
+            Some(ReviewActionIdentity::Live(&live)),
+            Some("current".into()),
+            None
+        )
+        .unwrap(),
+        Some("current".into())
+    );
+    assert!(
+        select_current_review_effect_key(
+            Some(ReviewActionIdentity::Live(&live)),
+            Some("current".into()),
+            Some("different".into())
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn r1_root_applied_review_uses_the_durable_action_without_a_delivery_packet() {
+    let root = AppliedReviewContext {
+        action_id: "root-review-control",
+        program_source: "agentic-program:program",
+        pinned: 1,
+        through: 2,
+        program_events: &[],
+    };
+    assert_eq!(
+        select_current_review_effect_key(Some(ReviewActionIdentity::Applied(&root)), None, None)
             .unwrap(),
-        None
+        Some("root-review-control".to_owned()),
+        "a root review has no delivery packet, but the durable action still authenticates its own control call"
     );
 }
 
