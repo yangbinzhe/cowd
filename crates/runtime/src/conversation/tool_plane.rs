@@ -769,6 +769,7 @@ where
             None,
         )
         .await
+        .map(|(result, _)| result)
     }
 
     pub(crate) async fn execute_tool_batch_step_with_owner(
@@ -779,7 +780,13 @@ where
         replays: &BTreeMap<String, EarlyToolExecutionReceipt>,
         replay_invocations: &BTreeMap<String, harness_contract::tool::GovernedToolInvocation>,
         owner: Option<&(harness_contract::projection::RuntimeActivityBinding, u32)>,
-    ) -> Result<ToolBatchStepResult, RuntimeError>
+    ) -> Result<
+        (
+            ToolBatchStepResult,
+            Vec<harness_contract::tool::GovernedToolInvocation>,
+        ),
+        RuntimeError,
+    >
     where
         C: Sync,
     {
@@ -853,13 +860,16 @@ where
             // Every call in this batch was refused, so there is nothing to
             // compile. Answer with the refusals rather than an empty plan the
             // model cannot act on.
-            return Ok(ToolBatchStepResult {
-                refused_before_dispatch,
-                failed: refusal_messages.len(),
-                messages: refusal_messages,
-                max_concurrency_observed: 0,
-                parallel_batches: 0,
-            });
+            return Ok((
+                ToolBatchStepResult {
+                    refused_before_dispatch,
+                    failed: refusal_messages.len(),
+                    messages: refusal_messages,
+                    max_concurrency_observed: 0,
+                    parallel_batches: 0,
+                },
+                Vec::new(),
+            ));
         }
         let mut requests = calls
             .iter()
@@ -898,35 +908,11 @@ where
             }
         }
         let workspace_root = self.governed_workspace_root()?;
-        let compilation = GovernedToolCompiler.compile_partial_with_rejections(
+        let compilation = GovernedToolCompiler.compile_prepared_partial(
             &workspace_root,
             &requests,
+            &prepared,
             &admission_rejections,
-            |name, input| {
-                prepared
-                    .iter()
-                    .find(|invocation| {
-                        invocation.intent.tool_name == name
-                            && (invocation.intent.normalized_input == *input
-                                || (replay_invocations.contains_key(&invocation.invocation_id)
-                                    && requests.iter().any(|request| {
-                                        request.tool_use_id == invocation.invocation_id
-                                            && harness_contract::step::parse_strict_json(
-                                                &request.input,
-                                            )
-                                            .ok()
-                                            .as_ref()
-                                                == Some(input)
-                                    })))
-                    })
-                    .map(|invocation| {
-                        (
-                            invocation.effect.clone(),
-                            invocation.catalog_revision,
-                            invocation.descriptor_set_hash.clone(),
-                        )
-                    })
-            },
         );
         let mut compilation = match compilation {
             Ok(compilation) => compilation,
@@ -969,13 +955,16 @@ where
                     self.remember_tool_trace_from_message(&message);
                     messages.push(message);
                 }
-                return Ok(ToolBatchStepResult {
-                    refused_before_dispatch,
-                    failed: messages.len(),
-                    messages,
-                    max_concurrency_observed: 0,
-                    parallel_batches: 0,
-                });
+                return Ok((
+                    ToolBatchStepResult {
+                        refused_before_dispatch,
+                        failed: messages.len(),
+                        messages,
+                        max_concurrency_observed: 0,
+                        parallel_batches: 0,
+                    },
+                    prepared,
+                ));
             }
         };
         if let Some(plan) = compilation.plan.as_mut() {
@@ -1037,13 +1026,16 @@ where
             let mut messages = refusal_messages;
             messages.extend(preflight_messages);
             let failed = count_failed_tool_results(&messages);
-            return Ok(ToolBatchStepResult {
-                refused_before_dispatch,
-                failed,
-                messages,
-                max_concurrency_observed: 0,
-                parallel_batches: 0,
-            });
+            return Ok((
+                ToolBatchStepResult {
+                    refused_before_dispatch,
+                    failed,
+                    messages,
+                    max_concurrency_observed: 0,
+                    parallel_batches: 0,
+                },
+                prepared,
+            ));
         };
         self.record_governed_tool_plan(&plan)?;
         // Accountability: a call the model emitted that is neither scheduled
@@ -1204,13 +1196,16 @@ where
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         let failed = count_failed_tool_results(&messages);
-        Ok(ToolBatchStepResult {
-            refused_before_dispatch,
-            messages,
-            failed,
-            max_concurrency_observed,
-            parallel_batches,
-        })
+        Ok((
+            ToolBatchStepResult {
+                refused_before_dispatch,
+                messages,
+                failed,
+                max_concurrency_observed,
+                parallel_batches,
+            },
+            prepared,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -7,10 +7,11 @@ use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
 #[cfg(test)]
 use harness_contract::policy::PermissionScope;
 use harness_contract::policy::{PermissionOperation, PermissionResource};
+#[cfg(any(test, feature = "test-fixtures"))]
+use harness_contract::tool::ToolIntent;
 use harness_contract::tool::{
     GovernedToolInvocation, GovernedToolPlanProjection, ResourceAccess, ResourceDemand,
     ResourceScopeDemand, ToolDependency, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
-    ToolIntent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -262,19 +263,172 @@ pub struct GovernedToolPolicyValidationReport {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GovernedToolCompiler;
 
+struct PreparedToolNode {
+    invocation: GovernedToolInvocation,
+    resource_scope: ToolResourceScope,
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+fn prepare_fixture_node(
+    workspace_root: &Path,
+    request: &ToolRequest,
+    describe: &impl Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
+) -> Result<PreparedToolNode, GovernedToolCompileError> {
+    let normalized_input = serde_json::from_str::<Value>(&request.input)
+        .map(canonical_json)
+        .map_err(|error| GovernedToolCompileError::InvalidInput {
+            task_id: request.tool_use_id.clone(),
+            reason: error.to_string(),
+        })?;
+    let (effect, catalog_revision, descriptor_set_hash) =
+        describe(&request.tool_name, &normalized_input).ok_or_else(|| {
+            GovernedToolCompileError::MissingDescriptor {
+                task_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+            }
+        })?;
+    let resource_scope =
+        normalized_resource_scope(&effect, workspace_root).map_err(|(scope, reason)| {
+            GovernedToolCompileError::InvalidNormalizedScope {
+                task_id: request.tool_use_id.clone(),
+                scope,
+                reason,
+            }
+        })?;
+    let invocation = GovernedToolInvocation {
+        origin: None,
+        contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
+        invocation_id: request.tool_use_id.clone(),
+        intent: ToolIntent {
+            invocation_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            normalized_input,
+        },
+        resource_demand: resource_demand_from_effect(&effect),
+        effect,
+        explicit_dependencies: request
+            .depends_on
+            .iter()
+            .map(|dependency| ToolDependency {
+                invocation_id: request.tool_use_id.clone(),
+                depends_on: dependency.clone(),
+                reason: "model_explicit_dependency".into(),
+            })
+            .collect(),
+        compiled_dependencies: Vec::new(),
+        catalog_revision,
+        descriptor_set_hash,
+        idempotency_key: tool_plan_idempotency_key(request),
+    };
+    Ok(PreparedToolNode {
+        invocation,
+        resource_scope,
+    })
+}
+
 impl GovernedToolCompiler {
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn compile(
         &self,
         workspace_root: &Path,
         requests: &[ToolRequest],
         describe_registered_tool: impl Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     ) -> Result<ValidatedGovernedToolDag, GovernedToolCompileError> {
-        ValidatedGovernedToolDag::compile(workspace_root, requests, describe_registered_tool)
+        let ids = validate_task_ids(requests)?;
+        validate_dependencies(requests, &ids)?;
+        let attempts = requests
+            .iter()
+            .map(|request| prepare_fixture_node(workspace_root, request, &describe_registered_tool))
+            .collect::<Vec<_>>();
+        for request in requests {
+            for dependency in &request.depends_on {
+                if let Err(error) = &attempts[ids[dependency.as_str()]] {
+                    return Err(GovernedToolCompileError::DependencyReferencesRejectedTask {
+                        task_id: request.tool_use_id.clone(),
+                        dependency_id: dependency.clone(),
+                        rejection_reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        let prepared = attempts.into_iter().collect::<Result<Vec<_>, _>>()?;
+        ValidatedGovernedToolDag::from_prepared(requests, prepared)
+    }
+
+    /// Consume the exact Step/ToolHost preparation. Dispatch retains its live
+    /// authorization, source, path and attempt checks; compilation only adds DAG edges.
+    pub fn compile_prepared_partial(
+        &self,
+        workspace_root: &Path,
+        requests: &[ToolRequest],
+        prepared: &[GovernedToolInvocation],
+        admission_rejections: &BTreeMap<String, String>,
+    ) -> Result<GovernedToolCompilation, GovernedToolCompileError> {
+        let mut by_id = BTreeMap::new();
+        for invocation in prepared {
+            if !requests
+                .iter()
+                .any(|request| request.tool_use_id == invocation.invocation_id)
+                || by_id
+                    .insert(invocation.invocation_id.as_str(), invocation)
+                    .is_some()
+            {
+                return Err(GovernedToolCompileError::CompilationInvariant {
+                    reason: "prepared invocation has duplicate or foreign identity".into(),
+                });
+            }
+        }
+        self.compile_partial_nodes(requests, admission_rejections, |request| {
+            let invocation = *by_id.get(request.tool_use_id.as_str()).ok_or_else(|| {
+                GovernedToolCompileError::MissingDescriptor {
+                    task_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                }
+            })?;
+            if invocation.intent.invocation_id != request.tool_use_id
+                || invocation.intent.tool_name != request.tool_name
+                || invocation.effect.tool_id != invocation.intent.tool_name
+                || invocation
+                    .explicit_dependencies
+                    .iter()
+                    .any(|dependency| dependency.invocation_id != request.tool_use_id)
+                || invocation
+                    .explicit_dependencies
+                    .iter()
+                    .map(|dependency| &dependency.depends_on)
+                    .collect::<BTreeSet<_>>()
+                    != request.depends_on.iter().collect::<BTreeSet<_>>()
+                || invocation
+                    .compiled_dependencies
+                    .iter()
+                    .any(|dependency| dependency.invocation_id != request.tool_use_id)
+            {
+                return Err(GovernedToolCompileError::CompilationInvariant {
+                    reason: format!(
+                        "prepared invocation binding changed for {}",
+                        request.tool_use_id
+                    ),
+                });
+            }
+            let resource_scope = normalized_resource_scope(&invocation.effect, workspace_root)
+                .map_err(
+                    |(scope, reason)| GovernedToolCompileError::InvalidNormalizedScope {
+                        task_id: request.tool_use_id.clone(),
+                        scope,
+                        reason,
+                    },
+                )?;
+            Ok(PreparedToolNode {
+                invocation: (*invocation).clone(),
+                resource_scope,
+            })
+        })
     }
 
     /// Compile every valid node while isolating malformed nodes, their
     /// descendants, and cycle-affected subgraphs. Graph identity errors remain
     /// whole-batch failures because no unambiguous dependency graph exists.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn compile_partial<F>(
         &self,
         workspace_root: &Path,
@@ -292,6 +446,7 @@ impl GovernedToolCompiler {
         )
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn compile_partial_with_rejections<F>(
         &self,
         workspace_root: &Path,
@@ -302,6 +457,17 @@ impl GovernedToolCompiler {
     where
         F: Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     {
+        self.compile_partial_nodes(requests, admission_rejections, |request| {
+            prepare_fixture_node(workspace_root, request, &describe_registered_tool)
+        })
+    }
+
+    fn compile_partial_nodes(
+        &self,
+        requests: &[ToolRequest],
+        admission_rejections: &BTreeMap<String, String>,
+        prepare: impl Fn(&ToolRequest) -> Result<PreparedToolNode, GovernedToolCompileError>,
+    ) -> Result<GovernedToolCompilation, GovernedToolCompileError> {
         let id_to_index = validate_task_ids(requests)?;
         let mut rejected = requests
             .iter()
@@ -313,6 +479,7 @@ impl GovernedToolCompiler {
             })
             .collect::<BTreeMap<_, _>>();
 
+        let mut prepared_nodes = BTreeMap::new();
         for (index, request) in requests.iter().enumerate() {
             for dependency in &request.depends_on {
                 if dependency == &request.tool_use_id {
@@ -333,40 +500,15 @@ impl GovernedToolCompiler {
                 }
             }
 
-            let normalized_input = match serde_json::from_str::<Value>(&request.input) {
-                Ok(input) => canonical_json(input),
-                Err(error) => {
-                    rejected.entry(index).or_insert_with(|| {
-                        GovernedToolCompileError::InvalidInput {
-                            task_id: request.tool_use_id.clone(),
-                            reason: error.to_string(),
-                        }
-                        .to_string()
-                    });
-                    continue;
+            if !rejected.contains_key(&index) {
+                match prepare(request) {
+                    Ok(node) => {
+                        prepared_nodes.insert(index, node);
+                    }
+                    Err(error) => {
+                        rejected.insert(index, error.to_string());
+                    }
                 }
-            };
-            let Some((effect, _, _)) =
-                describe_registered_tool(&request.tool_name, &normalized_input)
-            else {
-                rejected.entry(index).or_insert_with(|| {
-                    GovernedToolCompileError::MissingDescriptor {
-                        task_id: request.tool_use_id.clone(),
-                        tool_name: request.tool_name.clone(),
-                    }
-                    .to_string()
-                });
-                continue;
-            };
-            if let Err((scope, reason)) = normalized_resource_scope(&effect, workspace_root) {
-                rejected.entry(index).or_insert_with(|| {
-                    GovernedToolCompileError::InvalidNormalizedScope {
-                        task_id: request.tool_use_id.clone(),
-                        scope,
-                        reason,
-                    }
-                    .to_string()
-                });
             }
         }
 
@@ -425,11 +567,17 @@ impl GovernedToolCompiler {
         let plan = if accepted_requests.is_empty() {
             None
         } else {
-            let mut plan = ValidatedGovernedToolDag::compile(
-                workspace_root,
-                &accepted_requests,
-                |name, input| describe_registered_tool(name, input),
-            )?;
+            let nodes = accepted_indices
+                .iter()
+                .map(|index| {
+                    prepared_nodes.remove(index).ok_or_else(|| {
+                        GovernedToolCompileError::CompilationInvariant {
+                            reason: "accepted node has no original preparation".into(),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut plan = ValidatedGovernedToolDag::from_prepared(&accepted_requests, nodes)?;
             for task in &mut plan.tasks {
                 task.original_call_index = accepted_indices[task.original_call_index];
             }
@@ -488,102 +636,27 @@ impl ValidatedGovernedToolDag {
     #[must_use]
     pub fn from_requests(requests: &[ToolRequest]) -> Self {
         let workspace = std::env::current_dir().expect("test workspace");
-        Self::compile(&workspace, requests, |name, input| {
-            Some((fixture_effect(name, input), 1, "test-fixture".to_string()))
-        })
-        .expect("fixture requests form a valid governed tool DAG")
+        GovernedToolCompiler
+            .compile(&workspace, requests, |name, input| {
+                Some((fixture_effect(name, input), 1, "test-fixture".to_string()))
+            })
+            .expect("fixture requests form a valid governed tool DAG")
     }
 
-    fn compile(
-        workspace_root: &Path,
+    fn from_prepared(
         requests: &[ToolRequest],
-        describe_registered_tool: impl Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
+        prepared: Vec<PreparedToolNode>,
     ) -> Result<Self, GovernedToolCompileError> {
         let id_to_index = validate_task_ids(requests)?;
         validate_dependencies(requests, &id_to_index)?;
-
+        if prepared.len() != requests.len() {
+            return Err(GovernedToolCompileError::CompilationInvariant {
+                reason: "prepared graph cardinality changed".into(),
+            });
+        }
         let mut parallel_read_count = 0;
         let mut limited_count = 0;
         let mut destructive_count = 0;
-        let mut rejected = BTreeMap::<String, String>::new();
-        let mut first_rejection = None;
-        let mut prepared = Vec::with_capacity(requests.len());
-
-        for request in requests {
-            let normalized_input = match serde_json::from_str::<Value>(&request.input) {
-                Ok(input) => canonical_json(input),
-                Err(error) => {
-                    let reason = error.to_string();
-                    rejected.insert(
-                        request.tool_use_id.clone(),
-                        format!("invalid JSON input: {reason}"),
-                    );
-                    first_rejection.get_or_insert_with(|| GovernedToolCompileError::InvalidInput {
-                        task_id: request.tool_use_id.clone(),
-                        reason,
-                    });
-                    continue;
-                }
-            };
-            let Some((effect, catalog_revision, descriptor_set_hash)) =
-                describe_registered_tool(&request.tool_name, &normalized_input)
-            else {
-                rejected.insert(
-                    request.tool_use_id.clone(),
-                    format!("missing descriptor for `{}`", request.tool_name),
-                );
-                first_rejection.get_or_insert_with(|| {
-                    GovernedToolCompileError::MissingDescriptor {
-                        task_id: request.tool_use_id.clone(),
-                        tool_name: request.tool_name.clone(),
-                    }
-                });
-                continue;
-            };
-            let resource_scope = match normalized_resource_scope(&effect, workspace_root) {
-                Ok(scope) => scope,
-                Err((scope, reason)) => {
-                    rejected.insert(
-                        request.tool_use_id.clone(),
-                        format!("invalid normalized scope `{scope}`: {reason}"),
-                    );
-                    first_rejection.get_or_insert_with(|| {
-                        GovernedToolCompileError::InvalidNormalizedScope {
-                            task_id: request.tool_use_id.clone(),
-                            scope,
-                            reason,
-                        }
-                    });
-                    continue;
-                }
-            };
-            prepared.push((
-                normalized_input,
-                effect,
-                catalog_revision,
-                descriptor_set_hash,
-                resource_scope,
-            ));
-        }
-
-        if !rejected.is_empty() {
-            for request in requests {
-                for dependency in &request.depends_on {
-                    if let Some(reason) = rejected.get(dependency) {
-                        return Err(GovernedToolCompileError::DependencyReferencesRejectedTask {
-                            task_id: request.tool_use_id.clone(),
-                            dependency_id: dependency.clone(),
-                            rejection_reason: reason.clone(),
-                        });
-                    }
-                }
-            }
-            return Err(first_rejection.unwrap_or_else(|| {
-                GovernedToolCompileError::CompilationInvariant {
-                    reason: "rejected tool set has no typed rejection".to_string(),
-                }
-            }));
-        }
 
         let mut predecessors = vec![Vec::<usize>::new(); requests.len()];
         let mut successors = vec![Vec::<usize>::new(); requests.len()];
@@ -610,8 +683,14 @@ impl ValidatedGovernedToolDag {
         let mut tasks = Vec::with_capacity(requests.len());
         for (original_call_index, (request, prepared)) in requests.iter().zip(prepared).enumerate()
         {
-            let (normalized_input, effect, catalog_revision, descriptor_set_hash, resource_scope) =
-                prepared;
+            let PreparedToolNode {
+                invocation,
+                resource_scope,
+            } = prepared;
+            let normalized_input = invocation.intent.normalized_input.clone();
+            let effect = invocation.effect.clone();
+            let catalog_revision = invocation.catalog_revision;
+            let descriptor_set_hash = invocation.descriptor_set_hash.clone();
             let safety_category = ToolSafetyCategory::from_effect(&effect);
             let analysis =
                 analyze_request(request, &effect, safety_category, resource_scope.clone());
@@ -626,32 +705,8 @@ impl ValidatedGovernedToolDag {
                     limited_count += 1;
                 }
             }
-            let resource_demand = resource_demand_from_effect(&effect);
-            let invocation = GovernedToolInvocation {
-                origin: None,
-                contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
-                invocation_id: request.tool_use_id.clone(),
-                intent: ToolIntent {
-                    invocation_id: request.tool_use_id.clone(),
-                    tool_name: request.tool_name.clone(),
-                    normalized_input: normalized_input.clone(),
-                },
-                effect: effect.clone(),
-                resource_demand: resource_demand.clone(),
-                explicit_dependencies: request
-                    .depends_on
-                    .iter()
-                    .map(|depends_on| ToolDependency {
-                        invocation_id: request.tool_use_id.clone(),
-                        depends_on: depends_on.clone(),
-                        reason: "model_explicit_dependency".to_string(),
-                    })
-                    .collect(),
-                compiled_dependencies: Vec::new(),
-                catalog_revision,
-                descriptor_set_hash: descriptor_set_hash.clone(),
-                idempotency_key: tool_plan_idempotency_key(request),
-            };
+            let resource_demand = invocation.resource_demand.clone();
+            let idempotency_key = invocation.idempotency_key.clone();
             tasks.push(GovernedToolPlanTask {
                 step_binding: None,
                 original_call_index,
@@ -659,7 +714,7 @@ impl ValidatedGovernedToolDag {
                 tool_call_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 normalized_input,
-                idempotency_key: tool_plan_idempotency_key(request),
+                idempotency_key,
                 model_visible_name: model_visible_tool_name(&request.tool_name),
                 can_parallelize: matches!(
                     execution_mode,
@@ -2197,18 +2252,31 @@ mod tests {
     }
 
     #[test]
-    fn invalid_graph_never_reaches_lifecycle_or_effect_hooks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let lifecycle_events = AtomicUsize::new(0);
-        let tool_calls = AtomicUsize::new(0);
-        let effect_intents = AtomicUsize::new(0);
-        let result = compile_fixture(&[request("task", "read_file", vec!["task".to_string()])]);
-
-        assert!(result.is_err());
-        assert_eq!(lifecycle_events.load(Ordering::Relaxed), 0);
-        assert_eq!(tool_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(effect_intents.load(Ordering::Relaxed), 0);
+    fn identity_rejection_precedes_any_descriptor_resolution() {
+        let resolutions = std::cell::Cell::new(0);
+        let workspace = tempfile::tempdir().unwrap();
+        let describe = |name: &str, input: &Value| {
+            resolutions.set(resolutions.get() + 1);
+            Some((fixture_effect(name, input), 1, "fixture".into()))
+        };
+        let invalid = request("task", "read_file", vec!["task".to_string()]);
+        assert!(GovernedToolCompiler
+            .compile(workspace.path(), &[invalid], describe)
+            .is_err());
+        assert_eq!(
+            resolutions.get(),
+            0,
+            "self dependency must reject before calling the resolver"
+        );
+        let valid = request("valid", "read_file", Vec::new());
+        assert!(GovernedToolCompiler
+            .compile(workspace.path(), &[valid], describe)
+            .is_ok());
+        assert_eq!(
+            resolutions.get(),
+            1,
+            "the independent positive must actually resolve"
+        );
     }
 
     #[test]
@@ -2912,3 +2980,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "governed_tool_plan_prepared_tests.rs"]
+mod prepared_contract_tests;

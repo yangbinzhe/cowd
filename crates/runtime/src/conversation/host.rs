@@ -5031,18 +5031,21 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
             else {
                 return defer("registered_effect_descriptor_unavailable".to_string());
             };
-            let mut plan = match crate::GovernedToolCompiler.compile(
+            let mut plan = match crate::GovernedToolCompiler.compile_prepared_partial(
                 services.workspace_root(),
                 std::slice::from_ref(&request),
-                |_name, _input| {
-                    Some((
-                        invocation.effect.clone(),
-                        invocation.catalog_revision,
-                        invocation.descriptor_set_hash.clone(),
-                    ))
-                },
+                &prepared,
+                &Default::default(),
             ) {
-                Ok(plan) => plan,
+                Ok(compilation) => match compilation.plan {
+                    Some(plan) if compilation.rejected.is_empty() => plan,
+                    _ => {
+                        return defer(format!(
+                            "governed_candidate_rejected:{:?}",
+                            compilation.rejected
+                        ))
+                    }
+                },
                 Err(error) => return defer(format!("governed_candidate_rejected:{error}")),
             };
             crate::step_snapshot::bind_plan_calls(&mut plan, std::slice::from_ref(&candidate.call));

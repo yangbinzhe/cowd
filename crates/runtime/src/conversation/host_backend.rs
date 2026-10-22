@@ -6940,24 +6940,32 @@ where
                         depends_on: call.depends_on.clone(),
                     })
                     .collect::<Vec<_>>();
-                let prepared = requests
-                    .iter()
-                    .map(|request| {
-                        if let Some(invocation) = receipt_invocations.get(&request.tool_use_id) {
-                            return Ok(invocation.clone());
+                let mut prepared = Vec::with_capacity(requests.len());
+                let mut admission_rejections = BTreeMap::new();
+                for request in &requests {
+                    if let Some(invocation) = receipt_invocations.get(&request.tool_use_id) {
+                        prepared.push(invocation.clone());
+                        continue;
+                    }
+                    match tool_exec.prepare_step_invocations(std::slice::from_ref(request), &calls)
+                    {
+                        Ok(mut invocations) if invocations.len() == 1 => {
+                            prepared.push(invocations.remove(0))
                         }
-                        tool_exec
-                            .prepare_step_invocations(std::slice::from_ref(request), &calls)
-                            .map_err(|error| error.to_string())?
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| "missing prepared invocation".to_string())
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-                    .map_err(|reason| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason,
-                    })?;
+                        Ok(_) => {
+                            admission_rejections.insert(
+                                request.tool_use_id.clone(),
+                                "missing or ambiguous prepared invocation".into(),
+                            );
+                        }
+                        Err(error) => {
+                            admission_rejections.insert(
+                                request.tool_use_id.clone(),
+                                format!("step admission refused: {error}"),
+                            );
+                        }
+                    }
+                }
                 let prepared_by_id = prepared
                     .iter()
                     .map(|invocation| (invocation.invocation_id.clone(), invocation.clone()))
@@ -6977,23 +6985,13 @@ where
                             .understanding
                             .forbids_workspace_write
                     });
-                let mut governed_compilation = crate::GovernedToolCompiler.compile_partial(
-                    self.services.workspace_root(),
-                    &requests,
-                    |name, input| {
-                        prepared.iter().find_map(|invocation| {
-                            (invocation.intent.tool_name == name
-                                && invocation.intent.normalized_input == *input)
-                                .then(|| {
-                                    (
-                                        invocation.effect.clone(),
-                                        invocation.catalog_revision,
-                                        invocation.descriptor_set_hash.clone(),
-                                    )
-                                })
-                        })
-                    },
-                );
+                let mut governed_compilation = crate::GovernedToolCompiler
+                    .compile_prepared_partial(
+                        self.services.workspace_root(),
+                        &requests,
+                        &prepared,
+                        &admission_rejections,
+                    );
                 if let Ok(compilation) = governed_compilation.as_mut() {
                     if let Some(plan) = compilation.plan.as_mut() {
                         crate::step_snapshot::bind_plan_calls(plan, &calls);
@@ -7240,36 +7238,7 @@ where
                 root_owner = Some((owner, attempt));
             }
             let transcript_len = runtime.session_head().await.message_count;
-            let requests = calls
-                .iter()
-                .map(|call| crate::tool_dispatch::ToolRequest {
-                    tool_use_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    input: call.input.clone(),
-                    depends_on: call.depends_on.clone(),
-                })
-                .collect::<Vec<_>>();
-            let mut prepared_invocations = Vec::new();
-            for request in &requests {
-                if let Some(invocation) = receipt_invocations.get(&request.tool_use_id) {
-                    prepared_invocations.push(invocation.clone());
-                } else {
-                    prepared_invocations.extend(
-                        runtime
-                            .tool_executor()
-                            .prepare_step_invocations(std::slice::from_ref(request), &calls)
-                            .map_err(|error| NodeExecutorError::Poll {
-                                node_id: ticket.node_id.clone(),
-                                reason: error.to_string(),
-                            })?,
-                    );
-                }
-            }
-            let prepared_tool_invocations = prepared_invocations
-                .into_iter()
-                .map(|invocation| (invocation.invocation_id.clone(), invocation))
-                .collect::<std::collections::HashMap<_, _>>();
-            let result = runtime
+            let outcome = runtime
                 .execute_tool_batch_step_with_owner(
                     &calls,
                     &prompter,
@@ -7287,10 +7256,15 @@ where
                 .await
                 .truncate_messages(transcript_len);
             drop(runtime);
-            let result = result.map_err(|error| NodeExecutorError::Poll {
-                node_id: ticket.node_id.clone(),
-                reason: error.to_string(),
-            })?;
+            let (result, prepared_invocations) =
+                outcome.map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: error.to_string(),
+                })?;
+            let prepared_tool_invocations = prepared_invocations
+                .into_iter()
+                .map(|invocation| (invocation.invocation_id.clone(), invocation))
+                .collect::<std::collections::HashMap<_, _>>();
             let orchestration_terminal_summary: Option<String> = None;
             let agentic_progress_refs = agentic_action_progress_refs(&result.messages);
             (
