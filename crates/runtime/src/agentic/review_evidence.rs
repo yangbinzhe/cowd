@@ -9,13 +9,13 @@ mod results;
 #[cfg(test)]
 pub(crate) use coverage::evidence_contains;
 pub(crate) use coverage::validate_review_coverage;
-pub(crate) use current_review::CurrentReviewContext;
+pub(crate) use current_review::{CurrentReviewContext, ReviewActionIdentity};
 #[allow(unused_imports)]
 pub(crate) use policy::{
     committed_proof_sources, completion_admission_context, effect_review_snapshot,
     proof_input_snapshot, proof_input_snapshot_for_action, root_self_review_policy,
-    validate_proof_inputs, validate_proof_inputs_for_action, CompletionAdmissionContext,
-    ProofInputSnapshot,
+    validate_applied_proof_inputs, validate_proof_inputs, validate_proof_inputs_for_action,
+    CompletionAdmissionContext, ProofInputSnapshot,
 };
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
@@ -255,6 +255,40 @@ pub(crate) fn bound_artifact_identities(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// Bounded diagnostic only: this never changes source acceptance or proof cuts.
+pub(crate) fn describe_source_advance(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    after: u64,
+) -> String {
+    const MAX_ADVANCED_EVENTS: usize = 8;
+    let head = match store.stream_revision(source) {
+        Ok(head) => head,
+        Err(_) => return "writer_advance=unknown head_read_failed".into(),
+    };
+    let events = match store.list_stream_after(
+        source,
+        after,
+        head.max(after),
+        MAX_ADVANCED_EVENTS,
+        256 * 1024,
+    ) {
+        Ok(events) => events,
+        Err(_) => return format!("writer_advance=unknown head={head} event_read_failed"),
+    };
+    let writers = events
+        .iter()
+        .map(|event| {
+            format!(
+                "#{}:{}:{}",
+                event.sequence, event.kind, event.transaction_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("advanced={} head={head} [{writers}]", events.len())
 }
 
 #[cfg(test)]
@@ -503,16 +537,15 @@ fn selected_work(
                     .iter()
                     .cloned(),
             );
+            let contract = semantic_task_contract(task);
             tasks.insert(reference, serde_json::json!({
-            "team":task.team_id,"objective":task.objective,"acceptance":task.acceptance,
-            "acceptance_checks":task.acceptance_checks,"criterion_source":task.criterion_source,
-            "obligations":task.obligation_refs,"capabilities":task.required_capabilities,
-            "execution_requirements":task.execution_requirements,"purpose":task.purpose,
-            "dependencies":task.depends_on,"status":task.status,"claimant":task.claimant,
-            "claim_generation":task.claim_generation,"execution":task.claim_execution_id,
-            "artifacts":task.artifact_refs,"reviewer":task.reviewed_by,"unresolved":task.unresolved,
-            "replacements":task.replacement_task_refs,"pending_retirement":task.pending_retirement,
-        }));
+                "team":contract["team_id"], "objective":contract["objective"], "acceptance":contract["acceptance"],
+                "acceptance_checks":contract["acceptance_checks"], "criterion_source":contract["criterion_source"],
+                "obligations":contract["obligation_refs"], "capabilities":contract["required_capabilities"],
+                "execution_requirements":contract["execution_requirements"], "purpose":contract["purpose"],
+                "dependencies":contract["depends_on"], "artifacts":contract["artifact_refs"],
+                "unresolved":contract["unresolved"], "replacements":contract["replacement_task_refs"],
+            }));
         }
         let mut pending_artifacts = std::mem::take(&mut artifacts)
             .into_iter()
@@ -612,6 +645,35 @@ fn selected_work(
     ))
 }
 
+/// One semantic Task projection shared by complete and dependency-selected work.
+/// Physical facts remain available to completion/effect/claim owners and source CAS.
+fn semantic_task_contract(task: &super::program::AgenticTaskProjection) -> serde_json::Value {
+    let mut value = serde_json::to_value(task).expect("serializable Task projection");
+    let fields = value.as_object_mut().expect("Task object");
+    for field in [
+        "status",
+        "claimant",
+        "claim_generation",
+        "claim_execution_id",
+        "claimed_at_ms",
+        "lease_expires_at_ms",
+        "claim_renewal_streak",
+        "active_attempts",
+        "failed_attempts",
+        "review_generation",
+        "failed_review_attempts",
+        "last_failure",
+        "cancel_requested_by",
+        "cancel_reason_ref",
+        "cancel_evidence_refs",
+        "pending_retirement",
+        "reviewed_by",
+    ] {
+        fields.remove(field);
+    }
+    value
+}
+
 pub(crate) fn work_manifest_digest(program: &AgenticProgramProjection) -> String {
     // Hash semantic work, not lease renewal or retirement of its workers.
     let teams = program.teams.iter().map(|(id, team)| (id, serde_json::json!({
@@ -625,32 +687,7 @@ pub(crate) fn work_manifest_digest(program: &AgenticProgramProjection) -> String
     let tasks = program
         .tasks
         .iter()
-        .map(|(id, task)| {
-            let mut value = serde_json::to_value(task).expect("serializable Task projection");
-            let fields = value.as_object_mut().expect("Task object");
-            for field in ["claimed_at_ms", "lease_expires_at_ms", "active_attempts"] {
-                fields.remove(field);
-            }
-            if task.purpose == harness_contract::agent_action::TaskPurpose::Exploration {
-                for field in [
-                    "status",
-                    "claimant",
-                    "claim_generation",
-                    "claim_execution_id",
-                    "failed_attempts",
-                    "review_generation",
-                    "failed_review_attempts",
-                    "last_failure",
-                    "cancel_requested_by",
-                    "cancel_reason_ref",
-                    "cancel_evidence_refs",
-                    "pending_retirement",
-                ] {
-                    fields.remove(field);
-                }
-            }
-            (id, value)
-        })
+        .map(|(id, task)| (id, semantic_task_contract(task)))
         .collect::<BTreeMap<_, _>>();
     let value = serde_json::json!({
         "program": program.program_id, "objective": program.objective_id,
@@ -3193,7 +3230,7 @@ impl RuntimeServices {
             goal.as_ref(),
             &verification,
             readers,
-            current_review,
+            current_review.map(ReviewActionIdentity::Live),
         )?;
         verification.work_manifest_digest = snapshot.work_digest;
         verification.effect_manifest_digest = Some(snapshot.effects.digest);
@@ -4150,4 +4187,5 @@ mod tests {
             assert!(program.tasks["task:unproven"].artifact_refs.is_empty());
         }
     }
+    include!("review_evidence/work_contract_tests.rs");
 }

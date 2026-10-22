@@ -30,6 +30,28 @@ pub(crate) struct CurrentReviewContext<'a> {
     pub actor: &'a AgentActorBinding,
 }
 
+/// The identity of the review action a proof is being re-verified against.
+///
+/// A proof is re-verified either while its review call is still live (the
+/// action being applied) or after it has landed (the durable record the Goal
+/// conclusion reads). Both resolve to ONE thing: the applied Program action id
+/// that carries this proof. Nothing else about the review is needed to decide
+/// whether a Program advance is that review's own application.
+#[derive(Clone, Copy)]
+pub(crate) enum ReviewActionIdentity<'a> {
+    Live(&'a CurrentReviewContext<'a>),
+    Applied(&'a AppliedReviewContext<'a>),
+}
+
+impl<'a> ReviewActionIdentity<'a> {
+    pub(crate) fn action_id(&self) -> &'a str {
+        match self {
+            Self::Live(context) => context.action_id,
+            Self::Applied(context) => context.action_id,
+        }
+    }
+}
+
 fn review_control_tool(action: &AgentAction) -> Option<&'static str> {
     match action {
         AgentAction::TaskReview(_) => Some(TASK_REVIEW_TOOL_ID),
@@ -38,12 +60,134 @@ fn review_control_tool(action: &AgentAction) -> Option<&'static str> {
     }
 }
 
+/// True when this Program event is the review's own application.
+///
+/// The review is a governed Program action, so while the proof is being
+/// assembled its own application is not in the stream yet and it lands one
+/// revision later. Pinning the Program at the cut the proof was built against
+/// therefore compares a revision that can never be reached: the review's own
+/// application always follows its own discovery. The event that records THIS
+/// action's application is the only advance the review may absorb.
+pub(crate) fn is_current_review_application(event: &crate::DurableRuntimeEvent) -> bool {
+    event.kind == "agentic.action_applied"
+        && event.payload["envelope"]["action"]["kind"].as_str() == Some(OBJECTIVE_REVIEW_TOOL_ID)
+        || event.kind == "agentic.action_applied"
+            && event.payload["envelope"]["action"]["kind"].as_str() == Some(TASK_REVIEW_TOOL_ID)
+}
+
+pub(crate) fn program_cut_absorbs_own_review(
+    events: &[crate::DurableRuntimeEvent],
+    program_source: &str,
+    pinned: u64,
+    current: u64,
+    action_id: &str,
+) -> bool {
+    current.checked_sub(pinned) == Some(events.len() as u64)
+        && events.iter().enumerate().all(|(offset, event)| {
+            event.stream_id == program_source
+                && event.sequence == pinned + offset as u64 + 1
+                && event.scope == crate::RuntimeEventScope::Program
+                && event.schema_version == 1
+                && (is_current_review_application(event)
+                    && event.payload["envelope"]["action_id"].as_str() == Some(action_id)
+                    || is_worker_lifecycle_event(event)
+                    || is_completion_request_event(event)
+                    || is_conclusion_process_event(event))
+        })
+}
+
+/// A bounded operation-local source slice. No full history scan or fixed
+/// eight-event liveness barrier. All cuts remain part of the original CAS.
+pub(crate) fn program_events_after_cut(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    pinned: u64,
+    through: u64,
+) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+    let count = through
+        .checked_sub(pinned)
+        .ok_or("review Program cut moved backwards")?;
+    if count > 1024 {
+        return Err("review Program tail event budget exhausted; rebuild original proof".into());
+    }
+    let mut events = Vec::new();
+    let mut after = pinned;
+    let mut bytes = 0usize;
+    while after < through {
+        let page = store.list_stream_after(
+            source,
+            after,
+            through,
+            64,
+            (4 * 1024 * 1024usize).saturating_sub(bytes),
+        )?;
+        if page.is_empty() {
+            return Err("review Program tail is incomplete".into());
+        }
+        for event in page {
+            if event.stream_id != source || event.sequence != after + 1 || event.sequence > through
+            {
+                return Err("review Program tail identity or sequence changed".into());
+            }
+            bytes = bytes
+                .checked_add(
+                    serde_json::to_vec(&event)
+                        .map_err(|error| error.to_string())?
+                        .len(),
+                )
+                .ok_or("review Program tail byte budget overflow")?;
+            if bytes > 4 * 1024 * 1024 {
+                return Err("review Program tail byte budget exhausted".into());
+            }
+            after = event.sequence;
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
 /// One governed tool call of the Session's plans, with the identity the
 /// proof would exempt.
 struct PlanCandidate {
     effect_key: String,
     tool_name: String,
     step: crate::step_snapshot::StepCallBinding,
+}
+
+/// An already applied review, resolved from the durable action record.
+///
+/// The conclusion path re-verifies a review that has landed, so the action it
+/// names must exist in the Program journal and must be the action that
+/// carried THIS proof. It is resolved from the durable record rather than from
+/// the proof, so a stored value can never grant its own exemption.
+pub(crate) struct AppliedReviewContext<'a> {
+    pub action_id: &'a str,
+    pub program_source: &'a str,
+    pub pinned: u64,
+    pub through: u64,
+    pub program_events: &'a [crate::DurableRuntimeEvent],
+}
+
+/// Select the already authenticated identity, never recover a failed live
+/// authentication from historical evidence. Applied reviews have no live call.
+pub(crate) fn select_current_review_effect_key(
+    identity: Option<ReviewActionIdentity<'_>>,
+    live: Option<String>,
+    rebound: Option<String>,
+) -> Result<Option<String>, String> {
+    match (identity, live, rebound) {
+        (Some(ReviewActionIdentity::Live(_)), Some(live), Some(rebound)) => {
+            if live != rebound {
+                return Err(
+                    "proof review call identity changed between the review and its application"
+                        .into(),
+                );
+            }
+            Ok(Some(live))
+        }
+        (Some(ReviewActionIdentity::Live(_)), live, _) => Ok(live),
+        (Some(ReviewActionIdentity::Applied(_)), _, rebound) | (None, _, rebound) => Ok(rebound),
+    }
 }
 
 /// Every governed tool call of the pinned Session plans.
@@ -839,4 +983,283 @@ mod tests {
             "a child index that does not exist names no call"
         );
     }
+
+    fn test_program_cut_absorbs_own_review(
+        store: &crate::RuntimeEventStore,
+        source: &str,
+        pinned: u64,
+        current: u64,
+        action: &str,
+    ) -> bool {
+        program_events_after_cut(store, source, pinned, current)
+            .map(|events| program_cut_absorbs_own_review(&events, source, pinned, current, action))
+            .unwrap_or(false)
+    }
+
+    fn append_program_event(
+        store: &std::sync::Arc<crate::RuntimeEventStore>,
+        kind: &str,
+        action_id: &str,
+    ) {
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:program".into(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: "agentic.action_applied".into(),
+                status: Some("applied".into()),
+                actor: Some("agent".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "envelope": {
+                        "action_id": action_id,
+                        "action": {"kind": kind, "input": {"criterion_ref": "user_intent"}}
+                    }
+                }),
+            })
+            .unwrap();
+    }
+
+    /// Append a Program-scope bookkeeping event that carries no action
+    /// envelope (a lease renewal, a completion reopen).
+    fn append_program_bookkeeping(store: &std::sync::Arc<crate::RuntimeEventStore>, kind: &str) {
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:program".into(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: kind.into(),
+                status: Some("open".into()),
+                actor: Some("runtime.program-supervisor".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"gaps": ["review_validation_failed"]}),
+            })
+            .unwrap();
+    }
+
+    /// The exact Program advance the normal business chain produced when the
+    /// Goal refused to converge.
+    ///
+    /// The review is applied, the worker settles around it, the root asks for
+    /// completion twice, and the Program records that it could not close the
+    /// Goal twice. The last two records are the Program's own account of the
+    /// judgement that failed - a proof that invalidated itself on them could
+    /// never be judged, so the Goal reopened forever.
+    #[test]
+    fn r1_a_proof_absorbs_the_programs_own_record_of_a_failed_judgement() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        append_program_event(&store, "task_claim", "worker-claim");
+        let pinned = store.stream_revision("agentic-program:program").unwrap();
+        append_program_event(&store, OBJECTIVE_REVIEW_TOOL_ID, "this-review");
+        append_program_bookkeeping(&store, "agentic.task_lease_renewed");
+        append_program_event(&store, "task_withdraw", "root-withdraw");
+        append_program_event(&store, "task_attempt_fail", "runtime-attempt-settle");
+        append_program_event(&store, "objective_complete_request", "root-completion-1");
+        append_program_bookkeeping(&store, "agentic.completion_reopened");
+        append_program_event(&store, "objective_complete_request", "root-completion-2");
+        append_program_bookkeeping(&store, "agentic.completion_reopened");
+        let current = store.stream_revision("agentic-program:program").unwrap();
+        assert_eq!(
+            current - pinned,
+            8,
+            "the recorded advance is eight events long"
+        );
+        assert!(
+            test_program_cut_absorbs_own_review(
+                store.as_ref(),
+                "agentic-program:program",
+                pinned,
+                current,
+                "this-review"
+            ),
+            "the Program's own conclusion bookkeeping is not a change to the work"
+        );
+        // A business write in the same advance is still a reason to rebuild.
+        append_program_event(&store, "task_submit", "worker-submit");
+        let advanced = store.stream_revision("agentic-program:program").unwrap();
+        assert!(!test_program_cut_absorbs_own_review(
+            store.as_ref(),
+            "agentic-program:program",
+            pinned,
+            advanced,
+            "this-review"
+        ));
+    }
+
+    /// The review's own application is the one Program advance its proof may
+    /// absorb: the proof is assembled before the action is applied, so the
+    /// pinned cut always precedes it.
+    #[test]
+    fn r1_a_proof_absorbs_its_own_review_application_and_nothing_else() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        append_program_event(&store, "task_claim", "worker-claim");
+        let pinned = store.stream_revision("agentic-program:program").unwrap();
+        append_program_event(&store, OBJECTIVE_REVIEW_TOOL_ID, "this-review");
+        let current = store.stream_revision("agentic-program:program").unwrap();
+        assert!(test_program_cut_absorbs_own_review(
+            store.as_ref(),
+            "agentic-program:program",
+            pinned,
+            current,
+            "this-review"
+        ));
+        // Another actor's review, or the same review under another id, is a
+        // different action and must not be absorbed.
+        assert!(!test_program_cut_absorbs_own_review(
+            store.as_ref(),
+            "agentic-program:program",
+            pinned,
+            current,
+            "another-review"
+        ));
+        // A business write in the same advance is not the review.
+        append_program_event(&store, "task_submit", "worker-submit");
+        let advanced = store.stream_revision("agentic-program:program").unwrap();
+        assert!(!test_program_cut_absorbs_own_review(
+            store.as_ref(),
+            "agentic-program:program",
+            pinned,
+            advanced,
+            "this-review"
+        ));
+        // An unmoved cut always matches.
+        assert!(test_program_cut_absorbs_own_review(
+            store.as_ref(),
+            "agentic-program:program",
+            advanced,
+            advanced,
+            "this-review"
+        ));
+    }
+
+    /// The root's withdrawal/settlement around the review landing is the same
+    /// worker bookkeeping the Program owner already treats as semantically
+    /// neutral, so it must not invalidate a proof either.
+    #[test]
+    fn r1_a_proof_absorbs_worker_bookkeeping_around_its_review() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        append_program_event(&store, "task_claim", "worker-claim");
+        let pinned = store.stream_revision("agentic-program:program").unwrap();
+        append_program_event(&store, OBJECTIVE_REVIEW_TOOL_ID, "this-review");
+        append_program_event(&store, "task_withdraw", "root-withdraw");
+        append_program_event(&store, "task_attempt_fail", "runtime-attempt-settle");
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:program".into(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: "agentic.task_lease_renewed".into(),
+                status: Some("renewed".into()),
+                actor: Some("agent".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"claim_generation": 2}),
+            })
+            .unwrap();
+        let current = store.stream_revision("agentic-program:program").unwrap();
+        assert!(
+            test_program_cut_absorbs_own_review(
+                store.as_ref(),
+                "agentic-program:program",
+                pinned,
+                current,
+                "this-review"
+            ),
+            "the review's own application and the worker bookkeeping around it are both neutral"
+        );
+        // A real business write in the same advance is still a reason to rebuild.
+        append_program_event(&store, "task_submit", "worker-submit");
+        let advanced = store.stream_revision("agentic-program:program").unwrap();
+        assert!(!test_program_cut_absorbs_own_review(
+            store.as_ref(),
+            "agentic-program:program",
+            pinned,
+            advanced,
+            "this-review"
+        ));
+    }
+
+    /// The root's completion request lands after the review by construction:
+    /// it is the action that asks this proof to be judged. The conclusion path
+    /// already binds that request by its own digest and revision, so its
+    /// application is an advance the proof may absorb too.
+    #[test]
+    fn r1_a_proof_absorbs_the_completion_request_it_is_judging() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        append_program_event(&store, "task_claim", "worker-claim");
+        let pinned = store.stream_revision("agentic-program:program").unwrap();
+        append_program_event(&store, OBJECTIVE_REVIEW_TOOL_ID, "this-review");
+        append_program_event(&store, "task_withdraw", "root-withdraw");
+        append_program_event(&store, "objective_complete_request", "root-completion");
+        let current = store.stream_revision("agentic-program:program").unwrap();
+        assert!(
+            test_program_cut_absorbs_own_review(
+                store.as_ref(),
+                "agentic-program:program",
+                pinned,
+                current,
+                "this-review"
+            ),
+            "the review and the completion request it is judged under both land after its cut"
+        );
+        // A different deliverable, or a spec change, still rebuilds the proof.
+        append_program_event(&store, "task_submit", "worker-submit");
+        let advanced = store.stream_revision("agentic-program:program").unwrap();
+        assert!(!test_program_cut_absorbs_own_review(
+            store.as_ref(),
+            "agentic-program:program",
+            pinned,
+            advanced,
+            "this-review"
+        ));
+    }
+    include!("current_review_applied_tests.rs");
+}
+/// True when this Program event is worker lifecycle bookkeeping.
+///
+/// The Program owner already treats a lease renewal as semantically neutral
+/// for its own carrier cut (`commit_program_conclusion` tolerates exactly
+/// `agentic.task_lease_renewed`). A review lands one revision after its own
+/// discovery, and the withdrawal/settlement the root performs around that
+/// landing is the same kind of bookkeeping: it changes who holds the Task,
+/// never what the Task asked for.
+pub(crate) fn is_worker_lifecycle_event(event: &crate::DurableRuntimeEvent) -> bool {
+    event.scope == crate::RuntimeEventScope::Program
+        && (event.kind == "agentic.task_lease_renewed"
+            || event.kind == "agentic.action_applied"
+                && matches!(
+                    event.payload["envelope"]["action"]["kind"].as_str(),
+                    Some("task_withdraw") | Some("task_release") | Some("task_attempt_fail")
+                ))
+}
+
+/// True when this Program event records the completion request the conclusion
+/// is being prepared for.
+///
+/// A proof is assembled while the review is being written, so the root's
+/// completion request - the action that asks this very proof to be judged -
+/// necessarily lands afterwards. The conclusion path already binds that request
+/// by its own digest and revision, so its application is the second advance the
+/// proof may absorb.
+pub(crate) fn is_completion_request_event(event: &crate::DurableRuntimeEvent) -> bool {
+    event.kind == "agentic.action_applied"
+        && event.payload["envelope"]["action"]["kind"].as_str()
+            == Some("objective_complete_request")
+}
+
+/// True when this Program event records the conclusion PROCESS itself.
+///
+/// A Program that cannot close its Goal says so: it reopens the completion
+/// when a conclusion attempt fails, and it records a rejected completion
+/// request when the request never became an action. Both are records ABOUT
+/// the conclusion, not changes to the work the proof fenced - the Tasks, the
+/// artifacts and the results are exactly what they were.
+///
+/// They have to be absorbed for the same reason the completion request
+/// itself is: a proof that invalidated itself on the record of its own
+/// failed judgement could never be judged. The record is written BECAUSE the
+/// proof was not accepted, so leaving it outside the absorb-list turns one
+/// rejected proof into an endless rejection.
+pub(crate) fn is_conclusion_process_event(event: &crate::DurableRuntimeEvent) -> bool {
+    event.scope == crate::RuntimeEventScope::Program
+        && matches!(
+            event.kind.as_str(),
+            "agentic.completion_reopened" | "agentic.completion_rejected"
+        )
 }

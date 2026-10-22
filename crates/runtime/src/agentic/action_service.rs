@@ -2422,11 +2422,13 @@ impl AgentActionService {
                 goal.as_ref(),
                 proof,
                 readers,
-                Some(&super::review_evidence::CurrentReviewContext {
-                    action_id: &envelope.action_id,
-                    action: &envelope.action,
-                    actor: &envelope.actor,
-                }),
+                Some(super::review_evidence::ReviewActionIdentity::Live(
+                    &super::review_evidence::CurrentReviewContext {
+                        action_id: &envelope.action_id,
+                        action: &envelope.action,
+                        actor: &envelope.actor,
+                    },
+                )),
             ) {
                 Ok(snapshot) => policy_sources.extend(snapshot.sources),
                 Err(error) => {
@@ -5355,7 +5357,7 @@ fn topic_cursor_stream(program_id: &str, execution_id: &str) -> String {
     format!("agentic-topic-cursor:{program_id}:{execution_id}")
 }
 
-fn action_key(action_id: &str) -> String {
+pub(super) fn action_key(action_id: &str) -> String {
     format!("agent-action:{action_id}")
 }
 

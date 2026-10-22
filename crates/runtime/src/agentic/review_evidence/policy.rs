@@ -274,6 +274,79 @@ pub(crate) fn validate_proof_inputs(
     validate_proof_inputs_for_action(store, program, goal, proof, readers, None)
 }
 
+/// A persisted review is revalidated against the original action that carries
+/// this exact proof. A missing, foreign or ambiguous record grants no exemption.
+pub(crate) fn validate_applied_proof_inputs(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    goal: Option<&GoalContract>,
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+    readers: super::ResultContentReaders<'_>,
+) -> Result<ProofInputSnapshot, String> {
+    let source = format!("agentic-program:{}", program.program_id);
+    let pinned = proof
+        .input_set
+        .as_ref()
+        .and_then(|set| set.source_revisions.get(&source))
+        .copied()
+        .ok_or("applied proof has no original Program cut")?;
+    let events =
+        super::current_review::program_events_after_cut(store, &source, pinned, program.revision)?;
+    let applied = original_review_action_id(&events, proof)?
+        .ok_or("original applied review action missing")?;
+    let original = events
+        .iter()
+        .find(|event| event.payload["envelope"]["action_id"].as_str() == Some(applied.as_str()))
+        .ok_or("original applied review record missing")?;
+    let envelope: harness_contract::agent_action::AgentActionEnvelope =
+        serde_json::from_value(original.payload["envelope"].clone())
+            .map_err(|_| "original applied review envelope missing")?;
+    if original.scope != crate::RuntimeEventScope::Program
+        || original.schema_version != 1
+        || envelope.actor.program_id != program.program_id
+        || envelope.actor.objective_id != program.objective_id
+        || envelope.actor.session_id != program.session_id
+        || envelope.actor.turn_id != program.turn_id
+        || envelope.actor.root_execution_id != program.root_execution_id
+        || !matches!(
+            envelope.action,
+            harness_contract::agent_action::AgentAction::TaskReview(_)
+                | harness_contract::agent_action::AgentAction::ObjectiveReview(_)
+        )
+    {
+        return Err("original applied review identity mismatch".into());
+    }
+    let indexed = store
+        .event_by_idempotency_key(
+            &source,
+            &crate::agentic::action_service::action_key(&applied),
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("original applied review primary missing")?;
+    if serde_json::to_value(&indexed).map_err(|error| error.to_string())?
+        != serde_json::to_value(original).map_err(|error| error.to_string())?
+    {
+        return Err("original applied review primary/index mismatch".into());
+    }
+    let context = super::current_review::AppliedReviewContext {
+        action_id: &applied,
+        program_source: &source,
+        pinned,
+        through: program.revision,
+        program_events: &events,
+    };
+    validate_proof_inputs_for_action(
+        store,
+        program,
+        goal,
+        proof,
+        readers,
+        Some(super::current_review::ReviewActionIdentity::Applied(
+            &context,
+        )),
+    )
+}
+
 /// Re-verify a proof against the LIVE action it is applying, so the review's
 /// own in-flight call is resolved again from the durable evidence instead of
 /// from anything the proof carries.
@@ -283,7 +356,7 @@ pub(crate) fn validate_proof_inputs_for_action(
     goal: Option<&GoalContract>,
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
-    current_review: Option<&super::current_review::CurrentReviewContext<'_>>,
+    current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
     let current = crate::AgentActionService::new(std::sync::Arc::clone(store))
         .project(&program.program_id)
@@ -325,9 +398,22 @@ pub(crate) fn validate_proof_inputs_for_action(
     .filter_map(|(dimension, differs)| differs.then_some(dimension))
     .collect::<Vec<_>>();
     if !changed.is_empty() {
+        let writer = snapshot
+            .sources
+            .iter()
+            .find_map(|source| {
+                inputs
+                    .source_revisions
+                    .get(&source.stream_id)
+                    .filter(|expected| **expected != source.expected_revision)
+                    .map(|expected| {
+                        super::describe_source_advance(store, &source.stream_id, *expected)
+                    })
+            })
+            .unwrap_or_else(|| "writer_advance=not_observed_at_pinned_cuts".into());
         return Err(format!(
-            "stale v2 proof: relevant result, source or acceptance policy changed; dimensions={}",
-            changed.join(",")
+            "stale v2 proof: relevant result, source or acceptance policy changed; dimensions={}; {}",
+            changed.join(","), writer
         ));
     }
     Ok(snapshot)
@@ -4010,7 +4096,7 @@ pub(crate) fn proof_input_snapshot_for_action(
     goal: Option<&GoalContract>,
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
-    current_review: Option<&super::current_review::CurrentReviewContext<'_>>,
+    current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
     proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review)
 }
@@ -4022,7 +4108,7 @@ fn proof_input_snapshot_for_phase(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     accepted_policy_digest: Option<&str>,
     readers: super::ResultContentReaders<'_>,
-    current_review: Option<&super::current_review::CurrentReviewContext<'_>>,
+    current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
     if inputs.version != 2 {
@@ -4088,6 +4174,28 @@ fn proof_input_snapshot_for_phase(
         .map_err(|error| error.to_string())?;
     if program_revision != program.revision {
         return Err("proof Program source changed; retry current inputs".into());
+    }
+    if let Some(super::current_review::ReviewActionIdentity::Applied(context)) = current_review {
+        let pinned = inputs
+            .source_revisions
+            .get(&program_source)
+            .copied()
+            .ok_or("applied proof has no original Program cut")?;
+        if !super::current_review::program_cut_absorbs_own_review(
+            context.program_events,
+            &program_source,
+            pinned,
+            program_revision,
+            context.action_id,
+        ) || context.program_source != program_source
+            || context.pinned != pinned
+            || context.through != program_revision
+        {
+            return Err(format!(
+                "proof Program source changed; retry current inputs; {}",
+                super::describe_source_advance(store, &program_source, pinned)
+            ));
+        }
     }
     sources.insert(program_source, program_revision);
     let mut related_work =
@@ -4802,11 +4910,16 @@ fn proof_input_snapshot_for_phase(
                 .iter()
                 .any(|reference| super::is_process_body_receipt(reference))
         }) {
-        Some(super::results::result_source_events(
-            store,
-            &format!("agentic-program:{}", program.program_id),
-            &mut sources,
-        )?)
+        match current_review {
+            Some(super::current_review::ReviewActionIdentity::Applied(context)) => {
+                Some(context.program_events.to_vec())
+            }
+            _ => Some(super::results::result_source_events(
+                store,
+                &format!("agentic-program:{}", program.program_id),
+                &mut sources,
+            )?),
+        }
     } else {
         None
     };
@@ -4864,11 +4977,13 @@ fn proof_input_snapshot_for_phase(
     // are present they have to agree, so a proof can never exempt a call the
     // live action did not perform.
     let live_identity = match (current_review, reviewer_delivery_packet.as_ref()) {
-        (Some(context), Some(packet)) => super::current_review::resolve_current_review_effect_key(
-            &session_events,
-            packet,
-            context,
-        )?,
+        (Some(super::current_review::ReviewActionIdentity::Live(context)), Some(packet)) => {
+            super::current_review::resolve_current_review_effect_key(
+                &session_events,
+                packet,
+                context,
+            )?
+        }
         _ => None,
     };
     let rebound_identity = match reviewer_delivery_packet.as_ref() {
@@ -4891,21 +5006,11 @@ fn proof_input_snapshot_for_phase(
     // call. A live action that authenticates to NOTHING exempts nothing -
     // falling back to the stored candidate would exempt a call this action
     // is not performing.
-    let current_review_effect_key = match (current_review, live_identity, rebound_identity) {
-        (Some(_), Some(live), Some(rebound)) => {
-            if live != rebound {
-                return Err(
-                    "proof review call identity changed between the review and its application"
-                        .into(),
-                );
-            }
-            Some(live)
-        }
-        (Some(_), Some(live), None) => Some(live),
-        (Some(_), None, _) => None,
-        (None, _, Some(rebound)) => Some(rebound),
-        (None, _, None) => None,
-    };
+    let current_review_effect_key = super::current_review::select_current_review_effect_key(
+        current_review,
+        live_identity,
+        rebound_identity,
+    )?;
     let deliveries = review_delivery_snapshot(
         store,
         program,
@@ -5740,7 +5845,8 @@ fn proof_input_snapshot_for_phase(
             .map_err(|error| error.to_string())?;
         if actual_revision != *revision {
             return Err(format!(
-                "proof source changed during validation; retry current inputs; source={source} expected={revision} actual={actual_revision} phase=final_source_fence"
+                "proof source changed during validation; retry current inputs; source={source} expected={revision} actual={actual_revision} phase=final_source_fence; {}",
+                super::describe_source_advance(store, source, *revision)
             ));
         }
     }

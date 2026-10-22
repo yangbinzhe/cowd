@@ -239,7 +239,7 @@ impl GoalStore {
                     .verification
                     .as_ref()
                     .ok_or_else(|| "latest review proof missing".to_string())?;
-                let snapshot = crate::agentic::review_evidence::validate_proof_inputs(
+                let snapshot = crate::agentic::review_evidence::validate_applied_proof_inputs(
                     &self.event_store,
                     program,
                     Some(&goal),
