@@ -298,6 +298,108 @@ pub struct AppendTransactionRequest {
     pub events: Vec<RuntimeTransactionEventInput>,
 }
 
+/// Cumulative limits for one source check, not a fresh allowance for each page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCheckBudget {
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub max_pages: usize,
+    pub max_sources: usize,
+    pub max_lock_millis: u64,
+}
+
+impl Default for SourceCheckBudget {
+    fn default() -> Self {
+        Self {
+            max_events: 1024,
+            max_bytes: 4 * 1024 * 1024,
+            max_pages: 64,
+            max_sources: 128,
+            max_lock_millis: 1000,
+        }
+    }
+}
+
+impl SourceCheckBudget {
+    pub fn validate(&self) -> RuntimeEventStoreResult<()> {
+        let ceiling = Self::default();
+        if self.max_events == 0
+            || self.max_events > ceiling.max_events
+            || self.max_bytes == 0
+            || self.max_bytes > ceiling.max_bytes
+            || self.max_pages == 0
+            || self.max_pages > ceiling.max_pages
+            || self.max_sources == 0
+            || self.max_sources > ceiling.max_sources
+            || self.max_lock_millis == 0
+            || self.max_lock_millis > ceiling.max_lock_millis
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "invalid cumulative source-check budget".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Original immutable command and dependency cut. Neutral tails never rewrite
+/// this request or its idempotency hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedAppendRequest {
+    pub transaction: AppendTransactionRequest,
+    pub frame_digest: String,
+    pub budget: SourceCheckBudget,
+}
+
+impl CheckedAppendRequest {
+    pub fn identity_hash(&self) -> RuntimeEventStoreResult<String> {
+        self.budget.validate()?;
+        if self.frame_digest.is_empty()
+            || self.transaction.expected_streams.len() > self.budget.max_sources
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "missing frame or source-check source budget exceeded".into(),
+            ));
+        }
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                "checked-source-v1",
+                &self.transaction,
+                &self.frame_digest
+            ),)?)
+        ))
+    }
+}
+
+/// Only the original domain owner implements this trusted Rust interface.
+/// It must use its immutable frame and these bounded events only: no store
+/// access, locks, model/tool calls, or other IO inside validation.
+pub trait CheckedSourceValidator: Send + Sync {
+    fn frame_digest(&self) -> &str;
+    fn validate_tail(
+        &self,
+        source: &ExpectedStreamRevision,
+        observed_revision: u64,
+        events: &[DurableRuntimeEvent],
+    ) -> RuntimeEventStoreResult<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedSourceEvidence {
+    pub frame_digest: String,
+    pub sources: Vec<CommittedStreamRevision>,
+    pub events_read: usize,
+    pub bytes_read: usize,
+    pub pages_read: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedAppendReceipt {
+    pub commit: AppendTransactionReceipt,
+    pub validation: CheckedSourceEvidence,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTerminalInput {
     pub terminal_id: String,
@@ -633,6 +735,15 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+    fn append_checked_transaction(
+        &self,
+        _request: CheckedAppendRequest,
+        _validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<CheckedAppendReceipt> {
+        Err(RuntimeEventStoreError::InvalidTransaction(
+            "backend does not support checked-source transactions".into(),
+        ))
+    }
     fn append_transaction_with_terminal(
         &self,
         request: AppendTransactionRequest,

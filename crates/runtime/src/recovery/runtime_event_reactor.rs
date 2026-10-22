@@ -232,6 +232,12 @@ struct LaneRuntimeState {
 struct RegisteredLane {
     lane: Arc<RuntimeProjectionLane>,
     state: Arc<LaneRuntimeState>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+struct RetainedProjectionWorker {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    outcome: Option<Result<(), String>>,
 }
 
 pub struct RuntimeEventReactor {
@@ -240,7 +246,7 @@ pub struct RuntimeEventReactor {
     admission_capacity: usize,
     cancellation: CancellationToken,
     started: AtomicBool,
-    workers: Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>,
+    workers: Mutex<Vec<(String, Arc<tokio::sync::Mutex<RetainedProjectionWorker>>)>>,
     #[cfg(any(test, feature = "test-fixtures"))]
     notification_sources:
         Arc<Mutex<BTreeMap<String, (tokio::sync::watch::Receiver<u64>, Arc<AtomicU64>)>>>,
@@ -295,6 +301,7 @@ impl RuntimeEventReactor {
                 RegisteredLane {
                     lane: Arc::new(lane),
                     state: Arc::new(LaneRuntimeState::default()),
+                    wake: Arc::new(tokio::sync::Notify::new()),
                 },
             );
         }
@@ -319,7 +326,24 @@ impl RuntimeEventReactor {
         })
     }
 
+    /// Coalesced scheduling hint only: the lane rereads its durable sources.
+    /// One retained permit covers notifications arriving during a pass, without
+    /// spawning work or retaining a queue of graph identities.
+    pub(crate) fn wake_lane(&self, projection_id: &str) -> bool {
+        if self.cancellation.is_cancelled() {
+            return false;
+        }
+        let Some(registered) = self.lanes.get(projection_id) else {
+            return false;
+        };
+        registered.wake.notify_one();
+        true
+    }
+
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            return Err("Runtime event reactor admission is closed".to_string());
+        }
         if self.started.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -341,6 +365,9 @@ impl RuntimeEventReactor {
             .workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cancellation.is_cancelled() {
+            return Err("Runtime event reactor admission is closed".to_string());
+        }
         for (projection_id, registered) in &self.lanes {
             let projection_id = projection_id.clone();
             let lane = Arc::clone(&registered.lane);
@@ -348,6 +375,7 @@ impl RuntimeEventReactor {
             let event_store = Arc::clone(&self.event_store);
             let cancellation = self.cancellation.clone();
             let admission = Arc::clone(&admission);
+            let wake = Arc::clone(&registered.wake);
             let worker_projection_id = projection_id.clone();
             #[cfg(any(test, feature = "test-fixtures"))]
             let notification_sources = self.notification_sources.clone();
@@ -449,6 +477,7 @@ impl RuntimeEventReactor {
                             };
                             tokio::select! {
                                 _ = cancellation.cancelled() => break,
+                                _ = wake.notified() => {}
                                 changed = commits.changed() => {
                                     if changed.is_err() {
                                         break;
@@ -489,7 +518,13 @@ impl RuntimeEventReactor {
                     }
                 }
             });
-            workers.push((projection_id, worker));
+            workers.push((
+                projection_id,
+                Arc::new(tokio::sync::Mutex::new(RetainedProjectionWorker {
+                    handle: Some(worker),
+                    outcome: None,
+                })),
+            ));
         }
         Ok(())
     }
@@ -575,22 +610,33 @@ impl RuntimeEventReactor {
 
     pub async fn shutdown(&self) -> RuntimeEventReactorShutdownReport {
         self.cancellation.cancel();
-        let mut workers = std::mem::take(
-            &mut *self
-                .workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut report = RuntimeEventReactorShutdownReport::default();
-        for (projection_id, mut worker) in workers.drain(..) {
-            match tokio::time::timeout_at(deadline, &mut worker).await {
+        for (projection_id, worker) in workers {
+            let joined = tokio::time::timeout_at(deadline, async {
+                let mut worker = worker.lock().await;
+                if let Some(handle) = worker.handle.as_mut() {
+                    // Borrow the retained handle: dropping this shutdown waiter
+                    // or reaching its deadline must not detach physical work.
+                    let outcome = handle.await.map_err(|error| error.to_string());
+                    worker.handle = None;
+                    worker.outcome = Some(outcome);
+                }
+                worker
+                    .outcome
+                    .clone()
+                    .expect("joined projection worker outcome")
+            })
+            .await;
+            match joined {
                 Ok(Ok(())) => report.drained_lanes.push(projection_id),
                 Ok(Err(error)) => report.join_errors.push(format!("{projection_id}: {error}")),
-                Err(_) => {
-                    worker.abort();
-                    report.timed_out_lanes.push(projection_id);
-                }
+                Err(_) => report.timed_out_lanes.push(projection_id),
             }
         }
         report
@@ -728,12 +774,134 @@ mod tests {
         assert!(error.contains("duplicate Runtime projection lane"));
     }
 
+    #[tokio::test]
+    async fn explicit_wakes_during_a_pass_coalesce_and_stop_at_shutdown() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rescanned = Arc::new(tokio::sync::Notify::new());
+        let passes = Arc::new(AtomicUsize::new(0));
+        let mut description = descriptor("projector:explicit-wake");
+        description.safety_tick = Duration::from_secs(60);
+        let lane = RuntimeProjectionLane::asynchronous(description, {
+            let entered = entered.clone();
+            let release = release.clone();
+            let rescanned = rescanned.clone();
+            let passes = passes.clone();
+            move |_| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let rescanned = rescanned.clone();
+                let passes = passes.clone();
+                Box::pin(async move {
+                    if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.notify_one();
+                        release.notified().await;
+                    } else {
+                        rescanned.notify_one();
+                    }
+                    Ok(RuntimeProjectionPass::default())
+                })
+            }
+        });
+        let reactor = Arc::new(RuntimeEventReactor::sealed(store, [lane]).unwrap());
+        assert!(!reactor.wake_lane("missing"));
+        reactor.start().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        for _ in 0..10_000 {
+            assert!(reactor.wake_lane("projector:explicit-wake"));
+        }
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "no concurrent reentry");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), rescanned.notified())
+            .await
+            .unwrap();
+        let report = reactor.shutdown().await;
+        assert_eq!(report.drained_lanes, ["projector:explicit-wake"]);
+        assert!(report.timed_out_lanes.is_empty());
+        assert!(report.join_errors.is_empty());
+        assert_eq!(passes.load(Ordering::SeqCst), 2, "bounded coalescing");
+        assert!(!reactor.wake_lane("projector:explicit-wake"));
+    }
+
     #[test]
     fn admission_capacity_respects_every_resource_bound() {
         assert_eq!(admission_capacity(8, 16, 4), 4);
         assert_eq!(admission_capacity(8, 2, 16), 2);
         assert_eq!(admission_capacity(1, 16, 16), 1);
         assert_eq!(admission_capacity(0, 0, 0), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoned_shutdown_retains_blocking_work_until_physical_return() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
+        let lane = RuntimeProjectionLane::blocking(descriptor("projector:physical-drain"), {
+            let entered = entered.clone();
+            move |_| {
+                entered.notify_one();
+                wait.lock().unwrap().recv().unwrap();
+                Ok(RuntimeProjectionPass::default())
+            }
+        });
+        let reactor = Arc::new(RuntimeEventReactor::sealed(store, [lane]).unwrap());
+        reactor.start().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        // Polling then dropping the shutdown future is a cancelled caller, not
+        // permission to abandon the worker's join or its blocking IO.
+        let mut first = Box::pin(reactor.shutdown());
+        assert!(futures::poll!(&mut first).is_pending());
+        drop(first);
+        let mut second = Box::pin(reactor.shutdown());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert!(!reactor.wake_lane("projector:physical-drain"));
+        release.send(()).unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap();
+        assert_eq!(report.drained_lanes, ["projector:physical-drain"]);
+        assert!(report.timed_out_lanes.is_empty());
+        assert!(report.join_errors.is_empty());
+        assert_eq!(reactor.shutdown().await, report);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n1_shutdown_timeout_retains_join_and_rejects_new_admission() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let lane = RuntimeProjectionLane::asynchronous(descriptor("projector:late-exit"), {
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_| {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(RuntimeProjectionPass::default())
+                })
+            }
+        });
+        let reactor = Arc::new(RuntimeEventReactor::sealed(store, [lane]).unwrap());
+        reactor.start().unwrap();
+        entered.notified().await;
+        let first = reactor.shutdown().await;
+        assert!(first.drained_lanes.is_empty());
+        assert_eq!(first.timed_out_lanes, ["projector:late-exit"]);
+        assert!(reactor.start().is_err());
+        assert!(!reactor.wake_lane("projector:late-exit"));
+        release.notify_one();
+        let second = reactor.shutdown().await;
+        assert_eq!(second.drained_lanes, ["projector:late-exit"]);
+        assert!(second.timed_out_lanes.is_empty());
+        assert!(second.join_errors.is_empty());
     }
 
     #[tokio::test]

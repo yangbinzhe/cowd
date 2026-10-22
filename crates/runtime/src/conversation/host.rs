@@ -1524,11 +1524,11 @@ where
             .lock()
             .await
             .restore_controlled_recovery_claims_for_turn(&session_id, &turn_ref, &graph_id)?;
-        let persisted_graph = services
-            .graph_state_store()
-            .load_async(&graph_id)
-            .await
-            .ok();
+        let persisted_graph = match services.graph_state_store().load_async(&graph_id).await {
+            Ok(graph) => Some(graph),
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => None,
+            Err(error) => return Err(RuntimeError::new(error.to_string())),
+        };
         services
             .model_step_executor()
             .install_resolver(Arc::new(TurnModelResolver {
@@ -1556,104 +1556,36 @@ where
                 state: Arc::downgrade(&state),
                 services: Arc::downgrade(&services),
             }));
-        let run_result = if persisted_graph.is_some() {
-            let recovered_root = services.execution_supervisor().recover_graph(&graph_id)
-            .await
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-            if execution_role == TurnExecutionRole::RootTurn && ingress.is_none() {
-                if recovered_root.lineage != graph.lineage
-                    || recovered_root.parent_execution != graph.parent_execution
-                {
-                    return Err(RuntimeError::new("recovered direct root identity mismatch"));
-                }
-                let lineage = recovered_root.lineage.as_ref().ok_or_else(|| {
-                    RuntimeError::new("registered direct root requires lineage")
-                })?;
-                services.record_live_execution(
-                    &lineage.session_id,
-                    recovered_root.id.clone(),
-                    lineage.turn_id.clone(),
-                );
-                let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
-                    RuntimeError::new("owned root requires its event bus")
-                })?;
-                (owned_root_scope, owned_root_bus_lease) =
-                    enter_owned_root_scope(&services, &bus, &recovered_root, None)?;
+        let recovering = persisted_graph.is_some();
+        let mut registered = if recovering {
+            let recovered = services.execution_supervisor().recover_graph(&graph_id)
+                .await.map_err(|error| RuntimeError::new(error.to_string()))?;
+            if execution_role == TurnExecutionRole::RootTurn && ingress.is_none()
+                && (recovered.lineage != graph.lineage
+                    || recovered.parent_execution != graph.parent_execution)
+            {
+                return Err(RuntimeError::new("recovered direct root identity mismatch"));
             }
-            let revised_strategy = runtime
-                .lock()
-                .await
-                .active_turn_strategy()
-                .ok_or_else(|| {
-                    RuntimeError::new("strategy owner disappeared after recovered Team admission")
-                })?;
-            if revised_strategy.decision.compile_target != compile_target {
-                let recovered = services
-                    .graph_state_store()
-                    .load_async(&graph_id)
-                    .await
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                let replacement = compile_retargeted_conversation_graph(
-                    &recovered,
-                    content,
-                    &session_id,
-                    ingress.as_ref(),
-                    revised_strategy.decision.compile_target,
-                    &strategy_parent_node_id,
-                )?;
-                services
-                    .commit_service()
-                    .retarget_planned_graph_async(
-                        recovered,
-                        replacement,
-                        format!(
-                            "recovered strategy decision {} revision {} downgraded compile target before execution",
-                            revised_strategy.decision_id, revised_strategy.revision,
-                        ),
-                    )
-                    .await
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-            }
-            services
-                .execution_supervisor()
-                .drive_registered(&graph_id)
-                .await
-                .map(|(_, report)| report)
+            recovered
         } else {
-            let mut registered = services
-                .execution_supervisor()
+            services.execution_supervisor()
                 .register_continuation_graph(graph, continuation_actor)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            if execution_role == TurnExecutionRole::RootTurn && ingress.is_none() {
-                let lineage = registered.lineage.as_ref().ok_or_else(|| {
-                    RuntimeError::new("registered direct root requires lineage")
-                })?;
-                services.record_live_execution(
-                    &lineage.session_id,
-                    registered.id.clone(),
-                    lineage.turn_id.clone(),
-                );
-                let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
-                    RuntimeError::new("owned root requires its event bus")
-                })?;
-                (owned_root_scope, owned_root_bus_lease) =
-                    enter_owned_root_scope(&services, &bus, &registered, None)?;
-            }
-            if let Some(lineage) = registered.lineage.as_ref() {
-                services
-                    .task_runtime_port()
-                    .link_existing_graph(
-                        &lineage.task_id,
-                        &registered.id,
-                        registered.revision,
-                        vec![harness_contract::reality::EvidenceRef::observed(
-                            "execution_graph",
-                            registered.id.clone(),
-                        )],
-                    )
-                    .map_err(RuntimeError::new)?;
-            }
+                .await.map_err(|error| RuntimeError::new(error.to_string()))?
+        };
+        if execution_role == TurnExecutionRole::RootTurn && ingress.is_none() {
+            let lineage = registered.lineage.as_ref().ok_or_else(|| {
+                RuntimeError::new("registered direct root requires lineage")
+            })?;
+            services.record_live_execution(
+                &lineage.session_id, registered.id.clone(), lineage.turn_id.clone(),
+            );
+            let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
+                RuntimeError::new("owned root requires its event bus")
+            })?;
+            (owned_root_scope, owned_root_bus_lease) =
+                enter_owned_root_scope(&services, &bus, &registered, None)?;
+        }
+        if !recovering {
             // Publish the durable graph ID before execution. Surfaces can now
             // attach their cursor stream while model/tool nodes are running;
             // the final summary below remains an update, not the first hint.
@@ -1678,49 +1610,64 @@ where
                     },
                 });
             }
-            let revised_strategy = runtime
-                .lock()
-                .await
-                .active_turn_strategy()
-                .ok_or_else(|| {
-                    RuntimeError::new("strategy owner disappeared after Team admission")
-                })?;
-            if revised_strategy.decision.compile_target != compile_target {
-                let replacement = compile_retargeted_conversation_graph(
-                    &registered,
-                    content,
-                    &session_id,
-                    ingress.as_ref(),
-                    revised_strategy.decision.compile_target,
-                    &strategy_parent_node_id,
-                )?;
-                services
-                    .commit_service()
-                    .retarget_planned_graph_async(
-                        registered.clone(),
-                        replacement,
-                        format!(
-                            "strategy decision {} revision {} downgraded compile target from {:?} to {:?} before parent execution",
-                            revised_strategy.decision_id,
-                            revised_strategy.revision,
-                            compile_target,
-                            revised_strategy.decision.compile_target,
-                        ),
-                    )
-                    .await
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                registered = services
-                    .graph_state_store()
-                    .load_async(&graph_id)
-                    .await
+        }
+        let revised_strategy = runtime
+            .lock()
+            .await
+            .active_turn_strategy()
+            .ok_or_else(|| {
+                RuntimeError::new("strategy owner disappeared after Team admission")
+            })?;
+        if revised_strategy.decision.compile_target != compile_target {
+            if recovering {
+                registered = services.graph_state_store().load_async(&graph_id).await
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
             }
+            let replacement = compile_retargeted_conversation_graph(
+                &registered,
+                content,
+                &session_id,
+                ingress.as_ref(),
+                revised_strategy.decision.compile_target,
+                &strategy_parent_node_id,
+            )?;
             services
-                .execution_supervisor()
-                .drive_registered(&registered.id)
+                .commit_service()
+                .retarget_planned_graph_async(
+                    registered.clone(),
+                    replacement,
+                    format!(
+                        "strategy decision {} revision {} downgraded compile target from {:?} to {:?} before parent execution",
+                        revised_strategy.decision_id,
+                        revised_strategy.revision,
+                        compile_target,
+                        revised_strategy.decision.compile_target,
+                    ),
+                )
                 .await
-                .map(|(_, report)| report)
-        };
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            registered = services
+                .graph_state_store()
+                .load_async(&graph_id)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        if let Some(lineage) = registered.lineage.as_ref() {
+            services
+                .task_runtime_port()
+                .link_existing_graph(
+                    &lineage.task_id,
+                    &registered.id,
+                    registered.revision,
+                    vec![harness_contract::reality::EvidenceRef::observed(
+                        "execution_graph",
+                        registered.id.clone(),
+                    )],
+                )
+                .map_err(RuntimeError::new)?;
+        }
+        let run_result = services.execution_supervisor()
+            .drive_registered(&registered.id).await.map(|(_, report)| report);
         run_result.map_err(|error| RuntimeError::new(error.to_string()))?;
         // Agent-first collaboration parks the root graph on a durable
         // WaitingExternal barrier while child graphs run. Keep the ingress

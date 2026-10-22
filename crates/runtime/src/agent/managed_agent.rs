@@ -365,6 +365,28 @@ impl ManagedAgentDispatcher {
         Ok(values)
     }
 
+    /// Read a bounded pending page from the original projection. The extra
+    /// entry tells the consumer whether to retain a continuation cursor.
+    pub(crate) fn running_invocation_page(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Vec<ManagedAgentInvocation> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let state = self
+            .state_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .invocations
+            .range::<str, _>((Excluded(after), Unbounded))
+            .map(|(_, invocation)| invocation)
+            .filter(|invocation| invocation.status == ManagedAgentInvocationStatus::Running)
+            .take(limit.max(1).saturating_add(1))
+            .cloned()
+            .collect()
+    }
+
     pub fn outbox(&self) -> Result<Vec<FencedEffectOutboxRecord>, String> {
         let state = self.state()?;
         let mut values = state.outbox.into_values().collect::<Vec<_>>();
@@ -1838,6 +1860,59 @@ mod tests {
                 now_ms,
             )
             .expect("start");
+    }
+
+    #[test]
+    fn n1_running_pages_resume_after_cold_projection_without_skipping_pending_work() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let dispatcher = ManagedAgentDispatcher::event_sourced(store.clone(), "n1-pages").unwrap();
+        let mut expected = Vec::new();
+        for index in 0..4 {
+            let mut definition = definition(ManagedAgentTrigger::Manual);
+            definition.managed_agent_id = format!("workspace/n1/page-{index}");
+            let definition = dispatcher.register_definition(definition, 1).unwrap();
+            dispatcher
+                .trigger_manual(&definition.managed_agent_id, "request", 2)
+                .unwrap();
+            let claim = dispatcher
+                .claim_ready("page-owner", 3, 120_000, 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            materialize_and_start(
+                &dispatcher,
+                &claim,
+                "page-owner",
+                &format!("graph-{index}"),
+                4,
+            );
+            expected.push(claim.invocation_id);
+        }
+        let mut pending = definition(ManagedAgentTrigger::Manual);
+        pending.managed_agent_id = "workspace/n1/not-running".into();
+        let pending = dispatcher.register_definition(pending, 5).unwrap();
+        dispatcher
+            .trigger_manual(&pending.managed_agent_id, "pending", 6)
+            .unwrap();
+        expected.sort();
+        let first = dispatcher.running_invocation_page("", 2);
+        assert_eq!(first.len(), 3, "two entries plus one continuation witness");
+        assert_eq!(first[0].invocation_id, expected[0]);
+        assert_eq!(first[1].invocation_id, expected[1]);
+        let cursor = first[1].invocation_id.clone();
+        drop(dispatcher);
+        let recovered = ManagedAgentDispatcher::event_sourced(store, "n1-pages").unwrap();
+        let second = recovered.running_invocation_page(&cursor, 2);
+        assert_eq!(
+            second
+                .iter()
+                .map(|entry| entry.invocation_id.clone())
+                .collect::<Vec<_>>(),
+            expected[2..]
+        );
+        assert!(recovered
+            .running_invocation_page(&expected[3], 2)
+            .is_empty());
     }
 
     #[test]

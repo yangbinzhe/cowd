@@ -2629,69 +2629,8 @@ impl RuntimeServices {
         let mut completed = Vec::new();
         let mut failed = Vec::new();
         for invocation in running {
-            let Some(graph_id) = invocation.execution_ref.as_deref() else {
+            let Some(terminal) = self.reconcile_managed_agent_invocation(invocation).await? else {
                 continue;
-            };
-            let graph = match self.graph_state_store.load_async(graph_id).await {
-                Ok(graph) => graph,
-                Err(ExecutionStateStoreError::NotFound { .. }) => continue,
-                Err(error) => return Err(RuntimeServicesError::GraphState(error)),
-            };
-            if graph
-                .node_statuses
-                .values()
-                .any(|status| !status.is_terminal())
-            {
-                continue;
-            }
-            let succeeded = !graph.node_statuses.is_empty()
-                && graph
-                    .node_statuses
-                    .values()
-                    .all(|status| *status == ExecutionNodeStatus::Completed);
-            let dispatcher_id = invocation.claimed_by.as_deref().ok_or_else(|| {
-                RuntimeServicesError::Invariant(format!(
-                    "running managed invocation `{}` has no dispatcher fence owner",
-                    invocation.invocation_id
-                ))
-            })?;
-            let mut evidence_refs = graph
-                .node_results
-                .values()
-                .flat_map(|result| result.evidence_refs.iter())
-                .map(|reference| reference.evidence_ref.id.clone())
-                .collect::<Vec<_>>();
-            evidence_refs.push(format!("execution-graph:{graph_id}@{}", graph.revision));
-            evidence_refs.sort();
-            evidence_refs.dedup();
-            let terminal = match self.managed_agents.complete_invocation(
-                &invocation.invocation_id,
-                dispatcher_id,
-                invocation.fence_generation,
-                succeeded,
-                now_ms(),
-                Some(graph_id.to_string()),
-                evidence_refs,
-                (!succeeded).then(|| {
-                    format!(
-                        "managed execution graph reached non-success terminal state at revision {}",
-                        graph.revision
-                    )
-                }),
-            ) {
-                Ok(terminal) => terminal,
-                Err(error) => {
-                    let current = self
-                        .managed_agents
-                        .invocations()
-                        .map_err(RuntimeServicesError::Mission)?
-                        .into_iter()
-                        .find(|current| current.invocation_id == invocation.invocation_id);
-                    match current {
-                        Some(current) if !current.status.is_active() => current,
-                        _ => return Err(RuntimeServicesError::Mission(error)),
-                    }
-                }
             };
             if terminal.status == crate::ManagedAgentInvocationStatus::Completed {
                 completed.push(terminal);
@@ -2700,6 +2639,77 @@ impl RuntimeServices {
             }
         }
         Ok((completed, failed))
+    }
+
+    pub(super) async fn reconcile_managed_agent_invocation(
+        &self,
+        invocation: crate::ManagedAgentInvocation,
+    ) -> Result<Option<crate::ManagedAgentInvocation>, RuntimeServicesError> {
+        let Some(graph_id) = invocation.execution_ref.as_deref() else {
+            return Ok(None);
+        };
+        let graph = match self.graph_state_store.load_async(graph_id).await {
+            Ok(graph) => graph,
+            Err(ExecutionStateStoreError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(RuntimeServicesError::GraphState(error)),
+        };
+        if graph
+            .node_statuses
+            .values()
+            .any(|status| !status.is_terminal())
+        {
+            return Ok(None);
+        }
+        let succeeded = !graph.node_statuses.is_empty()
+            && graph
+                .node_statuses
+                .values()
+                .all(|status| *status == ExecutionNodeStatus::Completed);
+        let dispatcher_id = invocation.claimed_by.as_deref().ok_or_else(|| {
+            RuntimeServicesError::Invariant(format!(
+                "running managed invocation `{}` has no dispatcher fence owner",
+                invocation.invocation_id
+            ))
+        })?;
+        let mut evidence_refs = graph
+            .node_results
+            .values()
+            .flat_map(|result| result.evidence_refs.iter())
+            .map(|reference| reference.evidence_ref.id.clone())
+            .collect::<Vec<_>>();
+        evidence_refs.push(format!("execution-graph:{graph_id}@{}", graph.revision));
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let terminal = match self.managed_agents.complete_invocation(
+            &invocation.invocation_id,
+            dispatcher_id,
+            invocation.fence_generation,
+            succeeded,
+            now_ms(),
+            Some(graph_id.to_string()),
+            evidence_refs,
+            (!succeeded).then(|| {
+                format!(
+                    "managed execution graph reached non-success terminal state at revision {}",
+                    graph.revision
+                )
+            }),
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let current = self
+                    .managed_agents
+                    .invocations()
+                    .map_err(RuntimeServicesError::Mission)?
+                    .into_iter()
+                    .find(|current| current.invocation_id == invocation.invocation_id);
+                match current {
+                    Some(current) if !current.status.is_active() => current,
+                    _ => return Err(RuntimeServicesError::Mission(error)),
+                }
+            }
+        };
+        Ok(Some(terminal))
     }
 
     async fn submit_managed_agent_invocation(

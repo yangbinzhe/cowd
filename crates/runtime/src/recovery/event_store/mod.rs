@@ -430,6 +430,32 @@ impl RuntimeEventStore {
         Ok(receipt)
     }
 
+    pub fn append_checked_transaction(
+        &self,
+        mut request: CheckedAppendRequest,
+        validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<CheckedAppendReceipt> {
+        self.ensure_graph_transaction_recovery_admitted(&request.transaction)?;
+        self.validate_content_publication(&mut request.transaction)?;
+        request.identity_hash()?;
+        if request.frame_digest != validator.frame_digest() {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "source validator frame mismatch".into(),
+            ));
+        }
+        let streams = request
+            .transaction
+            .expected_streams
+            .iter()
+            .map(|source| source.stream_id.clone())
+            .collect::<Vec<_>>();
+        let receipt = self.with_stream_locks(&streams, || {
+            self.backend.append_checked_transaction(request, validator)
+        })?;
+        self.publish_commit(receipt.commit.commit_cursor);
+        Ok(receipt)
+    }
+
     pub fn list_stream_after(
         &self,
         stream_id: &str,

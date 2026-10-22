@@ -840,6 +840,41 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         Ok(receipt)
     }
 
+    fn append_checked_transaction(
+        &self,
+        request: CheckedAppendRequest,
+        validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<CheckedAppendReceipt> {
+        request.identity_hash()?;
+        if validator.frame_digest() != request.frame_digest {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "source frame mismatch".into(),
+            ));
+        }
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        pg(tx.query_one(
+            "SELECT set_config('statement_timeout', $1, true)",
+            &[&format!("{}ms", request.budget.max_lock_millis)],
+        ))?;
+        let commit = append_transaction_in_tx_checked(
+            &mut tx,
+            &request.transaction,
+            None,
+            Some((&request, validator)),
+        )?;
+        let row = pg(tx.query_one(
+            "SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1",
+            &[&request.transaction.transaction_id],
+        ))?;
+        let evidence: Option<Value> = pg(row.try_get(0))?;
+        let validation = serde_json::from_value(evidence.ok_or_else(|| {
+            RuntimeEventStoreError::Corrupt("checked commit missing source evidence".into())
+        })?)?;
+        pg(tx.commit())?;
+        Ok(CheckedAppendReceipt { commit, validation })
+    }
+
     fn append_transaction_with_terminal(
         &self,
         request: AppendTransactionRequest,
@@ -2473,6 +2508,15 @@ fn append_transaction_in_tx(
     request: &AppendTransactionRequest,
     terminal: Option<&SessionTerminalInput>,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+    append_transaction_in_tx_checked(tx, request, terminal, None)
+}
+
+fn append_transaction_in_tx_checked(
+    tx: &mut PostgresTransaction<'_>,
+    request: &AppendTransactionRequest,
+    terminal: Option<&SessionTerminalInput>,
+    checked: Option<(&CheckedAppendRequest, &dyn CheckedSourceValidator)>,
+) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
     validate_transaction(request)?;
     RuntimeEventStore::validate_current_content_inputs(request)?;
     if let Some(terminal) = terminal {
@@ -2483,7 +2527,11 @@ fn append_transaction_in_tx(
             )));
         }
     }
-    let request_hash = request_hash_with_terminal(request, terminal)?;
+    let request_hash = match checked {
+        Some((request, _)) => request.identity_hash()?,
+        None => request_hash_with_terminal(request, terminal)?,
+    };
+    let held_since = std::time::Instant::now();
     let transaction_lock = format!("cowd-runtime-event-transaction:{}", request.transaction_id);
     pg(tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -2515,14 +2563,93 @@ fn append_transaction_in_tx(
             &[&stream_lock],
         ))?;
     }
-    let expected = request
+    let mut expected = request
         .expected_streams
         .iter()
         .map(|stream| (stream.stream_id.as_str(), stream.expected_revision))
         .collect::<BTreeMap<_, _>>();
+    let mut evidence = checked.map(|(request, _)| CheckedSourceEvidence {
+        frame_digest: request.frame_digest.clone(),
+        sources: Vec::new(),
+        events_read: 0,
+        bytes_read: 0,
+        pages_read: 0,
+    });
     for stream in &request.expected_streams {
         let actual = stream_head(tx, &stream.stream_id)?;
-        if actual != stream.expected_revision {
+        if let Some((checked, validator)) = checked {
+            let evidence = evidence.as_mut().expect("checked evidence initialized");
+            let count = actual
+                .checked_sub(stream.expected_revision)
+                .ok_or_else(|| {
+                    RuntimeEventStoreError::Corrupt("source cut exceeds current head".into())
+                })?;
+            let count = usize::try_from(count).map_err(|_| {
+                RuntimeEventStoreError::HistoryBudgetExceeded("source count overflow".into())
+            })?;
+            evidence.events_read = evidence.events_read.saturating_add(count);
+            evidence.pages_read = evidence.pages_read.saturating_add(count.div_ceil(64));
+            if evidence.events_read > checked.budget.max_events
+                || evidence.pages_read > checked.budget.max_pages
+            {
+                return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                    "cumulative source tail budget".into(),
+                ));
+            }
+            let metadata = pg(tx.query(
+                "SELECT sequence,encoded_bytes FROM runtime_events WHERE stream_id=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT $4",
+                &[&stream.stream_id, &to_i64(stream.expected_revision, "source cut")?,
+                  &to_i64(actual, "source head")?, &to_i64(count as u64, "source count")?]))?;
+            if metadata.len() != count {
+                return Err(RuntimeEventStoreError::Corrupt(
+                    "incomplete source tail".into(),
+                ));
+            }
+            for (offset, row) in metadata.iter().enumerate() {
+                let sequence = from_i64(pg(row.try_get(0))?, "source sequence")?;
+                if sequence != stream.expected_revision + offset as u64 + 1 {
+                    return Err(RuntimeEventStoreError::Corrupt(
+                        "discontinuous source tail".into(),
+                    ));
+                }
+                let bytes = from_i64(pg(row.try_get(1))?, "source bytes")?;
+                evidence.bytes_read = evidence
+                    .bytes_read
+                    .saturating_add(16)
+                    .saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
+            }
+            if evidence.bytes_read > checked.budget.max_bytes
+                || held_since.elapsed().as_millis() > u128::from(checked.budget.max_lock_millis)
+            {
+                return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                    "cumulative source bytes or held time".into(),
+                ));
+            }
+            let rows = pg(tx.query(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT $4"),
+                &[&stream.stream_id, &to_i64(stream.expected_revision, "source cut")?,
+                  &to_i64(actual, "source head")?, &to_i64(count as u64, "source count")?]))?;
+            let events = rows
+                .iter()
+                .map(row_to_event)
+                .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
+            if events.len() != count {
+                return Err(RuntimeEventStoreError::Corrupt(
+                    "source tail changed under guard".into(),
+                ));
+            }
+            validator.validate_tail(stream, actual, &events)?;
+            if held_since.elapsed().as_millis() > u128::from(checked.budget.max_lock_millis) {
+                return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                    "source validator held time".into(),
+                ));
+            }
+            evidence.sources.push(CommittedStreamRevision {
+                stream_id: stream.stream_id.clone(),
+                expected_revision: stream.expected_revision,
+                committed_revision: actual,
+            });
+            expected.insert(stream.stream_id.as_str(), actual);
+        } else if actual != stream.expected_revision {
             return Err(RuntimeEventStoreError::StaleRevision {
                 stream_id: stream.stream_id.clone(),
                 expected: stream.expected_revision,
@@ -2546,6 +2673,15 @@ fn append_transaction_in_tx(
         ],
     ))?;
     let commit_cursor = from_i64(pg(row.try_get(0))?, "commit_cursor")?;
+    if let Some(evidence) = evidence {
+        pg(tx.execute(
+            "UPDATE runtime_commits SET checked_source_evidence=$1 WHERE commit_cursor=$2",
+            &[
+                &serde_json::to_value(evidence)?,
+                &to_i64(commit_cursor, "commit cursor")?,
+            ],
+        ))?;
+    }
     if let Some(terminal) = terminal {
         insert_terminal_in_tx(tx, terminal, commit_cursor)?;
     }
@@ -2630,7 +2766,7 @@ fn append_transaction_in_tx(
     }
     let mut stream_revisions = Vec::with_capacity(request.expected_streams.len());
     for stream in &request.expected_streams {
-        let committed_revision = stream.expected_revision
+        let committed_revision = expected[stream.stream_id.as_str()]
             + increments
                 .get(stream.stream_id.as_str())
                 .copied()
@@ -2659,6 +2795,13 @@ fn append_transaction_in_tx(
             expected_revision: stream.expected_revision,
             committed_revision,
         });
+    }
+    if checked.is_some_and(|(request, _)| {
+        held_since.elapsed().as_millis() > u128::from(request.budget.max_lock_millis)
+    }) {
+        return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+            "source transaction held time".into(),
+        ));
     }
     Ok(AppendTransactionReceipt {
         commit_cursor,

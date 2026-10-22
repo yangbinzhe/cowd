@@ -1552,54 +1552,18 @@ impl RuntimeServices {
         })
     }
 
-    /// Install the single settled-graph observer after `RuntimeServices` has
-    /// been fully assembled. Keeping the callback on an `Arc` lets it invoke
-    /// the complete recovery executor without constructing a second service
-    /// graph or capturing a strong self-cycle.
+    /// A settled callback only wakes the original durable consumer. The reactor
+    /// owns its work and join; no callback can retain or independently drive the
+    /// Runtime after shutdown.
     pub(crate) fn install_graph_settled_observer(
         self: &Arc<Self>,
     ) -> Result<(), RuntimeServicesError> {
-        let managed_projection_store = self.graph_state_store.clone();
-        let managed_projection_dispatcher = Arc::clone(&self.managed_agents);
-        // The observer is retained by this supervisor. Capturing its strong Arc
-        // here would keep the runner, event store and PostgreSQL pool alive even
-        // after shutdown and after RuntimeServices itself has been dropped.
-        let settled_lineage_supervisor = Arc::downgrade(&self.execution_supervisor);
-        let settled_agentic_actions = self.agent_action_service();
-        let settled_services = Arc::downgrade(self);
+        let reactor = Arc::downgrade(&self.event_reactor);
         self.execution_supervisor
-            .install_graph_settled_observer(move |graph_id| {
-                let graph_id = graph_id.to_string();
-                let graph_store = managed_projection_store.clone();
-                let dispatcher = Arc::clone(&managed_projection_dispatcher);
-                let Some(lineage_supervisor) = settled_lineage_supervisor.upgrade() else {
-                    return;
-                };
-                let agentic_actions = settled_agentic_actions.clone();
-                let services = settled_services.clone();
-                tokio::spawn(async move {
-                    if let Some(services) = services.upgrade() {
-                        if let Err(error) = services.retry_agentic_run_exit(&graph_id).await {
-                            tracing::warn!(graph_id, %error, "Agent exit settlement awaits original durable lane retry");
-                        }
-                    }
-                    if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
-                        &graph_id,
-                        &agentic_actions,
-                        &graph_store,
-                        lineage_supervisor.as_ref(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(graph_id, %error, "settled Agent graph could not wake its Agentic Program root barrier");
-                    }
-                    if let Err(error) =
-                        project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
-                            .await
-                    {
-                        tracing::warn!(graph_id, error, "managed Agent terminal projector could not reduce graph state");
-                    }
-                });
+            .install_graph_settled_observer(move |_graph_id| {
+                if let Some(reactor) = reactor.upgrade() {
+                    reactor.wake_lane(AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID);
+                }
             })
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
@@ -4751,6 +4715,10 @@ fn agentic_program_wait_resolution_lane(
 fn agentic_settled_graph_resolution_interest() -> crate::RuntimeProjectionInterest {
     crate::RuntimeProjectionInterest::new([
         crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::ManagedAgent,
+            "managed_agent.invocation.started.v1",
+        ),
+        crate::RuntimeProjectionEventInterest::new(
             RuntimeEventScope::ExecutionNode,
             "execution_node.transitioned",
         ),
@@ -4804,10 +4772,6 @@ fn agentic_settled_graph_resolution_lane(
                 let services = agent_runtime
                     .services()
                     .ok_or("Agent exit reconciliation lane has no bound RuntimeServices")?;
-                if page.scanned_commits == 0 {
-                    services.retry_pending_agentic_run_exits().await?;
-                    return Ok(crate::RuntimeProjectionPass::default());
-                }
                 let mut touched_graphs = BTreeSet::new();
                 let mut unscoped_effect_receipt = false;
                 for batch in &page.batches {
@@ -4823,10 +4787,39 @@ fn agentic_settled_graph_resolution_lane(
                         }
                     }
                 }
+                // Running invocations are durable pending work, independently
+                // of the event cursor. Rotate a bounded page so a long-running
+                // prefix cannot hide later terminal graphs after a restart.
+                let managed_after = checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.payload.get("managed_after"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let mut pending_managed = services
+                    .managed_agents
+                    .running_invocation_page(managed_after, batch_size);
+                let managed_backlog = pending_managed.len() > batch_size.max(1);
+                pending_managed.truncate(batch_size.max(1));
+                let next_managed_after = if managed_backlog {
+                    pending_managed
+                        .last()
+                        .map(|invocation| invocation.invocation_id.clone())
+                } else {
+                    None
+                };
+                let mut managed_errors = Vec::new();
+                for invocation in pending_managed {
+                    if let Err(error) = services
+                        .reconcile_managed_agent_invocation(invocation)
+                        .await
+                    {
+                        managed_errors.push(error.to_string());
+                    }
+                }
                 // A graph may settle before or after its Program root commits the
                 // durable wait. Reconcile both the transitioned graph and its
                 // linked Agent children so either event order closes the barrier.
-                let mut exit_errors = Vec::new();
+                let mut exit_errors = managed_errors;
                 for graph_id in &touched_graphs {
                     if let Err(error) = services.retry_agentic_run_exit(graph_id).await {
                         exit_errors.push(format!("{graph_id}:{error}"));
@@ -4867,7 +4860,8 @@ fn agentic_settled_graph_resolution_lane(
                     })
                     .unwrap_or(0);
                 let retry_now_ms = now_ms();
-                if unscoped_effect_receipt
+                if page.scanned_commits == 0
+                    || unscoped_effect_receipt
                     || retry_now_ms < last_exit_retry_ms
                     || retry_now_ms.saturating_sub(last_exit_retry_ms) >= 5_000
                 {
@@ -4879,6 +4873,9 @@ fn agentic_settled_graph_resolution_lane(
                 if !exit_errors.is_empty() {
                     return Err(exit_errors.join("; "));
                 }
+                if page.scanned_commits == 0 && managed_after.is_empty() && !managed_backlog {
+                    return Ok(crate::RuntimeProjectionPass::default());
+                }
                 // The checkpoint advances only after every matching join was
                 // either atomically resolved or proven inapplicable/terminal.
                 event_store
@@ -4888,15 +4885,17 @@ fn agentic_settled_graph_resolution_lane(
                         &serde_json::json!({
                             "source_cursor": page.scanned_through_cursor,
                             "resolved_graphs": touched_graphs.len(),
+                            "managed_after": next_managed_after,
                             "last_exit_retry_ms": last_exit_retry_ms,
                         }),
                         now_ms(),
                     )
                     .map_err(|error| error.to_string())?;
-                Ok(
+                let mut pass =
                     crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
-                        .with_matches(page.matched_events),
-                )
+                        .with_matches(page.matched_events);
+                pass.backlog |= managed_backlog;
+                Ok(pass)
             })
         },
     ))
@@ -4941,6 +4940,149 @@ mod exact_exit_lane_tests {
     }
 
     #[tokio::test]
+    async fn n1_managed_terminal_projection_handles_both_durable_orders() {
+        use harness_contract::agent::{AgentDefinitionId, DefinitionScope, RevisionSelector};
+        use harness_contract::execution_graph::{ExecutionNodeKind, ExecutionNodeSpec};
+        use harness_contract::managed_agent::*;
+        for graph_first in [false, true] {
+            let services = RuntimeServices::in_memory().unwrap();
+            let dispatcher = services.managed_agents.clone();
+            let definition = dispatcher
+                .register_definition(
+                    ManagedAgentDefinition {
+                        managed_agent_id: "workspace/n1/managed".into(),
+                        revision: 1,
+                        target: ManagedAgentTarget::Agent {
+                            definition_id: AgentDefinitionId::new(
+                                DefinitionScope::Workspace,
+                                "n1/managed",
+                            )
+                            .unwrap(),
+                            selector: RevisionSelector::LatestApprovedStable,
+                        },
+                        trigger: ManagedAgentTrigger::Manual,
+                        session_id: "n1-managed-session".into(),
+                        objective: "project canonical execution terminal".into(),
+                        acceptance: vec![],
+                        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                        model_lease: "default".into(),
+                        granted_capabilities: vec![harness_contract::agent::AgentCapability::Read],
+                        allowed_tool_contract_refs: vec![],
+                        allowed_skill_refs: vec![],
+                        resource_scopes: vec!["workspace".into()],
+                        overlap_policy: ManagedAgentOverlapPolicy::Forbid,
+                        retry_policy: ManagedAgentRetryPolicy::default(),
+                        health_policy: ManagedAgentHealthPolicy::default(),
+                        enabled: true,
+                    },
+                    1,
+                )
+                .unwrap();
+            let mut graph = ExecutionGraph::new("N1 managed terminal projection");
+            graph.id = "n1-managed-graph".into();
+            crate::test_support::attach_execution_graph_lineage(&mut graph);
+            graph.nodes.push(ExecutionNodeSpec::new(
+                ExecutionNodeKind::Verify,
+                "verify",
+                "n1-no-required-input",
+            ));
+            if graph_first {
+                services
+                    .execution_supervisor()
+                    .register_graph(graph.clone())
+                    .await
+                    .unwrap();
+                services
+                    .execution_supervisor()
+                    .drive_registered(&graph.id)
+                    .await
+                    .unwrap();
+            }
+            dispatcher
+                .trigger_manual(&definition.managed_agent_id, "n1-request", 2)
+                .unwrap();
+            let claim = dispatcher
+                .claim_ready("n1-dispatcher", 3, 120000, 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let token = claim.claim_token.as_deref().unwrap();
+            dispatcher
+                .begin_graph_registration(
+                    &claim.invocation_id,
+                    "n1-dispatcher",
+                    claim.fence_generation,
+                    token,
+                    graph.id.clone(),
+                )
+                .unwrap();
+            dispatcher
+                .materialize_invocation(
+                    &claim.invocation_id,
+                    "n1-dispatcher",
+                    claim.fence_generation,
+                    token,
+                    graph.id.clone(),
+                    "n1-registration".into(),
+                )
+                .unwrap();
+            dispatcher
+                .start_invocation(
+                    &claim.invocation_id,
+                    "n1-dispatcher",
+                    claim.fence_generation,
+                    token,
+                    graph.id.clone(),
+                    4,
+                )
+                .unwrap();
+            if !graph_first {
+                // A missing graph must not manufacture a completed invocation.
+                assert!(services
+                    .reconcile_managed_agent_invocation(
+                        dispatcher.invocations().unwrap().pop().unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    dispatcher.invocations().unwrap()[0].status,
+                    crate::ManagedAgentInvocationStatus::Running
+                );
+                services
+                    .execution_supervisor()
+                    .register_graph(graph.clone())
+                    .await
+                    .unwrap();
+                services
+                    .execution_supervisor()
+                    .drive_registered(&graph.id)
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let invocation = dispatcher.invocations().unwrap().pop().unwrap();
+                    if !invocation.status.is_active() {
+                        assert_eq!(
+                            invocation.status,
+                            crate::ManagedAgentInvocationStatus::Completed
+                        );
+                        assert_eq!(invocation.execution_ref.as_deref(), Some(graph.id.as_str()));
+                        assert_eq!(invocation.fence_generation, claim.fence_generation);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("original reactor must project terminal without dispatch/retry");
+            services.shutdown_maintenance().await;
+            assert!(services.shutdown_execution().await.errors.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn exact_exit_original_services_shutdown_is_repeatable_without_runs() {
         let services = RuntimeServices::in_memory().unwrap();
         let first = services.shutdown_execution().await;
@@ -4950,84 +5092,6 @@ mod exact_exit_lane_tests {
         assert_eq!(first.forced_aborts, 0);
         assert_eq!(second.forced_aborts, 0);
         services.shutdown_maintenance().await;
-    }
-}
-
-async fn project_managed_invocation_terminal(
-    graph_state_store: ExecutionGraphStateStore,
-    managed_agents: Arc<crate::ManagedAgentDispatcher>,
-    graph_id: &str,
-) -> Result<(), String> {
-    let Some(invocation) = managed_agents
-        .invocations()?
-        .into_iter()
-        .find(|invocation| {
-            invocation.status == crate::ManagedAgentInvocationStatus::Running
-                && invocation.execution_ref.as_deref() == Some(graph_id)
-        })
-    else {
-        return Ok(());
-    };
-    let graph = match graph_state_store.load_async(graph_id).await {
-        Ok(graph) => graph,
-        Err(ExecutionStateStoreError::NotFound { .. }) => return Ok(()),
-        Err(error) => return Err(error.to_string()),
-    };
-    if graph
-        .node_statuses
-        .values()
-        .any(|status| !status.is_terminal())
-    {
-        return Ok(());
-    }
-    let succeeded = !graph.node_statuses.is_empty()
-        && graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::Completed);
-    let dispatcher_id = invocation.claimed_by.as_deref().ok_or_else(|| {
-        format!(
-            "running managed invocation `{}` has no dispatcher fence owner",
-            invocation.invocation_id
-        )
-    })?;
-    let mut evidence_refs = graph
-        .node_results
-        .values()
-        .flat_map(|result| result.evidence_refs.iter())
-        .map(|reference| reference.evidence_ref.id.clone())
-        .collect::<Vec<_>>();
-    evidence_refs.push(format!("execution-graph:{graph_id}@{}", graph.revision));
-    evidence_refs.sort();
-    evidence_refs.dedup();
-    match managed_agents.complete_invocation(
-        &invocation.invocation_id,
-        dispatcher_id,
-        invocation.fence_generation,
-        succeeded,
-        now_ms(),
-        Some(graph_id.to_string()),
-        evidence_refs,
-        (!succeeded).then(|| {
-            format!(
-                "managed execution graph reached non-success terminal state at revision {}",
-                graph.revision
-            )
-        }),
-    ) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let already_terminal = managed_agents
-                .invocations()?
-                .into_iter()
-                .find(|current| current.invocation_id == invocation.invocation_id)
-                .is_some_and(|current| !current.status.is_active());
-            if already_terminal {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
     }
 }
 

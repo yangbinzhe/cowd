@@ -593,6 +593,7 @@ async fn r1_gateway_startup_repaired_session_replays_original_program_without_ne
             false,
             None,
             true,
+            true,
         )
         .await;
         let (_, held) =

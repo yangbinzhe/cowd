@@ -10663,7 +10663,7 @@ impl PhysicalProcessFixture {
         profile: crate::config::AgentExecutorSandboxProfile,
         name: &str,
     ) -> Self {
-        Self::with_session_owner(profile, name, None).await
+        Box::pin(Self::with_session_owner(profile, name, None)).await
     }
 
     async fn with_session_owner(
@@ -14594,9 +14594,9 @@ impl RootWireServer {
                         })
                         .cloned();
                     if let Some((_, arrived, resume)) = gate {
+                        response_pause.lock().unwrap().take();
                         arrived.notify_one();
                         resume.notified().await;
-                        response_pause.lock().unwrap().take();
                     }
                 }
                 let delta = { queued.lock().unwrap().pop_front() };

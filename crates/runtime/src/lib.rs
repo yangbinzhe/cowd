@@ -702,15 +702,17 @@ pub use runtime_event_replay::{
 };
 pub use runtime_event_store::{
     decode_session_terminal_artifact_ref, encode_session_terminal_artifact_ref,
-    AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
-    CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision, PreparedContentRoot,
-    PreparedReconciliationReport, QuiescedContentRoots, RuntimeEventInput, RuntimeEventRecord,
+    AppendTransactionReceipt, AppendTransactionRequest, CheckedAppendReceipt, CheckedAppendRequest,
+    CheckedSourceEvidence, CheckedSourceValidator, CommittedEventBatch, CommittedStreamRevision,
+    DurableRuntimeEvent, ExpectedStreamRevision, PreparedContentRoot, PreparedReconciliationReport,
+    QuiescedContentRoots, RuntimeBoundedEventLookup, RuntimeEventInput, RuntimeEventRecord,
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
-    RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeProjectionCheckpoint, RuntimeSourceMutationFence, RuntimeBoundedEventLookup,
+    RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeProjectionCheckpoint,
     RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionScanPage,
     RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
-    RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
-    SessionTerminalInput, SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
+    RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeSourceMutationFence,
+    RuntimeTransactionEventInput, SessionTerminalInput, SourceCheckBudget,
+    SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
 };
 #[doc(hidden)]
 pub use runtime_event_store::{

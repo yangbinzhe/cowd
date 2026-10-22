@@ -26,6 +26,128 @@ mod native_effect_history_tests;
 
 use authorization::{validate_transition, validate_transition_with_admission_contexts};
 
+/// Immutable claim identities at the original conclusion cut. Only an exact
+/// renewal of one of these claims is neutral to that conclusion.
+struct ProgramConclusionSources {
+    digest: String,
+    program_id: String,
+    claims: BTreeMap<String, (String, String)>,
+}
+
+impl crate::CheckedSourceValidator for ProgramConclusionSources {
+    fn frame_digest(&self) -> &str {
+        &self.digest
+    }
+
+    fn validate_tail(
+        &self,
+        source: &ExpectedStreamRevision,
+        observed_revision: u64,
+        events: &[crate::DurableRuntimeEvent],
+    ) -> crate::RuntimeEventStoreResult<()> {
+        if observed_revision == source.expected_revision && events.is_empty() {
+            return Ok(());
+        }
+        let reject = || RuntimeEventStoreError::StaleRevision {
+            stream_id: source.stream_id.clone(),
+            expected: source.expected_revision,
+            actual: observed_revision,
+        };
+        if source.stream_id != program_stream(&self.program_id)
+            || observed_revision.checked_sub(source.expected_revision) != Some(events.len() as u64)
+        {
+            return Err(reject());
+        }
+        for (offset, event) in events.iter().enumerate() {
+            let task = event.payload["task_ref"].as_str().ok_or_else(reject)?;
+            let (agent, execution) = self.claims.get(task).ok_or_else(reject)?;
+            let generation = source.expected_revision + offset as u64;
+            if event.stream_id != source.stream_id
+                || event.sequence != generation + 1
+                || event.scope != RuntimeEventScope::Program
+                || event.kind != TASK_LEASE_RENEWED_EVENT_KIND
+                || event.schema_version != 1
+                || event.status.as_deref() != Some("renewed")
+                || !event.refs.is_empty()
+                || event.actor.as_deref() != Some(agent.as_str())
+                || event.payload["agent_id"].as_str() != Some(agent.as_str())
+                || event.payload["execution_id"].as_str() != Some(execution.as_str())
+                || event.idempotency_key.as_deref()
+                    != Some(format!("claim-lease-renewed:{execution}:{generation}").as_str())
+                || event.transaction_id
+                    != format!(
+                        "claim-lease-renewed:{}:{execution}:{generation}",
+                        self.program_id
+                    )
+                || event.transaction_index != 0
+            {
+                return Err(reject());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod conclusion_source_tests {
+    use super::*;
+    use crate::CheckedSourceValidator;
+
+    #[test]
+    fn n2_conclusion_neutrality_requires_exact_original_claim_and_writer() {
+        let frame = ProgramConclusionSources {
+            digest: "frame".into(),
+            program_id: "p".into(),
+            claims: BTreeMap::from([("task".into(), ("agent".into(), "execution".into()))]),
+        };
+        let source = ExpectedStreamRevision {
+            stream_id: "agentic-program:p".into(),
+            expected_revision: 39,
+        };
+        let event = crate::DurableRuntimeEvent {
+            event_id: "event".into(),
+            stream_id: "agentic-program:p".into(),
+            sequence: 40,
+            scope: RuntimeEventScope::Program,
+            kind: "agentic.task_lease_renewed".into(),
+            status: Some("renewed".into()),
+            actor: Some("agent".into()),
+            refs: vec![],
+            payload: json!({"task_ref":"task", "agent_id":"agent", "execution_id":"execution"}),
+            created_at_ms: 42,
+            commit_cursor: 100,
+            transaction_id: "claim-lease-renewed:p:execution:39".into(),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: Some("claim-lease-renewed:execution:39".into()),
+        };
+        frame
+            .validate_tail(&source, 40, std::slice::from_ref(&event))
+            .unwrap();
+        let mut bad = event.clone();
+        bad.actor = Some("foreign".into());
+        assert!(frame.validate_tail(&source, 40, &[bad]).is_err());
+        let mut bad = event.clone();
+        bad.payload["execution_id"] = json!("old-attempt");
+        assert!(frame.validate_tail(&source, 40, &[bad]).is_err());
+        let mut bad = event.clone();
+        bad.payload["task_ref"] = json!("unclaimed");
+        assert!(frame.validate_tail(&source, 40, &[bad]).is_err());
+        let mut bad = event.clone();
+        bad.kind = "agentic.action".into();
+        assert!(frame.validate_tail(&source, 40, &[bad]).is_err());
+        let mut bad = event.clone();
+        bad.idempotency_key = Some("claim-lease-renewed:execution:38".into());
+        assert!(frame.validate_tail(&source, 40, &[bad]).is_err());
+        assert!(frame.validate_tail(&source, 41, &[event]).is_err());
+        let foreign = ExpectedStreamRevision {
+            stream_id: "reviewer-graph".into(),
+            expected_revision: 4,
+        };
+        assert!(frame.validate_tail(&foreign, 5, &[]).is_err());
+    }
+}
+
 pub(crate) fn validate_receipt_index_record(
     event: &crate::DurableRuntimeEvent,
     source: &str,
@@ -961,6 +1083,164 @@ impl AgentActionService {
         Ok(())
     }
 
+    /// A failed local control operation can be physically finished without
+    /// succeeding at its business action. This narrow admission is used only
+    /// after the original exact run/graph/closure checks; it grants no review
+    /// or Goal credit and does not admit failed remote or Process work.
+    fn authenticate_failed_control_retirement(
+        &self,
+        packet: &harness_contract::agent::AgentTaskPacket,
+        attempt: u32,
+        index: &crate::DurableRuntimeEvent,
+        pin: &mut impl FnMut(&str) -> Result<u64, String>,
+    ) -> Result<(), String> {
+        use harness_contract::policy::{PermissionOperation, PermissionResource};
+        use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind};
+        let denied =
+            || "runtime retirement failed control receipt is not authenticated".to_string();
+        let key = index.payload["idempotency_key"]
+            .as_str()
+            .ok_or_else(denied)?;
+        let source = format!("execution-effect:{key}");
+        if pin(&source)? != 2 {
+            return Err(denied());
+        }
+        let primary = self
+            .store
+            .event_by_idempotency_key(&source, &format!("{key}:receipt"))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(denied)?;
+        let intent = self
+            .store
+            .event_by_idempotency_key(&source, &format!("{key}:intent"))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(denied)?;
+        let effect: ToolEffectDescriptor =
+            serde_json::from_value(intent.payload["effect"].clone()).map_err(|_| denied())?;
+        let outcome: crate::RuntimeToolExecutionOutcome =
+            serde_json::from_value(primary.payload["outcome"].clone()).map_err(|_| denied())?;
+        let expected_parent = json!({"execution_id":packet.graph_id(),"node_id":packet.node_id()});
+        let expected_index = format!(
+            "execution-agent-receipts:{}:{}:{attempt}",
+            packet.graph_id(),
+            packet.node_id()
+        );
+        let index_revision = pin(&expected_index)?;
+        validate_receipt_index_record(index, &expected_index, index.sequence, index_revision)?;
+        let intent_index = self
+            .store
+            .event_by_idempotency_key(&expected_index, &format!("agent-tool-intent:{key}"))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(denied)?;
+        validate_receipt_index_record(
+            &intent_index,
+            &expected_index,
+            intent_index.sequence,
+            index_revision,
+        )?;
+        let expected_refs = vec![
+            crate::RuntimeEventRef {
+                kind: "tool_invocation".into(),
+                id: outcome.tool_use_id.clone(),
+            },
+            crate::RuntimeEventRef {
+                kind: "execution_graph".into(),
+                id: packet.graph_id().into(),
+            },
+            crate::RuntimeEventRef {
+                kind: "execution_node".into(),
+                id: packet.node_id().into(),
+            },
+            crate::RuntimeEventRef {
+                kind: "agent_attempt".into(),
+                id: attempt.to_string(),
+            },
+        ];
+        if effect.effect_kind != ToolEffectKind::Write
+            || effect.uses_network
+            || effect.spawns_process
+            || effect.mutates_packages
+            || effect.mutates_system
+            || effect.scopes.is_empty()
+            || effect.scopes.iter().any(|scope| {
+                scope.resource != PermissionResource::Tool
+                    || scope.operation != PermissionOperation::Control
+                    || scope.target.is_some()
+            })
+            || outcome.status != crate::RuntimeToolExecutionStatus::Failed
+            || outcome.tool_name != effect.tool_id
+            || !packet.allowed_tools.contains(&effect.tool_id)
+            || packet
+                .binding
+                .as_ref()
+                .is_none_or(|binding| !binding.tool_contract_refs.contains(&effect.tool_id))
+            || index.stream_id != expected_index
+            || index.kind != "execution.agent_tool.receipt"
+            || primary.kind != "execution.effect.receipt"
+            || primary.status.as_deref() != Some("completed")
+            || primary.sequence != 2
+            || primary.schema_version != 1
+            || intent.kind != "execution.effect.intent"
+            || intent.status.as_deref() != Some("inflight")
+            || intent.sequence != 1
+            || intent.schema_version != 1
+            || [index, &primary, &intent].iter().any(|event| {
+                event.actor.as_deref() != Some("governed_tool")
+                    || event.scope != RuntimeEventScope::ExecutionNode
+            })
+            || primary.transaction_id != index.transaction_id
+            || primary.commit_cursor != index.commit_cursor
+            || primary.transaction_index >= index.transaction_index
+            || intent.commit_cursor >= primary.commit_cursor
+            || primary.refs != expected_refs
+            || primary.refs != index.refs
+            || intent.refs != primary.refs
+            || intent_index.refs != intent.refs
+            || intent_index.kind != "execution.agent_tool.intent"
+            || intent_index.status.as_deref() != Some("inflight")
+            || intent_index.sequence >= index.sequence
+            || intent.transaction_id != intent_index.transaction_id
+            || intent.commit_cursor != intent_index.commit_cursor
+            || intent.transaction_index >= intent_index.transaction_index
+            || intent_index.payload["effect_kind"] != "write"
+            || intent_index.payload["tool_name"] != effect.tool_id
+            || intent_index.payload["descriptor_hash"] != effect.descriptor_hash
+            || intent_index.payload["resolved_effect_scope"]
+                != intent.payload["resolved_effect_scope"]
+            || intent_index.payload["effect_scope"] != index.payload["effect_scope"]
+            || intent_index.payload["effect_scopes"] != index.payload["effect_scopes"]
+            || primary.payload["input_sha256"] != intent.payload["input_sha256"]
+            || primary.payload["input_sha256"]
+                .as_str()
+                .is_none_or(|digest| digest.is_empty())
+            || !primary.refs.iter().any(|reference| {
+                reference.kind == "agent_attempt" && reference.id == attempt.to_string()
+            })
+            || primary.payload["idempotency_key"] != key
+            || intent.payload["idempotency_key"] != key
+            || primary.payload["outcome"] != index.payload["outcome"]
+            || primary.payload["effect"] != intent.payload["effect"]
+            || primary.payload["descriptor_hash"] != effect.descriptor_hash
+            || primary.payload["tool_name"] != effect.tool_id
+            || intent.payload["tool_name"] != effect.tool_id
+            || primary.payload["replay"] != intent.payload["replay"]
+            || primary.payload["replay"]["session_id"] != packet.session_id()
+            || primary.payload["replay"]["parent_execution"] != expected_parent
+            || primary.payload["replay"]["call_id"] != outcome.tool_use_id
+            || primary.payload["replay"]["invocation"]["effect"] != intent.payload["effect"]
+            || primary.payload["resolved_effect_scope"] != intent.payload["resolved_effect_scope"]
+            || primary.payload["resolved_effect_scope"] != index.payload["resolved_effect_scope"]
+            || index.payload["effect_kind"] != "write"
+        {
+            return Err(denied());
+        }
+        super::review_evidence::validate_original_effect_scope(
+            &primary.payload["resolved_effect_scope"],
+            &effect,
+        )?;
+        Ok(())
+    }
+
     fn runtime_retirement_admission(
         &self,
         projection: &AgenticProgramProjection,
@@ -1471,12 +1751,20 @@ impl AgentActionService {
                     || receipt.payload["resolved_effect_scope"]
                         != index_receipt.payload["resolved_effect_scope"]
                     || receipt.payload["outcome"] != index_receipt.payload["outcome"]
-                    || !matches!(
-                        receipt.payload["outcome"]["status"].as_str(),
-                        Some("executed" | "blocked_permission")
-                    )
                 {
                     return Err("runtime retirement effect receipt is not known settled".into());
+                }
+                match receipt.payload["outcome"]["status"].as_str() {
+                    Some("executed" | "blocked_permission") => {}
+                    Some("failed") => self.authenticate_failed_control_retirement(
+                        &packet,
+                        packet.attempt,
+                        &index_receipt,
+                        &mut pin,
+                    )?,
+                    _ => {
+                        return Err("runtime retirement effect receipt is not known settled".into())
+                    }
                 }
                 if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Process {
                     for cut in super::review_evidence::validate_bounded_process_retirement(
@@ -1564,6 +1852,17 @@ impl AgentActionService {
                                     }
                                 }
                             }
+                            settled.insert(identity.to_string());
+                        }
+                        "execution.agent_tool.receipt"
+                            if event.payload["outcome"]["status"] == "failed" =>
+                        {
+                            self.authenticate_failed_control_retirement(
+                                &packet,
+                                attempt_number,
+                                &event,
+                                &mut pin,
+                            )?;
                             settled.insert(identity.to_string());
                         }
                         _ => {
@@ -3126,38 +3425,6 @@ impl AgentActionService {
                 "prepared own Program carrier cut is missing".into(),
             ));
         }
-        let current = self.project(&projection.program_id)?;
-        let lease_rebased = current.revision != original_revision;
-        if lease_rebased {
-            let delta = self
-                .store
-                .list_stream_after(
-                    &own_stream,
-                    original_revision,
-                    current.revision,
-                    1_024,
-                    4 * 1024 * 1024,
-                )
-                .map_err(AgentActionServiceError::EventStore)?;
-            if current.revision <= original_revision
-                || current.revision - original_revision != delta.len() as u64
-                || !delta.iter().enumerate().all(|(offset, event)| {
-                    event.sequence == original_revision + offset as u64 + 1
-                        && event.scope == RuntimeEventScope::Program
-                        && event.kind == TASK_LEASE_RENEWED_EVENT_KIND
-                })
-                || super::review_evidence::proof_value_digest(&current.completion_request)
-                    != super::review_evidence::proof_value_digest(&projection.completion_request)
-            {
-                return Err(RuntimeEventStoreError::StaleRevision {
-                    stream_id: own_stream,
-                    expected: original_revision,
-                    actual: current.revision,
-                }
-                .into());
-            }
-        }
-        let projection = &current;
         let history = self
             .proof_session_queries
             .as_ref()
@@ -3236,7 +3503,14 @@ impl AgentActionService {
             }
             if let Some(context) = context {
                 for source in context.sources() {
-                    current_sources.insert(source.stream_id.clone(), source.expected_revision);
+                    current_sources.insert(
+                        source.stream_id.clone(),
+                        if source.stream_id == own_stream {
+                            original_revision
+                        } else {
+                            source.expected_revision
+                        },
+                    );
                 }
             }
             if prepared.goal.criteria.iter().any(|criterion| {
@@ -3302,8 +3576,22 @@ impl AgentActionService {
                 ))?;
                 for source in snapshot.sources {
                     if current_sources
-                        .insert(source.stream_id, source.expected_revision)
-                        .is_some_and(|previous| previous != source.expected_revision)
+                        .insert(
+                            source.stream_id.clone(),
+                            if source.stream_id == own_stream {
+                                original_revision
+                            } else {
+                                source.expected_revision
+                            },
+                        )
+                        .is_some_and(|previous| {
+                            previous
+                                != if source.stream_id == own_stream {
+                                    original_revision
+                                } else {
+                                    source.expected_revision
+                                }
+                        })
                     {
                         return Err(AgentActionServiceError::EventStore(
                             "proof sources changed between required reviews before A".into(),
@@ -3351,16 +3639,7 @@ impl AgentActionService {
                 ));
             }
             for source in &prepared.policy_sources {
-                let revision = if lease_rebased && source.stream_id == own_stream {
-                    if source.expected_revision != original_revision {
-                        return Err(AgentActionServiceError::EventStore(
-                            "own Program prepared cut is inconsistent".into(),
-                        ));
-                    }
-                    projection.revision
-                } else {
-                    source.expected_revision
-                };
+                let revision = source.expected_revision;
                 if let Some(previous) = current_sources.insert(source.stream_id.clone(), revision) {
                     if previous != revision {
                         return Err(RuntimeEventStoreError::StaleRevision {
@@ -3468,11 +3747,23 @@ impl AgentActionService {
                 },
             ],
         };
-        let stream_ids = transaction
-            .expected_streams
+        let claims = projection
+            .tasks
             .iter()
-            .map(|source| source.stream_id.clone())
-            .collect::<Vec<_>>();
+            .filter_map(|(id, task)| {
+                (task.status == AgenticTaskStatus::Claimed).then(|| {
+                    Some((
+                        id.clone(),
+                        (task.claimant.clone()?, task.claim_execution_id.clone()?),
+                    ))
+                })?
+            })
+            .collect::<BTreeMap<_, _>>();
+        let sources = ProgramConclusionSources {
+            digest: super::review_evidence::proof_value_digest(&(&transaction, &claims)),
+            program_id: projection.program_id.clone(),
+            claims,
+        };
         #[cfg(test)]
         CONCLUSION_APPEND_HOOK.with(|slot| {
             let hook = slot.borrow_mut().take();
@@ -3480,20 +3771,14 @@ impl AgentActionService {
                 hook(&transaction);
             }
         });
-        self.store.with_stream_locks(&stream_ids, || {
-            let stream_id = program_stream(&projection.program_id);
-            let actual = self.store.stream_revision(&stream_id)?;
-            if actual != projection.revision {
-                return Err(RuntimeEventStoreError::StaleRevision {
-                    stream_id,
-                    expected: projection.revision,
-                    actual,
-                }
-                .into());
-            }
-            self.store.append_transaction_locked(transaction)?;
-            Ok::<_, AgentActionServiceError>(())
-        })?;
+        self.store.append_checked_transaction(
+            crate::CheckedAppendRequest {
+                transaction,
+                frame_digest: sources.digest.clone(),
+                budget: crate::SourceCheckBudget::default(),
+            },
+            &sources,
+        )?;
         self.project(&projection.program_id)
     }
 

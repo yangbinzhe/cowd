@@ -1041,6 +1041,7 @@ fn runtime_event_clean_baseline_has_current_fences_and_discovery_index() {
         "idx_runtime_session_outbox_execution",
         "(session_id, execution_id, turn_id)",
         "encoded_bytes BIGINT NOT NULL",
+        "checked_source_evidence JSONB",
         "input_claim_revision BIGINT",
         "idx_runtime_events_stream_idempotency",
         "runtime_consumed_decision_leases",
@@ -3535,4 +3536,182 @@ fn own858_transparent_prepared_wrapper_preserves_fence_and_both_cas_faults() {
             assert_eq!(source, backend.source_mutation_fence().unwrap());
         }
     }
+}
+
+#[test]
+fn n2_checked_source_commit_survives_response_loss_and_rejects_related_write() {
+    struct Neutral;
+    impl CheckedSourceValidator for Neutral {
+        fn frame_digest(&self) -> &str {
+            "pg-source-frame"
+        }
+        fn validate_tail(
+            &self,
+            source: &ExpectedStreamRevision,
+            actual: u64,
+            events: &[DurableRuntimeEvent],
+        ) -> RuntimeEventStoreResult<()> {
+            if events.iter().all(|event| event.kind == "neutral") {
+                Ok(())
+            } else {
+                Err(RuntimeEventStoreError::StaleRevision {
+                    stream_id: source.stream_id.clone(),
+                    expected: source.expected_revision,
+                    actual,
+                })
+            }
+        }
+    }
+    fn command(id: &str, head: u64, kind: &str) -> AppendTransactionRequest {
+        AppendTransactionRequest {
+            transaction_id: id.into(),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: "source".into(),
+                expected_revision: head,
+            }],
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: "source".into(),
+                    scope: RuntimeEventScope::Program,
+                    kind: kind.into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                },
+                idempotency_key: Some(id.into()),
+                schema_version: 1,
+            }],
+        }
+    }
+    // Preserve this test's namespace on panic, including a migration failure.
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    fixture
+        .reconnect()
+        .apply_migrations(RUNTIME_EVENT_DOMAIN, &RUNTIME_EVENT_MIGRATIONS[..1])
+        .unwrap();
+    let store = PostgresRuntimeEventStore::new(fixture.reconnect()).unwrap();
+    store
+        .append_transaction(command("lease-1", 0, "neutral"))
+        .unwrap();
+    let original = CheckedAppendRequest {
+        transaction: command("conclusion", 0, "conclusion"),
+        frame_digest: "pg-source-frame".into(),
+        budget: runtime::SourceCheckBudget::default(),
+    };
+    assert!(matches!(
+        store.append_transaction(original.transaction.clone()),
+        Err(RuntimeEventStoreError::StaleRevision { .. })
+    ));
+    let first = store
+        .append_checked_transaction(original.clone(), &Neutral)
+        .unwrap();
+    assert_eq!(first.validation.events_read, 1);
+    assert_eq!(first.validation.sources[0].expected_revision, 0);
+    assert_eq!(first.validation.sources[0].committed_revision, 1);
+    assert_eq!(first.commit.stream_revisions[0].expected_revision, 0);
+    assert_eq!(first.commit.stream_revisions[0].committed_revision, 2);
+    drop(store);
+    let store = PostgresRuntimeEventStore::new(fixture.reconnect()).unwrap();
+    store
+        .append_transaction(command("lease-2", 2, "neutral"))
+        .unwrap();
+    let repeated = store
+        .append_checked_transaction(original.clone(), &Neutral)
+        .unwrap();
+    assert!(repeated.commit.duplicate);
+    assert_eq!(repeated.commit.commit_cursor, first.commit.commit_cursor);
+    assert_eq!(
+        repeated.commit.stream_revisions,
+        first.commit.stream_revisions
+    );
+    assert_eq!(repeated.validation, first.validation);
+    let mut changed = original.clone();
+    changed.transaction.events[0].event.payload = serde_json::json!({"different": true});
+    assert!(matches!(
+        store.append_checked_transaction(changed, &Neutral),
+        Err(RuntimeEventStoreError::TransactionConflict { .. })
+    ));
+    let mut related = original;
+    related.transaction = command("second-conclusion", 1, "conclusion");
+    assert!(matches!(
+        store.append_checked_transaction(related.clone(), &Neutral),
+        Err(RuntimeEventStoreError::StaleRevision { .. })
+    ));
+    related.budget.max_events = 1;
+    assert!(matches!(
+        store.append_checked_transaction(related, &Neutral),
+        Err(RuntimeEventStoreError::HistoryBudgetExceeded(_))
+    ));
+    assert_eq!(store.stream_revision("source").unwrap(), 3);
+    struct Pausing {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl CheckedSourceValidator for Pausing {
+        fn frame_digest(&self) -> &str {
+            "pg-source-frame"
+        }
+        fn validate_tail(
+            &self,
+            _: &ExpectedStreamRevision,
+            _: u64,
+            _: &[DurableRuntimeEvent],
+        ) -> RuntimeEventStoreResult<()> {
+            // A bounded test probe stops inside validation, with no store IO.
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .unwrap();
+            Ok(())
+        }
+    }
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = PostgresRuntimeEventStore::new(fixture.reconnect()).unwrap();
+    let worker = std::thread::spawn(move || {
+        writer
+            .append_checked_transaction(
+                CheckedAppendRequest {
+                    transaction: command("guarded", 3, "conclusion"),
+                    frame_digest: "pg-source-frame".into(),
+                    budget: runtime::SourceCheckBudget::default(),
+                },
+                &Pausing {
+                    entered: entered_tx,
+                    release: std::sync::Mutex::new(release_rx),
+                },
+            )
+            .unwrap()
+    });
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let executor = fixture.reconnect();
+    let mut connection = executor.checkout_critical().unwrap();
+    let mut tx = connection.transaction().unwrap();
+    let acquired: bool = tx
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&"cowd-runtime-event-stream:source"],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        !acquired,
+        "source guard must remain held during pure validation"
+    );
+    tx.rollback().unwrap();
+    release_tx.send(()).unwrap();
+    let guarded = worker.join().unwrap();
+    assert_eq!(guarded.commit.stream_revisions[0].committed_revision, 4);
+    let later = store
+        .append_transaction(command("later-related", 4, "related"))
+        .unwrap();
+    assert!(later.commit_cursor > guarded.commit.commit_cursor);
+    assert_eq!(store.stream_revision("source").unwrap(), 5);
+    drop(store);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
 }

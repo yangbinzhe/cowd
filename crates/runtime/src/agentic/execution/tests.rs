@@ -4076,7 +4076,25 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
     let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
     assert!(!proof.independence_required);
     assert!(proof.review_policy_digest.is_some());
-    assert_eq!(proof.reads.len(), if external_decision { 4 } else { 3 });
+    for reference in &references {
+        assert!(
+            proof.reads.iter().any(|read| {
+                (&read.result_ref == reference || &read.content_ref == reference)
+                    && !read.receipt_refs.is_empty()
+            }),
+            "requested result must retain an authenticated read: {reference}"
+        );
+    }
+    let authored = proof
+        .reads
+        .iter()
+        .find(|read| read.content_ref == content.selector)
+        .expect("the authored content remains covered through its artifact alias");
+    assert_eq!(authored.sha256, content.sha256);
+    assert_eq!(
+        authored.bytes,
+        b"The current result was read and checked.".len() as u64
+    );
     if external_decision {
         assert_eq!(proof.result_source_revisions.len(), 1);
         assert!(proof.reads.iter().any(
@@ -4223,6 +4241,14 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         .await
         .unwrap_err()
         .contains("not readable"));
+    let required_policy_sources = std::iter::once("session:session-dispatch".to_string())
+        .chain(
+            references
+                .iter()
+                .filter(|reference| reference.starts_with("approval:v1:"))
+                .map(|reference| format!("approval:{reference}")),
+        )
+        .collect::<Vec<_>>();
     let requested = services
         .submit_agent_action(&bind(
             "root-complete",
@@ -4252,10 +4278,15 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         .prepare_program_conclusion(&before)
         .unwrap();
     assert!(prepared.gaps.is_empty(), "{:?}", prepared.gaps);
-    assert_eq!(
-        prepared.policy_sources.len(),
-        if external_decision { 2 } else { 1 }
-    );
+    for source in required_policy_sources {
+        assert!(
+            prepared
+                .policy_sources
+                .iter()
+                .any(|revision| { revision.stream_id == source && revision.expected_revision > 0 }),
+            "completion must fence the original policy source: {source}"
+        );
+    }
     // Negative concurrency injection only: no effect or positive read is invented.
     services
         .event_store()

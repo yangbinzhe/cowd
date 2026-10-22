@@ -3415,14 +3415,10 @@ struct PublicationFixture {
 impl PublicationFixture {
     fn new() -> Self {
         let root = std::path::PathBuf::from(
-            std::env::var_os("COWD_R1_06_FIXTURE_ROOT").expect("explicit private fixture root"),
+            std::env::var_os("COWD_TEST_FIXTURE_ROOT").expect("explicit private fixture root"),
         )
         .join(format!("synthesize-471-{}", uuid::Uuid::new_v4()));
-        assert!(
-            root.is_absolute()
-                && root
-                    .starts_with("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel",)
-        );
+        assert!(root.is_absolute(), "fixture root must be absolute");
         std::fs::create_dir_all(&root).unwrap();
         let backend = Arc::new(EphemeralRuntimeEventStore::new());
         let artifacts = Arc::new(crate::ArtifactStore::for_test_default(

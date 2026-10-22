@@ -27,12 +27,15 @@ pub(super) fn selected_journal() -> Arc<RuntimeEventStore> {
 enum ClosureFault {
     Missing,
     WrongAttempt,
+    ForeignReceipt,
+    UnknownReceipt,
 }
 
 #[derive(Debug, Default)]
 struct FaultControl {
     execution: String,
     hold_settlement: bool,
+    fail_release_once: bool,
     closure: Option<(String, String, ClosureFault)>,
     race_source: Option<String>,
     attempted: Vec<AppendTransactionRequest>,
@@ -45,6 +48,7 @@ struct RetirementJournal {
     store: std::sync::OnceLock<std::sync::Weak<RuntimeEventStore>>,
     closure_hits: AtomicUsize,
     race_hits: AtomicUsize,
+    release_failure_hits: AtomicUsize,
 }
 
 impl RetirementJournal {
@@ -55,6 +59,7 @@ impl RetirementJournal {
             store: std::sync::OnceLock::new(),
             closure_hits: AtomicUsize::new(0),
             race_hits: AtomicUsize::new(0),
+            release_failure_hits: AtomicUsize::new(0),
         });
         let store = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
         backend.store.set(Arc::downgrade(&store)).unwrap();
@@ -84,10 +89,38 @@ macro_rules! delegate_retirement_ports {
 }
 
 impl RuntimeEventStoreBackend for RetirementJournal {
+    fn append_checked_transaction(
+        &self,
+        request: crate::CheckedAppendRequest,
+        validator: &dyn crate::CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<crate::CheckedAppendReceipt> {
+        self.inner.append_checked_transaction(request, validator)
+    }
+
     fn append_transaction(
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        {
+            let mut control = self.control.lock().unwrap();
+            if control.fail_release_once
+                && request.events.iter().any(|event| {
+                    serde_json::from_value::<AgentActionEnvelope>(
+                        event.event.payload["envelope"].clone(),
+                    )
+                    .is_ok_and(|envelope| {
+                        envelope.actor.execution_id.as_deref() == Some(control.execution.as_str())
+                            && matches!(envelope.action, AgentAction::TaskRelease(_))
+                    })
+                })
+            {
+                control.fail_release_once = false;
+                self.release_failure_hits.fetch_add(1, Ordering::SeqCst);
+                return Err(RuntimeEventStoreError::Corrupt(
+                    "N1 injected original release transaction failure".into(),
+                ));
+            }
+        }
         let (hold, race) = {
             let mut control = self.control.lock().unwrap();
             let selected = request.events.iter().any(|event| {
@@ -152,7 +185,9 @@ impl RuntimeEventStoreBackend for RetirementJournal {
         self.closure_hits.fetch_add(1, Ordering::SeqCst);
         match fault {
             ClosureFault::Missing => Ok(None),
-            ClosureFault::WrongAttempt => {
+            ClosureFault::WrongAttempt
+            | ClosureFault::ForeignReceipt
+            | ClosureFault::UnknownReceipt => {
                 let store = self.store.get().unwrap().upgrade().unwrap();
                 let mut record = store
                     .resolve_read_record(original.clone())
@@ -176,7 +211,22 @@ impl RuntimeEventStoreBackend for RetirementJournal {
                         _ => 0,
                     }
                 }
-                assert_eq!(change_attempt(&mut record.payload), 1);
+                match fault {
+                    ClosureFault::WrongAttempt => {
+                        assert_eq!(change_attempt(&mut record.payload), 1)
+                    }
+                    ClosureFault::ForeignReceipt => {
+                        record.payload["replay"]["parent_execution"]["execution_id"] =
+                            serde_json::json!("foreign-execution")
+                    }
+                    ClosureFault::UnknownReceipt => {
+                        record.payload["outcome"]["status"] = serde_json::json!("unknown")
+                    }
+                    ClosureFault::Missing => unreachable!(),
+                }
+                if record.scope != RuntimeEventScope::ExecutionGraph {
+                    return Ok(Some(record));
+                }
                 record
                     .payload
                     .as_object_mut()
@@ -270,15 +320,14 @@ struct NativeRetirementFixture {
 impl NativeRetirementFixture {
     async fn new(name: &str) -> Self {
         let (journal, backend) = RetirementJournal::new();
-        let physical = JOURNAL_479
-            .scope(
-                journal,
-                PhysicalProcessFixture::new(
-                    crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
-                    name,
-                ),
-            )
-            .await;
+        let physical = Box::pin(JOURNAL_479.scope(
+            journal,
+            PhysicalProcessFixture::new(
+                crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+                name,
+            ),
+        ))
+        .await;
         let services = &physical.services;
         let cleanup = RealFixtureCleanup {
             services: services.clone(),
@@ -836,6 +885,11 @@ async fn assert_withdrawn_once(fixture: &NativeRetirementFixture) {
         .retry_agentic_run_exit(fixture.worker.packet.graph_id())
         .await
         .unwrap());
+    assert_withdrawn_evidence(fixture).await;
+}
+
+async fn assert_withdrawn_evidence(fixture: &NativeRetirementFixture) {
+    let services = &fixture.physical.services;
     let program = services
         .agent_action_service()
         .project(&fixture.worker.root_actor.program_id)
@@ -895,10 +949,6 @@ async fn assert_withdrawn_once(fixture: &NativeRetirementFixture) {
         .any(|source| source.expected_revision > 0
             && source.stream_id == fixture.paused_ticket.graph_id));
     for _repeat in 0..2 {
-        assert!(services
-            .retry_agentic_run_exit(fixture.worker.packet.graph_id())
-            .await
-            .unwrap());
         let replay = services.agent_action_service().apply(&original).unwrap();
         assert_eq!(replay.status, AgentActionStatus::Applied);
         assert!(replay.duplicate);
@@ -1486,3 +1536,228 @@ async fn r1_479_process_unreaped_owner_cannot_settle() {
 
 #[path = "receipt_index_791_retirement_tests.rs"]
 mod receipt_index_791_retirement_tests;
+
+#[tokio::test]
+async fn n1_native_retirement_recovers_automatically_after_fault_release() {
+    automatic_retirement_after_fault(false).await;
+}
+
+#[tokio::test]
+async fn n1_failed_control_receipt_retires_only_after_exact_physical_exit() {
+    let fixture = Box::pin(NativeRetirementFixture::new("n1-failed-control")).await;
+    let services = &fixture.physical.services;
+    let worker = &fixture.worker;
+    let backend = &fixture.backend;
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    *fixture.wire.pause.lock().unwrap() = Some((
+        "n1-after-failed-control".into(),
+        arrived.clone(),
+        resume.clone(),
+    ));
+    {
+        let mut replies = fixture.wire.replies.lock().unwrap();
+        replies.clear();
+        for (id, tool, input) in [
+            (
+                "n1-failed-release",
+                "task_release",
+                serde_json::json!({"task_ref":worker.task_ref,"reason":"Release unfinished work"}),
+            ),
+            (
+                "n1-after-failed-control",
+                "read_file",
+                serde_json::json!({"path":"out/a","complete":true}),
+            ),
+        ] {
+            replies.push_back(serde_json::json!({"role":"assistant","content":null,
+                "tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":tool,"arguments":input.to_string()}}]}));
+        }
+        replies.push_back(serde_json::json!({"role":"assistant","content":"The control failed; no work was accepted."}));
+    }
+    backend.control.lock().unwrap().fail_release_once = true;
+    fixture.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+        .await
+        .expect(
+            "Native continuation must observe the failed control before the next held response",
+        );
+    assert_eq!(
+        backend.release_failure_hits.load(Ordering::SeqCst),
+        1,
+        "original action transaction fault must be reached"
+    );
+    let receipts = services
+        .commit_service()
+        .load_delegated_agent_tool_receipts(
+            worker.packet.graph_id(),
+            worker.packet.node_id(),
+            worker.packet.attempt,
+        )
+        .unwrap();
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt.outcome.tool_name == "task_release"
+                && receipt.outcome.status == crate::RuntimeToolExecutionStatus::Failed),
+        "original commit owner must persist Failed receipt: {receipts:?}"
+    );
+    worker.withdraw().await;
+    assert_rejected_without_program_mutation(services, worker, "exact local backend exit");
+    worker.cancel().await;
+    resume.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        services.cancel_execution_tree(
+            worker.packet.graph_id(),
+            "N1 failed local control retirement",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    worker.wait_exit().await;
+    assert_real_closures(services, worker.packet.graph_id());
+    let index_source = format!(
+        "execution-agent-receipts:{}:{}:{}",
+        worker.packet.graph_id(),
+        worker.packet.node_id(),
+        worker.packet.attempt
+    );
+    let original = services
+        .event_store()
+        .list_stream(&index_source)
+        .unwrap()
+        .into_iter()
+        .find(|event| {
+            event.kind == "execution.agent_tool.receipt"
+                && event.payload["outcome"]["tool_name"] == "task_release"
+        })
+        .expect("original Failed receipt index");
+    let key = original.payload["idempotency_key"].as_str().unwrap();
+    let primary_source = format!("execution-effect:{key}");
+    for (source, selected, fault) in [
+        (
+            primary_source.clone(),
+            format!("{key}:receipt"),
+            ClosureFault::Missing,
+        ),
+        (
+            primary_source.clone(),
+            format!("{key}:receipt"),
+            ClosureFault::ForeignReceipt,
+        ),
+        (
+            primary_source.clone(),
+            format!("{key}:receipt"),
+            ClosureFault::UnknownReceipt,
+        ),
+        (
+            index_source,
+            format!("agent-tool-intent:{key}"),
+            ClosureFault::Missing,
+        ),
+    ] {
+        let hits = backend.closure_hits.load(Ordering::SeqCst);
+        backend.control.lock().unwrap().closure = Some((source, selected, fault));
+        assert_rejected_without_program_mutation(services, worker, "failed control receipt");
+        assert!(
+            backend.closure_hits.load(Ordering::SeqCst) > hits,
+            "negative receipt fault must be read"
+        );
+        backend.control.lock().unwrap().closure = None;
+    }
+    backend.allow();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let program = services
+                .agent_action_service()
+                .project(&worker.root_actor.program_id)
+                .unwrap();
+            if program.tasks[&worker.task_ref].status == crate::AgenticTaskStatus::Withdrawn {
+                assert!(program.tasks[&worker.task_ref].active_attempts.is_empty());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("original lane must retire physically closed failed control work");
+    assert_eq!(
+        services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap(),
+        fixture.goal_before
+    );
+    assert_not_success(services, worker);
+    services.shutdown_maintenance().await;
+    let report = services.shutdown_execution().await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.remaining_keys, 0);
+}
+
+#[tokio::test]
+async fn n1_native_retirement_recovers_automatically_after_cold_rebuild() {
+    automatic_retirement_after_fault(true).await;
+}
+
+async fn automatic_retirement_after_fault(cold: bool) {
+    let fixture = NativeRetirementFixture::new("n1-auto-retirement").await;
+    fixture.worker.withdraw().await;
+    fixture.worker.cancel().await;
+    fixture.resume.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fixture.physical.services.cancel_execution_tree(
+            fixture.worker.packet.graph_id(),
+            "N1 automatic retirement cancellation",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    fixture.worker.wait_exit().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !fixture.backend.control.lock().unwrap().attempted.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("production lane must hit the held settlement fault");
+    assert_pending(&fixture.physical.services, &fixture.worker);
+    let fixture = if cold {
+        fixture.cold_rebuild().await
+    } else {
+        fixture
+    };
+    fixture.backend.allow();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let program = fixture
+                .physical
+                .services
+                .agent_action_service()
+                .project(&fixture.worker.root_actor.program_id)
+                .unwrap();
+            if program.tasks[&fixture.worker.task_ref].status == crate::AgenticTaskStatus::Withdrawn
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("production lane must recover without test-driven retry");
+    assert_withdrawn_evidence(&fixture).await;
+    assert_real_closures(&fixture.physical.services, fixture.worker.packet.graph_id());
+    fixture.physical.services.shutdown_maintenance().await;
+    let report = fixture.physical.services.shutdown_execution().await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.forced_aborts, 0, "{report:?}");
+    assert_eq!(report.remaining_keys, 0, "{report:?}");
+}

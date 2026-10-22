@@ -31,7 +31,10 @@ impl InterventionPolicy {
                 "goal is already terminal",
             );
         }
-        if completion_evidence_closed(goal, progress) {
+        // A reviewed Program criterion is not its completion commit. Keep
+        // the original action path available until that owner closes the
+        // Goal, while still applying uncertainty and repetition guards below.
+        if goal.execution_binding.is_none() && completion_evidence_closed(goal, progress) {
             return proposal(
                 goal,
                 progress,
@@ -561,6 +564,99 @@ mod tests {
                 .kind,
             RuntimeInterventionKind::Continue
         );
+    }
+
+    #[test]
+    fn n1_reviewed_program_keeps_completion_action_and_safety_guards() {
+        let mut goal = goal();
+        goal.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+            objective_id: "objective".into(),
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            root_execution_id: "graph".into(),
+            agentic_program_id: "program".into(),
+        });
+        let mut progress = progress();
+        progress
+            .criteria
+            .insert("terminal".into(), AcceptanceStatus::Satisfied);
+        progress.evidence_refs.push("evidence:terminal".into());
+        let mut advanced = observation(1, RuntimeObservationKind::ToolProgress, "withdraw");
+        advanced.result_class = ObservationResultClass::Succeeded;
+        advanced.information_gain.provenance = MeasureProvenance::Observed;
+        advanced
+            .information_gain
+            .distinguishing_evidence_refs
+            .push("receipt:withdraw".into());
+        assert_eq!(
+            InterventionPolicy
+                .propose(&goal, &progress, std::slice::from_ref(&advanced))
+                .unwrap()
+                .kind,
+            RuntimeInterventionKind::Continue
+        );
+        assert_eq!(goal.completion, GoalCompletion::Open);
+
+        progress
+            .effects
+            .insert("remote".into(), EffectTerminalClass::Uncertain);
+        assert_eq!(
+            InterventionPolicy
+                .propose(&goal, &progress, std::slice::from_ref(&advanced))
+                .unwrap()
+                .kind,
+            RuntimeInterventionKind::Block
+        );
+        progress.effects.clear();
+        progress
+            .criteria
+            .insert("terminal".into(), AcceptanceStatus::Blocked);
+        assert_eq!(
+            InterventionPolicy
+                .propose(&goal, &progress, std::slice::from_ref(&advanced))
+                .unwrap()
+                .kind,
+            RuntimeInterventionKind::Synthesize
+        );
+        progress
+            .criteria
+            .insert("terminal".into(), AcceptanceStatus::Satisfied);
+        progress.open_conflicts.push("conflict:review".into());
+        assert_eq!(
+            InterventionPolicy
+                .propose(&goal, &progress, std::slice::from_ref(&advanced))
+                .unwrap()
+                .kind,
+            RuntimeInterventionKind::Replan
+        );
+        progress.open_conflicts.clear();
+        let stalled = [
+            observation(2, RuntimeObservationKind::ToolProgress, "read-a"),
+            observation(3, RuntimeObservationKind::ToolProgress, "read-b"),
+        ];
+        assert_eq!(
+            InterventionPolicy
+                .propose(&goal, &progress, &stalled)
+                .unwrap()
+                .kind,
+            RuntimeInterventionKind::Synthesize
+        );
+        for terminal in [
+            GoalCompletion::Satisfied,
+            GoalCompletion::Partial,
+            GoalCompletion::Blocked,
+            GoalCompletion::Failed,
+            GoalCompletion::Cancelled,
+        ] {
+            goal.completion = terminal;
+            assert_eq!(
+                InterventionPolicy
+                    .propose(&goal, &progress, &stalled)
+                    .unwrap()
+                    .kind,
+                RuntimeInterventionKind::Continue
+            );
+        }
     }
 
     #[test]

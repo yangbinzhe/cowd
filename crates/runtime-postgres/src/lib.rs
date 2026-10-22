@@ -37,7 +37,8 @@ use runtime::{
     validate_runtime_event as validate_event,
     validate_runtime_event_transaction as validate_transaction,
     validate_runtime_fenced_terminal as validate_fenced_terminal, AppendTransactionReceipt,
-    AppendTransactionRequest, CommittedEventBatch, CommittedStreamRevision, DurableRuntimeEvent,
+    AppendTransactionRequest, CheckedAppendReceipt, CheckedAppendRequest, CheckedSourceEvidence,
+    CheckedSourceValidator, CommittedEventBatch, CommittedStreamRevision, DurableRuntimeEvent,
     ExpectedStreamRevision, MissionOrganizationDecision, MissionOrganizationStatus,
     RuntimeEventInput, RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore,
     RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
@@ -121,7 +122,8 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             commit_cursor BIGSERIAL PRIMARY KEY,
             transaction_id TEXT NOT NULL UNIQUE,
             request_hash TEXT NOT NULL,
-            created_at_ms BIGINT NOT NULL
+            created_at_ms BIGINT NOT NULL,
+            checked_source_evidence JSONB
         )"#,
         r#"CREATE TABLE runtime_events (
             event_id TEXT PRIMARY KEY,

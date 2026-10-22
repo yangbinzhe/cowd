@@ -247,6 +247,7 @@ struct LoopbackProvider {
     routes: Arc<std::sync::Mutex<Vec<(String, tokio::sync::mpsc::Sender<ProviderRequest>)>>>,
     marker: String,
     task_route_controls: usize,
+    pending_request: Option<ProviderRequest>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -364,11 +365,15 @@ impl LoopbackProvider {
             routes,
             marker: format!("RECOVERY_{}_LANE", model.to_ascii_uppercase()),
             task_route_controls: 0,
+            pending_request: None,
             task,
         }
     }
 
     async fn next(&mut self) -> ProviderRequest {
+        if let Some(request) = self.pending_request.take() {
+            return request;
+        }
         tokio::time::timeout(Duration::from_secs(90), async {
             for _ in 0..2 {
                 let request = self.requests.recv().await.expect("loopback request channel closed");
@@ -384,6 +389,21 @@ impl LoopbackProvider {
             }
             panic!("recovery206 request budget exhausted before the production model continuation");
         }).await.expect("production provider continuation did not arrive within the original shared 90s deadline")
+    }
+
+    // Sending a scripted call does not establish that its command committed.
+    // Keep the actual continuation for the next scripted response.
+    async fn wait_for_tool_result(&mut self, call_id: &str) {
+        let request = self.next().await;
+        assert!(
+            request.body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|message| message["role"] == "tool" && message["tool_call_id"] == call_id),
+            "production continuation must carry the result for {call_id}"
+        );
+        self.pending_request = Some(request);
     }
 
     async fn tool(&mut self, id: &str, name: &str, input: Value, text: Option<&str>) {
@@ -870,6 +890,7 @@ impl ReviewedTurn {
             lose_commit_response,
             None,
             false,
+            true,
         )
         .await
     }
@@ -883,6 +904,7 @@ impl ReviewedTurn {
         lose_commit_response: bool,
         optional: Option<&mut LoopbackProvider>,
         hold_resolution: bool,
+        hold_producer_until_a: bool,
     ) -> Self {
         use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
         let runtime = services.runtime.runtime_services();
@@ -1028,6 +1050,25 @@ impl ReviewedTurn {
                 &session_id,
                 call_id,
                 producer_graph,
+            )
+            .await;
+        }
+        if !hold_producer_until_a {
+            // TaskExecute closes on Submitted through the production owner;
+            // no additional provider request is required for physical exit.
+            durable_turn_until(
+                services,
+                &graph_id,
+                &program_id,
+                "normal_producer_physically_finished",
+                || {
+                    let graph = runtime.graph_state_store().load(producer_graph).unwrap();
+                    graph
+                        .node_statuses
+                        .values()
+                        .all(|status| status.is_terminal())
+                        .then_some(())
+                },
             )
             .await;
         }
@@ -1515,6 +1556,16 @@ impl ReviewedTurn {
                 None,
             )
             .await;
+            root.wait_for_tool_result("recovery-optional-retire").await;
+            let program = runtime.agent_action_service().project(&program_id).unwrap();
+            assert_eq!(
+                program.tasks[&optional_task].status,
+                runtime::AgenticTaskStatus::CancelRequested
+            );
+            assert!(
+                !program.tasks[&optional_task].active_attempts.is_empty(),
+                "a committed withdrawal must still retain the held physical attempt"
+            );
             Some((optional_task, request, release))
         } else {
             None
@@ -1664,23 +1715,25 @@ impl ReviewedTurn {
             )
             .await;
         }
-        let producer_graph = runtime
-            .graph_state_store()
-            .load(
-                program.tasks[&task_ref]
-                    .claim_execution_id
-                    .as_deref()
-                    .unwrap(),
-            )
-            .unwrap();
-        assert!(
-            producer_graph
-                .node_statuses
-                .values()
-                .any(|status| !status.is_terminal()),
-            "A must be real while its already-receipted producer is still physically alive"
-        );
-        producer.finish("The claimed Task is submitted with its original report; no further write is needed.").await;
+        if hold_producer_until_a {
+            let producer_graph = runtime
+                .graph_state_store()
+                .load(
+                    program.tasks[&task_ref]
+                        .claim_execution_id
+                        .as_deref()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(
+                producer_graph
+                    .node_statuses
+                    .values()
+                    .any(|status| !status.is_terminal()),
+                "A must be real while its already-receipted producer is still physically alive"
+            );
+            producer.finish("The claimed Task is submitted with its original report; no further write is needed.").await;
+        }
         assert!(!goal.reviews.is_empty());
         assert!(goal
             .reviews
@@ -2438,6 +2491,56 @@ async fn assert_staged_artifact(
 }
 
 #[tokio::test]
+async fn n1_b_reviewed_file_reaches_real_session_without_recovery_faults() {
+    let root = fixture_root();
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let mut producer = LoopbackProvider::start("producer").await;
+    let mut reviewer = LoopbackProvider::start("reviewer").await;
+    let providers = provider_registry(&[&provider, &producer, &reviewer]);
+    let topology = SelectedStorageTopology::compose_for_test(
+        &root.path().join("home"),
+        &root.path().join("workspace"),
+    )
+    .unwrap();
+    let services = RecoveryServices::start(root.path(), topology, providers).await;
+    use futures::FutureExt;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mut turn = ReviewedTurn::produce_with_optional(
+            &services,
+            &mut provider,
+            &mut producer,
+            &mut reviewer,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .await;
+        assert!(turn.optional_receipts.is_empty());
+        let (terminal, _) = drive_final_until(&mut provider, &mut turn.observer.observed)
+            .await
+            .unwrap();
+        turn.observer.bind().unwrap();
+        turn.assert_materialized(&services, &terminal).await;
+    })
+    .catch_unwind()
+    .await;
+    if result.is_err() {
+        eprintln!(
+            "normal_b retained_namespace={:?}",
+            services.topology.preserve_failed_test_namespace()
+        );
+    }
+    drop(services.stop().await);
+    if let Err(error) = result {
+        eprintln!("normal_b retained_fixture_root={}", root.keep().display());
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
 async fn r1_terminal_recovery_satisfied_a_reaches_real_session() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("off,runtime::runtime_event_reactor=warn,runtime::execution_core::services=warn")
@@ -2466,6 +2569,7 @@ async fn r1_terminal_recovery_satisfied_a_reaches_real_session() {
         false,
         Some(&mut optional),
         false,
+        true,
     )
     .await;
     let candidate = turn.candidate.take().unwrap();
@@ -3303,6 +3407,7 @@ async fn lost_notify_checkpoint_restart(after_checkpoint: bool) {
         false,
         None,
         true,
+        true,
     )
     .await;
     let (revision, held) =
@@ -4129,12 +4234,9 @@ async fn r1_delivery_fault_points_are_independent_and_require_nonempty_identitie
 }
 
 fn fixture_root() -> tempfile::TempDir {
-    let plan = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .map(|ancestor| ancestor.join("plan/2026-10/1016-cowd-future-kernel"))
-        .find(|candidate| candidate.join("design-contract.json").is_file())
-        .expect("recovery fixture requires the execution plan tree");
-    let root = plan.join("evidence/execution/kernel-terminal-20261016/R1-03/fixtures");
+    let root = std::env::var_os("COWD_TEST_FIXTURE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&root).unwrap();
     tempfile::Builder::new()
         .prefix("detached-adapter-restart-")

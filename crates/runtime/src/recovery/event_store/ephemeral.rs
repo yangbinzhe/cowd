@@ -24,6 +24,7 @@ struct EphemeralState {
     position_indexes: BTreeMap<(String, String), BTreeMap<(u64, u32), usize>>,
     transactions: BTreeMap<String, AppendTransactionReceipt>,
     transaction_hashes: BTreeMap<String, String>,
+    checked_evidence: BTreeMap<String, CheckedSourceEvidence>,
     checkpoints: BTreeMap<String, RuntimeProjectionCheckpoint>,
     consumed_leases: BTreeSet<String>,
     terminals: BTreeMap<String, RuntimeSessionOutboxRecord>,
@@ -380,12 +381,33 @@ impl EphemeralRuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: Option<SessionTerminalInput>,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.append_inner_checked(request, terminal, None)
+            .map(|(receipt, _)| receipt)
+    }
+
+    fn append_inner_checked(
+        &self,
+        request: AppendTransactionRequest,
+        terminal: Option<SessionTerminalInput>,
+        checked: Option<(&CheckedAppendRequest, &dyn CheckedSourceValidator)>,
+    ) -> RuntimeEventStoreResult<(AppendTransactionReceipt, Option<CheckedSourceEvidence>)> {
         validate_runtime_event_transaction(&request)?;
         RuntimeEventStore::validate_current_content_inputs(&request)?;
         if let Some(terminal) = &terminal {
             validate_runtime_fenced_terminal(terminal)?;
         }
-        let hash = runtime_event_request_hash_with_terminal(&request, terminal.as_ref())?;
+        let hash = match checked {
+            Some((request, validator)) => {
+                if request.frame_digest != validator.frame_digest() {
+                    return Err(RuntimeEventStoreError::InvalidTransaction(
+                        "source frame mismatch".into(),
+                    ));
+                }
+                request.identity_hash()?
+            }
+            None => runtime_event_request_hash_with_terminal(&request, terminal.as_ref())?,
+        };
+        let held_since = std::time::Instant::now();
         let mut state = self
             .state
             .lock()
@@ -398,7 +420,10 @@ impl EphemeralRuntimeEventStore {
             }
             let mut duplicate = receipt.clone();
             duplicate.duplicate = true;
-            return Ok(duplicate);
+            return Ok((
+                duplicate,
+                state.checked_evidence.get(&request.transaction_id).cloned(),
+            ));
         }
         for input in &request.events {
             if input.idempotency_key.as_ref().is_some_and(|key| {
@@ -412,36 +437,104 @@ impl EphemeralRuntimeEventStore {
                 ));
             }
         }
-        for expected in &request.expected_streams {
-            let actual = state
-                .events
-                .iter()
-                .filter(|event| event.stream_id == expected.stream_id)
-                .map(|event| event.sequence)
-                .max()
-                .unwrap_or(0);
-            if actual != expected.expected_revision {
+        let mut evidence = checked.map(|(request, _)| CheckedSourceEvidence {
+            frame_digest: request.frame_digest.clone(),
+            sources: Vec::new(),
+            events_read: 0,
+            bytes_read: 0,
+            pages_read: 0,
+        });
+        let mut revisions = BTreeMap::new();
+        for source in &request.expected_streams {
+            let positions = state.stream_positions.get(&source.stream_id);
+            let actual = positions
+                .and_then(|positions| positions.last_key_value())
+                .map_or(0, |(sequence, _)| *sequence);
+            if let Some((checked, validator)) = checked {
+                let evidence = evidence.as_mut().expect("checked evidence initialized");
+                let count = actual
+                    .checked_sub(source.expected_revision)
+                    .ok_or_else(|| {
+                        RuntimeEventStoreError::Corrupt("source cut exceeds current head".into())
+                    })?;
+                let count = usize::try_from(count).map_err(|_| {
+                    RuntimeEventStoreError::HistoryBudgetExceeded("source count overflow".into())
+                })?;
+                evidence.events_read = evidence.events_read.saturating_add(count);
+                evidence.pages_read = evidence.pages_read.saturating_add(count.div_ceil(64));
+                if evidence.events_read > checked.budget.max_events
+                    || evidence.pages_read > checked.budget.max_pages
+                {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                        "cumulative source tail budget".into(),
+                    ));
+                }
+                let selected = positions
+                    .into_iter()
+                    .flat_map(|positions| {
+                        positions.range((
+                            std::ops::Bound::Excluded(source.expected_revision),
+                            std::ops::Bound::Included(actual),
+                        ))
+                    })
+                    .map(|(sequence, position)| (*sequence, *position))
+                    .collect::<Vec<_>>();
+                if selected.len() != count {
+                    return Err(RuntimeEventStoreError::Corrupt(
+                        "incomplete source tail".into(),
+                    ));
+                }
+                for (offset, (sequence, position)) in selected.iter().enumerate() {
+                    if *sequence != source.expected_revision + offset as u64 + 1 {
+                        return Err(RuntimeEventStoreError::Corrupt(
+                            "discontinuous source tail".into(),
+                        ));
+                    }
+                    evidence.bytes_read = evidence
+                        .bytes_read
+                        .saturating_add(16)
+                        .saturating_add(state.encoded_bytes[*position]);
+                }
+                if evidence.bytes_read > checked.budget.max_bytes
+                    || held_since.elapsed().as_millis() > u128::from(checked.budget.max_lock_millis)
+                {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                        "cumulative source bytes or held time".into(),
+                    ));
+                }
+                let events = selected
+                    .iter()
+                    .map(|(_, position)| state.events[*position].clone())
+                    .collect::<Vec<_>>();
+                validator.validate_tail(source, actual, &events)?;
+                if held_since.elapsed().as_millis() > u128::from(checked.budget.max_lock_millis) {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                        "source validator held time".into(),
+                    ));
+                }
+                evidence.sources.push(CommittedStreamRevision {
+                    stream_id: source.stream_id.clone(),
+                    expected_revision: source.expected_revision,
+                    committed_revision: actual,
+                });
+            } else if actual != source.expected_revision {
                 return Err(RuntimeEventStoreError::StaleRevision {
-                    stream_id: expected.stream_id.clone(),
-                    expected: expected.expected_revision,
+                    stream_id: source.stream_id.clone(),
+                    expected: source.expected_revision,
                     actual,
                 });
             }
+            revisions.insert(source.stream_id.clone(), actual);
         }
-        state.next_cursor += 1;
-        let cursor = state.next_cursor;
-        let mut revisions: BTreeMap<String, u64> = request
-            .expected_streams
-            .iter()
-            .map(|value| (value.stream_id.clone(), value.expected_revision))
-            .collect();
+        let cursor = state.next_cursor + 1;
         let mut event_ids = Vec::with_capacity(request.events.len());
+        let mut prepared_events = Vec::with_capacity(request.events.len());
         for (index, input) in request.events.iter().enumerate() {
             let sequence = revisions.get(&input.event.stream_id).copied().unwrap_or(0) + 1;
             revisions.insert(input.event.stream_id.clone(), sequence);
             let event_id = format!("runtime-event-{}", uuid::Uuid::new_v4());
             event_ids.push(event_id.clone());
-            state.events.push(DurableRuntimeEvent {
+            let event = DurableRuntimeEvent {
                 event_id,
                 stream_id: input.event.stream_id.clone(),
                 sequence,
@@ -457,14 +550,31 @@ impl EphemeralRuntimeEventStore {
                 transaction_index: index as u32,
                 schema_version: input.schema_version,
                 idempotency_key: input.idempotency_key.clone(),
-            });
+            };
+            let encoded_bytes = serde_json::to_vec(&event)?.len();
+            prepared_events.push((event, encoded_bytes));
+        }
+        if checked.is_some_and(|(request, _)| {
+            held_since.elapsed().as_millis() > u128::from(request.budget.max_lock_millis)
+        }) {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                "checked transaction preparation held time".into(),
+            ));
+        }
+        // Serialization and all fallible validation finish before publishing
+        // any event, index or cursor under the original state lock.
+        state.next_cursor = cursor;
+        for (index, (input, (event, encoded_bytes))) in
+            request.events.iter().zip(prepared_events).enumerate()
+        {
+            let sequence = event.sequence;
+            state.events.push(event);
             let position = state.events.len() - 1;
             state
                 .commit_positions
                 .entry(cursor)
                 .or_default()
                 .push(position);
-            let encoded_bytes = serde_json::to_vec(&state.events[position])?.len();
             state.encoded_bytes.push(encoded_bytes);
             state
                 .stream_positions
@@ -548,10 +658,15 @@ impl EphemeralRuntimeEventStore {
         state
             .transaction_hashes
             .insert(request.transaction_id.clone(), hash);
+        if let Some(evidence) = &evidence {
+            state
+                .checked_evidence
+                .insert(request.transaction_id.clone(), evidence.clone());
+        }
         state
             .transactions
             .insert(request.transaction_id, receipt.clone());
-        Ok(receipt)
+        Ok((receipt, evidence))
     }
 
     fn matching(
@@ -1132,6 +1247,23 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
         self.append_inner(request, None)
+    }
+    fn append_checked_transaction(
+        &self,
+        request: CheckedAppendRequest,
+        validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<CheckedAppendReceipt> {
+        let (commit, validation) = self.append_inner_checked(
+            request.transaction.clone(),
+            None,
+            Some((&request, validator)),
+        )?;
+        Ok(CheckedAppendReceipt {
+            commit,
+            validation: validation.ok_or_else(|| {
+                RuntimeEventStoreError::Corrupt("checked commit missing source evidence".into())
+            })?,
+        })
     }
     fn append_transaction_with_terminal(
         &self,
@@ -2414,5 +2546,134 @@ mod source_fence_tests {
         let current = backend.source_mutation_fence().unwrap();
         assert_eq!(current.mutation_epoch, source.mutation_epoch + 1);
         backend.compare_and_put_projection_checkpoint_fenced("858-checkpoint", 1, 1, &payload, 0, &current).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod checked_source_tests {
+    use super::*;
+
+    struct Neutral;
+    impl CheckedSourceValidator for Neutral {
+        fn frame_digest(&self) -> &str {
+            "independent-frame"
+        }
+        fn validate_tail(
+            &self,
+            source: &ExpectedStreamRevision,
+            actual: u64,
+            events: &[DurableRuntimeEvent],
+        ) -> RuntimeEventStoreResult<()> {
+            if events.iter().all(|event| event.kind == "neutral") {
+                Ok(())
+            } else {
+                Err(RuntimeEventStoreError::StaleRevision {
+                    stream_id: source.stream_id.clone(),
+                    expected: source.expected_revision,
+                    actual,
+                })
+            }
+        }
+    }
+
+    fn command(id: &str, head: u64, kind: &str) -> AppendTransactionRequest {
+        AppendTransactionRequest {
+            transaction_id: id.into(),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: "source".into(),
+                expected_revision: head,
+            }],
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: "source".into(),
+                    scope: RuntimeEventScope::Program,
+                    kind: kind.into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                },
+                idempotency_key: Some(id.into()),
+                schema_version: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn n2_checked_append_keeps_original_identity_and_strict_cas() {
+        let store = EphemeralRuntimeEventStore::new();
+        store
+            .append_transaction(command("neutral-1", 0, "neutral"))
+            .unwrap();
+        let original = CheckedAppendRequest {
+            transaction: command("conclusion", 0, "conclusion"),
+            frame_digest: "independent-frame".into(),
+            budget: SourceCheckBudget::default(),
+        };
+        assert!(matches!(
+            store.append_transaction(original.transaction.clone()),
+            Err(RuntimeEventStoreError::StaleRevision { .. })
+        ));
+        let receipt = store
+            .append_checked_transaction(original.clone(), &Neutral)
+            .unwrap();
+        assert_eq!(receipt.validation.sources[0].expected_revision, 0);
+        assert_eq!(receipt.validation.sources[0].committed_revision, 1);
+        assert_eq!(receipt.validation.events_read, 1);
+        assert_eq!(receipt.commit.stream_revisions[0].committed_revision, 2);
+        store
+            .append_transaction(command("neutral-2", 2, "neutral"))
+            .unwrap();
+        let duplicate = store
+            .append_checked_transaction(original.clone(), &Neutral)
+            .unwrap();
+        assert!(duplicate.commit.duplicate);
+        assert_eq!(duplicate.commit.commit_cursor, receipt.commit.commit_cursor);
+        assert_eq!(duplicate.validation, receipt.validation);
+        let mut changed = original;
+        changed.transaction.events[0].event.payload = serde_json::json!({"changed": true});
+        assert!(matches!(
+            store.append_checked_transaction(changed, &Neutral),
+            Err(RuntimeEventStoreError::TransactionConflict { .. })
+        ));
+        assert_eq!(store.stream_revision("source").unwrap(), 3);
+    }
+
+    #[test]
+    fn n2_checked_append_rejects_related_tail_and_budget_without_mutation() {
+        let store = EphemeralRuntimeEventStore::new();
+        store
+            .append_transaction(command("related", 0, "related"))
+            .unwrap();
+        let request = CheckedAppendRequest {
+            transaction: command("conclusion", 0, "conclusion"),
+            frame_digest: "independent-frame".into(),
+            budget: SourceCheckBudget::default(),
+        };
+        assert!(matches!(
+            store.append_checked_transaction(request, &Neutral),
+            Err(RuntimeEventStoreError::StaleRevision { .. })
+        ));
+        assert_eq!(store.stream_revision("source").unwrap(), 1);
+        let store = EphemeralRuntimeEventStore::new();
+        store
+            .append_transaction(command("neutral-1", 0, "neutral"))
+            .unwrap();
+        store
+            .append_transaction(command("neutral-2", 1, "neutral"))
+            .unwrap();
+        let request = CheckedAppendRequest {
+            transaction: command("conclusion", 0, "conclusion"),
+            frame_digest: "independent-frame".into(),
+            budget: SourceCheckBudget {
+                max_events: 1,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            store.append_checked_transaction(request, &Neutral),
+            Err(RuntimeEventStoreError::HistoryBudgetExceeded(_))
+        ));
+        assert_eq!(store.stream_revision("source").unwrap(), 2);
     }
 }

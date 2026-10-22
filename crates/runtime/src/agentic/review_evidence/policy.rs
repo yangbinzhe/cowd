@@ -306,12 +306,29 @@ pub(crate) fn validate_proof_inputs_for_action(
         current_review,
     )?;
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
-    if snapshot.semantic_digest != inputs.semantic_digest
-        || snapshot.policy_digest != inputs.acceptance_policy_digest
-        || snapshot.work_digest != proof.work_manifest_digest
-        || proof.effect_manifest_digest.as_deref() != Some(snapshot.effects.digest.as_str())
-    {
-        return Err("stale v2 proof: relevant result, source or acceptance policy changed".into());
+    let changed = [
+        (
+            "semantic",
+            snapshot.semantic_digest != inputs.semantic_digest,
+        ),
+        (
+            "policy",
+            snapshot.policy_digest != inputs.acceptance_policy_digest,
+        ),
+        ("work", snapshot.work_digest != proof.work_manifest_digest),
+        (
+            "effects",
+            proof.effect_manifest_digest.as_deref() != Some(snapshot.effects.digest.as_str()),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(dimension, differs)| differs.then_some(dimension))
+    .collect::<Vec<_>>();
+    if !changed.is_empty() {
+        return Err(format!(
+            "stale v2 proof: relevant result, source or acceptance policy changed; dimensions={}",
+            changed.join(",")
+        ));
     }
     Ok(snapshot)
 }
