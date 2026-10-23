@@ -174,104 +174,112 @@ fn assert_unsupported_review_inputs(
 
 #[tokio::test]
 async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
-    with_native_review_before_apply(|services, original, donor| {
-        assert_unsupported_review_inputs(services, original, donor, "objective");
-        let actions = services.agent_action_service();
-        let mut positive = original.clone();
-        positive.action_id = "direct-v2-objective-positive".into();
-        let mutation = services
-            .goal_store()
-            .prepare_agentic_objective_action(
-                &positive,
-                &donor.producers,
-                Some(&donor.verification),
-            )
-            .unwrap();
-        let applied = actions
-            .apply_with_goal_event(
-                &positive,
-                mutation.stream_id,
-                mutation.expected_stream_revision,
-                mutation.event,
-                Some(&donor.verification),
-            )
-            .unwrap();
-        assert_eq!(applied.status, AgentActionStatus::Applied, "{applied:?}");
-        let mut no_proof_gap = original.clone();
-        no_proof_gap.action_id = "legitimate-gap-without-proof".into();
-        if let AgentAction::ObjectiveReview(input) = &mut no_proof_gap.action {
-            input.decision = harness_contract::agent_action::ObjectiveReviewDecision::Gap;
-            input.reason =
-                "gap: the reviewed delivery still lacks its named missing deliverable".into();
-        }
-        let gap = actions.apply(&no_proof_gap).unwrap();
-        assert_eq!(gap.status, AgentActionStatus::Applied, "{gap:?}");
+    with_native_review_async(|services, original, donor| {
+        Box::pin(async move {
+            assert_unsupported_review_inputs(&services, &original, &donor, "objective");
+            let actions = services.agent_action_service();
+            let mut positive = original.clone();
+            positive.action_id = "direct-v2-objective-positive".into();
+            let mutation = services
+                .goal_store()
+                .prepare_agentic_objective_action(
+                    &positive,
+                    &donor.producers,
+                    Some(&donor.verification),
+                )
+                .unwrap();
+            let applied = actions
+                .apply_with_goal_event(
+                    &positive,
+                    mutation.stream_id,
+                    mutation.expected_stream_revision,
+                    mutation.event,
+                    Some(&donor.verification),
+                )
+                .unwrap();
+            assert_eq!(applied.status, AgentActionStatus::Applied, "{applied:?}");
+            let mut no_proof_gap = original.clone();
+            no_proof_gap.action_id = "legitimate-gap-without-proof".into();
+            if let AgentAction::ObjectiveReview(input) = &mut no_proof_gap.action {
+                input.decision = harness_contract::agent_action::ObjectiveReviewDecision::Gap;
+                input.reason =
+                    "gap: the reviewed delivery still lacks its named missing deliverable".into();
+            }
+            let gap = actions.apply(&no_proof_gap).unwrap();
+            assert_eq!(gap.status, AgentActionStatus::Applied, "{gap:?}");
+        })
     })
     .await;
     for action_kind in ["task-accept", "task-rework", "task-challenge"] {
-        with_native_task_review_before_apply(move |services, original, donor| {
-            assert_unsupported_review_inputs(services, original, donor, action_kind);
-            let actions = services.agent_action_service();
-            let mut positive = original.clone();
-            positive.action_id = format!("direct-v2-{action_kind}-positive");
-            if let AgentAction::TaskReview(input) = &mut positive.action {
-                if action_kind != "task-accept" {
-                    input.decision = if action_kind == "task-rework" {
-                        TaskReviewDecision::Rework
-                    } else {
-                        TaskReviewDecision::Challenge
-                    };
-                    input.operator_requirement = Some(
-                        services
-                            .goal_store()
-                            .get(&format!(
-                                "goal:{}",
-                                original.actor.root_execution_id.as_ref().unwrap()
-                            ))
-                            .unwrap()
-                            .unwrap()
-                            .objective,
+        with_native_task_review_async(
+            NativeTaskReviewCase::default(),
+            move |services, original, donor| {
+                Box::pin(async move {
+                    assert_unsupported_review_inputs(&services, &original, &donor, action_kind);
+                    let actions = services.agent_action_service();
+                    let mut positive = original.clone();
+                    positive.action_id = format!("direct-v2-{action_kind}-positive");
+                    if let AgentAction::TaskReview(input) = &mut positive.action {
+                        if action_kind != "task-accept" {
+                            input.decision = if action_kind == "task-rework" {
+                                TaskReviewDecision::Rework
+                            } else {
+                                TaskReviewDecision::Challenge
+                            };
+                            input.operator_requirement = Some(
+                                services
+                                    .goal_store()
+                                    .get(&format!(
+                                        "goal:{}",
+                                        original.actor.root_execution_id.as_ref().unwrap()
+                                    ))
+                                    .unwrap()
+                                    .unwrap()
+                                    .objective,
+                            );
+                            input.reason =
+                                actions.project(&original.actor.program_id).unwrap().tasks
+                                    [&input.task_ref]
+                                    .acceptance_checks
+                                    .join("; ");
+                        }
+                    }
+                    let applied = actions
+                        .apply_verified_review(&positive, &donor.verification)
+                        .unwrap();
+                    assert_eq!(
+                        applied.status,
+                        AgentActionStatus::Applied,
+                        "{action_kind}: {applied:?}"
                     );
-                    input.reason = actions.project(&original.actor.program_id).unwrap().tasks
-                        [&input.task_ref]
-                        .acceptance_checks
-                        .join("; ");
-                }
-            }
-            let applied = actions
-                .apply_verified_review(&positive, &donor.verification)
-                .unwrap();
-            assert_eq!(
-                applied.status,
-                AgentActionStatus::Applied,
-                "{action_kind}: {applied:?}"
-            );
-            let task_ref = match &positive.action {
-                AgentAction::TaskReview(input) => input.task_ref.clone(),
-                _ => unreachable!(),
-            };
-            let current = actions.project(&original.actor.program_id).unwrap();
-            if action_kind == "task-accept" {
-                assert_eq!(
-                    current.tasks[&task_ref].status,
-                    crate::AgenticTaskStatus::Accepted
-                );
-                positive.action_id.push_str(":rereview");
-                let cursor = services.event_store().durable_commit_cursor().unwrap();
-                let repeated = actions.apply(&positive).unwrap();
-                assert_eq!(repeated.error.unwrap().code, "task_already_accepted");
-                assert_eq!(
-                    services.event_store().durable_commit_cursor().unwrap(),
-                    cursor
-                );
-            } else {
-                assert_eq!(
-                    current.tasks[&task_ref].status,
-                    crate::AgenticTaskStatus::Rework
-                );
-                assert_eq!(current.tasks[&task_ref].review_generation, 1);
-            }
-        })
+                    let task_ref = match &positive.action {
+                        AgentAction::TaskReview(input) => input.task_ref.clone(),
+                        _ => unreachable!(),
+                    };
+                    let current = actions.project(&original.actor.program_id).unwrap();
+                    if action_kind == "task-accept" {
+                        assert_eq!(
+                            current.tasks[&task_ref].status,
+                            crate::AgenticTaskStatus::Accepted
+                        );
+                        positive.action_id.push_str(":rereview");
+                        let cursor = services.event_store().durable_commit_cursor().unwrap();
+                        let repeated = actions.apply(&positive).unwrap();
+                        assert_eq!(repeated.error.unwrap().code, "task_already_accepted");
+                        assert_eq!(
+                            services.event_store().durable_commit_cursor().unwrap(),
+                            cursor
+                        );
+                    } else {
+                        assert_eq!(
+                            current.tasks[&task_ref].status,
+                            crate::AgenticTaskStatus::Rework
+                        );
+                        assert_eq!(current.tasks[&task_ref].review_generation, 1);
+                    }
+                })
+            },
+        )
         .await;
     }
 
@@ -352,7 +360,8 @@ async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
             envelope.action_id = "public-objective-gap-without-proof".into();
             if let AgentAction::ObjectiveReview(input) = &mut envelope.action {
                 input.decision = harness_contract::agent_action::ObjectiveReviewDecision::Gap;
-                input.reason = "gap: the independent objective review has not yet been accepted".into();
+                input.reason =
+                    "gap: the independent objective review has not yet been accepted".into();
             } else {
                 unreachable!()
             }
@@ -380,7 +389,6 @@ async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
     })
     .await;
 }
-
 async fn assert_public_exact_replay(
     services: &Arc<RuntimeServices>,
     envelope: &AgentActionEnvelope,
@@ -2249,7 +2257,7 @@ async fn exercise_proven_goal_while_workers_drain(
 ) {
     let host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
-    Box::pin(exercise_reviewed_goal_delivery_with_drain(
+    exercise_reviewed_goal_delivery_with_drain(
         services,
         host,
         false,
@@ -2257,7 +2265,7 @@ async fn exercise_proven_goal_while_workers_drain(
         delegated_case,
         direct_text,
         PhysicalDrainTiming::AfterGoal,
-    ))
+    )
     .await;
 }
 
@@ -2269,13 +2277,14 @@ async fn exercise_reviewed_goal_delivery_kind(
 ) {
     let read_host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(read_host.clone()).expect("runtime");
-    exercise_reviewed_goal_delivery_on(
+    exercise_reviewed_goal_delivery_with_drain(
         services,
         read_host,
         with_disclosure,
         with_effect,
         delegated_case,
         direct_text,
+        PhysicalDrainTiming::BeforeGoal,
     )
     .await;
 }

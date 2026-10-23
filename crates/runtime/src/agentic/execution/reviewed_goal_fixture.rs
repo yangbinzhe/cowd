@@ -102,12 +102,6 @@ tokio::task_local! {
         &Arc<RuntimeServices>, &crate::AgenticProgramProjection,
         crate::execution_core::goal::PreparedProgramConclusion, &AgentActionEnvelope,
     ) + Send>>>;
-    static NATIVE_TASK_REVIEW_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(
-        &Arc<RuntimeServices>, &AgentActionEnvelope, &crate::agentic::review_evidence::IndependentReview,
-    ) + Send>>>;
-    static NATIVE_REVIEW_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(
-        &Arc<RuntimeServices>, &AgentActionEnvelope, &crate::agentic::review_evidence::IndependentReview,
-    ) + Send>>>;
 }
 
 #[cfg(test)]
@@ -194,62 +188,6 @@ async fn run_native_a_probe(
                 false,
                 PhysicalDrainTiming::BeforeGoal,
                 scenario,
-            ))
-            .await;
-        })
-        .await;
-}
-
-#[cfg(test)]
-pub(crate) async fn with_native_review_before_apply(
-    probe: impl FnOnce(
-            &Arc<RuntimeServices>,
-            &AgentActionEnvelope,
-            &crate::agentic::review_evidence::IndependentReview,
-        ) + Send
-        + 'static,
-) {
-    NATIVE_REVIEW_PROBE
-        .scope(std::cell::RefCell::new(Some(Box::new(probe))), async {
-            let host = Arc::new(ReviewReadHost::default());
-            let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
-            Box::pin(exercise_reviewed_goal_proof_scenario(
-                services,
-                host,
-                false,
-                false,
-                DelegatedEffectCase::Review,
-                false,
-                PhysicalDrainTiming::BeforeGoal,
-                R1ProofScenario::ReviewAdmission,
-            ))
-            .await;
-        })
-        .await;
-}
-
-#[cfg(test)]
-pub(crate) async fn with_native_task_review_before_apply(
-    probe: impl FnOnce(
-            &Arc<RuntimeServices>,
-            &AgentActionEnvelope,
-            &crate::agentic::review_evidence::IndependentReview,
-        ) + Send
-        + 'static,
-) {
-    NATIVE_TASK_REVIEW_PROBE
-        .scope(std::cell::RefCell::new(Some(Box::new(probe))), async {
-            let host = Arc::new(ReviewReadHost::default());
-            let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
-            Box::pin(exercise_reviewed_goal_proof_scenario(
-                services,
-                host,
-                false,
-                false,
-                DelegatedEffectCase::Review,
-                false,
-                PhysicalDrainTiming::BeforeGoal,
-                R1ProofScenario::TaskReviewAdmission,
             ))
             .await;
         })
@@ -1099,26 +1037,6 @@ impl ReviewedFixtureServices {
     }
 }
 
-pub(super) async fn exercise_reviewed_goal_delivery_on(
-    services: Arc<RuntimeServices>,
-    read_host: Arc<ReviewReadHost>,
-    with_disclosure: bool,
-    with_effect: bool,
-    delegated_case: DelegatedEffectCase,
-    direct_text: bool,
-) {
-    Box::pin(exercise_reviewed_goal_delivery_with_drain(
-        services,
-        read_host,
-        with_disclosure,
-        with_effect,
-        delegated_case,
-        direct_text,
-        PhysicalDrainTiming::BeforeGoal,
-    ))
-    .await;
-}
-
 #[cfg(test)]
 pub(crate) async fn exercise_bounded_process_reviewed_goal_283() {
     let workspace = tempfile::tempdir().unwrap();
@@ -1198,7 +1116,8 @@ pub(crate) async fn exercise_bounded_process_input_changed_before_final_290() {
     services.shutdown_maintenance().await;
 }
 
-pub(super) async fn exercise_reviewed_goal_delivery_with_drain(
+#[inline(never)]
+pub(super) fn exercise_reviewed_goal_delivery_with_drain(
     services: Arc<RuntimeServices>,
     read_host: Arc<ReviewReadHost>,
     with_disclosure: bool,
@@ -1206,8 +1125,8 @@ pub(super) async fn exercise_reviewed_goal_delivery_with_drain(
     delegated_case: DelegatedEffectCase,
     direct_text: bool,
     drain_timing: PhysicalDrainTiming,
-) {
-    exercise_reviewed_goal_proof_scenario(
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+    Box::pin(exercise_reviewed_goal_proof_scenario(
         services,
         read_host,
         with_disclosure,
@@ -1216,8 +1135,7 @@ pub(super) async fn exercise_reviewed_goal_delivery_with_drain(
         direct_text,
         drain_timing,
         R1ProofScenario::Unchanged,
-    )
-    .await;
+    ))
 }
 
 async fn read_bounded_body_pages_283(
@@ -1495,6 +1413,15 @@ fn confirmed_run_exit_with_retry(
     }
 }
 
+#[inline(never)]
+fn boxed_fixture_stage<Make, Stage>(make: Make) -> std::pin::Pin<Box<Stage>>
+where
+    Make: FnOnce() -> Stage,
+    Stage: std::future::Future,
+{
+    Box::pin(make())
+}
+
 pub(super) async fn exercise_reviewed_goal_proof_scenario(
     services: Arc<RuntimeServices>,
     read_host: Arc<ReviewReadHost>,
@@ -1572,12 +1499,18 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
         envelope.actor.program_id = fixture_program_id.clone();
         envelope.actor.root_execution_id = Some("root-agentic-execution".to_string());
         if proof_scenario.native_sources() {
-            let policy = services.session_execution_policy(&envelope.actor.session_id)
+            let policy = services
+                .session_execution_policy(&envelope.actor.session_id)
                 .expect("Native physical fixture requires its installed Session policy");
-            assert_eq!(policy.autonomy_profile,
-                harness_contract::policy::AutonomyProfileId::Autonomous);
+            assert_eq!(
+                policy.autonomy_profile,
+                harness_contract::policy::AutonomyProfileId::Autonomous
+            );
             assert!(policy.permission_mode.permits(PermissionMode::ReadOnly));
-            assert_eq!(envelope.actor.permission_ceiling, Some(PermissionMode::ReadOnly));
+            assert_eq!(
+                envelope.actor.permission_ceiling,
+                Some(PermissionMode::ReadOnly)
+            );
             assert!(envelope.actor.resource_scopes.is_empty());
             envelope.actor.resource_scopes = vec!["workspace:.".into()];
         }
@@ -1593,1854 +1526,36 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
             ),
         ),
     );
-    let root_task_spec = services
-        .task_runtime_port()
-        .bind_task_spec(
-            "session-dispatch",
-            Some(PermissionMode::DangerFullAccess),
-            harness_contract::task::TaskSpec::new("root Agent-first Program"),
-        )
-        .expect("bind root task policy");
-    services
-        .task_aggregate_service()
-        .create(harness_contract::task::TaskCreateCommand {
-            task_id: "task-root-dispatch".to_string(),
-            mission_id: root_mission_id.to_string(),
-            kind: harness_contract::task::TaskKind::Root,
-            origin: harness_contract::task::TaskOrigin::User,
-            origin_session_id: "session-dispatch".to_string(),
-            origin_turn_id: "turn-dispatch".to_string(),
-            root_task_id: "task-root-dispatch".to_string(),
-            parent_task_id: None,
-            predecessor_task_id: None,
-            mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
-            mission_assigned_by: "test".to_string(),
-            spec: root_task_spec,
-            evidence_refs: Vec::new(),
-        })
-        .expect("create root task");
-    let action_service = services.agent_action_service();
-    let team_receipt = services
-        .submit_agent_action(&bind_root(root(
-            "team",
-            AgentAction::TeamCreate(TeamCreateInput {
-                name: "Research Team".to_string(),
-                mission: "investigate".to_string(),
-                objective: None,
-            }),
-        )))
-        .await
-        .expect("team");
-    if proof_scenario.native_sources() {
-        let initial = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(initial.permission_ceiling, PermissionMode::ReadOnly);
-        assert_eq!(initial.resource_scopes, vec!["workspace:.".to_string()]);
-    }
-    let team_ref = team_receipt.changed_refs[0].clone();
-    let agent_ref = services
-        .submit_agent_action(&bind_root(root(
-            "agent",
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: team_ref.clone(),
-                role: "Researcher".to_string(),
-                mission: "collect evidence".to_string(),
-                required_capabilities: if proof_scenario.bounded_process() {
-                    vec!["python".into(), "verification".into(), "write".into()]
-                } else if delegated_effect {
-                    vec!["web-research".into(), "write".into()]
-                } else {
-                    vec!["web-research".into()]
-                },
-                existing_agent_ref: None,
-                definition_ref: None,
-                model_profile_ref: None,
-                expertise_hints: Vec::new(),
-                execution_requirements: Vec::new(),
-            }),
-        )))
-        .await
-        .expect("agent")
-        .changed_refs[0]
-        .clone();
-    let task = bind_root(root(
-        "task",
-        AgentAction::TaskPublish(TaskPublishInput {
-            team_ref: team_ref.clone(),
-            title: "Evidence review".to_string(),
-            objective: "review crates/runtime/Cargo.toml".to_string(),
-            acceptance: "cite evidence".to_string(),
-            criterion_source: Default::default(),
-            acceptance_checks: Vec::new(),
-            required_capabilities: if delegated_effect {
-                vec!["python".into(), "verification".into(), "write".into()]
-            } else {
-                vec!["python".into(), "verification".into()]
-            },
-            depends_on: Vec::new(),
-
-            obligation_refs: Vec::new(),
-            purpose: Default::default(),
-            execution_requirements: Vec::new(),
-            expertise_hints: Vec::new(),
-        }),
-    ));
-    let task_ref = services
-        .submit_agent_action(&task)
-        .await
-        .expect("task")
-        .changed_refs[0]
-        .clone();
-    let receipts = services
-        .dispatch_agentic_followups(
-            &task,
-            AgenticDispatchContext {
-                session_id: "session-dispatch".to_string(),
-                turn_id: "turn-dispatch".to_string(),
-                model_lease: "default".to_string(),
-                permission_ceiling: PermissionMode::DangerFullAccess,
-                resource_scopes: vec!["workspace:.".to_string(), "network:*".to_string()],
-            },
-        )
-        .await
-        .expect("dispatch");
-    assert_eq!(receipts.len(), 1);
-    let producer_session = wait_real_process(&services, &receipts[0].graph_id).await;
-
-    let graph = services
-        .graph_state_store()
-        .load(&receipts[0].graph_id)
-        .expect("graph");
-    let packet: AgentTaskPacket =
-        serde_json::from_str(&graph.nodes[0].payload_ref).expect("packet");
-    assert_eq!(
-        packet
-            .binding
-            .as_ref()
-            .map(|binding| binding.definition_ref.definition_id.as_str()),
-        Some(REAL_PROCESS_DEFINITION)
-    );
-    packet
-        .validate_cohort_prompt_package()
-        .expect("Agentic Program cohort scope");
-    let cohort = packet
-        .cohort_prompt_package
-        .as_ref()
-        .expect("shared Agentic Program prefix");
-    assert!(matches!(
-        &cohort.scope,
-        harness_contract::agent::CohortPromptScope::AgenticProgram {
-            session_id,
-            program_id,
-            team_id,
-        } if session_id == "session-dispatch"
-            && program_id == fixture_program_id.as_str()
-            && team_id == &team_ref
-    ));
-    let shared_prefix = cohort.render_user_messages().join("\n");
-    assert!(shared_prefix.contains("investigate"));
-    assert!(!shared_prefix.contains(&task_ref));
-    assert!(!shared_prefix.contains(&agent_ref));
-    assert_eq!(packet.deadline_at_ms, u64::MAX);
-    assert!(packet.objective.contains("state_inspect"));
-    assert!(packet.objective.contains("task_claim"));
-    assert!(matches!(
-        packet.agentic_binding.as_ref().map(|binding| &binding.focus),
-        Some(harness_contract::agent::AgenticExecutionFocus::TaskExecute {
-            task_ref: bound_task_ref,
-        }) if bound_task_ref == &task_ref
-    ));
-    assert!(packet.objective.contains("one result owner"));
-    assert!(packet.required_acceptance.evidence_obligations.is_empty());
-    assert!(packet.objective.contains("read:crates/runtime/Cargo.toml"));
-    assert!(!packet
-        .objective
-        .contains("already committed this exact work"));
-    let lineage = graph.lineage.as_ref().expect("child lineage");
-    assert_eq!(lineage.root_task_id, "task-root-dispatch");
-    assert_eq!(lineage.task_id, receipts[0].task_ref);
-    assert_eq!(packet.assignment.root_task_id, "task-root-dispatch");
-    assert_eq!(packet.assignment.mission_id, root_mission_id);
-    assert_eq!(
-        services
-            .task_aggregate_service()
-            .get(&receipts[0].task_ref)
-            .expect("load dispatched task")
-            .expect("dispatched task")
-            .mission_id,
-        root_mission_id
-    );
-    assert_eq!(
-        graph
-            .parent_execution
-            .as_ref()
-            .map(|binding| binding.execution_id.as_str()),
-        Some("root-agentic-execution")
-    );
-    let heartbeat = start_agentic_claim_heartbeat(Arc::downgrade(&services), &packet)
-        .expect("start worker-owned claim heartbeat")
-        .expect("execute packet owns a heartbeat guard");
-    tokio::task::yield_now().await;
-    let binding = packet.binding.clone().expect("binding");
-    assert_eq!(
-        binding.definition_ref.definition_id.as_str(),
-        REAL_PROCESS_DEFINITION
-    );
-    let expected_capabilities = if proof_scenario.bounded_process() {
-        vec![
-            AgentCapability::Read,
-            AgentCapability::Write,
-            AgentCapability::Test,
-        ]
-    } else {
-        vec![
-            AgentCapability::Read,
-            AgentCapability::Search,
-            AgentCapability::Write,
-            AgentCapability::Test,
-            AgentCapability::Network,
-        ]
-    };
-    assert_eq!(binding.effective_capabilities, expected_capabilities);
-    if proof_scenario.bounded_process() {
-        assert!(packet
-            .allowed_tools
-            .iter()
-            .any(|tool| tool == "execute_code"));
-        assert!(!packet.allowed_tools.iter().any(|tool| matches!(
-            tool.as_str(),
-            "bash" | "powershell" | "web_fetch" | "web_search"
-        )));
-    }
-    assert!(binding.skill_refs.is_empty());
-    assert!(binding
-        .tool_contract_refs
-        .contains(&"state_inspect".to_string()));
-    let display = binding.display.expect("display");
-    assert_eq!(display.label, "Researcher");
-    assert_eq!(display.focus_label.as_deref(), Some("Evidence review"));
-
-    let before_claim = action_service
-        .project(fixture_program_id.as_str())
-        .expect("projection before Agent claim");
-    assert_eq!(
-        before_claim.tasks[&task_ref].status,
-        AgenticTaskStatus::Published,
-        "dispatch must not impersonate the invited Agent by committing TaskClaim"
-    );
-    assert!(before_claim.tasks[&task_ref].claimant.is_none());
-    assert!(before_claim.tasks[&task_ref].claim_execution_id.is_none());
-    drop(heartbeat);
-
-    let actor = services
-        .resolve_agent_action_actor(
-            &ExecutionParentBinding {
-                execution_id: graph.id.clone(),
-                node_id: graph.nodes[0].id.clone(),
-            },
-            None,
-        )
-        .await
-        .expect("resolve immutable Agent actor");
-    assert_eq!(actor.kind, AgentActorKind::Agent);
-    assert_eq!(actor.actor_id, agent_ref);
-    assert_eq!(actor.agent_id.as_deref(), Some(agent_ref.as_str()));
-    assert_eq!(actor.team_id.as_deref(), Some(team_ref.as_str()));
-    assert_eq!(actor.execution_id.as_deref(), Some(graph.id.as_str()));
-
-    let shadow_id = "agentic-graph:rebound-packet";
-    let original_children = services
-        .graph_state_store()
-        .child_links("root-agentic-execution")
-        .unwrap();
-    assert_eq!(
-        services.event_store().stream_revision(shadow_id).unwrap(),
-        0
-    );
-    let probe = PhysicalProcessFixture::with_session_owner(
-        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
-        "packet-parent-negative-255",
-        Some(&services.0),
-    )
-    .await;
-    let probe_worker = probe
-        .dispatch(
-            "packet-parent-negative-255",
-            vec!["read:.".into()],
-            false,
-            false,
-            true,
-        )
-        .await;
-    let negative_services = &probe.services;
-    let valid_parent = ExecutionParentBinding {
-        execution_id: probe_worker.packet.graph_id().into(),
-        node_id: probe_worker.packet.node_id().into(),
-    };
-    let valid_actor = negative_services
-        .resolve_agent_action_actor(&valid_parent, None)
-        .await
-        .expect("same isolated services must resolve its genuinely admitted Process");
-    assert_eq!(
-        valid_actor.agent_id.as_deref(),
-        Some(
-            probe_worker
-                .packet
-                .agentic_binding
-                .as_ref()
-                .unwrap()
-                .agent_id
-                .as_str()
-        )
-    );
-    let valid_graph = negative_services
-        .graph_state_store()
-        .load(&valid_parent.execution_id)
-        .unwrap();
-    probe_worker.finish_readonly_control().await;
-    assert!(confirmed_run_exit_with_retry(negative_services.event_store(), &probe_worker.packet)
-    .is_some());
-    assert!(!probe_worker.directory().exists());
-    let mut rebound_graph = valid_graph.clone();
-    rebound_graph.id = shadow_id.into();
-    assert_eq!(rebound_graph.nodes, valid_graph.nodes);
-    assert_eq!(rebound_graph.lineage, valid_graph.lineage);
-    assert_eq!(rebound_graph.parent_execution, valid_graph.parent_execution);
-    negative_services
-        .commit_service()
-        .register_graph(rebound_graph.clone())
-        .expect("register corrupted recovery fixture");
-    let planned = negative_services
-        .graph_state_store()
-        .load(shadow_id)
-        .unwrap();
-    assert!(planned
-        .node_statuses
-        .values()
-        .all(|status| *status == harness_contract::execution_graph::ExecutionNodeStatus::Planned));
-    negative_services
-        .commit_service()
-        .apply_command(
-            &planned,
-            &harness_contract::execution_graph::ExecutionGraphCommand::Cancel {
-                expected_revision: planned.revision,
-                reason: "Retire the never-started isolated packet-parent rejection probe".into(),
-            },
-        )
-        .unwrap();
-    let cancelled = negative_services
-        .graph_state_store()
-        .load(shadow_id)
-        .unwrap();
-    assert!(
-        cancelled
-            .node_statuses
-            .values()
-            .all(|status| *status
-                == harness_contract::execution_graph::ExecutionNodeStatus::Cancelled)
-    );
-    assert_eq!(cancelled.nodes, valid_graph.nodes);
-    let error = negative_services
-        .resolve_agent_action_actor(
-            &ExecutionParentBinding {
-                execution_id: rebound_graph.id.clone(),
-                node_id: rebound_graph.nodes[0].id.clone(),
-            },
-            None,
-        )
-        .await
-        .expect_err("a packet cannot be rebound to a different parent graph");
-    assert_eq!(error, "agent_actor_packet_parent_binding_mismatch");
-    assert_eq!(
-        negative_services
-            .resolve_agent_action_actor(&valid_parent, None)
-            .await
-            .unwrap(),
-        valid_actor
-    );
-    assert!(negative_services
-        .agent_runtime()
-        .list()
-        .iter()
-        .all(|run| run.graph_id != shadow_id));
-    assert_eq!(
-        negative_services
-            .agent_runtime()
-            .get(probe_worker.packet.agent_id())
-            .unwrap()
-            .graph_id,
-        probe_worker.packet.graph_id()
-    );
-    assert!(
-        negative_services
-            .graph_state_store()
-            .load(shadow_id)
-            .unwrap()
-            .node_statuses
-            .values()
-            .all(|status| *status
-                == harness_contract::execution_graph::ExecutionNodeStatus::Cancelled)
-    );
-    negative_services.shutdown_maintenance().await;
-    assert_eq!(
-        services.event_store().stream_revision(shadow_id).unwrap(),
-        0
-    );
-    assert_eq!(
-        services
-            .graph_state_store()
-            .child_links("root-agentic-execution")
-            .unwrap(),
-        original_children
-    );
-    assert_eq!(
-        services
-            .resolve_agent_action_actor(
-                &ExecutionParentBinding {
-                    execution_id: graph.id.clone(),
-                    node_id: graph.nodes[0].id.clone(),
-                },
-                None
-            )
-            .await
-            .unwrap(),
-        actor
-    );
-
-    services
-        .submit_agent_action(&AgentActionEnvelope {
-            action_id: "model-agent-claim".to_string(),
-            actor: actor.clone(),
-            expected_revision: None,
-            action: AgentAction::TaskClaim(TaskClaimInput {
-                task_ref: task_ref.clone(),
-                reason: Some("I inspected the task and accept it".to_string()),
-            }),
-        })
-        .await
-        .expect("Agent claims its own work");
-    let after_claim = action_service
-        .project(fixture_program_id.as_str())
-        .expect("projection after Agent claim");
-    assert_eq!(
-        after_claim.tasks[&task_ref].status,
-        AgenticTaskStatus::Claimed
-    );
-    assert_eq!(
-        after_claim.tasks[&task_ref].claimant.as_deref(),
-        Some(agent_ref.as_str())
-    );
-    assert_eq!(
-        after_claim.tasks[&task_ref].claim_execution_id.as_deref(),
-        Some(graph.id.as_str())
-    );
-
-    let inspect = bind_root(root(
-        "inspect",
-        AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
-            query: None,
-            wait_for_workers: false,
-            scope_ref: None,
-            after_revision: None,
-            page_cursor: None,
-            entry_ref: None,
-        }),
-    ));
-    let before = services
-        .graph_state_store()
-        .nonterminal_graph_ids_async()
-        .await
-        .expect("active graphs");
-    assert!(services
-        .dispatch_agentic_followups(
-            &inspect,
-            AgenticDispatchContext {
-                session_id: "session-dispatch".to_string(),
-                turn_id: "turn-dispatch".to_string(),
-                model_lease: "default".to_string(),
-                permission_ceiling: PermissionMode::ReadOnly,
-                resource_scopes: Vec::new(),
-            },
-        )
-        .await
-        .expect("pure inspection")
-        .is_empty());
-    assert_eq!(
-        services
-            .graph_state_store()
-            .nonterminal_graph_ids_async()
-            .await
-            .expect("active graphs"),
-        before,
-        "state_inspect must never admit provider work"
-    );
-
-    // Continue real admission through the Objective and experience writers;
-    // never manufacture an episode/pattern event in this integration fixture.
-    let content = services
-        .artifact_store()
-        .write_bytes(
-            harness_contract::context::ArtifactWriteDescriptor {
-                media_type: "text/markdown".into(),
-                visibility_scope: "session:session-dispatch".into(),
-                expected_bytes: None,
-                original_name: Some("result.md".into()),
-            },
-            if with_disclosure { b"Source-backed findings. Limitation: performance estimate is illustrative, not an enterprise measurement. Disclose this limitation; no measured-performance claim is made.".as_slice() } else { b"Source-backed findings for independent review".as_slice() },
-        )
-        .await
-        .expect("persist content");
-    // An ordinary member organizes through its real compiled run grant.
-    // Its display role never provides authority and the new membership does
-    // not let another run inherit the original organizer's delegation.
-    let delegated = |id: &str, action: AgentAction| AgentActionEnvelope {
-        action_id: id.into(),
-        actor: actor.clone(),
-        expected_revision: None,
-        action,
-    };
-    let create = delegated(
-        "member-organizes-team",
-        AgentAction::TeamCreate(TeamCreateInput {
-            name: "Optional verification".into(),
-            mission: "organize a bounded follow-up".into(),
-            objective: None,
-        }),
-    );
-    let mut missing_run = create.clone();
-    missing_run.action_id = "member-no-run-grant".into();
-    missing_run.actor.execution_id = Some("nonexistent-organizer-run".into());
-    let denied = services.submit_agent_action(&missing_run).await.unwrap();
-    assert_eq!(
-        denied.status,
-        harness_contract::agent_action::AgentActionStatus::Rejected
-    );
-    let created = services.submit_agent_action(&create).await.unwrap();
-    assert_eq!(
-        created.status,
-        harness_contract::agent_action::AgentActionStatus::Applied,
-        "{created:?}"
-    );
-    let organized_team = created.changed_refs[0].clone();
-    let delegated_projection = action_service.project(fixture_program_id.as_str()).unwrap();
-    assert_eq!(
-        delegated_projection
-            .membership_for(&agent_ref, &organized_team)
-            .unwrap()
-            .delegation_ref,
-        actor.execution_id
-    );
-    let invited = services
-        .submit_agent_action(&delegated(
-            "member-organizer-invite",
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: organized_team.clone(),
-                role: "Verification peer".into(),
-                mission: "inspect only if needed".into(),
-                required_capabilities: vec!["read".into()],
-                existing_agent_ref: None,
-                definition_ref: None,
-                model_profile_ref: None,
-                expertise_hints: vec![],
-                execution_requirements: vec![],
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        invited.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let publish = delegated(
-        "member-organizer-task",
-        AgentAction::TaskPublish(TaskPublishInput {
-            team_ref: organized_team.clone(),
-            title: "Optional check".into(),
-            objective: "check need for further work".into(),
-            acceptance: "concrete evidence".into(),
-            criterion_source: Default::default(),
-            acceptance_checks: Vec::new(),
-            required_capabilities: vec!["read".into()],
-            depends_on: vec![],
-            obligation_refs: vec![],
-            purpose: Default::default(),
-            execution_requirements: vec![],
-            expertise_hints: vec![],
-        }),
-    );
-    let mut foreign_run = publish.clone();
-    foreign_run.action_id = "cannot-inherit-organizer-grant".into();
-    foreign_run.actor.execution_id = Some("another-run".into());
-    assert_eq!(
-        services
-            .submit_agent_action(&foreign_run)
-            .await
-            .unwrap()
-            .status,
-        harness_contract::agent_action::AgentActionStatus::Rejected
-    );
-    let published = services.submit_agent_action(&publish).await.unwrap();
-    assert_eq!(
-        published.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let optional_before = action_service.project(fixture_program_id.as_str()).unwrap();
-    let optional_task = optional_before.tasks[&published.changed_refs[0]].clone();
-    let optional_packets = optional_task.active_attempts.values().map(|attempt| {
-        let graph = services.graph_state_store().load(&attempt.execution_id).unwrap();
-        let nodes = graph.nodes.iter().filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .collect::<Vec<_>>();
-        assert_eq!(nodes.len(), 1);
-        let original: AgentTaskPacket = serde_json::from_str(&nodes[0].payload_ref).unwrap();
-        assert_eq!(original.graph_id(), attempt.execution_id);
-        let binding = original.agentic_binding.as_ref().unwrap();
-        assert_eq!(binding.program_id, fixture_program_id.as_str());
-        assert_eq!(binding.membership_id, attempt.membership_id);
-        assert_eq!(binding.team_id, organized_team);
-        assert!(matches!(&binding.focus,
-            harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref }
-                if task_ref == &published.changed_refs[0]));
-        original
-    }).collect::<Vec<_>>();
-    let optional_withdrawal = bind_root(root(
-        "retire-optional-verification",
-        AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
-            task_ref: published.changed_refs[0].clone(),
-            reason_ref: content.selector.clone(),
-            evidence_refs: vec![content.selector.clone()],
-        }),
-    ));
-    let retired = services
-        .submit_agent_action(&optional_withdrawal)
-        .await
-        .unwrap();
-    assert_eq!(
-        retired.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    services.dispatch_agentic_followups(&optional_withdrawal, AgenticDispatchContext {
-        session_id: optional_before.session_id.clone(),
-        turn_id: optional_before.turn_id.clone(),
-        model_lease: optional_before.model_lease.clone(),
-        permission_ceiling: optional_before.permission_ceiling,
-        resource_scopes: optional_before.resource_scopes.clone(),
-    }).await.expect("original optional withdrawal followup");
-    let exited = services
-        .submit_agent_action(&bind_root(root(
-            "exit-optional-team",
-            AgentAction::TeamUpdate(harness_contract::agent_action::TeamUpdateInput {
-                team_ref: organized_team.clone(),
-                mission_ref: None,
-                request_retire: true,
-                reason_ref: Some(content.selector.clone()),
-            }),
-        )))
-        .await
-        .unwrap();
-    assert_eq!(
-        exited.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    for original in &optional_packets {
-        wait_retired_process(&services, original, &published.changed_refs[0]).await;
-        assert!(confirmed_run_exit_with_retry(services.event_store(), original).is_some());
-        assert!(crate::agent_runtime::authenticated_run_lifecycle(services.event_store(), original)
-            .unwrap().no_direct_effects());
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            let current = action_service.project(fixture_program_id.as_str()).unwrap();
-            if current.teams[&organized_team].lifecycle
-                == crate::agentic::program::AgenticTeamLifecycle::Retired {
-                let task = &current.tasks[&published.changed_refs[0]];
-                assert_eq!(task.status, crate::AgenticTaskStatus::Withdrawn);
-                assert!(task.active_attempts.is_empty() && task.pending_retirement.is_none());
-                assert!(task.claimant.is_none() && task.claim_execution_id.is_none());
-                let had_attempt = optional_task.status == crate::AgenticTaskStatus::Claimed
-                    || !optional_task.active_attempts.is_empty();
-                assert_eq!(task.claim_generation, optional_task.claim_generation
-                    + u64::from(had_attempt));
-                for original in &optional_packets {
-                    let membership = &original.agentic_binding.as_ref().unwrap().membership_id;
-                    assert_eq!(current.memberships[membership].lifecycle,
-                        crate::agentic::program::AgenticMembershipLifecycle::Retired);
-                }
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }).await.unwrap_or_else(|error| {
-        own832_diagnostics::capture(&services, fixture_program_id.as_str(),
-            &published.changed_refs[0], "original_team_retirement_timeout", optional_packets.first());
-        panic!("optional Team retirement missing: {error:?}; see OWN832 snapshot");
+    let task_production_stage = boxed_fixture_stage(|| async {
+        include!("reviewed_goal_fixture/task_production_stage.rs")
     });
-
-    let mut pending_effect = None;
-    if proof_scenario.optional_unknown() {
-        std::fs::write(
-            services.workspace_root().join("review-effect.txt"),
-            "physical target exists before the required producer admission",
-        )
-        .unwrap();
-    }
-    let delegated_write_content = if proof_scenario.native_sources()
-        || matches!(
-            proof_scenario,
-            R1ProofScenario::PartialDependency
-                | R1ProofScenario::TransitiveDependency
-                | R1ProofScenario::ReadDelivery(_)
-        ) {
-        "actual delegated write\nstable middle line\ninitial dependency last line\n"
-    } else {
-        "actual delegated write"
-    };
-    let verified_delegated_content = if proof_scenario.native_sources()
-        || matches!(
-            proof_scenario,
-            R1ProofScenario::PartialDependency
-                | R1ProofScenario::TransitiveDependency
-                | R1ProofScenario::ReadDelivery(_)
-        ) {
-        "actual delegated write\nstable middle line\nchanged dependency last line\n"
-    } else {
-        delegated_write_content
-    };
-    let writer = if delegated_effect {
-        let writer = Arc::new(
-            RealProcessSession::prepare(
-                &services,
-                &packet,
-                &crate::agent_model_selector::AgentModelSelection {
-                    model: "test".into(),
-                    provider: "test".into(),
-                    registry_revision: 0,
-                },
-            )
-            .unwrap(),
-        );
-        writer
-            .execute_tool(
-                "delegated-write",
-                "edit",
-                &serde_json::json!({"path":"review-effect.txt","content":delegated_write_content})
-                    .to_string(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            delegated_write_content
-        );
-        if proof_scenario == R1ProofScenario::ReadDelivery(RealProcessProofCase::Effects) {
-            std::fs::write(
-                services.workspace_root().join("r1-optional-target.txt"),
-                "Initial second target of result A",
-            )
-            .unwrap();
-            writer.execute_tool("f2-real-second-target-A", "edit",
-                r#"{"path":"r1-optional-target.txt","content":"Actual second governed target of result A"}"#).await.unwrap();
-        }
-        let (request, calls_before_replay) = {
-            let calls = read_host.calls.lock().unwrap();
-            (
-                calls
-                    .iter()
-                    .rev()
-                    .find(|call| call.tool_name == "edit")
-                    .unwrap()
-                    .clone(),
-                calls.len(),
-            )
-        };
-        let dispatcher =
-            crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
-                &services, &packet,
-            );
-        let (first_replay, second_replay) = tokio::join!(
-            dispatcher.execute(request.clone()),
-            dispatcher.execute(request)
-        );
-        assert_eq!(
-            first_replay.unwrap().status,
-            crate::RuntimeToolExecutionStatus::Executed
-        );
-        assert_eq!(
-            second_replay.unwrap().status,
-            crate::RuntimeToolExecutionStatus::Executed
-        );
-        assert_eq!(
-            read_host.calls.lock().unwrap().len(),
-            calls_before_replay,
-            "durable ToolBatch replay must not repeat the physical write"
-        );
-        let mut stale_packet = packet.clone();
-        stale_packet.attempt += 1;
-        let stale = RealProcessSession::prepare(
-            &services,
-            &stale_packet,
-            &crate::agent_model_selector::AgentModelSelection {
-                model: "test".into(),
-                provider: "test".into(),
-                registry_revision: 0,
-            },
-        )
-        .unwrap();
-        let error = stale
-            .execute_tool(
-                "stale-generation-write",
-                "edit",
-                r#"{"path":"review-effect.txt","content":"stale generation"}"#,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("tool_effect_authority"),
-            "{error}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            delegated_write_content
-        );
-        if delegated_case == DelegatedEffectCase::PendingReview {
-            let gate = Arc::new(ReviewWriteHold::default());
-            read_host.held_write.set(Arc::clone(&gate)).unwrap();
-            let held_writer = Arc::clone(&writer);
-            let running = tokio::spawn(async move {
-                held_writer
-                    .execute_tool(
-                        "pending-required-write",
-                        "edit",
-                        &serde_json::json!({"path":"review-effect.txt","content":delegated_write_content}).to_string(),
-                    )
-                    .await
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
-                .await
-                .unwrap();
-            pending_effect = Some((gate, running));
-        }
-        Some(writer)
-    } else {
-        None
-    };
-    if delegated_case == DelegatedEffectCase::Withdraw {
-        let withdraw = bind_root(root(
-            "withdraw-live-producer",
-            AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
-                task_ref: task_ref.clone(),
-                reason_ref: content.selector.clone(),
-                evidence_refs: vec![content.selector.clone()],
-            }),
-        ));
-        assert_eq!(
-            services
-                .submit_agent_action(&withdraw)
-                .await
-                .unwrap()
-                .status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-        assert_eq!(
-            services
-                .graph_state_store()
-                .load(packet.graph_id())
-                .unwrap()
-                .node_statuses[packet.node_id()],
-            harness_contract::execution_graph::ExecutionNodeStatus::Running,
-            "prove the Program fence before stopping the process"
-        );
-        let index = format!(
-            "execution-agent-receipts:{}:{}:{}",
-            packet.graph_id(),
-            packet.node_id(),
-            packet.attempt
-        );
-        let revision = services.event_store().stream_revision(&index).unwrap();
-        let error = writer
-            .as_ref()
-            .unwrap()
-            .execute_tool(
-                "withdrawn-but-running",
-                "edit",
-                r#"{"path":"review-effect.txt","content":"withdrawn worker must not write"}"#,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("tool_effect_authority"),
-            "{error}"
-        );
-        assert_eq!(
-            services.event_store().stream_revision(&index).unwrap(),
-            revision
-        );
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            delegated_write_content
-        );
-        services
-            .dispatch_agentic_followups(
-                &withdraw,
-                AgenticDispatchContext {
-                    session_id: "session-dispatch".into(),
-                    turn_id: "turn-dispatch".into(),
-                    model_lease: "test".into(),
-                    permission_ceiling: PermissionMode::DangerFullAccess,
-                    resource_scopes: vec!["workspace:.".into()],
-                },
-            )
-            .await
-            .unwrap();
-        wait_retired_process(&services, &packet, &task_ref).await;
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(
-            current.tasks[&task_ref].status,
-            AgenticTaskStatus::Withdrawn
-        );
-        assert!(current.tasks[&task_ref].active_attempts.is_empty());
-        wait_retired_process(&services, &packet, &task_ref).await;
-        assert_eq!(
-            services.event_store().stream_revision(&index).unwrap(),
-            revision,
-            "cancellation retains the original effect evidence"
-        );
+    let Some((
+        action_service,
+        team_ref,
+        task,
+        task_ref,
+        producer_session,
+        packet,
+        actor,
+        content,
+        mut pending_effect,
+        delegated_write_content,
+        verified_delegated_content,
+        writer,
+        bounded_runs,
+        mut review_evidence_refs,
+        artifact,
+        reviewer,
+        _probe,
+    )) = task_production_stage.await
+    else {
         return;
-    }
-    let bounded_runs = if proof_scenario.bounded_process() {
-        run_bounded_process_versions_283(&services, &read_host, writer.as_ref().unwrap()).await
-    } else {
-        Vec::new()
     };
-    let mut review_evidence_refs = vec![content.selector.clone()];
-    if let Some(current) = bounded_runs.last() {
-        review_evidence_refs.push(current.body.selector.clone());
-    }
-    let artifact = if direct_text {
-        let mut wrong_claim = actor.clone();
-        wrong_claim.execution_id = Some("unbound-producer-cannot-submit".into());
-        let refused = services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "wrong-claim-text-submit".into(),
-                actor: wrong_claim,
-                expected_revision: None,
-                action: AgentAction::TaskSubmit(TaskSubmitInput {
-                    task_ref: task_ref.clone(),
-                    artifact_refs: vec![],
-                    evidence_refs: vec![],
-                    unresolved: vec![],
-                    deliverable: Some(TaskOneShotDeliverable {
-                        block_index: 0,
-                        kind: "report".into(),
-                        title: "Not this claimant".into(),
-                        resolved_content_ref: Some(content.selector.clone()),
-                    }),
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            refused.status,
-            harness_contract::agent_action::AgentActionStatus::Rejected
-        );
-        assert!(action_service
-            .project(fixture_program_id.as_str())
-            .unwrap()
-            .objective_verdict
-            .is_none());
-        let submitted = services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "experience-text-submit".into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::TaskSubmit(TaskSubmitInput {
-                    task_ref: task_ref.clone(),
-                    artifact_refs: vec![],
-                    evidence_refs: vec![],
-                    unresolved: vec![],
-                    deliverable: Some(TaskOneShotDeliverable {
-                        block_index: 0,
-                        kind: "report".into(),
-                        title: "Plain text findings".into(),
-                        resolved_content_ref: Some(content.selector.clone()),
-                    }),
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            submitted.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{submitted:?}"
-        );
-        let program = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(
-            program.tasks[&task_ref].status,
-            crate::AgenticTaskStatus::Submitted
-        );
-        assert!(program.objective_verdict.is_none());
-        program.tasks[&task_ref].artifact_refs[0].clone()
-    } else {
-        services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "experience-artifact".into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::ArtifactCommit(ArtifactCommitInput {
-                    content_ref: content.selector.clone(),
-                    kind: "report".into(),
-                    title: "Findings".into(),
-                    relates_to: vec![],
-                }),
-            })
-            .await
-            .unwrap()
-            .changed_refs[0]
-            .clone()
+    let task_review_stage =
+        boxed_fixture_stage(|| async { include!("reviewed_goal_fixture/task_review_stage.rs") });
+    let Some((reviewer_session, review_graph, _bridge)) = task_review_stage.await else {
+        return;
     };
-    let reviewer = services
-        .submit_agent_action(&bind_root(root(
-            "experience-reviewer",
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: team_ref.clone(),
-                role: "Verifier".into(),
-                mission: "Inspect evidence".into(),
-                required_capabilities: vec!["read".into()],
-                existing_agent_ref: None,
-                definition_ref: None,
-                model_profile_ref: None,
-                expertise_hints: Vec::new(),
-                execution_requirements: Vec::new(),
-            }),
-        )))
-        .await
-        .expect("invite verifier")
-        .changed_refs[0]
-        .clone();
-    let submit = AgentActionEnvelope {
-        action_id: "experience-submit".into(),
-        actor: actor.clone(),
-        expected_revision: None,
-        action: AgentAction::TaskSubmit(TaskSubmitInput {
-            deliverable: None,
-            task_ref: task_ref.clone(),
-            artifact_refs: vec![artifact.clone()],
-            evidence_refs: vec![content.selector.clone()],
-            unresolved: if with_disclosure {
-                vec!["Performance estimate lacks enterprise measurement".into()]
-            } else {
-                vec![]
-            },
-        }),
-    };
-    if !direct_text {
-        assert_eq!(
-            services.submit_agent_action(&submit).await.unwrap().status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-    }
-    if let Some(writer) = writer.as_ref().filter(|_| pending_effect.is_none()) {
-        let index = format!(
-            "execution-agent-receipts:{}:{}:{}",
-            packet.graph_id(),
-            packet.node_id(),
-            packet.attempt
-        );
-        let revision = services.event_store().stream_revision(&index).unwrap();
-        let error = writer
-            .execute_tool(
-                "late-after-submit",
-                "edit",
-                r#"{"path":"review-effect.txt","content":"must never be written"}"#,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("tool_effect_authority"),
-            "{error}"
-        );
-        assert_eq!(
-            services.event_store().stream_revision(&index).unwrap(),
-            revision
-        );
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            delegated_write_content
-        );
-    }
-    let review_dispatch = services
-        .dispatch_agentic_followups(
-            &submit,
-            AgenticDispatchContext {
-                session_id: "session-dispatch".into(),
-                turn_id: "turn-dispatch".into(),
-                model_lease: "test".into(),
-                permission_ceiling: PermissionMode::ReadOnly,
-                resource_scopes: vec!["read:.".into()],
-            },
-        )
-        .await
-        .unwrap_or_else(|error| {
-            own832_diagnostics::capture(&services, fixture_program_id.as_str(),
-                &task_ref, "original_review_dispatch_failed", Some(&packet));
-            panic!("physical reviewer admission: {error}; see OWN832 snapshot");
-        });
-    let review_projection = action_service.project(fixture_program_id.as_str()).unwrap();
-    let submitted_task = &review_projection.tasks[&task_ref];
-    if submitted_task.status != crate::AgenticTaskStatus::Submitted
-        || submitted_task.active_attempts.values().filter(|attempt|
-            attempt.mode == harness_contract::agent_action::AgentAttemptMode::Review
-        ).count() != 1
-        || submitted_task.active_attempts.values().any(|attempt|
-            attempt.mode == harness_contract::agent_action::AgentAttemptMode::Review
-                && (attempt.agent_id != reviewer || attempt.generation != submitted_task.review_generation)
-        )
-        || review_dispatch.len() > 1
-        || review_dispatch.iter().any(|receipt|
-            receipt.task_ref != task_ref || receipt.agent_ref != reviewer || receipt.mode != "review"
-                || submitted_task.active_attempts.values().all(|attempt|
-                    attempt.mode != harness_contract::agent_action::AgentAttemptMode::Review
-                        || attempt.execution_id != receipt.graph_id)
-        )
-    {
-        own832_diagnostics::capture(
-            &services,
-            fixture_program_id.as_str(),
-            &task_ref,
-            "original_review_after_submit_dispatch",
-            Some(&packet),
-        );
-    }
-    assert_eq!(submitted_task.status, crate::AgenticTaskStatus::Submitted);
-    let review_attempts = submitted_task.active_attempts.values().filter(|attempt|
-        attempt.mode == harness_contract::agent_action::AgentAttemptMode::Review
-    ).collect::<Vec<_>>();
-    assert_eq!(review_attempts.len(), 1, "{submitted_task:?}; dispatch={review_dispatch:?}");
-    let original_review = review_attempts[0];
-    assert_eq!(original_review.agent_id, reviewer);
-    assert_eq!(original_review.generation, submitted_task.review_generation);
-    assert!(review_dispatch.len() <= 1, "{review_dispatch:?}");
-    for receipt in &review_dispatch {
-        assert_eq!(receipt.graph_id, original_review.execution_id);
-        assert_eq!(receipt.task_ref, task_ref);
-        assert_eq!(receipt.agent_ref, reviewer);
-        assert_eq!(receipt.mode, "review");
-    }
-    let original_review_graph_id = original_review.execution_id.clone();
-    let reviewer_session = wait_real_process(&services, &original_review_graph_id).await;
-    let review_binding = reviewer_session.packet.agentic_binding.as_ref().unwrap();
-    assert_eq!(review_binding.program_id, fixture_program_id.as_str());
-    assert_eq!(review_binding.agent_id, reviewer);
-    assert_eq!(review_binding.membership_id, original_review.membership_id);
-    assert!(matches!(&review_binding.focus,
-        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref: reviewed }
-            if reviewed == &task_ref));
-    let review_graph = services
-        .graph_state_store()
-        .load(&original_review_graph_id)
-        .unwrap();
-    let reviewer_actor = services
-        .resolve_agent_action_actor(
-            &ExecutionParentBinding {
-                execution_id: review_graph.id.clone(),
-                node_id: review_graph.nodes[0].id.clone(),
-            },
-            None,
-        )
-        .await
-        .expect("reviewer binding");
-    let mut review_envelope = AgentActionEnvelope {
-        action_id: "experience-review".into(),
-        actor: reviewer_actor,
-        expected_revision: None,
-        action: AgentAction::TaskReview(TaskReviewInput {
-            operator_requirement: None,
-            task_ref: task_ref.clone(),
-            decision: TaskReviewDecision::Accept,
-            reason: "Read and checked the persisted artifact".into(),
-            evidence_refs: vec![content.selector.clone()],
-        }),
-    };
-    if let Some((gate, running)) = pending_effect.take() {
-        let refused = services.submit_agent_action(&review_envelope).await;
-        let unsettled = action_service.project(fixture_program_id.as_str()).unwrap();
-        let source = format!(
-            "execution-agent-receipts:{}:{}:{}",
-            packet.graph_id(),
-            packet.node_id(),
-            packet.attempt
-        );
-        let events = services.event_store().list_stream(&source).unwrap();
-        let receipts = events
-            .iter()
-            .filter(|event| event.kind == "execution.agent_tool.receipt")
-            .filter_map(|event| event.payload["idempotency_key"].as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let pending = events
-            .iter()
-            .filter(|event| event.kind == "execution.agent_tool.intent")
-            .filter_map(|event| event.payload["idempotency_key"].as_str())
-            .filter(|key| !receipts.contains(key))
-            .count();
-        gate.release.notify_one();
-        running.await.unwrap().unwrap();
-        let error = refused.unwrap_err();
-        assert!(error.contains("effect_review_pending"), "{error}");
-        assert_eq!(pending, 1);
-        assert_eq!(
-            unsettled.tasks[&task_ref].status,
-            crate::AgenticTaskStatus::Submitted
-        );
-        assert!(unsettled.objective_verdict.is_none());
-        println!(
-            "V3_REQUIRED_PENDING_WITNESS {}",
-            serde_json::json!({
-                "effect_source": source, "unsettled_intents": pending,
-                "task": task_ref, "denial": error, "receipt_after_release": true,
-            })
-        );
-    }
-    let unread_review_error = services
-        .submit_agent_action(&review_envelope)
-        .await
-        .unwrap_err();
-    println!("V3_REQUIRED_UNREAD_REVIEW_DENIAL {unread_review_error}");
-    let expected_unread_review_error = if delegated_effect {
-        "review_requires_effect_observation"
-    } else {
-        "review_requires_current_physical_reads"
-    };
-    assert!(
-        unread_review_error.contains(expected_unread_review_error),
-        "{unread_review_error}"
-    );
-    let review_packet = serde_json::from_str(&review_graph.nodes[0].payload_ref).unwrap();
-    let bridge = RealProcessSession::prepare(
-        &services,
-        &review_packet,
-        &crate::agent_model_selector::AgentModelSelection {
-            model: "test".into(),
-            provider: "test".into(),
-            registry_revision: 0,
-        },
-    )
-    .unwrap();
-    if delegated_effect {
-        assert!(services
-            .submit_agent_action(&review_envelope)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
-        std::fs::write(
-            services.workspace_root().join("unrelated-review.txt"),
-            "unrelated",
-        )
-        .unwrap();
-        bridge
-            .execute_tool(
-                "unrelated-delegated-target",
-                "read_file",
-                r#"{"path":"unrelated-review.txt"}"#,
-            )
-            .await
-            .unwrap();
-        assert!(services
-            .submit_agent_action(&review_envelope)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
-        bridge
-            .execute_tool(
-                "actual-delegated-target",
-                "read_file",
-                r#"{"path":"review-effect.txt","complete":true}"#,
-            )
-            .await
-            .unwrap();
-        if proof_scenario == R1ProofScenario::ReadDelivery(RealProcessProofCase::Effects) {
-            let missing_second_target_error = services
-                .submit_agent_action(&review_envelope)
-                .await
-                .unwrap_err();
-            assert!(
-                missing_second_target_error.contains("review_requires_effect_observation"),
-                "{missing_second_target_error}"
-            );
-            bridge
-                .execute_tool(
-                    "actual-delegated-second-target",
-                    "read_file",
-                    r#"{"path":"r1-optional-target.txt","complete":true}"#,
-                )
-                .await
-                .unwrap();
-        }
-        if !bounded_runs.is_empty() {
-            for path in ["bounded_source.py", "bounded_test.py"] {
-                bridge
-                    .execute_tool(
-                        &format!("bounded-file-read:{path}"),
-                        "read_file",
-                        &serde_json::json!({"path":path,"complete":true}).to_string(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        }
-        let unread_body_error = services
-            .submit_agent_action(&review_envelope)
-            .await
-            .unwrap_err();
-        assert!(
-            unread_body_error.contains("review_requires_current_physical_reads"),
-            "{unread_body_error}"
-        );
-    }
-    let assert_fresh_action_239 = |before: usize,
-                                   envelope: &AgentActionEnvelope,
-                                   outcome: &Result<
-        harness_contract::agent_action::AgentActionObservation,
-        String,
-    >| {
-        use sha2::{Digest, Sha256};
-        let calls = read_host.calls.lock().unwrap();
-        let delta = &calls[before..];
-        assert_eq!(
-            delta.len(),
-            1,
-            "fresh Process action must enter the actual Host exactly once"
-        );
-        let request = &delta[0];
-        assert_eq!(request.tool_name, envelope.action.kind());
-        assert_eq!(
-            request.session_id.as_deref(),
-            Some(review_packet.session_id())
-        );
-        let parent = request.parent_execution.as_ref().unwrap();
-        assert_eq!(parent.execution_id, review_packet.graph_id());
-        assert_eq!(parent.node_id, review_packet.node_id());
-        assert_eq!(
-            request.parent_execution_attempt,
-            Some(review_packet.attempt)
-        );
-        assert_eq!(
-            request.authorization.as_ref().unwrap().tool_id,
-            envelope.action.kind()
-        );
-        let binding = request.step_binding.as_ref().unwrap();
-        assert_eq!(binding.origin.call_id, request.tool_use_id);
-        assert_eq!(
-            binding.origin.origin_step_id,
-            binding.snapshot.identity.step_id
-        );
-        assert_eq!(
-            binding.snapshot.identity.session_id,
-            review_packet.session_id()
-        );
-        assert_eq!(
-            Some(binding.snapshot.identity.turn_id.as_str()),
-            review_packet.assignment.execution_identity.turn_id()
-        );
-        assert_eq!(
-            binding.snapshot.identity.execution_id.as_deref(),
-            Some(review_packet.graph_id())
-        );
-        assert_eq!(
-            binding.snapshot.identity.run_ref.as_deref(),
-            Some(review_packet.run_id())
-        );
-        assert_eq!(
-            binding.snapshot.identity.actor_ref.as_deref(),
-            Some(review_packet.agent_id())
-        );
-        assert_eq!(
-            binding.snapshot.identity.attempt,
-            Some(review_packet.attempt)
-        );
-        assert!(
-            matches!(&binding.origin.source, harness_contract::step::CallSource::Process { worker_id, .. }
-            if worker_id == review_packet.run_id())
-        );
-        let metadata = bridge.action_metadata_path_239(&request.tool_use_id);
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(metadata).unwrap()).unwrap();
-        assert_eq!(value["envelope"], serde_json::to_value(envelope).unwrap());
-        let scope = serde_json::json!([
-            review_packet.session_id(),
-            review_packet.graph_id(),
-            review_packet.node_id(),
-            review_packet.run_id(),
-            review_packet.agent_id(),
-            review_packet.attempt,
-            review_packet
-                .binding
-                .as_ref()
-                .map(|binding| binding.binding_digest.as_str())
-        ]);
-        let stream = format!(
-            "agent-process-transport:{:x}",
-            Sha256::digest(scope.to_string().as_bytes())
-        );
-        let key = format!("{:x}", Sha256::digest(request.tool_use_id.as_bytes()));
-        let completed = services
-            .event_store()
-            .event_by_idempotency_key(&stream, &format!("completed:{key}"))
-            .unwrap()
-            .unwrap();
-        let started = services
-            .event_store()
-            .event_by_idempotency_key(&stream, &format!("started:{key}"))
-            .unwrap()
-            .unwrap();
-        let input: serde_json::Value = serde_json::from_str(&request.input).unwrap();
-        assert_eq!(
-            input,
-            serde_json::to_value(&envelope.action).unwrap()["input"]
-        );
-        let fingerprint = harness_contract::step::canonical_digest(
-            "process-tool-call",
-            &serde_json::json!(["tool_result", request.tool_name, input]),
-        )
-        .unwrap();
-        for (event, stage) in [(&started, "started"), (&completed, "completed")] {
-            assert_eq!(event.kind, format!("agent.process_request_{stage}"));
-            assert_eq!(event.scope, crate::RuntimeEventScope::Agent);
-            assert_eq!(event.schema_version, 1);
-            assert_eq!(event.status.as_deref(), Some(stage));
-            assert_eq!(event.actor.as_deref(), Some(review_packet.agent_id()));
-            assert_eq!(event.payload["fingerprint"], fingerprint);
-            assert_eq!(event.payload["request_id"], request.tool_use_id);
-            assert_eq!(event.payload["authority"], "transport_replay_only");
-        }
-        assert!(started.commit_cursor < completed.commit_cursor);
-        let response = &completed.payload["response"];
-        assert_eq!(response["kind"], "tool_result");
-        assert_eq!(response["origin_step_id"], binding.origin.origin_step_id);
-        assert_eq!(response["request_id"], request.tool_use_id);
-        assert_eq!(response["run_id"], review_packet.run_id());
-        assert_eq!(response["agent_id"], review_packet.agent_id());
-        match outcome {
-            Ok(observation) => {
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(response["output"].as_str().unwrap())
-                        .unwrap(),
-                    serde_json::to_value(observation).unwrap()
-                );
-                assert!(response.get("error").is_none());
-            }
-            Err(error) => assert_eq!(response["error"].as_str(), Some(error.as_str())),
-        }
-        request.tool_use_id.clone()
-    };
-    let action_side_effects_239 = || {
-        let calls = read_host
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| request.tool_name != "task_review")
-            .map(|request| serde_json::to_value(request).unwrap())
-            .collect::<Vec<_>>();
-        let receipts = [&packet, &review_packet]
-            .into_iter()
-            .map(|packet| {
-                services
-                    .event_store()
-                    .list_stream(&format!(
-                        "execution-agent-receipts:{}:{}:{}",
-                        packet.graph_id(),
-                        packet.node_id(),
-                        packet.attempt
-                    ))
-                    .unwrap()
-                    .into_iter()
-                    .map(|event| serde_json::to_value(event).unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let targets = ["review-effect.txt", "out/a"]
-            .map(|path| std::fs::read(services.workspace_root().join(path)).ok());
-        (calls, receipts, targets)
-    };
-    let replay_probe_230 = if !delegated_effect {
-        let request_id = format!("unread-review-230:{}", uuid::Uuid::new_v4());
-        let before_239 = read_host.calls.lock().unwrap().len();
-        let error = bridge
-            .action_with_request_id(&review_envelope, &request_id)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            assert_fresh_action_239(before_239, &review_envelope, &Err(error.clone())),
-            request_id
-        );
-        assert!(
-            error.contains("review_requires_current_physical_reads"),
-            "{error}"
-        );
-        assert_eq!(
-            read_host
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request.tool_use_id == request_id)
-                .count(),
-            1
-        );
-        let metadata = bridge
-            .prepare_action_metadata_239(&review_envelope, &request_id)
-            .unwrap();
-        let original = std::fs::read(&metadata).unwrap();
-        let before = read_host.calls.lock().unwrap().len();
-        let revision = action_service
-            .project(fixture_program_id.as_str())
-            .unwrap()
-            .revision;
-        for mutation in 0..4 {
-            let mut conflict = review_envelope.clone();
-            match mutation {
-                0 => conflict.action_id.push_str(":different-business"),
-                1 => conflict.expected_revision = Some(revision),
-                2 => conflict.expected_revision = Some(revision + 1),
-                _ => match &mut conflict.action {
-                    AgentAction::TaskReview(input) => input.reason.push_str(":different-payload"),
-                    _ => unreachable!(),
-                },
-            }
-            assert!(bridge
-                .action_with_request_id(&conflict, &request_id)
-                .await
-                .unwrap_err()
-                .contains("invocation metadata conflict"));
-            assert_eq!(std::fs::read(&metadata).unwrap(), original);
-            assert_eq!(read_host.calls.lock().unwrap().len(), before);
-            assert_eq!(
-                action_service
-                    .project(fixture_program_id.as_str())
-                    .unwrap()
-                    .revision,
-                revision
-            );
-        }
-        let reserved_id = format!("reserved-before-send-239:{}", uuid::Uuid::new_v4());
-        let mut reserved = review_envelope.clone();
-        reserved.expected_revision = Some(revision);
-        let path = bridge
-            .prepare_action_metadata_239(&reserved, &reserved_id)
-            .unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        for expected_revision in [None, Some(revision + 1)] {
-            let mut contender = reserved.clone();
-            contender.expected_revision = expected_revision;
-            assert!(bridge
-                .action_with_request_id(&contender, &reserved_id)
-                .await
-                .unwrap_err()
-                .contains("invocation metadata conflict"));
-            assert_eq!(std::fs::read(&path).unwrap(), bytes);
-            assert_eq!(read_host.calls.lock().unwrap().len(), before);
-            assert_eq!(
-                action_service
-                    .project(fixture_program_id.as_str())
-                    .unwrap()
-                    .revision,
-                revision
-            );
-        }
-        let reserved_before = read_host.calls.lock().unwrap().len();
-        let reserved_error = bridge
-            .action_with_request_id(&reserved, &reserved_id)
-            .await
-            .unwrap_err();
-        assert!(reserved_error.contains("review_requires_current_physical_reads"));
-        assert_eq!(
-            assert_fresh_action_239(reserved_before, &reserved, &Err(reserved_error)),
-            reserved_id
-        );
-        Some((request_id, error))
-    } else {
-        None
-    };
-    let original_evidence_output = bridge
-        .execute_tool(
-            "read-result",
-            "evidence_retrieve",
-            &serde_json::json!({"evidence_ref":content.selector}).to_string(),
-        )
-        .await
-        .unwrap();
-    let evidence_input = serde_json::json!({"evidence_ref":content.selector});
-    let descriptor = read_host
-        .catalog
-        .get()
-        .unwrap()
-        .pin_snapshot()
-        .describe_effect("evidence_retrieve", &evidence_input);
-    assert_eq!(
-        descriptor.effect_kind,
-        harness_contract::tool::ToolEffectKind::Read
-    );
-    let original_request = read_host
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|request| {
-            request.tool_name == "evidence_retrieve"
-                && request.tool_use_id == "read-result"
-                && request.parent_execution.as_ref().is_some_and(|parent| {
-                    parent.execution_id == review_packet.graph_id()
-                        && parent.node_id == review_packet.node_id()
-                })
-        })
-        .cloned()
-        .expect("actual reviewer ToolHost invocation must be recorded");
-    let original_acquisition = crate::context_evidence::read_acquisition_seal(
-        &original_request,
-        &original_evidence_output,
-    )
-    .expect("original complete content must seal before storage bounding");
-    let original_body: serde_json::Value = serde_json::from_str(&original_evidence_output).unwrap();
-    let original_chunks = original_body["chunks"].as_array().unwrap();
-    assert_eq!(
-        original_body["total_chunks"].as_u64().unwrap(),
-        original_chunks.len() as u64
-    );
-    let original_content = original_chunks
-        .iter()
-        .map(|chunk| chunk["content"].as_str().unwrap())
-        .collect::<String>();
-    assert_eq!(
-        original_acquisition.body.source_bytes,
-        original_content.len() as u64
-    );
-    assert_eq!(
-        original_acquisition.body.source_sha256,
-        crate::context_evidence::read_sha256(original_content.as_bytes())
-    );
-    let digest_only =
-        crate::agentic::review_evidence::compact_read_receipt(&original_evidence_output);
-    assert!(crate::context_evidence::read_body_seal("evidence_retrieve", &digest_only).is_none());
-    assert!(
-        crate::context_evidence::read_acquisition_seal(&original_request, &digest_only).is_none(),
-        "digest-only storage metadata cannot become an independent physical read"
-    );
-    let material = assert_process_delivery(&services, &review_packet, "read-result");
-    assert_eq!(
-        serde_json::to_value(&material.acquisition).unwrap(),
-        serde_json::to_value(&original_acquisition).unwrap()
-    );
-    assert_eq!(
-        material.presentation_sha256,
-        crate::context_evidence::read_sha256(original_evidence_output.as_bytes())
-    );
-    assert_eq!(
-        material.presentation_bytes,
-        original_evidence_output.len() as u64
-    );
-    assert_eq!(material.acquisition.tool_name, "evidence_retrieve");
-    assert_eq!(material.acquisition.body.source_ref, content.selector);
-    assert!(!material.body_omitted);
-    if !bounded_runs.is_empty() {
-        let current = bounded_runs.last().unwrap();
-        let mut selected = review_envelope.clone();
-        selected.action_id = "bounded-unread-body-283".into();
-        if let AgentAction::TaskReview(input) = &mut selected.action {
-            input.evidence_refs = review_evidence_refs.clone();
-        }
-        let missing = services.submit_agent_action(&selected).await.unwrap_err();
-        assert!(
-            missing.contains("review_requires_complete_process_body"),
-            "{missing}"
-        );
-        for (index, run) in bounded_runs.iter().enumerate() {
-            read_bounded_body_pages_283(
-                &services,
-                &bridge,
-                &format!("bounded-independent-body:{index}"),
-                &run.body,
-                (index + 1 == bounded_runs.len()).then_some(&selected),
-            )
-            .await;
-        }
-        let mut old = selected.clone();
-        old.action_id = "bounded-old-version-selection-283".into();
-        if let AgentAction::TaskReview(input) = &mut old.action {
-            input.evidence_refs = vec![
-                content.selector.clone(),
-                bounded_runs[0].body.selector.clone(),
-            ];
-        }
-        let denied = services.submit_agent_action(&old).await.unwrap_err();
-        assert!(
-            denied.contains("process") && (denied.contains("input") || denied.contains("current")),
-            "{denied}"
-        );
-        if let AgentAction::TaskReview(input) = &mut review_envelope.action {
-            input.evidence_refs = review_evidence_refs.clone();
-        }
-        assert_eq!(current.admission.inputs.len(), 2);
-    }
-    let mut newer_generation = action_service.project(fixture_program_id.as_str()).unwrap();
-    if let Some((request_id, original_error)) = &replay_probe_230 {
-        let original_host = read_host
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| request.tool_use_id == *request_id)
-            .map(|request| serde_json::to_value(request).unwrap())
-            .collect::<Vec<_>>();
-        let before = read_host.calls.lock().unwrap().len();
-        let replayed_error = bridge
-            .action_with_request_id(&review_envelope, request_id)
-            .await
-            .unwrap_err();
-        assert_eq!(&replayed_error, original_error);
-        assert_eq!(read_host.calls.lock().unwrap().len(), before);
-        assert_eq!(
-            read_host
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request.tool_use_id == *request_id)
-                .map(|request| serde_json::to_value(request).unwrap())
-                .collect::<Vec<_>>(),
-            original_host
-        );
-        assert_eq!(
-            read_host
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request.tool_use_id == *request_id)
-                .count(),
-            1,
-            "same transport identity must replay its refusal without re-entering the action host"
-        );
-    }
-    newer_generation
-        .tasks
-        .get_mut(&task_ref)
-        .unwrap()
-        .review_generation += 1;
-    assert!(services
-        .independent_result_review(
-            &review_envelope.actor,
-            &newer_generation,
-            &[artifact.clone()],
-            None,
-        )
-        .await
-        .err()
-        .unwrap()
-        .contains("review attempt generation is stale"));
-    let mut stolen_run = review_envelope.clone();
-    stolen_run.action_id = "review-with-producer-run".into();
-    stolen_run.actor.execution_id = actor.execution_id.clone();
-    assert!(services.submit_agent_action(&stolen_run).await.is_err());
-    let side_effects_before_239 = replay_probe_230.as_ref().map(|_| action_side_effects_239());
-    if replay_probe_230.is_some() {
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let mut stale = review_envelope.clone();
-        stale.expected_revision = Some(current.revision + 1);
-        let request_id = format!("fresh-cas-conflict-239:{}", uuid::Uuid::new_v4());
-        let before = read_host.calls.lock().unwrap().len();
-        let denied = bridge
-            .action_with_request_id(&stale, &request_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            denied.status,
-            harness_contract::agent_action::AgentActionStatus::Rejected
-        );
-        assert_eq!(denied.error.as_ref().unwrap().code, "stale_revision");
-        assert_eq!(
-            assert_fresh_action_239(before, &stale, &Ok(denied)),
-            request_id
-        );
-        assert_eq!(
-            action_service
-                .project(fixture_program_id.as_str())
-                .unwrap()
-                .revision,
-            current.revision
-        );
-        assert!(services
-            .event_store()
-            .event_by_idempotency_key(
-                &format!("agentic-program:{}", fixture_program_id),
-                &format!("agent-action:{}", review_envelope.action_id)
-            )
-            .unwrap()
-            .is_none());
-        assert!(bridge
-            .action_with_request_id(&review_envelope, &request_id)
-            .await
-            .unwrap_err()
-            .contains("invocation metadata conflict"));
-        assert_eq!(read_host.calls.lock().unwrap().len(), before + 1);
-        assert_eq!(Some(action_side_effects_239()), side_effects_before_239);
-    }
-    let fresh_before_239 = read_host.calls.lock().unwrap().len();
-    let reviewed = services
-        .submit_agent_action(&review_envelope)
-        .await
-        .unwrap();
-    if replay_probe_230.is_some() {
-        let fresh_id =
-            assert_fresh_action_239(fresh_before_239, &review_envelope, &Ok(reviewed.clone()));
-        assert_ne!(fresh_id, replay_probe_230.as_ref().unwrap().0);
-        assert_eq!(Some(action_side_effects_239()), side_effects_before_239);
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let revision = current.revision;
-        let task_before = serde_json::to_value(&current.tasks[&task_ref]).unwrap();
-        let duplicate_before = read_host.calls.lock().unwrap().len();
-        let retried = services
-            .submit_agent_action(&review_envelope)
-            .await
-            .unwrap();
-        let duplicate_id =
-            assert_fresh_action_239(duplicate_before, &review_envelope, &Ok(retried.clone()));
-        assert_ne!(duplicate_id, fresh_id);
-        assert_ne!(duplicate_id, replay_probe_230.as_ref().unwrap().0);
-        assert_eq!(retried.action_id, review_envelope.action_id);
-        assert!(retried.duplicate);
-        let program = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(
-            serde_json::to_value(&program.tasks[&task_ref]).unwrap(),
-            task_before
-        );
-        let applied = services
-            .event_store()
-            .list_stream(&format!("agentic-program:{}", fixture_program_id))
-            .unwrap()
-            .into_iter()
-            .filter(|event| {
-                event.kind == "agentic.action_applied"
-                    && event.payload["envelope"]["action_id"] == review_envelope.action_id
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(applied.len(), 1);
-        assert_eq!(
-            applied[0].payload["envelope"],
-            serde_json::to_value(&review_envelope).unwrap()
-        );
-        assert_eq!(Some(action_side_effects_239()), side_effects_before_239);
-        assert_eq!(
-            action_service
-                .project(fixture_program_id.as_str())
-                .unwrap()
-                .revision,
-            revision,
-            "a fresh transport request must retain business action idempotency after apply"
-        );
-    }
-    assert_eq!(
-        reviewed.status,
-        harness_contract::agent_action::AgentActionStatus::Applied,
-        "{reviewed:?}"
-    );
     let drain_workers = || async {
         services
             .cancel_execution_tree(
@@ -3471,10 +1586,7 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
                     .payload_ref,
             )
             .unwrap();
-            assert!(
-                confirmed_run_exit_with_retry(services.event_store(), &original)
-                    .is_some()
-            );
+            assert!(confirmed_run_exit_with_retry(services.event_store(), &original).is_some());
             assert_eq!(
                 services
                     .graph_state_store()
@@ -3510,3568 +1622,49 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
         drain_workers().await;
     }
     use harness_contract::goal::{GoalCompletion, GoalContract};
-    services
-        .goal_store()
-        .create(GoalContract {
-            id: "goal:root-agentic-execution".into(),
-            session_id: "session-dispatch".into(),
-            objective: {
-                #[cfg(test)]
-                if let Ok(Some(objective)) =
-                    NATIVE_TASK_CASE.try_with(|case| case.objective.clone())
-                {
-                    objective
-                } else {
-                    "dispatch objective".into()
-                }
-                #[cfg(not(test))]
-                {
-                    "dispatch objective".into()
-                }
-            },
-            criteria: vec![harness_contract::goal::AcceptanceCriterion {
-                id: "reviewed-delivery".into(),
-                statement: "Deliver independently reviewed source-backed work".into(),
-                statement_ref: None,
-                source_refs: Vec::new(),
-                required_evidence: vec!["execution_graph:root-agentic-execution".into()],
-                status: harness_contract::goal::AcceptanceStatus::Open,
-                waiver: None,
-            }],
-            constraints: vec![],
-            phase: "execution".into(),
-            evidence_refs: vec![],
-            unresolved: vec![],
-            blockers: vec![],
-            scope: harness_contract::goal::GoalScope::UserObjective,
-            user_intent_criterion_id: Some("reviewed-delivery".into()),
-            source_intent_ref: Some("session_message:dispatch".into()),
-            execution_binding: Some(harness_contract::goal::GoalExecutionBinding {
-                objective_id: fixture_objective_id.as_str().into(),
-                session_id: "session-dispatch".into(),
-                turn_id: "turn-dispatch".into(),
-                root_execution_id: "root-agentic-execution".into(),
-                agentic_program_id: fixture_program_id.as_str().into(),
-            }),
-            spec_revision: 1,
-            spec_digest: "dispatch-test".into(),
-            review_refs: vec![],
-            waiting: None,
-            participation_requirement: None,
-            obligations: vec![harness_contract::goal::ObjectiveObligation {
-                obligation_id: "source-backed-delivery".into(),
-                required: true,
-                success_predicate: "Deliver the source-backed result with independent inspection"
-                    .into(),
-                producer: harness_contract::goal::ObjectiveProducerContract {
-                    capability_id: Some("read".into()),
-                    ..Default::default()
-                },
-                evidence_requirement: harness_contract::goal::ObjectiveEvidenceRequirement {
-                    required_artifact_kinds: vec!["report".into()],
-                    independent_verifier_required: true,
-                    reread_required: true,
-                },
-                state: harness_contract::goal::ObjectiveObligationState::Open,
-                artifact_refs: vec![],
-                evidence_refs: vec![],
-                reread_receipts: vec![],
-                verifier_decision: None,
-                diagnostic_code: None,
-            }],
-            recovery: None,
-            terminal: None,
-            completion: GoalCompletion::Open,
-            revision: 1,
-            user_sequence: 1,
-            reviews: Vec::new(),
-        })
-        .expect("Objective creation");
-    if with_disclosure {
-        use harness_contract::agent_action::{
-            AgentActionStatus, IssueDisposition, IssueDispositionKind, MessagePublishInput,
-            ObjectiveCompleteRequestInput,
-        };
-        let issue = crate::agentic::issues::issues(
-            &action_service.project(fixture_program_id.as_str()).unwrap(),
-        )
-        .remove(0);
-        let try_complete = |id: &str| {
-            bind_root(root(
-                id,
-                AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                    blocked: false,
-                    blocked_reason: None,
-                    human_review_required: false,
-                    recommended_next_actions: Vec::new(),
-                    result_refs: vec![artifact.clone()],
-                    evidence_refs: vec![content.selector.clone()],
-                    unresolved: vec![],
-                }),
-            ))
-        };
-        assert_eq!(
-            services
-                .submit_agent_action(&try_complete("unclassified-completion"))
-                .await
-                .unwrap()
-                .status,
-            AgentActionStatus::Rejected
-        );
-        for (id, disposition) in [
-            ("must-resolve", IssueDispositionKind::MustResolve),
-            ("explicit-disclosure", IssueDispositionKind::Disclose),
-        ] {
-            let receipt = services
-                .submit_agent_action(&bind_root(root(
-                    id,
-                    AgentAction::MessagePublish(MessagePublishInput {
-                        topic_ref: format!("topic:{fixture_program_id}"),
-                        summary: Some(
-                            "Explicitly retain the unmeasured estimate limitation".into(),
-                        ),
-                        content_ref: Some(content.selector.clone()),
-                        refs: vec![task_ref.clone()],
-                        recipients: vec![],
-                        intent: None,
-                        issue_dispositions: vec![IssueDisposition {
-                            issue_ref: issue.issue_ref.clone(),
-                            disposition,
-                            reason_ref: content.selector.clone(),
-                            evidence_refs: vec![content.selector.clone()],
-                        }],
-                    }),
-                )))
-                .await
-                .unwrap();
-            assert_eq!(receipt.status, AgentActionStatus::Applied, "{receipt:?}");
-            if disposition == IssueDispositionKind::MustResolve {
-                assert_eq!(
-                    services
-                        .submit_agent_action(&try_complete("must-resolve-completion"))
-                        .await
-                        .unwrap()
-                        .status,
-                    AgentActionStatus::Rejected
-                );
-                assert_eq!(
-                    services
-                        .goal_store()
-                        .get("goal:root-agentic-execution")
-                        .unwrap()
-                        .unwrap()
-                        .completion,
-                    GoalCompletion::Open
-                );
-            }
-        }
-    }
-    // Accepted Task work cannot certify coverage of the original Objective.
-    let premature = services
-        .submit_agent_action(&bind_root(root(
-            "before-original-review",
-            AgentAction::ObjectiveCompleteRequest(
-                harness_contract::agent_action::ObjectiveCompleteRequestInput {
-                    blocked: false,
-                    blocked_reason: None,
-                    human_review_required: false,
-                    recommended_next_actions: Vec::new(),
-                    result_refs: vec![artifact.clone()],
-                    evidence_refs: vec![content.selector.clone()],
-                    unresolved: vec![],
-                },
-            ),
-        )))
-        .await
-        .unwrap();
-    assert_eq!(
-        premature.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let supervisor =
-        crate::execution_core::goal::ObjectiveSupervisor::new(Arc::clone(services.goal_store()));
-    let mut reconciled = crate::agentic::supervision::reconcile_completion_request(
-        &action_service,
-        &supervisor,
-        fixture_program_id.as_str(),
-    );
-    if reconciled
-        .as_ref()
-        .err()
-        .is_some_and(|error| error.contains("revision mismatch"))
-    {
-        let drain_before_retry = drain_timing == PhysicalDrainTiming::BeforeGoal;
-        eprintln!("R1_RECONCILE_CAS_RETRY drain_before_retry={drain_before_retry} retry=1");
-        if drain_before_retry {
-            drain_workers().await;
-        }
-        reconciled = crate::agentic::supervision::reconcile_completion_request(
-            &action_service,
-            &supervisor,
-            fixture_program_id.as_str(),
-        );
-    }
-    reconciled.unwrap();
-    let gap = action_service.project(fixture_program_id.as_str()).unwrap();
-    assert_eq!(gap.status, crate::AgenticProgramStatus::Open);
-    assert_eq!(
-        gap.tasks[&task_ref].status,
-        crate::AgenticTaskStatus::Accepted
-    );
-    assert!(services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap()
-        .terminal
-        .is_none());
-    let mut scoped_goal_reviewer = if proof_scenario.needs_scoped_review() {
-        Some(
-            start_r1_scoped_goal_reviewer(
-                &services,
-                &bind_root(root("r1-scoped-reviewer-root", task.action.clone())).actor,
-                &content.selector,
-                "r1-scoped-reviewer",
-                !proof_scenario.native_sources()
-                    && !matches!(
-                        proof_scenario,
-                        R1ProofScenario::TransitiveDependency
-                            | R1ProofScenario::ReviewerInfluence
-                            | R1ProofScenario::ReadDelivery(_)
-                    ),
-            )
-            .await,
-        )
-    } else {
-        None
-    };
-    if with_effect {
-        let (effect_ref, effect_runtime) =
-            root_reads_generic_results(&services, read_host, &content.selector, true, true).await;
-        let effect_ref = effect_ref.unwrap();
-        let added = services
-            .submit_agent_action(&bind_root(root(
-                "effect-condition",
-                AgentAction::ObjectiveUpdate(
-                    harness_contract::agent_action::ObjectiveUpdateInput {
-                        criterion_ref: None,
-                        operation: harness_contract::agent_action::ObjectiveUpdateOperation::Add,
-                        statement_ref: Some(content.selector.clone()),
-                        source_refs: vec![content.selector.clone()],
-                        reason_ref: Some(content.selector.clone()),
-                        evidence_requirements: vec![],
-                    },
-                ),
-            )))
-            .await
-            .unwrap();
-        assert_eq!(
-            added.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{added:?}"
-        );
-        let effect_access = services
-            .session_evidence_access(
-                "session-dispatch",
-                effect_ref.strip_prefix("tool://").unwrap(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let wrapped = services
-            .submit_agent_action(&bind_root(root(
-                "wrapped-effect",
-                AgentAction::ArtifactCommit(ArtifactCommitInput {
-                    content_ref: effect_access.retrieval_selector.clone(),
-                    kind: "receipt".into(),
-                    title: "Published effect receipt".into(),
-                    relates_to: vec![],
-                }),
-            )))
-            .await
-            .unwrap();
-        assert_eq!(
-            wrapped.status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-        let work = bind_root(root(
-            "effect-review-task",
-            AgentAction::TaskPublish(TaskPublishInput {
-                team_ref: team_ref.clone(),
-                title: "Inspect changed file".into(),
-                objective: "Read and review the actual changed file".into(),
-                acceptance: "Record the current Goal effect review".into(),
-                criterion_source: Default::default(),
-                acceptance_checks: Vec::new(),
-                required_capabilities: vec!["read".into()],
-                depends_on: vec![],
-                obligation_refs: vec![],
-                purpose: harness_contract::agent_action::TaskPurpose::Exploration,
-                execution_requirements: vec![],
-                expertise_hints: vec![],
-            }),
-        ));
-        let work_receipt = services.submit_agent_action(&work).await.unwrap();
-        assert_eq!(
-            work_receipt.status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-        let review_context = || AgenticDispatchContext {
-            session_id: "session-dispatch".into(),
-            turn_id: "turn-dispatch".into(),
-            model_lease: "test".into(),
-            permission_ceiling: PermissionMode::ReadOnly,
-            resource_scopes: vec!["workspace:.".into(), "network:*".into()],
-        };
-        let admitted = services
-            .dispatch_agentic_followups(&work, review_context())
-            .await
-            .unwrap();
-        assert_eq!(admitted.len(), 1);
-        let effect_session = wait_real_process(&services, &admitted[0].graph_id).await;
-        let effect_graph = services
-            .graph_state_store()
-            .load(&admitted[0].graph_id)
-            .unwrap();
-        let effect_actor = services
-            .resolve_agent_action_actor(
-                &ExecutionParentBinding {
-                    execution_id: effect_graph.id.clone(),
-                    node_id: effect_graph.nodes[0].id.clone(),
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        let claimed = services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "effect-review-claim".into(),
-                actor: effect_actor.clone(),
-                expected_revision: None,
-                action: AgentAction::TaskClaim(TaskClaimInput {
-                    task_ref: work_receipt.changed_refs[0].clone(),
-                    reason: None,
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            claimed.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{claimed:?}"
-        );
-        let check_effect = AgentActionEnvelope {
-            action_id: "independent-effect-review".into(),
-            actor: effect_actor,
-            expected_revision: None,
-            action: AgentAction::ObjectiveReview(
-                harness_contract::agent_action::ObjectiveReviewInput {
-                    criterion_ref: added.changed_refs[0].clone(),
-                    decision: harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-                    result_refs: vec![
-                        effect_ref.clone(),
-                        wrapped.changed_refs[0].clone(),
-                        effect_access.retrieval_selector.clone(),
-                    ],
-                    evidence_refs: vec![content.selector.clone()],
-                    reason_ref: content.selector.clone(),
-                    reason: String::new(),
-                },
-            ),
-        };
-        let physical: AgentTaskPacket =
-            serde_json::from_str(&effect_graph.nodes[0].payload_ref).unwrap();
-        assert_eq!(
-            physical.agentic_binding.as_ref().unwrap().task_purpose,
-            Some(harness_contract::agent_action::TaskPurpose::Exploration)
-        );
-        assert!(physical
-            .objective
-            .contains(crate::agentic::order_contract::EXPLORATION_CLOSEOUT_CONTRACT));
-        let reader = RealProcessSession::prepare(
-            &services,
-            &physical,
-            &crate::agent_model_selector::AgentModelSelection {
-                model: "test".into(),
-                provider: "test".into(),
-                registry_revision: 0,
-            },
-        )
-        .unwrap();
-        reader
-            .execute_tool(
-                "read-effect-receipt",
-                "evidence_retrieve",
-                &serde_json::json!({"evidence_ref":effect_ref}).to_string(),
-            )
-            .await
-            .unwrap();
-        reader
-            .execute_tool(
-                "read-effect-content-alias",
-                "evidence_retrieve",
-                &serde_json::json!({"evidence_ref":effect_access.retrieval_selector}).to_string(),
-            )
-            .await
-            .unwrap();
-        let missing_effect_observation = services
-            .submit_agent_action(&check_effect)
-            .await
-            .unwrap_err();
-        assert!(missing_effect_observation.contains("review_requires_effect_observation"),
-            "effect-negative prerequisite failed before its intended gate: {missing_effect_observation}");
-        std::fs::write(
-            services.workspace_root().join("unrelated-review.txt"),
-            "unrelated contents",
-        )
-        .unwrap();
-        reader
-            .execute_tool(
-                "read-other-file",
-                "read_file",
-                r#"{"path":"unrelated-review.txt"}"#,
-            )
-            .await
-            .unwrap();
-        assert!(services
-            .submit_agent_action(&check_effect)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
-        reader
-            .execute_tool(
-                "read-affected-file",
-                "read_file",
-                r#"{"path":"review-effect.txt"}"#,
-            )
-            .await
-            .unwrap();
-        let accepted = services.submit_agent_action(&check_effect).await
-            .unwrap_or_else(|error| panic!(
-                "effect review failed without weakening alias coverage: {error}; original_results={:?}; diagnostics={}",
-                match &check_effect.action {
-                    AgentAction::ObjectiveReview(input) => &input.result_refs,
-                    _ => unreachable!(),
-                },
-                r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
-            ));
-        assert_eq!(
-            accepted.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{accepted:?}"
-        );
-        let prior = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let prior_digest = prior
-            .reviews
-            .last()
-            .unwrap()
-            .verification
-            .as_ref()
-            .unwrap()
-            .effect_manifest_digest
-            .clone();
-        write_root_review_effect(
-            &effect_runtime,
-            "root-write-again",
-            "actually persisted revised content\nstable middle line\nactually revised a second time\n",
-        )
-        .await;
-        // Negative preparation only: the real request remains uncommitted while
-        // this review worker is active. The Goal owner must invalidate its old review.
-        let mut proposed = action_service.project(fixture_program_id.as_str()).unwrap();
-        proposed.completion_request = Some(
-            crate::agentic::program::AgenticCompletionRequestProjection {
-                action_id: "test-negative-conclusion".into(),
-                requested_by: "root:session-dispatch".into(),
-                program_revision: proposed.revision,
-                result_refs: vec![artifact.clone()],
-                primary_artifact_ref: Some(artifact.clone()),
-                evidence_refs: vec![content.selector.clone()],
-                unresolved: vec![],
-            },
-        );
-        let stale_conclusion = services
-            .goal_store()
-            .prepare_program_conclusion(&proposed)
-            .unwrap();
-        assert!(stale_conclusion.goal.terminal.is_none());
-        assert!(stale_conclusion.gaps.contains(&format!(
-            "criterion_review_required:{}",
-            added.changed_refs[0]
-        )));
-        let mut refreshed = check_effect.clone();
-        refreshed.action_id = "effect-review-after-new-write".into();
-        assert!(services
-            .submit_agent_action(&refreshed)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
-        reader
-            .execute_tool(
-                "reread-after-second-write",
-                "read_file",
-                r#"{"path":"review-effect.txt","limit":1}"#,
-            )
-            .await
-            .unwrap();
-        let partial_refresh = services.submit_agent_action(&refreshed).await.unwrap_err();
-        assert!(
-            partial_refresh.contains("review_requires_effect_observation"),
-            "{partial_refresh}"
-        );
-        reader
-            .execute_tool(
-                "reread-other-dependency-after-unscoped-root-write",
-                "read_file",
-                r#"{"path":"unrelated-review.txt"}"#,
-            )
-            .await
-            .unwrap();
-        for (call_id, input) in [
-            (
-                "reread-only-middle-line",
-                r#"{"path":"review-effect.txt","offset":1,"limit":1}"#,
-            ),
-            (
-                "reread-only-first-two-lines",
-                r#"{"path":"review-effect.txt","limit":2}"#,
-            ),
-        ] {
-            let output = reader
-                .execute_tool(call_id, "read_file", input)
-                .await
-                .unwrap();
-            let actual: serde_json::Value = serde_json::from_str(&output).unwrap();
-            assert_eq!(actual["truncated"], true);
-            assert_eq!(actual["file"]["totalLines"], 3);
-            assert!(!actual["file"]["content"]
-                .as_str()
-                .unwrap()
-                .contains("actually revised a second time"));
-            let error = services.submit_agent_action(&refreshed).await.unwrap_err();
-            assert!(
-                error.contains("review_requires_effect_observation"),
-                "{error}"
-            );
-            println!(
-                "R1_PARTIAL_DEPENDENCY_REJECTED {}",
-                serde_json::json!({
-                    "call_id":call_id,"start_line":actual["file"]["startLine"],
-                    "num_lines":actual["file"]["numLines"],"total_lines":actual["file"]["totalLines"],
-                    "reason":error,
-                })
-            );
-        }
-        reader
-            .execute_tool(
-                "reread-complete-after-partial-windows",
-                "read_file",
-                r#"{"path":"review-effect.txt","complete":true}"#,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            services
-                .submit_agent_action(&refreshed)
-                .await
-                .unwrap()
-                .status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-        let reviewed = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let proof = reviewed
-            .reviews
-            .last()
-            .unwrap()
-            .verification
-            .as_ref()
-            .unwrap();
-        assert!(proof.independence_required);
-        assert_eq!(
-            proof.reads[0].result_kind,
-            harness_contract::goal::GoalResultKind::ToolEffect
-        );
-        assert_eq!(proof.reads[0].effect_observation_refs.len(), 1);
-        assert!(proof.effect_manifest_digest.is_some());
-        assert_ne!(proof.effect_manifest_digest, prior_digest);
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let publication = current.artifacts.get(&wrapped.changed_refs[0])
-            .expect("the original wrapped publication must remain authoritative");
-        assert_eq!(publication.artifact_ref, wrapped.changed_refs[0]);
-        assert_eq!(publication.content_ref, effect_access.retrieval_selector);
-        let body_artifact = services.artifact_store().resolve(&publication.content_ref).unwrap();
-        assert_eq!(body_artifact.selector, publication.content_ref);
-        assert_eq!(body_artifact.visibility_scope, format!("session:{}", physical.session_id()));
-        let original_body = services.artifact_store()
-            .read_blocking(&body_artifact, &body_artifact.visibility_scope, None).unwrap();
-        let original_sha = crate::context_evidence::read_sha256(&original_body);
-        assert_eq!(original_sha, body_artifact.sha256);
-        assert_eq!(original_body.len() as u64, body_artifact.bytes);
-        let raw_access = services.session_evidence_access(
-            physical.session_id(), effect_ref.strip_prefix("tool://").unwrap(),
-        ).await.unwrap().expect("the original ToolRaw mapping must still exist");
-        assert_eq!(raw_access.retrieval_selector, publication.content_ref);
-        assert_eq!(raw_access.sha256, body_artifact.sha256);
-        assert_eq!(raw_access.bytes, body_artifact.bytes);
-        assert_eq!(raw_access.visibility_scope, body_artifact.visibility_scope);
-        assert_ne!(effect_ref, publication.content_ref,
-            "logical ToolRaw identity must not be confused with its opaque content selector");
-        let receipt_union = proof.reads.iter().flat_map(|read| read.receipt_refs.iter())
-            .cloned().collect::<std::collections::BTreeSet<_>>();
-        let (file_receipt, file_material, _) = r1_original_process_read_659(
-            &services, &physical, "reread-complete-after-partial-windows",
-        );
-        let crate::context_evidence::ReadExtent::FileLines {
-            start_line, line_count, total_lines, source_omitted, ..
-        } = &file_material.acquisition.body.extent else {
-            panic!("the effect witness must be the actual complete File acquisition");
-        };
-        assert_eq!(*start_line, 1);
-        assert_eq!(line_count, total_lines);
-        assert!(!source_omitted);
-        let actual_file = std::fs::read(services.workspace_root().join("review-effect.txt")).unwrap();
-        assert_eq!(file_material.acquisition.body.source_sha256,
-            crate::context_evidence::read_sha256(&actual_file));
-        assert_eq!(file_material.acquisition.body.source_bytes, actual_file.len() as u64);
-        let mut independent_receipts = std::collections::BTreeSet::new();
-        let mut independent_primaries = std::collections::BTreeSet::new();
-        for (call_id, input_ref, result_ref) in [
-            ("read-effect-receipt", effect_ref.as_str(), effect_ref.as_str()),
-            ("read-effect-content-alias", effect_access.retrieval_selector.as_str(),
-                wrapped.changed_refs[0].as_str()),
-        ] {
-            let (receipt_ref, material, output) = r1_original_process_read_659(
-                &services, &physical, call_id,
-            );
-            assert!(independent_receipts.insert(receipt_ref.clone()));
-            assert!(independent_primaries.insert((
-                material.acquisition.primary_stream.clone(), material.acquisition.primary_key.clone(),
-            )));
-            assert!(receipt_union.contains(&receipt_ref),
-                "original call {call_id} receipt {receipt_ref} is missing from proof coverage");
-            let covered = proof.reads.iter().find(|read| read.result_ref == result_ref)
-                .expect("the exact ToolRaw/publication proof identity must remain");
-            assert!(covered.receipt_refs.contains(&receipt_ref),
-                "original call {call_id} receipt {receipt_ref} must cover its own result {result_ref}");
-            assert_eq!(material.acquisition.input_sha256, crate::context_evidence::read_sha256(
-                serde_json::json!({"evidence_ref":input_ref}).to_string().as_bytes()));
-            assert_eq!(material.acquisition.tool_name, "evidence_retrieve");
-            let body = &material.acquisition.body;
-            assert_eq!(body.source_ref, input_ref);
-            assert_eq!(body.source_sha256, original_sha);
-            assert_eq!(body.source_bytes, body_artifact.bytes);
-            assert_eq!(covered.content_ref, body_artifact.selector);
-            assert_eq!(covered.sha256.trim_start_matches("sha256:"),
-                body.source_sha256.trim_start_matches("sha256:"));
-            assert_eq!(covered.bytes, body.source_bytes);
-            let output_body = crate::context_evidence::read_body_seal("evidence_retrieve", &output)
-                .expect("the original response must retain a verifiable body extent");
-            assert_eq!(&output_body, body);
-            let crate::context_evidence::ReadExtent::ArtifactChunks { total_chunks, chunks } =
-                &body.extent else { panic!("evidence retrieval must retain original chunk extent"); };
-            assert_eq!(chunks.iter().map(|chunk| chunk.index).collect::<std::collections::BTreeSet<_>>(),
-                (0..*total_chunks).collect::<std::collections::BTreeSet<_>>());
-            let actual_output: serde_json::Value = serde_json::from_str(&output).unwrap();
-            assert_eq!(actual_output["evidence_ref"], input_ref);
-            assert_eq!(actual_output["available"], true);
-            assert_eq!(actual_output["bytes"], body_artifact.bytes);
-            assert_eq!(actual_output["sha256"].as_str().unwrap().trim_start_matches("sha256:"),
-                body.source_sha256.trim_start_matches("sha256:"));
-            let delivered = actual_output["chunks"].as_array().unwrap().iter()
-                .map(|chunk| chunk["content"].as_str().unwrap()).collect::<String>();
-            assert_eq!(delivered.as_bytes(), original_body.as_slice());
-            assert_eq!(chunks.iter().map(|chunk| chunk.body_bytes).sum::<u64>(), body.source_bytes);
-            for chunk in chunks {
-                let actual = actual_output["chunks"].as_array().unwrap().iter()
-                    .find(|actual| actual["index"].as_u64() == Some(chunk.index)).unwrap();
-                let text = actual["content"].as_str().unwrap();
-                assert_eq!(chunk.body_bytes, text.len() as u64);
-                assert_eq!(chunk.body_sha256, crate::context_evidence::read_sha256(text.as_bytes()));
-            }
-            assert!(covered.effect_observation_refs.contains(&file_receipt),
-                "{result_ref} must cite the real current complete File witness {file_receipt}");
-        }
-        assert_eq!(independent_receipts.len(), 2);
-        assert_eq!(independent_primaries.len(), 2);
-        let requested = match &check_effect.action {
-            AgentAction::ObjectiveReview(input) => &input.result_refs,
-            _ => unreachable!(),
-        };
-        assert_eq!(requested.len(), 3, "all original result citations must remain");
-        let identity = |reference: &str| {
-            crate::agentic::review_evidence::review_result_identity(&current, reference).unwrap()
-        };
-        let expected_identities = requested.iter().map(|reference| identity(reference))
-            .collect::<std::collections::BTreeSet<_>>();
-        let actual_identities = proof.reads.iter().map(|read| identity(&read.result_ref))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(actual_identities, expected_identities);
-        assert_eq!(actual_identities.len(), proof.reads.len(),
-            "proof coverage must contain exactly one entry per authenticated material identity");
-        assert_eq!(identity(&requested[1]), identity(&requested[2]),
-            "logical artifact and exact content selector denote one publication");
-        assert_ne!(identity(&requested[0]), identity(&requested[1]),
-            "the original ToolRaw receipt remains a separate authenticated identity");
-        assert!(proof
-            .reads
-            .iter()
-            .all(|read| read.result_kind == harness_contract::goal::GoalResultKind::ToolEffect));
-
-        let manifest = proof.work_manifest_digest.clone();
-        let artifact_count_before_retirement = action_service
-            .project(fixture_program_id.as_str())
-            .unwrap()
-            .artifacts
-            .len();
-        let withdrawn = AgentActionEnvelope {
-            action_id: "effect-review-finished".into(),
-            actor: check_effect.actor.clone(),
-            expected_revision: None,
-            action: AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
-                task_ref: work_receipt.changed_refs[0].clone(),
-                reason_ref: content.selector.clone(),
-                evidence_refs: vec![content.selector.clone()],
-            }),
-        };
-        effect_session.retire_control(&withdrawn, &work_receipt.changed_refs[0]).await;
-        services
-            .dispatch_agentic_followups(&withdrawn, review_context())
-            .await
-            .unwrap();
-        wait_retired_process(
-            &services,
-            &effect_session.packet,
-            &work_receipt.changed_refs[0],
-        )
-        .await;
-        let drained = services
-            .agent_action_service()
-            .project(fixture_program_id.as_str())
-            .unwrap();
-        assert_eq!(
-            drained.tasks[&work_receipt.changed_refs[0]].status,
-            crate::AgenticTaskStatus::Withdrawn
-        );
-        assert!(drained.tasks[&work_receipt.changed_refs[0]]
-            .active_attempts
-            .is_empty());
-        wait_retired_process(
-            &services,
-            &effect_session.packet,
-            &work_receipt.changed_refs[0],
-        )
-        .await;
-        assert_eq!(drained.artifacts.len(), artifact_count_before_retirement);
-        let current_goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let current = crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &drained,
-            Some(&current_goal),
-            proof,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        )
-        .expect("retiring the reviewer does not change its actual reviewed inputs");
-        assert_eq!(current.work_digest, manifest);
-        let mut stale = check_effect.clone();
-        stale.action_id = "withdrawn-review-cannot-mutate-goal".into();
-        assert_eq!(
-            services.submit_agent_action(&stale).await.unwrap().status,
-            harness_contract::agent_action::AgentActionStatus::Rejected
-        );
-    } else if delegated_effect {
-        if scoped_goal_reviewer.is_none() {
-            let (_, runtime) =
-                root_reads_generic_results(&services, read_host, &content.selector, false, false)
-                    .await;
-            root_review_target_tool(
-                &runtime,
-                "root-verify-delegated-target",
-                "read_file",
-                "review-effect.txt",
-                "",
-            )
-            .await;
-        }
-    } else {
-        if direct_text {
-            let unrelated = services
-                .artifact_store()
-                .write_bytes(
-                    harness_contract::context::ArtifactWriteDescriptor {
-                        media_type: "text/plain".into(),
-                        visibility_scope: "session:session-dispatch".into(),
-                        expected_bytes: None,
-                        original_name: None,
-                    },
-                    b"Different content is not the admitted result",
-                )
-                .await
-                .unwrap();
-            root_reads_review_result(&services, read_host.clone(), &unrelated.selector).await;
-            let rejected = services
-                .submit_agent_action(&bind_root(root(
-                    "wrong-content-is-not-independent-proof",
-                    AgentAction::ObjectiveReview(
-                        harness_contract::agent_action::ObjectiveReviewInput {
-                            criterion_ref: "reviewed-delivery".into(),
-                            decision:
-                                harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-                            result_refs: vec![artifact.clone()],
-                            evidence_refs: vec![content.selector.clone()],
-                            reason_ref: content.selector.clone(),
-                            reason: String::new(),
-                        },
-                    ),
-                )))
-                .await
-                .unwrap_err();
-            assert!(
-                rejected.contains("review_requires_current_physical_reads"),
-                "{rejected}"
-            );
-            assert_eq!(
-                services
-                    .goal_store()
-                    .get("goal:root-agentic-execution")
-                    .unwrap()
-                    .unwrap()
-                    .completion,
-                harness_contract::goal::GoalCompletion::Open
-            );
-        }
-        root_reads_review_result(&services, read_host, &content.selector).await;
-    }
-    if let R1ProofScenario::LegacyReplay(unknown_version) = proof_scenario {
-        assert!(drain_timing == PhysicalDrainTiming::BeforeGoal);
-        exercise_legacy_review_replay(
-            &services,
-            &effect_host,
-            unknown_version,
-            bind_root(root(
-                "r1-historical-objective-review",
-                AgentAction::ObjectiveReview(
-                    harness_contract::agent_action::ObjectiveReviewInput {
-                        criterion_ref: "reviewed-delivery".into(),
-                        decision:
-                            harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-                        result_refs: vec![artifact.clone()],
-                        evidence_refs: vec![content.selector.clone()],
-                        reason_ref: content.selector.clone(),
-                        reason: String::new(),
-                    },
-                ),
-            )),
-        )
-        .await;
+    let goal_sources_stage =
+        boxed_fixture_stage(|| async { include!("reviewed_goal_fixture/goal_sources_stage.rs") });
+    let Some((mut scoped_goal_reviewer, mut optional_effect)) = goal_sources_stage.await else {
         return;
-    }
-    let mut optional_effect = if proof_scenario.optional_unknown() {
-        Some(
-            start_r1_optional_effect(
-                &services,
-                &effect_host,
-                &bind_root(root("r1-optional-actor", task.action.clone())).actor,
-                &content.selector,
-                proof_scenario,
-            )
-            .await,
-        )
-    } else {
-        None
     };
-    if proof_scenario.invalid_child() {
-        use sha2::Digest;
-        let optional = optional_effect.as_ref().unwrap();
-        let links = services
-            .graph_state_store()
-            .child_links(&optional.graph_id)
-            .unwrap();
-        assert_eq!(links.len(), 1);
-        let original = services
-            .graph_state_store()
-            .load(&links[0].child_execution_id)
-            .unwrap();
-        assert_eq!(original.nodes.len(), 1);
-        assert_eq!(original.nodes[0].kind, ExecutionNodeKind::ToolBatch);
-        use crate::execution_core::graph::executors::agent_tool::{
-            decode_bound_agent_tool, decode_bound_agent_tool_graph, decode_bound_agent_tool_node,
-            encode_bound_agent_tool,
-        };
-        let mut bound = decode_bound_agent_tool_graph(&original).unwrap();
-        match proof_scenario {
-            R1ProofScenario::OptionalForeignChild => {
-                bound.request.parent_execution.as_mut().unwrap().node_id =
-                    "foreign-agent-node".into();
-            }
-            R1ProofScenario::OptionalWrongChildAttempt => {
-                bound.request.parent_execution_attempt = Some(optional.packet.attempt + 1);
-            }
-            R1ProofScenario::OptionalMixedChild => {}
-            _ => unreachable!(),
-        }
-        let packed =
-            encode_bound_agent_tool(&bound.agent_id, &bound.run_id, bound.request).unwrap();
-        let envelope = harness_contract::step::parse_strict_json(&packed).unwrap();
-        let payload = serde_json::to_string_pretty(&envelope).unwrap();
-        let decoded = decode_bound_agent_tool(&payload).unwrap();
-        if proof_scenario == R1ProofScenario::OptionalWrongChildAttempt {
-            assert_eq!(
-                decoded.request.parent_execution_attempt,
-                Some(optional.packet.attempt + 1)
-            );
-            assert_eq!(decoded.request.parent_execution, original.parent_execution);
-        }
-        assert_ne!(payload, original.nodes[0].payload_ref);
-        let digest = format!("{:x}", sha2::Sha256::digest(payload.as_bytes()));
-        let mut child = ExecutionGraph::new("Adversarial typed child input");
-        child.id = format!("agent-tool-batch:{digest}");
-        child.lineage = original.lineage.clone();
-        child.service_class = original.service_class;
-        child.parent_execution = original.parent_execution.clone();
-        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", payload);
-        node.id = format!("agent-tool:{digest}");
-        node.idempotency_key = node.id.clone();
-        child.nodes.push(node);
-        if proof_scenario == R1ProofScenario::OptionalMixedChild {
-            child.nodes.push(ExecutionNodeSpec::new(
-                ExecutionNodeKind::InlineModel,
-                "inline_model",
-                "unowned-child-payload",
-            ));
-        }
-        decode_bound_agent_tool_node(&child.id, &child.nodes[0]).unwrap();
-        match proof_scenario {
-            R1ProofScenario::OptionalForeignChild => {
-                assert!(decode_bound_agent_tool_graph(&child)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("original parent mismatch"));
-            }
-            R1ProofScenario::OptionalWrongChildAttempt => {
-                assert_eq!(
-                    decode_bound_agent_tool_graph(&child)
-                        .unwrap()
-                        .request
-                        .parent_execution_attempt,
-                    Some(optional.packet.attempt + 1)
-                );
-            }
-            R1ProofScenario::OptionalMixedChild => {
-                assert!(decode_bound_agent_tool_graph(&child)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("requires one original node"));
-            }
-            _ => unreachable!(),
-        }
-        services.commit_service().register_graph(child).unwrap();
-        optional.assert_pending(&services);
-    }
-    let bind_review = |envelope: AgentActionEnvelope| {
+    let bind_review = |envelope: AgentActionEnvelope, reviewer: Option<&R1ScopedReviewer>| {
         let mut envelope = bind_root(envelope);
-        if let Some(reviewer) = scoped_goal_reviewer.as_ref() {
+        if let Some(reviewer) = reviewer {
             envelope.actor = reviewer.actor.clone();
         }
         envelope
     };
-    let native_sources = if proof_scenario.native_sources() {
-        Some(
-            exercise_native_task_sources(
-                &services,
-                &effect_host,
-                &bind_root(root("native-root", task.action.clone())).actor,
-                proof_scenario,
-            )
-            .await,
-        )
-    } else {
-        None
+    let objective_admission_stage = boxed_fixture_stage(|| async {
+        include!("reviewed_goal_fixture/objective_admission_stage.rs")
+    });
+    let Some((
+        native_sources,
+        reviewed_delivery_refs,
+        transitive_inputs,
+        bounded_selected_body_receipts,
+        obligation_envelope,
+        mut raced_material,
+        _physical_history,
+    )) = objective_admission_stage.await
+    else {
+        return;
     };
-    #[cfg(test)]
-    if proof_scenario == R1ProofScenario::TaskReviewAdmission
-        && !NATIVE_TASK_CASE
-            .try_with(|case| case.complete_goal)
-            .unwrap_or(false)
-    {
-        scoped_goal_reviewer.take().unwrap().finish(&services).await;
-        drain_workers().await;
-        services.shutdown_maintenance().await;
+    let objective_commit_stage = boxed_fixture_stage(|| async {
+        include!("reviewed_goal_fixture/objective_commit_stage.rs")
+    });
+    let Some((mut optional_effect,)) = objective_commit_stage.await else {
         return;
-    }
-    let mut reviewed_delivery_refs = vec![artifact.clone()];
-    if let Some(native) = native_sources.as_ref() {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        for (index, selector) in native.result_contents.iter().enumerate() {
-            reviewer
-                .reader
-                .execute_tool(
-                    &format!("native-result-independent-read:{index}"),
-                    "evidence_retrieve",
-                    &serde_json::json!({"evidence_ref":selector}).to_string(),
-                )
-                .await
-                .unwrap();
-        }
-        reviewer.reader.execute_tool(
-            "native-goal-independent-current-target-read",
-            "read_file",
-            r#"{"path":"review-effect.txt","complete":true}"#,
-        ).await.unwrap();
-        reviewed_delivery_refs.extend(native.result_refs.clone());
-    }
-    #[cfg(test)]
-    if let R1ProofScenario::ProgramPublication(case) = proof_scenario {
-        let native = native_sources.as_ref().unwrap();
-        let root_actor = bind_root(root("program-publication-root", task.action.clone())).actor;
-        if exercise_program_publication_review(
-            &services,
-            &effect_host,
-            &root_actor,
-            scoped_goal_reviewer.as_ref().unwrap(),
-            native,
-            case,
-            &content.selector,
-            &mut reviewed_delivery_refs,
-        )
-        .await
-        {
-            scoped_goal_reviewer.take().unwrap().finish(&services).await;
-            drain_workers().await;
-            return;
-        }
-    }
-    let mut transitive_inputs = None;
-    if proof_scenario == R1ProofScenario::ReviewerInfluence {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        let (derived_selector, derived_artifact) = publish_r1_material(
-            &services,
-            &reviewer.actor,
-            "r1-reviewer-owned-material",
-            b"Actual reviewer-authored input D for a subsequently produced result.",
-            Vec::new(),
-        )
-        .await;
-        let (_, _root_reader) = root_reads_generic_results(
-            &services,
-            effect_host.clone(),
-            &derived_selector,
-            false,
-            false,
-        )
-        .await;
-        let (result_selector, result_artifact) = publish_r1_material(
-            &services,
-            &bind_root(root("r1-influenced-root", task.action.clone())).actor,
-            "r1-primary-using-reviewer-material",
-            b"Root produced R-prime after actually reading D.",
-            vec![derived_artifact.clone()],
-        )
-        .await;
-        reviewer
-            .reader
-            .execute_tool(
-                "r1-reviewer-influenced-result-read",
-                "evidence_retrieve",
-                &serde_json::json!({"evidence_ref":result_selector}).to_string(),
-            )
-            .await
-            .unwrap();
-        let before = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let refusal = services
-            .submit_agent_action(&bind_review(root(
-                "r1-transitive-self-review-refusal",
-                AgentAction::ObjectiveReview(
-                    harness_contract::agent_action::ObjectiveReviewInput {
-                        criterion_ref: "source-backed-delivery".into(),
-                        decision:
-                            harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-                        result_refs: vec![artifact.clone(), result_artifact.clone()],
-                        evidence_refs: vec![content.selector.clone()],
-                        reason_ref: content.selector.clone(),
-                        reason: String::new(),
-                    },
-                ),
-            )))
-            .await
-            .unwrap_err();
-        assert!(
-            refusal.contains("producer")
-                && (refusal.contains("reviewer") || refusal.contains("independen")),
-            "{refusal}; reviewer_task={:?}; derived_artifact={:?}; root_result={:?}",
-            services
-                .agent_action_service()
-                .project(fixture_program_id.as_str())
-                .map(|program| program.tasks.get(&reviewer.task_ref).cloned()),
-            services
-                .agent_action_service()
-                .project(fixture_program_id.as_str())
-                .map(|program| program.artifacts.get(&derived_artifact).cloned()),
-            services
-                .agent_action_service()
-                .project(fixture_program_id.as_str())
-                .map(|program| program.artifacts.get(&result_artifact).cloned()),
-        );
-        assert_eq!(
-            services.goal_store().get(&before.id).unwrap().unwrap(),
-            before
-        );
-        assert!(before.terminal.is_none());
-        assert!(action_service
-            .project(fixture_program_id.as_str())
-            .unwrap()
-            .objective_verdict
-            .is_none());
-        println!(
-            "R1_PRIMARY_REVIEWER_INFLUENCE_REFUSED {}",
-            serde_json::json!({
-                "reviewer":reviewer.actor.actor_id,"derived_input":derived_artifact,"primary":result_artifact,"reason":refusal,"half_a":false,
-            })
-        );
-        scoped_goal_reviewer.take().unwrap().finish(&services).await;
-        services
-            .cancel_execution_tree(&review_graph.id, "primary influence negative complete")
-            .await
-            .unwrap();
-        services
-            .cancel_execution_tree(packet.graph_id(), "primary influence negative complete")
-            .await
-            .unwrap();
-        return;
-    }
-    if proof_scenario == R1ProofScenario::TransitiveDependency
-        || proof_scenario.mechanical_approval()
-    {
-        let (_, runtime) = root_reads_generic_results(
-            &services,
-            effect_host.clone(),
-            &content.selector,
-            false,
-            true,
-        )
-        .await;
-        write_root_review_effect(
-            &runtime,
-            "r1-transitive-input-setup",
-            delegated_write_content,
-        )
-        .await;
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            delegated_write_content
-        );
-        let producer = start_r1_scoped_goal_reviewer(
-            &services,
-            &bind_root(root("r1-transitive-root", task.action.clone())).actor,
-            &content.selector,
-            "r1-derived-producer",
-            true,
-        )
-        .await;
-        let approval_ref = create_r1_transitive_decision(&services);
-        producer
-            .reader
-            .execute_tool(
-                "r1-derived-approval-read",
-                "evidence_retrieve",
-                &serde_json::json!({"evidence_ref":approval_ref}).to_string(),
-            )
-            .await
-            .unwrap();
-        let (_, _, approval_source) = services
-            .approval_result_content("session-dispatch", &approval_ref)
-            .await
-            .unwrap();
-        let (derived_selector, derived_artifact) = publish_r1_material(
-            &services,
-            &producer.actor,
-            "r1-derived-publication",
-            b"Derived observation D uses the actual approval and physical input X.",
-            vec![artifact.clone()],
-        )
-        .await;
-        root_review_input_tool(
-            &runtime,
-            "r1-root-derived-material-read",
-            "evidence_retrieve",
-            &serde_json::json!({"evidence_ref":derived_selector}).to_string(),
-        )
-        .await;
-        let (result_selector, result_artifact) = publish_r1_material(
-            &services,
-            &bind_root(root("r1-transitive-result-actor", task.action.clone())).actor,
-            "r1-transitive-result-publication",
-            b"Root result R uses the actually retrieved derived observation D.",
-            vec![derived_artifact],
-        )
-        .await;
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        reviewer
-            .reader
-            .execute_tool(
-                "r1-transitive-result-read",
-                "evidence_retrieve",
-                &serde_json::json!({"evidence_ref":result_selector}).to_string(),
-            )
-            .await
-            .unwrap();
-        reviewed_delivery_refs.push(result_artifact);
-        let producer_graph = producer.packet.graph_id().to_owned();
-        producer.finish(&services).await;
-        transitive_inputs = Some((runtime, producer_graph, approval_source));
-    }
-    #[cfg(test)]
-    if proof_scenario == R1ProofScenario::MechanicalExtra {
-        let current = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        services
-            .goal_store()
-            .revise(
-                &current.id,
-                current.revision,
-                current.user_sequence + 1,
-                "actual additional accepted and waived conditions",
-                |goal| {
-                    let mut extra = goal.criteria[0].clone();
-                    extra.id = "additional-accepted-condition".into();
-                    extra.status = harness_contract::goal::AcceptanceStatus::Open;
-                    extra.required_evidence = vec![content.selector.clone()];
-                    goal.criteria.push(extra.clone());
-                    extra.id = "waived-additional".into();
-                    extra.status = harness_contract::goal::AcceptanceStatus::Waived;
-                    extra.waiver = Some(harness_contract::goal::CriterionWaiver {
-                        actor: "operator:fixture".into(),
-                        reason: "explicit bounded waiver".into(),
-                        permission_receipt: content.selector.clone(),
-                    });
-                    goal.criteria.push(extra);
-                    let mut optional = goal.obligations[0].clone();
-                    optional.obligation_id = "unrelated-optional".into();
-                    optional.required = false;
-                    optional.state = harness_contract::goal::ObjectiveObligationState::Open;
-                    optional.verifier_decision = None;
-                    goal.obligations.push(optional.clone());
-                    optional.obligation_id = "additional-accepted-condition".into();
-                    goal.obligations.push(optional);
-                    let mut intersection = goal.obligations[0].clone();
-                    intersection.obligation_id = goal.user_intent_criterion_id.clone().unwrap();
-                    intersection.artifact_refs = reviewed_delivery_refs.clone();
-                    intersection.state = harness_contract::goal::ObjectiveObligationState::Open;
-                    intersection.verifier_decision = None;
-                    goal.obligations.push(intersection);
-                    goal.spec_revision += 1;
-                    goal.spec_digest = crate::execution_core::goal::goal_spec_digest(goal);
-                    vec![
-                        "criteria".into(),
-                        "obligations".into(),
-                        "spec_revision".into(),
-                        "spec_digest".into(),
-                    ]
-                },
-            )
-            .unwrap();
-    }
-    let mut bounded_selected_body_receipts = Vec::new();
-    if !bounded_runs.is_empty() {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        for path in ["bounded_source.py", "bounded_test.py"] {
-            reviewer
-                .reader
-                .execute_tool(
-                    &format!("bounded-goal-file:{path}"),
-                    "read_file",
-                    &serde_json::json!({"path":path,"complete":true}).to_string(),
-                )
-                .await
-                .unwrap();
-        }
-        for (index, run) in bounded_runs.iter().enumerate() {
-            let receipts = read_bounded_body_pages_283(
-                &services,
-                &reviewer.reader,
-                &format!("bounded-goal-body:{index}"),
-                &run.body,
-                None,
-            )
-            .await;
-            if index + 1 == bounded_runs.len() {
-                bounded_selected_body_receipts = receipts;
-            }
-        }
-        let (_, runtime) = execute_root_review_reads_with_approval(
-            &services,
-            effect_host.clone(),
-            &content.selector,
-            true,
-            false,
-            PermissionMode::DangerFullAccess,
-            Some(Arc::clone(services.approval_coordinator())),
-        )
-        .await;
-        assert!(!crate::ToolExecutor::owns_durable_tool_effect(
-            &RootReviewReader(effect_host.clone()),
-            "execute_code"
-        ));
-        let bounded_input = serde_json::json!({"language":"python","code":"exec(open('/project/bounded_test.py').read())",
-            "input_files":["bounded_source.py","bounded_test.py"],"timeout_ms":5000}).to_string();
-        runtime.execute_approved_bounded_code(&bounded_input).await.unwrap();
-        let request = effect_host
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|request| {
-                request.tool_name == "execute_code"
-                    && request.tool_use_id == "bounded-root-nonowns-283"
-            })
-            .cloned()
-            .unwrap();
-        assert!(request.parent_execution.is_none());
-        let effect = &request.compiled_invocation.as_ref().unwrap().effect;
-        let receipt = services
-            .commit_service()
-            .completed_tool_effect(&request, effect)
-            .unwrap()
-            .unwrap();
-        let fact = receipt
-            .observed_evidence
-            .iter()
-            .find_map(|observed| match &observed.target {
-                harness_contract::context::EvidenceTargetIdentity::ToolExecution { execution } => {
-                    Some(execution)
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert!(fact.stdout_bytes > 16 * 1024);
-        read_bounded_body_pages_283(
-            &services,
-            &reviewer.reader,
-            "bounded-goal-root-body",
-            &fact.body,
-            None,
-        )
-        .await;
-    }
-    let obligation_envelope = bind_review(root(
-        "source-obligation-review",
-        AgentAction::ObjectiveReview(harness_contract::agent_action::ObjectiveReviewInput {
-            criterion_ref: "source-backed-delivery".into(),
-            decision: harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-            result_refs: reviewed_delivery_refs.clone(),
-            evidence_refs: review_evidence_refs.clone(),
-            reason_ref: content.selector.clone(),
-            reason: String::new(),
-        }),
-    ));
-    if let Some((runtime, producer_graph, approval_source)) = transitive_inputs.as_ref() {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        reviewer.reader.execute_tool(
-            "r1-independent-transitive-baseline-input-read",
-            "read_file",
-            r#"{"path":"review-effect.txt","complete":true}"#,
-        ).await.unwrap();
-        let (_, baseline_read, _) = r1_original_process_read_659(
-            &services, &reviewer.packet, "r1-independent-transitive-baseline-input-read",
-        );
-        let actual_input = std::fs::read(services.workspace_root().join("review-effect.txt")).unwrap();
-        let setup_request = effect_host.calls.lock().unwrap().iter()
-            .find(|request| request.tool_name == "edit"
-                && request.tool_use_id == "r1-transitive-input-setup")
-            .cloned().expect("the actual root setup write must remain recorded");
-        let setup_receipt = services.event_store().event_by_idempotency_key(
-            &format!("execution-effect:{}", setup_request.idempotency_key),
-            &format!("{}:receipt", setup_request.idempotency_key),
-        ).unwrap().expect("the root setup write needs its actual original receipt");
-        assert_eq!(setup_receipt.kind, "execution.effect.receipt");
-        assert_eq!(setup_receipt.payload["outcome"]["status"], "executed");
-        assert!(baseline_read.acquisition_cursor > setup_receipt.commit_cursor);
-        assert_eq!(baseline_read.acquisition.body.source_sha256,
-            crate::context_evidence::read_sha256(&actual_input));
-        assert_eq!(baseline_read.acquisition.body.source_bytes, actual_input.len() as u64);
-        let crate::context_evidence::ReadExtent::FileLines {
-            start_line, line_count, total_lines, source_omitted, ..
-        } = &baseline_read.acquisition.body.extent else {
-            panic!("transitive baseline needs its independent actual File read, not an artifact read");
-        };
-        assert_eq!(*start_line, 1);
-        assert_eq!(line_count, total_lines);
-        assert!(!source_omitted);
-        let mut baseline = obligation_envelope.clone();
-        baseline.action_id = "r1-transitive-baseline-review".into();
-        let applied = services
-            .submit_agent_action(&baseline)
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "transitive baseline review failed: {error}; diagnostics={}",
-                    r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
-                )
-            });
-        assert_eq!(
-            applied.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{applied:?}"
-        );
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
-        let inputs = proof.input_set.as_ref().unwrap();
-        assert!(inputs.packet_digests.contains_key(producer_graph));
-        assert_eq!(
-            proof
-                .result_source_revisions
-                .get(&approval_source.stream_id),
-            Some(&approval_source.expected_revision)
-        );
-        assert!(inputs.material_events.iter().any(|event| event
-            .stream_id
-            .starts_with(&format!("execution-agent-receipts:{producer_graph}:"))));
-        assert!(inputs
-            .required_scopes
-            .iter()
-            .any(|target| target.path.workspace_relative_path == "review-effect.txt"));
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let original_snapshot = crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &current,
-            Some(&goal),
-            proof,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        )
-        .expect("the unmodified real transitive proof must remain consumable");
-        assert_eq!(original_snapshot.semantic_digest, inputs.semantic_digest);
-        for mutation in 0..4 {
-            let mut omitted = proof.clone();
-            let selected = omitted.input_set.as_mut().unwrap();
-            match mutation {
-                0 => selected.required_scopes.clear(),
-                1 => selected.material_events.clear(),
-                2 => {
-                    selected.packet_digests.remove(producer_graph);
-                }
-                _ => selected.source_revisions.clear(),
-            }
-            let rejected = crate::agentic::review_evidence::proof_input_snapshot(
-                services.event_store(),
-                &current,
-                Some(&goal),
-                &omitted,
-                crate::agentic::review_evidence::ResultContentReaders {
-                    process_inputs: None,
-                    artifacts: Some(services.artifact_store().as_ref()),
-                    history: services.session_history_reader().as_deref(),
-                },
-            );
-            assert!(rejected.is_err(), "manifest omission {mutation} must fail original-source reconstruction, not only the final digest comparison");
-            assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), goal);
-        }
-        write_root_review_effect(
-            runtime,
-            "r1-transitive-change-input",
-            verified_delegated_content,
-        )
-        .await;
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            verified_delegated_content
-        );
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert!(crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &current,
-            Some(&goal),
-            proof,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref()
-            }
-        )
-        .is_err());
-        let rejected = services
-            .submit_agent_action(&obligation_envelope)
-            .await
-            .unwrap_err();
-        assert!(
-            rejected.contains("review_requires_effect_observation"),
-            "{rejected}"
-        );
-        scoped_goal_reviewer
-            .as_ref()
-            .unwrap()
-            .reader
-            .execute_tool(
-                "r1-independent-transitive-input-read",
-                "read_file",
-                r#"{"path":"review-effect.txt","complete":true}"#,
-            )
-            .await
-            .unwrap();
-        println!(
-            "R1_TRANSITIVE_MATERIAL_WITNESS {}",
-            serde_json::json!({
-                "producer_graph":producer_graph,"approval_source":approval_source,
-                "fresh_review_without_changed_input_refused":true,"independent_input_retrieved":true,
-            })
-        );
-    }
-    if proof_scenario == R1ProofScenario::PartialDependency {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        let (_, root_runtime) = root_reads_generic_results(
-            &services,
-            effect_host.clone(),
-            &content.selector,
-            false,
-            true,
-        )
-        .await;
-        write_root_review_effect(
-            &root_runtime,
-            "r1-change-dependent-last-line",
-            verified_delegated_content,
-        )
-        .await;
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            verified_delegated_content
-        );
-        let actual_write = services
-            .event_store()
-            .list_stream("session:session-dispatch")
-            .unwrap()
-            .into_iter()
-            .find(|event| {
-                event.kind == "tool.invocation.completed"
-                    && event.payload["tool_call_id"] == "r1-change-dependent-last-line"
-            })
-            .expect("the dependency mutation must have a real completed invocation");
-        assert!(actual_write.payload["governed_plan_id"].as_str().is_some());
-        let actual_root_journal = services.event_store().list_stream("session:session-dispatch").unwrap()
-            .into_iter().filter(|event| event.kind == "tool.execution_plan.created"
-                || event.kind.starts_with("tool.invocation."))
-            .map(|event| serde_json::json!({"kind":event.kind,"payload":event.payload,"cursor":event.commit_cursor}))
-            .collect::<Vec<_>>();
-        println!(
-            "R1_ROOT_DEPENDENCY_JOURNAL {}",
-            serde_json::json!(actual_root_journal)
-        );
-        reviewer
-            .reader
-            .execute_tool(
-                "r1-refresh-other-dependency",
-                "read_file",
-                r#"{"path":"unrelated-review.txt","complete":true}"#,
-            )
-            .await
-            .unwrap();
-        for (index, input) in [
-            serde_json::json!({"path":"review-effect.txt","limit":1}),
-            serde_json::json!({"path":"review-effect.txt","offset":1,"limit":1}),
-            serde_json::json!({"path":"review-effect.txt","limit":2}),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let output = reviewer
-                .reader
-                .execute_tool(
-                    &format!("r1-partial-dependency-{index}"),
-                    "read_file",
-                    &input.to_string(),
-                )
-                .await
-                .unwrap();
-            let actual: serde_json::Value = serde_json::from_str(&output).unwrap();
-            assert_eq!(actual["truncated"], true, "{actual}");
-            assert_eq!(actual["file"]["totalLines"], 3);
-            assert!(!output.contains("changed dependency last line"), "{output}");
-            let rejected = services
-                .submit_agent_action(&obligation_envelope)
-                .await
-                .unwrap_err();
-            assert!(
-                rejected.contains("review_requires_effect_observation"),
-                "{rejected}"
-            );
-        }
-        root_review_target_tool(
-            &root_runtime,
-            "r1-producer-only-complete-read",
-            "read_file",
-            "review-effect.txt",
-            "",
-        )
-        .await;
-        let root_read = services
-            .event_store()
-            .list_stream("session:session-dispatch")
-            .unwrap()
-            .into_iter()
-            .find(|event| {
-                event.kind == "tool.invocation.completed"
-                    && event.payload["tool_call_id"] == "r1-producer-only-complete-read"
-            })
-            .expect("the non-reviewer must really complete the read, not merely attempt it");
-        let root_output_ref = root_read.payload["full_output_ref"].as_str().unwrap();
-        let access = services
-            .session_evidence_access(
-                "session-dispatch",
-                root_output_ref.strip_prefix("tool://").unwrap(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let root_output = services
-            .artifact_store()
-            .resolve(&access.retrieval_selector)
-            .unwrap();
-        let root_bytes = services
-            .artifact_store()
-            .read(&root_output, "session:session-dispatch", None)
-            .await
-            .unwrap();
-        let actual_root_output: serde_json::Value = serde_json::from_slice(&root_bytes).unwrap();
-        assert_eq!(actual_root_output["truncated"], false);
-        assert_eq!(actual_root_output["file"]["startLine"], 1);
-        assert_eq!(actual_root_output["file"]["numLines"], 3);
-        assert!(String::from_utf8(root_bytes)
-            .unwrap()
-            .contains("changed dependency last line"));
-        let rejected = services
-            .submit_agent_action(&obligation_envelope)
-            .await
-            .unwrap_err();
-        assert!(
-            rejected.contains("review_requires_effect_observation"),
-            "{rejected}"
-        );
-        let output = reviewer
-            .reader
-            .execute_tool(
-                "r1-independent-complete-dependency",
-                "read_file",
-                r#"{"path":"review-effect.txt","complete":true}"#,
-            )
-            .await
-            .unwrap();
-        let actual: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(actual["truncated"], false);
-        assert_eq!(actual["file"]["numLines"], 3);
-        assert!(output.contains("changed dependency last line"));
-        println!(
-            "R1_PARTIAL_DEPENDENCY_WITNESS {}",
-            serde_json::json!({
-                "reviewer":reviewer.packet.graph_id(), "partial_windows_rejected":3,
-                "producer_only_read_rejected":true, "complete_independent_read":actual,
-            })
-        );
-    }
-    if let R1ProofScenario::ReadDelivery(case) = proof_scenario {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        if exercise_process_proof_case(
-            &services,
-            &effect_host,
-            reviewer,
-            &obligation_envelope,
-            &content.selector,
-            &bind_root(root("real-process-case-root", task.action.clone())).actor,
-            case,
-        )
-        .await
-        {
-            let current = services
-                .agent_action_service()
-                .project(&reviewer.actor.program_id)
-                .unwrap();
-            if current.tasks[&reviewer.task_ref]
-                .pending_retirement
-                .is_none()
-                && current.tasks[&reviewer.task_ref].status != crate::AgenticTaskStatus::Withdrawn
-            {
-                let retirement = bind_root(root(
-                    "negative-probe-original-retirement",
-                    AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
-                        task_ref: reviewer.task_ref.clone(),
-                        reason_ref: content.selector.clone(),
-                        evidence_refs: vec![content.selector.clone()],
-                    }),
-                ));
-                assert_eq!(
-                    services
-                        .submit_agent_action(&retirement)
-                        .await
-                        .unwrap()
-                        .status,
-                    harness_contract::agent_action::AgentActionStatus::Applied
-                );
-            }
-            services
-                .cancel_execution_tree(reviewer.packet.graph_id(), "delivery negative complete")
-                .await
-                .unwrap();
-            wait_retired_process(&services, &reviewer.packet, &reviewer.task_ref).await;
-            drain_workers().await;
-            return;
-        }
-    }
-    let mut raced_material = None;
-    #[cfg(test)]
-    if matches!(
-        proof_scenario,
-        R1ProofScenario::ProgramPublication(_)
-            | R1ProofScenario::Mechanical
-            | R1ProofScenario::MechanicalApproval
-            | R1ProofScenario::MechanicalExtra
-            | R1ProofScenario::MechanicalCrossTeam
-            | R1ProofScenario::ReviewAdmission
-    ) {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        assert!(
-            !exercise_process_proof_case(
-                &services,
-                &effect_host,
-                reviewer,
-                &obligation_envelope,
-                &content.selector,
-                &bind_root(root("program-process-positive", task.action.clone())).actor,
-                RealProcessProofCase::NativeSources
-            )
-            .await
-        );
-    }
-    #[cfg(test)]
-    let physical_history = if proof_scenario == R1ProofScenario::PhysicalLineage {
-        prepare_physical_lineage_history(
-            &services,
-            &effect_host,
-            &bind_root(root("physical-history-root", task.action.clone())).actor,
-            &content.selector,
-            &obligation_envelope,
-        )
-        .await
-    } else {
-        Vec::new()
     };
-    if proof_scenario == R1ProofScenario::PhysicalOpaque {
-        assert_other_processes_host_only(&services, &optional_effect.as_ref().unwrap().packet);
-    }
-    #[cfg(test)]
-    if proof_scenario == R1ProofScenario::ReviewAdmission {
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let AgentAction::ObjectiveReview(input) = &obligation_envelope.action else {
-            unreachable!()
-        };
-        let donor = services
-            .independent_result_review(
-                &obligation_envelope.actor,
-                &current,
-                &input.result_refs,
-                Some(&input.criterion_ref),
-            )
-            .await
-            .unwrap_or_else(|error| panic!(
-                "original review admission failed: {error}; diagnostics={}",
-                r1_goal_proof_diagnostic(&services, &current.program_id),
-            ));
-        assert_eq!(donor.verification.input_set.as_ref().unwrap().version, 2);
-        assert!(!donor
-            .verification
-            .input_set
-            .as_ref()
-            .unwrap()
-            .material_events
-            .is_empty());
-        let async_probe = NATIVE_REVIEW_ASYNC_PROBE
-            .try_with(|slot| slot.borrow_mut().take())
-            .ok()
-            .flatten();
-        if let Some(probe) = async_probe {
-            probe(services.0.clone(), obligation_envelope.clone(), donor).await;
-        } else {
-            let probe = NATIVE_REVIEW_PROBE.with(|slot| slot.borrow_mut().take().unwrap());
-            probe(&services.0, &obligation_envelope, &donor);
-        }
-    }
-    let obligation_result = if proof_scenario == R1ProofScenario::MaterialEnumerationRace {
-        let reviewer = scoped_goal_reviewer.as_ref().unwrap();
-        let note = services
-            .artifact_store()
-            .write_bytes(
-                harness_contract::context::ArtifactWriteDescriptor {
-                    media_type: "text/plain".into(),
-                    visibility_scope: "session:session-dispatch".into(),
-                    expected_bytes: None,
-                    original_name: Some("r1-concurrent-material.txt".into()),
-                },
-                b"Material M, read after the actual enumeration cut.",
-            )
-            .await
-            .unwrap();
-        let committed = services
-            .submit_agent_action(&bind_root(root(
-                "r1-raced-material-publication",
-                AgentAction::ArtifactCommit(ArtifactCommitInput {
-                    content_ref: note.selector.clone(),
-                    kind: "note".into(),
-                    title: "Concurrent actual review material".into(),
-                    relates_to: Vec::new(),
-                }),
-            )))
-            .await
-            .unwrap();
-        assert_eq!(
-            committed.status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-        let source = format!(
-            "execution-agent-receipts:{}:{}:{}",
-            reviewer.packet.graph_id(),
-            reviewer.packet.node_id(),
-            reviewer.packet.attempt
-        );
-        let before_revision = services.event_store().stream_revision(&source).unwrap();
-        let before_reviews = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap()
-            .reviews
-            .len();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let mut actual_events = Vec::new();
-        let inject = async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
-                .await
-                .expect("actual producer material-cut checkpoint");
-            let output = reviewer
-                .reader
-                .execute_tool(
-                    "r1-concurrent-material-read",
-                    "evidence_retrieve",
-                    &serde_json::json!({"evidence_ref":note.selector}).to_string(),
-                )
-                .await
-                .unwrap();
-            assert!(output.contains("Material M"), "{output}");
-            actual_events = services
-                .event_store()
-                .list_stream(&source)
-                .unwrap()
-                .into_iter()
-                .filter(|event| {
-                    event.sequence > before_revision
-                        && event.kind == "execution.agent_tool.receipt"
-                        && event.payload["effect_kind"] == "read"
-                        && event.payload["outcome"]["status"] == "executed"
-                })
-                .map(|event| event.event_id)
-                .collect();
-            assert!(
-                !actual_events.is_empty(),
-                "M must have an actual read receipt after the cut"
-            );
-            release.notify_one();
-        };
-        #[cfg(test)]
-        let guarded = crate::agentic::review_evidence::with_proof_material_cut_barrier(
-            source.clone(),
-            entered.clone(),
-            release.clone(),
-            services.0.submit_agent_action(&obligation_envelope),
-        );
-        #[cfg(not(test))]
-        let guarded = async {
-            Err::<harness_contract::agent_action::AgentActionObservation, String>(
-                "material-cut fault control is available only in unit tests".into(),
-            )
-        };
-        let (rejected, ()) = tokio::join!(guarded, inject);
-        let rejected = rejected.unwrap_err();
-        assert!(
-            rejected.contains("actual read material enumeration cut changed"),
-            "{rejected}"
-        );
-        let after = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.reviews.len(), before_reviews);
-        assert!(after.terminal.is_none());
-        raced_material = Some((
-            source,
-            actual_events,
-            note.selector,
-            committed.changed_refs[0].clone(),
-        ));
-        services.submit_agent_action(&obligation_envelope).await
-    } else {
-        services.submit_agent_action(&obligation_envelope).await
+    let goal_completion_stage = boxed_fixture_stage(|| async {
+        include!("reviewed_goal_fixture/goal_completion_stage.rs")
+    });
+    let Some(()) = goal_completion_stage.await else {
+        return;
     };
-    if proof_scenario.optional_unknown()
-        && !(proof_scenario.invalid_child()
-            && obligation_result.as_ref().is_ok_and(|result| {
-                result.status == harness_contract::agent_action::AgentActionStatus::Applied
-            }))
-        && !matches!(
-            proof_scenario,
-            R1ProofScenario::OptionalSharedCheckpoint
-                | R1ProofScenario::OptionalNotRetiring
-                | R1ProofScenario::OptionalSourceRace
-                | R1ProofScenario::OptionalForgedB
-                | R1ProofScenario::OptionalForeignB
-                | R1ProofScenario::PhysicalAfterA
-        )
-    {
-        let reason = match obligation_result {
-            Err(error) => error,
-            Ok(observation) => {
-                assert_eq!(
-                    observation.status,
-                    harness_contract::agent_action::AgentActionStatus::Rejected
-                );
-                observation
-                    .error
-                    .expect("explicit unknown rejection")
-                    .message
-            }
-        };
-        assert!(
-            reason.contains("effect_review_pending")
-                || reason.contains("unknown")
-                || reason.contains("unsettled")
-                || (proof_scenario.invalid_child()
-                    && (reason.contains("child")
-                        || reason.contains("ToolBatch")
-                        || reason.contains("attempt")
-                        || reason.contains("parent"))),
-            "{reason}"
-        );
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            goal.completion,
-            harness_contract::goal::GoalCompletion::Open
-        );
-        assert!(goal.terminal.is_none());
-        assert!(action_service
-            .project(fixture_program_id.as_str())
-            .unwrap()
-            .objective_verdict
-            .is_none());
-        let mut optional = optional_effect.unwrap();
-        optional.assert_pending(&services);
-        if proof_scenario == R1ProofScenario::PhysicalOpaque {
-            assert!(
-                reason.contains("opaque Process history"),
-                "must reject the target physical dimension: {reason}"
-            );
-            optional.hold.release.notify_one();
-            (&mut optional.worker).await.unwrap().unwrap();
-            optional.process.finish().await;
-            wait_admitted_graph_terminal(&services, &optional.packet).await;
-            let lifecycle = crate::agent_runtime::authenticated_run_lifecycle(
-                services.event_store(),
-                &optional.packet,
-            )
-            .unwrap();
-            assert!(!lifecycle.no_direct_effects());
-            assert!(confirmed_run_exit_with_retry(services.event_store(), &optional.packet)
-            .is_some());
-            assert!(!process_control_directory(&services, &optional.packet).exists());
-            let mut retried = obligation_envelope.clone();
-            retried.action_id.push_str(":after-real-reap");
-            let refused = services.submit_agent_action(&retried).await;
-            let message = match refused {
-                Err(error) => error,
-                Ok(result) => {
-                    assert_eq!(
-                        result.status,
-                        harness_contract::agent_action::AgentActionStatus::Rejected
-                    );
-                    result.error.unwrap().message
-                }
-            };
-            assert!(message.contains("opaque Process history"), "{message}");
-            let program = services
-                .agent_action_service()
-                .project(fixture_program_id.as_str())
-                .unwrap();
-            assert!(!program.tasks[&optional.task_ref].active_attempts.is_empty());
-        } else if proof_scenario.invalid_child() {
-            optional.finish_rejected_child(&services, proof_scenario).await;
-        } else {
-            optional.finish(&services).await;
-        }
-        scoped_goal_reviewer.take().unwrap().finish(&services).await;
-        services
-            .cancel_execution_tree(&review_graph.id, "R1 negative fixture complete")
-            .await
-            .unwrap();
-        services
-            .cancel_execution_tree(packet.graph_id(), "R1 negative fixture complete")
-            .await
-            .unwrap();
-        assert_eq!(
-            services
-                .goal_store()
-                .get(&goal.id)
-                .unwrap()
-                .unwrap()
-                .completion,
-            harness_contract::goal::GoalCompletion::Open
-        );
-        println!(
-            "R1_OPTIONAL_UNKNOWN_REJECTED {}",
-            serde_json::json!({"reason":reason,"goal":goal.id})
-        );
-        return;
-    }
-    let obligation_review = obligation_result.unwrap();
-    #[cfg(test)]
-    if proof_scenario == R1ProofScenario::PhysicalLineage {
-        assert_physical_lineage_history_cut(&services, &physical_history);
-    }
-    assert_eq!(
-        obligation_review.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let reviewed_goal = services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        reviewed_goal.obligations[0].state,
-        harness_contract::goal::ObjectiveObligationState::Satisfied
-    );
-    assert!(!reviewed_goal.obligations[0].reread_receipts.is_empty());
-    if !bounded_runs.is_empty() {
-        let proof = reviewed_goal
-            .reviews
-            .iter()
-            .find(|review| review.criterion_ref == "source-backed-delivery")
-            .unwrap()
-            .verification
-            .as_ref()
-            .unwrap();
-        let inputs = proof.input_set.as_ref().unwrap();
-        for run in &bounded_runs {
-            let stream = format!("execution-effect:{}", run.admission.binding.call_key);
-            assert!(
-                inputs.source_revisions.contains_key(&stream),
-                "every historical run remains a source cut"
-            );
-            for suffix in ["process-admission", "receipt"] {
-                let original = services
-                    .event_store()
-                    .event_by_idempotency_key(
-                        &stream,
-                        &format!("{}:{suffix}", run.admission.binding.call_key),
-                    )
-                    .unwrap()
-                    .unwrap();
-                assert!(
-                    inputs
-                        .material_events
-                        .iter()
-                        .any(|event| event.stream_id == stream
-                            && event.event_id == original.event_id),
-                    "original process admission and terminal must remain material: {suffix}"
-                );
-            }
-        }
-        let program = action_service.project(fixture_program_id.as_str()).unwrap();
-        let verifier = crate::agentic::review_evidence::ProcessInputVerifier::new(Arc::clone(
-            services.scope_locks(),
-        ));
-        let process_frame = verifier.frame();
-        assert!(crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), &program,
-            Some(&reviewed_goal), proof, crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs:None, artifacts:Some(services.artifact_store().as_ref()),
-                history:services.session_history_reader().as_deref(),
-            }).is_err(), "an otherwise authentic selected Process proof cannot silently fall back to file-only context");
-        crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &program,
-            Some(&reviewed_goal),
-            proof,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: Some(&process_frame),
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        )
-        .expect("original full process proof must validate before any single-field omission");
-        for omitted in ["run", "source-cut", "body-read"] {
-            let mut broken = proof.clone();
-            let old_stream = format!(
-                "execution-effect:{}",
-                bounded_runs[1].admission.binding.call_key
-            );
-            match omitted {
-                "run" => broken
-                    .input_set
-                    .as_mut()
-                    .unwrap()
-                    .material_events
-                    .retain(|event| event.stream_id != old_stream),
-                "source-cut" => {
-                    broken
-                        .input_set
-                        .as_mut()
-                        .unwrap()
-                        .source_revisions
-                        .remove(&old_stream);
-                }
-                "body-read" => {
-                    assert!(bounded_selected_body_receipts.len() > 1);
-                    let selected = bounded_selected_body_receipts.first().unwrap();
-                    assert!(broken
-                        .reads
-                        .iter()
-                        .any(|read| read.effect_observation_refs.contains(selected)));
-                    for read in &mut broken.reads {
-                        read.effect_observation_refs
-                            .retain(|reference| reference != selected);
-                    }
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                crate::agentic::review_evidence::validate_proof_inputs(
-                    services.event_store(),
-                    &program,
-                    Some(&reviewed_goal),
-                    &broken,
-                    crate::agentic::review_evidence::ResultContentReaders {
-                        process_inputs: Some(&process_frame),
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: services.session_history_reader().as_deref(),
-                    }
-                )
-                .is_err(),
-                "omitting {omitted} must not preserve the original review proof"
-            );
-        }
-    }
-    if let Some((source, actual_events, selector, artifact_ref)) = raced_material {
-        let inputs = reviewed_goal
-            .reviews
-            .iter()
-            .find(|review| review.criterion_ref == "source-backed-delivery")
-            .unwrap()
-            .verification
-            .as_ref()
-            .unwrap()
-            .input_set
-            .as_ref()
-            .unwrap();
-        for event_id in &actual_events {
-            assert!(inputs
-                .material_events
-                .iter()
-                .any(|event| event.stream_id == source && &event.event_id == event_id));
-        }
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(
-            crate::agentic::review_evidence::review_result_identity(&current, &selector).unwrap(),
-            artifact_ref
-        );
-        assert!(inputs.artifact_refs.contains(&artifact_ref));
-        assert!(
-            inputs.auxiliary_refs.contains(&selector),
-            "{:?}",
-            inputs.auxiliary_refs
-        );
-        println!(
-            "R1_MATERIAL_CUT_WITNESS {}",
-            serde_json::json!({
-                "source":source,"actual_read_events":actual_events,"material":artifact_ref,
-                "rejected_without_review_append":true,"fresh_retry_includes_material":true,
-            })
-        );
-    }
-    assert_eq!(
-        reviewed_goal.obligations[0].verifier_decision.as_ref(),
-        obligation_review.changed_refs.first()
-    );
-    assert_eq!(
-        reviewed_goal.spec_revision,
-        if proof_scenario.mechanical_extra() {
-            if with_effect {
-                3
-            } else {
-                2
-            }
-        } else if with_effect {
-            2
-        } else {
-            1
-        },
-        "review changes progress, not requirements"
-    );
-    let semantic_review = services
-        .submit_agent_action(&bind_review(root(
-            "original-objective-review",
-            AgentAction::ObjectiveReview(harness_contract::agent_action::ObjectiveReviewInput {
-                criterion_ref: "reviewed-delivery".into(),
-                decision: harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-                result_refs: reviewed_delivery_refs.clone(),
-                evidence_refs: review_evidence_refs.clone(),
-                reason_ref: content.selector.clone(),
-                reason: String::new(),
-            }),
-        )))
-        .await
-        .unwrap();
-    assert_eq!(
-        semantic_review.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    #[cfg(test)]
-    if proof_scenario == R1ProofScenario::MechanicalExtra {
-        let extra = bind_review(root(
-            "real-additional-accepted-review",
-            AgentAction::ObjectiveReview(harness_contract::agent_action::ObjectiveReviewInput {
-                criterion_ref: "additional-accepted-condition".into(),
-                decision: harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-                result_refs: reviewed_delivery_refs.clone(),
-                evidence_refs: vec![content.selector.clone()],
-                reason_ref: content.selector.clone(),
-                reason: "actual independent additional criterion".into(),
-            }),
-        ));
-        let applied = services.submit_agent_action(&extra).await.unwrap();
-        assert_eq!(
-            applied.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{applied:?}"
-        );
-        let current = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        services
-            .goal_store()
-            .revise(
-                &current.id,
-                current.revision,
-                current.user_sequence + 1,
-                "unrelated optional historical review",
-                |goal| {
-                    let mut historical = goal.reviews.last().unwrap().clone();
-                    historical.criterion_ref = "unrelated-optional".into();
-                    historical.review_id = "unrelated-optional-historical".into();
-                    historical.verification = None;
-                    goal.reviews.push(historical);
-                    vec!["reviews".into()]
-                },
-            )
-            .unwrap();
-    }
-    if let Some(reviewer) = scoped_goal_reviewer.take() {
-        reviewer.finish(&services).await;
-    }
-    if matches!(
-        proof_scenario,
-        R1ProofScenario::UnrelatedNote
-            | R1ProofScenario::ExecutionEpoch
-            | R1ProofScenario::AcceptancePolicy
-    ) {
-        let reviewed = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let before = action_service.project(fixture_program_id.as_str()).unwrap();
-        let original_manifest = crate::agentic::review_evidence::work_manifest_digest(&before);
-        assert!(!reviewed.reviews.is_empty());
-        for review in &reviewed.reviews {
-            let proof = review
-                .verification
-                .as_ref()
-                .expect("real independent proof");
-            assert_eq!(proof.input_set.as_ref().unwrap().version, 2);
-            crate::agentic::review_evidence::validate_proof_inputs(
-                services.event_store(),
-                &before,
-                Some(&reviewed),
-                proof,
-                crate::agentic::review_evidence::ResultContentReaders {
-                    process_inputs: None,
-                    artifacts: Some(services.artifact_store().as_ref()),
-                    history: services.session_history_reader().as_deref(),
-                },
-            )
-            .expect("proof is current before the controlled change");
-        }
-        match proof_scenario {
-            R1ProofScenario::UnrelatedNote => {
-                let original = reviewed
-                    .reviews
-                    .iter()
-                    .find(|review| review.criterion_ref == "reviewed-delivery")
-                    .unwrap()
-                    .verification
-                    .as_ref()
-                    .unwrap();
-                let alias = services
-                    .independent_result_review(
-                        &bind_root(task.clone()).actor,
-                        &before,
-                        &[content.selector.clone()],
-                        Some("reviewed-delivery"),
-                    )
-                    .await
-                    .expect("the real content alias selects its authoritative producer Task");
-                assert_eq!(
-                    alias.verification.input_set.as_ref().unwrap().task_refs,
-                    original.input_set.as_ref().unwrap().task_refs
-                );
-                assert_eq!(
-                    alias.verification.input_set.as_ref().unwrap().artifact_refs,
-                    original.input_set.as_ref().unwrap().artifact_refs
-                );
-                assert_eq!(
-                    alias.verification.work_manifest_digest,
-                    original.work_manifest_digest
-                );
-                assert!(alias
-                    .verification
-                    .reads
-                    .iter()
-                    .any(|read| { read.sha256 == content.sha256 && read.bytes == content.bytes }));
-                let note = services
-                    .artifact_store()
-                    .write_bytes(
-                        harness_contract::context::ArtifactWriteDescriptor {
-                            media_type: "text/plain".into(),
-                            visibility_scope: "session:session-dispatch".into(),
-                            expected_bytes: None,
-                            original_name: Some("r1-unrelated-note.txt".into()),
-                        },
-                        b"An unrelated observation; not a required result or review material.",
-                    )
-                    .await
-                    .unwrap();
-                let observation = services
-                    .submit_agent_action(&bind_root(root(
-                        "r1-unrelated-note",
-                        AgentAction::ArtifactCommit(ArtifactCommitInput {
-                            content_ref: note.selector,
-                            kind: "note".into(),
-                            title: "Auxiliary observation".into(),
-                            relates_to: Vec::new(),
-                        }),
-                    )))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    observation.status,
-                    harness_contract::agent_action::AgentActionStatus::Applied,
-                    "{observation:?}"
-                );
-                let current = action_service.project(fixture_program_id.as_str()).unwrap();
-                assert_eq!(current.artifacts.len(), before.artifacts.len() + 1);
-                assert_ne!(
-                    crate::agentic::review_evidence::work_manifest_digest(&current),
-                    original_manifest,
-                    "the historical all-artifact invalidation really changes"
-                );
-            }
-            R1ProofScenario::ExecutionEpoch => {
-                let previous = services
-                    .session_execution_policy("session-dispatch")
-                    .unwrap();
-                let replacement = harness_contract::policy::SessionExecutionPolicy::from_profile(
-                    harness_contract::policy::AutonomyProfileId::Cautious,
-                    previous.revision + 1,
-                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
-                );
-                services
-                    .session_execution_policy_control("session-dispatch")
-                    .unwrap()
-                    .replace(replacement.clone())
-                    .unwrap();
-                assert_eq!(
-                    services.session_execution_policy("session-dispatch"),
-                    Some(replacement.clone())
-                );
-                assert_ne!(previous.permission_mode, replacement.permission_mode);
-                assert!(replacement.revision > previous.revision);
-                assert_eq!(
-                    action_service.project(fixture_program_id.as_str()).unwrap(),
-                    before,
-                    "a future execution epoch must not rewrite business facts"
-                );
-            }
-            R1ProofScenario::AcceptancePolicy => {
-                let calls_before = effect_host.calls.lock().unwrap().len();
-                let mut session = crate::Session::new();
-                session.session_id = "session-dispatch".into();
-                let runtime = crate::ConversationRuntime::new(
-                    session,
-                    NoReviewProvider,
-                    RootReviewReader(Arc::clone(&effect_host)),
-                    crate::PermissionPolicy::new(PermissionMode::DangerFullAccess),
-                    vec!["Inspect the same committed result".into()],
-                )
-                .without_memory()
-                .with_runtime_event_store(Arc::clone(services.event_store()));
-                runtime
-                    .begin_turn_strategy_with_resource_snapshot(
-                        "turn-dispatch",
-                        "调研外部资料并形成报告",
-                        None,
-                    )
-                    .unwrap();
-                runtime
-                    .bind_turn_strategy_execution("turn-dispatch", "root-agentic-execution")
-                    .unwrap();
-                let call = crate::conversation::ModelToolCall {
-                    binding: None,
-                    id: "r1-policy-mutation-plan".into(),
-                    name: "edit".into(),
-                    input: r#"{"action":"write","path":"review-effect.txt","content":"requires actual approval before mutation"}"#.into(),
-                    depends_on: Vec::new(),
-                };
-                let request = crate::tool_dispatch::ToolRequest {
-                    tool_use_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    input: call.input.clone(),
-                    depends_on: Vec::new(),
-                };
-                let prepared = crate::ToolExecutor::prepare_governed_invocations(
-                    runtime.tool_executor().as_ref(),
-                    std::slice::from_ref(&request),
-                );
-                let plan = crate::GovernedToolCompiler
-                    .compile(
-                        services.workspace_root(),
-                        std::slice::from_ref(&request),
-                        |name, input| {
-                            prepared.iter().find_map(|invocation| {
-                                (invocation.intent.tool_name == name
-                                    && invocation.intent.normalized_input == *input)
-                                    .then(|| {
-                                        (
-                                            invocation.effect.clone(),
-                                            invocation.catalog_revision,
-                                            invocation.descriptor_set_hash.clone(),
-                                        )
-                                    })
-                            })
-                        },
-                    )
-                    .unwrap();
-                let decision = runtime
-                    .retarget_active_turn_strategy_for_governed_plan(
-                        &plan,
-                        std::slice::from_ref(&call),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    decision.pattern(),
-                    harness_contract::core::ExecutionPattern::Execute
-                );
-                assert!(decision
-                    .gates()
-                    .contains(&harness_contract::core::ExecutionPolicyGate::Permission));
-                println!(
-                    "R1_ACCEPTANCE_POLICY_REVISION {}",
-                    serde_json::json!({
-                        "risk":decision.risk(),"modifiers":decision.modifiers(),"gates":decision.gates(),
-                    })
-                );
-                assert_eq!(effect_host.calls.lock().unwrap().len(), calls_before);
-            }
-            _ => unreachable!(),
-        }
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let current_goal = services.goal_store().get(&reviewed.id).unwrap().unwrap();
-        assert_eq!(current_goal, reviewed);
-        for review in &reviewed.reviews {
-            let proof = review.verification.as_ref().unwrap();
-            let validation = crate::agentic::review_evidence::validate_proof_inputs(
-                services.event_store(),
-                &current,
-                Some(&current_goal),
-                proof,
-                crate::agentic::review_evidence::ResultContentReaders {
-                    process_inputs: None,
-                    artifacts: Some(services.artifact_store().as_ref()),
-                    history: services.session_history_reader().as_deref(),
-                },
-            );
-            if proof_scenario == R1ProofScenario::AcceptancePolicy {
-                let error = validation
-                    .err()
-                    .expect("changed acceptance policy stales the proof");
-                assert!(error.contains("stale v2 proof"), "{error}");
-                let fresh = crate::agentic::review_evidence::proof_input_snapshot(
-                    services.event_store(),
-                    &current,
-                    Some(&current_goal),
-                    proof,
-                    crate::agentic::review_evidence::ResultContentReaders {
-                        process_inputs: None,
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: services.session_history_reader().as_deref(),
-                    },
-                )
-                .unwrap();
-                assert_ne!(
-                    fresh.policy_digest,
-                    proof.input_set.as_ref().unwrap().acceptance_policy_digest
-                );
-            } else {
-                let snapshot = validation
-                    .expect("unrelated changes preserve the original independent verdict");
-                assert_eq!(
-                    snapshot.semantic_digest,
-                    proof.input_set.as_ref().unwrap().semantic_digest
-                );
-            }
-        }
-        if proof_scenario == R1ProofScenario::AcceptancePolicy {
-            for (index, review) in reviewed.reviews.iter().enumerate() {
-                let refreshed = services
-                    .submit_agent_action(&bind_root(root(
-                        &format!("r1-policy-refreshed-review-{index}"),
-                        AgentAction::ObjectiveReview(
-                            harness_contract::agent_action::ObjectiveReviewInput {
-                                criterion_ref: review.criterion_ref.clone(),
-                                decision: harness_contract::agent_action::ObjectiveReviewDecision::Satisfied,
-                                result_refs: review.result_refs.clone(),
-                                evidence_refs: review.evidence_refs.clone(),
-                                reason_ref: content.selector.clone(),
-                                reason: "Review the same read evidence under the current acceptance policy".into(),
-                            },
-                        ),
-                    )))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    refreshed.status,
-                    harness_contract::agent_action::AgentActionStatus::Applied,
-                    "{refreshed:?}"
-                );
-            }
-            let refreshed = services.goal_store().get(&reviewed.id).unwrap().unwrap();
-            let program = action_service.project(fixture_program_id.as_str()).unwrap();
-            for review in refreshed.reviews.iter().skip(reviewed.reviews.len()) {
-                crate::agentic::review_evidence::validate_proof_inputs(
-                    services.event_store(),
-                    &program,
-                    Some(&refreshed),
-                    review.verification.as_ref().unwrap(),
-                    crate::agentic::review_evidence::ResultContentReaders {
-                        process_inputs: None,
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: services.session_history_reader().as_deref(),
-                    },
-                )
-                .expect("fresh independent review closes the policy-change recovery");
-            }
-        }
-        println!(
-            "R1_PROOF_PRESERVATION {}",
-            serde_json::json!({
-                "scenario": match proof_scenario {
-                    R1ProofScenario::UnrelatedNote => "unrelated_note",
-                    R1ProofScenario::ExecutionEpoch => "execution_epoch",
-                    R1ProofScenario::AcceptancePolicy => "acceptance_policy",
-                    _ => unreachable!(),
-                },
-                "before_revision": before.revision,
-                "after_revision": current.revision,
-                "actual_review_count": reviewed.reviews.len(),
-                "goal_spec_revision": reviewed.spec_revision,
-            })
-        );
-    }
-    #[cfg(test)]
-    if proof_scenario == R1ProofScenario::Mechanical {
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
-        let history = services.session_history_reader();
-        let readers = crate::agentic::review_evidence::ResultContentReaders {
-            process_inputs: None,
-            artifacts: Some(services.artifact_store().as_ref()),
-            history: history.as_deref(),
-        };
-        let before = crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &current,
-            Some(&goal),
-            proof,
-            readers,
-        )
-        .unwrap();
-        let published = services
-            .submit_agent_action(&bind_root(root(
-                "mechanical-unrelated-note",
-                AgentAction::MessagePublish(harness_contract::agent_action::MessagePublishInput {
-                    topic_ref: format!("topic:{}", current.program_id),
-                    summary: Some("unrelated note".into()),
-                    content_ref: None,
-                    refs: vec![],
-                    recipients: vec![],
-                    intent: None,
-                    issue_dispositions: vec![],
-                }),
-            )))
-            .await
-            .unwrap();
-        assert_eq!(
-            published.status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let after = crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &current,
-            Some(&goal),
-            proof,
-            readers,
-        )
-        .unwrap();
-        assert_eq!(before.semantic_digest, after.semantic_digest);
-    }
-    let completion_envelope = bind_root(root(
-        "experience-complete",
-        AgentAction::ObjectiveCompleteRequest(
-            harness_contract::agent_action::ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
-                result_refs: reviewed_delivery_refs.clone(),
-                evidence_refs: vec![content.selector.clone()],
-                unresolved: vec![],
-            },
-        ),
-    ));
-    let completion = services
-        .submit_agent_action(&completion_envelope)
-        .await
-        .unwrap();
-    if completion.status == harness_contract::agent_action::AgentActionStatus::Rejected {
-        eprintln!(
-            "R1_COMPLETION_REFUSAL_WITNESS original_error={:?}; diagnostics={}",
-            completion.error,
-            r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
-        );
-    }
-    if proof_scenario.invalid_child() {
-        assert_eq!(
-            completion.status,
-            harness_contract::agent_action::AgentActionStatus::Rejected,
-            "{completion:?}"
-        );
-        assert_eq!(
-            completion.error.as_ref().unwrap().code,
-            "objective_not_verifiable"
-        );
-        let optional = optional_effect.take().unwrap();
-        optional.assert_pending(&services);
-        optional.finish_rejected_child(&services, proof_scenario).await;
-        assert!(services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap()
-            .terminal
-            .is_none());
-        assert!(action_service
-            .project(fixture_program_id.as_str())
-            .unwrap()
-            .objective_verdict
-            .is_none());
-        println!(
-            "R1_BOUND_CHILD_REJECTED {}",
-            serde_json::json!({"reason":completion.error,"half_a":false,"held_effect_released_only_after_refusal":true})
-        );
-        services
-            .cancel_execution_tree(&review_graph.id, "invalid child fixture complete")
-            .await
-            .unwrap();
-        services
-            .cancel_execution_tree(packet.graph_id(), "invalid child fixture complete")
-            .await
-            .unwrap();
-        return;
-    }
-    if proof_scenario == R1ProofScenario::OptionalNotRetiring {
-        assert_eq!(
-            completion.status,
-            harness_contract::agent_action::AgentActionStatus::Rejected,
-            "{completion:?}"
-        );
-        let error = completion.error.as_ref().unwrap();
-        assert_eq!(error.code, "objective_not_verifiable");
-        assert!(
-            error.message.contains("execution_cleanup_pending"),
-            "{error:?}"
-        );
-        let optional = optional_effect.unwrap();
-        let before = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(
-            before.tasks[&optional.task_ref].status,
-            crate::AgenticTaskStatus::Claimed
-        );
-        assert!(before.tasks[&optional.task_ref]
-            .pending_retirement
-            .is_none());
-        assert!(before.objective_verdict.is_none());
-        optional.assert_pending(&services);
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        assert_eq!(goal.completion, GoalCompletion::Open);
-        assert!(goal.terminal.is_none());
-        let retirement = bind_root(root(
-            "r1-negative-explicit-retirement-after-refusal",
-            AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
-                task_ref: optional.task_ref.clone(),
-                reason_ref: content.selector.clone(),
-                evidence_refs: vec![content.selector.clone()],
-            }),
-        ));
-        let retired = services.submit_agent_action(&retirement).await.unwrap();
-        assert_eq!(
-            retired.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{retired:?}"
-        );
-        optional.assert_pending(&services);
-        optional
-            .finish_after_retirement(&services, Some(retirement))
-            .await;
-        services
-            .cancel_execution_tree(&review_graph.id, "R1 nonretiring negative complete")
-            .await
-            .unwrap();
-        services
-            .cancel_execution_tree(packet.graph_id(), "R1 nonretiring negative complete")
-            .await
-            .unwrap();
-        assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), goal);
-        println!(
-            "R1_OPTIONAL_NOT_RETIRING_REJECTED {}",
-            serde_json::json!({"goal":goal.id,"reason":error.message})
-        );
-        return;
-    }
-    assert_eq!(
-        completion.status,
-        harness_contract::agent_action::AgentActionStatus::Applied,
-        "{completion:?}"
-    );
-    #[cfg(test)]
-    if matches!(
-        proof_scenario,
-        R1ProofScenario::Mechanical
-            | R1ProofScenario::MechanicalApproval
-            | R1ProofScenario::MechanicalExtra
-            | R1ProofScenario::MechanicalCrossTeam
-    ) {
-        let current = action_service.project(fixture_program_id.as_str()).unwrap();
-        let actual = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        assert_eq!(actual.completion, GoalCompletion::Open);
-        assert!(actual.terminal.is_none());
-        let prepared = services
-            .goal_store()
-            .prepare_program_conclusion(&current)
-            .unwrap();
-        assert!(prepared.gaps.is_empty(), "{:?}", prepared.gaps);
-        assert_eq!(prepared.goal.completion, GoalCompletion::Satisfied);
-        for condition in crate::agentic::review_evidence::required_review_conditions(&prepared.goal)
-        {
-            let review = prepared
-                .goal
-                .reviews
-                .iter()
-                .rev()
-                .find(|review| review.criterion_ref == condition)
-                .unwrap();
-            assert_eq!(
-                review
-                    .verification
-                    .as_ref()
-                    .unwrap()
-                    .input_set
-                    .as_ref()
-                    .unwrap()
-                    .version,
-                2
-            );
-        }
-        assert!(prepared
-            .source_frame
-            .sources()
-            .any(
-                |source| source.stream_id == format!("agentic-program:{}", current.program_id)
-                    && source.expected_revision == current.revision
-            ));
-        NATIVE_A_PROBE.with(|slot| {
-            slot.borrow_mut().take().unwrap()(&services.0, &current, prepared, &completion_envelope)
-        });
-        services.shutdown_maintenance().await;
-        return;
-    }
-    let objective_supervisor =
-        crate::execution_core::goal::ObjectiveSupervisor::new(Arc::clone(services.goal_store()));
-    if proof_scenario == R1ProofScenario::ReadDelivery(RealProcessProofCase::Effects) {
-        assert_real_process_effect_proof_conclusion_guards(&services, fixture_program_id.as_str());
-    }
-    if proof_scenario == R1ProofScenario::OptionalSourceRace {
-        let before = action_service.project(fixture_program_id.as_str()).unwrap();
-        let prepared = services
-            .goal_store()
-            .prepare_program_conclusion(&before)
-            .unwrap();
-        assert_eq!(
-            prepared.goal.completion,
-            GoalCompletion::Satisfied,
-            "{:?}",
-            prepared.goal
-        );
-        let optional = optional_effect.take().unwrap();
-        optional.assert_pending(&services);
-        let source = optional.index.clone();
-        let before_revision = services.event_store().stream_revision(&source).unwrap();
-        assert!(
-            prepared.source_frame.sources().any(|expected| {
-                expected.stream_id == source && expected.expected_revision == before_revision
-            }),
-            "prepared A must carry the actual optional source fence"
-        );
-        let receipt_services = services.0.clone();
-        let receipt_program_id = fixture_program_id.clone();
-        optional.finish_after_receipt(&services, None, None, move || {
-            let services = ReviewedFixtureServices(receipt_services);
-            let action_service = services.agent_action_service();
-            let fixture_program_id = receipt_program_id;
-            let after_revision = services.event_store().stream_revision(&source).unwrap();
-            assert!(after_revision > before_revision);
-            let before_attempt = action_service.project(fixture_program_id.as_str()).unwrap();
-            let goal_before = services.goal_store().get("goal:root-agentic-execution")
-                .unwrap().unwrap();
-            assert!(before_attempt.objective_verdict.is_none(), "{before_attempt:?}");
-            assert_eq!(goal_before.completion, GoalCompletion::Open);
-            assert!(goal_before.terminal.is_none());
-            let error = action_service.commit_program_conclusion(&before, prepared)
-                .err().expect("the original A transaction must reject a changed actual source cut");
-            match &error {
-                crate::AgentActionServiceError::Store(crate::RuntimeEventStoreError::StaleRevision {
-                    stream_id, expected, actual,
-                }) => {
-                    assert_eq!(stream_id, &source);
-                    assert_eq!(*expected, before_revision);
-                    assert_eq!(*actual, after_revision);
-                }
-                other => panic!("original A must reject its actual optional source fence: {other}"),
-            }
-            let after = action_service.project(fixture_program_id.as_str()).unwrap();
-            assert!(after.objective_verdict.is_none(), "{after:?}");
-            assert_eq!(after.revision, before_attempt.revision);
-            let goal = services.goal_store().get("goal:root-agentic-execution")
-                .unwrap().unwrap();
-            assert_eq!(goal, goal_before);
-            println!("R1_PREPARED_A_SOURCE_RACE {}", serde_json::json!({
-                "source":source,"before_revision":before_revision,"after_revision":after_revision,
-                "error":error.to_string(),"goal":goal.id,"half_terminal":false,
-                "race_scope":"actual physical receipt before Task cleanup and completion reconciliation",
-            }));
-        }).await;
-    }
-    let bounded_committed = if proof_scenario.bounded_process() {
-        use crate::execution_core::graph::{ScopeLockMode, ScopeLockRequest, ScopedResource};
-        let before_goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let before_program = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(before_goal.completion, GoalCompletion::Open);
-        assert!(before_program.objective_verdict.is_none());
-        let prepared = services
-            .goal_store()
-            .prepare_program_conclusion(&before_program)
-            .unwrap_or_else(|error| panic!(
-                "original bounded Goal prepare rejected: {error}; program={} projection_cutoff={}; diagnostics={}",
-                before_program.program_id,
-                before_program.revision,
-                r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
-            ));
-        assert_eq!(
-            prepared.goal.completion,
-            GoalCompletion::Satisfied,
-            "original prepared Goal gaps: {:?}; program={} projection_cutoff={}; diagnostics={}",
-            prepared.gaps,
-            before_program.program_id,
-            before_program.revision,
-            r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
-        );
-        let writer_request = ScopeLockRequest {
-            scope: ScopedResource::workspace_object(
-                services
-                    .path_identity_resolver()
-                    .resolve_existing("bounded_source.py")
-                    .unwrap(),
-            ),
-            mode: ScopeLockMode::Write,
-        };
-        let original = std::fs::read(services.workspace_root().join("bounded_source.py")).unwrap();
-        let writer = services.scope_locks().try_acquire([writer_request.clone()]).unwrap()
-            .expect("collector/prepare must release only its local frame before a later final operation");
-        if proof_scenario == R1ProofScenario::BoundedProcessInputChanged {
-            std::fs::write(
-                services.workspace_root().join("bounded_source.py"),
-                b"VALUE = 290\n",
-            )
-            .unwrap();
-            drop(writer);
-            let refused = action_service
-                .commit_program_conclusion(&before_program, prepared)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                refused.contains("process")
-                    && (refused.contains("input") || refused.contains("witness")),
-                "{refused}"
-            );
-            assert_eq!(
-                services.goal_store().get(&before_goal.id).unwrap().unwrap(),
-                before_goal
-            );
-            assert_eq!(
-                serde_json::to_value(action_service.project(fixture_program_id.as_str()).unwrap())
-                    .unwrap(),
-                serde_json::to_value(&before_program).unwrap()
-            );
-            drain_workers().await;
-            return;
-        }
-        let started = std::time::Instant::now();
-        let busy = action_service
-            .commit_program_conclusion(&before_program, prepared)
-            .unwrap_err()
-            .to_string();
-        assert!(busy.contains("busy") || busy.contains("retry"), "{busy}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "sync busy must not await its own writer"
-        );
-        assert_eq!(
-            services.goal_store().get(&before_goal.id).unwrap().unwrap(),
-            before_goal
-        );
-        assert_eq!(
-            serde_json::to_value(action_service.project(fixture_program_id.as_str()).unwrap())
-                .unwrap(),
-            serde_json::to_value(&before_program).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(services.workspace_root().join("bounded_source.py")).unwrap(),
-            original
-        );
-        drop(writer);
-        #[cfg(test)]
-        {
-            let prepared = services
-                .goal_store()
-                .prepare_program_conclusion(&before_program)
-                .unwrap();
-            let checked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let captured = checked.clone();
-            let locks = Arc::clone(services.scope_locks());
-            let source = services.workspace_root().join("bounded_source.py");
-            with_native_conclusion_append_hook(move |transaction| {
-                assert!(!transaction.expected_streams.is_empty());
-                assert!(locks.try_acquire([writer_request]).unwrap().is_none(),
-                    "the actual final input frame must remain held at the original A transaction boundary");
-                assert_eq!(std::fs::read(source).unwrap(), original);
-                captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }, || action_service.commit_program_conclusion(&before_program, prepared)).unwrap();
-            assert_eq!(checked.load(std::sync::atomic::Ordering::SeqCst), 1);
-            let after = services
-                .scope_locks()
-                .try_acquire([ScopeLockRequest {
-                    scope: ScopedResource::workspace_object(
-                        services
-                            .path_identity_resolver()
-                            .resolve_existing("bounded_source.py")
-                            .unwrap(),
-                    ),
-                    mode: ScopeLockMode::Write,
-                }])
-                .unwrap()
-                .expect("final operation must release its own frame only after CAS returns");
-            drop(after);
-            true
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
-    } else {
-        false
-    };
-    if !bounded_committed {
-        let reconciled = crate::agentic::supervision::reconcile_completion_request(
-            &action_service,
-            &objective_supervisor,
-            fixture_program_id.as_str(),
-        )
-        .expect("verified Objective");
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        if goal.completion != GoalCompletion::Satisfied {
-            eprintln!(
-                "R1_FINAL_CONCLUSION_NOT_SATISFIED reconciled_status={:?}; diagnostics={}",
-                reconciled.as_ref().map(|program| program.status),
-                r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
-            );
-        }
-    }
-    if let Some(optional) = optional_effect {
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let program = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(
-            goal.completion,
-            GoalCompletion::Satisfied,
-            "{program:?} {goal:?}"
-        );
-        assert!(program.objective_verdict.is_some());
-        assert_eq!(
-            program.tasks[&optional.task_ref].status,
-            crate::AgenticTaskStatus::CancelRequested
-        );
-        assert!(program.tasks[&optional.task_ref]
-            .pending_retirement
-            .is_some());
-        assert_ne!(
-            program.tasks[&optional.task_ref].status,
-            crate::AgenticTaskStatus::Accepted
-        );
-        optional.assert_pending(&services);
-        println!(
-            "R1_OPTIONAL_UNKNOWN_SATISFIED {}",
-            serde_json::json!({
-                "goal":goal.id,"verdict":program.objective_verdict,"optional_task":optional.task_ref,
-                "execution":"unknown_draining","effect_index":optional.index,
-            })
-        );
-        if probes_final_b {
-            assert_r1_optional_final_b(
-                &services,
-                &effect_host,
-                &optional,
-                &content.selector,
-                proof_scenario,
-            )
-            .await;
-        }
-        if proof_scenario == R1ProofScenario::PhysicalAfterA {
-            optional.worker.await.unwrap().unwrap();
-            wait_retired_process(&services, &optional.packet, &optional.task_ref).await;
-        } else {
-            optional.finish(&services).await;
-        }
-        drain_workers().await;
-        assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), goal);
-        return;
-    }
-    if drain_timing == PhysicalDrainTiming::AfterGoal {
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let program = action_service.project(fixture_program_id.as_str()).unwrap();
-        let manifest = crate::agentic::review_evidence::work_manifest_digest(&program);
-        assert_eq!(
-            goal.completion,
-            GoalCompletion::Satisfied,
-            "{program:?} {goal:?}"
-        );
-        assert_eq!(program.status, crate::AgenticProgramStatus::Verified);
-        assert_eq!(
-            program.tasks[&task_ref].status,
-            crate::AgenticTaskStatus::Accepted
-        );
-        assert!(!goal.reviews.is_empty());
-        assert!(goal
-            .reviews
-            .iter()
-            .all(|review| review
-                .verification
-                .as_ref()
-                .is_some_and(
-                    |proof| !proof.reads.is_empty() && proof.effect_manifest_digest.is_some()
-                )));
-        assert!(
-            confirmed_run_exit_with_retry(services.event_store(), &packet)
-                .is_none()
-        );
-        assert!(confirmed_run_exit_with_retry(services.event_store(), &reviewer_session.packet)
-        .is_none());
-        for (execution_id, node_id) in [
-            (packet.graph_id(), packet.node_id()),
-            (review_graph.id.as_str(), review_graph.nodes[0].id.as_str()),
-        ] {
-            assert_eq!(
-                services
-                    .graph_state_store()
-                    .load(execution_id)
-                    .unwrap()
-                    .node_statuses[node_id],
-                ExecutionNodeStatus::Running
-            );
-        }
-        if let Some(writer) = writer.as_ref() {
-            let source = format!(
-                "execution-agent-receipts:{}:{}:{}",
-                packet.graph_id(),
-                packet.node_id(),
-                packet.attempt
-            );
-            let revision = services.event_store().stream_revision(&source).unwrap();
-            let calls = effect_host.calls.lock().unwrap().len();
-            let target = services.workspace_root().join("review-effect.txt");
-            let bytes_before = std::fs::read(&target).unwrap();
-            let error = writer.execute_tool("after-goal-before-drain", "edit", r#"{"path":"review-effect.txt","content":"must not overwrite verified target"}"#).await.unwrap_err();
-            let expected_fence = if proof_scenario == R1ProofScenario::ExecutionEpoch {
-                "ProcessJsonl packet policy revision is stale"
-            } else {
-                "tool_effect_authority"
-            };
-            assert!(error.to_string().contains(expected_fence), "{error}");
-            assert_eq!(
-                services.event_store().stream_revision(&source).unwrap(),
-                revision
-            );
-            assert_eq!(effect_host.calls.lock().unwrap().len(), calls);
-            assert_eq!(std::fs::read(&target).unwrap(), bytes_before);
-        }
-        let mut late_semantic = task.clone();
-        late_semantic.action_id = "after-goal-before-drain-publish".into();
-        let refused = services.submit_agent_action(&late_semantic).await.unwrap();
-        assert_eq!(
-            refused.status,
-            harness_contract::agent_action::AgentActionStatus::Rejected
-        );
-        assert_eq!(refused.error.unwrap().code, "program_terminal");
-        println!(
-            "V3_DRAIN_WITNESS {}",
-            serde_json::json!({
-                "goal": goal.id, "goal_revision": goal.revision,
-                "program_revision": program.revision, "verdict": program.objective_verdict,
-                "producer": packet.graph_id(), "reviewer": review_graph.id,
-                "physical_before": "running", "effect_host_calls": effect_host.calls.lock().unwrap().len(),
-            })
-        );
-        drain_workers().await;
-        assert_eq!(
-            services
-                .goal_store()
-                .get("goal:root-agentic-execution")
-                .unwrap()
-                .unwrap(),
-            goal
-        );
-        let drained = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(drained.objective_verdict, program.objective_verdict);
-        assert_eq!(
-            crate::agentic::review_evidence::work_manifest_digest(&drained),
-            manifest
-        );
-        assert_eq!(
-            drained.tasks[&task_ref].status,
-            crate::AgenticTaskStatus::Accepted
-        );
-    }
-    if let Some((_, _, approval_source)) = transitive_inputs.as_ref() {
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        assert_eq!(goal.completion, GoalCompletion::Satisfied);
-        crate::agentic::review_evidence::committed_proof_sources(
-            services.event_store(),
-            &goal,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        )
-        .unwrap();
-        let program_before = action_service.project(fixture_program_id.as_str()).unwrap();
-        let protected_streams = [
-            format!("goal:{}", goal.id),
-            format!("agentic-program:{}", fixture_program_id),
-        ]
-        .into_iter()
-        .map(|stream| {
-            let events = services.event_store().list_stream(&stream).unwrap();
-            (stream, events)
-        })
-        .collect::<Vec<_>>();
-        let original = services
-            .event_store()
-            .list_stream(&approval_source.stream_id)
-            .unwrap()
-            .pop()
-            .unwrap();
-        services
-            .event_store()
-            .append(crate::RuntimeEventInput {
-                stream_id: approval_source.stream_id.clone(),
-                scope: original.scope,
-                kind: original.kind,
-                status: original.status,
-                actor: original.actor,
-                refs: original.refs,
-                payload: original.payload,
-            })
-            .unwrap();
-        assert!(services
-            .event_store()
-            .stream_revision(&approval_source.stream_id)
-            .unwrap()
-            > approval_source.expected_revision);
-        let cursor_after_fault = services.event_store().durable_commit_cursor().unwrap();
-        let refusal = crate::agentic::review_evidence::committed_proof_sources(
-            services.event_store(),
-            &goal,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        )
-        .err()
-        .expect("changed authenticated decision source must invalidate B's old content");
-        assert_eq!(
-            refusal,
-            "external decision content predates its current authenticated decision source"
-        );
-        assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), goal);
-        assert_eq!(
-            action_service.project(fixture_program_id.as_str()).unwrap(),
-            program_before
-        );
-        for (stream, events) in protected_streams {
-            assert_eq!(services.event_store().list_stream(&stream).unwrap(), events);
-        }
-        assert_eq!(
-            services.event_store().durable_commit_cursor().unwrap(),
-            cursor_after_fault
-        );
-        println!(
-            "R1_TRANSITIVE_APPROVAL_SOURCE_FAULT {}",
-            serde_json::json!({
-                "source":approval_source.stream_id,"fault":"duplicate original decision event through actual event owner",
-                "committed_b_inputs_refused":refusal,"historical_a_unchanged":true,
-                "rejection_class":"authenticated_decision_content_freshness",
-                "half_write":false,"not_claimed":"CAS race, new legitimate approval decision or full B/Session fault chain",
-            })
-        );
-    }
-    if delegated_effect {
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        assert_eq!(goal.completion, GoalCompletion::Satisfied);
-        assert_eq!(
-            action_service
-                .project(fixture_program_id.as_str())
-                .unwrap()
-                .status,
-            crate::AgenticProgramStatus::Verified
-        );
-        assert!(crate::execution_core::goal::assessment::current_reviews_satisfy_the_goal(&goal));
-        let conditions = crate::agentic::review_evidence::required_review_conditions(&goal);
-        assert!(!conditions.is_empty());
-        for condition in conditions {
-            let review = goal.reviews.iter().rev()
-                .find(|review| review.criterion_ref == condition)
-                .expect("satisfied goal requires its current required review");
-            assert_eq!(review.decision, "satisfied");
-            assert_eq!(review.spec_revision, goal.spec_revision);
-            assert_eq!(review.input_manifest_digest, goal.spec_digest);
-            let proof = review.verification.as_ref()
-                .expect("current satisfied required review must carry verification");
-            if let Some(native) = native_sources.as_ref() {
-                for source_packet in [&packet, &native.packet] {
-                    assert!(
-                        proof.effect_source_refs.contains(&format!(
-                            "execution-agent-receipts:{}:{}:{}",
-                            source_packet.graph_id(),
-                            source_packet.node_id(),
-                            source_packet.attempt,
-                        )),
-                        "the combined branch must fence both actual producer sources"
-                    );
-                }
-            } else {
-                assert_eq!(
-                    proof.effect_source_refs,
-                    vec![format!(
-                        "execution-agent-receipts:{}:{}:{}",
-                        packet.graph_id(),
-                        packet.node_id(),
-                        packet.attempt
-                    )]
-                );
-            }
-            assert!(proof.effect_manifest_digest.is_some());
-            if native_sources.is_none() {
-                assert!(proof.reads.iter().all(|read| read.result_kind
-                    == harness_contract::goal::GoalResultKind::ToolEffect
-                    && !read.effect_observation_refs.is_empty()));
-            } else {
-                let original = proof
-                    .reads
-                    .iter()
-                    .find(|read| read.result_ref == artifact)
-                    .unwrap();
-                assert_eq!(
-                    original.result_kind,
-                    harness_contract::goal::GoalResultKind::ToolEffect
-                );
-                assert!(!original.effect_observation_refs.is_empty());
-            }
-        }
-    }
-    if with_disclosure {
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        assert_eq!(goal.completion, GoalCompletion::Satisfied);
-        let program = action_service.project(fixture_program_id.as_str()).unwrap();
-        assert_eq!(program.status, crate::AgenticProgramStatus::Verified);
-        assert_eq!(
-            program.tasks[&task_ref].unresolved,
-            vec!["Performance estimate lacks enterprise measurement"]
-        );
-        let issue = crate::agentic::issues::issues(&program).remove(0);
-        assert_eq!(
-            issue.disposition.unwrap().disposition,
-            harness_contract::agent_action::IssueDispositionKind::Disclose
-        );
-        assert!(issue.adjudication_ref.is_some());
-        return;
-    }
-    if let Some(native) = native_sources.as_ref() {
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        for criterion in ["reviewed-delivery", "source-backed-delivery"] {
-            let proof = goal
-                .reviews
-                .iter()
-                .rev()
-                .find(|review| review.criterion_ref == criterion)
-                .and_then(|review| review.verification.as_ref())
-                .unwrap();
-            assert!(proof.input_set.as_ref().unwrap().packet_digests.contains_key(native.packet.graph_id()),
-                "Goal must consume the actual Native Task source, not merely observe a neighboring material");
-            assert!(proof
-                .producer_execution_ids
-                .iter()
-                .any(|execution| execution
-                    == &format!("agent-run:{}", native.packet.run_id())),
-                "Goal must consume the actual Native Task producer execution, not merely observe a neighboring material");
-            for reference in &native.result_refs {
-                assert!(
-                    proof.reads.iter().any(|read| &read.result_ref == reference),
-                    "the original independent Goal review must cover every Native result"
-                );
-            }
-        }
-    }
-    let episode_program = action_service.project(fixture_program_id.as_str()).unwrap();
-    let episode_goal = services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        episode_program.status,
-        crate::AgenticProgramStatus::Verified,
-        "episode requires the actual original A, not a synthetic B: {}",
-        r1_goal_proof_diagnostic(&services, fixture_program_id.as_str())
-    );
-    assert_eq!(
-        episode_goal.completion,
-        GoalCompletion::Satisfied,
-        "episode requires the original satisfied Goal"
-    );
-    let episode_verdict = episode_program
-        .objective_verdict
-        .as_ref()
-        .expect("verified Program must retain its real Objective verdict");
-    assert_eq!(episode_verdict.goal_id, episode_goal.id);
-    let episode_sources = services
-        .event_store()
-        .list_stream(&format!("agentic-program:{fixture_program_id}"))
-        .unwrap();
-    assert!(
-        episode_sources
-            .iter()
-            .any(|event| event.scope == crate::RuntimeEventScope::Program
-                && event.kind == "agentic.objective_verdict_bound"
-                && event.payload["verdict"] == serde_json::to_value(episode_verdict).unwrap()),
-        "the original A transaction must emit the actual evolution projection source"
-    );
-    let projector =
-        crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
-            Arc::clone(services.event_store()),
-            services.graph_state_store().clone(),
-            services.workspace_key().to_owned(),
-        );
-    let episode_checkpoint_before = services
-        .event_store()
-        .projection_checkpoint("projector:agentic-collaboration-experience:v1");
-    let mut episode_projection_passes = Vec::new();
-    loop {
-        let pass = projector
-            .project_available(64)
-            .expect("production episode projection");
-        episode_projection_passes.push(pass);
-        if !pass.backlog {
-            break;
-        }
-    }
-    let episodes = services
-        .collaboration_experience_episodes(10)
-        .expect("public experience read model");
-    if episodes.len() != 1 {
-        let checkpoint_after = services
-            .event_store()
-            .projection_checkpoint("projector:agentic-collaboration-experience:v1");
-        let verdicts = services
-            .event_store()
-            .list_stream(&format!("agentic-program:{fixture_program_id}"))
-            .map(|events| {
-                events
-                    .into_iter()
-                    .filter(|event| event.kind == "agentic.objective_verdict_bound")
-                    .collect::<Vec<_>>()
-            });
-        let evolution_streams = services
-            .event_store()
-            .stream_ids_for_scope(crate::RuntimeEventScope::Evolution);
-        eprintln!(
-            "R1_EPISODE_PROJECTION_FAILURE checkpoints_before={episode_checkpoint_before:?}; checkpoints_after={checkpoint_after:?}; passes={episode_projection_passes:?}; verdicts={verdicts:?}; evolution_streams={evolution_streams:?}; diagnostics={}",
-            r1_goal_proof_diagnostic(&services, fixture_program_id.as_str()),
-        );
-    }
-    assert_eq!(
-        episodes.len(),
-        1,
-        "original verified Objective must produce exactly one durable episode"
-    );
-    if proof_scenario == R1ProofScenario::OptionalSourceRace {
-        assert_eq!(
-            episodes[0].outcome,
-            harness_contract::evolution::CollaborationExperienceOutcome::Completed
-        );
-        assert_eq!(episodes[0].coverage.required_obligation_count, 2);
-        assert_eq!(episodes[0].coverage.satisfied_obligation_count, 1);
-        assert_eq!(episodes[0].coverage.coverage_basis_points, 5000);
-        assert!(!episodes[0].coverage.reusable);
-        assert!(!episodes[0].is_pattern_eligible());
-    } else {
-        assert!(episodes[0].is_pattern_eligible(), "{:#?}", episodes[0]);
-    }
-    assert!(episodes[0]
-        .resource_summary
-        .context_reservation_tokens
-        .is_none());
-    assert!(!serde_json::to_string(&episodes[0])
-        .unwrap()
-        .contains("Source-backed findings"));
-    assert!(
-        services
-            .collaboration_semantic_patterns(10)
-            .unwrap()
-            .is_empty(),
-        "one Turn is not a reusable pattern"
-    );
-    projector.project_available(64).expect("idempotent replay");
-    assert_eq!(
-        services
-            .collaboration_experience_episodes(10)
-            .unwrap()
-            .len(),
-        1
-    );
+    let post_completion_stage = boxed_fixture_stage(|| async {
+        include!("reviewed_goal_fixture/post_completion_stage.rs")
+    });
+    post_completion_stage.await;
 }
 
 // Hold only the named Task's producer/reviewer at the existing backend boundary. The
@@ -10188,13 +4781,18 @@ pub(super) fn root_reads_generic_results<'fixture>(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = (Option<String>, RootReviewRuntime)> + Send + 'fixture>,
 > {
-    Box::pin(execute_root_review_reads(
+    Box::pin(execute_root_review_reads_with_approval(
         services,
         host,
         selector,
         read_tool_receipt,
         write_effect,
-        if write_effect { PermissionMode::DangerFullAccess } else { PermissionMode::ReadOnly },
+        if write_effect {
+            PermissionMode::DangerFullAccess
+        } else {
+            PermissionMode::ReadOnly
+        },
+        None,
     ))
 }
 
@@ -10293,19 +4891,6 @@ pub(in crate::agentic) fn bind_review_fixture_root(
         .bind_and_start_node(&graph, node_id, binding)
         .unwrap()
         .graph
-}
-
-async fn execute_root_review_reads(
-    services: &Arc<RuntimeServices>,
-    host: Arc<ReviewReadHost>,
-    selector: &str,
-    read_tool_receipt: bool,
-    write_effect: bool,
-    permission_mode: PermissionMode,
-) -> (Option<String>, RootReviewRuntime) {
-    execute_root_review_reads_with_approval(
-        services, host, selector, read_tool_receipt, write_effect, permission_mode, None,
-    ).await
 }
 
 async fn execute_root_review_reads_with_approval(
@@ -10595,13 +5180,14 @@ pub async fn independently_reviewed_goal_fixture(
     services
         .install_session_ports(ports.clone(), ports.clone(), ports.clone(), ports)
         .unwrap();
-    exercise_reviewed_goal_delivery_on(
+    exercise_reviewed_goal_delivery_with_drain(
         services.clone(),
         read_host,
         false,
         false,
         DelegatedEffectCase::None,
         true,
+        PhysicalDrainTiming::BeforeGoal,
     )
     .await;
     let goal = services
@@ -11986,200 +6572,205 @@ fn assert_other_processes_host_only(services: &RuntimeServices, opaque: &AgentTa
 }
 
 #[cfg(test)]
-async fn prepare_physical_lineage_history(
-    services: &ReviewedFixtureServices,
-    host: &Arc<ReviewReadHost>,
-    root_actor: &AgentActorBinding,
-    content_ref: &str,
-    review: &AgentActionEnvelope,
-) -> Vec<AgentTaskPacket> {
-    let historical = start_r1_scoped_goal_worker(
-        services,
-        root_actor,
-        content_ref,
-        "physical-historical-attempt",
-        false,
-        false,
-    )
-    .await;
-    let old = historical.packet.clone();
-    historical.reader.finish().await;
-    let current_graph = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            let program = services
-                .agent_action_service()
-                .project(&root_actor.program_id)
-                .unwrap();
-            let task = &program.tasks[&historical.task_ref];
-            if let Some(attempt) = task
-                .active_attempts
-                .values()
-                .find(|attempt| attempt.execution_id != old.graph_id())
-            {
-                break attempt.execution_id.clone();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the original failed-unsubmitted attempt must be retried by its original Task owner");
-    let process = wait_real_process(services, &current_graph).await;
-    let current = process.packet.clone();
-    assert_ne!(old.run_id(), current.run_id());
-    assert!(current.attempt > old.attempt);
-    let actor = services
-        .resolve_agent_action_actor(
-            &ExecutionParentBinding {
-                execution_id: current.graph_id().into(),
-                node_id: current.node_id().into(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    let claimed = process
-        .action(&AgentActionEnvelope {
-            action_id: "physical-history-new-claim".into(),
-            actor: actor.clone(),
-            expected_revision: None,
-            action: AgentAction::TaskClaim(TaskClaimInput {
-                task_ref: historical.task_ref.clone(),
-                reason: None,
-            }),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        claimed.status,
-        harness_contract::agent_action::AgentActionStatus::Applied,
-        "{claimed:?}"
-    );
-    process
-        .execute_tool(
-            "physical-historical-new-read",
-            "evidence_retrieve",
-            &serde_json::json!({"evidence_ref":content_ref}).to_string(),
-        )
-        .await
-        .unwrap();
-    let retired = R1ScopedReviewer {
-        actor,
-        packet: current.clone(),
-        reader: process,
-        task_ref: historical.task_ref.clone(),
-        reason_ref: content_ref.into(),
-    };
-    retired.finish(services).await;
-    let program = services
-        .agent_action_service()
-        .project(&root_actor.program_id)
-        .unwrap();
-    assert!(program.tasks[&historical.task_ref]
-        .active_attempts
-        .is_empty());
-    let scratch = process_control_directory(services, &current);
-    let mut spec = crate::ProcessJsonlSpec::new(
-        "command:r1-controlled-process",
-        ".cowd/fixtures/r1-worker.py",
-        vec![scratch.parent().unwrap().to_string_lossy().into_owned()],
-    );
-    spec.sandbox_profile = crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly;
-    spec.command_digest = crate::ProcessJsonlSpec::digest_for(
-        &spec.command_ref,
-        &spec.executable,
-        &spec.args,
-        None,
-        &spec.environment_refs,
-        spec.sandbox_profile,
-        &spec.transport_limits,
-    );
-    let fixture = PhysicalProcessFixture {
-        services: services.0.clone(),
-        host: host.clone(),
-        spec,
-        definition: REAL_PROCESS_DEFINITION.into(),
-        _storage_root: None,
-    };
-    let gate = services.agent_runtime().hold_next_process_run_admission();
-    let zero = fixture
-        .dispatch(
-            "physical-zero-head",
-            vec!["read:.".into()],
-            false,
+#[inline(never)]
+fn prepare_physical_lineage_history<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    host: &'fixture Arc<ReviewReadHost>,
+    root_actor: &'fixture AgentActorBinding,
+    content_ref: &'fixture str,
+    review: &'fixture AgentActionEnvelope,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Vec<AgentTaskPacket>> + 'fixture>> {
+    Box::pin(async move {
+        let historical = start_r1_scoped_goal_worker(
+            services,
+            root_actor,
+            content_ref,
+            "physical-historical-attempt",
             false,
             false,
         )
         .await;
-    tokio::time::timeout(std::time::Duration::from_secs(30), gate.entered.notified())
+        let old = historical.packet.clone();
+        historical.reader.finish().await;
+        let current_graph = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let program = services
+                    .agent_action_service()
+                    .project(&root_actor.program_id)
+                    .unwrap();
+                let task = &program.tasks[&historical.task_ref];
+                if let Some(attempt) = task
+                    .active_attempts
+                    .values()
+                    .find(|attempt| attempt.execution_id != old.graph_id())
+                {
+                    break attempt.execution_id.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
         .await
-        .unwrap();
-    let lifecycle = zero.lifecycle();
-    assert!(!lifecycle.no_direct_effects());
-    assert_eq!(lifecycle.sources.len(), 1);
-    assert_eq!(
-        lifecycle.sources[0].expected_revision, 0,
-        "real new Agent stream must be pinned even without lifecycle events"
-    );
-    let mut negative = review.clone();
-    negative.action_id.push_str(":real-zero-head");
-    let refused = services.submit_agent_action(&negative).await;
-    let reason = match refused {
-        Err(error) => error,
-        Ok(result) => {
-            assert_eq!(
-                result.status,
-                harness_contract::agent_action::AgentActionStatus::Rejected
-            );
-            result.error.unwrap().message
-        }
-    };
-    assert!(
-        reason.contains("opaque Process history"),
-        "a missing admission must reach the physical predicate: {reason}"
-    );
-    gate.release.notify_one();
-    zero.process.started().await.unwrap();
-    let live = zero.lifecycle();
-    assert!(live.no_direct_effects());
-    assert!(live.sources[0].expected_revision > 0);
-    let rejected_stream = "agent:physical-zero-cut-rejected";
-    let mut expected_streams = lifecycle.sources;
-    expected_streams.push(crate::ExpectedStreamRevision {
-        stream_id: rejected_stream.into(),
-        expected_revision: 0,
-    });
-    let result = services
-        .event_store()
-        .append_transaction(crate::AppendTransactionRequest {
-            transaction_id: "physical-zero-cut-must-fail".into(),
-            expected_streams,
-            events: vec![crate::RuntimeTransactionEventInput {
-                event: crate::RuntimeEventInput {
-                    stream_id: rejected_stream.into(),
-                    scope: crate::RuntimeEventScope::Agent,
-                    kind: "fixture.zero_cut_never_committed".into(),
-                    status: None,
-                    actor: None,
-                    refs: vec![],
-                    payload: serde_json::json!({}),
+        .expect(
+            "the original failed-unsubmitted attempt must be retried by its original Task owner",
+        );
+        let process = wait_real_process(services, &current_graph).await;
+        let current = process.packet.clone();
+        assert_ne!(old.run_id(), current.run_id());
+        assert!(current.attempt > old.attempt);
+        let actor = services
+            .resolve_agent_action_actor(
+                &ExecutionParentBinding {
+                    execution_id: current.graph_id().into(),
+                    node_id: current.node_id().into(),
                 },
-                idempotency_key: None,
-                schema_version: 1,
-            }],
+                None,
+            )
+            .await
+            .unwrap();
+        let claimed = process
+            .action(&AgentActionEnvelope {
+                action_id: "physical-history-new-claim".into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: historical.task_ref.clone(),
+                    reason: None,
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.status,
+            harness_contract::agent_action::AgentActionStatus::Applied,
+            "{claimed:?}"
+        );
+        process
+            .execute_tool(
+                "physical-historical-new-read",
+                "evidence_retrieve",
+                &serde_json::json!({"evidence_ref":content_ref}).to_string(),
+            )
+            .await
+            .unwrap();
+        let retired = R1ScopedReviewer {
+            actor,
+            packet: current.clone(),
+            reader: process,
+            task_ref: historical.task_ref.clone(),
+            reason_ref: content_ref.into(),
+        };
+        retired.finish(services).await;
+        let program = services
+            .agent_action_service()
+            .project(&root_actor.program_id)
+            .unwrap();
+        assert!(program.tasks[&historical.task_ref]
+            .active_attempts
+            .is_empty());
+        let scratch = process_control_directory(services, &current);
+        let mut spec = crate::ProcessJsonlSpec::new(
+            "command:r1-controlled-process",
+            ".cowd/fixtures/r1-worker.py",
+            vec![scratch.parent().unwrap().to_string_lossy().into_owned()],
+        );
+        spec.sandbox_profile = crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly;
+        spec.command_digest = crate::ProcessJsonlSpec::digest_for(
+            &spec.command_ref,
+            &spec.executable,
+            &spec.args,
+            None,
+            &spec.environment_refs,
+            spec.sandbox_profile,
+            &spec.transport_limits,
+        );
+        let fixture = PhysicalProcessFixture {
+            services: services.0.clone(),
+            host: host.clone(),
+            spec,
+            definition: REAL_PROCESS_DEFINITION.into(),
+            _storage_root: None,
+        };
+        let gate = services.agent_runtime().hold_next_process_run_admission();
+        let zero = fixture
+            .dispatch(
+                "physical-zero-head",
+                vec!["read:.".into()],
+                false,
+                false,
+                false,
+            )
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.entered.notified())
+            .await
+            .unwrap();
+        let lifecycle = zero.lifecycle();
+        assert!(!lifecycle.no_direct_effects());
+        assert_eq!(lifecycle.sources.len(), 1);
+        assert_eq!(
+            lifecycle.sources[0].expected_revision, 0,
+            "real new Agent stream must be pinned even without lifecycle events"
+        );
+        let mut negative = review.clone();
+        negative.action_id.push_str(":real-zero-head");
+        let refused = services.submit_agent_action(&negative).await;
+        let reason = match refused {
+            Err(error) => error,
+            Ok(result) => {
+                assert_eq!(
+                    result.status,
+                    harness_contract::agent_action::AgentActionStatus::Rejected
+                );
+                result.error.unwrap().message
+            }
+        };
+        assert!(
+            reason.contains("opaque Process history"),
+            "a missing admission must reach the physical predicate: {reason}"
+        );
+        gate.release.notify_one();
+        zero.process.started().await.unwrap();
+        let live = zero.lifecycle();
+        assert!(live.no_direct_effects());
+        assert!(live.sources[0].expected_revision > 0);
+        let rejected_stream = "agent:physical-zero-cut-rejected";
+        let mut expected_streams = lifecycle.sources;
+        expected_streams.push(crate::ExpectedStreamRevision {
+            stream_id: rejected_stream.into(),
+            expected_revision: 0,
         });
-    assert!(
-        matches!(result, Err(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
+        let result = services
+            .event_store()
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: "physical-zero-cut-must-fail".into(),
+                expected_streams,
+                events: vec![crate::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: rejected_stream.into(),
+                        scope: crate::RuntimeEventScope::Agent,
+                        kind: "fixture.zero_cut_never_committed".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({}),
+                    },
+                    idempotency_key: None,
+                    schema_version: 1,
+                }],
+            });
+        assert!(
+            matches!(result, Err(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
         stream_id, expected:0, actual,
     }) if stream_id == live.sources[0].stream_id && actual > 0),
-        "the actual admission must invalidate precisely the original zero-head CAS"
-    );
-    assert!(services
-        .event_store()
-        .list_stream(rejected_stream)
-        .unwrap()
-        .is_empty());
-    zero.finish().await;
-    vec![old, current, zero.packet]
+            "the actual admission must invalidate precisely the original zero-head CAS"
+        );
+        assert!(services
+            .event_store()
+            .list_stream(rejected_stream)
+            .unwrap()
+            .is_empty());
+        zero.finish().await;
+        vec![old, current, zero.packet]
+    })
 }
 
 #[cfg(test)]
@@ -15406,750 +9997,759 @@ async fn wait_process_pipe_readers_closed_665(
     Err("FailedSend original pipe observation requires Linux /proc/self/fd and poll".into())
 }
 
-async fn exercise_process_proof_case(
-    services: &ReviewedFixtureServices,
-    host: &Arc<ReviewReadHost>,
-    reviewer: &R1ScopedReviewer,
-    envelope: &AgentActionEnvelope,
-    content_ref: &str,
-    root_actor: &AgentActorBinding,
+#[inline(never)]
+fn exercise_process_proof_case<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    host: &'fixture Arc<ReviewReadHost>,
+    reviewer: &'fixture R1ScopedReviewer,
+    envelope: &'fixture AgentActionEnvelope,
+    content_ref: &'fixture str,
+    root_actor: &'fixture AgentActorBinding,
     case: RealProcessProofCase,
-) -> bool {
-    let session = &reviewer.reader;
-    let packet = &reviewer.packet;
-    let before = services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap();
-    assert!(before.terminal.is_none());
-    assert!(
-        confirmed_run_exit_with_retry(services.event_store(), packet)
-            .is_none()
-    );
-    match case {
-        RealProcessProofCase::FailedSend => {
-            let driver_observation = process_send_observer_665(packet);
-            let fault_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            let hold = Arc::new(ReviewWriteHold::default());
-            *host.read_hold.lock().unwrap() = Some(hold.clone());
-            let driver = session.clone();
-            let running =
-                tokio::spawn(async move {
+) -> std::pin::Pin<Box<impl std::future::Future<Output = bool> + 'fixture>> {
+    Box::pin(async move {
+        let session = &reviewer.reader;
+        let packet = &reviewer.packet;
+        let before = services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap();
+        assert!(before.terminal.is_none());
+        assert!(confirmed_run_exit_with_retry(services.event_store(), packet).is_none());
+        match case {
+            RealProcessProofCase::FailedSend => {
+                let driver_observation = process_send_observer_665(packet);
+                let fault_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let hold = Arc::new(ReviewWriteHold::default());
+                *host.read_hold.lock().unwrap() = Some(hold.clone());
+                let driver = session.clone();
+                let running = tokio::spawn(async move {
                     driver.command(serde_json::json!({
                 "request_id":"failed-actual-send", "tool_name":"read_file",
                 "input":{"path":"review-effect.txt","complete":true}, "close_stdin":true,
             })).await
                 });
-            tokio::time::timeout(std::time::Duration::from_secs(15), hold.entered.notified())
-                .await
-                .unwrap();
-            let closed_pipe = tokio::time::timeout_at(fault_deadline, async {
-                let marker = wait_fixture_file(
-                    &process_control_directory(services, packet).join("stdin-closed.json"),
-                )
-                .await?;
-                let marker: serde_json::Value =
-                    serde_json::from_slice(&marker).map_err(|error| error.to_string())?;
-                if marker["request_id"] != "failed-actual-send"
-                    || marker["packet"]
-                        != serde_json::to_value(packet).map_err(|error| error.to_string())?
-                {
-                    return Err("FailedSend marker does not match the original request/packet".into());
-                }
-                let inode = marker["stdin_inode"]
-                    .as_u64()
-                    .filter(|inode| *inode > 0)
-                    .ok_or("FailedSend marker omitted the original stdin pipe inode")?;
-                let retirement = AgentActionEnvelope {
-                    action_id: "failed-send-original-retirement".into(),
-                    actor: root_actor.clone(),
-                    expected_revision: None,
-                    action: AgentAction::TaskWithdraw(
-                        harness_contract::agent_action::TaskWithdrawInput {
-                            task_ref: reviewer.task_ref.clone(),
-                            reason_ref: content_ref.into(),
-                            evidence_refs: vec![content_ref.into()],
-                        },
-                    ),
-                };
-                let receipt = services.submit_agent_action(&retirement).await?;
-                if receipt.status != harness_contract::agent_action::AgentActionStatus::Applied {
-                    return Err("original FailedSend retirement was not Applied".into());
-                }
-                wait_process_pipe_readers_closed_665(inode).await
-            })
-            .await;
-            hold.release.notify_one();
-            let original_write_end = closed_pipe
-                .expect("original pipe readers must close within the original command deadline")
-                .expect("original pipe and retirement must be authenticated before release");
-            let (command_result, driver_failure) =
-                tokio::time::timeout_at(fault_deadline, async {
-                    let command_result = running.await.expect("original Process driver task");
-                    let driver_failure = loop {
-                        match driver_observation.try_recv() {
-                            Ok(failure) => break failure,
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                panic!("original Process driver observation disconnected");
-                            }
-                        }
+                tokio::time::timeout(std::time::Duration::from_secs(15), hold.entered.notified())
+                    .await
+                    .unwrap();
+                let closed_pipe = tokio::time::timeout_at(fault_deadline, async {
+                    let marker = wait_fixture_file(
+                        &process_control_directory(services, packet).join("stdin-closed.json"),
+                    )
+                    .await?;
+                    let marker: serde_json::Value =
+                        serde_json::from_slice(&marker).map_err(|error| error.to_string())?;
+                    if marker["request_id"] != "failed-actual-send"
+                        || marker["packet"]
+                            != serde_json::to_value(packet).map_err(|error| error.to_string())?
+                    {
+                        return Err(
+                            "FailedSend marker does not match the original request/packet".into(),
+                        );
+                    }
+                    let inode = marker["stdin_inode"]
+                        .as_u64()
+                        .filter(|inode| *inode > 0)
+                        .ok_or("FailedSend marker omitted the original stdin pipe inode")?;
+                    let retirement = AgentActionEnvelope {
+                        action_id: "failed-send-original-retirement".into(),
+                        actor: root_actor.clone(),
+                        expected_revision: None,
+                        action: AgentAction::TaskWithdraw(
+                            harness_contract::agent_action::TaskWithdrawInput {
+                                task_ref: reviewer.task_ref.clone(),
+                                reason_ref: content_ref.into(),
+                                evidence_refs: vec![content_ref.into()],
+                            },
+                        ),
                     };
-                    (command_result, driver_failure)
+                    let receipt = services.submit_agent_action(&retirement).await?;
+                    if receipt.status != harness_contract::agent_action::AgentActionStatus::Applied
+                    {
+                        return Err("original FailedSend retirement was not Applied".into());
+                    }
+                    wait_process_pipe_readers_closed_665(inode).await
                 })
+                .await;
+                hold.release.notify_one();
+                let original_write_end = closed_pipe
+                    .expect("original pipe readers must close within the original command deadline")
+                    .expect("original pipe and retirement must be authenticated before release");
+                let (command_result, driver_failure) = tokio::time::timeout_at(
+                    fault_deadline,
+                    async {
+                        let command_result = running.await.expect("original Process driver task");
+                        let driver_failure = loop {
+                            match driver_observation.try_recv() {
+                                Ok(failure) => break failure,
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    panic!("original Process driver observation disconnected");
+                                }
+                            }
+                        };
+                        (command_result, driver_failure)
+                    },
+                )
                 .await
-                .expect("actual write failure must be observed within the original command deadline");
-            assert!(command_result.is_err());
-            assert!(
+                .expect(
+                    "actual write failure must be observed within the original command deadline",
+                );
+                assert!(command_result.is_err());
+                assert!(
                 driver_failure
                     .starts_with("ProcessJsonl protocol failed: write ProcessJsonl Runtime message: "),
                 "FailedSend requires the original write_all/flush error, not command timeout or EOF: {}",
                 driver_failure.chars().take(1200).collect::<String>()
             );
-            drop(original_write_end);
-            wait_retired_process(services, packet, &reviewer.task_ref).await;
-            assert!(process_materials(services, packet)
-                .iter()
-                .all(|(_, material)| material.tool_invocation_id != "failed-actual-send"));
-            let source = format!(
-                "execution-agent-receipts:{}:{}:{}",
-                packet.graph_id(),
-                packet.node_id(),
-                packet.attempt
-            );
-            assert!(services
-                .event_store()
-                .list_stream(&source)
-                .unwrap()
-                .iter()
-                .any(|event| event.kind == "execution.agent_tool.receipt"
-                    && event
-                        .payload
-                        .get(crate::context_evidence::READ_ACQUISITION_FIELD)
-                        .is_some()));
-            let acquisitions = services
-                .event_store()
-                .list_stream(&source)
-                .unwrap()
-                .into_iter()
-                .filter(|event| event.kind == "execution.agent_tool.receipt")
-                .filter_map(|event| {
-                    event
-                        .payload
-                        .get(crate::context_evidence::READ_ACQUISITION_FIELD)
-                        .cloned()
-                })
-                .map(|value| {
-                    serde_json::from_value::<crate::context_evidence::ReadAcquisitionSeal>(value)
+                drop(original_write_end);
+                wait_retired_process(services, packet, &reviewer.task_ref).await;
+                assert!(process_materials(services, packet)
+                    .iter()
+                    .all(|(_, material)| material.tool_invocation_id != "failed-actual-send"));
+                let source = format!(
+                    "execution-agent-receipts:{}:{}:{}",
+                    packet.graph_id(),
+                    packet.node_id(),
+                    packet.attempt
+                );
+                assert!(services
+                    .event_store()
+                    .list_stream(&source)
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.kind == "execution.agent_tool.receipt"
+                        && event
+                            .payload
+                            .get(crate::context_evidence::READ_ACQUISITION_FIELD)
+                            .is_some()));
+                let acquisitions = services
+                    .event_store()
+                    .list_stream(&source)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|event| event.kind == "execution.agent_tool.receipt")
+                    .filter_map(|event| {
+                        event
+                            .payload
+                            .get(crate::context_evidence::READ_ACQUISITION_FIELD)
+                            .cloned()
+                    })
+                    .map(|value| {
+                        serde_json::from_value::<crate::context_evidence::ReadAcquisitionSeal>(
+                            value,
+                        )
                         .expect("actual receipt acquisition seal")
-                })
-                .filter(|seal| seal.invocation_id == "failed-actual-send")
-                .collect::<Vec<_>>();
-            assert_eq!(acquisitions.len(), 1);
-            let acquisition = &acquisitions[0];
-            assert_eq!(acquisition.graph_id, packet.graph_id());
-            assert_eq!(acquisition.node_id, packet.node_id());
-            assert_eq!(acquisition.attempt, packet.attempt);
-            assert_eq!(acquisition.tool_name, "read_file");
-            let primary = services
-                .event_store()
-                .event_by_idempotency_key(&acquisition.primary_stream, &acquisition.primary_key)
-                .unwrap()
-                .expect("failed send retains the original acquisition primary");
-            let index = services
-                .event_store()
-                .event_by_idempotency_key(&acquisition.index_stream, &acquisition.index_key)
-                .unwrap()
-                .expect("failed send retains the original acquisition index");
-            assert_eq!(primary.transaction_id, index.transaction_id);
-            assert_eq!(
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
-                index.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
-            );
-            assert_eq!(
-                index.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
-                serde_json::to_value(acquisition).unwrap()
-            );
-            eprintln!(
-                "R1_PROCESS_665_SEND {}",
-                serde_json::json!({
-                    "run_id": packet.run_id(),
-                    "graph_id": packet.graph_id(),
-                    "node_id": packet.node_id(),
-                    "attempt": packet.attempt,
-                    "request_id": acquisition.invocation_id,
-                    "driver_failure": driver_failure.chars().take(1200).collect::<String>(),
-                    "acquisition_primary": primary.event_id,
-                    "acquisition_index": index.event_id,
-                    "confirmed_exit": confirmed_run_exit_with_retry(services.event_store(), packet).is_some(),
-                })
-            );
-            assert_eq!(
-                services.goal_store().get(&before.id).unwrap().unwrap(),
-                before
-            );
-            return true;
-        }
-        RealProcessProofCase::Preview => {
-            let huge = "actual complete source body\n".repeat(16_384);
-            std::fs::write(services.workspace_root().join("review-effect.txt"), &huge).unwrap();
-            let output = session
-                .execute_tool(
-                    "actual-frame-preview",
-                    "read_file",
-                    r#"{"path":"review-effect.txt","complete":true}"#,
-                )
-                .await
-                .unwrap();
-            let preview: serde_json::Value = serde_json::from_str(&output).unwrap();
-            assert_eq!(preview["kind"], "process_tool_preview");
-            assert_eq!(preview["truncated"], true);
-            let material = assert_process_delivery(services, packet, "actual-frame-preview");
-            assert!(material.body_omitted);
-            assert!(material.delivered_extent.is_none());
-            assert_process_review_refused(services, envelope, "preview-is-not-complete-delivery")
-                .await;
-            let (_, runtime) =
-                root_reads_generic_results(services, host.clone(), content_ref, false, true).await;
-            write_root_review_effect(
-                &runtime,
-                "restore-after-frame-preview",
-                "actual delegated write\nstable middle line\ninitial dependency last line\n",
-            )
-            .await;
-        }
-        RealProcessProofCase::Pages => {
-            for (index, input) in [
-                serde_json::json!({"path":"review-effect.txt","offset":0,"limit":1}),
-                serde_json::json!({"path":"review-effect.txt","offset":1,"limit":1}),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let id = format!("same-attempt-page-{index}");
-                session
-                    .execute_tool(&id, "read_file", &input.to_string())
+                    })
+                    .filter(|seal| seal.invocation_id == "failed-actual-send")
+                    .collect::<Vec<_>>();
+                assert_eq!(acquisitions.len(), 1);
+                let acquisition = &acquisitions[0];
+                assert_eq!(acquisition.graph_id, packet.graph_id());
+                assert_eq!(acquisition.node_id, packet.node_id());
+                assert_eq!(acquisition.attempt, packet.attempt);
+                assert_eq!(acquisition.tool_name, "read_file");
+                let primary = services
+                    .event_store()
+                    .event_by_idempotency_key(&acquisition.primary_stream, &acquisition.primary_key)
+                    .unwrap()
+                    .expect("failed send retains the original acquisition primary");
+                let index = services
+                    .event_store()
+                    .event_by_idempotency_key(&acquisition.index_stream, &acquisition.index_key)
+                    .unwrap()
+                    .expect("failed send retains the original acquisition index");
+                assert_eq!(primary.transaction_id, index.transaction_id);
+                assert_eq!(
+                    primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
+                    index.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
+                );
+                assert_eq!(
+                    index.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
+                    serde_json::to_value(acquisition).unwrap()
+                );
+                eprintln!(
+                    "R1_PROCESS_665_SEND {}",
+                    serde_json::json!({
+                        "run_id": packet.run_id(),
+                        "graph_id": packet.graph_id(),
+                        "node_id": packet.node_id(),
+                        "attempt": packet.attempt,
+                        "request_id": acquisition.invocation_id,
+                        "driver_failure": driver_failure.chars().take(1200).collect::<String>(),
+                        "acquisition_primary": primary.event_id,
+                        "acquisition_index": index.event_id,
+                        "confirmed_exit": confirmed_run_exit_with_retry(services.event_store(), packet).is_some(),
+                    })
+                );
+                assert_eq!(
+                    services.goal_store().get(&before.id).unwrap().unwrap(),
+                    before
+                );
+                return true;
+            }
+            RealProcessProofCase::Preview => {
+                let huge = "actual complete source body\n".repeat(16_384);
+                std::fs::write(services.workspace_root().join("review-effect.txt"), &huge).unwrap();
+                let output = session
+                    .execute_tool(
+                        "actual-frame-preview",
+                        "read_file",
+                        r#"{"path":"review-effect.txt","complete":true}"#,
+                    )
                     .await
                     .unwrap();
-                let material = assert_process_delivery(services, packet, &id);
-                assert_eq!(
-                    material.grade,
-                    crate::context_evidence::ReadDeliveryGrade::AgentChannelSend
-                );
-                assert_process_review_refused(services, envelope, &id).await;
+                let preview: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(preview["kind"], "process_tool_preview");
+                assert_eq!(preview["truncated"], true);
+                let material = assert_process_delivery(services, packet, "actual-frame-preview");
+                assert!(material.body_omitted);
+                assert!(material.delivered_extent.is_none());
+                assert_process_review_refused(
+                    services,
+                    envelope,
+                    "preview-is-not-complete-delivery",
+                )
+                .await;
+                let (_, runtime) =
+                    root_reads_generic_results(services, host.clone(), content_ref, false, true)
+                        .await;
+                write_root_review_effect(
+                    &runtime,
+                    "restore-after-frame-preview",
+                    "actual delegated write\nstable middle line\ninitial dependency last line\n",
+                )
+                .await;
             }
-            let peer = start_r1_scoped_goal_reviewer(
-                services,
-                root_actor,
-                content_ref,
-                "page-peer",
-                false,
-            )
-            .await;
-            peer.reader
-                .execute_tool(
-                    "other-attempt-final-page",
-                    "read_file",
-                    r#"{"path":"review-effect.txt","offset":2,"limit":1}"#,
+            RealProcessProofCase::Pages => {
+                for (index, input) in [
+                    serde_json::json!({"path":"review-effect.txt","offset":0,"limit":1}),
+                    serde_json::json!({"path":"review-effect.txt","offset":1,"limit":1}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let id = format!("same-attempt-page-{index}");
+                    session
+                        .execute_tool(&id, "read_file", &input.to_string())
+                        .await
+                        .unwrap();
+                    let material = assert_process_delivery(services, packet, &id);
+                    assert_eq!(
+                        material.grade,
+                        crate::context_evidence::ReadDeliveryGrade::AgentChannelSend
+                    );
+                    assert_process_review_refused(services, envelope, &id).await;
+                }
+                let peer = start_r1_scoped_goal_reviewer(
+                    services,
+                    root_actor,
+                    content_ref,
+                    "page-peer",
+                    false,
                 )
-                .await
-                .unwrap();
-            assert_process_review_refused(
-                services,
-                envelope,
-                "cross-attempt-cannot-complete-pages",
-            )
-            .await;
-            peer.finish(services).await;
-            let (_, runtime) =
-                root_reads_generic_results(services, host.clone(), content_ref, false, true).await;
-            write_root_review_effect(
-                &runtime,
-                "advance-page-content-version",
-                "new first page\nnew middle page\nnew final page\n",
-            )
-            .await;
-            session
-                .execute_tool(
-                    "different-version-final-page",
-                    "read_file",
-                    r#"{"path":"review-effect.txt","offset":2,"limit":1}"#,
+                .await;
+                peer.reader
+                    .execute_tool(
+                        "other-attempt-final-page",
+                        "read_file",
+                        r#"{"path":"review-effect.txt","offset":2,"limit":1}"#,
+                    )
+                    .await
+                    .unwrap();
+                assert_process_review_refused(
+                    services,
+                    envelope,
+                    "cross-attempt-cannot-complete-pages",
                 )
-                .await
-                .unwrap();
-            assert_process_review_refused(
-                services,
-                envelope,
-                "mixed-content-versions-cannot-union",
-            )
-            .await;
-            write_root_review_effect(
-                &runtime,
-                "restore-after-version-pages",
-                "actual delegated write\nstable middle line\ninitial dependency last line\n",
-            )
-            .await;
-        }
-        RealProcessProofCase::LateDelivery => {
-            let old = "old actual acquisition line\n".repeat(1024);
-            std::fs::write(services.workspace_root().join("review-effect.txt"), &old).unwrap();
-            let driver = session.clone();
-            let reading =
-                tokio::spawn(async move {
+                .await;
+                peer.finish(services).await;
+                let (_, runtime) =
+                    root_reads_generic_results(services, host.clone(), content_ref, false, true)
+                        .await;
+                write_root_review_effect(
+                    &runtime,
+                    "advance-page-content-version",
+                    "new first page\nnew middle page\nnew final page\n",
+                )
+                .await;
+                session
+                    .execute_tool(
+                        "different-version-final-page",
+                        "read_file",
+                        r#"{"path":"review-effect.txt","offset":2,"limit":1}"#,
+                    )
+                    .await
+                    .unwrap();
+                assert_process_review_refused(
+                    services,
+                    envelope,
+                    "mixed-content-versions-cannot-union",
+                )
+                .await;
+                write_root_review_effect(
+                    &runtime,
+                    "restore-after-version-pages",
+                    "actual delegated write\nstable middle line\ninitial dependency last line\n",
+                )
+                .await;
+            }
+            RealProcessProofCase::LateDelivery => {
+                let old = "old actual acquisition line\n".repeat(1024);
+                std::fs::write(services.workspace_root().join("review-effect.txt"), &old).unwrap();
+                let driver = session.clone();
+                let reading = tokio::spawn(async move {
                     driver.command(serde_json::json!({
                 "request_id":"late-old-acquisition","tool_name":"read_file",
                 "input":{"path":"review-effect.txt","complete":true},"defer_receive":true,
             })).await
                 });
-            let directory = process_control_directory(services, packet);
-            wait_fixture_file(&directory.join("receive-held.json"))
+                let directory = process_control_directory(services, packet);
+                wait_fixture_file(&directory.join("receive-held.json"))
+                    .await
+                    .unwrap();
+                let source = format!(
+                    "execution-agent-receipts:{}:{}:{}",
+                    packet.graph_id(),
+                    packet.node_id(),
+                    packet.attempt
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    loop {
+                        if services
+                            .event_store()
+                            .list_stream(&source)
+                            .unwrap()
+                            .iter()
+                            .any(|event| {
+                                event.kind == "execution.agent_tool.receipt"
+                                    && event
+                                        .payload
+                                        .get(crate::context_evidence::READ_ACQUISITION_FIELD)
+                                        .is_some_and(|value| {
+                                            value["origin"]["call_id"] == "late-old-acquisition"
+                                        })
+                            })
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
                 .await
                 .unwrap();
-            let source = format!(
-                "execution-agent-receipts:{}:{}:{}",
-                packet.graph_id(),
-                packet.node_id(),
-                packet.attempt
-            );
-            tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                loop {
-                    if services
-                        .event_store()
-                        .list_stream(&source)
-                        .unwrap()
-                        .iter()
-                        .any(|event| {
-                            event.kind == "execution.agent_tool.receipt"
-                                && event
-                                    .payload
-                                    .get(crate::context_evidence::READ_ACQUISITION_FIELD)
-                                    .is_some_and(|value| {
-                                        value["origin"]["call_id"] == "late-old-acquisition"
-                                    })
-                        })
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(process_materials(services, packet)
-                .iter()
-                .all(|(_, material)| material.tool_invocation_id != "late-old-acquisition"));
-            let (_, runtime) =
-                root_reads_generic_results(services, host.clone(), content_ref, false, true).await;
-            write_root_review_effect(
-                &runtime,
-                "write-after-actual-acquisition",
-                "new version after acquisition\n",
-            )
-            .await;
-            publish_fixture_file(
-                &directory.join("receive-release.json"),
-                &serde_json::json!({"release":true}),
-            )
-            .unwrap();
-            let reply = reading.await.unwrap().unwrap();
-            assert!(reply["output"]
-                .as_str()
-                .unwrap()
-                .contains("old actual acquisition"));
-            let material = assert_process_delivery(services, packet, "late-old-acquisition");
-            assert!(!material.body_omitted);
-            assert_process_review_refused(
-                services,
-                envelope,
-                "late-send-keeps-old-acquisition-version",
-            )
-            .await;
-            write_root_review_effect(
-                &runtime,
-                "restore-after-late-delivery",
-                "actual delegated write\nstable middle line\ninitial dependency last line\n",
-            )
-            .await;
-        }
-        RealProcessProofCase::Legacy => {
-            let source = format!(
-                "execution-agent-receipts:{}:{}:{}",
-                packet.graph_id(),
-                packet.node_id(),
-                packet.attempt
-            );
-            let original = services
-                .event_store()
-                .list_stream(&source)
-                .unwrap()
-                .into_iter()
-                .find(|event| event.kind == "execution.agent_tool.receipt")
-                .unwrap();
-            let mut legacy = original.payload.clone();
-            legacy
-                .as_object_mut()
-                .unwrap()
-                .remove(crate::context_evidence::READ_ACQUISITION_FIELD);
-            services
-                .event_store()
-                .append(crate::RuntimeEventInput {
-                    stream_id: source,
-                    scope: original.scope,
-                    kind: original.kind,
-                    status: original.status,
-                    actor: Some("untrusted-legacy-replay".into()),
-                    refs: original.refs,
-                    payload: legacy,
-                })
-                .unwrap();
-            let calls = host
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request.tool_name == "read_file")
-                .count();
-            assert_process_review_refused(services, envelope, "legacy-cannot-read-todays-file")
+                assert!(process_materials(services, packet)
+                    .iter()
+                    .all(|(_, material)| material.tool_invocation_id != "late-old-acquisition"));
+                let (_, runtime) =
+                    root_reads_generic_results(services, host.clone(), content_ref, false, true)
+                        .await;
+                write_root_review_effect(
+                    &runtime,
+                    "write-after-actual-acquisition",
+                    "new version after acquisition\n",
+                )
                 .await;
-            assert_eq!(
-                host.calls
+                publish_fixture_file(
+                    &directory.join("receive-release.json"),
+                    &serde_json::json!({"release":true}),
+                )
+                .unwrap();
+                let reply = reading.await.unwrap().unwrap();
+                assert!(reply["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("old actual acquisition"));
+                let material = assert_process_delivery(services, packet, "late-old-acquisition");
+                assert!(!material.body_omitted);
+                assert_process_review_refused(
+                    services,
+                    envelope,
+                    "late-send-keeps-old-acquisition-version",
+                )
+                .await;
+                write_root_review_effect(
+                    &runtime,
+                    "restore-after-late-delivery",
+                    "actual delegated write\nstable middle line\ninitial dependency last line\n",
+                )
+                .await;
+            }
+            RealProcessProofCase::Legacy => {
+                let source = format!(
+                    "execution-agent-receipts:{}:{}:{}",
+                    packet.graph_id(),
+                    packet.node_id(),
+                    packet.attempt
+                );
+                let original = services
+                    .event_store()
+                    .list_stream(&source)
+                    .unwrap()
+                    .into_iter()
+                    .find(|event| event.kind == "execution.agent_tool.receipt")
+                    .unwrap();
+                let mut legacy = original.payload.clone();
+                legacy
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(crate::context_evidence::READ_ACQUISITION_FIELD);
+                services
+                    .event_store()
+                    .append(crate::RuntimeEventInput {
+                        stream_id: source,
+                        scope: original.scope,
+                        kind: original.kind,
+                        status: original.status,
+                        actor: Some("untrusted-legacy-replay".into()),
+                        refs: original.refs,
+                        payload: legacy,
+                    })
+                    .unwrap();
+                let calls = host
+                    .calls
                     .lock()
                     .unwrap()
                     .iter()
                     .filter(|request| request.tool_name == "read_file")
-                    .count(),
-                calls
-            );
-            return true;
-        }
-        RealProcessProofCase::CommandAck => {
-            use harness_contract::agent::{AgentCommand, AgentCommandRequest};
-            let caller = services.agent_runtime().clone();
-            let original = packet.clone();
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let started = entered.clone();
-            let waiter = tokio::spawn(async move {
-                started.notify_one();
-                caller.execute_task(original).await
-            });
-            entered.notified().await;
-            waiter.abort();
-            let snapshot = services.agent_runtime().get(packet.agent_id()).unwrap();
-            let request = AgentCommandRequest {
-                command_id: format!("real-ack:{}", packet.run_id()),
-                agent_id: packet.agent_id().into(),
-                expected_revision: snapshot.revision,
-                command: AgentCommand::Interrupt,
-                input: None,
-            };
-            let command = services.agent_runtime().command(request);
-            let input = serde_json::json!({"evidence_ref":content_ref}).to_string();
-            let read = session.execute_tool("drive-command-ack", "evidence_retrieve", &input);
-            let (receipt, output) = tokio::join!(command, read);
-            assert!(receipt.accepted, "{receipt:?}");
-            output.unwrap();
-            assert!(
-                confirmed_run_exit_with_retry(services.event_store(), packet)
-                    .is_none()
-            );
-            let projection = services
-                .agent_action_service()
-                .project(&envelope.actor.program_id)
-                .unwrap();
-            assert!(!projection.tasks[&reviewer.task_ref]
-                .active_attempts
-                .is_empty());
-            assert!(services
-                .settle_abandoned_agentic_attempt(packet, "actual ACK is not exit")
-                .await
-                .is_err());
-            assert_eq!(
-                services
-                    .event_store()
-                    .list_stream(&format!("agent:{}", packet.agent_id()))
-                    .unwrap()
-                    .iter()
-                    .filter(|event| event.kind == "agent.run_admitted")
-                    .count(),
-                1
-            );
-        }
-        RealProcessProofCase::Restart => {
-            let peer = start_r1_scoped_goal_reviewer(
-                services,
-                root_actor,
-                content_ref,
-                "restart-peer",
-                false,
-            )
-            .await;
-            let original = peer.packet.clone();
-            let withdrawn = AgentActionEnvelope {
-                action_id: "restart-peer-retire".into(),
-                actor: root_actor.clone(),
-                expected_revision: None,
-                action: AgentAction::TaskWithdraw(
-                    harness_contract::agent_action::TaskWithdrawInput {
-                        task_ref: peer.task_ref.clone(),
-                        reason_ref: content_ref.into(),
-                        evidence_refs: vec![content_ref.into()],
-                    },
-                ),
-            };
-            services.submit_agent_action(&withdrawn).await.unwrap();
-            peer.reader.finish().await;
-            wait_retired_process(services, &original, &peer.task_ref).await;
-            let stream = format!("agent:{}", original.agent_id());
-            let head = services.event_store().stream_revision(&stream).unwrap();
-            let cold = crate::AgentRuntime::new(
-                services.event_store().clone(),
-                Arc::new(crate::ProviderRegistry::empty()),
-            );
-            assert!(
-                confirmed_run_exit_with_retry(services.event_store(), &original)
-                    .is_some()
-            );
-            cold.execute_task(original.clone()).await.unwrap();
-            assert_eq!(
-                services.event_store().stream_revision(&stream).unwrap(),
-                head
-            );
-            let mut wrong = original.clone();
-            wrong.attempt += 1;
-            assert!(
-                crate::agent_runtime::confirmed_run_exit(services.event_store(), &wrong)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            );
-            wrong = original.clone();
-            wrong.assignment.run_id = "legacy-without-original-exit".into();
-            assert!(
-                crate::agent_runtime::confirmed_run_exit(services.event_store(), &wrong)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            );
-            assert!(
-                confirmed_run_exit_with_retry(services.event_store(), packet)
-                    .is_none()
-            );
-        }
-        RealProcessProofCase::ReapAndEffect => {
-            use harness_contract::agent::{AgentCommand, AgentCommandRequest};
-            let optional = start_r1_optional_effect(
-                services,
-                host,
-                root_actor,
-                content_ref,
-                R1ProofScenario::OptionalSharedCheckpoint,
-            )
-            .await;
-            optional.assert_pending(services);
-            let snapshot = services
-                .agent_runtime()
-                .get(optional.packet.agent_id())
-                .unwrap();
-            let killed = services
-                .agent_runtime()
-                .command(AgentCommandRequest {
-                    command_id: format!("real-kill:{}", optional.packet.run_id()),
-                    agent_id: optional.packet.agent_id().into(),
+                    .count();
+                assert_process_review_refused(services, envelope, "legacy-cannot-read-todays-file")
+                    .await;
+                assert_eq!(
+                    host.calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|request| request.tool_name == "read_file")
+                        .count(),
+                    calls
+                );
+                return true;
+            }
+            RealProcessProofCase::CommandAck => {
+                use harness_contract::agent::{AgentCommand, AgentCommandRequest};
+                let caller = services.agent_runtime().clone();
+                let original = packet.clone();
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let started = entered.clone();
+                let waiter = tokio::spawn(async move {
+                    started.notify_one();
+                    caller.execute_task(original).await
+                });
+                entered.notified().await;
+                waiter.abort();
+                let snapshot = services.agent_runtime().get(packet.agent_id()).unwrap();
+                let request = AgentCommandRequest {
+                    command_id: format!("real-ack:{}", packet.run_id()),
+                    agent_id: packet.agent_id().into(),
                     expected_revision: snapshot.revision,
-                    command: AgentCommand::Cancel,
+                    command: AgentCommand::Interrupt,
                     input: None,
-                })
-                .await;
-            assert!(killed.accepted, "{killed:?}");
-            assert!(confirmed_run_exit_with_retry(services.event_store(), &optional.packet)
-            .is_none());
-            assert!(services
-                .settle_abandoned_agentic_attempt(
-                    &optional.packet,
-                    "kill precedes wait and receipt"
+                };
+                let command = services.agent_runtime().command(request);
+                let input = serde_json::json!({"evidence_ref":content_ref}).to_string();
+                let read = session.execute_tool("drive-command-ack", "evidence_retrieve", &input);
+                let (receipt, output) = tokio::join!(command, read);
+                assert!(receipt.accepted, "{receipt:?}");
+                output.unwrap();
+                assert!(confirmed_run_exit_with_retry(services.event_store(), packet).is_none());
+                let projection = services
+                    .agent_action_service()
+                    .project(&envelope.actor.program_id)
+                    .unwrap();
+                assert!(!projection.tasks[&reviewer.task_ref]
+                    .active_attempts
+                    .is_empty());
+                assert!(services
+                    .settle_abandoned_agentic_attempt(packet, "actual ACK is not exit")
+                    .await
+                    .is_err());
+                assert_eq!(
+                    services
+                        .event_store()
+                        .list_stream(&format!("agent:{}", packet.agent_id()))
+                        .unwrap()
+                        .iter()
+                        .filter(|event| event.kind == "agent.run_admitted")
+                        .count(),
+                    1
+                );
+            }
+            RealProcessProofCase::Restart => {
+                let peer = start_r1_scoped_goal_reviewer(
+                    services,
+                    root_actor,
+                    content_ref,
+                    "restart-peer",
+                    false,
                 )
-                .await
-                .is_err());
-            optional.assert_pending(services);
-            optional.hold.release.notify_one();
-            assert!(optional.worker.await.unwrap().is_err());
-            wait_retired_process(services, &optional.packet, &optional.task_ref).await;
-            let events = services.event_store().list_stream(&optional.index).unwrap();
-            assert!(events
-                .iter()
-                .any(|event| event.kind == "execution.agent_tool.receipt"
-                    && event.payload["idempotency_key"] == optional.request.idempotency_key));
+                .await;
+                let original = peer.packet.clone();
+                let withdrawn = AgentActionEnvelope {
+                    action_id: "restart-peer-retire".into(),
+                    actor: root_actor.clone(),
+                    expected_revision: None,
+                    action: AgentAction::TaskWithdraw(
+                        harness_contract::agent_action::TaskWithdrawInput {
+                            task_ref: peer.task_ref.clone(),
+                            reason_ref: content_ref.into(),
+                            evidence_refs: vec![content_ref.into()],
+                        },
+                    ),
+                };
+                services.submit_agent_action(&withdrawn).await.unwrap();
+                peer.reader.finish().await;
+                wait_retired_process(services, &original, &peer.task_ref).await;
+                let stream = format!("agent:{}", original.agent_id());
+                let head = services.event_store().stream_revision(&stream).unwrap();
+                let cold = crate::AgentRuntime::new(
+                    services.event_store().clone(),
+                    Arc::new(crate::ProviderRegistry::empty()),
+                );
+                assert!(confirmed_run_exit_with_retry(services.event_store(), &original).is_some());
+                cold.execute_task(original.clone()).await.unwrap();
+                assert_eq!(
+                    services.event_store().stream_revision(&stream).unwrap(),
+                    head
+                );
+                let mut wrong = original.clone();
+                wrong.attempt += 1;
+                assert!(
+                    crate::agent_runtime::confirmed_run_exit(services.event_store(), &wrong)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                );
+                wrong = original.clone();
+                wrong.assignment.run_id = "legacy-without-original-exit".into();
+                assert!(
+                    crate::agent_runtime::confirmed_run_exit(services.event_store(), &wrong)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                );
+                assert!(confirmed_run_exit_with_retry(services.event_store(), packet).is_none());
+            }
+            RealProcessProofCase::ReapAndEffect => {
+                use harness_contract::agent::{AgentCommand, AgentCommandRequest};
+                let optional = start_r1_optional_effect(
+                    services,
+                    host,
+                    root_actor,
+                    content_ref,
+                    R1ProofScenario::OptionalSharedCheckpoint,
+                )
+                .await;
+                optional.assert_pending(services);
+                let snapshot = services
+                    .agent_runtime()
+                    .get(optional.packet.agent_id())
+                    .unwrap();
+                let killed = services
+                    .agent_runtime()
+                    .command(AgentCommandRequest {
+                        command_id: format!("real-kill:{}", optional.packet.run_id()),
+                        agent_id: optional.packet.agent_id().into(),
+                        expected_revision: snapshot.revision,
+                        command: AgentCommand::Cancel,
+                        input: None,
+                    })
+                    .await;
+                assert!(killed.accepted, "{killed:?}");
+                assert!(
+                    confirmed_run_exit_with_retry(services.event_store(), &optional.packet)
+                        .is_none()
+                );
+                assert!(services
+                    .settle_abandoned_agentic_attempt(
+                        &optional.packet,
+                        "kill precedes wait and receipt"
+                    )
+                    .await
+                    .is_err());
+                optional.assert_pending(services);
+                optional.hold.release.notify_one();
+                assert!(optional.worker.await.unwrap().is_err());
+                wait_retired_process(services, &optional.packet, &optional.task_ref).await;
+                let events = services.event_store().list_stream(&optional.index).unwrap();
+                assert!(events
+                    .iter()
+                    .any(|event| event.kind == "execution.agent_tool.receipt"
+                        && event.payload["idempotency_key"] == optional.request.idempotency_key));
+            }
+            RealProcessProofCase::Effects => {
+                exercise_effect_observation_negatives(
+                    services,
+                    reviewer,
+                    envelope,
+                    content_ref,
+                    root_actor,
+                )
+                .await;
+            }
+            RealProcessProofCase::Authorized
+            | RealProcessProofCase::Mechanical
+            | RealProcessProofCase::Sources
+            | RealProcessProofCase::NativeSources => {}
         }
-        RealProcessProofCase::Effects => {
-            exercise_effect_observation_negatives(
-                services,
-                reviewer,
-                envelope,
-                content_ref,
-                root_actor,
-            )
-            .await;
-        }
-        RealProcessProofCase::Authorized
-        | RealProcessProofCase::Mechanical
-        | RealProcessProofCase::Sources
-        | RealProcessProofCase::NativeSources => {}
-    }
-    session
-        .execute_tool(
-            "real-independent-final-file",
-            "read_file",
-            r#"{"path":"review-effect.txt","complete":true}"#,
-        )
-        .await
-        .unwrap();
-    let material = assert_process_delivery(services, packet, "real-independent-final-file");
-    assert!(!material.body_omitted);
-    assert_ne!(
-        material.grade,
-        crate::context_evidence::ReadDeliveryGrade::ProviderModelObserved
-    );
-    if matches!(
-        case,
-        RealProcessProofCase::Authorized | RealProcessProofCase::Mechanical
-    ) {
-        let actual = session.started().await.unwrap();
-        assert!(actual
-            .required_acceptance
-            .evidence_obligations
-            .iter()
-            .all(|obligation| obligation.observation_requirement
-                != harness_contract::context::EvidenceObservationRequirement::ProviderModel));
-        assert_eq!(
-            material.grade,
-            crate::context_evidence::ReadDeliveryGrade::AgentChannelSend
-        );
-    }
-    if matches!(
-        case,
-        RealProcessProofCase::Sources | RealProcessProofCase::NativeSources
-    ) {
-        #[cfg(test)]
-        {
-            let program = services
-                .agent_action_service()
-                .project(&envelope.actor.program_id)
-                .unwrap();
-            services.assert_read_delivery_actor_matrix_for_test(
-                &program,
-                packet,
-                "real-independent-final-file",
-                case == RealProcessProofCase::NativeSources,
-            );
-        }
-        let mut initial = envelope.clone();
-        initial.action_id = "delivery-source-initial-review".into();
-        let observed = services.submit_agent_action(&initial).await.unwrap();
-        assert_eq!(
-            observed.status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-        let goal = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
-        let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
-        let program = services
-            .agent_action_service()
-            .project(&envelope.actor.program_id)
-            .unwrap();
-        let snapshot = crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &program,
-            Some(&goal),
-            proof,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        )
-        .unwrap();
-        let serialized = serde_json::to_string(&snapshot.sources).unwrap();
-        assert!(serialized.contains(&format!("session:{}", packet.session_id())));
         session
             .execute_tool(
-                "advance-real-delivery-source",
+                "real-independent-final-file",
                 "read_file",
                 r#"{"path":"review-effect.txt","complete":true}"#,
             )
             .await
             .unwrap();
-        let refreshed = crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &program,
-            Some(&goal),
-            proof,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        )
-        .unwrap();
-        assert!(snapshot.sources.iter().any(|old| refreshed
-            .sources
-            .iter()
-            .any(|current| current.stream_id == old.stream_id
-                && current.expected_revision > old.expected_revision)));
-        let rejected_stream = format!("proof-stale-cut:{}", packet.run_id());
-        let mut expected_sources = snapshot.sources.clone();
-        expected_sources.push(crate::ExpectedStreamRevision {
-            stream_id: rejected_stream.clone(),
-            expected_revision: 0,
-        });
-        let rejected = services
-            .event_store()
-            .append_transaction(crate::AppendTransactionRequest {
-                transaction_id: format!("proof-stale-cut:{}", packet.run_id()),
-                expected_streams: expected_sources,
-                events: vec![crate::RuntimeTransactionEventInput {
-                    event: crate::RuntimeEventInput {
-                        stream_id: rejected_stream.clone(),
-                        scope: crate::RuntimeEventScope::Agent,
-                        kind: "fixture.stale_cut_never_committed".into(),
-                        status: None,
-                        actor: None,
-                        refs: vec![],
-                        payload: serde_json::json!({}),
-                    },
-                    idempotency_key: None,
-                    schema_version: 1,
-                }],
-            });
-        match rejected {
-            Err(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
-                stream_id,
-                expected,
-                actual,
-            }) => {
-                assert_ne!(stream_id, rejected_stream);
-                assert!(actual > expected);
-                assert!(snapshot
-                    .sources
-                    .iter()
-                    .any(|source| source.stream_id == stream_id
-                        && source.expected_revision == expected));
-            }
-            other => panic!("original source cut must fail at stale CAS, got {other:?}"),
+        let material = assert_process_delivery(services, packet, "real-independent-final-file");
+        assert!(!material.body_omitted);
+        assert_ne!(
+            material.grade,
+            crate::context_evidence::ReadDeliveryGrade::ProviderModelObserved
+        );
+        if matches!(
+            case,
+            RealProcessProofCase::Authorized | RealProcessProofCase::Mechanical
+        ) {
+            let actual = session.started().await.unwrap();
+            assert!(actual
+                .required_acceptance
+                .evidence_obligations
+                .iter()
+                .all(|obligation| obligation.observation_requirement
+                    != harness_contract::context::EvidenceObservationRequirement::ProviderModel));
+            assert_eq!(
+                material.grade,
+                crate::context_evidence::ReadDeliveryGrade::AgentChannelSend
+            );
         }
-        assert!(services
-            .event_store()
-            .list_stream(&rejected_stream)
-            .unwrap()
-            .is_empty());
-    }
-    assert!(!host.calls.lock().unwrap().is_empty());
-    false
+        if matches!(
+            case,
+            RealProcessProofCase::Sources | RealProcessProofCase::NativeSources
+        ) {
+            #[cfg(test)]
+            {
+                let program = services
+                    .agent_action_service()
+                    .project(&envelope.actor.program_id)
+                    .unwrap();
+                services.assert_read_delivery_actor_matrix_for_test(
+                    &program,
+                    packet,
+                    "real-independent-final-file",
+                    case == RealProcessProofCase::NativeSources,
+                );
+            }
+            let mut initial = envelope.clone();
+            initial.action_id = "delivery-source-initial-review".into();
+            let observed = services.submit_agent_action(&initial).await.unwrap();
+            assert_eq!(
+                observed.status,
+                harness_contract::agent_action::AgentActionStatus::Applied
+            );
+            let goal = services
+                .goal_store()
+                .get("goal:root-agentic-execution")
+                .unwrap()
+                .unwrap();
+            let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
+            let program = services
+                .agent_action_service()
+                .project(&envelope.actor.program_id)
+                .unwrap();
+            let snapshot = crate::agentic::review_evidence::validate_proof_inputs(
+                services.event_store(),
+                &program,
+                Some(&goal),
+                proof,
+                crate::agentic::review_evidence::ResultContentReaders {
+                    process_inputs: None,
+                    artifacts: Some(services.artifact_store().as_ref()),
+                    history: services.session_history_reader().as_deref(),
+                },
+            )
+            .unwrap();
+            let serialized = serde_json::to_string(&snapshot.sources).unwrap();
+            assert!(serialized.contains(&format!("session:{}", packet.session_id())));
+            session
+                .execute_tool(
+                    "advance-real-delivery-source",
+                    "read_file",
+                    r#"{"path":"review-effect.txt","complete":true}"#,
+                )
+                .await
+                .unwrap();
+            let refreshed = crate::agentic::review_evidence::validate_proof_inputs(
+                services.event_store(),
+                &program,
+                Some(&goal),
+                proof,
+                crate::agentic::review_evidence::ResultContentReaders {
+                    process_inputs: None,
+                    artifacts: Some(services.artifact_store().as_ref()),
+                    history: services.session_history_reader().as_deref(),
+                },
+            )
+            .unwrap();
+            assert!(snapshot.sources.iter().any(|old| refreshed
+                .sources
+                .iter()
+                .any(|current| current.stream_id == old.stream_id
+                    && current.expected_revision > old.expected_revision)));
+            let rejected_stream = format!("proof-stale-cut:{}", packet.run_id());
+            let mut expected_sources = snapshot.sources.clone();
+            expected_sources.push(crate::ExpectedStreamRevision {
+                stream_id: rejected_stream.clone(),
+                expected_revision: 0,
+            });
+            let rejected =
+                services
+                    .event_store()
+                    .append_transaction(crate::AppendTransactionRequest {
+                        transaction_id: format!("proof-stale-cut:{}", packet.run_id()),
+                        expected_streams: expected_sources,
+                        events: vec![crate::RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: rejected_stream.clone(),
+                                scope: crate::RuntimeEventScope::Agent,
+                                kind: "fixture.stale_cut_never_committed".into(),
+                                status: None,
+                                actor: None,
+                                refs: vec![],
+                                payload: serde_json::json!({}),
+                            },
+                            idempotency_key: None,
+                            schema_version: 1,
+                        }],
+                    });
+            match rejected {
+                Err(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
+                    stream_id,
+                    expected,
+                    actual,
+                }) => {
+                    assert_ne!(stream_id, rejected_stream);
+                    assert!(actual > expected);
+                    assert!(snapshot
+                        .sources
+                        .iter()
+                        .any(|source| source.stream_id == stream_id
+                            && source.expected_revision == expected));
+                }
+                other => panic!("original source cut must fail at stale CAS, got {other:?}"),
+            }
+            assert!(services
+                .event_store()
+                .list_stream(&rejected_stream)
+                .unwrap()
+                .is_empty());
+        }
+        assert!(!host.calls.lock().unwrap().is_empty());
+        false
+    })
 }
 
 #[cfg(test)]
@@ -16361,301 +10961,305 @@ pub(super) async fn exercise_real_process_grade_contract() {
     }
 }
 
-async fn exercise_effect_observation_negatives(
-    services: &ReviewedFixtureServices,
-    reviewer: &R1ScopedReviewer,
-    envelope: &AgentActionEnvelope,
-    content_ref: &str,
-    root_actor: &AgentActorBinding,
-) {
-    let producer = start_r1_scoped_goal_worker(
-        services,
-        root_actor,
-        content_ref,
-        "f2-independent-B-producer",
-        false,
-        true,
-    )
-    .await;
-    producer
-        .reader
-        .execute_tool(
-            "f2-real-write-B",
-            "edit",
-            r#"{"path":"unrelated-review.txt","content":"Real independent effect B"}"#,
+#[inline(never)]
+fn exercise_effect_observation_negatives<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    reviewer: &'fixture R1ScopedReviewer,
+    envelope: &'fixture AgentActionEnvelope,
+    content_ref: &'fixture str,
+    root_actor: &'fixture AgentActorBinding,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'fixture>> {
+    Box::pin(async move {
+        let producer = start_r1_scoped_goal_worker(
+            services,
+            root_actor,
+            content_ref,
+            "f2-independent-B-producer",
+            false,
+            true,
         )
-        .await
-        .unwrap();
-    let (body, artifact) = publish_r1_material(
-        services,
-        &producer.actor,
-        "f2-real-result-B",
-        b"Result B describes its own governed write.",
-        Vec::new(),
-    )
-    .await;
-    let mut request = envelope.clone();
-    request.action_id = "f2-public-multi-result-review".into();
-    let AgentAction::ObjectiveReview(input) = &mut request.action else {
-        unreachable!()
-    };
-    input.result_refs.push(artifact);
-    reviewer
-        .reader
-        .execute_tool(
-            "f2-read-result-B",
-            "evidence_retrieve",
-            &serde_json::json!({"evidence_ref":body}).to_string(),
-        )
-        .await
-        .unwrap();
-    reviewer
-        .reader
-        .execute_tool(
-            "f2-only-read-B",
-            "read_file",
-            r#"{"path":"unrelated-review.txt","complete":true}"#,
-        )
-        .await
-        .unwrap();
-    assert_process_review_refused(services, &request, "write-A-read-only-B").await;
-    reviewer
-        .reader
-        .execute_tool(
-            "f2-partial-read-A",
-            "read_file",
-            r#"{"path":"review-effect.txt","offset":0,"limit":1}"#,
-        )
-        .await
-        .unwrap();
-    assert_process_review_refused(services, &request, "one-target-page-is-not-whole-witness").await;
-    reviewer
-        .reader
-        .execute_tool(
-            "f2-full-read-A",
-            "read_file",
-            r#"{"path":"review-effect.txt","complete":true}"#,
-        )
-        .await
-        .unwrap();
-    assert_process_review_refused(services, &request, "full-A-still-misses-its-second-target")
         .await;
-    reviewer
-        .reader
-        .execute_tool(
-            "f2-full-second-target-A",
-            "read_file",
-            r#"{"path":"r1-optional-target.txt","complete":true}"#,
+        producer
+            .reader
+            .execute_tool(
+                "f2-real-write-B",
+                "edit",
+                r#"{"path":"unrelated-review.txt","content":"Real independent effect B"}"#,
+            )
+            .await
+            .unwrap();
+        let (body, artifact) = publish_r1_material(
+            services,
+            &producer.actor,
+            "f2-real-result-B",
+            b"Result B describes its own governed write.",
+            Vec::new(),
         )
-        .await
-        .unwrap();
-    producer.finish(services).await;
-    let program = services
-        .agent_action_service()
-        .project(&request.actor.program_id)
-        .unwrap();
-    let goal = services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap();
-    let AgentAction::ObjectiveReview(input) = &request.action else {
-        unreachable!()
-    };
-    let genuine = services
-        .independent_result_review(
-            &request.actor,
-            &program,
-            &input.result_refs,
-            Some(&input.criterion_ref),
-        )
-        .await
-        .expect("complete actual A and B witnesses must admit an independent review");
-    let baseline = crate::agentic::review_evidence::proof_input_snapshot(
-        services.event_store(),
-        &program,
-        Some(&goal),
-        &genuine.verification,
-        crate::agentic::review_evidence::ResultContentReaders {
-            process_inputs: None,
-            artifacts: Some(services.artifact_store().as_ref()),
-            history: services.session_history_reader().as_deref(),
-        },
-    )
-    .unwrap();
-    assert!(genuine.verification.reads.len() >= 2);
-    let read_a = genuine
-        .verification
-        .reads
-        .iter()
-        .find(|read| read.result_ref != *input.result_refs.last().unwrap())
-        .unwrap();
-    let read_b = genuine
-        .verification
-        .reads
-        .iter()
-        .find(|read| read.result_ref == *input.result_refs.last().unwrap())
-        .unwrap();
-    assert!(!read_a.effect_observation_refs.is_empty());
-    assert!(!read_b.effect_observation_refs.is_empty());
-    let mut variants = Vec::new();
-    let mut borrowed = genuine.verification.clone();
-    let borrowed_refs = read_b.effect_observation_refs.clone();
-    borrowed
-        .reads
-        .iter_mut()
-        .find(|read| read.result_ref == read_a.result_ref)
-        .unwrap()
-        .effect_observation_refs = borrowed_refs;
-    variants.push(("borrow-B-reference-for-A", borrowed));
-    let mut missing = genuine.verification.clone();
-    missing
-        .reads
-        .iter_mut()
-        .find(|read| read.result_ref == read_a.result_ref)
-        .unwrap()
-        .effect_observation_refs
-        .clear();
-    variants.push(("missing-target-witness", missing));
-    let mut incomplete = genuine.verification.clone();
-    let witnesses = &mut incomplete
-        .reads
-        .iter_mut()
-        .find(|read| read.result_ref == read_a.result_ref)
-        .unwrap()
-        .effect_observation_refs;
-    assert!(witnesses.len() >= 2);
-    witnesses.truncate(1);
-    variants.push(("nonempty-but-incomplete-multitarget-witness", incomplete));
-    let mut counterfeit_kind = genuine.verification.clone();
-    counterfeit_kind
-        .reads
-        .iter_mut()
-        .find(|read| read.result_ref == read_a.result_ref)
-        .unwrap()
-        .result_kind = harness_contract::goal::GoalResultKind::Content;
-    variants.push(("wrong-result-kind", counterfeit_kind));
-    for (label, mut forged) in variants {
-        forged.work_manifest_digest = baseline.work_digest.clone();
-        forged.effect_manifest_digest = Some(baseline.effects.digest.clone());
-        if !forged.independence_required {
-            forged.review_policy_digest = Some(baseline.policy_digest.clone());
-        }
-        let inputs = forged.input_set.as_mut().unwrap();
-        inputs.semantic_digest = baseline.semantic_digest.clone();
-        inputs.acceptance_policy_digest = baseline.policy_digest.clone();
-        inputs.source_revisions = baseline
-            .sources
-            .iter()
-            .map(|source| (source.stream_id.clone(), source.expected_revision))
-            .collect();
-        assert_eq!(forged.input_set, genuine.verification.input_set);
-        if let Ok(recomputed) = crate::agentic::review_evidence::proof_input_snapshot(
-            services.event_store(),
-            &program,
-            Some(&goal),
-            &forged,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: services.session_history_reader().as_deref(),
-            },
-        ) {
-            forged.work_manifest_digest = recomputed.work_digest;
-            forged.effect_manifest_digest = Some(recomputed.effects.digest);
-            if !forged.independence_required {
-                forged.review_policy_digest = Some(recomputed.policy_digest.clone());
-            }
-            let inputs = forged.input_set.as_mut().unwrap();
-            inputs.semantic_digest = recomputed.semantic_digest;
-            inputs.acceptance_policy_digest = recomputed.policy_digest;
-            inputs.source_revisions = recomputed
-                .sources
-                .into_iter()
-                .map(|source| (source.stream_id, source.expected_revision))
-                .collect();
-            inputs.task_refs = recomputed.task_refs;
-            inputs.artifact_refs = recomputed.artifact_refs;
-        }
-        let before_goal = services.goal_store().get(&goal.id).unwrap().unwrap();
-        let before_program = services
+        .await;
+        let mut request = envelope.clone();
+        request.action_id = "f2-public-multi-result-review".into();
+        let AgentAction::ObjectiveReview(input) = &mut request.action else {
+            unreachable!()
+        };
+        input.result_refs.push(artifact);
+        reviewer
+            .reader
+            .execute_tool(
+                "f2-read-result-B",
+                "evidence_retrieve",
+                &serde_json::json!({"evidence_ref":body}).to_string(),
+            )
+            .await
+            .unwrap();
+        reviewer
+            .reader
+            .execute_tool(
+                "f2-only-read-B",
+                "read_file",
+                r#"{"path":"unrelated-review.txt","complete":true}"#,
+            )
+            .await
+            .unwrap();
+        assert_process_review_refused(services, &request, "write-A-read-only-B").await;
+        reviewer
+            .reader
+            .execute_tool(
+                "f2-partial-read-A",
+                "read_file",
+                r#"{"path":"review-effect.txt","offset":0,"limit":1}"#,
+            )
+            .await
+            .unwrap();
+        assert_process_review_refused(services, &request, "one-target-page-is-not-whole-witness")
+            .await;
+        reviewer
+            .reader
+            .execute_tool(
+                "f2-full-read-A",
+                "read_file",
+                r#"{"path":"review-effect.txt","complete":true}"#,
+            )
+            .await
+            .unwrap();
+        assert_process_review_refused(services, &request, "full-A-still-misses-its-second-target")
+            .await;
+        reviewer
+            .reader
+            .execute_tool(
+                "f2-full-second-target-A",
+                "read_file",
+                r#"{"path":"r1-optional-target.txt","complete":true}"#,
+            )
+            .await
+            .unwrap();
+        producer.finish(services).await;
+        let program = services
             .agent_action_service()
             .project(&request.actor.program_id)
             .unwrap();
-        let refusal = crate::agentic::review_evidence::validate_proof_inputs(
+        let goal = services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap();
+        let AgentAction::ObjectiveReview(input) = &request.action else {
+            unreachable!()
+        };
+        let genuine = services
+            .independent_result_review(
+                &request.actor,
+                &program,
+                &input.result_refs,
+                Some(&input.criterion_ref),
+            )
+            .await
+            .expect("complete actual A and B witnesses must admit an independent review");
+        let baseline = crate::agentic::review_evidence::proof_input_snapshot(
             services.event_store(),
             &program,
             Some(&goal),
-            &forged,
+            &genuine.verification,
             crate::agentic::review_evidence::ResultContentReaders {
                 process_inputs: None,
                 artifacts: Some(services.artifact_store().as_ref()),
                 history: services.session_history_reader().as_deref(),
             },
         )
-        .err()
-        .expect("correct canonical summaries cannot authorize another result's observation");
-        assert!(!refusal.contains("stale v2 proof"), "{label}: {refusal}");
-        let mut internal = request.clone();
-        internal.action_id = format!("f2-internal-negative:{label}");
-        let applied = services
-            .agent_action_service()
-            .apply_verified_review(&internal, &forged);
-        assert!(
-            applied.is_err()
-                || applied.as_ref().is_ok_and(|observation| observation.status
-                    == harness_contract::agent_action::AgentActionStatus::Rejected),
-            "{label}"
-        );
-        let mut historical = before_goal.clone();
-        let mut record = harness_contract::goal::ObjectiveReviewRecord {
-            review_id: format!("negative:{label}"),
-            criterion_ref: input.criterion_ref.clone(),
-            spec_revision: goal.spec_revision,
-            input_manifest_digest: baseline.work_digest.clone(),
-            result_refs: input.result_refs.clone(),
-            evidence_refs: input.evidence_refs.clone(),
-            reviewer_actor: request.actor.actor_id.clone(),
-            reviewer_execution_id: request.actor.execution_id.clone(),
-            producer_refs: genuine.producers.clone(),
-            decision: "satisfied".into(),
-            reason_ref: input.reason_ref.clone(),
-            verification: None,
-        };
-        record.criterion_ref = input.criterion_ref.clone();
-        record.verification = Some(forged);
-        historical.reviews.push(record);
-        assert!(
-            crate::agentic::review_evidence::committed_proof_sources(
+        .unwrap();
+        assert!(genuine.verification.reads.len() >= 2);
+        let read_a = genuine
+            .verification
+            .reads
+            .iter()
+            .find(|read| read.result_ref != *input.result_refs.last().unwrap())
+            .unwrap();
+        let read_b = genuine
+            .verification
+            .reads
+            .iter()
+            .find(|read| read.result_ref == *input.result_refs.last().unwrap())
+            .unwrap();
+        assert!(!read_a.effect_observation_refs.is_empty());
+        assert!(!read_b.effect_observation_refs.is_empty());
+        let mut variants = Vec::new();
+        let mut borrowed = genuine.verification.clone();
+        let borrowed_refs = read_b.effect_observation_refs.clone();
+        borrowed
+            .reads
+            .iter_mut()
+            .find(|read| read.result_ref == read_a.result_ref)
+            .unwrap()
+            .effect_observation_refs = borrowed_refs;
+        variants.push(("borrow-B-reference-for-A", borrowed));
+        let mut missing = genuine.verification.clone();
+        missing
+            .reads
+            .iter_mut()
+            .find(|read| read.result_ref == read_a.result_ref)
+            .unwrap()
+            .effect_observation_refs
+            .clear();
+        variants.push(("missing-target-witness", missing));
+        let mut incomplete = genuine.verification.clone();
+        let witnesses = &mut incomplete
+            .reads
+            .iter_mut()
+            .find(|read| read.result_ref == read_a.result_ref)
+            .unwrap()
+            .effect_observation_refs;
+        assert!(witnesses.len() >= 2);
+        witnesses.truncate(1);
+        variants.push(("nonempty-but-incomplete-multitarget-witness", incomplete));
+        let mut counterfeit_kind = genuine.verification.clone();
+        counterfeit_kind
+            .reads
+            .iter_mut()
+            .find(|read| read.result_ref == read_a.result_ref)
+            .unwrap()
+            .result_kind = harness_contract::goal::GoalResultKind::Content;
+        variants.push(("wrong-result-kind", counterfeit_kind));
+        for (label, mut forged) in variants {
+            forged.work_manifest_digest = baseline.work_digest.clone();
+            forged.effect_manifest_digest = Some(baseline.effects.digest.clone());
+            if !forged.independence_required {
+                forged.review_policy_digest = Some(baseline.policy_digest.clone());
+            }
+            let inputs = forged.input_set.as_mut().unwrap();
+            inputs.semantic_digest = baseline.semantic_digest.clone();
+            inputs.acceptance_policy_digest = baseline.policy_digest.clone();
+            inputs.source_revisions = baseline
+                .sources
+                .iter()
+                .map(|source| (source.stream_id.clone(), source.expected_revision))
+                .collect();
+            assert_eq!(forged.input_set, genuine.verification.input_set);
+            if let Ok(recomputed) = crate::agentic::review_evidence::proof_input_snapshot(
                 services.event_store(),
-                &historical,
+                &program,
+                Some(&goal),
+                &forged,
                 crate::agentic::review_evidence::ResultContentReaders {
                     process_inputs: None,
                     artifacts: Some(services.artifact_store().as_ref()),
-                    history: services.session_history_reader().as_deref()
+                    history: services.session_history_reader().as_deref(),
+                },
+            ) {
+                forged.work_manifest_digest = recomputed.work_digest;
+                forged.effect_manifest_digest = Some(recomputed.effects.digest);
+                if !forged.independence_required {
+                    forged.review_policy_digest = Some(recomputed.policy_digest.clone());
                 }
-            )
-            .is_err(),
-            "exact-A B proof-source gate must reject {label}"
-        );
-        assert_eq!(
-            services.goal_store().get(&goal.id).unwrap().unwrap(),
-            before_goal
-        );
-        assert_eq!(
-            services
+                let inputs = forged.input_set.as_mut().unwrap();
+                inputs.semantic_digest = recomputed.semantic_digest;
+                inputs.acceptance_policy_digest = recomputed.policy_digest;
+                inputs.source_revisions = recomputed
+                    .sources
+                    .into_iter()
+                    .map(|source| (source.stream_id, source.expected_revision))
+                    .collect();
+                inputs.task_refs = recomputed.task_refs;
+                inputs.artifact_refs = recomputed.artifact_refs;
+            }
+            let before_goal = services.goal_store().get(&goal.id).unwrap().unwrap();
+            let before_program = services
                 .agent_action_service()
                 .project(&request.actor.program_id)
-                .unwrap(),
-            before_program
+                .unwrap();
+            let refusal = crate::agentic::review_evidence::validate_proof_inputs(
+                services.event_store(),
+                &program,
+                Some(&goal),
+                &forged,
+                crate::agentic::review_evidence::ResultContentReaders {
+                    process_inputs: None,
+                    artifacts: Some(services.artifact_store().as_ref()),
+                    history: services.session_history_reader().as_deref(),
+                },
+            )
+            .err()
+            .expect("correct canonical summaries cannot authorize another result's observation");
+            assert!(!refusal.contains("stale v2 proof"), "{label}: {refusal}");
+            let mut internal = request.clone();
+            internal.action_id = format!("f2-internal-negative:{label}");
+            let applied = services
+                .agent_action_service()
+                .apply_verified_review(&internal, &forged);
+            assert!(
+                applied.is_err()
+                    || applied.as_ref().is_ok_and(|observation| observation.status
+                        == harness_contract::agent_action::AgentActionStatus::Rejected),
+                "{label}"
+            );
+            let mut historical = before_goal.clone();
+            let mut record = harness_contract::goal::ObjectiveReviewRecord {
+                review_id: format!("negative:{label}"),
+                criterion_ref: input.criterion_ref.clone(),
+                spec_revision: goal.spec_revision,
+                input_manifest_digest: baseline.work_digest.clone(),
+                result_refs: input.result_refs.clone(),
+                evidence_refs: input.evidence_refs.clone(),
+                reviewer_actor: request.actor.actor_id.clone(),
+                reviewer_execution_id: request.actor.execution_id.clone(),
+                producer_refs: genuine.producers.clone(),
+                decision: "satisfied".into(),
+                reason_ref: input.reason_ref.clone(),
+                verification: None,
+            };
+            record.criterion_ref = input.criterion_ref.clone();
+            record.verification = Some(forged);
+            historical.reviews.push(record);
+            assert!(
+                crate::agentic::review_evidence::committed_proof_sources(
+                    services.event_store(),
+                    &historical,
+                    crate::agentic::review_evidence::ResultContentReaders {
+                        process_inputs: None,
+                        artifacts: Some(services.artifact_store().as_ref()),
+                        history: services.session_history_reader().as_deref()
+                    }
+                )
+                .is_err(),
+                "exact-A B proof-source gate must reject {label}"
+            );
+            assert_eq!(
+                services.goal_store().get(&goal.id).unwrap().unwrap(),
+                before_goal
+            );
+            assert_eq!(
+                services
+                    .agent_action_service()
+                    .project(&request.actor.program_id)
+                    .unwrap(),
+                before_program
+            );
+            assert!(before_goal.terminal.is_none());
+        }
+        let applied = services.submit_agent_action(&request).await.unwrap();
+        assert_eq!(
+            applied.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
         );
-        assert!(before_goal.terminal.is_none());
-    }
-    let applied = services.submit_agent_action(&request).await.unwrap();
-    assert_eq!(
-        applied.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
+    })
 }
 
 fn assert_real_process_effect_proof_conclusion_guards(
@@ -17244,159 +11848,168 @@ async fn exercise_same_native_publisher_review(
 }
 
 #[cfg(test)]
-async fn exercise_program_publication_review(
-    services: &ReviewedFixtureServices,
-    _host: &Arc<ReviewReadHost>,
-    root_actor: &AgentActorBinding,
-    reviewer: &R1ScopedReviewer,
-    native: &NativeSourcePair,
+#[inline(never)]
+fn exercise_program_publication_review<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    _host: &'fixture Arc<ReviewReadHost>,
+    root_actor: &'fixture AgentActorBinding,
+    reviewer: &'fixture R1ScopedReviewer,
+    native: &'fixture NativeSourcePair,
     case: ProgramPublicationCase,
-    reason_ref: &str,
-    result_refs: &mut Vec<String>,
-) -> bool {
-    let (logical, selector) = native.registration.as_ref().unwrap();
-    let selected = if case.logical { logical } else { selector };
-    println!("R1_PROGRAM_PUBLICATION_CASE {case:?} actor={} execution={} selector={selector} logical={logical}",
+    reason_ref: &'fixture str,
+    result_refs: &'fixture mut Vec<String>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = bool> + 'fixture>> {
+    Box::pin(async move {
+        let (logical, selector) = native.registration.as_ref().unwrap();
+        let selected = if case.logical { logical } else { selector };
+        println!("R1_PROGRAM_PUBLICATION_CASE {case:?} actor={} execution={} selector={selector} logical={logical}",
         native.packet.agent_id(), native.packet.graph_id());
-    assert_eq!(native.result_contents[1], *selector);
-    if case.encoding.is_none() {
-        services
-            .assert_program_publication_for_test(root_actor, selected, selector, &native.packet)
-            .await;
-    }
-    let mut recursive = None;
-    let mut recursive_primary = None;
-    if case.probe == ProgramPublicationProbe::Recursive {
-        let producer = start_r1_scoped_goal_worker(
-            services,
-            root_actor,
-            selector,
-            "program-recursive-producer",
-            false,
-            false,
-        )
-        .await;
-        let bytes = b"A distinct derived report produced after actually reading the original Tool publication.";
-        std::fs::write(services.workspace_root().join("program-derived.txt"), bytes).unwrap();
-        let output = producer
-            .reader
-            .execute_tool(
-                "program-derived-publish",
-                "artifact_publish",
-                &serde_json::json!({"source":"file", "path":"program-derived.txt",
-                "sha256":crate::context_evidence::read_sha256(bytes), "media_type":"text/plain"})
-                .to_string(),
-            )
-            .await
-            .unwrap();
-        let publication: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(publication["status"], "published");
-        let derived = publication["content_ref"].as_str().unwrap().to_string();
-        let derived_logical = commit_existing_result_selector(
-            services,
-            &producer.actor,
-            "program-derived-registration",
-            &derived,
-            if case.logical {
-                vec![logical.clone()]
-            } else {
-                Vec::new()
-            },
-        )
-        .await;
-        let program = services
-            .agent_action_service()
-            .project(&root_actor.program_id)
-            .unwrap();
-        assert_eq!(
-            crate::agentic::review_evidence::review_result_identity(&program, selector).unwrap(),
-            *logical
-        );
-        assert_eq!(
-            crate::agentic::review_evidence::review_result_identity(&program, logical).unwrap(),
-            *logical
-        );
-        recursive_primary = Some(
+        assert_eq!(native.result_contents[1], *selector);
+        if case.encoding.is_none() {
             services
-                .program_primary_for_test(root_actor, &derived_logical, selector, &native.packet)
-                .await,
-        );
-        result_refs.retain(|reference| reference != logical && reference != selector);
-        result_refs.push(derived_logical.clone());
+                .assert_program_publication_for_test(root_actor, selected, selector, &native.packet)
+                .await;
+        }
+        let mut recursive = None;
+        let mut recursive_primary = None;
+        if case.probe == ProgramPublicationProbe::Recursive {
+            let producer = start_r1_scoped_goal_worker(
+                services,
+                root_actor,
+                selector,
+                "program-recursive-producer",
+                false,
+                false,
+            )
+            .await;
+            let bytes = b"A distinct derived report produced after actually reading the original Tool publication.";
+            std::fs::write(services.workspace_root().join("program-derived.txt"), bytes).unwrap();
+            let output = producer
+                .reader
+                .execute_tool(
+                    "program-derived-publish",
+                    "artifact_publish",
+                    &serde_json::json!({"source":"file", "path":"program-derived.txt",
+                "sha256":crate::context_evidence::read_sha256(bytes), "media_type":"text/plain"})
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let publication: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(publication["status"], "published");
+            let derived = publication["content_ref"].as_str().unwrap().to_string();
+            let derived_logical = commit_existing_result_selector(
+                services,
+                &producer.actor,
+                "program-derived-registration",
+                &derived,
+                if case.logical {
+                    vec![logical.clone()]
+                } else {
+                    Vec::new()
+                },
+            )
+            .await;
+            let program = services
+                .agent_action_service()
+                .project(&root_actor.program_id)
+                .unwrap();
+            assert_eq!(
+                crate::agentic::review_evidence::review_result_identity(&program, selector)
+                    .unwrap(),
+                *logical
+            );
+            assert_eq!(
+                crate::agentic::review_evidence::review_result_identity(&program, logical).unwrap(),
+                *logical
+            );
+            recursive_primary = Some(
+                services
+                    .program_primary_for_test(
+                        root_actor,
+                        &derived_logical,
+                        selector,
+                        &native.packet,
+                    )
+                    .await,
+            );
+            result_refs.retain(|reference| reference != logical && reference != selector);
+            result_refs.push(derived_logical.clone());
+            reviewer
+                .reader
+                .execute_tool(
+                    "program-independent-derived-read",
+                    "evidence_retrieve",
+                    &serde_json::json!({"evidence_ref":derived}).to_string(),
+                )
+                .await
+                .unwrap();
+            recursive = Some((producer, derived, derived_logical));
+        }
         reviewer
             .reader
             .execute_tool(
-                "program-independent-derived-read",
-                "evidence_retrieve",
-                &serde_json::json!({"evidence_ref":derived}).to_string(),
+                "program-independent-effect-read",
+                "read_file",
+                r#"{"path":"review-effect.txt","complete":true}"#,
             )
             .await
             .unwrap();
-        recursive = Some((producer, derived, derived_logical));
-    }
-    reviewer
-        .reader
-        .execute_tool(
-            "program-independent-effect-read",
-            "read_file",
-            r#"{"path":"review-effect.txt","complete":true}"#,
-        )
-        .await
-        .unwrap();
-    if case.encoding.is_some() {
-        assert_program_review_refused(
-            services,
-            &reviewer.actor,
-            result_refs.clone(),
-            reason_ref,
-            case.encoding,
-        )
-        .await;
+        if case.encoding.is_some() {
+            assert_program_review_refused(
+                services,
+                &reviewer.actor,
+                result_refs.clone(),
+                reason_ref,
+                case.encoding,
+            )
+            .await;
+            if let Some((producer, _, _)) = recursive {
+                producer.finish(services).await;
+            }
+            if let Some(primary) = recursive_primary {
+                primary.expect("recursive-only negative requires D metadata to resolve before rejecting original S; unknown-source fail-closed must not be misreported as recursive coverage");
+            }
+            return true;
+        }
+        if let Some(primary) = recursive_primary {
+            primary.unwrap();
+        }
+        if matches!(
+            case.probe,
+            ProgramPublicationProbe::Publisher | ProgramPublicationProbe::Recursive
+        ) {
+            let (review_results, review_contents) =
+                if let Some((_, derived, derived_logical)) = recursive.as_ref() {
+                    (
+                        vec![derived_logical.clone()],
+                        vec![derived.clone(), selector.clone(), reason_ref.to_string()],
+                    )
+                } else {
+                    (
+                        vec![selected.clone()],
+                        vec![selector.clone(), reason_ref.to_string()],
+                    )
+                };
+            exercise_same_native_publisher_review(
+                services,
+                root_actor,
+                native,
+                review_results,
+                review_contents,
+                reason_ref,
+                recursive.is_some(),
+            )
+            .await;
+            if case.probe == ProgramPublicationProbe::Publisher {
+                return true;
+            }
+        }
         if let Some((producer, _, _)) = recursive {
             producer.finish(services).await;
         }
-        if let Some(primary) = recursive_primary {
-            primary.expect("recursive-only negative requires D metadata to resolve before rejecting original S; unknown-source fail-closed must not be misreported as recursive coverage");
-        }
-        return true;
-    }
-    if let Some(primary) = recursive_primary {
-        primary.unwrap();
-    }
-    if matches!(
-        case.probe,
-        ProgramPublicationProbe::Publisher | ProgramPublicationProbe::Recursive
-    ) {
-        let (review_results, review_contents) =
-            if let Some((_, derived, derived_logical)) = recursive.as_ref() {
-                (
-                    vec![derived_logical.clone()],
-                    vec![derived.clone(), selector.clone(), reason_ref.to_string()],
-                )
-            } else {
-                (
-                    vec![selected.clone()],
-                    vec![selector.clone(), reason_ref.to_string()],
-                )
-            };
-        exercise_same_native_publisher_review(
-            services,
-            root_actor,
-            native,
-            review_results,
-            review_contents,
-            reason_ref,
-            recursive.is_some(),
-        )
-        .await;
-        if case.probe == ProgramPublicationProbe::Publisher {
-            return true;
-        }
-    }
-    if let Some((producer, _, _)) = recursive {
-        producer.finish(services).await;
-    }
-    false
+        false
+    })
 }
 
 struct NativeSourcePair {
@@ -17565,132 +12178,158 @@ async fn assert_native_task_material_wire(
     );
 }
 
-async fn exercise_native_task_sources(
-    services: &ReviewedFixtureServices,
-    host: &Arc<ReviewReadHost>,
-    root_actor: &AgentActorBinding,
+#[inline(never)]
+fn exercise_native_task_sources<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    host: &'fixture Arc<ReviewReadHost>,
+    root_actor: &'fixture AgentActorBinding,
     proof_scenario: R1ProofScenario,
-) -> NativeSourcePair {
-    use harness_contract::agent::*;
-    let _ = proof_scenario;
-    let wire = RootWireServer::start().await;
-    services
-        .provider_registry()
-        .replace_with_context_windows(
-            crate::config::ProvidersConfig {
-                providers: std::collections::HashMap::from([(
-                    "r1-native-loopback".into(),
-                    crate::config::ProviderConfig {
-                        name: "r1-native-loopback".into(),
-                        base_url: wire.endpoint.clone(),
-                        api_key: "local-fixture".into(),
-                        models: vec!["r1-native-wire".into()],
-                        protocol: Some("completions".into()),
-                        parallel_tool_calls: Default::default(),
-                        early_tool_start: Default::default(),
-                    },
-                )]),
-            },
-            std::collections::BTreeMap::from([("r1-native-wire".into(), 262_144)]),
-        )
-        .unwrap();
-    assert_eq!(
+) -> std::pin::Pin<Box<impl std::future::Future<Output = NativeSourcePair> + 'fixture>> {
+    Box::pin(async move {
+        use harness_contract::agent::*;
+        let _ = proof_scenario;
+        let wire = RootWireServer::start().await;
         services
             .provider_registry()
-            .pin()
-            .configured_context_window("r1-native-wire"),
-        Some(262_144)
-    );
-    let resources = services.provider_resource_config().read().unwrap().clone();
-    services
-        .replace_provider_resource_config(resources)
-        .unwrap();
-    let registry = services.definition_registry();
-    let base = registry
-        .resolve_agent(
-            &AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap(),
-            RevisionSelector::LatestApprovedStable,
-        )
-        .unwrap();
-    let mut manifest = base.revision.manifest.clone();
-    manifest.definition_id =
-        AgentDefinitionId::new(DefinitionScope::Workspace, "r1/native-sources").unwrap();
-    manifest.executor = AgentExecutorPolicy::CowdNative;
-    manifest.model_policy.allowed_models = vec!["r1-native-wire".into()];
-    manifest.model_policy.fallback_allowed = false;
-    let revision = registry
-        .agents()
-        .store_revision(manifest, &base.agent_markdown)
-        .unwrap();
-    registry
-        .agents()
-        .record_release_assignment(&ReleaseAssignment {
-            scope: DefinitionScope::Workspace,
-            revision_ref: revision.revision.revision_ref.clone(),
-            channel: ReleaseChannel::Stable,
-            status: ReleaseAssignmentStatus::Active,
-            authorization: ReleaseAuthorization::HumanApproval {
-                approval_ref: "fixture:approved-native-sources".into(),
-            },
-            content_digest: revision.revision.content_digest.clone(),
-        })
-        .unwrap();
-    services.refresh_definition_catalog().unwrap();
-    let envelope = |id: &str, action| AgentActionEnvelope {
-        action_id: format!("native-sources:{id}"),
-        actor: root_actor.clone(),
-        expected_revision: None,
-        action,
-    };
-    let team = services
-        .submit_agent_action(&envelope(
-            "team",
-            AgentAction::TeamCreate(TeamCreateInput {
-                name: "Native source execution".into(),
-                mission: "Read with the original Native backend".into(),
-                objective: None,
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        team.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let team_ref = team.changed_refs[0].clone();
-    let member = services.submit_agent_action(&envelope("member", AgentAction::AgentInvite(AgentInviteInput {
+            .replace_with_context_windows(
+                crate::config::ProvidersConfig {
+                    providers: std::collections::HashMap::from([(
+                        "r1-native-loopback".into(),
+                        crate::config::ProviderConfig {
+                            name: "r1-native-loopback".into(),
+                            base_url: wire.endpoint.clone(),
+                            api_key: "local-fixture".into(),
+                            models: vec!["r1-native-wire".into()],
+                            protocol: Some("completions".into()),
+                            parallel_tool_calls: Default::default(),
+                            early_tool_start: Default::default(),
+                        },
+                    )]),
+                },
+                std::collections::BTreeMap::from([("r1-native-wire".into(), 262_144)]),
+            )
+            .unwrap();
+        assert_eq!(
+            services
+                .provider_registry()
+                .pin()
+                .configured_context_window("r1-native-wire"),
+            Some(262_144)
+        );
+        let resources = services.provider_resource_config().read().unwrap().clone();
+        services
+            .replace_provider_resource_config(resources)
+            .unwrap();
+        let registry = services.definition_registry();
+        let base = registry
+            .resolve_agent(
+                &AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap(),
+                RevisionSelector::LatestApprovedStable,
+            )
+            .unwrap();
+        let mut manifest = base.revision.manifest.clone();
+        manifest.definition_id =
+            AgentDefinitionId::new(DefinitionScope::Workspace, "r1/native-sources").unwrap();
+        manifest.executor = AgentExecutorPolicy::CowdNative;
+        manifest.model_policy.allowed_models = vec!["r1-native-wire".into()];
+        manifest.model_policy.fallback_allowed = false;
+        let revision = registry
+            .agents()
+            .store_revision(manifest, &base.agent_markdown)
+            .unwrap();
+        registry
+            .agents()
+            .record_release_assignment(&ReleaseAssignment {
+                scope: DefinitionScope::Workspace,
+                revision_ref: revision.revision.revision_ref.clone(),
+                channel: ReleaseChannel::Stable,
+                status: ReleaseAssignmentStatus::Active,
+                authorization: ReleaseAuthorization::HumanApproval {
+                    approval_ref: "fixture:approved-native-sources".into(),
+                },
+                content_digest: revision.revision.content_digest.clone(),
+            })
+            .unwrap();
+        services.refresh_definition_catalog().unwrap();
+        let envelope = |id: &str, action| AgentActionEnvelope {
+            action_id: format!("native-sources:{id}"),
+            actor: root_actor.clone(),
+            expected_revision: None,
+            action,
+        };
+        let team = services
+            .submit_agent_action(&envelope(
+                "team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Native source execution".into(),
+                    mission: "Read with the original Native backend".into(),
+                    objective: None,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            team.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let team_ref = team.changed_refs[0].clone();
+        let member = services.submit_agent_action(&envelope("member", AgentAction::AgentInvite(AgentInviteInput {
         team_ref:team_ref.clone(), role:"Native source worker".into(),
         mission:"Read review-effect.txt and publish the exact selected file, then submit the authored report".into(),
         required_capabilities:vec!["read".into()], existing_agent_ref:None,
         definition_ref:Some(REAL_NATIVE_DEFINITION.into()), model_profile_ref:None,
         expertise_hints:vec![], execution_requirements:vec![],
     }))).await.unwrap();
-    assert_eq!(
-        member.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let review_team = services.submit_agent_action(&envelope(
-        "independent-review-team", AgentAction::TeamCreate(TeamCreateInput {
-            name:"Native source independent review".into(),
-            mission:"Review the Native deliverable without borrowing held fixture executions".into(),
-            objective:None,
-        }),
-    )).await.unwrap();
-    assert_eq!(review_team.status, harness_contract::agent_action::AgentActionStatus::Applied);
-    let independent_reviewer = services.submit_agent_action(&envelope(
-        "independent-reviewer", AgentAction::AgentInvite(AgentInviteInput {
-            team_ref:review_team.changed_refs[0].clone(), role:"Native source verifier".into(),
-            mission:"Independently inspect and review only the submitted Native deliverable".into(),
-            required_capabilities:vec!["read".into()], existing_agent_ref:None,
-            definition_ref:Some(REAL_PROCESS_DEFINITION.into()), model_profile_ref:None,
-            expertise_hints:vec![], execution_requirements:vec![],
-        }),
-    )).await.unwrap();
-    assert_eq!(independent_reviewer.status, harness_contract::agent_action::AgentActionStatus::Applied);
-    let independent_reviewer = independent_reviewer.changed_refs[0].clone();
-    assert!(!services.agent_runtime().running_agentic_members(&root_actor.program_id)
-        .contains(&independent_reviewer));
-    let mut publication = envelope("task", AgentAction::TaskPublish(TaskPublishInput {
+        assert_eq!(
+            member.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let review_team = services
+            .submit_agent_action(&envelope(
+                "independent-review-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Native source independent review".into(),
+                    mission:
+                        "Review the Native deliverable without borrowing held fixture executions"
+                            .into(),
+                    objective: None,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            review_team.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let independent_reviewer = services
+            .submit_agent_action(&envelope(
+                "independent-reviewer",
+                AgentAction::AgentInvite(AgentInviteInput {
+                    team_ref: review_team.changed_refs[0].clone(),
+                    role: "Native source verifier".into(),
+                    mission:
+                        "Independently inspect and review only the submitted Native deliverable"
+                            .into(),
+                    required_capabilities: vec!["read".into()],
+                    existing_agent_ref: None,
+                    definition_ref: Some(REAL_PROCESS_DEFINITION.into()),
+                    model_profile_ref: None,
+                    expertise_hints: vec![],
+                    execution_requirements: vec![],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            independent_reviewer.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let independent_reviewer = independent_reviewer.changed_refs[0].clone();
+        assert!(!services
+            .agent_runtime()
+            .running_agentic_members(&root_actor.program_id)
+            .contains(&independent_reviewer));
+        let mut publication = envelope("task", AgentAction::TaskPublish(TaskPublishInput {
         team_ref:team_ref.clone(), title:"Native immutable source proof".into(),
         objective:"Read review-effect.txt and publish the exact selected file, then submit the authored report".into(),
         acceptance:"A claimed, read-only Native attempt sends the full result through the actual provider".into(),
@@ -17699,294 +12338,304 @@ async fn exercise_native_task_sources(
         purpose:harness_contract::agent_action::TaskPurpose::Delivery,
         execution_requirements:vec![], expertise_hints:vec![],
     }));
-    #[cfg(test)]
-    let _ = NATIVE_TASK_CASE.try_with(|case| {
-        if let AgentAction::TaskPublish(input) = &mut publication.action {
-            if let Some(acceptance) = &case.acceptance {
-                input.acceptance = acceptance.clone();
-                input.acceptance_checks.clear();
+        #[cfg(test)]
+        let _ = NATIVE_TASK_CASE.try_with(|case| {
+            if let AgentAction::TaskPublish(input) = &mut publication.action {
+                if let Some(acceptance) = &case.acceptance {
+                    input.acceptance = acceptance.clone();
+                    input.acceptance_checks.clear();
+                }
+                input.criterion_source = case.criterion_source.clone();
             }
-            input.criterion_source = case.criterion_source.clone();
+        });
+        let task = services.submit_agent_action(&publication).await.unwrap();
+        assert_eq!(
+            task.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let task_ref = task.changed_refs[0].clone();
+        let reply = |id: &str, name: &str, input: serde_json::Value, content: Option<&str>| {
+            serde_json::json!({
+                "role":"assistant", "content":content,
+                "tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}],
+            })
+        };
+        let selected_bytes =
+            std::fs::read(services.workspace_root().join("review-effect.txt")).unwrap();
+        let selected_hash = crate::context_evidence::read_sha256(&selected_bytes);
+        let publications = [(
+            "native-publication-small",
+            format!("text/plain;fixture={}", "s".repeat(1024)),
+        )];
+        let mut submitted_unresolved: Vec<String> = Vec::new();
+        #[cfg(test)]
+        if let Ok(unresolved) = NATIVE_TASK_CASE.try_with(|case| case.unresolved.clone()) {
+            submitted_unresolved = unresolved;
         }
-    });
-    let task = services.submit_agent_action(&publication).await.unwrap();
-    assert_eq!(
-        task.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let task_ref = task.changed_refs[0].clone();
-    let reply = |id: &str, name: &str, input: serde_json::Value, content: Option<&str>| {
-        serde_json::json!({
-            "role":"assistant", "content":content,
-            "tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}],
-        })
-    };
-    let selected_bytes =
-        std::fs::read(services.workspace_root().join("review-effect.txt")).unwrap();
-    let selected_hash = crate::context_evidence::read_sha256(&selected_bytes);
-    let publications = [(
-        "native-publication-small",
-        format!("text/plain;fixture={}", "s".repeat(1024)),
-    )];
-    let mut submitted_unresolved: Vec<String> = Vec::new();
-    #[cfg(test)]
-    if let Ok(unresolved) = NATIVE_TASK_CASE.try_with(|case| case.unresolved.clone()) {
-        submitted_unresolved = unresolved;
-    }
-    {
-        let mut replies = wire.replies.lock().unwrap();
-        replies.push_back(reply("native-claim", "task_claim",
+        {
+            let mut replies = wire.replies.lock().unwrap();
+            replies.push_back(reply("native-claim", "task_claim",
             serde_json::json!({"task_ref":task_ref,"reason":"This original read-only Task fits my approved role"}), None));
-        replies.push_back(reply(
-            "native-preview-read",
-            "read_file",
-            serde_json::json!({"path":"review-effect.txt","offset":0,"limit":1}),
-            None,
-        ));
-        replies.push_back(reply(
-            "native-full-read",
-            "read_file",
-            serde_json::json!({"path":"review-effect.txt","complete":true}),
-            None,
-        ));
-        for (call, media_type) in &publications {
-            replies.push_back(reply(call, "artifact_publish", serde_json::json!({
+            replies.push_back(reply(
+                "native-preview-read",
+                "read_file",
+                serde_json::json!({"path":"review-effect.txt","offset":0,"limit":1}),
+                None,
+            ));
+            replies.push_back(reply(
+                "native-full-read",
+                "read_file",
+                serde_json::json!({"path":"review-effect.txt","complete":true}),
+                None,
+            ));
+            for (call, media_type) in &publications {
+                replies.push_back(reply(call, "artifact_publish", serde_json::json!({
                 "source":"file","path":"review-effect.txt","sha256":selected_hash,"media_type":media_type,
             }), None));
-        }
-        #[cfg(test)]
-        if NATIVE_TASK_CASE
-            .try_with(|case| case.commit_report)
-            .unwrap_or(false)
-        {
-            replies.push_back(reply("native-first-claim-artifact", "artifact_commit", serde_json::json!({
+            }
+            #[cfg(test)]
+            if NATIVE_TASK_CASE
+                .try_with(|case| case.commit_report)
+                .unwrap_or(false)
+            {
+                replies.push_back(reply("native-first-claim-artifact", "artifact_commit", serde_json::json!({
                 "content_ref":"current_message_block:0","kind":"report",
                 "title":"First-claim explicit report","relates_to":[task_ref],
             }), Some("A real first-claim artifact authored and committed by the active Native producer after its complete source read.")));
-        }
-        replies.push_back(reply("native-submit", "task_submit", serde_json::json!({
+            }
+            replies.push_back(reply("native-submit", "task_submit", serde_json::json!({
             "task_ref":task_ref,"artifact_refs":[],"evidence_refs":[],"unresolved":submitted_unresolved,
             "deliverable":{"block_index":0,"kind":"report","title":"Actual Native source report"},
         }), Some("I inspected the complete current review-effect.txt through the original Native provider ToolResult. The bounded file was published without changes; this report records the actual source-backed result. No unresolved items.")));
-        replies.push_back(serde_json::json!({"role":"assistant",
+            replies.push_back(serde_json::json!({"role":"assistant",
             "content":"The claimed Task has been submitted. The full source was inspected and the immutable report is complete. No unresolved items."}));
-    }
-    {
-        let mut replies = wire.replies.lock().unwrap();
-        replies.push_back(reply("native-rework-claim", "task_claim",
-            serde_json::json!({"task_ref":task_ref,
-                "reason":"The gap review reopened this Task; I claim the rework attempt"}), None));
-        replies.push_back(reply(
-            "native-rework-preview-read",
-            "read_file",
-            serde_json::json!({"path":"review-effect.txt","offset":0,"limit":1}),
-            None,
-        ));
-        replies.push_back(reply(
-            "native-rework-full-read",
-            "read_file",
-            serde_json::json!({"path":"review-effect.txt","complete":true}),
-            None,
-        ));
-        replies.push_back(reply("native-rework-publication-small", "artifact_publish", serde_json::json!({
+        }
+        {
+            let mut replies = wire.replies.lock().unwrap();
+            replies.push_back(reply(
+                "native-rework-claim",
+                "task_claim",
+                serde_json::json!({"task_ref":task_ref,
+                "reason":"The gap review reopened this Task; I claim the rework attempt"}),
+                None,
+            ));
+            replies.push_back(reply(
+                "native-rework-preview-read",
+                "read_file",
+                serde_json::json!({"path":"review-effect.txt","offset":0,"limit":1}),
+                None,
+            ));
+            replies.push_back(reply(
+                "native-rework-full-read",
+                "read_file",
+                serde_json::json!({"path":"review-effect.txt","complete":true}),
+                None,
+            ));
+            replies.push_back(reply("native-rework-publication-small", "artifact_publish", serde_json::json!({
             "source":"file","path":"review-effect.txt","sha256":selected_hash,"media_type":"text/plain;fixture=rework",
         }), None));
-        replies.push_back(reply("native-rework-submit", "task_submit", serde_json::json!({
+            replies.push_back(reply("native-rework-submit", "task_submit", serde_json::json!({
             "task_ref":task_ref,"artifact_refs":[],"evidence_refs":[],"unresolved":submitted_unresolved,
             "deliverable":{"block_index":0,"kind":"report","title":"Actual Native source rework report"},
         }), Some("The reopened Task was re-claimed and the complete current review-effect.txt was inspected again through the original Native provider ToolResult. The rework publication records the same source-backed result. No unresolved items.")));
-        replies.push_back(serde_json::json!({"role":"assistant",
+            replies.push_back(serde_json::json!({"role":"assistant",
             "content":"The rework attempt has been submitted. The full source was inspected again and the immutable report is complete. No unresolved items."}));
-    }
-    #[cfg(test)]
-    let encoding_guard = if let R1ProofScenario::ProgramPublication(case) = proof_scenario {
-        case.encoding.map(|field| {
-            RuntimeServices::program_raw_encoding_for_test(
-                services.event_store().clone(),
-                &root_actor.session_id,
-                "native-publication-small",
-                field,
-            )
-        })
-    } else {
-        None
-    };
-    #[cfg(test)]
-    let setup = NATIVE_TASK_SETUP
-        .try_with(|slot| slot.borrow_mut().take())
-        .ok()
-        .flatten();
-    #[cfg(test)]
-    let submit_pause = setup.as_ref().map(|_| {
-        let arrived = Arc::new(tokio::sync::Notify::new());
-        let resume = Arc::new(tokio::sync::Notify::new());
-        *wire.pause.lock().unwrap() =
-            Some(("native-submit".into(), arrived.clone(), resume.clone()));
-        (arrived, resume)
-    });
-    let admitted = services
-        .dispatch_agentic_followups(
-            &publication,
-            AgenticDispatchContext {
-                session_id: root_actor.session_id.clone(),
-                turn_id: root_actor.turn_id.clone(),
-                model_lease: "r1-native-wire".into(),
-                permission_ceiling: PermissionMode::ReadOnly,
-                resource_scopes: vec!["workspace:.".into()],
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(admitted.len(), 1);
-    assert_eq!(admitted[0].agent_ref, member.changed_refs[0]);
-    let graph = services
-        .graph_state_store()
-        .load(&admitted[0].graph_id)
-        .unwrap();
-    let node = graph
-        .nodes
-        .iter()
-        .find(|node| node.kind == ExecutionNodeKind::AgentTask)
-        .unwrap();
-    let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref).unwrap();
-    packet.validate_cohort_prompt_package().unwrap();
-    let binding = packet.binding.as_ref().unwrap();
-    binding.validate().unwrap();
-    assert_eq!(binding.definition_ref, revision.revision.revision_ref);
-    assert!(matches!(binding.executor, AgentExecutorPolicy::CowdNative));
-    assert!(binding.release.is_none());
-    let approved = registry
-        .resolve_agent(
-            &binding.definition_ref.definition_id,
-            RevisionSelector::LatestApprovedStable,
-        )
-        .unwrap();
-    assert_eq!(approved.revision.revision_ref, binding.definition_ref);
-    assert_eq!(
-        approved.revision.content_digest,
-        revision.revision.content_digest
-    );
-    let assignments = registry
-        .agents()
-        .release_assignments(&binding.definition_ref.definition_id)
-        .unwrap();
-    assert!(assignments.iter().any(
-        |assignment| assignment.revision_ref == binding.definition_ref
-            && assignment.channel == ReleaseChannel::Stable
-            && assignment.status == ReleaseAssignmentStatus::Active
-            && assignment.content_digest == revision.revision.content_digest
-    ));
-    assert!(binding
-        .effective_capabilities
-        .iter()
-        .all(|capability| matches!(capability, AgentCapability::Read | AgentCapability::Search)));
-    let parent = graph
-        .parent_execution
-        .as_ref()
-        .expect("Native dispatch must retain the original parent");
-    assert_eq!(
-        Some(parent.execution_id.as_str()),
-        root_actor.root_execution_id.as_deref()
-    );
-    let parent_graph = services
-        .graph_state_store()
-        .load(&parent.execution_id)
-        .unwrap();
-    assert!(parent_graph
-        .nodes
-        .iter()
-        .any(|node| node.id == parent.node_id && node.kind == ExecutionNodeKind::InlineModel));
-    assert!(matches!(packet.agentic_binding.as_ref().unwrap().focus,
-        AgenticExecutionFocus::TaskExecute { ref task_ref } if task_ref == &task.changed_refs[0]));
-    assert_eq!(packet.permission_ceiling, PermissionMode::ReadOnly);
-    assert!(!packet
-        .allowed_tools
-        .iter()
-        .any(|name| name == "edit" || name == "execute_code"));
-    assert!(packet.allowed_tools.iter().any(|name| name == "read_file"));
-    assert!(packet
-        .allowed_tools
-        .iter()
-        .any(|name| name == "task_submit"));
-    #[cfg(test)]
-    if let Some(setup) = setup {
-        let (arrived, resume) = submit_pause.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), arrived.notified())
-            .await
-            .unwrap_or_else(|elapsed| {
-                panic!(
-                    "original TaskSubmit wire pause did not arrive within 30s: {elapsed:?}; {}",
-                    RealProcessSession { services: services.0.clone(), packet: packet.clone() }
-                        .failure_diagnostic(),
-                );
-            });
-        let actor = services
-            .resolve_agent_action_actor(
-                &ExecutionParentBinding {
-                    execution_id: packet.graph_id().into(),
-                    node_id: packet.node_id().into(),
+        }
+        #[cfg(test)]
+        let encoding_guard = if let R1ProofScenario::ProgramPublication(case) = proof_scenario {
+            case.encoding.map(|field| {
+                RuntimeServices::program_raw_encoding_for_test(
+                    services.event_store().clone(),
+                    &root_actor.session_id,
+                    "native-publication-small",
+                    field,
+                )
+            })
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let setup = NATIVE_TASK_SETUP
+            .try_with(|slot| slot.borrow_mut().take())
+            .ok()
+            .flatten();
+        #[cfg(test)]
+        let submit_pause = setup.as_ref().map(|_| {
+            let arrived = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *wire.pause.lock().unwrap() =
+                Some(("native-submit".into(), arrived.clone(), resume.clone()));
+            (arrived, resume)
+        });
+        let admitted = services
+            .dispatch_agentic_followups(
+                &publication,
+                AgenticDispatchContext {
+                    session_id: root_actor.session_id.clone(),
+                    turn_id: root_actor.turn_id.clone(),
+                    model_lease: "r1-native-wire".into(),
+                    permission_ceiling: PermissionMode::ReadOnly,
+                    resource_scopes: vec!["workspace:.".into()],
                 },
-                None,
             )
             .await
             .unwrap();
-        let input: TaskSubmitInput = {
-            let replies = wire.replies.lock().unwrap();
-            serde_json::from_str(
-                replies.front().unwrap()["tool_calls"][0]["function"]["arguments"]
-                    .as_str()
-                    .unwrap(),
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].agent_ref, member.changed_refs[0]);
+        let graph = services
+            .graph_state_store()
+            .load(&admitted[0].graph_id)
+            .unwrap();
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::AgentTask)
+            .unwrap();
+        let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref).unwrap();
+        packet.validate_cohort_prompt_package().unwrap();
+        let binding = packet.binding.as_ref().unwrap();
+        binding.validate().unwrap();
+        assert_eq!(binding.definition_ref, revision.revision.revision_ref);
+        assert!(matches!(binding.executor, AgentExecutorPolicy::CowdNative));
+        assert!(binding.release.is_none());
+        let approved = registry
+            .resolve_agent(
+                &binding.definition_ref.definition_id,
+                RevisionSelector::LatestApprovedStable,
             )
-            .unwrap()
-        };
-        let worker = AgentActionEnvelope {
-            action_id: "native-source-setup".into(),
-            actor,
-            expected_revision: None,
-            action: AgentAction::TaskSubmit(input.clone()),
-        };
-        let input = setup(services.0.clone(), publication.clone(), worker, input).await;
-        wire.replies.lock().unwrap().front_mut().unwrap()["tool_calls"][0]["function"]
-            ["arguments"] = serde_json::to_string(&input).unwrap().into();
-        resume.notify_one();
-    }
-    wait_admitted_graph_terminal(services, &packet).await;
-    let native_run = services.agent_runtime().get(packet.agent_id()).unwrap();
-    assert_eq!(
-        native_run.backend,
-        crate::agent_run_handle::AgentBackendKind::InProcess
-    );
-    let native_graph = services
-        .graph_state_store()
-        .load(packet.graph_id())
-        .unwrap();
-    if native_run.status != harness_contract::agent::AgentStatus::Completed
-        || native_graph.node_statuses.get(packet.node_id()) != Some(&ExecutionNodeStatus::Completed)
-    {
-        let program = services
-            .agent_action_service()
-            .project(&root_actor.program_id);
-        let exit = crate::agent_runtime::confirmed_run_exit(services.event_store(), &packet);
-        let lifecycle = services
-            .event_store()
-            .list_stream(&format!("agent:{}", packet.agent_id()));
-        eprintln!(
-            "R1_NATIVE_SOURCE_FAILURE {}",
-            serde_json::json!({
-                "run":native_run,
-                "graph_id":native_graph.id,
-                "graph_revision":native_graph.revision,
-                "node_status":native_graph.node_statuses.get(packet.node_id()),
-                "node_result":native_graph.node_results.get(packet.node_id()),
-                "recovery_cursor":native_graph.recovery_cursor,
-                "task":program.as_ref().ok().and_then(|program| program.tasks.get(&task_ref)),
-                "program_error":program.as_ref().err().map(ToString::to_string),
-                "authenticated_exit":format!("{exit:?}"),
-                "agent_lifecycle":format!("{lifecycle:?}"),
-            })
+            .unwrap();
+        assert_eq!(approved.revision.revision_ref, binding.definition_ref);
+        assert_eq!(
+            approved.revision.content_digest,
+            revision.revision.content_digest
         );
-    }
-    assert_eq!(
+        let assignments = registry
+            .agents()
+            .release_assignments(&binding.definition_ref.definition_id)
+            .unwrap();
+        assert!(assignments.iter().any(|assignment| assignment.revision_ref
+            == binding.definition_ref
+            && assignment.channel == ReleaseChannel::Stable
+            && assignment.status == ReleaseAssignmentStatus::Active
+            && assignment.content_digest == revision.revision.content_digest));
+        assert!(binding
+            .effective_capabilities
+            .iter()
+            .all(|capability| matches!(
+                capability,
+                AgentCapability::Read | AgentCapability::Search
+            )));
+        let parent = graph
+            .parent_execution
+            .as_ref()
+            .expect("Native dispatch must retain the original parent");
+        assert_eq!(
+            Some(parent.execution_id.as_str()),
+            root_actor.root_execution_id.as_deref()
+        );
+        let parent_graph = services
+            .graph_state_store()
+            .load(&parent.execution_id)
+            .unwrap();
+        assert!(parent_graph
+            .nodes
+            .iter()
+            .any(|node| node.id == parent.node_id && node.kind == ExecutionNodeKind::InlineModel));
+        assert!(matches!(packet.agentic_binding.as_ref().unwrap().focus,
+        AgenticExecutionFocus::TaskExecute { ref task_ref } if task_ref == &task.changed_refs[0]));
+        assert_eq!(packet.permission_ceiling, PermissionMode::ReadOnly);
+        assert!(!packet
+            .allowed_tools
+            .iter()
+            .any(|name| name == "edit" || name == "execute_code"));
+        assert!(packet.allowed_tools.iter().any(|name| name == "read_file"));
+        assert!(packet
+            .allowed_tools
+            .iter()
+            .any(|name| name == "task_submit"));
+        #[cfg(test)]
+        if let Some(setup) = setup {
+            let (arrived, resume) = submit_pause.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), arrived.notified())
+                .await
+                .unwrap_or_else(|elapsed| {
+                    panic!(
+                        "original TaskSubmit wire pause did not arrive within 30s: {elapsed:?}; {}",
+                        RealProcessSession {
+                            services: services.0.clone(),
+                            packet: packet.clone()
+                        }
+                        .failure_diagnostic(),
+                    );
+                });
+            let actor = services
+                .resolve_agent_action_actor(
+                    &ExecutionParentBinding {
+                        execution_id: packet.graph_id().into(),
+                        node_id: packet.node_id().into(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let input: TaskSubmitInput = {
+                let replies = wire.replies.lock().unwrap();
+                serde_json::from_str(
+                    replies.front().unwrap()["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            let worker = AgentActionEnvelope {
+                action_id: "native-source-setup".into(),
+                actor,
+                expected_revision: None,
+                action: AgentAction::TaskSubmit(input.clone()),
+            };
+            let input = setup(services.0.clone(), publication.clone(), worker, input).await;
+            wire.replies.lock().unwrap().front_mut().unwrap()["tool_calls"][0]["function"]
+                ["arguments"] = serde_json::to_string(&input).unwrap().into();
+            resume.notify_one();
+        }
+        wait_admitted_graph_terminal(services, &packet).await;
+        let native_run = services.agent_runtime().get(packet.agent_id()).unwrap();
+        assert_eq!(
+            native_run.backend,
+            crate::agent_run_handle::AgentBackendKind::InProcess
+        );
+        let native_graph = services
+            .graph_state_store()
+            .load(packet.graph_id())
+            .unwrap();
+        if native_run.status != harness_contract::agent::AgentStatus::Completed
+            || native_graph.node_statuses.get(packet.node_id())
+                != Some(&ExecutionNodeStatus::Completed)
+        {
+            let program = services
+                .agent_action_service()
+                .project(&root_actor.program_id);
+            let exit = crate::agent_runtime::confirmed_run_exit(services.event_store(), &packet);
+            let lifecycle = services
+                .event_store()
+                .list_stream(&format!("agent:{}", packet.agent_id()));
+            eprintln!(
+                "R1_NATIVE_SOURCE_FAILURE {}",
+                serde_json::json!({
+                    "run":native_run,
+                    "graph_id":native_graph.id,
+                    "graph_revision":native_graph.revision,
+                    "node_status":native_graph.node_statuses.get(packet.node_id()),
+                    "node_result":native_graph.node_results.get(packet.node_id()),
+                    "recovery_cursor":native_graph.recovery_cursor,
+                    "task":program.as_ref().ok().and_then(|program| program.tasks.get(&task_ref)),
+                    "program_error":program.as_ref().err().map(ToString::to_string),
+                    "authenticated_exit":format!("{exit:?}"),
+                    "agent_lifecycle":format!("{lifecycle:?}"),
+                })
+            );
+        }
+        assert_eq!(
         native_run.status,
         harness_contract::agent::AgentStatus::Completed,
         "native source requires original successful execution: failure={:?}; graph_revision={}; node_status={:?}; node_result={:?}",
@@ -17995,119 +12644,154 @@ async fn exercise_native_task_sources(
         native_graph.node_statuses.get(packet.node_id()),
         native_graph.node_results.get(packet.node_id()),
     );
-    assert_eq!(
-        native_graph.node_statuses[packet.node_id()],
-        ExecutionNodeStatus::Completed,
-        "native source graph result={:?}",
-        native_graph.node_results.get(packet.node_id()),
-    );
-    let native_index_source = format!(
-        "execution-agent-receipts:{}:{}:{}", packet.graph_id(), packet.node_id(), packet.attempt,
-    );
-    let native_index = services.event_store().list_stream(&native_index_source).unwrap();
-    let native_session = services.event_store()
-        .list_stream(&format!("session:{}", root_actor.session_id)).unwrap();
-    let mut native_completed_calls = std::collections::BTreeSet::new();
-    for receipt in native_index.iter().filter(|event| event.kind == "execution.agent_tool.receipt") {
-        let outcome = &receipt.payload["outcome"];
-        let call = outcome["tool_use_id"].as_str().unwrap();
-        assert_eq!(outcome["status"], "executed");
-        let key = receipt.payload["idempotency_key"].as_str().unwrap();
-        let phase = if receipt.payload["effect_kind"] == "read" { "read-receipt" } else { "receipt" };
-        let primary = services.event_store().event_by_idempotency_key(
-            &format!("execution-effect:{key}"), &format!("{key}:{phase}"),
-        ).unwrap().unwrap();
-        let delegated_parent = &primary.payload["replay"]["parent_execution"];
-        let delegated = !delegated_parent.is_null();
-        let terminal = native_session.iter().find(|event| {
-            event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == call
-        });
-        if delegated {
-            let attempt = receipt
-                .refs
-                .iter()
-                .find(|reference| reference.kind == "agent_attempt")
-                .and_then(|reference| reference.id.parse::<u64>().ok())
-                .expect("a delegated receipt carries the attempt of its owner");
-            assert_eq!(
-                receipt.stream_id,
-                format!(
-                    "execution-agent-receipts:{}:{}:{attempt}",
+        assert_eq!(
+            native_graph.node_statuses[packet.node_id()],
+            ExecutionNodeStatus::Completed,
+            "native source graph result={:?}",
+            native_graph.node_results.get(packet.node_id()),
+        );
+        let native_index_source = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            packet.graph_id(),
+            packet.node_id(),
+            packet.attempt,
+        );
+        let native_index = services
+            .event_store()
+            .list_stream(&native_index_source)
+            .unwrap();
+        let native_session = services
+            .event_store()
+            .list_stream(&format!("session:{}", root_actor.session_id))
+            .unwrap();
+        let mut native_completed_calls = std::collections::BTreeSet::new();
+        for receipt in native_index
+            .iter()
+            .filter(|event| event.kind == "execution.agent_tool.receipt")
+        {
+            let outcome = &receipt.payload["outcome"];
+            let call = outcome["tool_use_id"].as_str().unwrap();
+            assert_eq!(outcome["status"], "executed");
+            let key = receipt.payload["idempotency_key"].as_str().unwrap();
+            let phase = if receipt.payload["effect_kind"] == "read" {
+                "read-receipt"
+            } else {
+                "receipt"
+            };
+            let primary = services
+                .event_store()
+                .event_by_idempotency_key(
+                    &format!("execution-effect:{key}"),
+                    &format!("{key}:{phase}"),
+                )
+                .unwrap()
+                .unwrap();
+            let delegated_parent = &primary.payload["replay"]["parent_execution"];
+            let delegated = !delegated_parent.is_null();
+            let terminal = native_session.iter().find(|event| {
+                event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == call
+            });
+            if delegated {
+                let attempt = receipt
+                    .refs
+                    .iter()
+                    .find(|reference| reference.kind == "agent_attempt")
+                    .and_then(|reference| reference.id.parse::<u64>().ok())
+                    .expect("a delegated receipt carries the attempt of its owner");
+                assert_eq!(
+                    receipt.stream_id,
+                    format!(
+                        "execution-agent-receipts:{}:{}:{attempt}",
+                        delegated_parent["execution_id"].as_str().unwrap(),
+                        delegated_parent["node_id"].as_str().unwrap(),
+                    ),
+                    "the per-attempt index must name the delegated owner of the receipt"
+                );
+                assert_eq!(
                     delegated_parent["execution_id"].as_str().unwrap(),
+                    packet.graph_id(),
+                    "the delegated owner is this agent task's graph"
+                );
+                assert_eq!(
                     delegated_parent["node_id"].as_str().unwrap(),
-                ),
-                "the per-attempt index must name the delegated owner of the receipt"
+                    packet.node_id(),
+                    "the delegated owner is this agent task's node"
+                );
+                assert_eq!(
+                    attempt,
+                    u64::from(packet.attempt),
+                    "the delegated owner is this attempt"
+                );
+            } else {
+                let terminal =
+                    terminal.expect("a root receipt requires its original Session callback");
+                let plan_id = terminal.payload["governed_plan_id"].as_str().unwrap();
+                assert!(native_session.iter().any(|event| {
+                    event.kind == "tool.execution_plan.created"
+                        && event.payload["plan_id"] == plan_id
+                        && event.payload["tasks"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|task| task["tool_call_id"] == call)
+                }));
+            }
+            assert_eq!(primary.schema_version, 1);
+            assert_eq!(primary.transaction_id, receipt.transaction_id);
+            assert_eq!(primary.commit_cursor, receipt.commit_cursor);
+            assert_eq!(primary.payload["outcome"], receipt.payload["outcome"]);
+            assert!(
+                primary.commit_cursor
+                    <= terminal.map_or(u64::MAX, |terminal| terminal.commit_cursor)
             );
-            assert_eq!(
-                delegated_parent["execution_id"].as_str().unwrap(),
-                packet.graph_id(),
-                "the delegated owner is this agent task's graph"
-            );
-            assert_eq!(
-                delegated_parent["node_id"].as_str().unwrap(),
-                packet.node_id(),
-                "the delegated owner is this agent task's node"
-            );
-            assert_eq!(
-                attempt,
-                u64::from(packet.attempt),
-                "the delegated owner is this attempt"
-            );
-        } else {
-            let terminal = terminal.expect("a root receipt requires its original Session callback");
-            let plan_id = terminal.payload["governed_plan_id"].as_str().unwrap();
-            assert!(native_session.iter().any(|event| {
-                event.kind == "tool.execution_plan.created"
-                    && event.payload["plan_id"] == plan_id
-                    && event.payload["tasks"].as_array().unwrap().iter()
-                        .any(|task| task["tool_call_id"] == call)
-            }));
+            if !delegated {
+                let owner = &primary.payload["root_effect_owner"];
+                let expected_stream = format!(
+                    "execution-agent-receipts:{}:{}:{}",
+                    owner["binding"]["root_execution_id"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    owner["binding"]["node_id"].as_str().unwrap_or_default(),
+                    owner["attempt"].as_u64().unwrap_or_default(),
+                );
+                assert_eq!(
+                    receipt.stream_id, expected_stream,
+                    "the per-attempt receipt index must name the real producer of the receipt"
+                );
+            }
+            if call.starts_with("native-") {
+                let terminal =
+                    terminal.expect("scripted Native call requires its original Session callback");
+                assert!(native_session.iter().any(|event| {
+                    event.kind == "tool.execution_plan.created"
+                        && event.payload["plan_id"] == terminal.payload["governed_plan_id"]
+                        && event.payload["tasks"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|task| task["tool_call_id"] == call)
+                }));
+                native_completed_calls.insert(call.to_string());
+            }
         }
-        assert_eq!(primary.schema_version, 1);
-        assert_eq!(primary.transaction_id, receipt.transaction_id);
-        assert_eq!(primary.commit_cursor, receipt.commit_cursor);
-        assert_eq!(primary.payload["outcome"], receipt.payload["outcome"]);
-        assert!(primary.commit_cursor <= terminal.map_or(u64::MAX, |terminal| terminal.commit_cursor));
-        if !delegated {
-            let owner = &primary.payload["root_effect_owner"];
-            let expected_stream = format!(
-                "execution-agent-receipts:{}:{}:{}",
-                owner["binding"]["root_execution_id"].as_str().unwrap_or_default(),
-                owner["binding"]["node_id"].as_str().unwrap_or_default(),
-                owner["attempt"].as_u64().unwrap_or_default(),
-            );
-            assert_eq!(
-                receipt.stream_id, expected_stream,
-                "the per-attempt receipt index must name the real producer of the receipt"
-            );
+        let mut expected_native_calls = std::collections::BTreeSet::from([
+            "native-claim".to_string(),
+            "native-preview-read".to_string(),
+            "native-full-read".to_string(),
+            "native-publication-small".to_string(),
+            "native-submit".to_string(),
+        ]);
+        // A commit_report case scripts one extra model-driven artifact_commit
+        // (fixture reply queue, native-first-claim-artifact); its receipt is
+        // model-started, so it legitimately joins the completed-call set.
+        #[cfg(test)]
+        if NATIVE_TASK_CASE
+            .try_with(|case| case.commit_report)
+            .unwrap_or(false)
+        {
+            expected_native_calls.insert("native-first-claim-artifact".to_string());
         }
-        if call.starts_with("native-") {
-            let terminal = terminal.expect("scripted Native call requires its original Session callback");
-            assert!(native_session.iter().any(|event| {
-                event.kind == "tool.execution_plan.created"
-                    && event.payload["plan_id"] == terminal.payload["governed_plan_id"]
-                    && event.payload["tasks"].as_array().unwrap().iter()
-                        .any(|task| task["tool_call_id"] == call)
-            }));
-            native_completed_calls.insert(call.to_string());
-        }
-    }
-    let mut expected_native_calls = std::collections::BTreeSet::from([
-        "native-claim".to_string(), "native-preview-read".to_string(),
-        "native-full-read".to_string(), "native-publication-small".to_string(),
-        "native-submit".to_string(),
-    ]);
-    // A commit_report case scripts one extra model-driven artifact_commit
-    // (fixture reply queue, native-first-claim-artifact); its receipt is
-    // model-started, so it legitimately joins the completed-call set.
-    #[cfg(test)]
-    if NATIVE_TASK_CASE
-        .try_with(|case| case.commit_report)
-        .unwrap_or(false)
-    {
-        expected_native_calls.insert("native-first-claim-artifact".to_string());
-    }
-    assert_eq!(native_completed_calls, expected_native_calls,
+        assert_eq!(native_completed_calls, expected_native_calls,
         "native receipt completeness: packet={}:{}:{}; host_calls={:?}; session_calls={:?}; wire_requests={}",
         packet.graph_id(), packet.node_id(), packet.attempt,
         host.calls.lock().unwrap().iter()
@@ -18119,11 +12803,11 @@ async fn exercise_native_task_sources(
             .collect::<Vec<_>>(),
         wire.requests.lock().unwrap().len(),
     );
-    let program = services
-        .agent_action_service()
-        .project(&root_actor.program_id)
-        .unwrap();
-    let automatic_review_packet = tokio::time::timeout(
+        let program = services
+            .agent_action_service()
+            .project(&root_actor.program_id)
+            .unwrap();
+        let automatic_review_packet = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
             loop {
@@ -18153,203 +12837,242 @@ async fn exercise_native_task_sources(
             "automatic_review_packet_timeout", Some(&packet));
         panic!("capture the actual automatic independent review packet: {error}; see OWN832 snapshot");
     });
-    let automatic_member = automatic_review_packet.agentic_binding.as_ref().unwrap();
-    assert_eq!(automatic_member.agent_id, independent_reviewer);
-    assert_eq!(automatic_member.team_id, review_team.changed_refs[0]);
-    assert_ne!(automatic_member.agent_id, packet.agentic_binding.as_ref().unwrap().agent_id);
-    let review_binding = automatic_review_packet.binding.as_ref().unwrap();
-    assert!(matches!(&review_binding.executor, AgentExecutorPolicy::ProcessJsonl { .. }));
-    assert_ne!(automatic_review_packet.agent_id(), packet.agent_id());
-    assert_ne!(automatic_review_packet.graph_id(), packet.graph_id());
-    assert_eq!(automatic_review_packet.permission_ceiling, PermissionMode::ReadOnly);
-    assert_eq!(program.permission_ceiling, PermissionMode::ReadOnly);
-    assert_eq!(program.resource_scopes, root_actor.resource_scopes);
-    assert_eq!(program.resource_scopes, vec!["workspace:.".to_string()]);
-    assert!(automatic_review_packet.resource_scopes.contains(&"workspace:.".to_string()));
-    assert!(review_binding.effective_capabilities.contains(&AgentCapability::Read));
-    let resolver = services.path_identity_resolver();
-    assert!(crate::agent_in_process_worker::resource_path_is_authorized(
-        resolver, ".", &automatic_review_packet.resource_scopes, false,
-    ));
-    let policy = services.session_execution_policy(automatic_review_packet.session_id()).unwrap();
-    assert_eq!(automatic_review_packet.policy_revision, policy.revision);
-    println!("R1_734_ACTUAL_AUTOMATIC_REVIEW {}", serde_json::json!({
-        "packet": &automatic_review_packet,
-        "definition_grant": review_binding,
-        "program_scopes": &program.resource_scopes,
-        "session_policy": policy,
-        "whole_workspace_read_authorized": true,
-        "capture": "new candidate execution; not the missing original packet",
-    }));
-    #[cfg(test)]
-    {
-        services.agent_runtime().validate_process_fixture_boundary(&automatic_review_packet)
-            .expect("the actual compiled independent Process review must pass the original guard");
-        let default_scopes = root("734-default-empty-grant", publication.action.clone())
-            .actor.resource_scopes;
-        assert!(default_scopes.is_empty());
-        for scopes in [default_scopes, vec!["read:review-effect.txt".into()]] {
-            let mut denied = automatic_review_packet.clone();
-            denied.resource_scopes = scopes;
-            assert!(!crate::agent_in_process_worker::resource_path_is_authorized(
-                resolver, ".", &denied.resource_scopes, false,
-            ));
-            let error = services.agent_runtime().validate_process_fixture_boundary(&denied)
-                .expect_err("default empty and narrow grants must still refuse a whole mount");
-            assert_eq!(error,
-                "physical_grant: Process whole workspace mount requires whole-read grant");
+        let automatic_member = automatic_review_packet.agentic_binding.as_ref().unwrap();
+        assert_eq!(automatic_member.agent_id, independent_reviewer);
+        assert_eq!(automatic_member.team_id, review_team.changed_refs[0]);
+        assert_ne!(
+            automatic_member.agent_id,
+            packet.agentic_binding.as_ref().unwrap().agent_id
+        );
+        let review_binding = automatic_review_packet.binding.as_ref().unwrap();
+        assert!(matches!(
+            &review_binding.executor,
+            AgentExecutorPolicy::ProcessJsonl { .. }
+        ));
+        assert_ne!(automatic_review_packet.agent_id(), packet.agent_id());
+        assert_ne!(automatic_review_packet.graph_id(), packet.graph_id());
+        assert_eq!(
+            automatic_review_packet.permission_ceiling,
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(program.permission_ceiling, PermissionMode::ReadOnly);
+        assert_eq!(program.resource_scopes, root_actor.resource_scopes);
+        assert_eq!(program.resource_scopes, vec!["workspace:.".to_string()]);
+        assert!(automatic_review_packet
+            .resource_scopes
+            .contains(&"workspace:.".to_string()));
+        assert!(review_binding
+            .effective_capabilities
+            .contains(&AgentCapability::Read));
+        let resolver = services.path_identity_resolver();
+        assert!(crate::agent_in_process_worker::resource_path_is_authorized(
+            resolver,
+            ".",
+            &automatic_review_packet.resource_scopes,
+            false,
+        ));
+        let policy = services
+            .session_execution_policy(automatic_review_packet.session_id())
+            .unwrap();
+        assert_eq!(automatic_review_packet.policy_revision, policy.revision);
+        println!(
+            "R1_734_ACTUAL_AUTOMATIC_REVIEW {}",
+            serde_json::json!({
+                "packet": &automatic_review_packet,
+                "definition_grant": review_binding,
+                "program_scopes": &program.resource_scopes,
+                "session_policy": policy,
+                "whole_workspace_read_authorized": true,
+                "capture": "new candidate execution; not the missing original packet",
+            })
+        );
+        #[cfg(test)]
+        {
+            services
+                .agent_runtime()
+                .validate_process_fixture_boundary(&automatic_review_packet)
+                .expect(
+                    "the actual compiled independent Process review must pass the original guard",
+                );
+            let default_scopes = root("734-default-empty-grant", publication.action.clone())
+                .actor
+                .resource_scopes;
+            assert!(default_scopes.is_empty());
+            for scopes in [default_scopes, vec!["read:review-effect.txt".into()]] {
+                let mut denied = automatic_review_packet.clone();
+                denied.resource_scopes = scopes;
+                assert!(
+                    !crate::agent_in_process_worker::resource_path_is_authorized(
+                        resolver,
+                        ".",
+                        &denied.resource_scopes,
+                        false,
+                    )
+                );
+                let error = services
+                    .agent_runtime()
+                    .validate_process_fixture_boundary(&denied)
+                    .expect_err("default empty and narrow grants must still refuse a whole mount");
+                assert_eq!(
+                    error,
+                    "physical_grant: Process whole workspace mount requires whole-read grant"
+                );
+            }
         }
-    }
-    let submitted = &program.tasks[&task_ref];
-    assert_eq!(
-        submitted.status,
-        crate::AgenticTaskStatus::Submitted,
-        "{submitted:?}"
-    );
-    assert_eq!(
-        submitted.claimant.as_deref(),
-        Some(member.changed_refs[0].as_str())
-    );
-    assert_eq!(
-        submitted.claim_execution_id.as_deref(),
-        Some(packet.graph_id())
-    );
-    assert_eq!(submitted.claim_generation, u64::from(packet.attempt));
-    assert_eq!(submitted.artifact_refs.len(), 1);
-    let mut result_refs = submitted.artifact_refs.clone();
-    let mut result_contents = vec![program.artifacts[&result_refs[0]].content_ref.clone()];
-    let events = services
-        .event_store()
-        .list_stream(&format!("session:{}", packet.session_id()))
-        .unwrap();
-    {
-        let material = events
-            .iter()
-            .filter(|event| event.kind == crate::context_evidence::NATIVE_DELIVERY_KIND)
-            .filter_map(|event| crate::context_evidence::decode_read_delivery(&event.payload).ok())
-            .find(|material| material.tool_invocation_id == "native-full-read"
-                || material.tool_invocation_id == "native-rework-full-read")
-            .expect("the original InProcess backend must confirm the real Native Agent read");
-        let preview = events.iter().filter(|event|event.kind == crate::context_evidence::NATIVE_DELIVERY_KIND)
+        let submitted = &program.tasks[&task_ref];
+        assert_eq!(
+            submitted.status,
+            crate::AgenticTaskStatus::Submitted,
+            "{submitted:?}"
+        );
+        assert_eq!(
+            submitted.claimant.as_deref(),
+            Some(member.changed_refs[0].as_str())
+        );
+        assert_eq!(
+            submitted.claim_execution_id.as_deref(),
+            Some(packet.graph_id())
+        );
+        assert_eq!(submitted.claim_generation, u64::from(packet.attempt));
+        assert_eq!(submitted.artifact_refs.len(), 1);
+        let mut result_refs = submitted.artifact_refs.clone();
+        let mut result_contents = vec![program.artifacts[&result_refs[0]].content_ref.clone()];
+        let events = services
+            .event_store()
+            .list_stream(&format!("session:{}", packet.session_id()))
+            .unwrap();
+        {
+            let material = events
+                .iter()
+                .filter(|event| event.kind == crate::context_evidence::NATIVE_DELIVERY_KIND)
+                .filter_map(|event| {
+                    crate::context_evidence::decode_read_delivery(&event.payload).ok()
+                })
+                .find(|material| {
+                    material.tool_invocation_id == "native-full-read"
+                        || material.tool_invocation_id == "native-rework-full-read"
+                })
+                .expect("the original InProcess backend must confirm the real Native Agent read");
+            let preview = events.iter().filter(|event|event.kind == crate::context_evidence::NATIVE_DELIVERY_KIND)
             .filter_map(|event|crate::context_evidence::decode_read_delivery(&event.payload).ok())
             .find(|material|material.tool_invocation_id == "native-preview-read"
                 || material.tool_invocation_id == "native-rework-preview-read")
             .expect("the separate partial Native read must retain its own delivery, not borrow the full read");
-        assert_eq!(preview.recipient, material.recipient);
-        assert_eq!(
-            preview.acquisition.body.source_sha256,
-            material.acquisition.body.source_sha256
-        );
-        assert_eq!(
-            preview.acquisition.body.source_bytes,
-            material.acquisition.body.source_bytes
-        );
-        assert_eq!(
-            preview.grade,
-            crate::context_evidence::ReadDeliveryGrade::ProviderModelObserved
-        );
-        assert!(matches!(
-            preview.delivered_extent,
-            Some(crate::context_evidence::ReadExtent::FileLines {
-                start_line: 1,
-                line_count: 1,
-                total_lines: 3,
-                ..
-            })
-        ));
-        let crate::context_evidence::ReadDeliveryRecipient::AgentTask { identity } =
-            &material.recipient
-        else {
-            panic!("Native Task coverage cannot be substituted with a Root Host read");
-        };
-        assert_eq!(identity, &packet.assignment.execution_identity);
-        assert_eq!(
-            material.grade,
-            crate::context_evidence::ReadDeliveryGrade::ProviderModelObserved
-        );
-        assert_eq!(material.acquisition.graph_id, packet.graph_id());
-        assert_eq!(material.acquisition.node_id, packet.node_id());
-        assert_eq!(material.acquisition.attempt, packet.attempt);
-        assert_eq!(
-            material.acquisition.step.run_ref.as_deref(),
-            Some(packet.run_id())
-        );
-        assert!(!material.body_omitted);
-        assert!(material.delivered_extent.is_some());
-        let primary = services
-            .event_store()
-            .event_by_idempotency_key(
-                &material.acquisition.primary_stream,
-                &material.acquisition.primary_key,
-            )
-            .unwrap()
-            .unwrap();
-        let index = services
-            .event_store()
-            .event_by_idempotency_key(
-                &material.acquisition.index_stream,
-                &material.acquisition.index_key,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(primary.transaction_id, index.transaction_id);
-        assert_eq!(primary.event_id, material.acquisition_event_id);
-        assert_eq!(index.event_id, material.index_event_id);
-        let claim = services.event_store().list_stream(&format!("agentic-program:{}",root_actor.program_id)).unwrap()
+            assert_eq!(preview.recipient, material.recipient);
+            assert_eq!(
+                preview.acquisition.body.source_sha256,
+                material.acquisition.body.source_sha256
+            );
+            assert_eq!(
+                preview.acquisition.body.source_bytes,
+                material.acquisition.body.source_bytes
+            );
+            assert_eq!(
+                preview.grade,
+                crate::context_evidence::ReadDeliveryGrade::ProviderModelObserved
+            );
+            assert!(matches!(
+                preview.delivered_extent,
+                Some(crate::context_evidence::ReadExtent::FileLines {
+                    start_line: 1,
+                    line_count: 1,
+                    total_lines: 3,
+                    ..
+                })
+            ));
+            let crate::context_evidence::ReadDeliveryRecipient::AgentTask { identity } =
+                &material.recipient
+            else {
+                panic!("Native Task coverage cannot be substituted with a Root Host read");
+            };
+            assert_eq!(identity, &packet.assignment.execution_identity);
+            assert_eq!(
+                material.grade,
+                crate::context_evidence::ReadDeliveryGrade::ProviderModelObserved
+            );
+            assert_eq!(material.acquisition.graph_id, packet.graph_id());
+            assert_eq!(material.acquisition.node_id, packet.node_id());
+            assert_eq!(material.acquisition.attempt, packet.attempt);
+            assert_eq!(
+                material.acquisition.step.run_ref.as_deref(),
+                Some(packet.run_id())
+            );
+            assert!(!material.body_omitted);
+            assert!(material.delivered_extent.is_some());
+            let primary = services
+                .event_store()
+                .event_by_idempotency_key(
+                    &material.acquisition.primary_stream,
+                    &material.acquisition.primary_key,
+                )
+                .unwrap()
+                .unwrap();
+            let index = services
+                .event_store()
+                .event_by_idempotency_key(
+                    &material.acquisition.index_stream,
+                    &material.acquisition.index_key,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(primary.transaction_id, index.transaction_id);
+            assert_eq!(primary.event_id, material.acquisition_event_id);
+            assert_eq!(index.event_id, material.index_event_id);
+            let claim = services.event_store().list_stream(&format!("agentic-program:{}",root_actor.program_id)).unwrap()
             .into_iter().find(|event|serde_json::from_value::<AgentActionEnvelope>(event.payload["envelope"].clone())
                 .is_ok_and(|envelope|matches!(&envelope.action, AgentAction::TaskClaim(input)
                     if input.task_ref == task_ref && envelope.actor.execution_id.as_deref() == Some(packet.graph_id()))))
             .expect("Native worker must actually claim through its original action host");
-        assert!(claim.commit_cursor < primary.commit_cursor);
-        assert_eq!(
-            primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
-            index.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
-        );
-        assert_native_task_material_wire(services, &packet, &preview, &wire.requests).await;
-        assert_native_task_material_wire(services, &packet, &material, &wire.requests).await;
-        #[cfg(test)]
-        services.assert_read_delivery_actor_matrix_for_test(
-            &program,
-            &packet,
-            "native-full-read",
-            false,
-        );
-        for (call_id, _) in &publications {
-            let owner = events
-                .iter()
-                .find(|event| {
-                    event.kind == "tool.invocation.completed"
-                        && event.payload["tool_call_id"] == *call_id
-                })
-                .expect("actual Native publication lifecycle");
-            assert_eq!(owner.payload["session_id"], packet.session_id());
-            assert_eq!(owner.payload["tool_name"], "artifact_publish");
+            assert!(claim.commit_cursor < primary.commit_cursor);
             assert_eq!(
-                owner.activity_binding().unwrap().agent_run_id.as_deref(),
-                Some(packet.run_id())
+                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
+                index.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
             );
-            let full_ref = owner.payload["full_output_ref"].as_str().unwrap();
-            let access = services
-                .session_evidence_access(
-                    packet.session_id(),
-                    full_ref.strip_prefix("tool://").unwrap(),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            let raw = services
-                .artifact_store()
-                .resolve(&access.retrieval_selector)
-                .unwrap();
-            let bytes = services
-                .artifact_store()
-                .read(&raw, &raw.visibility_scope, None)
-                .await
-                .unwrap();
-            assert!(bytes.len() > 500 && bytes.len() <= 256 * 1024);
-            if *call_id == "native-publication-small" {
-                assert!(bytes.len() < 16000);
+            assert_native_task_material_wire(services, &packet, &preview, &wire.requests).await;
+            assert_native_task_material_wire(services, &packet, &material, &wire.requests).await;
+            #[cfg(test)]
+            services.assert_read_delivery_actor_matrix_for_test(
+                &program,
+                &packet,
+                "native-full-read",
+                false,
+            );
+            for (call_id, _) in &publications {
+                let owner = events
+                    .iter()
+                    .find(|event| {
+                        event.kind == "tool.invocation.completed"
+                            && event.payload["tool_call_id"] == *call_id
+                    })
+                    .expect("actual Native publication lifecycle");
+                assert_eq!(owner.payload["session_id"], packet.session_id());
+                assert_eq!(owner.payload["tool_name"], "artifact_publish");
                 assert_eq!(
+                    owner.activity_binding().unwrap().agent_run_id.as_deref(),
+                    Some(packet.run_id())
+                );
+                let full_ref = owner.payload["full_output_ref"].as_str().unwrap();
+                let access = services
+                    .session_evidence_access(
+                        packet.session_id(),
+                        full_ref.strip_prefix("tool://").unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let raw = services
+                    .artifact_store()
+                    .resolve(&access.retrieval_selector)
+                    .unwrap();
+                let bytes = services
+                    .artifact_store()
+                    .read(&raw, &raw.visibility_scope, None)
+                    .await
+                    .unwrap();
+                assert!(bytes.len() > 500 && bytes.len() <= 256 * 1024);
+                if *call_id == "native-publication-small" {
+                    assert!(bytes.len() < 16000);
+                    assert_eq!(
                     full_ref
                         .strip_prefix(&format!("tool://tool-raw-{call_id}-"))
                         .unwrap()
@@ -18357,349 +13080,363 @@ async fn exercise_native_task_sources(
                     16,
                     "legacy injection must exercise ordinary16, never a complete staged64 carrier"
                 );
-                assert!(owner
-                    .payload
-                    .get("output_ref")
-                    .is_none_or(serde_json::Value::is_null));
-                assert!(owner.payload["output_preview"].as_str().unwrap().len() < bytes.len());
-                let expected_anchor = serde_json::json!({
-                    "version":1, "ref_id":full_ref, "tool_call_id":call_id,
-                    "sha256":raw.sha256, "byte_count":raw.bytes, "selector":raw.selector,
-                    "visibility_scope":raw.visibility_scope, "media_type":raw.media_type,
-                });
-                #[allow(unused_mut)]
-                let mut encoding: Option<&str> = None;
-                #[cfg(test)]
-                if let R1ProofScenario::ProgramPublication(case) = proof_scenario {
-                    encoding = case.encoding;
-                }
-                match encoding {
-                    None => assert_eq!(owner.payload["runtime_raw_content_v1"], expected_anchor),
-                    Some("legacy") => assert!(owner.payload.get("runtime_raw_content_v1").is_none()),
-                    Some(field) => {
-                        let mut actual = owner.payload["runtime_raw_content_v1"].clone();
-                        assert_ne!(actual[field], expected_anchor[field]);
-                        actual[field] = expected_anchor[field].clone();
-                        assert_eq!(actual, expected_anchor);
+                    assert!(owner
+                        .payload
+                        .get("output_ref")
+                        .is_none_or(serde_json::Value::is_null));
+                    assert!(owner.payload["output_preview"].as_str().unwrap().len() < bytes.len());
+                    let expected_anchor = serde_json::json!({
+                        "version":1, "ref_id":full_ref, "tool_call_id":call_id,
+                        "sha256":raw.sha256, "byte_count":raw.bytes, "selector":raw.selector,
+                        "visibility_scope":raw.visibility_scope, "media_type":raw.media_type,
+                    });
+                    #[allow(unused_mut)]
+                    let mut encoding: Option<&str> = None;
+                    #[cfg(test)]
+                    if let R1ProofScenario::ProgramPublication(case) = proof_scenario {
+                        encoding = case.encoding;
                     }
-                }
-                let request = host
-                    .calls
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|request| {
-                        request.tool_use_id == *call_id
-                            && request
-                                .parent_execution
-                                .as_ref()
-                                .is_some_and(|parent| parent.execution_id == packet.graph_id())
-                    })
-                    .cloned()
-                    .unwrap();
-                let step = request.step_binding.as_ref().unwrap();
-                assert_eq!(
-                    step.snapshot.identity.run_ref.as_deref(),
-                    Some(packet.run_id())
-                );
-                assert_eq!(
-                    owner.payload["input_hash"],
-                    crate::tool_invocation::stable_hash(&request.input)
-                );
-                let key = step.effect_idempotency_key();
-                let primaries = ["read-receipt", "receipt"]
-                    .into_iter()
-                    .filter_map(|suffix| {
-                        services.event_store().event_by_idempotency_key(
-                            &format!("execution-effect:{key}"), &format!("{key}:{suffix}")).unwrap()
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(primaries.len(), 1, "publication primary must be unique");
-                let primary = &primaries[0];
-                assert_ne!(primary.payload["outcome_truncated"], true);
-                assert_eq!(primary.payload["outcome"]["status"], "executed");
-                assert!(primary.payload["outcome"]["error"].is_null());
-                assert_eq!(
+                    match encoding {
+                        None => {
+                            assert_eq!(owner.payload["runtime_raw_content_v1"], expected_anchor)
+                        }
+                        Some("legacy") => {
+                            assert!(owner.payload.get("runtime_raw_content_v1").is_none())
+                        }
+                        Some(field) => {
+                            let mut actual = owner.payload["runtime_raw_content_v1"].clone();
+                            assert_ne!(actual[field], expected_anchor[field]);
+                            actual[field] = expected_anchor[field].clone();
+                            assert_eq!(actual, expected_anchor);
+                        }
+                    }
+                    let request =
+                        host.calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|request| {
+                                request.tool_use_id == *call_id
+                                    && request.parent_execution.as_ref().is_some_and(|parent| {
+                                        parent.execution_id == packet.graph_id()
+                                    })
+                            })
+                            .cloned()
+                            .unwrap();
+                    let step = request.step_binding.as_ref().unwrap();
+                    assert_eq!(
+                        step.snapshot.identity.run_ref.as_deref(),
+                        Some(packet.run_id())
+                    );
+                    assert_eq!(
+                        owner.payload["input_hash"],
+                        crate::tool_invocation::stable_hash(&request.input)
+                    );
+                    let key = step.effect_idempotency_key();
+                    let primaries = ["read-receipt", "receipt"]
+                        .into_iter()
+                        .filter_map(|suffix| {
+                            services
+                                .event_store()
+                                .event_by_idempotency_key(
+                                    &format!("execution-effect:{key}"),
+                                    &format!("{key}:{suffix}"),
+                                )
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(primaries.len(), 1, "publication primary must be unique");
+                    let primary = &primaries[0];
+                    assert_ne!(primary.payload["outcome_truncated"], true);
+                    assert_eq!(primary.payload["outcome"]["status"], "executed");
+                    assert!(primary.payload["outcome"]["error"].is_null());
+                    assert_eq!(
                     primary.payload["outcome"]["output"].as_str().unwrap().as_bytes(),
                     bytes.as_slice(),
                     "the complete primary and writer raw anchor must carry identical original bytes"
                 );
-                assert!(primary.commit_cursor < owner.commit_cursor);
+                    assert!(primary.commit_cursor < owner.commit_cursor);
+                }
+                let published: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(published["status"], "published");
+                assert_eq!(published["bytes"], selected_bytes.len());
+                assert_eq!(published["sha256"], selected_hash);
+                let selector = published["content_ref"].as_str().unwrap().to_string();
+                result_refs.push(selector.clone());
+                result_contents.push(selector);
             }
-            let published: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(published["status"], "published");
-            assert_eq!(published["bytes"], selected_bytes.len());
-            assert_eq!(published["sha256"], selected_hash);
-            let selector = published["content_ref"].as_str().unwrap().to_string();
-            result_refs.push(selector.clone());
-            result_contents.push(selector);
         }
-    }
-    #[cfg(test)]
-    let registration = if let R1ProofScenario::ProgramPublication(case) = proof_scenario {
-        let selector = result_contents[1].clone();
-        let before = services
-            .event_store()
-            .list_stream(&format!("session:{}", root_actor.session_id))
-            .unwrap();
-        assert!(!before.iter().any(|event| event
-            .activity_binding()
-            .is_some_and(|binding| binding.agent_run_id.is_none())
-            && event.kind == "tool.invocation.completed"
-            && event.payload["tool_name"] == "evidence_retrieve"
-            && event.payload.to_string().contains(&selector)));
-        let logical = commit_existing_result_selector(
-            services,
-            root_actor,
-            "program-small-registration",
-            &selector,
-            Vec::new(),
+        #[cfg(test)]
+        let registration = if let R1ProofScenario::ProgramPublication(case) = proof_scenario {
+            let selector = result_contents[1].clone();
+            let before = services
+                .event_store()
+                .list_stream(&format!("session:{}", root_actor.session_id))
+                .unwrap();
+            assert!(!before.iter().any(|event| event
+                .activity_binding()
+                .is_some_and(|binding| binding.agent_run_id.is_none())
+                && event.kind == "tool.invocation.completed"
+                && event.payload["tool_name"] == "evidence_retrieve"
+                && event.payload.to_string().contains(&selector)));
+            let logical = commit_existing_result_selector(
+                services,
+                root_actor,
+                "program-small-registration",
+                &selector,
+                Vec::new(),
+            )
+            .await;
+            let committed = services
+                .event_store()
+                .list_stream(&format!("agentic-program:{}", root_actor.program_id))
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.payload["envelope"]["action_id"] == "program-small-registration"
+                })
+                .unwrap();
+            assert!(before
+                .iter()
+                .all(|event| event.commit_cursor < committed.commit_cursor));
+            assert_eq!(
+                crate::agentic::review_evidence::review_result_identity(
+                    &services
+                        .agent_action_service()
+                        .project(&root_actor.program_id)
+                        .unwrap(),
+                    &selector
+                )
+                .unwrap(),
+                logical
+            );
+            result_refs[1] = if case.logical {
+                logical.clone()
+            } else {
+                selector.clone()
+            };
+            Some((logical, selector))
+        } else {
+            None
+        };
+        #[cfg(test)]
+        drop(encoding_guard);
+        let (_, root_runtime) =
+            root_reads_generic_results(services, host.clone(), &result_contents[0], false, false)
+                .await;
+        root_review_input_tool(
+            &root_runtime,
+            "root-publication-large",
+            "artifact_publish",
+            &serde_json::json!({"source":"file","path":"review-effect.txt","sha256":selected_hash,
+            "media_type":format!("text/plain;fixture={}", "多".repeat(20000))})
+            .to_string(),
         )
         .await;
-        let committed = services
+        let root_events = services
             .event_store()
-            .list_stream(&format!("agentic-program:{}", root_actor.program_id))
-            .unwrap()
-            .into_iter()
-            .find(|event| event.payload["envelope"]["action_id"] == "program-small-registration")
+            .list_stream(&format!("session:{}", packet.session_id()))
             .unwrap();
-        assert!(before
+        let large_owner = root_events
             .iter()
-            .all(|event| event.commit_cursor < committed.commit_cursor));
-        assert_eq!(
-            crate::agentic::review_evidence::review_result_identity(
-                &services
-                    .agent_action_service()
-                    .project(&root_actor.program_id)
-                    .unwrap(),
-                &selector
-            )
-            .unwrap(),
-            logical
-        );
-        result_refs[1] = if case.logical {
-            logical.clone()
-        } else {
-            selector.clone()
-        };
-        Some((logical, selector))
-    } else {
-        None
-    };
-    #[cfg(test)]
-    drop(encoding_guard);
-    let (_, root_runtime) =
-        root_reads_generic_results(services, host.clone(), &result_contents[0], false, false).await;
-    root_review_input_tool(
-        &root_runtime,
-        "root-publication-large",
-        "artifact_publish",
-        &serde_json::json!({"source":"file","path":"review-effect.txt","sha256":selected_hash,
-            "media_type":format!("text/plain;fixture={}", "多".repeat(20000))})
-        .to_string(),
-    )
-    .await;
-    let root_events = services
-        .event_store()
-        .list_stream(&format!("session:{}", packet.session_id()))
-        .unwrap();
-    let large_owner = root_events
-        .iter()
-        .find(|event| {
-            event.kind == "tool.invocation.completed"
-                && event.payload["tool_call_id"] == "root-publication-large"
-        })
-        .unwrap();
-    let full_ref = large_owner.payload["full_output_ref"].as_str().unwrap();
-    let access = services
-        .session_evidence_access(
-            packet.session_id(),
-            full_ref.strip_prefix("tool://").unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let raw = services
-        .artifact_store()
-        .resolve(&access.retrieval_selector)
-        .unwrap();
-    let raw_bytes = services
-        .artifact_store()
-        .read(&raw, &raw.visibility_scope, None)
-        .await
-        .unwrap();
-    assert!(raw_bytes.len() > 16000 && raw_bytes.len() <= 256 * 1024);
-    assert!(!large_owner.payload["output_ref"].is_null());
-    assert!(
-        raw_bytes.len()
-            > String::from_utf8(raw_bytes.clone())
-                .unwrap()
-                .chars()
-                .count()
-    );
-    let publication: serde_json::Value = serde_json::from_slice(&raw_bytes).unwrap();
-    assert_eq!(publication["status"], "published");
-    let selected = publication["content_ref"].as_str().unwrap().to_string();
-    let request = host
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|request| request.tool_use_id == "root-publication-large")
-        .cloned()
-        .unwrap();
-    let key = request
-        .step_binding
-        .as_ref()
-        .unwrap()
-        .effect_idempotency_key();
-    let primary = services
-        .event_store()
-        .event_by_idempotency_key(
-            &format!("execution-effect:{key}"),
-            &format!("{key}:read-receipt"),
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(primary.payload["outcome_truncated"], true,
-        "the real large publication must require immutable full-output recovery rather than reuse a complete primary");
-    result_refs.push(selected.clone());
-    result_contents.push(selected);
-    let verifier = wait_real_process(services, automatic_review_packet.graph_id()).await;
-    assert_eq!(verifier.packet, automatic_review_packet);
-    let agentic = verifier
-        .packet
-        .agentic_binding
-        .as_ref()
-        .expect("typed automatic independent review binding");
-    let reviewer_team = agentic.team_id.clone();
-    let program = services
-        .agent_action_service()
-        .project(&root_actor.program_id)
-        .unwrap();
-    assert!(program.agent_is_active_in(&agentic.agent_id, &reviewer_team));
-    assert_eq!(agentic.task_team_id, team_ref);
-    assert!(
-        matches!(&agentic.focus, AgenticExecutionFocus::TaskReview { task_ref: bound } if bound == &task_ref)
-    );
-    if proof_scenario.mechanical_cross_team() {
-        let author_team = &packet.agentic_binding.as_ref().unwrap().team_id;
-        assert_eq!(author_team, &team_ref);
-        assert_ne!(&reviewer_team, author_team,
-            "cross-Team review must use a different Team from the real Native author");
-    }
-    for (position, content) in result_contents.iter().enumerate() {
-        verifier
-            .execute_tool(
-                &format!("native-task-independent-read:{position}"),
-                "evidence_retrieve",
-                &serde_json::json!({"evidence_ref":content}).to_string(),
+            .find(|event| {
+                event.kind == "tool.invocation.completed"
+                    && event.payload["tool_call_id"] == "root-publication-large"
+            })
+            .unwrap();
+        let full_ref = large_owner.payload["full_output_ref"].as_str().unwrap();
+        let access = services
+            .session_evidence_access(
+                packet.session_id(),
+                full_ref.strip_prefix("tool://").unwrap(),
             )
             .await
+            .unwrap()
             .unwrap();
-    }
-    let actor = services
-        .resolve_agent_action_actor(
-            &ExecutionParentBinding {
-                execution_id: verifier.packet.graph_id().into(),
-                node_id: verifier.packet.node_id().into(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(actor.team_id.as_deref(), Some(reviewer_team.as_str()));
-    let mut seen_review_refs = std::collections::BTreeSet::new();
-    let review_evidence_refs: Vec<_> = result_refs.iter()
-        .map(|reference| {
-            reference.strip_prefix("artifact:")
-                .filter(|logical| !logical.starts_with("//"))
-                .map_or_else(|| reference.clone(), |logical| format!("artifact://{logical}"))
-        })
-        .chain(result_contents.iter().skip(1).cloned())
-        .filter(|reference| seen_review_refs.insert(reference.clone()))
-        .collect();
-    let envelope = AgentActionEnvelope {
-        action_id: "native-sources:task-review".into(),
-        actor,
-        expected_revision: None,
-        action: AgentAction::TaskReview(TaskReviewInput {
-            operator_requirement: None,
-            task_ref: task_ref.clone(),
-            decision: TaskReviewDecision::Accept,
-            reason:
-                "The actual immutable Native report and selected source were independently read"
-                    .into(),
-            evidence_refs: review_evidence_refs,
-        }),
-    };
-    let mut probed = false;
-    #[cfg(test)]
-    if proof_scenario == R1ProofScenario::TaskReviewAdmission {
-        let current = services
+        let raw = services
+            .artifact_store()
+            .resolve(&access.retrieval_selector)
+            .unwrap();
+        let raw_bytes = services
+            .artifact_store()
+            .read(&raw, &raw.visibility_scope, None)
+            .await
+            .unwrap();
+        assert!(raw_bytes.len() > 16000 && raw_bytes.len() <= 256 * 1024);
+        assert!(!large_owner.payload["output_ref"].is_null());
+        assert!(
+            raw_bytes.len()
+                > String::from_utf8(raw_bytes.clone())
+                    .unwrap()
+                    .chars()
+                    .count()
+        );
+        let publication: serde_json::Value = serde_json::from_slice(&raw_bytes).unwrap();
+        assert_eq!(publication["status"], "published");
+        let selected = publication["content_ref"].as_str().unwrap().to_string();
+        let request = host
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.tool_use_id == "root-publication-large")
+            .cloned()
+            .unwrap();
+        let key = request
+            .step_binding
+            .as_ref()
+            .unwrap()
+            .effect_idempotency_key();
+        let primary = services
+            .event_store()
+            .event_by_idempotency_key(
+                &format!("execution-effect:{key}"),
+                &format!("{key}:read-receipt"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(primary.payload["outcome_truncated"], true,
+        "the real large publication must require immutable full-output recovery rather than reuse a complete primary");
+        result_refs.push(selected.clone());
+        result_contents.push(selected);
+        let verifier = wait_real_process(services, automatic_review_packet.graph_id()).await;
+        assert_eq!(verifier.packet, automatic_review_packet);
+        let agentic = verifier
+            .packet
+            .agentic_binding
+            .as_ref()
+            .expect("typed automatic independent review binding");
+        let reviewer_team = agentic.team_id.clone();
+        let program = services
             .agent_action_service()
             .project(&root_actor.program_id)
             .unwrap();
-        assert_eq!(
-            current.tasks[&task_ref].status,
-            crate::AgenticTaskStatus::Submitted
+        assert!(program.agent_is_active_in(&agentic.agent_id, &reviewer_team));
+        assert_eq!(agentic.task_team_id, team_ref);
+        assert!(
+            matches!(&agentic.focus, AgenticExecutionFocus::TaskReview { task_ref: bound } if bound == &task_ref)
         );
-        let donor = services
-            .independent_result_review(
-                &envelope.actor,
-                &current,
-                &current.tasks[&task_ref].artifact_refs,
+        if proof_scenario.mechanical_cross_team() {
+            let author_team = &packet.agentic_binding.as_ref().unwrap().team_id;
+            assert_eq!(author_team, &team_ref);
+            assert_ne!(
+                &reviewer_team, author_team,
+                "cross-Team review must use a different Team from the real Native author"
+            );
+        }
+        for (position, content) in result_contents.iter().enumerate() {
+            verifier
+                .execute_tool(
+                    &format!("native-task-independent-read:{position}"),
+                    "evidence_retrieve",
+                    &serde_json::json!({"evidence_ref":content}).to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        let actor = services
+            .resolve_agent_action_actor(
+                &ExecutionParentBinding {
+                    execution_id: verifier.packet.graph_id().into(),
+                    node_id: verifier.packet.node_id().into(),
+                },
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(donor.verification.input_set.as_ref().unwrap().version, 2);
-        assert!(!donor
-            .verification
-            .input_set
-            .as_ref()
-            .unwrap()
-            .material_events
-            .is_empty());
-        let goal = services
-            .goal_store()
-            .get(&format!(
-                "goal:{}",
-                root_actor.root_execution_id.as_ref().unwrap()
-            ))
-            .unwrap()
-            .unwrap();
-        let _ = NATIVE_TASK_CASE.try_with(|case| {
-            if let Some(objective) = &case.objective {
-                assert_eq!(&goal.objective, objective);
-            }
-            if let Some(acceptance) = &case.acceptance {
-                assert_eq!(&current.tasks[&task_ref].acceptance, acceptance);
-            }
+        assert_eq!(actor.team_id.as_deref(), Some(reviewer_team.as_str()));
+        let mut seen_review_refs = std::collections::BTreeSet::new();
+        let review_evidence_refs: Vec<_> = result_refs
+            .iter()
+            .map(|reference| {
+                reference
+                    .strip_prefix("artifact:")
+                    .filter(|logical| !logical.starts_with("//"))
+                    .map_or_else(
+                        || reference.clone(),
+                        |logical| format!("artifact://{logical}"),
+                    )
+            })
+            .chain(result_contents.iter().skip(1).cloned())
+            .filter(|reference| seen_review_refs.insert(reference.clone()))
+            .collect();
+        let envelope = AgentActionEnvelope {
+            action_id: "native-sources:task-review".into(),
+            actor,
+            expected_revision: None,
+            action: AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
+                task_ref: task_ref.clone(),
+                decision: TaskReviewDecision::Accept,
+                reason:
+                    "The actual immutable Native report and selected source were independently read"
+                        .into(),
+                evidence_refs: review_evidence_refs,
+            }),
+        };
+        let mut probed = false;
+        #[cfg(test)]
+        if proof_scenario == R1ProofScenario::TaskReviewAdmission {
+            let current = services
+                .agent_action_service()
+                .project(&root_actor.program_id)
+                .unwrap();
             assert_eq!(
-                current.tasks[&task_ref].criterion_source,
-                case.criterion_source
+                current.tasks[&task_ref].status,
+                crate::AgenticTaskStatus::Submitted
             );
-            assert_eq!(current.tasks[&task_ref].unresolved, case.unresolved);
-        });
-        let history = services.session_history_reader();
-        crate::agentic::review_evidence::validate_proof_inputs(
-            services.event_store(),
-            &current,
-            Some(&goal),
-            &donor.verification,
-            crate::agentic::review_evidence::ResultContentReaders {
-                process_inputs: None,
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: history.as_deref(),
-            },
-        )
-        .unwrap();
-        let async_probe = NATIVE_TASK_ASYNC_PROBE
-            .try_with(|slot| slot.borrow_mut().take())
-            .ok()
-            .flatten();
-        if let Some(probe) = async_probe {
+            let donor = services
+                .independent_result_review(
+                    &envelope.actor,
+                    &current,
+                    &current.tasks[&task_ref].artifact_refs,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(donor.verification.input_set.as_ref().unwrap().version, 2);
+            assert!(!donor
+                .verification
+                .input_set
+                .as_ref()
+                .unwrap()
+                .material_events
+                .is_empty());
+            let goal = services
+                .goal_store()
+                .get(&format!(
+                    "goal:{}",
+                    root_actor.root_execution_id.as_ref().unwrap()
+                ))
+                .unwrap()
+                .unwrap();
+            let _ = NATIVE_TASK_CASE.try_with(|case| {
+                if let Some(objective) = &case.objective {
+                    assert_eq!(&goal.objective, objective);
+                }
+                if let Some(acceptance) = &case.acceptance {
+                    assert_eq!(&current.tasks[&task_ref].acceptance, acceptance);
+                }
+                assert_eq!(
+                    current.tasks[&task_ref].criterion_source,
+                    case.criterion_source
+                );
+                assert_eq!(current.tasks[&task_ref].unresolved, case.unresolved);
+            });
+            let history = services.session_history_reader();
+            crate::agentic::review_evidence::validate_proof_inputs(
+                services.event_store(),
+                &current,
+                Some(&goal),
+                &donor.verification,
+                crate::agentic::review_evidence::ResultContentReaders {
+                    process_inputs: None,
+                    artifacts: Some(services.artifact_store().as_ref()),
+                    history: history.as_deref(),
+                },
+            )
+            .unwrap();
+            let probe = NATIVE_TASK_ASYNC_PROBE.with(|slot| slot.borrow_mut().take().unwrap());
             NATIVE_REWORK_WIRE
                 .scope(
                     NativeReworkWire {
@@ -18711,75 +13448,85 @@ async fn exercise_native_task_sources(
                     probe(services.0.clone(), envelope.clone(), donor),
                 )
                 .await;
-        } else {
-            let probe = NATIVE_TASK_REVIEW_PROBE.with(|slot| slot.borrow_mut().take().unwrap());
-            probe(&services.0, &envelope, &donor);
+            probed = true;
         }
-        probed = true;
-    }
-    if !probed {
-        let reviewed = services.submit_agent_action(&envelope).await.unwrap();
-        assert_eq!(
-            reviewed.status,
-            harness_contract::agent_action::AgentActionStatus::Applied,
-            "{reviewed:?}"
-        );
-    }
-    if probed {
-        let current = services.agent_action_service().project(&root_actor.program_id).unwrap();
-        if current.tasks[&task_ref].status == crate::AgenticTaskStatus::Submitted {
-            let retired = services.submit_agent_action(&AgentActionEnvelope {
-                action_id: "native-negative-probe-retire-original-task".into(),
-                actor: root_actor.clone(),
-                expected_revision: None,
-                action: AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
-                    task_ref: task_ref.clone(),
-                    reason_ref: result_contents[0].clone(),
-                    evidence_refs: result_contents.clone(),
-                }),
-            }).await.unwrap();
-            assert_eq!(retired.status, harness_contract::agent_action::AgentActionStatus::Applied);
+        if !probed {
+            let reviewed = services.submit_agent_action(&envelope).await.unwrap();
+            assert_eq!(
+                reviewed.status,
+                harness_contract::agent_action::AgentActionStatus::Applied,
+                "{reviewed:?}"
+            );
         }
-    }
-    if !services
-        .graph_state_store()
-        .load(verifier.packet.graph_id())
-        .unwrap()
-        .node_statuses
-        .values()
-        .all(|status| status.is_terminal())
-    {
-        verifier.finish().await;
-    }
-    wait_process_graph_terminal(services, &verifier).await;
-    verifier.wait_exit().await;
-    assert!(confirmed_run_exit_with_retry(services.event_store(), &verifier.packet).is_some());
-    assert!(!services.agent_runtime().running_agentic_members(&root_actor.program_id)
-        .contains(&independent_reviewer));
-    if !probed {
-        assert_eq!(
-            services
+        if probed {
+            let current = services
                 .agent_action_service()
                 .project(&root_actor.program_id)
-                .unwrap()
-                .tasks[&task_ref]
-                .status,
-            crate::AgenticTaskStatus::Accepted
-        );
-    }
-    assert!(host.calls.lock().unwrap().iter().any(|request| request
+                .unwrap();
+            if current.tasks[&task_ref].status == crate::AgenticTaskStatus::Submitted {
+                let retired = services
+                    .submit_agent_action(&AgentActionEnvelope {
+                        action_id: "native-negative-probe-retire-original-task".into(),
+                        actor: root_actor.clone(),
+                        expected_revision: None,
+                        action: AgentAction::TaskWithdraw(
+                            harness_contract::agent_action::TaskWithdrawInput {
+                                task_ref: task_ref.clone(),
+                                reason_ref: result_contents[0].clone(),
+                                evidence_refs: result_contents.clone(),
+                            },
+                        ),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    retired.status,
+                    harness_contract::agent_action::AgentActionStatus::Applied
+                );
+            }
+        }
+        if !services
+            .graph_state_store()
+            .load(verifier.packet.graph_id())
+            .unwrap()
+            .node_statuses
+            .values()
+            .all(|status| status.is_terminal())
+        {
+            verifier.finish().await;
+        }
+        wait_process_graph_terminal(services, &verifier).await;
+        verifier.wait_exit().await;
+        assert!(confirmed_run_exit_with_retry(services.event_store(), &verifier.packet).is_some());
+        assert!(!services
+            .agent_runtime()
+            .running_agentic_members(&root_actor.program_id)
+            .contains(&independent_reviewer));
+        if !probed {
+            assert_eq!(
+                services
+                    .agent_action_service()
+                    .project(&root_actor.program_id)
+                    .unwrap()
+                    .tasks[&task_ref]
+                    .status,
+                crate::AgenticTaskStatus::Accepted
+            );
+        }
+        assert!(host.calls.lock().unwrap().iter().any(|request| request
             .parent_execution
             .as_ref()
             .is_some_and(|parent| parent.execution_id == packet.graph_id())
             && request.tool_name == "read_file"));
-    NativeSourcePair {
-        packet,
-        result_refs,
-        result_contents,
-        _wire: wire,
-        #[cfg(test)]
-        registration,
-    }
+        NativeSourcePair {
+            packet,
+            result_refs,
+            result_contents,
+            _wire: wire,
+            #[cfg(test)]
+            registration,
+        }
+    })
 }
 
 #[cfg(test)]

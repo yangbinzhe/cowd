@@ -123,12 +123,37 @@ async fn real_independently_reviewed_satisfied_a_survives_postgres_adapter_resta
         .all(|task| task.active_attempts.is_empty()));
     let stream = format!("agentic-program:{}", witnessed.program.program_id);
     let before = events.list_stream(&stream).unwrap();
+    let old_services = Arc::downgrade(&witnessed.services);
+    let old_events = Arc::downgrade(&events);
+    let shutdown = witnessed.services.shutdown_execution().await;
+    assert!(shutdown.errors.is_empty(), "{shutdown:?}");
+    assert_eq!(shutdown.forced_aborts, 0, "{shutdown:?}");
     witnessed.services.shutdown_maintenance().await;
     let goal = witnessed.goal;
     drop(witnessed.services);
+    drop(events);
+    assert!(old_services.upgrade().is_none(), "old Runtime is retained");
+    assert!(
+        old_events.upgrade().is_none(),
+        "old event adapter is retained"
+    );
     let (restored, events) = services(&fixture, temporary.path());
     assert_eq!(restored.goal_store().get(&goal.id).unwrap().unwrap(), goal);
     assert_eq!(events.list_stream(&stream).unwrap(), before);
+    let restored_content = restored
+        .artifact_store()
+        .resolve(&artifact.content_ref)
+        .unwrap();
+    assert_eq!(
+        restored
+            .artifact_store()
+            .read(&restored_content, "session:session-dispatch", None)
+            .await
+            .unwrap(),
+        b"Source-backed findings for independent review"
+    );
+    let shutdown = restored.shutdown_execution().await;
+    assert!(shutdown.errors.is_empty(), "{shutdown:?}");
     restored.shutdown_maintenance().await;
 }
 

@@ -71,6 +71,13 @@ impl PostgresTestScope {
 
 impl Drop for PostgresTestScope {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "postgres_fixture retained {} reason=thread_unwinding",
+                self.schema
+            );
+            return;
+        }
         let result = self
             .base
             .checkout_critical()
@@ -84,11 +91,7 @@ impl Drop for PostgresTestScope {
             eprintln!("postgres_fixture dropped {}", self.schema);
         }
         if let Err(error) = result {
-            if std::thread::panicking() {
-                eprintln!("owned PostgreSQL fixture cleanup failed: {error}");
-            } else {
-                panic!("owned PostgreSQL fixture cleanup failed: {error}");
-            }
+            panic!("owned PostgreSQL fixture cleanup failed: {error}");
         }
     }
 }

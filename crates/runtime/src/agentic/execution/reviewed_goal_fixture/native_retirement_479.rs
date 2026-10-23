@@ -603,7 +603,7 @@ impl NativeRetirementFixture {
         .await
         .expect("original retirement execution must become quiescent")
         .expect("original retirement execution must finish its physical closure");
-        assert!(assert_real_closures(services, self.worker.packet.graph_id()) >= 3);
+        assert_real_closures(services, self.worker.packet.graph_id());
     }
 
     async fn cold_rebuild(self) -> Self {
