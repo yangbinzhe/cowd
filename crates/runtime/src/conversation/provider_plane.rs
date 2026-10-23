@@ -1265,6 +1265,9 @@ where
                         .map(RuntimeError::provider_failure_scope),
                 );
                 drop(provider_lease);
+                let observed_usage = stream_run
+                    .collected
+                    .observed_usage(stream_run.failure.is_none());
                 let CollectedProviderStream {
                     text,
                     public_reasoning,
@@ -1272,6 +1275,7 @@ where
                     signature,
                     calls,
                     usage,
+                    usage_observed: _,
                     effective_provider_identity,
                     first_event_at,
                     first_text_at: _,
@@ -1291,7 +1295,7 @@ where
                 }
                 add_token_usage(&mut billed_usage, usage);
                 token_reservations
-                    .reconcile(usage)
+                    .reconcile(observed_usage)
                     .map_err(|error| error.with_provider_usage(billed_usage))?;
                 self.reconcile_provider_context_usage(usage);
                 if let Some(error) = stream_run.failure {
@@ -1398,7 +1402,7 @@ where
                         assistant_message: ConversationMessage {
                             role: crate::session::MessageRole::Assistant,
                             blocks,
-                            usage: Some(usage),
+                            usage: observed_usage,
                         },
                         preflight_tool_results: Vec::new(),
                         usage: billed_usage,
@@ -2433,6 +2437,9 @@ where
             )
             .await;
             let resource_result_class = stream_run.resource_result_class;
+            let observed_usage = stream_run
+                .collected
+                .observed_usage(stream_run.failure.is_none());
             let CollectedProviderStream {
                 text,
                 public_reasoning,
@@ -2440,6 +2447,7 @@ where
                 signature,
                 mut calls,
                 usage,
+                usage_observed: _,
                 effective_provider_identity,
                 first_event_at,
                 first_text_at,
@@ -2510,7 +2518,7 @@ where
             );
             drop(provider_lease);
             token_reservations
-                .reconcile(usage)
+                .reconcile(observed_usage)
                 .map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
             if let Some(error) = stream_run.failure {
                 let error = error.with_provider_account_key(provider_account_key.clone());
@@ -2868,7 +2876,7 @@ where
                         let assistant_message = ConversationMessage {
                             role: crate::session::MessageRole::Assistant,
                             blocks,
-                            usage: Some(usage),
+                            usage: observed_usage,
                         };
                         self.consume_active_runtime_inputs_for_next_step(
                             TurnInputCheckpoint::AfterProviderResponse,
@@ -3046,7 +3054,7 @@ where
                 let assistant_message = ConversationMessage {
                     role: crate::session::MessageRole::Assistant,
                     blocks,
-                    usage: Some(usage),
+                    usage: observed_usage,
                 };
                 self.consume_active_runtime_inputs_for_next_step(
                     TurnInputCheckpoint::AfterProviderResponse,
@@ -3106,7 +3114,7 @@ where
             let assistant_message = ConversationMessage {
                 role: crate::session::MessageRole::Assistant,
                 blocks,
-                usage: Some(usage),
+                usage: observed_usage,
             };
             self.session
                 .write()

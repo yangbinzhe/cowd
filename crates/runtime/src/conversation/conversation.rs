@@ -377,21 +377,19 @@ impl EvaluationProviderTokenReservation {
         self.dispatched = true;
     }
 
-    fn reconcile(&mut self, usage: TokenUsage) {
+    fn reconcile(&mut self, usage: impl Into<Option<TokenUsage>>) {
         if self.reconciled {
             return;
         }
+        // Missing/uncertain usage retains the original dispatched charge.
+        let Some(usage) = usage.into() else {
+            return;
+        };
         let input = u64::from(usage.input_tokens);
         let output = u64::from(usage.output_tokens);
         let cached = u64::from(usage.cache_creation_input_tokens)
             .saturating_add(u64::from(usage.cache_read_input_tokens));
         let actual = input.saturating_add(output).saturating_add(cached);
-        if actual == 0 {
-            // Missing provider usage is not permission to refund a hard
-            // reservation. Drop will close the outstanding request while
-            // retaining the conservative charge.
-            return;
-        }
         if let Ok(mut lease) = self.lease.state.lock() {
             if self.advisory || !lease.enforced {
                 lease.telemetry_consumed = lease.telemetry_consumed.saturating_add(actual);
@@ -508,7 +506,8 @@ impl ProviderTokenReservationSet {
         // after this point: crash/unknown usage conservatively consumes it.
     }
 
-    fn reconcile(&mut self, usage: TokenUsage) -> Result<(), RuntimeError> {
+    fn reconcile(&mut self, usage: impl Into<Option<TokenUsage>>) -> Result<(), RuntimeError> {
+        let usage = usage.into();
         if let Some(reservation) = self.evaluation.as_mut() {
             reservation.reconcile(usage);
         }
@@ -927,6 +926,7 @@ struct ModelStreamReducer {
     signature: String,
     calls: Vec<ModelToolCall>,
     usage: TokenUsage,
+    usage_observed: bool,
     effective_provider_identity: Option<harness_contract::outcome::ProviderIdentity>,
     first_event_at: Option<Instant>,
     first_text_at: Option<Instant>,
@@ -1072,6 +1072,7 @@ impl ModelStreamReducer {
             signature: String::new(),
             calls: Vec::new(),
             usage: TokenUsage::default(),
+            usage_observed: false,
             effective_provider_identity: None,
             first_event_at: None,
             first_text_at: None,
@@ -1449,6 +1450,7 @@ impl ModelStreamReducer {
             }
             AssistantEvent::Usage(value) => {
                 self.usage = value;
+                self.usage_observed = true;
                 false
             }
             AssistantEvent::MessageStop => {
@@ -1517,6 +1519,7 @@ impl ModelStreamReducer {
             signature: self.signature,
             calls: self.calls,
             usage: self.usage,
+            usage_observed: self.usage_observed,
             effective_provider_identity: self.effective_provider_identity,
             first_event_at: self.first_event_at,
             first_text_at: self.first_text_at,
@@ -1606,6 +1609,7 @@ struct CollectedProviderStream {
     signature: String,
     calls: Vec<ModelToolCall>,
     usage: TokenUsage,
+    usage_observed: bool,
     effective_provider_identity: Option<harness_contract::outcome::ProviderIdentity>,
     first_event_at: Option<Instant>,
     first_text_at: Option<Instant>,
@@ -1615,6 +1619,12 @@ struct CollectedProviderStream {
     early_tool_receipts: Vec<EarlyToolExecutionReceipt>,
     early_tool_deferrals: Vec<EarlyToolDeferral>,
     response_completed_at_ms: u64,
+}
+
+impl CollectedProviderStream {
+    fn observed_usage(&self, completed: bool) -> Option<TokenUsage> {
+        (self.usage_observed && completed).then_some(self.usage)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

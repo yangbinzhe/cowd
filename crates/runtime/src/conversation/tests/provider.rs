@@ -1627,6 +1627,65 @@ fn provider_reservation_set_leaves_delegated_untouched_when_evaluation_admission
 }
 
 #[test]
+fn provider_usage_missing_zero_and_failed_partial_are_distinct_at_original_reducer() {
+    let missing = ModelStreamReducer::new(None, None, "missing".into()).finish("completed");
+    assert_eq!(missing.observed_usage(true), None);
+    let mut zero = ModelStreamReducer::new(None, None, "zero".into());
+    zero.apply(
+        AssistantEvent::Usage(TokenUsage::default()),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    let zero = zero.finish("completed");
+    assert_eq!(zero.observed_usage(true), Some(TokenUsage::default()));
+    let mut partial = ModelStreamReducer::new(None, None, "partial".into());
+    partial
+        .apply(
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 17,
+                ..Default::default()
+            }),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    let partial = partial.finish("failed");
+    assert_eq!(
+        partial.usage.input_tokens, 17,
+        "observed partial evidence is retained"
+    );
+    assert_eq!(
+        partial.observed_usage(false),
+        None,
+        "a failed transport cannot finalize the charge from partial input usage"
+    );
+}
+
+#[test]
+fn evaluation_usage_missing_keeps_charge_but_reported_zero_refunds_once() {
+    for observed in [false, true] {
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let guard = registry
+            .install("session-usage-truth", "eval-usage-truth", 1_000)
+            .unwrap();
+        let lease = guard.lease();
+        let mut request = token_reservation_request();
+        let mut reservation =
+            ProviderTokenReservationSet::acquire(Some(&lease), None, "test", &mut request).unwrap();
+        reservation.mark_dispatched();
+        let original_charge = guard.snapshot().unwrap().consumed;
+        assert!(original_charge > 0);
+        let usage = observed.then_some(TokenUsage::default());
+        reservation.reconcile(usage).unwrap();
+        reservation.reconcile(usage).unwrap();
+        drop(reservation);
+        let result = guard.snapshot().unwrap();
+        assert_eq!(result.consumed, if observed { 0 } else { original_charge });
+        assert_eq!(result.outstanding, 0);
+        assert!(!result.breached);
+    }
+}
+
+#[test]
 fn advisory_evaluation_lease_never_blocks_provider_admission() {
     let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
     let guard = registry

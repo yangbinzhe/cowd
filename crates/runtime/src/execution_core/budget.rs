@@ -243,7 +243,9 @@ impl ParentExecutionBudgetLedger {
 }
 
 impl DurableProviderBudgetReservation {
-    pub fn reconcile(&mut self, usage: TokenUsage) -> Result<(), String> {
+    pub fn reconcile(&mut self, usage: impl Into<Option<TokenUsage>>) -> Result<(), String> {
+        let observed_usage = usage.into();
+        let usage = observed_usage.unwrap_or_default();
         if self.reconciled {
             return Ok(());
         }
@@ -251,7 +253,7 @@ impl DurableProviderBudgetReservation {
             .saturating_add(u64::from(usage.output_tokens))
             .saturating_add(u64::from(usage.cache_creation_input_tokens))
             .saturating_add(u64::from(usage.cache_read_input_tokens));
-        let missing_usage = actual_tokens == 0;
+        let missing_usage = observed_usage.is_none();
         for _ in 0..MAX_BUDGET_CAS_RETRIES {
             let stream_revision = self
                 .ledger
@@ -419,6 +421,44 @@ mod tests {
             revision: parent.revision,
             slot_index,
             total_slots: 4,
+        }
+    }
+
+    #[test]
+    fn reported_zero_and_missing_usage_replay_as_different_original_budget_facts() {
+        for observed in [false, true] {
+            let store = Arc::new(RuntimeEventStore::for_test());
+            let parent = parent();
+            let ledger =
+                ParentExecutionBudgetLedger::new(Arc::clone(&store), parent.clone()).unwrap();
+            let mut reservation = ledger
+                .reserve_provider(&child(&parent, 0), "usage-truth", "capable-model", 10, 100)
+                .unwrap();
+            assert_eq!(ledger.snapshot().unwrap().reserved_tokens, 120);
+            let usage = observed.then_some(TokenUsage::default());
+            reservation.reconcile(usage).unwrap();
+            reservation.reconcile(usage).unwrap();
+            drop(reservation);
+            let replayed = ParentExecutionBudgetLedger::new(Arc::clone(&store), parent)
+                .unwrap()
+                .snapshot()
+                .unwrap();
+            assert_eq!(replayed.reserved_tokens, if observed { 0 } else { 120 });
+            assert_eq!(replayed.settled_tokens, 0);
+            let events = store.list_stream("execution-budget:parent-budget").unwrap();
+            assert_eq!(
+                events.len(),
+                3,
+                "create + original reservation + exactly one settlement fact"
+            );
+            assert_eq!(
+                events[2].kind,
+                if observed {
+                    "execution_budget.provider_reconciled"
+                } else {
+                    "execution_budget.usage_missing"
+                }
+            );
         }
     }
 
