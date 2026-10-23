@@ -354,7 +354,10 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
         )
         .await
         .unwrap();
-    manager.orchestrator().forget(&id).await.unwrap();
+    kernel
+        .erase(&context, id, "explicit private-note erasure")
+        .await
+        .unwrap();
     assert!(executor
         .execute_runtime_tool_with_binding("private_note", note_input, note_binding)
         .await

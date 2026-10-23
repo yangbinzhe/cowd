@@ -335,63 +335,115 @@ impl CognitiveContextManager {
         self.orchestrator.recall(&mem_id).await
     }
 
-    /// Delete a memory entry by ID.
-    ///
-    /// If a write guard is configured, the delete is checked against the
-    /// guard's layer permissions. Note: the layer must be inferred from the
-    /// entry itself; if the entry is not found, the delete is still attempted
-    /// (it will simply be a no-op).
-    pub async fn delete_entry(&self, id: &str) -> Result<()> {
-        let mem_id = match uuid::Uuid::try_parse(id) {
-            Ok(id) => id,
-            Err(_) => {
-                return Err(crate::MemoryError::InvalidArgument(format!(
-                    "invalid memory id: {id}"
-                )));
-            }
-        };
+    pub(crate) async fn erase_entry_for_turn(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        reason: &str,
+    ) -> Result<crate::store::MemoryLifecycleReceipt> {
+        let store = self.orchestrator.store();
+        if let Some(entry) = store.get(&memory_id).await? {
+            return self.erase_original_entry(ctx, &entry, reason).await;
+        }
+        // Missing is not erased. Only the exact original operation's durable
+        // receipt may confirm a retry after physical body removal.
+        let source = store
+            .read_source_fence(&format!("memory:{memory_id}"))?
+            .ok_or_else(|| MemoryError::NotFound(memory_id.to_string()))?;
+        let scope: MemoryScope = source.scope_key.parse().map_err(MemoryError::Store)?;
+        if scope.scope_key() != source.scope_key || !memory_scope_visible_to_ctx(&scope, ctx) {
+            return Err(MemoryError::StaleSource);
+        }
+        let id = crate::store::MemoryLifecycleMutation::erasure_id(
+            &source.scope_key,
+            memory_id,
+            &ctx.session_id,
+            &ctx.agent_id,
+            reason,
+        )?;
+        let receipt = store
+            .lifecycle_receipt(&id)
+            .await?
+            .ok_or(MemoryError::StaleSource)?;
+        source.verifies_retirement(&receipt.source)?;
+        crate::store::MemoryLifecycleMutation::validate_erasure_confirmation(
+            &source.scope_key,
+            memory_id,
+            ctx,
+            reason,
+            &receipt,
+        )?;
+        self.notify_memory_cleanup();
+        Ok(receipt)
+    }
 
-        // Try to look up the entry's layer for guard check
-        if let Some(entry) = self.orchestrator.recall(&mem_id).await? {
-            let policy = self.check_write_access(entry.layer);
-            if !policy.is_allowed() {
-                return Err(MemoryError::WriteDenied {
+    pub(super) async fn erase_original_entry(
+        &self,
+        ctx: &MemoryTurnContext,
+        entry: &MemoryEntry,
+        reason: &str,
+    ) -> Result<crate::store::MemoryLifecycleReceipt> {
+        if reason.trim().is_empty() || !crate::kernel::memory_entry_visible_to_ctx(entry, ctx) {
+            return Err(MemoryError::StaleSource);
+        }
+        let policy = self.check_write_access(entry.layer);
+        if !policy.is_allowed() {
+            return Err(MemoryError::WriteDenied {
+                layer: format!("{:?}", entry.layer),
+                write_source: format!(
+                    "{:?}",
+                    self.write_guard.as_ref().map(|guard| guard.source())
+                ),
+            });
+        }
+        let store = self.orchestrator.store();
+        let history = store
+            .kv_get(&format!("memory_lifecycle:{}", entry.id))
+            .await?;
+        let events: Vec<MemoryLifecycleEvent> = history
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default();
+        let command = crate::store::MemoryLifecycleMutation::erase(
+            entry,
+            history,
+            MemoryLifecycleEvent {
+                memory_id: entry.id,
+                from: events.last().map(|event| event.to),
+                to: MemoryState::Archived,
+                reason: reason.into(),
+                session_id: ctx.session_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                occurred_at: Utc::now(),
+            },
+        )?;
+        let receipt = store.commit_lifecycle(command).await?;
+        self.notify_memory_cleanup();
+        self.invalidate_prepare_context_cache();
+        if policy.requires_audit() || self.audit_log.is_some() {
+            if let Some(log) = &self.audit_log {
+                // Erasure audit records the operation, never a new copy of the
+                // body being erased. Persistence authority is the native receipt.
+                if let Err(error) = log.log(&AuditEntry {
+                    timestamp: Utc::now(),
+                    operation: AuditOperation::Delete,
+                    entry_id: entry.id.to_string(),
                     layer: format!("{:?}", entry.layer),
-                    write_source: self
+                    source: self
                         .write_guard
                         .as_ref()
-                        .map(|g| format!("{:?}", g.source()))
-                        .unwrap_or_default(),
-                });
-            }
-            // Audit log for delete
-            if policy.requires_audit() || self.audit_log.is_some() {
-                if let Some(ref log) = self.audit_log {
-                    let _ = log.log(&AuditEntry {
-                        timestamp: Utc::now(),
-                        operation: AuditOperation::Delete,
-                        entry_id: id.to_string(),
-                        layer: format!("{:?}", entry.layer),
-                        source: self
-                            .write_guard
-                            .as_ref()
-                            .map(|g| g.source())
-                            .unwrap_or(WriteSource::System),
-                        summary: truncate_summary(
-                            &entry.content,
-                            self.config.tuning.audit_truncate_len,
-                        ),
-
-                        agent_id: None,
-                        session_id: None,
-                    });
+                        .map(|guard| guard.source())
+                        .unwrap_or(WriteSource::System),
+                    summary: format!("body erased; mutation={}", receipt.mutation_id),
+                    agent_id: Some(ctx.agent_id.clone()),
+                    session_id: Some(ctx.session_id.clone()),
+                }) {
+                    tracing::warn!(%error,"Memory erasure audit observation failed after durable commit");
                 }
             }
         }
-
-        self.orchestrator.forget(&mem_id).await?;
-        self.invalidate_prepare_context_cache();
-        Ok(())
+        Ok(receipt)
     }
 
     /// Update a memory entry's content, tags, and/or priority.

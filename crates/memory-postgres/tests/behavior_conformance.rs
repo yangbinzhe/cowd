@@ -133,15 +133,46 @@ async fn delete_removes_entry() {
     store.insert(&e).await.unwrap();
     assert!(store.get(&id).await.unwrap().is_some());
 
-    store.delete(&id).await.unwrap();
+    let command = memory::store::MemoryLifecycleMutation::erase(
+        &e,
+        None,
+        memory::MemoryLifecycleEvent {
+            memory_id: id,
+            from: None,
+            to: memory::MemoryState::Archived,
+            reason: "explicit erase".into(),
+            session_id: "test".into(),
+            agent_id: "test".into(),
+            occurred_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+    let receipt = store.commit_lifecycle(command.clone()).await.unwrap();
+    assert!(receipt.body_erased);
+    assert_eq!(store.commit_lifecycle(command).await.unwrap(), receipt);
     assert!(store.get(&id).await.unwrap().is_none());
 }
 
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-async fn delete_idempotent() {
+async fn erasure_without_an_original_body_is_not_a_successful_noop() {
     let (_fixture, store) = open_store();
-    store.delete(&Uuid::new_v4()).await.unwrap();
+    let absent = entry("missing", "absent", "never written", MemoryLayer::L1);
+    let command = memory::store::MemoryLifecycleMutation::erase(
+        &absent,
+        None,
+        memory::MemoryLifecycleEvent {
+            memory_id: absent.id,
+            from: None,
+            to: memory::MemoryState::Archived,
+            reason: "explicit erase".into(),
+            session_id: "test".into(),
+            agent_id: "test".into(),
+            occurred_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+    assert!(store.commit_lifecycle(command).await.is_err());
 }
 
 #[tokio::test]

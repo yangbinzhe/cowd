@@ -43,6 +43,29 @@ fn memory_entry(id: uuid::Uuid, marker: &str) -> MemoryEntry {
     }
 }
 
+fn erase_command(entry: &MemoryEntry, history: Option<String>) -> MemoryLifecycleMutation {
+    let from: Vec<memory::MemoryLifecycleEvent> = history
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .unwrap()
+        .unwrap_or_default();
+    MemoryLifecycleMutation::erase(
+        entry,
+        history,
+        memory::MemoryLifecycleEvent {
+            memory_id: entry.id,
+            from: from.last().map(|event| event.to),
+            to: memory::MemoryState::Archived,
+            reason: "explicit native erasure".into(),
+            session_id: "native-test".into(),
+            agent_id: "native-test".into(),
+            occurred_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 async fn real_postgres_memory_body_cas_create_conflict_and_observation_survive_reopen() {
@@ -408,7 +431,11 @@ async fn real_postgres_memory_roundtrip() {
     }
     for concurrent_id in concurrent_ids {
         assert!(reopened.get(&concurrent_id).await.unwrap().is_some());
-        reopened.delete(&concurrent_id).await.unwrap();
+        let original = reopened.get(&concurrent_id).await.unwrap().unwrap();
+        reopened
+            .commit_lifecycle(erase_command(&original, None))
+            .await
+            .unwrap();
     }
     assert!(reopened.executor().health().metrics.checkout_count > 8);
 }
@@ -1003,7 +1030,35 @@ async fn real_postgres_memory_body_and_verbatim_rollback_and_reopen_together() {
         .unwrap(),
         serde_json::to_value(&first).unwrap()
     );
-    assert!(store.delete(&entry.id).await.is_err());
+    let rejected_erase = erase_command(&original, None);
+    assert!(store
+        .commit_lifecycle(rejected_erase.clone())
+        .await
+        .is_err());
+    for table in ["memory_lifecycle_receipts", "memory_cleanup_pending"] {
+        let count: i64 = connection
+            .query_one(
+                &format!("SELECT count(*) FROM {table} WHERE mutation_id=$1"),
+                &[&rejected_erase.mutation_id],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            count, 0,
+            "a refused retained-text delete cannot publish receipt or pending"
+        );
+    }
+    let fences: i64 = connection
+        .query_one(
+            "SELECT count(*) FROM memory_source_fences WHERE source_ref=$1",
+            &[&format!("memory:{}", original.id)],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        fences, 0,
+        "the same refusal must roll back source retirement"
+    );
     assert!(
         store.get(&entry.id).await.unwrap().is_some(),
         "delete must roll back when retained text deletion fails"
@@ -1037,19 +1092,30 @@ async fn real_postgres_memory_body_and_verbatim_rollback_and_reopen_together() {
         .unwrap();
     assert_eq!(corrected.content, "corrected durable body");
     assert_eq!(corrected.timestamp, entry.updated_at.to_rfc3339());
-    reopened.delete(&entry.id).await.unwrap();
+    reopened
+        .commit_lifecycle(erase_command(&entry, None))
+        .await
+        .unwrap();
     assert!(reopened.get(&entry.id).await.unwrap().is_none());
     assert!(reopened
         .load_verbatim_by_id(&entry.id.to_string())
         .await
         .unwrap()
         .is_none());
-    assert!(matches!(
+    assert!(
         reopened
             .update(&entry, &MemoryEntryRevision::of(&entry).unwrap())
-            .await,
-        Err(MemoryError::NotFound(_))
-    ));
+            .await
+            .is_err(),
+        "erased source must remain fenced against rewriting"
+    );
+    assert!(
+        reopened
+            .read_source_fence(&format!("memory:{}", entry.id))
+            .unwrap()
+            .unwrap()
+            .retired
+    );
     assert!(reopened
         .load_verbatim_by_id(&entry.id.to_string())
         .await
@@ -1335,8 +1401,12 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
     let knowledge = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
     let fabric = KnowledgeFabric::with_store(knowledge.clone()).with_memory_sources(store.clone());
-    let entry = memory_entry(uuid::Uuid::new_v4(), "archive-cleanup");
-    let independent = memory_entry(uuid::Uuid::new_v4(), "independent-cleanup");
+    // Namespace-only search has no Agent grant; these original project
+    // sources are explicitly shared. Private-source denial is a separate gate.
+    let mut entry = memory_entry(uuid::Uuid::new_v4(), "archive-cleanup");
+    entry.visibility = AgentVisibility::Shared;
+    let mut independent = memory_entry(uuid::Uuid::new_v4(), "independent-cleanup");
+    independent.visibility = AgentVisibility::Shared;
     store.insert(&entry).await.unwrap();
     store.insert(&independent).await.unwrap();
     let mut document = DocumentContent::new("retiring pack", "Keep original evidence.");
@@ -1731,9 +1801,17 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .is_empty());
     drop(reopened_kernel);
     drop(reopened);
-    // A live epoch-zero record cannot authorize a source whose body was
-    // physically removed by the still-unmigrated legacy erase caller.
-    reopened_store.delete(&independent.id).await.unwrap();
+    // Deliberate storage corruption in this owned schema, never a production
+    // deletion entry: a live fence must not authorize an absent original body.
+    {
+        let mut connection = reopened_store.executor().checkout_critical().unwrap();
+        connection
+            .execute(
+                "DELETE FROM memory_entries WHERE id=$1",
+                &[&independent.id.to_string()],
+            )
+            .unwrap();
+    }
     assert!(reopened_store
         .read_source_fence(&format!("memory:{}", independent.id))
         .is_err());
@@ -2503,4 +2581,119 @@ async fn real_postgres_retired_derivative_never_hydrates_its_large_ancestor() {
     assert!(read.fence.retired);
     assert!(read.revision.is_none());
     assert!(read.materialized_bytes < 4096);
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_erasure_receipt_binds_original_cut_identity_and_reopens_without_body() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = PostgresMemoryStore::new(executor.clone()).unwrap();
+    let mut original = memory_entry(uuid::Uuid::new_v4(), "erase original");
+    store.insert(&original).await.unwrap();
+    let old = erase_command(&original, None);
+    let cut = MemoryEntryRevision::of(&original).unwrap();
+    original.content = "new content before erase admission".into();
+    store.update(&original, &cut).await.unwrap();
+    assert!(store.commit_lifecycle(old.clone()).await.is_err());
+    assert!(store.get(&original.id).await.unwrap().is_some());
+    let command = erase_command(&original, None);
+    let receipt = store.commit_lifecycle(command.clone()).await.unwrap();
+    assert!(receipt.body_erased);
+    assert!(store.get(&original.id).await.unwrap().is_none());
+    assert!(store
+        .load_verbatim_by_id(&original.id.to_string())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        store.commit_lifecycle(old).await.is_err(),
+        "the operation ID cannot confirm a different original body cut"
+    );
+    let mut foreign = command.clone();
+    foreign.scope_key = "project_foreign".into();
+    assert!(store.commit_lifecycle(foreign).await.is_err());
+    let mut wrong_actor = command.clone();
+    wrong_actor.event.agent_id = "foreign-agent".into();
+    assert!(store.commit_lifecycle(wrong_actor).await.is_err());
+    drop(store);
+    let reopened = PostgresMemoryStore::new(executor).unwrap();
+    assert_eq!(reopened.commit_lifecycle(command).await.unwrap(), receipt);
+    assert_eq!(
+        reopened
+            .lifecycle_receipt(&receipt.mutation_id)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    let pending = reopened.pending_memory_cleanup(None, 16).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].mutation_id, receipt.mutation_id);
+    assert!(reopened.insert(&original).await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_erasure_skipped_delete_cannot_publish_a_receipt() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = PostgresMemoryStore::new(executor.clone()).unwrap();
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("CREATE FUNCTION skip_erasure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$").unwrap();
+    for table in ["memory_entries", "memory_verbatim"] {
+        let original = memory_entry(uuid::Uuid::new_v4(), table);
+        store.insert(&original).await.unwrap();
+        let command = erase_command(&original, None);
+        connection.batch_execute(&format!("CREATE TRIGGER skip_erasure BEFORE DELETE ON {table} FOR EACH ROW EXECUTE FUNCTION skip_erasure()")).unwrap();
+        assert!(
+            store.commit_lifecycle(command.clone()).await.is_err(),
+            "a skipped {table} deletion is not erasure"
+        );
+        assert_eq!(
+            store.get(&original.id).await.unwrap().unwrap().content,
+            original.content
+        );
+        assert_eq!(
+            store
+                .load_verbatim_by_id(&original.id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            original.content
+        );
+        for metadata in ["memory_lifecycle_receipts", "memory_cleanup_pending"] {
+            let count: i64 = connection
+                .query_one(
+                    &format!("SELECT count(*) FROM {metadata} WHERE mutation_id=$1"),
+                    &[&command.mutation_id],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(count, 0, "skipped deletion cannot publish {metadata}");
+        }
+        let fences: i64 = connection
+            .query_one(
+                "SELECT count(*) FROM memory_source_fences WHERE source_ref=$1",
+                &[&format!("memory:{}", original.id)],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(fences, 0);
+        assert!(store
+            .kv_get(&format!("memory_lifecycle:{}", original.id))
+            .await
+            .unwrap()
+            .is_none());
+        connection
+            .batch_execute(&format!("DROP TRIGGER skip_erasure ON {table}"))
+            .unwrap();
+        assert!(store.commit_lifecycle(command).await.unwrap().body_erased);
+        assert!(store.get(&original.id).await.unwrap().is_none());
+        assert!(store
+            .load_verbatim_by_id(&original.id.to_string())
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

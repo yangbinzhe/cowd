@@ -114,11 +114,6 @@ impl LayerManager for IdentityLayer {
         Ok(id)
     }
 
-    /// Remove an identity entry.
-    async fn remove(&self, id: &MemoryId) -> Result<()> {
-        self.store.delete(id).await
-    }
-
     /// Prepare context from L0: all identity entries within budget.
     async fn prepare_context(&self, budget: &TokenBudget) -> Result<PreparedContext> {
         let available = budget.available.min(IDENTITY_TOKEN_BUDGET);
@@ -244,15 +239,6 @@ mod tests {
             .unwrap();
         assert_eq!(got.layer, MemoryLayer::L0);
         assert_eq!(got.priority, Priority::Critical);
-    }
-
-    #[tokio::test]
-    async fn remove_deletes_entry() {
-        let layer = IdentityLayer::new(in_memory());
-        let id = layer.set("T", "C").await.unwrap();
-        assert_eq!(layer.load().await.unwrap().len(), 1);
-        layer.remove(&id).await.unwrap();
-        assert_eq!(layer.load().await.unwrap().len(), 0);
     }
 
     #[tokio::test]

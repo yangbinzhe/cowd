@@ -273,10 +273,6 @@ impl LayerManager for ProjectLayer {
         Ok(id)
     }
 
-    async fn remove(&self, id: &MemoryId) -> Result<()> {
-        self.store.delete(id).await
-    }
-
     /// Prepare L2 context within the given token budget.
     async fn prepare_context(&self, budget: &TokenBudget) -> Result<PreparedContext> {
         let available = budget.available.min(self.max_tokens);

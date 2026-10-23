@@ -826,6 +826,20 @@ impl MemoryKernel {
             .await
     }
 
+    /// Explicit body erasure. The original receipt distinguishes physical body
+    /// removal from still-pending Knowledge/auxiliary cleanup.
+    pub async fn erase(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        reason: &str,
+    ) -> MemoryKernelResult<crate::store::MemoryLifecycleReceipt> {
+        self.manager
+            .erase_entry_for_turn(ctx, memory_id, reason)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Append a lifecycle transition. Evidence is not mutated.
     pub async fn transition_state(
         &self,
@@ -1899,7 +1913,7 @@ pub(crate) fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
     MemoryScope::Session(ctx.session_id.clone())
 }
 
-fn memory_entry_visible_to_ctx(entry: &MemoryEntry, ctx: &MemoryTurnContext) -> bool {
+pub(crate) fn memory_entry_visible_to_ctx(entry: &MemoryEntry, ctx: &MemoryTurnContext) -> bool {
     crate::store::MemorySourceAccess::of(entry).visible_to_ctx(ctx)
 }
 

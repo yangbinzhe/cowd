@@ -136,7 +136,21 @@ async fn postgres_memory_discovery_versions_content_and_lifecycle_atomically() {
         ..query.clone()
     };
     let key = format!("memory_lifecycle:{}", saved.id);
-    store.kv_put(&key, "[{\"to\":\"Archived\"}]").await.unwrap();
+    let observation = memory::store::MemoryLifecycleMutation::new(
+        &saved,
+        None,
+        memory::MemoryLifecycleEvent {
+            memory_id: saved.id,
+            from: None,
+            to: memory::MemoryState::Observed,
+            reason: "original observation".into(),
+            session_id: "test".into(),
+            agent_id: "test".into(),
+            occurred_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+    store.commit_lifecycle(observation.clone()).await.unwrap();
     assert!(store.discover_page(resume).await.is_err());
     let all = store
         .discover_page(MemoryDiscoveryQuery {
@@ -147,7 +161,7 @@ async fn postgres_memory_discovery_versions_content_and_lifecycle_atomically() {
         .unwrap();
     assert_eq!(all.lifecycle[0].key, key);
     let before = all.revisions.clone();
-    store.kv_put(&key, "[{\"to\":\"Archived\"}]").await.unwrap();
+    store.commit_lifecycle(observation).await.unwrap();
     let reopened = PostgresMemoryStore::new(scoped).unwrap();
     assert_eq!(
         reopened
@@ -157,7 +171,22 @@ async fn postgres_memory_discovery_versions_content_and_lifecycle_atomically() {
             .revisions,
         before
     );
-    store.delete(&saved.id).await.unwrap();
+    let history = store.kv_get(&key).await.unwrap();
+    let erasure = memory::store::MemoryLifecycleMutation::erase(
+        &saved,
+        history,
+        memory::MemoryLifecycleEvent {
+            memory_id: saved.id,
+            from: Some(memory::MemoryState::Observed),
+            to: memory::MemoryState::Archived,
+            reason: "explicit erase".into(),
+            session_id: "test".into(),
+            agent_id: "test".into(),
+            occurred_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+    store.commit_lifecycle(erasure).await.unwrap();
     assert!(reopened
         .discover_page(MemoryDiscoveryQuery {
             expected_revisions: Some(before),

@@ -40,9 +40,6 @@ pub trait LayerManager: Send + Sync {
     /// require an original target revision through the store update contract.
     async fn insert(&self, entry: MemoryEntry) -> Result<MemoryId>;
 
-    /// Remove an entry from this layer.
-    async fn remove(&self, id: &MemoryId) -> Result<()>;
-
     /// Prepare a context fragment from this layer within the given budget.
     async fn prepare_context(&self, budget: &TokenBudget) -> Result<PreparedContext>;
 

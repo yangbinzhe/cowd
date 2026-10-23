@@ -237,10 +237,6 @@ pub trait MemoryStore: MemorySourceFenceReader + Send + Sync {
     /// target witness. Scope changes and stale bodies are refused atomically.
     async fn update(&self, entry: &MemoryEntry, expected: &MemoryEntryRevision) -> Result<()>;
 
-    /// Remove a body and matching verbatim atomically. Source/derived erasure
-    /// obligations remain a separate governed domain contract.
-    async fn delete(&self, id: &MemoryId) -> Result<()>;
-
     /// Atomically compare the original body/history and publish lifecycle,
     /// source epoch, receipt and derived cleanup obligation in this owner.
     async fn commit_lifecycle(

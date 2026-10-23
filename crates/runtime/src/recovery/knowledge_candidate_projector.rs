@@ -547,6 +547,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_private_candidate_rollback_uses_its_scoped_erase_receipt() {
+        let (_root, _events, _approvals, promotion) = fixture().await;
+        let candidate = private_candidate(
+            "candidate-original-rollback",
+            "Private rollback",
+            "An original governed private observation.",
+        );
+        let promoted = promotion.govern(candidate.clone()).await.unwrap();
+        assert_eq!(promoted.state, KnowledgeCandidateState::Promoted);
+        assert!(promotion
+            .rollback(&candidate.candidate_id, "")
+            .await
+            .is_err());
+        assert_eq!(
+            promotion
+                .get(&candidate.candidate_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            KnowledgeCandidateState::Promoted
+        );
+        let retired = promotion
+            .rollback(&candidate.candidate_id, "source withdrawn")
+            .await
+            .unwrap();
+        assert_eq!(retired.state, KnowledgeCandidateState::RolledBack);
+        assert_eq!(retired.receipt, promoted.receipt);
+        assert_eq!(
+            promotion
+                .rollback(&candidate.candidate_id, "source withdrawn")
+                .await
+                .unwrap(),
+            retired
+        );
+        assert!(promotion
+            .rollback("foreign-candidate", "source withdrawn")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn projector_does_not_starve_source_commits_behind_its_checkpoint() {
         let (_root, events, _approvals, promotion) = fixture().await;
         events

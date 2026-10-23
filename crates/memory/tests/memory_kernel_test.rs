@@ -1441,7 +1441,10 @@ async fn memory_discovery_pages_all_matches_without_leaking_hidden_cursor_ids() 
     let active = kernel.discover_page(&ctx, "needle", None, 7).await.unwrap();
     assert!(active.selected.iter().all(|item| item.atom.id != id));
     let cursor = active.next_cursor.unwrap();
-    store.delete(&id).await.unwrap();
+    kernel
+        .erase(&ctx, id, "erase retired discovery target")
+        .await
+        .unwrap();
     assert!(kernel
         .discover_page(&ctx, "needle", Some(&cursor), 7)
         .await
@@ -1661,8 +1664,10 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
         .with_memory_sources(store.clone());
     let mut retired = entry(MemoryLayer::L3, MemorySource::Import, "retire rule");
     retired.scope = MemoryScope::Project("A".into());
+    retired.visibility = AgentVisibility::Shared;
     let mut other = entry(MemoryLayer::L3, MemorySource::Import, "independent rule");
     other.scope = MemoryScope::Project("A".into());
+    other.visibility = AgentVisibility::Shared;
     store.insert(&retired).await.unwrap();
     store.insert(&other).await.unwrap();
     let ingest = |source: &memory::MemoryEntry, title: &str| {
@@ -2162,59 +2167,6 @@ async fn knowledge_required_source_read_failure_is_not_empty_success_or_foreign_
             .len(),
         2
     );
-    // Persist a live source observation before simulating the legacy physical delete.
-    let event = memory::MemoryLifecycleEvent {
-        memory_id: own.id,
-        from: None,
-        to: MemoryState::Observed,
-        reason: "original observation".into(),
-        session_id: "s".into(),
-        agent_id: "a".into(),
-        occurred_at: Utc::now(),
-    };
-    store
-        .commit_lifecycle(memory::store::MemoryLifecycleMutation::new(&own, None, event).unwrap())
-        .await
-        .unwrap();
-    store.delete(&own.id).await.unwrap();
-    assert!(matches!(
-        fabric.search_namespace(&KnowledgeNamespace::Project("A".into()), ""),
-        Err(memory::KnowledgeStoreError::MemorySourceRead(_))
-    ));
-}
-
-#[tokio::test]
-async fn live_source_fence_without_its_original_body_is_unknown() {
-    use memory::store::{
-        EphemeralMemoryStore, MemoryLifecycleMutation, MemorySourceFenceReader, MemoryStore,
-    };
-    let store = EphemeralMemoryStore::new();
-    let original = entry(MemoryLayer::L3, MemorySource::UserExplicit, "original body");
-    store.insert(&original).await.unwrap();
-    let event = memory::MemoryLifecycleEvent {
-        memory_id: original.id,
-        from: None,
-        to: MemoryState::Observed,
-        reason: "original observation".into(),
-        session_id: "s".into(),
-        agent_id: "a".into(),
-        occurred_at: Utc::now(),
-    };
-    store
-        .commit_lifecycle(MemoryLifecycleMutation::new(&original, None, event).unwrap())
-        .await
-        .unwrap();
-    assert!(
-        !store
-            .read_source_fence(&format!("memory:{}", original.id))
-            .unwrap()
-            .unwrap()
-            .retired
-    );
-    store.delete(&original.id).await.unwrap();
-    assert!(store
-        .read_source_fence(&format!("memory:{}", original.id))
-        .is_err());
 }
 
 #[tokio::test]
@@ -3251,4 +3203,192 @@ async fn retired_derivative_uses_only_its_original_fence_not_a_large_ancestor() 
     assert!(read.fence.retired);
     assert!(read.revision.is_none());
     assert!(read.materialized_bytes < 4096);
+}
+
+#[tokio::test]
+async fn explicit_erasure_has_its_own_receipt_and_cannot_recreate_or_confirm_a_foreign_call() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryEntryRevision, MemoryExtractionOrigin, MemorySourceFenceReader,
+        MemoryStore,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("memory")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager.clone());
+    let ctx = MemoryTurnContext::new("s", "a").with_project_id(Some("project-a".into()));
+    let mut source = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "body retained for archive only",
+    );
+    source.scope = MemoryScope::Project("project-a".into());
+    kernel.remember(&ctx, source.clone()).await.unwrap();
+    let original = store.get(&source.id).await.unwrap().unwrap();
+    kernel
+        .archive(&ctx, source.id, "archive source")
+        .await
+        .unwrap();
+    assert!(store.get(&source.id).await.unwrap().is_some());
+    assert!(store
+        .load_verbatim_by_id(&source.id.to_string())
+        .await
+        .unwrap()
+        .is_some());
+    let receipt = kernel
+        .erase(&ctx, source.id, "explicit erase")
+        .await
+        .unwrap();
+    assert!(receipt.body_erased);
+    assert!(receipt.source.retired);
+    assert!(store.get(&source.id).await.unwrap().is_none());
+    assert!(store
+        .load_verbatim_by_id(&source.id.to_string())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        kernel
+            .erase(&ctx, source.id, "explicit erase")
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert!(kernel
+        .erase(
+            &MemoryTurnContext::new("s", "foreign").with_project_id(ctx.project_id.clone()),
+            source.id,
+            "explicit erase"
+        )
+        .await
+        .is_err());
+    assert!(kernel
+        .erase(&ctx, source.id, "different erase operation")
+        .await
+        .is_err());
+    assert!(kernel
+        .erase(&ctx, uuid::Uuid::new_v4(), "never existed")
+        .await
+        .is_err());
+    assert!(kernel.remember(&ctx, source.clone()).await.is_err());
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000017";
+    let mut late = original.clone();
+    late.id = uuid::Uuid::new_v4();
+    late.source = MemorySource::AutoExtracted;
+    late.tags = vec![batch.into()];
+    let late_ctx = ctx
+        .clone()
+        .with_source_readset(Some(vec![MemoryEntryRevision::of(&original).unwrap()]));
+    assert!(store
+        .write_extraction(
+            &late,
+            &MemoryExtractionOrigin::for_entry(&late_ctx, &late, batch).unwrap(),
+            None
+        )
+        .await
+        .is_err());
+    let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
+    assert_eq!(
+        pending.len(),
+        2,
+        "Archive and Erase are distinct original operations"
+    );
+    assert!(pending
+        .iter()
+        .all(|pending| !pending.auxiliary_confirmed && pending.knowledge_receipt_digest.is_none()));
+    let fabric = memory::KnowledgeFabric::with_store(Arc::new(
+        memory::InMemoryKnowledgeStore::new().with_memory_owner(store.clone()),
+    ))
+    .with_memory_sources(store.clone());
+    assert!(manager
+        .recover_memory_cleanup(&fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        store
+            .read_source_fence(&format!("memory:{}", source.id))
+            .unwrap()
+            .unwrap()
+            .retired
+    );
+}
+
+#[tokio::test]
+async fn erasure_preserves_original_layer_scope_and_operation_kind_guards() {
+    use memory::store::{EphemeralMemoryStore, MemoryLifecycleMutation, MemoryStore};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let mut source = entry(
+        MemoryLayer::L0,
+        MemorySource::UserExplicit,
+        "protected body",
+    );
+    source.scope = MemoryScope::Project("A".into());
+    source.source_agent = Some("owner".into());
+    store.insert(&source).await.unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("memory")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap()
+        .with_write_source(memory::write_guard::WriteSource::Tool),
+    );
+    let kernel = MemoryKernel::new(manager);
+    let ctx = MemoryTurnContext::new("s", "owner").with_project_id(Some("A".into()));
+    assert!(kernel
+        .erase(&ctx, source.id, "not granted to tools")
+        .await
+        .is_err());
+    let foreign = MemoryTurnContext::new("s", "owner").with_project_id(Some("foreign".into()));
+    assert!(kernel
+        .erase(&foreign, source.id, "wrong scope")
+        .await
+        .is_err());
+    let archive = MemoryLifecycleMutation::new(
+        &source,
+        None,
+        memory::MemoryLifecycleEvent {
+            memory_id: source.id,
+            from: None,
+            to: MemoryState::Archived,
+            reason: "archive only".into(),
+            session_id: "s".into(),
+            agent_id: "owner".into(),
+            occurred_at: Utc::now(),
+        },
+    )
+    .unwrap();
+    let mut forged = serde_json::to_value(archive).unwrap();
+    forged["erase_body"] = serde_json::json!(true);
+    assert!(
+        store
+            .commit_lifecycle(serde_json::from_value(forged).unwrap())
+            .await
+            .is_err(),
+        "Archive identity cannot be borrowed for a body erase"
+    );
+    assert!(store.get(&source.id).await.unwrap().is_some());
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
 }

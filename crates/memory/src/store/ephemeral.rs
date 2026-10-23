@@ -494,15 +494,6 @@ impl MemoryStore for EphemeralMemoryStore {
         put_discovery_entry(&mut state, &entry);
         Ok(())
     }
-    async fn delete(&self, id: &MemoryId) -> Result<()> {
-        let mut state = self.write()?;
-        if let Some(entry) = state.entries.remove(&id.to_string()) {
-            bump_discovery(&mut state, &entry.scope);
-        }
-        state.verbatim.remove(&id.to_string());
-        Ok(())
-    }
-
     async fn commit_lifecycle(
         &self,
         command: MemoryLifecycleMutation,
@@ -542,6 +533,10 @@ impl MemoryStore for EphemeralMemoryStore {
             state
                 .cleanup_pending
                 .insert(command.mutation_id.clone(), pending);
+        }
+        if command.erases_body() {
+            state.entries.remove(&entry.id.to_string());
+            state.verbatim.remove(&entry.id.to_string());
         }
         state
             .lifecycle_receipts
@@ -1394,5 +1389,27 @@ mod extraction_source_budget_tests {
             ),
             "another source must not parse an origin exceeding its remaining shared budget"
         );
+    }
+}
+
+#[cfg(test)]
+mod corruption_tests {
+    use super::*;
+    #[test]
+    fn live_source_fence_without_its_original_body_is_unknown() {
+        let store = EphemeralMemoryStore::new();
+        let id = uuid::Uuid::new_v4();
+        let source = format!("memory:{id}");
+        store.write().unwrap().source_fences.insert(
+            source.clone(),
+            MemorySourceFence {
+                source_ref: source.clone(),
+                scope_key: "project_a".into(),
+                delete_epoch: 0,
+                retired: false,
+            },
+        );
+        assert!(store.read_source_fence(&source).is_err());
+        assert!(store.read_source_revision(&source, 4096).is_err());
     }
 }

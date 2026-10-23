@@ -383,8 +383,32 @@ impl L4PromotionService {
             .memory_manager
             .as_ref()
             .ok_or_else(|| "knowledge rollback requires a configured Memory manager".to_string())?;
-        manager
-            .delete_entry(&receipt.memory_id)
+        let candidate = &projection.candidate;
+        let mut context = memory::MemoryTurnContext::new(
+            candidate
+                .execution_identity
+                .session_id()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("knowledge-candidate:{}", candidate.candidate_id)),
+            "runtime-l4-promotion-service",
+        );
+        match &candidate.scope {
+            KnowledgeCandidateScope::AgentPrivate(agent) => context.agent_id = agent.clone(),
+            KnowledgeCandidateScope::Team(team) => context.team_id = Some(team.clone()),
+            KnowledgeCandidateScope::Workspace(project) => {
+                context.project_id = Some(project.clone())
+            }
+            KnowledgeCandidateScope::Global => {}
+        }
+        memory::MemoryKernel::new(manager.clone())
+            .erase(
+                &context,
+                receipt
+                    .memory_id
+                    .parse()
+                    .map_err(|_| "invalid original L4 Memory receipt ID")?,
+                &format!("L4 rollback {}: {reason}", candidate.candidate_id),
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.append_state(

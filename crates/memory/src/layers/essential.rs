@@ -192,10 +192,6 @@ impl LayerManager for EssentialLayer {
         Ok(id)
     }
 
-    async fn remove(&self, id: &MemoryId) -> Result<()> {
-        self.store.delete(id).await
-    }
-
     /// Prepare L1 context within the given token budget.
     async fn prepare_context(&self, budget: &TokenBudget) -> Result<PreparedContext> {
         let available = budget.available.min(self.max_tokens);
@@ -386,26 +382,6 @@ mod tests {
             .find(|e| e.id == id)
             .unwrap();
         assert_eq!(loaded.layer, MemoryLayer::L1);
-    }
-
-    #[tokio::test]
-    async fn remove_deletes_entry() {
-        let layer = EssentialLayer::new(in_memory());
-        let id = layer
-            .add(
-                MemoryCategory::Decision,
-                "T",
-                "C",
-                Priority::Normal,
-                MemorySource::AutoExtracted,
-                vec![],
-                MemoryScope::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(layer.load().await.unwrap().len(), 1);
-        layer.remove(&id).await.unwrap();
-        assert_eq!(layer.load().await.unwrap().len(), 0);
     }
 
     #[tokio::test]

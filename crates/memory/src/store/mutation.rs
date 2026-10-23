@@ -54,6 +54,8 @@ pub struct MemoryLifecycleMutation {
     pub event: MemoryLifecycleEvent,
     #[serde(default = "origin_revocation_default", skip_deserializing)]
     revoke_origin: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    erase_body: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +119,10 @@ pub struct MemoryLifecycleReceipt {
     pub command_digest: String,
     pub event: MemoryLifecycleEvent,
     pub source: MemorySourceFence,
+    /// Physical body/verbatim removal only. Derived cleanup remains pending
+    /// until the original Knowledge and auxiliary receipts are confirmed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub body_erased: bool,
 }
 
 /// A synchronous, narrow read port for the synchronous Knowledge owner. Both
@@ -467,6 +473,10 @@ fn typed_digest(domain: &str, value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn origin_revocation_default() -> bool {
     true
 }
@@ -487,6 +497,7 @@ impl MemoryLifecycleMutation {
             expected_history,
             event,
             revoke_origin: true,
+            erase_body: false,
         };
         let mutation_id = if matches!(
             command.event.to,
@@ -510,6 +521,67 @@ impl MemoryLifecycleMutation {
         };
         command.mutation_id = mutation_id;
         Ok(command)
+    }
+
+    pub fn erase(
+        entry: &MemoryEntry,
+        expected_history: Option<String>,
+        event: MemoryLifecycleEvent,
+    ) -> Result<Self> {
+        if event.to != MemoryState::Archived {
+            return Err(MemoryError::StaleSource);
+        }
+        let mut command = Self::new(entry, expected_history, event)?;
+        command.erase_body = true;
+        command.mutation_id = Self::erasure_id(
+            &command.scope_key,
+            command.event.memory_id,
+            &command.event.session_id,
+            &command.event.agent_id,
+            &command.event.reason,
+        )?;
+        Ok(command)
+    }
+
+    pub fn erases_body(&self) -> bool {
+        self.erase_body
+    }
+
+    pub fn erasure_id(
+        scope_key: &str,
+        memory_id: MemoryId,
+        session_id: &str,
+        agent_id: &str,
+        reason: &str,
+    ) -> Result<String> {
+        typed_digest(
+            "cowd.memory.erasure.id.v1",
+            &(scope_key, memory_id, session_id, agent_id, reason),
+        )
+    }
+
+    pub fn validate_erasure_confirmation(
+        scope_key: &str,
+        memory_id: MemoryId,
+        ctx: &crate::MemoryTurnContext,
+        reason: &str,
+        receipt: &MemoryLifecycleReceipt,
+    ) -> Result<()> {
+        receipt.source.verifies_retirement(&receipt.source)?;
+        if !receipt.body_erased
+            || receipt.mutation_id
+                != Self::erasure_id(scope_key, memory_id, &ctx.session_id, &ctx.agent_id, reason)?
+            || receipt.source.source_ref != format!("memory:{memory_id}")
+            || receipt.source.scope_key != scope_key
+            || receipt.event.memory_id != memory_id
+            || receipt.event.to != MemoryState::Archived
+            || receipt.event.session_id != ctx.session_id
+            || receipt.event.agent_id != ctx.agent_id
+            || receipt.event.reason != reason
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        Ok(())
     }
 
     /// Retiring a redundant projection is not revoking its original input.
@@ -547,7 +619,9 @@ impl MemoryLifecycleMutation {
 
     pub fn command_digest(&self) -> Result<String> {
         typed_digest(
-            if self.revoke_origin {
+            if self.erase_body {
+                "cowd.memory.erasure.command.v1"
+            } else if self.revoke_origin {
                 "cowd.memory.lifecycle.command.v2"
             } else {
                 "cowd.memory.redundant-projection.command.v1"
@@ -561,6 +635,7 @@ impl MemoryLifecycleMutation {
             || receipt.command_digest != self.command_digest()?
             || receipt.event.memory_id != self.event.memory_id
             || receipt.source.scope_key != self.scope_key
+            || receipt.body_erased != self.erase_body
         {
             return Err(MemoryError::Store(
                 "Memory lifecycle mutation identity collision".into(),
@@ -584,6 +659,7 @@ impl MemoryLifecycleMutation {
             || receipt.event.session_id != self.event.session_id
             || receipt.event.agent_id != self.event.agent_id
             || receipt.event.reason != self.event.reason
+            || receipt.body_erased != self.erase_body
         {
             return Err(MemoryError::Store(
                 "foreign Memory retirement confirmation".into(),
@@ -600,7 +676,17 @@ impl MemoryLifecycleMutation {
         history: Option<&str>,
         source: Option<&MemorySourceFence>,
     ) -> Result<(String, MemoryLifecycleReceipt, Option<MemoryCleanupPending>)> {
-        if self.mutation_id.is_empty()
+        if (self.erase_body
+            && (self.event.to != MemoryState::Archived
+                || self.mutation_id
+                    != Self::erasure_id(
+                        &self.scope_key,
+                        self.event.memory_id,
+                        &self.event.session_id,
+                        &self.event.agent_id,
+                        &self.event.reason,
+                    )?))
+            || self.mutation_id.is_empty()
             || self.event.session_id.is_empty()
             || self.event.agent_id.is_empty()
             || entry.id != self.event.memory_id
@@ -666,6 +752,7 @@ impl MemoryLifecycleMutation {
             command_digest: self.command_digest()?,
             event: self.event.clone(),
             source: fence,
+            body_erased: self.erase_body,
         };
         Ok((raw, receipt, pending))
     }

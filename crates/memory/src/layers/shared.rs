@@ -249,13 +249,6 @@ impl LayerManager for SharedLayer {
         })
     }
 
-    async fn remove(&self, id: &MemoryId) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        self.store.delete(id).await
-    }
-
     async fn prepare_context(&self, budget: &TokenBudget) -> Result<PreparedContext> {
         if !self.enabled {
             return Ok(PreparedContext {
@@ -397,9 +390,7 @@ impl crate::store::MemoryStore for NoopStore {
     ) -> crate::store::Result<()> {
         Ok(())
     }
-    async fn delete(&self, _id: &MemoryId) -> crate::store::Result<()> {
-        Ok(())
-    }
+
     async fn commit_lifecycle(
         &self,
         _: crate::store::MemoryLifecycleMutation,
@@ -775,12 +766,6 @@ mod tests {
         let entries = layer.load().await.unwrap();
         let got = entries.iter().find(|e| e.id == id).unwrap();
         assert_eq!(got.layer, MemoryLayer::L4);
-    }
-
-    #[tokio::test]
-    async fn remove_noops_when_disabled() {
-        let layer = SharedLayer::disabled();
-        layer.remove(&uuid::Uuid::new_v4()).await.unwrap();
     }
 
     #[tokio::test]

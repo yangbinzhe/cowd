@@ -735,11 +735,6 @@ impl MemoryOrchestrator {
         self.store.get(id).await
     }
 
-    /// Permanently delete a memory entry.
-    pub async fn forget(&self, id: &MemoryId) -> Result<()> {
-        self.store.delete(id).await
-    }
-
     /// Update an existing memory entry in-place.
     pub async fn update(
         &self,
@@ -1166,22 +1161,6 @@ mod tests {
         assert!(orch.recall(&fake).await.unwrap().is_none());
     }
 
-    // ── Delete ──────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn forget_removes_entry() {
-        let store = in_memory_store();
-        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
-        let id = orch
-            .remember(test_entry(MemoryLayer::L1, "tmp", "x"))
-            .await
-            .unwrap();
-        assert!(orch.recall(&id).await.unwrap().is_some());
-
-        orch.forget(&id).await.unwrap();
-        assert!(orch.recall(&id).await.unwrap().is_none());
-    }
-
     // ── List ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1434,17 +1413,34 @@ mod tests {
                 assert_eq!(verbatim.content, "corrected retained body");
                 assert_eq!(verbatim.timestamp, entry.updated_at.to_rfc3339());
             }
-            store.delete(&entry.id).await.unwrap();
+            let event = crate::MemoryLifecycleEvent {
+                memory_id: entry.id,
+                from: None,
+                to: crate::MemoryState::Archived,
+                reason: "explicit native erasure".into(),
+                session_id: "test".into(),
+                agent_id: "test".into(),
+                occurred_at: Utc::now(),
+            };
+            let erase = crate::store::MemoryLifecycleMutation::erase(&entry, None, event).unwrap();
+            assert!(store.commit_lifecycle(erase).await.unwrap().body_erased);
             assert!(store.get(&entry.id).await.unwrap().is_none());
             assert!(store
                 .load_verbatim_by_id(&entry.id.to_string())
                 .await
                 .unwrap()
                 .is_none());
-            assert!(matches!(
-                store.update(&entry, &revision).await,
-                Err(MemoryError::NotFound(_))
-            ));
+            assert!(
+                store.update(&entry, &revision).await.is_err(),
+                "erased source must remain fenced against rewriting"
+            );
+            assert!(
+                store
+                    .read_source_fence(&format!("memory:{}", entry.id))
+                    .unwrap()
+                    .unwrap()
+                    .retired
+            );
             assert!(store
                 .load_verbatim_by_id(&entry.id.to_string())
                 .await

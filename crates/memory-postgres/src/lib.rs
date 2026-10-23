@@ -949,25 +949,6 @@ impl MemoryStore for PostgresMemoryStore {
         let expected = expected.clone();
         run_memory_blocking(move || store.update_entry(&entry, &expected)).await
     }
-    async fn delete(&self, id: &MemoryId) -> MemoryResult<()> {
-        let store = self.clone();
-        let id = id.to_string();
-        run_memory_blocking(move || {
-            let mut connection = store
-                .executor
-                .checkout_critical()
-                .map_err(storage_memory_error)?;
-            let mut tx = connection.transaction().map_err(postgres_memory_error)?;
-            tx.execute("DELETE FROM memory_entries WHERE id=$1", &[&id])
-                .map_err(postgres_memory_error)?;
-            tx.execute("DELETE FROM memory_verbatim WHERE id=$1", &[&id])
-                .map_err(postgres_memory_error)?;
-            tx.commit().map_err(postgres_memory_error)?;
-            Ok(())
-        })
-        .await
-    }
-
     async fn commit_lifecycle(
         &self,
         command: MemoryLifecycleMutation,
@@ -1009,6 +990,18 @@ impl MemoryStore for PostgresMemoryStore {
             if let Some(pending)=pending {
                 let payload=serde_json::to_value(&pending).map_err(json_memory_error)?;
                 tx.execute("INSERT INTO memory_cleanup_pending(mutation_id,source_ref,delete_epoch,payload) VALUES($1,$2,$3,$4)", &[&command.mutation_id,&source_ref,&epoch,&payload]).map_err(postgres_memory_error)?;
+            }
+            if command.erases_body() {
+                // SQL success is not physical deletion: a BEFORE DELETE
+                // trigger can suppress a row without returning an error.
+                // This original transaction owns the locked, existing body and
+                // must prove both representations absent before its receipt.
+                let deleted = tx.execute("DELETE FROM memory_entries WHERE id=$1", &[&target]).map_err(postgres_memory_error)?;
+                tx.execute("DELETE FROM memory_verbatim WHERE id=$1", &[&target]).map_err(postgres_memory_error)?;
+                let remains: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM memory_entries WHERE id=$1) OR EXISTS(SELECT 1 FROM memory_verbatim WHERE id=$1)", &[&target]).map_err(postgres_memory_error)?.try_get(0).map_err(postgres_memory_error)?;
+                if deleted != 1 || remains {
+                    return Err(MemoryError::Store("Memory erasure did not remove its original body and retained text".into()));
+                }
             }
             let payload=serde_json::to_value(&receipt).map_err(json_memory_error)?;
             tx.execute("INSERT INTO memory_lifecycle_receipts(mutation_id,payload) VALUES($1,$2)", &[&command.mutation_id,&payload]).map_err(postgres_memory_error)?;

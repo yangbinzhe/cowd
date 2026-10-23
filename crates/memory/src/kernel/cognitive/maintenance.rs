@@ -5,15 +5,21 @@ impl CognitiveContextManager {
     ///
     /// This covers steps 3 and 4 from the full turn-end sequence:
     ///   - Load essential layer entries, check each for staleness
-    ///   - Prune stale entries via `orchestrator.forget`
+    ///   - Erase stale entries through the original scoped lifecycle transaction
     ///   - Check pre-authored seed trigger conditions against turn keywords
     ///
     /// Failures are logged and swallowed so they never abort the turn.
-    pub async fn run_drift_and_seeds(&self, messages: &[Message]) -> Result<()> {
-        let mut pruned_any = false;
+    pub async fn run_drift_and_seeds(
+        &self,
+        turn: &MemoryTurnContext,
+        messages: &[Message],
+    ) -> Result<()> {
         // ── 3. Drift detection on L1 entries ────────────────────────────────
         let l1_entries = self.orchestrator.load_fixed_layers().await?;
         for entry in &l1_entries {
+            if !crate::kernel::memory_entry_visible_to_ctx(entry, turn) {
+                continue;
+            }
             match self.drift.check(entry) {
                 crate::drift::DriftVerdict::Prune { reason } => {
                     tracing::debug!(
@@ -21,8 +27,8 @@ impl CognitiveContextManager {
                         reason = %reason,
                         "drift: pruning entry"
                     );
-                    let _ = self.orchestrator.forget(&entry.id).await;
-                    pruned_any = true;
+                    self.erase_original_entry(turn, entry, &format!("drift prune: {reason}"))
+                        .await?;
                 }
                 crate::drift::DriftVerdict::FlagForReview { reason } => {
                     tracing::debug!(
@@ -46,10 +52,6 @@ impl CognitiveContextManager {
         {
             let mut reg = self.seeds.lock();
             reg.check_triggers("turn_end", &turn_keywords, Utc::now());
-        }
-
-        if pruned_any {
-            self.invalidate_prepare_context_cache();
         }
 
         Ok(())
@@ -89,7 +91,7 @@ impl CognitiveContextManager {
         // ── Extract ∥ Drift+Seeds ── Maintenance ──────────────────────
         let (extract_result, drift_result) = tokio::join!(
             async { self.extract_and_remember_for_turn(turn, messages).await },
-            async { self.run_drift_and_seeds(messages).await },
+            async { self.run_drift_and_seeds(turn, messages).await },
         );
         if let Err(error) = extract_result {
             tracing::warn!(%error, "on_turn_end: extraction failed");

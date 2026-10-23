@@ -227,10 +227,6 @@ impl LayerManager for DeepLayer {
         Ok(id)
     }
 
-    async fn remove(&self, id: &MemoryId) -> Result<()> {
-        self.store.delete(id).await
-    }
-
     /// Deep layer does not prepare a fixed context block.
     ///
     /// Use [`recall`] instead for on-demand retrieval.  This method returns an
