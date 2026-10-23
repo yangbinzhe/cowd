@@ -482,12 +482,8 @@ impl RuntimeServices {
                     "structured Graph result differs from original prepared body/attempt".into(),
                 );
             }
-            let bytes = self
-                .artifact_store()
-                .read(&prepared.body, &prepared.body.visibility_scope, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            let stored = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+            let bodies = read_structured_artifacts(self, &task, &[&prepared.body]).await?;
+            let stored = String::from_utf8(bodies[0].to_vec()).map_err(|e| e.to_string())?;
             let phase = task
                 .current_phase_id
                 .clone()
@@ -695,48 +691,76 @@ impl ScopedNodeBackendResolver for Resolver {
     }
 }
 
+#[derive(Debug)]
+struct FrozenInputs {
+    instruction: String,
+    input: Value,
+    schema: Value,
+    // Covers these decoded values and their original bytes through rendering
+    // and schema validation. Dropping a temporary read cannot return capacity.
+    _sources: Vec<crate::content_publication::AuthorizedPublicationBytes>,
+}
+
+async fn read_structured_artifacts(
+    services: &RuntimeServices,
+    task: &TaskAggregate,
+    references: &[&ArtifactRef],
+) -> Result<Vec<crate::content_publication::AuthorizedPublicationBytes>, String> {
+    let scope = format!("session:{}", task.origin_session_id);
+    if references
+        .iter()
+        .any(|reference| reference.visibility_scope != scope)
+    {
+        return Err("structured artifact source Session conflict".into());
+    }
+    let ranges = references
+        .iter()
+        .map(|reference| ((*reference).clone(), 0..reference.bytes))
+        .collect::<Vec<_>>();
+    services
+        .read_admitted_artifact_ranges(&ranges, &task.origin_session_id, 32)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn frozen_inputs(
     services: &RuntimeServices,
     task: &TaskAggregate,
-) -> Result<(String, Value, Value), String> {
+) -> Result<FrozenInputs, String> {
     task.validate()?;
     let provenance = task
         .application_provenance
         .as_ref()
         .ok_or("structured provenance missing")?;
-    let scope = format!("session:{}", task.origin_session_id);
-    let mut bodies = Vec::new();
-    for reference in [
+    let references = [
         &provenance.instruction_ref,
         &provenance.input_ref,
         &provenance.result_schema_ref,
-    ] {
-        if reference.visibility_scope != scope {
-            return Err("structured artifact source Session conflict".into());
-        }
-        let bytes = services
-            .artifact_store()
-            .read(reference, &scope, None)
-            .await
-            .map_err(|e| e.to_string())?;
+    ];
+    let bodies = read_structured_artifacts(services, task, &references).await?;
+    for (reference, bytes) in references.into_iter().zip(&bodies) {
         if bytes.len() as u64 != reference.bytes
-            || format!("sha256:{:x}", Sha256::digest(&bytes)) != reference.sha256
+            || format!("sha256:{:x}", Sha256::digest(bytes.as_ref())) != reference.sha256
         {
             return Err("structured artifact bytes/digest mismatch".into());
         }
-        bodies.push(bytes);
     }
     let schema: Value = serde_json::from_slice(&bodies[2]).map_err(|e| e.to_string())?;
     cowd_app_protocol::validate_result_schema(&schema)?;
     let canonical = cowd_app_protocol::canonical_result_schema_bytes(&schema)?;
-    if canonical != bodies[2]
+    if canonical.as_slice() != bodies[2].as_ref()
         || format!("{:x}", Sha256::digest(&canonical)) != provenance.result_schema_digest
     {
         return Err("frozen structured schema digest conflict".into());
     }
-    let instruction = String::from_utf8(bodies.remove(0)).map_err(|e| e.to_string())?;
-    let input = serde_json::from_slice(&bodies[0]).map_err(|e| e.to_string())?;
-    Ok((instruction, input, schema))
+    let instruction = String::from_utf8(bodies[0].to_vec()).map_err(|e| e.to_string())?;
+    let input = serde_json::from_slice(&bodies[1]).map_err(|e| e.to_string())?;
+    Ok(FrozenInputs {
+        instruction,
+        input,
+        schema,
+        _sources: bodies,
+    })
 }
 fn validate_current_policy(services: &RuntimeServices, task: &TaskAggregate) -> Result<(), String> {
     let binding = &task
@@ -807,12 +831,11 @@ impl ScopedNodeBackend for Backend {
             ));
         }
         validate_current_policy(&services, &task).map_err(invalid)?;
-        let (instruction, input, schema) =
-            frozen_inputs(&services, &task).await.map_err(invalid)?;
+        let frozen = frozen_inputs(&services, &task).await.map_err(invalid)?;
         let provenance = task.application_provenance.clone().unwrap();
         let binding = task.structured_registration.clone().unwrap();
         let prompt = serde_json::to_string(&json!({"result_contract":{"contract_id":provenance.result_contract_id,
-            "schema":schema,"max_bytes":provenance.result_max_bytes},"instruction":instruction,"untrusted_application_input":input})).map_err(|e| invalid(e.to_string()))?;
+            "schema":frozen.schema,"max_bytes":provenance.result_max_bytes},"instruction":frozen.instruction,"untrusted_application_input":frozen.input})).map_err(|e| invalid(e.to_string()))?;
         let max_tokens = u32::try_from(
             provenance
                 .result_max_bytes
@@ -928,13 +951,16 @@ impl ScopedNodeBackend for Backend {
             .aggregate;
         let completion = client
             .complete_admitted_control_analysis(prepared, &lease, &resource_config)
-            .await
-            .map_err(|e| NodeExecutorError::Uncertain {
-                node_id: ticket.node_id.clone(),
-                reason: format!("original structured Provider outcome unknown: {e}"),
-            })?;
+            .await;
+        // The actual Provider leaf is finished locally. Never hold its scarce
+        // slot while reading, validating or durably publishing artifacts.
+        drop(lease);
+        let completion = completion.map_err(|e| NodeExecutorError::Uncertain {
+            node_id: ticket.node_id.clone(),
+            reason: format!("original structured Provider outcome unknown: {e}"),
+        })?;
         let result = parse_structured_result(&completion.text).map_err(invalid)?;
-        cowd_app_protocol::validate_result_value(&schema, &result).map_err(invalid)?;
+        cowd_app_protocol::validate_result_value(&frozen.schema, &result).map_err(invalid)?;
         let bytes = serde_json::to_vec(&result).map_err(|e| invalid(e.to_string()))?;
         if bytes.len() as u64 > provenance.result_max_bytes {
             return Err(invalid("structured result exceeds frozen limit".into()));
@@ -993,6 +1019,8 @@ impl ScopedNodeBackend for Backend {
                 serde_json::to_string(&prepared).map_err(|e| invalid(e.to_string()))?,
             )
             .map_err(invalid)?;
+        drop(frozen);
+        drop(prompt);
         result_outcome(&services, &task, &prepared)
             .await
             .map_err(invalid)
@@ -1033,23 +1061,16 @@ async fn result_outcome(
         return Err("prepared result binding differs".into());
     }
     validate_ticket(services, task, &prepared.ticket)?;
-    let (_, _, schema) = frozen_inputs(services, task).await?;
-    let bytes = services
-        .artifact_store()
-        .read(
-            &prepared.body,
-            &format!("session:{}", task.origin_session_id),
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let stored: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let frozen = frozen_inputs(services, task).await?;
+    let bodies = read_structured_artifacts(services, task, &[&prepared.body]).await?;
+    let bytes = &bodies[0];
+    let stored: Value = serde_json::from_slice(bytes.as_ref()).map_err(|e| e.to_string())?;
     let provenance = task
         .application_provenance
         .as_ref()
         .ok_or("structured provenance missing")?;
     let result = &stored["result"];
-    cowd_app_protocol::validate_result_value(&schema, result)?;
+    cowd_app_protocol::validate_result_value(&frozen.schema, result)?;
     let result_bytes = serde_json::to_vec(result).map_err(|e| e.to_string())?;
     if stored["kind"] != "cowd.application.structured_task_result.v1"
         || stored["result_contract"]
@@ -1081,7 +1102,7 @@ async fn result_outcome(
         status: ExecutionNodeStatus::Completed,
         result_ref: Some(prepared.body.selector.clone()),
         wait_class: None,
-        summary: Some(String::from_utf8(bytes).map_err(|e| e.to_string())?),
+        summary: Some(String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?),
         evidence_refs: Vec::new(),
         failure: None,
         usage,
@@ -1251,10 +1272,36 @@ mod tests {
         provenance.result_schema_ref = refs[2].clone();
         provenance.result_schema_digest = format!("{:x}", Sha256::digest(&schema_bytes));
         let (task, _) = super::super::store::prepare_task_creation(command).unwrap();
-        let (instruction, input, actual_schema) = frozen_inputs(&services, &task).await.unwrap();
-        assert_eq!(instruction, "return a bounded result");
-        assert_eq!(input, json!({"value":37}));
-        assert_eq!(actual_schema, schema);
+        let frozen = frozen_inputs(&services, &task).await.unwrap();
+        assert_eq!(frozen.instruction, "return a bounded result");
+        assert_eq!(frozen.input, json!({"value":37}));
+        assert_eq!(frozen.schema, schema);
+        let context = crate::execution_core::graph::ExecutionResourceKind::ContextBytes;
+        assert!(
+            services
+                .resource_manager()
+                .snapshot(&context)
+                .unwrap()
+                .active_leases
+                > 0
+        );
+        drop(frozen);
+        assert_eq!(
+            services
+                .resource_manager()
+                .snapshot(&context)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        // The Task authenticates Session scope before the shared reader sees a
+        // ref; it cannot authorize a canonical foreign artifact by self-label.
+        let mut foreign = refs[0].clone();
+        foreign.visibility_scope = "session:foreign".into();
+        assert!(read_structured_artifacts(&services, &task, &[&foreign])
+            .await
+            .unwrap_err()
+            .contains("Session conflict"));
         let mut wrong = task.clone();
         wrong
             .application_provenance

@@ -138,7 +138,7 @@ impl From<&str> for PublicationReadError {
 
 pub struct AuthorizedPublicationBytes {
     bytes: Vec<u8>,
-    _reservation: crate::execution_core::graph::ExecutionResourceLease,
+    _reservation: std::sync::Arc<crate::execution_core::graph::ExecutionResourceLease>,
 }
 
 impl std::fmt::Debug for AuthorizedPublicationBytes {
@@ -301,14 +301,43 @@ impl crate::RuntimeServices {
         range: std::ops::Range<u64>,
         session_id: &str,
     ) -> Result<AuthorizedPublicationBytes, PublicationReadError> {
-        let count = range
-            .end
-            .checked_sub(range.start)
-            .ok_or("invalid publication range")?;
-        // Covers returned bytes, UTF8/base64/JSON expansion and verification
-        // scratch before repository.object may materialize a compact body.
+        Ok(self
+            .read_admitted_artifact_ranges(&[(artifact.clone(), range)], session_id, 8)
+            .await?
+            .remove(0))
+    }
+
+    /// The original caller authenticates scope; this internal IO port is not a
+    /// grant. Resolve every complete immutable ref before admitting the batch,
+    /// then hold one original reservation across IO and all returned bodies.
+    /// Expansion includes the caller's decoded DOM, strings and render scratch.
+    pub(crate) async fn read_admitted_artifact_ranges(
+        &self,
+        ranges: &[(ArtifactRef, std::ops::Range<u64>)],
+        session_id: &str,
+        expansion: u64,
+    ) -> Result<Vec<AuthorizedPublicationBytes>, PublicationReadError> {
+        if ranges.is_empty() || expansion == 0 {
+            return Err("empty artifact batch or invalid resident expansion".into());
+        }
+        let mut count = 0u64;
+        for (artifact, range) in ranges {
+            if range.start > range.end
+                || range.end > artifact.bytes
+                || self
+                    .artifact_store()
+                    .resolve(&artifact.selector)
+                    .map_err(|e| e.to_string())?
+                    != *artifact
+            {
+                return Err("source_version_conflict or invalid artifact range".into());
+            }
+            count = count
+                .checked_add(range.end - range.start)
+                .ok_or_else(|| PublicationReadError::Capacity("resident budget overflow".into()))?;
+        }
         let resident = count
-            .checked_mul(8)
+            .checked_mul(expansion)
             .and_then(|n| n.checked_add(self.artifact_store().public_read_scratch_bytes()))
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| PublicationReadError::Capacity("resident budget overflow".into()))?;
@@ -319,7 +348,7 @@ impl crate::RuntimeServices {
             .as_millis() as u64;
         let request = crate::execution_core::graph::ResourceAdmissionRequest::new(
             crate::execution_core::graph::ExecutionServiceClass::Foreground,
-            [(kind.clone(), resident.max(1))],
+            [(kind, resident.max(1))],
         )
         .with_fairness_key(format!("context:{session_id}"))
         .with_deadline_at_ms(now.saturating_add(5000));
@@ -332,38 +361,43 @@ impl crate::RuntimeServices {
             crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } => lease,
             _ => {
                 return Err(PublicationReadError::Capacity(
-                    "publication reservation not admitted".into(),
+                    "artifact reservation not admitted".into(),
                 ))
             }
         };
         let store = self.artifact_store().clone();
-        let artifact = artifact.clone();
+        let ranges = ranges.to_vec();
         tokio::task::spawn_blocking(move || {
-            let _lease = lease;
-            // Resolve rejects PrivatePrepared before pin can adopt anything.
-            if store
-                .resolve(&artifact.selector)
-                .map_err(|e| e.to_string())?
-                != artifact
-            {
-                return Err("source_version_conflict".into());
+            let lease = std::sync::Arc::new(lease);
+            let mut bodies = Vec::with_capacity(ranges.len());
+            for (artifact, range) in ranges {
+                // Revalidate after queueing and inside the physical read. The
+                // private-prepared origin fence remains in the original store.
+                if store
+                    .resolve(&artifact.selector)
+                    .map_err(|e| e.to_string())?
+                    != artifact
+                {
+                    return Err("source_version_conflict".to_string());
+                }
+                let owner = format!("publication-read:{}", uuid::Uuid::new_v4());
+                store
+                    .pin(&artifact, &owner, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS)
+                    .map_err(|e| e.to_string())?;
+                let _pin = PublicationReadPin {
+                    store: store.clone(),
+                    artifact: artifact.clone(),
+                    owner,
+                };
+                let bytes = store
+                    .read_public_range_blocking(&artifact, &artifact.visibility_scope, range)
+                    .map_err(|e| e.to_string())?;
+                bodies.push(AuthorizedPublicationBytes {
+                    bytes,
+                    _reservation: lease.clone(),
+                });
             }
-            let owner = format!("publication-read:{}", uuid::Uuid::new_v4());
-            store
-                .pin(&artifact, &owner, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS)
-                .map_err(|e| e.to_string())?;
-            let _pin = PublicationReadPin {
-                store: store.clone(),
-                artifact: artifact.clone(),
-                owner,
-            };
-            let bytes = store
-                .read_public_range_blocking(&artifact, &artifact.visibility_scope, range)
-                .map_err(|e| e.to_string())?;
-            Ok(AuthorizedPublicationBytes {
-                bytes,
-                _reservation: _lease,
-            })
+            Ok(bodies)
         })
         .await
         .map_err(|e| PublicationReadError::Io(e.to_string()))?
@@ -541,6 +575,94 @@ pub(crate) mod tests {
             .filter(|s| s.kind == crate::execution_core::graph::ExecutionResourceKind::ContextBytes)
             .map(|s| s.active_leases)
             .sum()
+    }
+
+    #[tokio::test]
+    async fn artifact_batch_admits_before_first_read_and_retains_one_lease_until_last_body() {
+        use crate::execution_core::graph::{ExecutionResourceKind, ResourceQuota};
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let mut ranges = Vec::new();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let reference = services
+                .artifact_store()
+                .write_bytes(
+                    ArtifactWriteDescriptor {
+                        media_type: "text/plain".into(),
+                        visibility_scope: "session:batch".into(),
+                        expected_bytes: Some(body.len() as u64),
+                        original_name: None,
+                    },
+                    body,
+                )
+                .await
+                .unwrap();
+            ranges.push((reference, 0..body.len() as u64));
+        }
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        let resources = services.resource_manager().clone();
+        services
+            .artifact_store()
+            .set_public_read_hook(Arc::new(move || {
+                assert_eq!(
+                    resources
+                        .snapshot(&ExecutionResourceKind::ContextBytes)
+                        .unwrap()
+                        .active_leases,
+                    328_032 // 11 bytes * 32 + default compact/hash scratch.
+                );
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        let mut invalid = ranges.clone();
+        invalid[1].0.sha256 = format!("sha256:{}", "a".repeat(64));
+        assert!(services
+            .read_admitted_artifact_ranges(&invalid, "batch", 32)
+            .await
+            .is_err());
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "all refs validated before any body materializes"
+        );
+        let mut bodies = services
+            .read_admitted_artifact_ranges(&ranges, "batch", 32)
+            .await
+            .unwrap();
+        assert_eq!(bodies[0].as_ref(), b"first");
+        assert_eq!(bodies[1].as_ref(), b"second");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(resident_active(&services), 328_032);
+        assert!(Arc::ptr_eq(
+            &bodies[0]._reservation,
+            &bodies[1]._reservation
+        ));
+        drop(bodies.remove(0));
+        assert_eq!(
+            resident_active(&services),
+            328_032,
+            "remaining body still owns the complete original reservation"
+        );
+        drop(bodies);
+        assert_eq!(resident_active(&services), 0);
+        services
+            .resource_manager()
+            .update_quota(
+                &ExecutionResourceKind::ContextBytes,
+                ResourceQuota::new(1, 128, 128).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            services
+                .read_admitted_artifact_ranges(&ranges, "batch", 32)
+                .await,
+            Err(PublicationReadError::Capacity(_))
+        ));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "capacity refusal before IO"
+        );
+        assert_eq!(resident_active(&services), 0);
     }
 
     #[tokio::test]
