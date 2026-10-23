@@ -735,6 +735,10 @@ mod tests {
     }
 
     impl memory::KnowledgeStore for ReadOnlyKnowledgeStore {
+        fn quarantine_source(&self, _: &str) -> Result<Vec<String>, memory::KnowledgeStoreError> {
+            self.reject_write()?;
+            unreachable!("write rejection always returns Err")
+        }
         fn save_receipt(
             &self,
             _: &memory::KnowledgeIngestionReceipt,

@@ -3961,6 +3961,9 @@ fn refused_knowledge_read<T>() -> Result<T, memory::KnowledgeStoreError> {
 }
 
 impl memory::KnowledgeStore for RefusingKnowledgeReader {
+    fn quarantine_source(&self, _: &str) -> Result<Vec<String>, memory::KnowledgeStoreError> {
+        refused_knowledge_read()
+    }
     fn save_receipt(
         &self,
         _: &memory::KnowledgeIngestionReceipt,

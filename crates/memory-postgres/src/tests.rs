@@ -1458,3 +1458,119 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     drop(std::mem::ManuallyDrop::into_inner(fixture));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_source_retirement_ignores_foreign_budget_and_reopens() {
+    use harness_contract::knowledge::KnowledgeObjectState;
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let mut document = memory::DocumentContent::new("own", "must retain\nmust not retain");
+    document.source = Some("import-fixture:own-retirement".into());
+    let own = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("A".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document,
+        )
+        .unwrap();
+    let mut foreign_doc = memory::DocumentContent::new("foreign", "foreign policy");
+    foreign_doc.source = Some("import-fixture:foreign-retirement".into());
+    let foreign = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("B".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            foreign_doc,
+        )
+        .unwrap();
+    let mut oversized = foreign.pack.clone();
+    oversized.name = "x".repeat(memory::knowledge::KNOWLEDGE_READ_MAX_BYTES + 1);
+    store
+        .commit_maintenance(
+            &store.maintenance_inputs().unwrap(),
+            &[oversized.clone()],
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.maintenance_inputs(),
+        Err(KnowledgeStoreError::ReadLimit)
+    ));
+    assert!(!own.conflicts.is_empty());
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("CREATE FUNCTION refuse_retire() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused retirement'; END $$; CREATE TRIGGER refuse_retire BEFORE UPDATE ON knowledge_conflict FOR EACH ROW EXECUTE FUNCTION refuse_retire()").unwrap();
+    assert!(fabric
+        .quarantine_source("import-fixture:own-retirement")
+        .is_err());
+    let row = connection
+        .query_one(
+            "SELECT payload FROM knowledge_pack WHERE pack_id=$1",
+            &[&own.pack.pack_id],
+        )
+        .unwrap();
+    assert_eq!(
+        row.get::<_, serde_json::Value>(0),
+        serde_json::to_value(&own.pack).unwrap(),
+        "late conflict failure rolls pack write back"
+    );
+    connection
+        .batch_execute(
+            "DROP TRIGGER refuse_retire ON knowledge_conflict; DROP FUNCTION refuse_retire()",
+        )
+        .unwrap();
+    assert_eq!(
+        fabric
+            .quarantine_source("import-fixture:own-retirement")
+            .unwrap(),
+        vec![own.pack.pack_id.clone()]
+    );
+    assert!(matches!(
+        fabric.quarantine_source("import-fixture:foreign-retirement"),
+        Err(KnowledgeStoreError::ReadLimit)
+    ));
+    let row = connection
+        .query_one(
+            "SELECT payload FROM knowledge_pack WHERE pack_id=$1",
+            &[&foreign.pack.pack_id],
+        )
+        .unwrap();
+    assert_eq!(
+        row.get::<_, serde_json::Value>(0),
+        serde_json::to_value(&oversized).unwrap()
+    );
+    drop(connection);
+    drop(fabric);
+    drop(store);
+    drop(executor);
+    let reopened = Arc::new(PostgresKnowledgeStore::new(fixture.reconnect()).unwrap());
+    assert!(reopened
+        .quarantine_source("import-fixture:own-retirement")
+        .unwrap()
+        .is_empty());
+    let mut connection = reopened.executor.checkout_online_read().unwrap();
+    let row = connection
+        .query_one(
+            "SELECT payload FROM knowledge_pack WHERE pack_id=$1",
+            &[&own.pack.pack_id],
+        )
+        .unwrap();
+    let pack: harness_contract::knowledge::KnowledgePack =
+        serde_json::from_value(row.get(0)).unwrap();
+    assert_eq!(pack.state, KnowledgeObjectState::Quarantined);
+    for conflict in own.conflicts {
+        let row = connection
+            .query_one(
+                "SELECT payload->>'decision' FROM knowledge_conflict WHERE conflict_id=$1",
+                &[&conflict.conflict_id],
+            )
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "source_pack_inactive");
+    }
+    drop(connection);
+    drop(reopened);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}

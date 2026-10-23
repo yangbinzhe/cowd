@@ -208,6 +208,9 @@ pub trait KnowledgeStore: Send + Sync {
         receipt: &KnowledgeIngestionReceipt,
     ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError>;
     fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError>;
+    /// Read and quarantine this source and its dependent conflicts in one native
+    /// transaction. Unrelated sources are not materialized or part of its budget.
+    fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError>;
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
     fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
     fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError>;
@@ -870,40 +873,7 @@ impl KnowledgeFabric {
     /// stop participating in activation and Matrix projection while its
     /// corpus/canon evidence remains available for audit.
     pub fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
-        let expected = self.store.maintenance_inputs()?;
-        let mut state = KnowledgeFabricState::from_snapshot(expected.clone());
-        let quarantined = {
-            let corpus_ids = state
-                .corpus
-                .values()
-                .filter(|corpus| corpus.source_ref.id == source_ref)
-                .map(|corpus| corpus.corpus_id.clone())
-                .collect::<BTreeSet<_>>();
-            if corpus_ids.is_empty() {
-                return Ok(Vec::new());
-            }
-            let now = Utc::now();
-            state
-                .packs
-                .values_mut()
-                .filter(|pack| {
-                    pack.source_corpus_refs
-                        .iter()
-                        .any(|corpus_id| corpus_ids.contains(corpus_id))
-                        && pack.state != KnowledgeObjectState::Quarantined
-                })
-                .map(|pack| {
-                    pack.state = KnowledgeObjectState::Quarantined;
-                    pack.health_score_bp = 0;
-                    pack.updated_at = now;
-                    pack.clone()
-                })
-                .collect::<Vec<_>>()
-        };
-        let resolved = retire_conflicts_in_state(&mut state);
-        self.store
-            .commit_maintenance(&expected, &quarantined, &resolved)?;
-        Ok(quarantined.into_iter().map(|pack| pack.pack_id).collect())
+        self.store.quarantine_source(source_ref)
     }
 
     /// Close conflict reviews whose source pack can no longer participate.
@@ -1383,6 +1353,89 @@ fn retire_conflicts_in_state(state: &mut KnowledgeFabricState) -> Vec<KnowledgeC
         .collect::<Vec<_>>()
 }
 
+/// Shared policy over an already reserved source frame. Native adapters own the
+/// guard/transaction, so no second global snapshot or cross-owner CAS is needed.
+pub fn prepare_source_quarantine(
+    snapshot: KnowledgeSnapshot,
+) -> (Vec<KnowledgePack>, Vec<KnowledgeConflictRecord>) {
+    let mut state = KnowledgeFabricState::from_snapshot(snapshot);
+    let now = Utc::now();
+    let packs = state
+        .packs
+        .values_mut()
+        .filter(|pack| pack.state != KnowledgeObjectState::Quarantined)
+        .map(|pack| {
+            pack.state = KnowledgeObjectState::Quarantined;
+            pack.health_score_bp = 0;
+            pack.updated_at = now;
+            pack.clone()
+        })
+        .collect();
+    let conflicts = retire_conflicts_in_state(&mut state);
+    (packs, conflicts)
+}
+
+fn bounded_source_snapshot(
+    state: &KnowledgeFabricState,
+    source_ref: &str,
+) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+    let mut budget = Budget(0);
+    let mut rows = 0usize;
+    macro_rules! reserve {
+        ($value:expr) => {{
+            rows += 1;
+            if rows > KNOWLEDGE_READ_MAX_ROWS {
+                return Err(KnowledgeStoreError::ReadLimit);
+            }
+            serde_json::to_writer(&mut budget, $value)
+                .map_err(|_| KnowledgeStoreError::ReadLimit)?;
+        }};
+    }
+    let mut corpus = Vec::new();
+    for item in state
+        .corpus
+        .values()
+        .filter(|item| item.source_ref.id == source_ref)
+    {
+        reserve!(item);
+        corpus.push(item);
+    }
+    let corpus_ids = corpus
+        .iter()
+        .map(|item| item.corpus_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut packs = Vec::new();
+    for pack in state.packs.values().filter(|pack| {
+        pack.source_corpus_refs
+            .iter()
+            .any(|id| corpus_ids.contains(id.as_str()))
+    }) {
+        reserve!(pack);
+        packs.push(pack);
+    }
+    let pack_ids = packs
+        .iter()
+        .map(|pack| pack.pack_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut conflicts = Vec::new();
+    for item in state.conflicts.values().filter(|item| {
+        item.pack_id
+            .as_deref()
+            .is_some_and(|id| pack_ids.contains(id))
+    }) {
+        reserve!(item);
+        conflicts.push(item);
+    }
+    Ok(KnowledgeSnapshot {
+        corpus: corpus.into_iter().cloned().collect(),
+        packs: packs.into_iter().cloned().collect(),
+        conflicts: conflicts.into_iter().cloned().collect(),
+        canon: Vec::new(),
+        chunks: Vec::new(),
+        usage: Vec::new(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct InMemoryKnowledgeStore {
     state: Arc<RwLock<KnowledgeFabricState>>,
@@ -1428,6 +1481,25 @@ fn bump_candidate_revisions(
 }
 
 impl KnowledgeStore for InMemoryKnowledgeStore {
+    fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = bounded_source_snapshot(&state, source_ref)?;
+        let (packs, conflicts) = prepare_source_quarantine(snapshot);
+        bump_candidate_revisions(&mut state, packs.iter().map(|pack| pack.namespace.clone()))?;
+        let ids = packs.iter().map(|pack| pack.pack_id.clone()).collect();
+        for pack in packs {
+            state.packs.insert(pack.pack_id.clone(), pack);
+        }
+        for conflict in conflicts {
+            state
+                .conflicts
+                .insert(conflict.conflict_id.clone(), conflict);
+        }
+        Ok(ids)
+    }
     fn save_receipt(
         &self,
         receipt: &KnowledgeIngestionReceipt,
@@ -3018,6 +3090,12 @@ mod tests {
     }
 
     impl KnowledgeStore for FaultingKnowledgeStore {
+        fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
+            if self.mode() == 3 {
+                return Err(KnowledgeStoreError::Backend("read refused".into()));
+            }
+            self.inner.quarantine_source(source_ref)
+        }
         fn save_receipt(
             &self,
             receipt: &KnowledgeIngestionReceipt,
@@ -3339,6 +3417,91 @@ mod tests {
         ));
     }
     #[test]
+    fn knowledge_source_retirement_ignores_foreign_budget_but_refuses_own_overflow() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let mut own_document = DocumentContent::new(
+            "own",
+            "must retain
+must not retain",
+        );
+        own_document.source = Some("import-fixture:own-retirement".into());
+        let own = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("A".into()),
+                KnowledgeActivationPolicy::DefaultForDomain,
+                KnowledgeGovernanceLevel::Required,
+                own_document,
+            )
+            .unwrap();
+        let foreign = ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("B".into()),
+            "foreign",
+            KnowledgeGovernanceLevel::Required,
+        );
+        let mut oversized = foreign.pack.clone();
+        oversized.name = "x".repeat(KNOWLEDGE_READ_MAX_BYTES + 1);
+        store
+            .commit_maintenance(
+                &store.maintenance_inputs().unwrap(),
+                &[oversized.clone()],
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.maintenance_inputs(),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+        assert!(
+            !own.conflicts.is_empty(),
+            "conflict update must be exercised"
+        );
+        assert_eq!(
+            fabric
+                .quarantine_source("import-fixture:own-retirement")
+                .unwrap(),
+            vec![own.pack.pack_id.clone()]
+        );
+        assert!(
+            fabric
+                .quarantine_source("import-fixture:own-retirement")
+                .unwrap()
+                .is_empty(),
+            "retry must not rewrite already retired rows"
+        );
+        let before = {
+            let state = store.state.read().unwrap();
+            assert_eq!(
+                state.packs[&own.pack.pack_id].state,
+                KnowledgeObjectState::Quarantined
+            );
+            assert_eq!(state.packs[&foreign.pack.pack_id], oversized);
+            for conflict in &own.conflicts {
+                assert_eq!(
+                    state.conflicts[&conflict.conflict_id].decision.as_deref(),
+                    Some("source_pack_inactive")
+                );
+            }
+            serde_json::to_value(&state.packs[&foreign.pack.pack_id]).unwrap()
+        };
+        assert!(matches!(
+            fabric.quarantine_source(&foreign.corpus.source_ref.id),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+        assert_eq!(
+            serde_json::to_value(&store.state.read().unwrap().packs[&foreign.pack.pack_id])
+                .unwrap(),
+            before,
+            "own overflow must not partially commit"
+        );
+        assert!(fabric
+            .quarantine_source("import-fixture:absent")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn knowledge_collection_reports_each_commit_instead_of_hiding_a_partial_batch() {
         let fabric = KnowledgeFabric::new();
         let receipts = KnowledgeIngestionService::new().ingest_collection(
@@ -3445,11 +3608,16 @@ mod tests {
             .activate("s", "validate source", "main", Some("A"))
             .unwrap()
             .0;
-        assert_eq!(plan.active_pack_ids, vec![own.pack.pack_id]);
+        assert_eq!(plan.active_pack_ids, vec![own.pack.pack_id.clone()]);
         assert!(matches!(
             fabric.activate("s", "validate source", "main", Some("B")),
             Err(KnowledgeStoreError::ReadLimit)
         ));
+        assert_eq!(
+            fabric.quarantine_source(&own.corpus.source_ref.id).unwrap(),
+            vec![own.pack.pack_id],
+            "foreign row growth must not block a complete small-source retirement"
+        );
     }
 
     #[test]
