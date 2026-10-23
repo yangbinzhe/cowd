@@ -569,7 +569,6 @@ async fn r1_gateway_startup_partition_original_valid_goal_control() {
 
 #[tokio::test]
 async fn r1_gateway_startup_repaired_session_replays_original_program_without_new_event() {
-    original_valid_goal_control_483().await;
     let root = fixture_root();
     std::fs::create_dir_all(root.path().join("workspace")).unwrap();
     let mut provider = LoopbackProvider::start("root").await;

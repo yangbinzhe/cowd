@@ -185,11 +185,6 @@ async fn external_decision_evidence_uses_runtime_source_and_authenticated_pagina
 }
 
 #[tokio::test]
-async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifact() {
-    publication_creation_identity_gateway_case().await;
-}
-
-#[tokio::test]
 async fn r1_publication_gateway_mint_and_passthrough_keep_creation_identity() {
     publication_creation_identity_gateway_case().await;
 }
