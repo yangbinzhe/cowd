@@ -404,14 +404,6 @@ where
     /// would be empty on every call and the dedup would never fire. It is still
     /// in-memory only: deduplication is a within-session economy, not a new
     /// durability contract, and a restart simply re-reads once.
-    #[cfg(test)]
-    fn clear_read_receipt_index() {
-        Self::read_receipt_index()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
-
     fn read_receipt_index() -> &'static Mutex<HashMap<(String, String, String), ArtifactRef>> {
         static INDEX: std::sync::OnceLock<Mutex<HashMap<(String, String, String), ArtifactRef>>> =
             std::sync::OnceLock::new();
@@ -796,14 +788,14 @@ mod tests {
     /// artifact, and none of them added information.
     #[tokio::test]
     async fn redundant_full_read_returns_the_existing_receipt() {
-        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
+        let scope = ReadReceiptScope::new();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         let read = || RawEvidenceWrite {
             metadata: serde_json::json!({
                 "tool_name": "read_file",
                 "input_hash": "input-whole-file",
             }),
-            ..write()
+            ..scope.write()
         };
         let first = facade.persist(read()).await.unwrap();
         let second = facade.persist(read()).await.unwrap();
@@ -825,28 +817,22 @@ mod tests {
     /// times.
     #[tokio::test]
     async fn a_fresh_facade_per_call_still_reuses_the_receipt() {
-        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
+        let scope = ReadReceiptScope::new();
         let read = || RawEvidenceWrite {
             metadata: serde_json::json!({
                 "tool_name": "read_file",
                 "input_hash": "input-fresh-facade",
             }),
-            ..write()
+            ..scope.write()
         };
-        // A new store AND a new facade for every call, exactly as the tool
-        // executor does.
-        let first = RawEvidenceFacade::new(CountingStore::default())
-            .persist(read())
-            .await
-            .unwrap();
-        let second = RawEvidenceFacade::new(CountingStore::default())
-            .persist(read())
-            .await
-            .unwrap();
-        assert_eq!(
-            first.retrieval_selector, second.retrieval_selector,
-            "a fresh facade must still reuse the receipt the Session already has"
-        );
+        let first_facade = RawEvidenceFacade::new(CountingStore::default());
+        let first = first_facade.persist(read()).await.unwrap();
+        assert_eq!(first_facade.persist_calls(), 1);
+        drop(first_facade);
+        let second_facade = RawEvidenceFacade::new(CountingStore::default());
+        let second = second_facade.persist(read()).await.unwrap();
+        assert_eq!(second_facade.persist_calls(), 0);
+        assert_eq!(first.retrieval_selector, second.retrieval_selector);
     }
 
     /// A ranged read names `limit`/`offset`, so its input hash differs and it
@@ -854,69 +840,47 @@ mod tests {
     /// redundant reading.
     #[tokio::test]
     async fn ranged_reads_are_not_deduped() {
-        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
-        let facade = RawEvidenceFacade::new(CountingStore::default());
-        let whole = facade
-            .persist(RawEvidenceWrite {
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "whole"}),
-                ..write()
-            })
-            .await
-            .unwrap();
-        let ranged = facade
-            .persist(RawEvidenceWrite {
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "limit-20"}),
-                ..write()
-            })
-            .await
-            .unwrap();
-        assert_ne!(whole.retrieval_selector, ranged.retrieval_selector);
-        assert_eq!(facade.persist_calls(), 2, "a ranged read must be persisted");
+        for (whole_hash, ranged_hash) in
+            [("whole", "limit-20"), ("narrow-whole", "narrow-limit-20")]
+        {
+            let scope = ReadReceiptScope::new();
+            let facade = RawEvidenceFacade::new(CountingStore::default());
+            let read = |input_hash| RawEvidenceWrite {
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": input_hash}),
+                ..scope.write()
+            };
+            let whole = facade.persist(read(whole_hash)).await.unwrap();
+            let ranged = facade.persist(read(ranged_hash)).await.unwrap();
+            assert_ne!(
+                whole.retrieval_selector, ranged.retrieval_selector,
+                "{whole_hash}/{ranged_hash}"
+            );
+            assert_eq!(facade.persist_calls(), 2, "{whole_hash}/{ranged_hash}");
+        }
     }
 
-    /// A different read is a different read. Narrowing the range changes the
-    /// input, so it is persisted rather than served from the first receipt:
-    /// that is how a model asks for bytes the first read did not cover.
-    #[tokio::test]
-    async fn a_narrower_range_is_a_different_read() {
-        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
-        let facade = RawEvidenceFacade::new(CountingStore::default());
-        facade
-            .persist(RawEvidenceWrite {
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "narrow-whole"}),
-                ..write()
-            })
-            .await
-            .unwrap();
-        facade
-            .persist(RawEvidenceWrite {
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "narrow-limit-20"}),
-                ..write()
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            facade.persist_calls(),
-            2,
-            "a different input is a different read and must be persisted"
-        );
-    }
-
-    /// The same read issued twice is one read. The framework's own evidence
-    /// economy says a file an accepted Task already read is opened through its
-    /// durable receipt, so the second identical call reuses the first receipt
-    /// even though the payload framing differs - which it always does, because
-    /// the payload names the call that produced it.
+    /// The same raw bytes and input can back two distinct call receipts.
+    /// Only the receipt identity changes here; changing payload bytes is not
+    /// a framing-only case and must not bypass the production hash check.
     #[tokio::test]
     async fn the_same_read_twice_is_one_read_even_when_the_framing_differs() {
-        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
+        let scope = ReadReceiptScope::new();
         let facade = RawEvidenceFacade::new(CountingStore::default());
-        let read = || RawEvidenceWrite {
+        let read = |call| RawEvidenceWrite {
+            evidence_ref: EvidenceRef::observed("tool", call),
             metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
-            ..write()
+            ..scope.write()
         };
-        let first = facade.persist(read()).await.unwrap();
-        let second = facade.persist(read()).await.unwrap();
+        let first_write = read("raw-call-first");
+        let second_write = read("raw-call-second");
+        let first_ref = first_write.evidence_ref.clone();
+        let second_ref = second_write.evidence_ref.clone();
+        assert_ne!(first_ref, second_ref);
+        assert_eq!(first_write.payload, second_write.payload);
+        let first = facade.persist(first_write).await.unwrap();
+        let second = facade.persist(second_write).await.unwrap();
+        assert_eq!(first.evidence_ref, first_ref);
+        assert_eq!(second.evidence_ref, second_ref);
         assert_eq!(first.retrieval_selector, second.retrieval_selector);
         assert_eq!(facade.persist_calls(), 1);
     }
@@ -927,28 +891,40 @@ mod tests {
     /// three first reads a loop.
     #[tokio::test]
     async fn a_different_session_reads_the_same_file_again() {
-        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
+        let first_scope = ReadReceiptScope::new();
+        let second_scope = ReadReceiptScope::new();
+        assert_ne!(first_scope.session_id, second_scope.session_id);
         let facade = RawEvidenceFacade::new(CountingStore::default());
-        facade
-            .persist(RawEvidenceWrite {
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
-                ..write()
-            })
-            .await
-            .unwrap();
-        facade
-            .persist(RawEvidenceWrite {
-                session_id: "s2".to_string(),
-                visibility_scope: "session:s2".to_string(),
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
-                ..write()
-            })
-            .await
-            .unwrap();
+        let read = |scope: &ReadReceiptScope| RawEvidenceWrite {
+            metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+            ..scope.write()
+        };
+        facade.persist(read(&first_scope)).await.unwrap();
+        facade.persist(read(&second_scope)).await.unwrap();
         assert_eq!(
             facade.persist_calls(),
             2,
-            "another Session's first read is information, not waste"
+            "different Sessions need separate first writes"
+        );
+        let first_key = (
+            first_scope.session_id.clone(),
+            "read_file".to_string(),
+            "same".to_string(),
+        );
+        assert!(RawEvidenceFacade::<CountingStore>::read_receipt_index()
+            .lock()
+            .unwrap()
+            .contains_key(&first_key));
+        drop(first_scope);
+        assert!(!RawEvidenceFacade::<CountingStore>::read_receipt_index()
+            .lock()
+            .unwrap()
+            .contains_key(&first_key));
+        facade.persist(read(&second_scope)).await.unwrap();
+        assert_eq!(
+            facade.persist_calls(),
+            2,
+            "dropping one scope must retain another's cached read"
         );
     }
 
@@ -957,7 +933,6 @@ mod tests {
     /// bytes coincide.
     #[tokio::test]
     async fn a_non_read_write_is_never_deduped() {
-        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         for _ in 0..2 {
             facade
@@ -970,6 +945,36 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(facade.persist_calls(), 2, "only reads are deduplicated");
+    }
+
+    /// Own only this test's cache namespace; never clear a sibling test's entries.
+    struct ReadReceiptScope {
+        session_id: String,
+    }
+
+    impl ReadReceiptScope {
+        fn new() -> Self {
+            Self {
+                session_id: format!("raw-receipt-test-{}", uuid::Uuid::new_v4()),
+            }
+        }
+
+        fn write(&self) -> RawEvidenceWrite {
+            RawEvidenceWrite {
+                session_id: self.session_id.clone(),
+                visibility_scope: format!("session:{}", self.session_id),
+                ..write()
+            }
+        }
+    }
+
+    impl Drop for ReadReceiptScope {
+        fn drop(&mut self) {
+            RawEvidenceFacade::<CountingStore>::read_receipt_index()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(session, _, _), _| session != &self.session_id);
+        }
     }
 
     #[derive(Default)]
