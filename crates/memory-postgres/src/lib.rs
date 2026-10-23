@@ -241,6 +241,12 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "ALTER TABLE memory_triples DROP CONSTRAINT memory_triples_pkey",
         "ALTER TABLE memory_triples ADD CONSTRAINT memory_triples_pkey PRIMARY KEY USING INDEX uq_memory_triples_scope_id",
     ],
+}, PostgresMigrationSpec {
+    id:"memory.0010.typed-knowledge-cleanup-ack",domain:MEMORY_DOMAIN,version:10,
+    description:"replay older boolean cleanup confirmations through original typed Knowledge receipts",
+    statements:&[
+        "UPDATE memory_cleanup_pending SET confirmed=FALSE,payload=payload-'knowledge_confirmed' WHERE NOT(payload ? 'knowledge_receipt_digest')",
+    ],
 }];
 
 const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
@@ -329,6 +335,13 @@ const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     statements:&[
         "CREATE FUNCTION knowledge_corpus_candidates_changed() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE ns TEXT; BEGIN IF TG_OP='UPDATE' AND OLD.payload->'source_ref'=NEW.payload->'source_ref' AND OLD.namespace_key=NEW.namespace_key THEN RETURN NULL; END IF; FOR ns IN SELECT DISTINCT namespace_key FROM knowledge_corpus WHERE corpus_id=CASE WHEN TG_OP='DELETE' THEN OLD.corpus_id ELSE NEW.corpus_id END LOOP PERFORM knowledge_bump_candidate_namespace(ns); END LOOP; IF TG_OP='DELETE' THEN PERFORM knowledge_bump_candidate_namespace(OLD.namespace_key); ELSIF TG_OP='UPDATE' AND OLD.namespace_key<>NEW.namespace_key THEN PERFORM knowledge_bump_candidate_namespace(OLD.namespace_key); END IF; RETURN NULL; END $$",
         "CREATE TRIGGER knowledge_corpus_candidate_revision AFTER INSERT OR UPDATE OR DELETE ON knowledge_corpus FOR EACH ROW EXECUTE FUNCTION knowledge_corpus_candidates_changed()",
+    ],
+}, PostgresMigrationSpec {
+    id:"knowledge.0005.memory-retirement-receipts",domain:KNOWLEDGE_DOMAIN,version:5,
+    description:"commit exact original Memory source and epoch quarantine receipts",
+    statements:&[
+        "CREATE TABLE knowledge_memory_retirement_receipts(source_ref TEXT NOT NULL,scope_key TEXT NOT NULL,delete_epoch BIGINT NOT NULL CHECK(delete_epoch>0),receipt_digest TEXT NOT NULL,payload JSONB NOT NULL,PRIMARY KEY(source_ref,scope_key,delete_epoch))",
+        "CREATE INDEX knowledge_memory_retirement_source ON knowledge_memory_retirement_receipts(source_ref)",
     ],
 }];
 
@@ -966,25 +979,31 @@ impl MemoryStore for PostgresMemoryStore {
         let after = after_mutation.map(str::to_owned);
         run_memory_blocking(move || {
             let mut connection=store.executor.checkout_online_read().map_err(storage_memory_error)?;
-            connection.query("SELECT payload FROM memory_cleanup_pending WHERE NOT confirmed AND ($1::TEXT IS NULL OR mutation_id>$1) ORDER BY mutation_id LIMIT $2", &[&after,&(limit as i64)]).map_err(postgres_memory_error)?.into_iter().map(|r| serde_json::from_value(r.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)).collect()
+            connection.query("SELECT payload,mutation_id,source_ref,delete_epoch FROM memory_cleanup_pending WHERE NOT confirmed AND ($1::TEXT IS NULL OR mutation_id>$1) ORDER BY mutation_id LIMIT $2", &[&after,&(limit as i64)]).map_err(postgres_memory_error)?.into_iter().map(|r| {
+                let pending: MemoryCleanupPending = serde_json::from_value(r.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
+                pending.validate()?;
+                if pending.mutation_id != r.try_get::<_, String>(1).map_err(postgres_memory_error)? || pending.source.source_ref != r.try_get::<_, String>(2).map_err(postgres_memory_error)? || i64::try_from(pending.source.delete_epoch).ok() != Some(r.try_get::<_, i64>(3).map_err(postgres_memory_error)?) { return Err(MemoryError::Store("Memory pending row identity mismatch".into())); }
+                Ok(pending)
+            }).collect()
         }).await
     }
 
     async fn confirm_memory_cleanup(
         &self,
         expected: &MemoryCleanupPending,
-        knowledge: bool,
+        knowledge: Option<&memory::knowledge::MemorySourceQuarantineReceipt>,
         auxiliary: bool,
     ) -> MemoryResult<()> {
         let store = self.clone();
         let expected = expected.clone();
+        let knowledge = knowledge.cloned();
         run_memory_blocking(move || {
             let mut connection=store.executor.checkout_critical().map_err(storage_memory_error)?;
             let mut tx=connection.transaction().map_err(postgres_memory_error)?;
             let row=tx.query_opt("SELECT payload FROM memory_cleanup_pending WHERE mutation_id=$1 FOR UPDATE", &[&expected.mutation_id]).map_err(postgres_memory_error)?.ok_or_else(||MemoryError::NotFound(expected.mutation_id.clone()))?;
             let mut pending:MemoryCleanupPending=serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
             if pending.source!=expected.source || pending.memory_id!=expected.memory_id {return Err(MemoryError::Store("foreign Memory cleanup confirmation".into()));}
-            pending.knowledge_confirmed |= knowledge; pending.auxiliary_confirmed |= auxiliary;
+            pending.confirm_knowledge(knowledge.as_ref())?; pending.auxiliary_confirmed |= auxiliary;
             if auxiliary {
                 let id=expected.memory_id.to_string();let reference=expected.source.source_ref.clone();let scope=expected.source.scope_key.clone();
                 tx.execute("DELETE FROM memory_symbol_references WHERE memory_id=$1", &[&id]).map_err(postgres_memory_error)?;
@@ -992,7 +1011,7 @@ impl MemoryStore for PostgresMemoryStore {
                 tx.execute("UPDATE memory_entities SET payload=jsonb_set(payload,'{source_ids}',(payload->'source_ids')-$2::text-$3::text) WHERE scope_key=$1 AND ((payload->'source_ids') ? $2 OR (payload->'source_ids') ? $3)", &[&scope,&id,&reference]).map_err(postgres_memory_error)?;
                 tx.execute("DELETE FROM memory_triples WHERE scope_key=$1 AND payload->>'source'=ANY($2::text[])", &[&scope,&vec![id,reference]]).map_err(postgres_memory_error)?;
             }
-            let complete=pending.knowledge_confirmed && pending.auxiliary_confirmed;
+            let complete=pending.knowledge_receipt_digest.is_some() && pending.auxiliary_confirmed;
             let payload=serde_json::to_value(&pending).map_err(json_memory_error)?;
             tx.execute("UPDATE memory_cleanup_pending SET confirmed=$2,payload=$3 WHERE mutation_id=$1", &[&expected.mutation_id,&complete,&payload]).map_err(postgres_memory_error)?;
             tx.commit().map_err(postgres_memory_error)?;Ok(())
@@ -1651,9 +1670,15 @@ impl PostgresKnowledgeStore {
 }
 
 impl KnowledgeStore for PostgresKnowledgeStore {
-    fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
+    fn quarantine_source(
+        &self,
+        source_ref: &str,
+        retirement: Option<&memory::store::VerifiedMemoryRetirement>,
+    ) -> Result<memory::knowledge::KnowledgeSourceQuarantine, KnowledgeStoreError> {
+        memory::knowledge::validate_quarantine_source(source_ref, retirement)?;
         let store = self.clone();
         let source_ref = source_ref.to_owned();
+        let retirement = retirement.map(|proof| proof.source().clone());
         run_driver_sync(
             move || {
                 let mut connection = store
@@ -1661,15 +1686,60 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     .checkout_critical()
                     .map_err(storage_knowledge_error)?;
                 let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
-                // Same lock order as the original maintenance owner. Source selection,
-                // budget reservation and writes share this transaction, including an
-                // absent source; no concurrent ingestion can appear between them.
+                if let Some(expected) = retirement.as_ref() {
+                    // Same original Memory fence, checked inside this native Knowledge
+                    // transaction. No observation or boolean can stand for its epoch.
+                    let row = tx.query_opt("SELECT payload,scope_key,delete_epoch FROM memory_source_fences WHERE source_ref=$1 FOR SHARE", &[&source_ref]).map_err(postgres_knowledge_error)?.ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+                    let current: MemorySourceFence =
+                        serde_json::from_value(row.try_get(0).map_err(postgres_knowledge_error)?)
+                            .map_err(json_knowledge_error)?;
+                    let scope: String = row.try_get(1).map_err(postgres_knowledge_error)?;
+                    let epoch: i64 = row.try_get(2).map_err(postgres_knowledge_error)?;
+                    if scope != current.scope_key
+                        || u64::try_from(epoch).ok() != Some(current.delete_epoch)
+                    {
+                        return Err(KnowledgeStoreError::StaleRead);
+                    }
+                    current
+                        .verifies_retirement(expected)
+                        .map_err(|_| KnowledgeStoreError::StaleRead)?;
+                }
+                // Original maintenance lock order also closes the absent-receipt / new
+                // ingestion gap. Ingestion takes ROW EXCLUSIVE before reading receipts.
                 tx.batch_execute("LOCK TABLE knowledge_corpus, knowledge_pack, knowledge_conflict IN SHARE ROW EXCLUSIVE MODE").map_err(postgres_knowledge_error)?;
+                if let Some(expected) = retirement.as_ref() {
+                    let epoch = i64::try_from(expected.delete_epoch)
+                        .map_err(|_| KnowledgeStoreError::StaleRead)?;
+                    if let Some(row) = tx.query_opt("SELECT CASE WHEN octet_length(payload::text)<=8388608 THEN payload END,receipt_digest FROM knowledge_memory_retirement_receipts WHERE source_ref=$1 AND scope_key=$2 AND delete_epoch=$3", &[&source_ref,&expected.scope_key,&epoch]).map_err(postgres_knowledge_error)? {
+                    let receipt: memory::knowledge::MemorySourceQuarantineReceipt = serde_json::from_value(row.try_get::<_, Option<serde_json::Value>>(0).map_err(postgres_knowledge_error)?.ok_or(KnowledgeStoreError::ReadLimit)?).map_err(json_knowledge_error)?;
+                    if receipt.source != *expected || receipt.digest()? != row.try_get::<_, String>(1).map_err(postgres_knowledge_error)? { return Err(KnowledgeStoreError::StaleRead); }
+                    tx.commit().map_err(postgres_knowledge_error)?;
+                    return Ok(memory::knowledge::KnowledgeSourceQuarantine { pack_ids: receipt.pack_ids.clone(), memory_receipt: Some(receipt) });
+                }
+                }
                 let frame = bounded_knowledge_source_snapshot(&mut tx, &source_ref)?;
                 let (packs, conflicts) = memory::knowledge::prepare_source_quarantine(frame);
+                let pack_ids: Vec<String> = packs.iter().map(|pack| pack.pack_id.clone()).collect();
+                let receipt =
+                    retirement.map(|source| memory::knowledge::MemorySourceQuarantineReceipt {
+                        source,
+                        pack_ids: pack_ids.clone(),
+                    });
+                let receipt_digest = receipt
+                    .as_ref()
+                    .map(|receipt| receipt.digest())
+                    .transpose()?;
                 apply_knowledge_maintenance(&mut tx, &packs, &conflicts)?;
+                if let Some(receipt) = receipt.as_ref() {
+                    let epoch = i64::try_from(receipt.source.delete_epoch)
+                        .map_err(|_| KnowledgeStoreError::StaleRead)?;
+                    tx.execute("INSERT INTO knowledge_memory_retirement_receipts(source_ref,scope_key,delete_epoch,receipt_digest,payload) VALUES($1,$2,$3,$4,$5)", &[&source_ref,&receipt.source.scope_key,&epoch,&receipt_digest.as_ref().ok_or(KnowledgeStoreError::StaleRead)?,&serde_json::to_value(receipt).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
+                }
                 tx.commit().map_err(postgres_knowledge_error)?;
-                Ok(packs.into_iter().map(|pack| pack.pack_id).collect())
+                Ok(memory::knowledge::KnowledgeSourceQuarantine {
+                    pack_ids,
+                    memory_receipt: receipt,
+                })
             },
             || KnowledgeStoreError::Backend("PostgreSQL source quarantine thread panicked".into()),
         )
@@ -1687,6 +1757,7 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     .checkout_critical()
                     .map_err(storage_knowledge_error)?;
                 let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                tx.batch_execute("LOCK TABLE knowledge_corpus, knowledge_pack, knowledge_conflict IN ROW EXCLUSIVE MODE").map_err(postgres_knowledge_error)?;
                 let (key, digest) = memory::knowledge::knowledge_ingestion_identity(&receipt)?;
                 let inserted = tx.execute("INSERT INTO knowledge_ingestion_receipt(request_key,input_digest,payload) VALUES($1,$2,$3) ON CONFLICT(request_key) DO NOTHING", &[&key,&digest,&serde_json::to_value(&receipt).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
                 if inserted == 0 {
@@ -1703,6 +1774,9 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     let original = serde_json::from_value(payload).map_err(json_knowledge_error)?;
                     tx.commit().map_err(postgres_knowledge_error)?;
                     return Ok(original);
+                }
+                if tx.query_opt("SELECT 1 FROM knowledge_memory_retirement_receipts WHERE source_ref=$1 LIMIT 1", &[&receipt.corpus.source_ref.id]).map_err(postgres_knowledge_error)?.is_some() {
+                    return Err(KnowledgeStoreError::StaleRead);
                 }
                 upsert_knowledge_json(
                     &mut tx,
@@ -2451,6 +2525,16 @@ fn apply_knowledge_maintenance(
     packs: &[harness_contract::knowledge::KnowledgePack],
     conflicts: &[harness_contract::knowledge::KnowledgeConflictRecord],
 ) -> Result<(), KnowledgeStoreError> {
+    for pack in packs
+        .iter()
+        .filter(|pack| memory::knowledge::knowledge_state_is_actionable(pack.state))
+    {
+        // Include the old source set: removing a retired reference from a
+        // replacement payload is not permission to reactivate its original pack.
+        if connection.query_opt("SELECT 1 FROM knowledge_corpus c JOIN knowledge_memory_retirement_receipts r ON r.source_ref=c.payload->'source_ref'->>'id' WHERE c.corpus_id=ANY($1::text[]) OR EXISTS(SELECT 1 FROM knowledge_pack p WHERE p.pack_id=$2 AND p.payload->'source_corpus_refs' ? c.corpus_id) LIMIT 1", &[&pack.source_corpus_refs,&pack.pack_id]).map_err(postgres_knowledge_error)?.is_some() {
+            return Err(KnowledgeStoreError::StaleRead);
+        }
+    }
     for pack in packs {
         upsert_knowledge_json(
             connection,

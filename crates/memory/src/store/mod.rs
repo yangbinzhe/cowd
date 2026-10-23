@@ -23,7 +23,8 @@ pub mod blob;
 mod mutation;
 pub use mutation::{
     lifecycle_retired, memory_entry_digest, MemoryCleanupPending, MemoryLifecycleMutation,
-    MemoryLifecycleReceipt, MemorySourceFence, MemorySourceFenceReader,
+    MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceFence,
+    MemorySourceFenceReader, VerifiedMemoryRetirement,
 };
 mod ephemeral;
 pub mod vector;
@@ -242,7 +243,7 @@ pub trait MemoryStore: Send + Sync {
     async fn confirm_memory_cleanup(
         &self,
         expected: &MemoryCleanupPending,
-        knowledge: bool,
+        knowledge: Option<&crate::knowledge::MemorySourceQuarantineReceipt>,
         auxiliary: bool,
     ) -> Result<()>;
 

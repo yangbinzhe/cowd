@@ -198,8 +198,64 @@ pub enum KnowledgeStoreError {
     Backend(String),
     #[error("knowledge source read set changed")]
     StaleRead,
+    #[error("Memory retirement source read failed")]
+    MemorySourceRead(#[source] crate::MemoryError),
+    #[error("Memory retirement source is unknown")]
+    MemorySourceUnknown,
     #[error("knowledge read exceeds the bounded frame")]
     ReadLimit,
+}
+
+/// Original Knowledge commit evidence for one Memory retirement epoch. This is
+/// distinct from Memory's source fence: it proves the other domain committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySourceQuarantineReceipt {
+    pub source: crate::store::MemorySourceFence,
+    pub pack_ids: Vec<String>,
+}
+
+impl MemorySourceQuarantineReceipt {
+    pub fn digest(&self) -> Result<String, KnowledgeStoreError> {
+        struct ReceiptHash {
+            budget: Budget,
+            hash: Sha256,
+        }
+        impl std::io::Write for ReceiptHash {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = std::io::Write::write(&mut self.budget, bytes)?;
+                self.hash.update(bytes);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = ReceiptHash {
+            budget: Budget(0),
+            hash: Sha256::new(),
+        };
+        sink.hash
+            .update(b"cowd.knowledge.memory-retirement.receipt.v1\0");
+        serde_json::to_writer(&mut sink, self).map_err(|_| KnowledgeStoreError::ReadLimit)?;
+        Ok(format!("{:x}", sink.hash.finalize()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeSourceQuarantine {
+    pub pack_ids: Vec<String>,
+    pub memory_receipt: Option<MemorySourceQuarantineReceipt>,
+}
+
+pub fn validate_quarantine_source(
+    source_ref: &str,
+    retirement: Option<&crate::store::VerifiedMemoryRetirement>,
+) -> Result<(), KnowledgeStoreError> {
+    match (source_ref.starts_with("memory:"), retirement) {
+        (true, Some(proof)) if proof.source().source_ref == source_ref => Ok(()),
+        (false, None) => Ok(()),
+        _ => Err(KnowledgeStoreError::StaleRead),
+    }
 }
 
 pub trait KnowledgeStore: Send + Sync {
@@ -210,7 +266,11 @@ pub trait KnowledgeStore: Send + Sync {
     fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError>;
     /// Read and quarantine this source and its dependent conflicts in one native
     /// transaction. Unrelated sources are not materialized or part of its budget.
-    fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError>;
+    fn quarantine_source(
+        &self,
+        source_ref: &str,
+        retirement: Option<&crate::store::VerifiedMemoryRetirement>,
+    ) -> Result<KnowledgeSourceQuarantine, KnowledgeStoreError>;
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
     fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
     fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError>;
@@ -283,6 +343,7 @@ struct KnowledgeFabricState {
     ingestion_receipts: BTreeMap<String, (String, KnowledgeIngestionReceipt)>,
     candidate_revisions: BTreeMap<String, u64>,
     candidate_store_id: String,
+    retirement_receipts: BTreeMap<(String, String, u64), MemorySourceQuarantineReceipt>,
 }
 
 /// A read is complete or refused; these limits never truncate a policy input.
@@ -321,6 +382,7 @@ impl KnowledgeFabricState {
             ingestion_receipts: BTreeMap::new(),
             candidate_revisions: BTreeMap::new(),
             candidate_store_id: String::new(),
+            retirement_receipts: BTreeMap::new(),
         }
     }
 }
@@ -873,7 +935,38 @@ impl KnowledgeFabric {
     /// stop participating in activation and Matrix projection while its
     /// corpus/canon evidence remains available for audit.
     pub fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
-        self.store.quarantine_source(source_ref)
+        validate_quarantine_source(source_ref, None)?;
+        Ok(self.store.quarantine_source(source_ref, None)?.pack_ids)
+    }
+
+    pub fn quarantine_memory_source(
+        &self,
+        expected: &crate::store::MemorySourceFence,
+    ) -> Result<MemorySourceQuarantineReceipt, KnowledgeStoreError> {
+        let reader = self
+            .memory_sources
+            .as_ref()
+            .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+        let proof = reader
+            .verify_retirement(expected)
+            .map_err(|error| match error {
+                crate::store::MemoryRetirementVerificationError::Read(error) => {
+                    KnowledgeStoreError::MemorySourceRead(error)
+                }
+                crate::store::MemoryRetirementVerificationError::Unknown => {
+                    KnowledgeStoreError::MemorySourceUnknown
+                }
+                crate::store::MemoryRetirementVerificationError::Stale => {
+                    KnowledgeStoreError::StaleRead
+                }
+            })?;
+        let result = self
+            .store
+            .quarantine_source(&expected.source_ref, Some(&proof))?;
+        result
+            .memory_receipt
+            .filter(|receipt| receipt.source == *expected)
+            .ok_or(KnowledgeStoreError::StaleRead)
     }
 
     /// Close conflict reviews whose source pack can no longer participate.
@@ -1481,15 +1574,44 @@ fn bump_candidate_revisions(
 }
 
 impl KnowledgeStore for InMemoryKnowledgeStore {
-    fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
+    fn quarantine_source(
+        &self,
+        source_ref: &str,
+        retirement: Option<&crate::store::VerifiedMemoryRetirement>,
+    ) -> Result<KnowledgeSourceQuarantine, KnowledgeStoreError> {
+        validate_quarantine_source(source_ref, retirement)?;
         let mut state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receipt_key = retirement.map(|proof| {
+            (
+                source_ref.to_owned(),
+                proof.source().scope_key.clone(),
+                proof.source().delete_epoch,
+            )
+        });
+        if let Some(original) = receipt_key
+            .as_ref()
+            .and_then(|key| state.retirement_receipts.get(key))
+        {
+            return Ok(KnowledgeSourceQuarantine {
+                pack_ids: original.pack_ids.clone(),
+                memory_receipt: Some(original.clone()),
+            });
+        }
         let snapshot = bounded_source_snapshot(&state, source_ref)?;
         let (packs, conflicts) = prepare_source_quarantine(snapshot);
+        let ids: Vec<String> = packs.iter().map(|pack| pack.pack_id.clone()).collect();
+        let receipt = retirement.map(|proof| MemorySourceQuarantineReceipt {
+            source: proof.source().clone(),
+            pack_ids: ids.clone(),
+        });
+        if let Some(receipt) = receipt.as_ref() {
+            receipt.digest()?;
+        }
+
         bump_candidate_revisions(&mut state, packs.iter().map(|pack| pack.namespace.clone()))?;
-        let ids = packs.iter().map(|pack| pack.pack_id.clone()).collect();
         for pack in packs {
             state.packs.insert(pack.pack_id.clone(), pack);
         }
@@ -1498,7 +1620,13 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 .conflicts
                 .insert(conflict.conflict_id.clone(), conflict);
         }
-        Ok(ids)
+        if let (Some(key), Some(receipt)) = (receipt_key, receipt.as_ref()) {
+            state.retirement_receipts.insert(key, receipt.clone());
+        }
+        Ok(KnowledgeSourceQuarantine {
+            pack_ids: ids,
+            memory_receipt: receipt,
+        })
     }
     fn save_receipt(
         &self,
@@ -1516,6 +1644,13 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 ));
             }
             return Ok(original.clone());
+        }
+        if state
+            .retirement_receipts
+            .keys()
+            .any(|(source, _, _)| source == &receipt.corpus.source_ref.id)
+        {
+            return Err(KnowledgeStoreError::StaleRead);
         }
         bump_candidate_revisions(&mut state, std::iter::once(receipt.pack.namespace.clone()))?;
         state
@@ -1711,6 +1846,26 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         let current = bounded_state_snapshot(&state, false)?;
         if !same_knowledge_maintenance_inputs(expected, &current)? {
             return Err(KnowledgeStoreError::StaleRead);
+        }
+        for pack in packs
+            .iter()
+            .filter(|pack| knowledge_state_is_actionable(pack.state))
+        {
+            let ids = pack.source_corpus_refs.iter().chain(
+                state
+                    .packs
+                    .get(&pack.pack_id)
+                    .into_iter()
+                    .flat_map(|old| old.source_corpus_refs.iter()),
+            );
+            if ids.filter_map(|id| state.corpus.get(id)).any(|corpus| {
+                state
+                    .retirement_receipts
+                    .keys()
+                    .any(|(source, _, _)| source == &corpus.source_ref.id)
+            }) {
+                return Err(KnowledgeStoreError::StaleRead);
+            }
         }
         let namespaces = packs
             .iter()
@@ -2507,7 +2662,7 @@ fn normalize_namespace_key(namespace: &KnowledgeNamespace) -> String {
     }
 }
 
-fn knowledge_state_is_actionable(state: KnowledgeObjectState) -> bool {
+pub fn knowledge_state_is_actionable(state: KnowledgeObjectState) -> bool {
     matches!(
         state,
         KnowledgeObjectState::Active
@@ -3090,11 +3245,15 @@ mod tests {
     }
 
     impl KnowledgeStore for FaultingKnowledgeStore {
-        fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
+        fn quarantine_source(
+            &self,
+            source_ref: &str,
+            retirement: Option<&crate::store::VerifiedMemoryRetirement>,
+        ) -> Result<KnowledgeSourceQuarantine, KnowledgeStoreError> {
             if self.mode() == 3 {
                 return Err(KnowledgeStoreError::Backend("read refused".into()));
             }
-            self.inner.quarantine_source(source_ref)
+            self.inner.quarantine_source(source_ref, retirement)
         }
         fn save_receipt(
             &self,
@@ -3416,6 +3575,95 @@ mod tests {
             Err(KnowledgeStoreError::ReadLimit)
         ));
     }
+    #[test]
+    fn knowledge_retirement_distinguishes_source_read_failure_from_unknown_and_stale() {
+        struct FailedReader(bool);
+        impl crate::store::MemorySourceFenceReader for FailedReader {
+            fn read_source_fence(
+                &self,
+                _: &str,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceFence>> {
+                if self.0 {
+                    Err(crate::MemoryError::Store(
+                        "synthetic-secret-canary-do-not-echo".into(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let expected = crate::store::MemorySourceFence {
+            source_ref: "memory:00000000-0000-0000-0000-000000000001".into(),
+            scope_key: "project_A".into(),
+            delete_epoch: 1,
+            retired: true,
+        };
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let failed = KnowledgeFabric::with_store(store.clone())
+            .with_memory_sources(Arc::new(FailedReader(true)));
+        let error = failed.quarantine_memory_source(&expected).unwrap_err();
+        assert!(matches!(error, KnowledgeStoreError::MemorySourceRead(_)));
+        assert!(!error
+            .to_string()
+            .contains("synthetic-secret-canary-do-not-echo"));
+        let unknown = KnowledgeFabric::with_store(store.clone())
+            .with_memory_sources(Arc::new(FailedReader(false)));
+        assert!(matches!(
+            unknown.quarantine_memory_source(&expected),
+            Err(KnowledgeStoreError::MemorySourceUnknown)
+        ));
+        let bad = crate::store::MemorySourceFence {
+            delete_epoch: 0,
+            ..expected
+        };
+        assert!(
+            matches!(
+                failed.quarantine_memory_source(&bad),
+                Err(KnowledgeStoreError::StaleRead)
+            ),
+            "invalid proof rejected before any backend read"
+        );
+        assert!(store.state.read().unwrap().retirement_receipts.is_empty());
+    }
+
+    #[test]
+    fn knowledge_retirement_receipt_commitment_binds_all_fields_and_is_bounded() {
+        let receipt = MemorySourceQuarantineReceipt {
+            source: crate::store::MemorySourceFence {
+                source_ref: "memory:00000000-0000-0000-0000-000000000001".into(),
+                scope_key: "project_A".into(),
+                delete_epoch: 3,
+                retired: true,
+            },
+            pack_ids: vec!["pack_a".into(), "pack_b".into()],
+        };
+        // Frozen compact typed JSON + the v1 domain, hashed independently with
+        // standard SHA-256; expected does not call the production serializer.
+        const EXPECTED: &str = "4288135c97f59e1969ac797af190eef7a8cdbd5a1d7c6af2e2396d975737243b";
+        assert_eq!(receipt.digest().unwrap(), EXPECTED);
+        let mut source = receipt.clone();
+        source.source.source_ref.push('x');
+        let mut scope = receipt.clone();
+        scope.source.scope_key.push('x');
+        let mut epoch = receipt.clone();
+        epoch.source.delete_epoch += 1;
+        let mut retired = receipt.clone();
+        retired.source.retired = false;
+        let mut pack = receipt.clone();
+        pack.pack_ids[0].push('x');
+        let mut order = receipt.clone();
+        order.pack_ids.reverse();
+        for changed in [source, scope, epoch, retired, pack, order] {
+            assert_ne!(changed.digest().unwrap(), EXPECTED);
+        }
+        let mut oversized = receipt;
+        oversized.pack_ids = vec!["x".repeat(KNOWLEDGE_READ_MAX_BYTES + 1)];
+        assert!(matches!(
+            oversized.digest(),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+    }
+
     #[test]
     fn knowledge_source_retirement_ignores_foreign_budget_but_refuses_own_overflow() {
         let store = Arc::new(InMemoryKnowledgeStore::new());

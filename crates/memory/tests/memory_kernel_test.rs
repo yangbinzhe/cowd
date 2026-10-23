@@ -1651,6 +1651,7 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
         KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
     };
     use memory::store::{EphemeralMemoryStore, MemorySourceFenceReader, MemoryStore};
+    use memory::KnowledgeStore;
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(EphemeralMemoryStore::new());
     let knowledge_store = Arc::new(memory::InMemoryKnowledgeStore::new());
@@ -1742,7 +1743,7 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].source.delete_epoch, 1);
-    assert!(!pending[0].knowledge_confirmed);
+    assert!(pending[0].knowledge_receipt_digest.is_none());
     assert!(!pending[0].auxiliary_confirmed);
     assert!(
         store
@@ -1781,9 +1782,76 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     let mut forged = pending[0].clone();
     forged.source.delete_epoch += 1;
     assert!(store
-        .confirm_memory_cleanup(&forged, true, true)
+        .confirm_memory_cleanup(&forged, None, true)
         .await
         .is_err());
+    // Knowledge committed, but Memory has not acknowledged it yet. A wrong
+    // epoch/scope receipt cannot stand in for this exact cross-domain fact.
+    let quarantine = fabric.quarantine_memory_source(&pending[0].source).unwrap();
+    assert_eq!(quarantine.source, pending[0].source);
+    assert_eq!(
+        quarantine.pack_ids,
+        vec![retired_receipt.pack.pack_id.clone()]
+    );
+    let mut wrong_receipt = quarantine.clone();
+    wrong_receipt.source.delete_epoch += 1;
+    assert!(store
+        .confirm_memory_cleanup(&pending[0], Some(&wrong_receipt), false)
+        .await
+        .is_err());
+    assert_eq!(
+        store.pending_memory_cleanup(None, 16).await.unwrap(),
+        pending
+    );
+    wrong_receipt.source = quarantine.source.clone();
+    wrong_receipt.source.scope_key = MemoryScope::Project("B".into()).scope_key();
+    assert!(store
+        .confirm_memory_cleanup(&pending[0], Some(&wrong_receipt), false)
+        .await
+        .is_err());
+    assert!(
+        fabric
+            .quarantine_source(&pending[0].source.source_ref)
+            .is_err(),
+        "a bare Memory source string is not an epoch proof"
+    );
+    // Model a valid precomputed artifact delayed until after retirement. The
+    // native store must reject it even if a caller bypasses Fabric preflight.
+    let mut late = retired_receipt.clone();
+    late.corpus.corpus_id = "late-corpus-after-retirement".into();
+    late.pack.pack_id = "late-pack-after-retirement".into();
+    late.pack.source_corpus_refs = vec![late.corpus.corpus_id.clone()];
+    late.canon.canon_id = "late-canon-after-retirement".into();
+    late.canon.pack_id = late.pack.pack_id.clone();
+    late.pack.canon_pack_ref = Some(late.canon.canon_id.clone());
+    late.chunks.clear();
+    late.conflicts.clear();
+    assert!(matches!(
+        knowledge_store.save_receipt(&late),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(
+        knowledge_store.save_receipt(&retired_receipt).unwrap().pack,
+        retired_receipt.pack,
+        "immutable receipt replay returns its original fact, never reactivates materialization"
+    );
+    let mut revive = fabric
+        .snapshot()
+        .unwrap()
+        .packs
+        .into_iter()
+        .find(|p| p.pack_id == retired_receipt.pack.pack_id)
+        .unwrap();
+    revive.state = harness_contract::knowledge::KnowledgeObjectState::Active;
+    revive.source_corpus_refs = vec![other_receipt.corpus.corpus_id.clone()];
+    assert!(matches!(
+        knowledge_store.commit_maintenance(
+            &knowledge_store.maintenance_inputs().unwrap(),
+            &[revive],
+            &[]
+        ),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
     drop(kernel);
     drop(manager);
     assert!(weak.upgrade().is_none());
@@ -1975,4 +2043,117 @@ async fn live_source_fence_without_its_original_body_is_unknown() {
     assert!(store
         .read_source_fence(&format!("memory:{}", original.id))
         .is_err());
+}
+
+#[tokio::test]
+async fn later_retirement_epoch_preserves_earlier_pending_and_exact_receipts() {
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    use memory::store::{EphemeralMemoryStore, MemorySourceFenceReader, MemoryStore};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let knowledge = Arc::new(memory::InMemoryKnowledgeStore::new());
+    let fabric = memory::KnowledgeFabric::with_store(knowledge).with_memory_sources(store.clone());
+    let mut body = entry(
+        MemoryLayer::L3,
+        MemorySource::Import,
+        "two retirement epochs",
+    );
+    body.scope = MemoryScope::Project("A".into());
+    store.insert(&body).await.unwrap();
+    let mut document = memory::DocumentContent::new("source policy", "retain original evidence");
+    document.source = Some(format!("memory:{}", body.id));
+    let original = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("A".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document,
+        )
+        .unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("manager")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager.clone());
+    let ctx = MemoryTurnContext::new("epoch-owner", "operator");
+    kernel
+        .archive(&ctx, body.id, "first retirement")
+        .await
+        .unwrap();
+    kernel
+        .archive(&ctx, body.id, "second retirement")
+        .await
+        .unwrap();
+    let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    let first = pending.iter().find(|p| p.source.delete_epoch == 1).unwrap();
+    let second = pending.iter().find(|p| p.source.delete_epoch == 2).unwrap();
+    assert_eq!(
+        store
+            .read_source_fence(&first.source.source_ref)
+            .unwrap()
+            .unwrap()
+            .delete_epoch,
+        2
+    );
+    let receipt1 = fabric.quarantine_memory_source(&first.source).unwrap();
+    let receipt2 = fabric.quarantine_memory_source(&second.source).unwrap();
+    assert_eq!(receipt1.source, first.source);
+    assert_eq!(receipt2.source, second.source);
+    assert_eq!(receipt1.pack_ids, vec![original.pack.pack_id]);
+    assert!(receipt2.pack_ids.is_empty());
+    assert_eq!(
+        fabric.quarantine_memory_source(&first.source).unwrap(),
+        receipt1
+    );
+    assert!(store
+        .confirm_memory_cleanup(first, Some(&receipt2), false)
+        .await
+        .is_err());
+    assert_eq!(
+        store.pending_memory_cleanup(None, 16).await.unwrap(),
+        pending
+    );
+    for bad in [
+        memory::store::MemorySourceFence {
+            delete_epoch: 0,
+            ..first.source.clone()
+        },
+        memory::store::MemorySourceFence {
+            delete_epoch: 3,
+            ..first.source.clone()
+        },
+        memory::store::MemorySourceFence {
+            scope_key: MemoryScope::Project("foreign".into()).scope_key(),
+            ..first.source.clone()
+        },
+        memory::store::MemorySourceFence {
+            source_ref: format!("memory:{}", uuid::Uuid::new_v4()),
+            ..first.source.clone()
+        },
+    ] {
+        assert!(fabric.quarantine_memory_source(&bad).is_err());
+    }
+    assert!(manager
+        .recover_memory_cleanup(&fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        store.get(&body.id).await.unwrap().is_some(),
+        "archive is not erase"
+    );
 }

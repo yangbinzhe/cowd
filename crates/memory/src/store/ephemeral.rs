@@ -279,23 +279,29 @@ impl MemoryStore for EphemeralMemoryStore {
                 "invalid Memory cleanup page size".into(),
             ));
         }
-        Ok(self
-            .read()?
+        let state = self.read()?;
+        let mut page = Vec::new();
+        for pending in state
             .cleanup_pending
             .values()
-            .filter(|p| {
-                !(p.knowledge_confirmed && p.auxiliary_confirmed)
-                    && after_mutation.is_none_or(|after| p.mutation_id.as_str() > after)
-            })
-            .take(limit)
-            .cloned()
-            .collect())
+            .filter(|p| after_mutation.is_none_or(|after| p.mutation_id.as_str() > after))
+        {
+            pending.validate()?;
+            if pending.knowledge_receipt_digest.is_some() && pending.auxiliary_confirmed {
+                continue;
+            }
+            page.push(pending.clone());
+            if page.len() == limit {
+                break;
+            }
+        }
+        Ok(page)
     }
 
     async fn confirm_memory_cleanup(
         &self,
         expected: &MemoryCleanupPending,
-        knowledge: bool,
+        knowledge: Option<&crate::knowledge::MemorySourceQuarantineReceipt>,
         auxiliary: bool,
     ) -> Result<()> {
         let mut state = self.write()?;
@@ -308,7 +314,7 @@ impl MemoryStore for EphemeralMemoryStore {
                 "foreign Memory cleanup confirmation".into(),
             ));
         }
-        pending.knowledge_confirmed |= knowledge;
+        pending.confirm_knowledge(knowledge)?;
         pending.auxiliary_confirmed |= auxiliary;
         if auxiliary {
             let id = expected.memory_id.to_string();

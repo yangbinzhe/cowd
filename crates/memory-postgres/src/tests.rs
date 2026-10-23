@@ -1356,10 +1356,57 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .any(|p| p.pack_id == other.pack.pack_id));
     assert!(store.update(&entry).await.is_err());
     assert!(store.insert(&entry).await.is_err());
-    assert!(!store.pending_memory_cleanup(None, 16).await.unwrap()[0].knowledge_confirmed);
+    assert!(store.pending_memory_cleanup(None, 16).await.unwrap()[0]
+        .knowledge_receipt_digest
+        .is_none());
     connection
         .batch_execute("DROP TRIGGER refuse_cleanup_pack ON knowledge_pack")
         .unwrap();
+    assert_eq!(
+        connection
+            .query_one(
+                "SELECT count(*) FROM knowledge_memory_retirement_receipts",
+                &[]
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    // Refuse the last write too: pack changes may not escape without their
+    // exact source/epoch commit evidence.
+    connection.batch_execute("CREATE FUNCTION refuse_cleanup_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'receipt unavailable'; END $$; CREATE TRIGGER refuse_cleanup_receipt BEFORE INSERT ON knowledge_memory_retirement_receipts FOR EACH ROW EXECUTE FUNCTION refuse_cleanup_receipt()").unwrap();
+    assert!(!manager
+        .recover_memory_cleanup(&fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        connection
+            .query_one(
+                "SELECT count(*) FROM knowledge_memory_retirement_receipts",
+                &[]
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    let original_row = connection
+        .query_one(
+            "SELECT payload FROM knowledge_pack WHERE pack_id=$1",
+            &[&retired.pack.pack_id],
+        )
+        .unwrap()
+        .get::<_, serde_json::Value>(0);
+    assert_eq!(original_row, serde_json::to_value(&retired.pack).unwrap());
+    assert!(store.pending_memory_cleanup(None, 16).await.unwrap()[0]
+        .knowledge_receipt_digest
+        .is_none());
+    connection
+        .batch_execute(
+            "DROP TRIGGER refuse_cleanup_receipt ON knowledge_memory_retirement_receipts",
+        )
+        .unwrap();
+
     drop(connection);
     drop(kernel);
     drop(manager);
@@ -1394,6 +1441,73 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .await
         .unwrap()
         .is_empty());
+    let actual_receipt = reopened_fabric
+        .quarantine_memory_source(&pending[0].source)
+        .unwrap();
+    assert_eq!(actual_receipt.source, pending[0].source);
+    assert_eq!(actual_receipt.pack_ids, vec![retired.pack.pack_id.clone()]);
+    assert_eq!(
+        reopened_fabric
+            .quarantine_memory_source(&pending[0].source)
+            .unwrap(),
+        actual_receipt
+    );
+    let mut inspect = fixture.reconnect().checkout_online_read().unwrap();
+    let stored_receipt: memory::knowledge::MemorySourceQuarantineReceipt = serde_json::from_value(inspect.query_one("SELECT payload FROM knowledge_memory_retirement_receipts WHERE source_ref=$1 AND delete_epoch=1", &[&pending[0].source.source_ref]).unwrap().get(0)).unwrap();
+    assert_eq!(stored_receipt, actual_receipt);
+    assert_eq!(inspect.query_one("SELECT receipt_digest FROM knowledge_memory_retirement_receipts WHERE source_ref=$1 AND delete_epoch=1", &[&pending[0].source.source_ref]).unwrap().get::<_, String>(0), actual_receipt.digest().unwrap());
+    // A payload-only corruption may not borrow the original receipt key/digest.
+    drop(inspect);
+    let mut inspect = fixture.reconnect().checkout_critical().unwrap();
+    inspect.execute("UPDATE knowledge_memory_retirement_receipts SET payload=jsonb_set(payload,'{pack_ids}','[\"foreign-pack\"]'::jsonb) WHERE source_ref=$1 AND delete_epoch=1", &[&pending[0].source.source_ref]).unwrap();
+    assert!(matches!(
+        reopened_fabric.quarantine_memory_source(&pending[0].source),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    inspect.execute("UPDATE knowledge_memory_retirement_receipts SET payload=$2 WHERE source_ref=$1 AND delete_epoch=1", &[&pending[0].source.source_ref,&serde_json::to_value(&actual_receipt).unwrap()]).unwrap();
+    assert_eq!(
+        reopened_fabric
+            .quarantine_memory_source(&pending[0].source)
+            .unwrap(),
+        actual_receipt
+    );
+    drop(inspect);
+    // A valid prepared result arriving late cannot bypass the native write
+    // fence; immutable original receipt replay is still a read of its old fact.
+    let writer = PostgresKnowledgeStore::new(fixture.reconnect()).unwrap();
+    let mut late = retired.clone();
+    late.corpus.corpus_id = "late-after-retirement-corpus".into();
+    late.pack.pack_id = "late-after-retirement-pack".into();
+    late.pack.source_corpus_refs = vec![late.corpus.corpus_id.clone()];
+    late.canon.canon_id = "late-after-retirement-canon".into();
+    late.canon.pack_id = late.pack.pack_id.clone();
+    late.pack.canon_pack_ref = Some(late.canon.canon_id.clone());
+    late.chunks.clear();
+    late.conflicts.clear();
+    assert!(matches!(
+        writer.save_receipt(&late),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(writer.save_receipt(&retired).unwrap().pack, retired.pack);
+    let mut revive = writer
+        .snapshot()
+        .unwrap()
+        .packs
+        .into_iter()
+        .find(|p| p.pack_id == retired.pack.pack_id)
+        .unwrap();
+    revive.state = harness_contract::knowledge::KnowledgeObjectState::Active;
+    revive.source_corpus_refs = vec![other.corpus.corpus_id.clone()];
+    assert!(matches!(
+        writer.commit_maintenance(&writer.maintenance_inputs().unwrap(), &[revive], &[]),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(
+        writer.snapshot().unwrap().packs.len(),
+        2,
+        "late failed command leaves no new body/receipt materialization"
+    );
+    drop(writer);
     let triples = reopened_store.load_triples(&scope).await.unwrap();
     assert_eq!(triples.len(), 1);
     assert_eq!(triples[0].id, "independent-triple");
@@ -1424,7 +1538,9 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .await
         .unwrap()
         .is_some());
-    memory::MemoryKernel::new(Arc::new(reopened))
+    let reopened = Arc::new(reopened);
+    let reopened_kernel = memory::MemoryKernel::new(reopened.clone());
+    reopened_kernel
         .archive(&ctx, entry.id, "archive exactly once")
         .await
         .unwrap();
@@ -1441,6 +1557,38 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .await
         .unwrap()
         .is_empty());
+    // The native receiver must also accept an authentic older retirement
+    // receipt after its source advances to another irreversible retirement.
+    reopened_kernel
+        .archive(&ctx, entry.id, "second independent retirement")
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened_store
+            .read_source_fence(&pending[0].source.source_ref)
+            .unwrap()
+            .unwrap()
+            .delete_epoch,
+        2
+    );
+    assert_eq!(
+        reopened_fabric
+            .quarantine_memory_source(&pending[0].source)
+            .unwrap(),
+        actual_receipt
+    );
+    assert!(reopened
+        .recover_memory_cleanup(&reopened_fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(reopened_store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    drop(reopened_kernel);
+    drop(reopened);
     // A live epoch-zero record cannot authorize a source whose body was
     // physically removed by the still-unmigrated legacy erase caller.
     reopened_store.delete(&independent.id).await.unwrap();
@@ -1548,8 +1696,9 @@ fn real_postgres_knowledge_source_retirement_ignores_foreign_budget_and_reopens(
     drop(executor);
     let reopened = Arc::new(PostgresKnowledgeStore::new(fixture.reconnect()).unwrap());
     assert!(reopened
-        .quarantine_source("import-fixture:own-retirement")
+        .quarantine_source("import-fixture:own-retirement", None)
         .unwrap()
+        .pack_ids
         .is_empty());
     let mut connection = reopened.executor.checkout_online_read().unwrap();
     let row = connection

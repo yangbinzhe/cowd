@@ -1951,17 +1951,19 @@ impl CognitiveContextManager {
         }
         let mut errors = Vec::new();
         for pending in &page {
-            let knowledge_done = if pending.knowledge_confirmed {
-                true
+            let knowledge_receipt = if pending.knowledge_receipt_digest.is_some() {
+                // This is the original Memory owner's durable reference to an
+                // acknowledged immutable Knowledge receipt, not a copied pack list.
+                None
             } else {
-                match knowledge.quarantine_source(&pending.source.source_ref) {
-                    Ok(_) => true,
+                match knowledge.quarantine_memory_source(&pending.source) {
+                    Ok(receipt) => Some(receipt),
                     Err(error) => {
                         errors.push(format!(
                             "Knowledge cleanup {}: {error}",
                             pending.mutation_id
                         ));
-                        false
+                        None
                     }
                 }
             };
@@ -1982,7 +1984,7 @@ impl CognitiveContextManager {
             // The original store applies associated durable auxiliary removals
             // atomically with its confirmation; vector eviction is idempotent.
             if let Err(error) = store
-                .confirm_memory_cleanup(pending, knowledge_done, auxiliary_done)
+                .confirm_memory_cleanup(pending, knowledge_receipt.as_ref(), auxiliary_done)
                 .await
             {
                 errors.push(format!(

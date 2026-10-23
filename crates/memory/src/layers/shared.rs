@@ -386,7 +386,7 @@ impl crate::store::MemoryStore for NoopStore {
     async fn confirm_memory_cleanup(
         &self,
         _: &crate::store::MemoryCleanupPending,
-        _: bool,
+        _: Option<&crate::knowledge::MemorySourceQuarantineReceipt>,
         _: bool,
     ) -> crate::store::Result<()> {
         Self::unavailable()

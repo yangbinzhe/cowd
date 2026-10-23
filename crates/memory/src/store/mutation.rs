@@ -14,6 +14,32 @@ pub struct MemorySourceFence {
     pub retired: bool,
 }
 
+impl MemorySourceFence {
+    /// A committed typed retirement never becomes live again. Later epochs
+    /// preserve all earlier retirement proofs within the exact immutable scope.
+    pub fn verifies_retirement(&self, expected: &Self) -> Result<()> {
+        let id = expected
+            .source_ref
+            .strip_prefix("memory:")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .ok_or_else(|| MemoryError::Store("invalid Memory retirement source".into()))?;
+        if expected.source_ref != format!("memory:{id}")
+            || !expected.retired
+            || expected.delete_epoch == 0
+            || expected.scope_key.is_empty()
+            || self.source_ref != expected.source_ref
+            || self.scope_key != expected.scope_key
+            || !self.retired
+            || self.delete_epoch < expected.delete_epoch
+        {
+            return Err(MemoryError::Store(
+                "foreign or stale Memory retirement proof".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryLifecycleMutation {
     pub mutation_id: String,
@@ -28,8 +54,54 @@ pub struct MemoryCleanupPending {
     pub mutation_id: String,
     pub memory_id: MemoryId,
     pub source: MemorySourceFence,
-    pub knowledge_confirmed: bool,
+    #[serde(default)]
+    pub knowledge_receipt_digest: Option<String>,
     pub auxiliary_confirmed: bool,
+}
+
+impl MemoryCleanupPending {
+    pub fn validate(&self) -> Result<()> {
+        self.source.verifies_retirement(&self.source)?;
+        if self.mutation_id.is_empty()
+            || self.source.source_ref != format!("memory:{}", self.memory_id)
+            || self
+                .knowledge_receipt_digest
+                .as_ref()
+                .is_some_and(|digest| {
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                })
+        {
+            return Err(MemoryError::Store("invalid Memory cleanup binding".into()));
+        }
+        Ok(())
+    }
+
+    pub fn confirm_knowledge(
+        &mut self,
+        receipt: Option<&crate::knowledge::MemorySourceQuarantineReceipt>,
+    ) -> Result<()> {
+        self.validate()?;
+        if let Some(receipt) = receipt {
+            let digest = receipt
+                .digest()
+                .map_err(|_| MemoryError::Store("invalid Knowledge retirement receipt".into()))?;
+            if receipt.source != self.source
+                || self
+                    .knowledge_receipt_digest
+                    .as_ref()
+                    .is_some_and(|old| old != &digest)
+            {
+                return Err(MemoryError::Store(
+                    "foreign Knowledge retirement receipt".into(),
+                ));
+            }
+            self.knowledge_receipt_digest = Some(digest);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +116,50 @@ pub struct MemoryLifecycleReceipt {
 /// adapters read their original Memory state; no writable mirror is permitted.
 pub trait MemorySourceFenceReader: Send + Sync {
     fn read_source_fence(&self, source_ref: &str) -> Result<Option<MemorySourceFence>>;
+
+    /// Typed retirement is irreversible in the original owner. An older epoch
+    /// remains retired after a later retirement; it must not strand its own
+    /// durable cleanup obligation. Legacy epoch-zero observations are not proofs.
+    fn verify_retirement(
+        &self,
+        expected: &MemorySourceFence,
+    ) -> std::result::Result<VerifiedMemoryRetirement, MemoryRetirementVerificationError> {
+        expected
+            .verifies_retirement(expected)
+            .map_err(|_| MemoryRetirementVerificationError::Stale)?;
+        let current = self
+            .read_source_fence(&expected.source_ref)
+            .map_err(MemoryRetirementVerificationError::Read)?
+            .ok_or(MemoryRetirementVerificationError::Unknown)?;
+        current
+            .verifies_retirement(expected)
+            .map_err(|_| MemoryRetirementVerificationError::Stale)?;
+        Ok(VerifiedMemoryRetirement {
+            source: expected.clone(),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryRetirementVerificationError {
+    #[error("Memory retirement source read failed")]
+    Read(#[source] MemoryError),
+    #[error("Memory retirement source is unknown")]
+    Unknown,
+    #[error("Memory retirement source does not match the proof")]
+    Stale,
+}
+
+/// Transient proof from the original Memory reader, never deserializable input
+/// or a writable mirror. Its constructor stays inside this owner module.
+#[derive(Debug, Clone)]
+pub struct VerifiedMemoryRetirement {
+    source: MemorySourceFence,
+}
+impl VerifiedMemoryRetirement {
+    pub fn source(&self) -> &MemorySourceFence {
+        &self.source
+    }
 }
 
 pub fn memory_entry_digest(entry: &MemoryEntry) -> Result<String> {
@@ -195,7 +311,7 @@ impl MemoryLifecycleMutation {
                 mutation_id: self.mutation_id.clone(),
                 memory_id: entry.id,
                 source: fence.clone(),
-                knowledge_confirmed: false,
+                knowledge_receipt_digest: None,
                 auxiliary_confirmed: false,
             })
         } else {
