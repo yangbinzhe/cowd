@@ -552,3 +552,62 @@ assert!(
     "unexpected error: {error}"
 );
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; failed schema retained"]
+async fn real_postgres_memory_get_is_readonly_even_when_updates_are_forbidden() {
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let store = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
+    let id = uuid::Uuid::new_v4();
+    let mut entry = memory_entry(id, "read-only lookup");
+    entry.access_count = 11;
+    store.insert(&entry).await.unwrap();
+    let mut connection = store.executor().checkout_critical().unwrap();
+    let before: serde_json::Value = connection
+        .query_one(
+            "SELECT payload FROM memory_entries WHERE id=$1",
+            &[&id.to_string()],
+        )
+        .unwrap()
+        .get(0);
+    connection
+        .batch_execute(
+            "CREATE FUNCTION reject_memory_lookup_write() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'lookup must not mutate memory'; END $$;
+         CREATE TRIGGER reject_memory_lookup_write BEFORE UPDATE ON memory_entries
+            FOR EACH ROW EXECUTE FUNCTION reject_memory_lookup_write();",
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "UPDATE memory_entries SET payload=payload WHERE id=$1",
+                &[&id.to_string()]
+            )
+            .is_err(),
+        "the negative write oracle must actually be armed"
+    );
+    for _ in 0..3 {
+        let loaded = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(loaded.id, id);
+        assert_eq!(loaded.title, entry.title);
+        assert_eq!(loaded.content, entry.content);
+        assert_eq!(loaded.access_count, 11);
+        assert_eq!(loaded.last_accessed_at, None);
+    }
+    assert!(store.get(&uuid::Uuid::new_v4()).await.unwrap().is_none());
+    let after: serde_json::Value = connection
+        .query_one(
+            "SELECT payload FROM memory_entries WHERE id=$1",
+            &[&id.to_string()],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        after, before,
+        "lookup must leave the complete original record unchanged"
+    );
+    drop(connection);
+    drop(store);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
