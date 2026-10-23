@@ -3701,3 +3701,151 @@ async fn auxiliary_production_filter_reads_shared_large_ancestry_once() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn legacy_retirement_adoption_binds_original_history_and_never_reopens_a_scope() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryLifecycleMutation, MemorySourceFenceReader, MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let original = entry(MemoryLayer::L3, MemorySource::Import, "legacy original");
+    store.insert(&original).await.unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: original.id,
+        from: None,
+        to: MemoryState::Superseded,
+        reason: "original retirement".into(),
+        session_id: "original-session".into(),
+        agent_id: "original-actor".into(),
+        occurred_at: Utc::now(),
+    };
+    let raw = serde_json::to_string(&vec![event.clone()]).unwrap();
+    let key = format!("memory_lifecycle:{}", original.id);
+    store.kv_put(&key, &raw).await.unwrap();
+    let page = store.legacy_lifecycle_page(None, 1).await.unwrap();
+    assert_eq!(page.after_id, Some(original.id.to_string()));
+    assert_eq!(page.entries.len(), 1);
+    assert!(store
+        .pending_memory_cleanup(None, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .read_source_fence(&format!("memory:{}", original.id))
+            .unwrap()
+            .unwrap()
+            .delete_epoch,
+        0
+    );
+    let command =
+        MemoryLifecycleMutation::adopt_legacy_retirement(&page.entries[0].0, &page.entries[0].1)
+            .unwrap()
+            .unwrap();
+    let mut foreign_scope = command.clone();
+    foreign_scope.scope_key = "project:foreign".into();
+    assert!(store.commit_lifecycle(foreign_scope).await.is_err());
+    let mut wrong_actor = command.clone();
+    wrong_actor.event.agent_id = "foreign-actor".into();
+    assert!(store.commit_lifecycle(wrong_actor).await.is_err());
+    let mut changed = event.clone();
+    changed.reason = "concurrent original history revision".into();
+    let changed = serde_json::to_string(&vec![changed]).unwrap();
+    store.kv_put(&key, &changed).await.unwrap();
+    assert!(store.commit_lifecycle(command.clone()).await.is_err());
+    assert!(store
+        .pending_memory_cleanup(None, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    store.kv_put(&key, &raw).await.unwrap();
+    let receipt = store.commit_lifecycle(command.clone()).await.unwrap();
+    assert_eq!(receipt.source.delete_epoch, 1);
+    assert!(receipt.source.retired);
+    assert!(!receipt.body_erased);
+    assert_eq!(receipt.event.agent_id, "original-actor");
+    let replay = serde_json::from_value(serde_json::to_value(&command).unwrap()).unwrap();
+    assert_eq!(store.commit_lifecycle(replay).await.unwrap(), receipt);
+    assert_eq!(
+        store.commit_lifecycle(command.clone()).await.unwrap(),
+        receipt
+    );
+    assert!(store
+        .legacy_lifecycle_page(None, 1)
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
+    let mut stripped = serde_json::to_value(&command).unwrap();
+    stripped["legacy_adoption"] = false.into();
+    assert!(store
+        .commit_lifecycle(serde_json::from_value(stripped).unwrap())
+        .await
+        .is_err());
+    assert_eq!(
+        store.pending_memory_cleanup(None, 2).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store.get(&original.id).await.unwrap().unwrap().content,
+        original.content
+    );
+    let mut held = original.clone();
+    held.scope = MemoryScope::LegacyUnresolvedAgent("unclassified".into());
+    assert!(
+        MemoryLifecycleMutation::adopt_legacy_retirement(&held, &raw)
+            .unwrap()
+            .is_none()
+    );
+    let mut wrong_id = event.clone();
+    wrong_id.memory_id = uuid::Uuid::new_v4();
+    assert!(MemoryLifecycleMutation::adopt_legacy_retirement(
+        &original,
+        &serde_json::to_string(&vec![wrong_id]).unwrap()
+    )
+    .is_err());
+    let mut revived = event.clone();
+    revived.from = Some(event.to);
+    revived.to = MemoryState::Observed;
+    assert!(MemoryLifecycleMutation::adopt_legacy_retirement(
+        &original,
+        &serde_json::to_string(&vec![event, revived]).unwrap()
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn legacy_lifecycle_page_reserves_bytes_and_advances_past_an_unreadable_source() {
+    use memory::store::{EphemeralMemoryStore, MemoryStore};
+    let store = EphemeralMemoryStore::new();
+    let mut huge = entry(MemoryLayer::L3, MemorySource::Import, "unreadable source");
+    huge.id = uuid::Uuid::from_u128(1);
+    huge.content = "x".repeat(memory::knowledge::KNOWLEDGE_READ_MAX_BYTES + 1);
+    let mut independent = entry(MemoryLayer::L3, MemorySource::Import, "independent source");
+    independent.id = uuid::Uuid::from_u128(2);
+    for e in [&huge, &independent] {
+        store.insert(e).await.unwrap();
+        store
+            .kv_put(&format!("memory_lifecycle:{}", e.id), "[]")
+            .await
+            .unwrap();
+    }
+    assert!(store.legacy_lifecycle_page(None, 0).await.is_err());
+    assert!(store.legacy_lifecycle_page(None, 257).await.is_err());
+    let page = store.legacy_lifecycle_page(None, 1).await.unwrap();
+    assert_eq!(page.unavailable_ids, vec![huge.id.to_string()]);
+    assert!(page.entries.is_empty());
+    assert_eq!(page.after_id, Some(huge.id.to_string()));
+    let next = store
+        .legacy_lifecycle_page(page.after_id.as_deref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(next.entries.len(), 1);
+    assert_eq!(next.entries[0].0.id, independent.id);
+    assert!(next.unavailable_ids.is_empty());
+    assert!(store
+        .pending_memory_cleanup(None, 1)
+        .await
+        .unwrap()
+        .is_empty());
+}

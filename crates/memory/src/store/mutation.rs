@@ -56,6 +56,8 @@ pub struct MemoryLifecycleMutation {
     revoke_origin: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     erase_body: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    legacy_adoption: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +125,15 @@ pub struct MemoryLifecycleReceipt {
     /// until the original Knowledge and auxiliary receipts are confirmed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub body_erased: bool,
+}
+
+/// A read-only migration page. Unmaterializable rows stay unavailable, but
+/// their identities advance the scan so an independent source is not starved.
+#[derive(Debug, Default)]
+pub struct MemoryLegacyLifecyclePage {
+    pub after_id: Option<String>,
+    pub entries: Vec<(MemoryEntry, String)>,
+    pub unavailable_ids: Vec<String>,
 }
 
 /// A synchronous, narrow read port for the synchronous Knowledge owner. Both
@@ -786,6 +797,7 @@ impl MemoryLifecycleMutation {
             event,
             revoke_origin: true,
             erase_body: false,
+            legacy_adoption: false,
         };
         let mutation_id = if matches!(
             command.event.to,
@@ -809,6 +821,49 @@ impl MemoryLifecycleMutation {
         };
         command.mutation_id = mutation_id;
         Ok(command)
+    }
+
+    /// Adopt only an original, fully identified retired history. This is a
+    /// migration of an existing retirement, never a grant to reconstruct lost
+    /// provenance or to classify an unresolved legacy Agent scope.
+    pub fn adopt_legacy_retirement(entry: &MemoryEntry, history: &str) -> Result<Option<Self>> {
+        if matches!(entry.scope, crate::MemoryScope::LegacyUnresolvedAgent(_)) {
+            return Ok(None);
+        }
+        let events: Vec<MemoryLifecycleEvent> =
+            serde_json::from_str(history).map_err(MemoryError::Serialisation)?;
+        let mut previous = None;
+        for event in &events {
+            if event.memory_id != entry.id
+                || event.from != previous
+                || event.session_id.is_empty()
+                || event.agent_id.is_empty()
+                || previous.is_some_and(|state| {
+                    matches!(state, MemoryState::Archived | MemoryState::Superseded)
+                        && !matches!(event.to, MemoryState::Archived | MemoryState::Superseded)
+                })
+            {
+                return Err(MemoryError::StaleSource);
+            }
+            previous = Some(event.to);
+        }
+        let Some(last) = events
+            .last()
+            .filter(|event| matches!(event.to, MemoryState::Archived | MemoryState::Superseded))
+        else {
+            return Ok(None);
+        };
+        let mut event = last.clone();
+        event.from = Some(last.to);
+        event.reason = "adopt original legacy retirement fence".into();
+        // Preserve the original actor and observation time. The captured body
+        // and complete history are checked again by the native commit owner.
+        let mut command = Self::new(entry, Some(history.to_owned()), event)?;
+        command.legacy_adoption = true;
+        let mutation_id =
+            typed_digest("cowd.memory.legacy-retirement.id.v1", &command.input_cut())?;
+        command.mutation_id = mutation_id;
+        Ok(Some(command))
     }
 
     pub fn erase(
@@ -907,7 +962,9 @@ impl MemoryLifecycleMutation {
 
     pub fn command_digest(&self) -> Result<String> {
         typed_digest(
-            if self.erase_body {
+            if self.legacy_adoption {
+                "cowd.memory.legacy-retirement.command.v1"
+            } else if self.erase_body {
                 "cowd.memory.erasure.command.v1"
             } else if self.revoke_origin {
                 "cowd.memory.lifecycle.command.v2"
@@ -964,6 +1021,15 @@ impl MemoryLifecycleMutation {
         history: Option<&str>,
         source: Option<&MemorySourceFence>,
     ) -> Result<(String, MemoryLifecycleReceipt, Option<MemoryCleanupPending>)> {
+        if self.legacy_adoption {
+            let original = history
+                .map(|history| Self::adopt_legacy_retirement(entry, history))
+                .transpose()?
+                .flatten();
+            if source.is_some() || original.as_ref() != Some(self) {
+                return Err(MemoryError::StaleSource);
+            }
+        }
         if (self.erase_body
             && (self.event.to != MemoryState::Archived
                 || self.mutation_id

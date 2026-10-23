@@ -585,6 +585,48 @@ impl MemoryStore for EphemeralMemoryStore {
         Ok(self.read()?.lifecycle_receipts.get(mutation_id).cloned())
     }
 
+    async fn legacy_lifecycle_page(
+        &self,
+        after_entry_id: Option<&str>,
+        limit: usize,
+    ) -> Result<MemoryLegacyLifecyclePage> {
+        if limit == 0 || limit > 256 {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        let state = self.read()?;
+        let mut remaining = crate::knowledge::KNOWLEDGE_READ_MAX_BYTES;
+        let mut page = MemoryLegacyLifecyclePage::default();
+        let mut scanned = 0;
+        for (id, entry) in state.entries.iter().filter(|(id, _)| {
+            after_entry_id.is_none_or(|after| id.as_str() > after)
+                && !state.source_fences.contains_key(&format!("memory:{id}"))
+        }) {
+            let Some(raw) = state.kv.get(&format!("memory_lifecycle:{id}")) else {
+                continue;
+            };
+            if entry.id.to_string() != *id {
+                return Err(MemoryError::StaleSource);
+            }
+            match reserved_source_bytes(&(entry, raw), remaining) {
+                Ok(bytes) => {
+                    remaining -= bytes;
+                    page.entries.push((entry.clone(), raw.clone()));
+                }
+                Err(MemoryError::SourceReadLimit) if page.entries.is_empty() => {
+                    page.unavailable_ids.push(id.clone());
+                }
+                Err(MemoryError::SourceReadLimit) => break,
+                Err(error) => return Err(error),
+            }
+            page.after_id = Some(id.clone());
+            scanned += 1;
+            if scanned == limit {
+                break;
+            }
+        }
+        Ok(page)
+    }
+
     async fn pending_memory_cleanup(
         &self,
         after_mutation: Option<&str>,

@@ -2633,6 +2633,56 @@ mod tests {
             store.pending_memory_cleanup(None, 16).await.unwrap().len(),
             1
         );
+        // A pre-fence retirement has no pending row for the old worker to
+        // discover. Reopen the manager and let the actual startup worker adopt
+        // it from the original body/history, without a test-side retry.
+        let legacy_id = manager
+            .orchestrator()
+            .write(
+                memory::MemoryLayer::L3,
+                memory::MemoryCategory::Reference,
+                "legacy source",
+                "retained legacy text",
+                memory::Priority::Normal,
+                memory::MemorySource::Import,
+                vec![],
+                memory::MemoryScope::Global,
+            )
+            .await
+            .unwrap();
+        let legacy_event = memory::MemoryLifecycleEvent {
+            memory_id: legacy_id,
+            from: None,
+            to: memory::MemoryState::Superseded,
+            reason: "legacy retirement".into(),
+            session_id: "original-session".into(),
+            agent_id: "original-agent".into(),
+            occurred_at: chrono::Utc::now(),
+        };
+        store
+            .kv_put(
+                &format!("memory_lifecycle:{legacy_id}"),
+                &serde_json::to_string(&vec![legacy_event]).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.pending_memory_cleanup(None, 16).await.unwrap().len(),
+            1
+        );
+        let old = Arc::downgrade(&manager);
+        drop(manager);
+        assert!(old.upgrade().is_none());
+        let manager = Arc::new(
+            CognitiveContextManager::new_with_selected_store(
+                config.clone(),
+                None,
+                None,
+                store.clone(),
+            )
+            .await
+            .unwrap(),
+        );
         let tasks = GatewayRuntimeTaskSet::new(Duration::from_secs(2));
         start_memory_governance_task(
             &tasks,
@@ -2654,6 +2704,14 @@ mod tests {
         })
         .await
         .expect("required cleanup cannot wait for optional startup delay");
+        let legacy_fence = memory::store::MemorySourceFenceReader::read_source_fence(
+            store.as_ref(),
+            &format!("memory:{legacy_id}"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(legacy_fence.retired);
+        assert_eq!(legacy_fence.delete_epoch, 1);
         let report = tasks.shutdown().await;
         assert_eq!(report.forced_aborts, 0);
         assert!(store.get(&id).await.unwrap().is_some());

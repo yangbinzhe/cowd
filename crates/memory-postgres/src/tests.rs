@@ -2946,3 +2946,160 @@ async fn real_postgres_auxiliary_production_filter_shares_one_bounded_source_fra
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_legacy_retirement_adopts_original_cut_after_reopen_without_a_second_epoch() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    let original = memory_entry(uuid::Uuid::from_u128(2), "legacy-retired");
+    let mut huge = memory_entry(uuid::Uuid::from_u128(1), "oversized-legacy");
+    huge.content = "x".repeat(memory::knowledge::KNOWLEDGE_READ_MAX_BYTES + 1);
+    let knowledge = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(knowledge.clone()).with_memory_sources(store.clone());
+    store.insert(&original).await.unwrap();
+    let mut doc = DocumentContent::new("legacy derived", "Original source material.");
+    doc.source = Some(format!("memory:{}", original.id));
+    doc.memory_source_revision = Some(MemoryEntryRevision::of(&original).unwrap());
+    let pack = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("snapshot-test".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            doc,
+        )
+        .unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: original.id,
+        from: None,
+        to: memory::MemoryState::Archived,
+        reason: "original pre-fence retirement".into(),
+        session_id: "legacy-session".into(),
+        agent_id: "legacy-actor".into(),
+        occurred_at: chrono::Utc::now(),
+    };
+    let raw = serde_json::to_string(&vec![event.clone()]).unwrap();
+    let key = format!("memory_lifecycle:{}", original.id);
+    store.kv_put(&key, &raw).await.unwrap();
+    store.insert(&huge).await.unwrap();
+    store
+        .kv_put(&format!("memory_lifecycle:{}", huge.id), "[]")
+        .await
+        .unwrap();
+    let page = store.legacy_lifecycle_page(None, 1).await.unwrap();
+    assert_eq!(page.after_id, Some(huge.id.to_string()));
+    assert_eq!(page.unavailable_ids, vec![huge.id.to_string()]);
+    assert!(page.entries.is_empty());
+    let next = store
+        .legacy_lifecycle_page(page.after_id.as_deref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(next.entries.len(), 1);
+    assert_eq!(next.entries[0].0.id, original.id);
+    let captured =
+        MemoryLifecycleMutation::adopt_legacy_retirement(&next.entries[0].0, &next.entries[0].1)
+            .unwrap()
+            .unwrap();
+    let mut changed = event;
+    changed.reason = "concurrent history edit".into();
+    store
+        .kv_put(&key, &serde_json::to_string(&vec![changed]).unwrap())
+        .await
+        .unwrap();
+    assert!(store.commit_lifecycle(captured.clone()).await.is_err());
+    assert!(store
+        .pending_memory_cleanup(None, 2)
+        .await
+        .unwrap()
+        .is_empty());
+    store.kv_put(&key, &raw).await.unwrap();
+    // Lose the complete old reader graph. Recovery gets no APP command or
+    // explicit register/adoption call; only the original persisted witnesses.
+    drop(fabric);
+    drop(knowledge);
+    drop(store);
+    drop(executor);
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(Arc::new(
+        PostgresKnowledgeStore::new(executor.clone()).unwrap(),
+    ))
+    .with_memory_sources(store.clone());
+    let root =
+        std::env::temp_dir().join(format!("cowd-legacy-retirement-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut config = memory::MemoryConfig::default();
+    config.store.blob_dir = root.join("blobs");
+    config.store.enable_vector_index = false;
+    config.governance.enabled = false;
+    let manager =
+        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+            .await
+            .unwrap();
+    // The oversized row is reported/held but cannot starve the next source.
+    let errors = manager.recover_memory_cleanup(&fabric, 1).await.unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains(&huge.id.to_string()));
+    assert!(store
+        .lifecycle_receipt(&captured.mutation_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(manager
+        .recover_memory_cleanup(&fabric, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    let receipt = store
+        .lifecycle_receipt(&captured.mutation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.source.delete_epoch, 1);
+    assert!(!receipt.body_erased);
+    assert!(store
+        .pending_memory_cleanup(None, 2)
+        .await
+        .unwrap()
+        .is_empty());
+    let retained = fabric
+        .snapshot()
+        .unwrap()
+        .packs
+        .into_iter()
+        .find(|p| p.pack_id == pack.pack.pack_id)
+        .unwrap();
+    assert_eq!(
+        retained.state,
+        harness_contract::knowledge::KnowledgeObjectState::Quarantined
+    );
+    assert_eq!(
+        store.get(&original.id).await.unwrap().unwrap().content,
+        original.content
+    );
+    for _ in 0..4 {
+        let _held = manager.recover_memory_cleanup(&fabric, 1).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .lifecycle_receipt(&captured.mutation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        store
+            .read_source_fence(&format!("memory:{}", original.id))
+            .unwrap()
+            .unwrap()
+            .delete_epoch,
+        1
+    );
+    assert_eq!(store.commit_lifecycle(captured).await.unwrap(), receipt);
+    drop(manager);
+    drop(fabric);
+    drop(store);
+    drop(executor);
+}

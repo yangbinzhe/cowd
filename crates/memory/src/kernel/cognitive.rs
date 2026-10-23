@@ -1973,7 +1973,39 @@ impl CognitiveContextManager {
         limit: usize,
     ) -> Result<Vec<String>> {
         const CURSOR: &str = "memory_cleanup:recovery_cursor";
+        const LEGACY_CURSOR: &str = "memory_cleanup:legacy_cursor";
         let store = self.orchestrator.store();
+        let mut errors = Vec::new();
+        let legacy_after = store.kv_get(LEGACY_CURSOR).await?.filter(|v| !v.is_empty());
+        let legacy = store
+            .legacy_lifecycle_page(legacy_after.as_deref(), limit)
+            .await;
+        match legacy {
+            Ok(page) => {
+                for id in page.unavailable_ids {
+                    errors.push(format!("Legacy Memory retirement {id}: source read limit"));
+                }
+                for (entry, history) in page.entries {
+                    let result =
+                        match crate::store::MemoryLifecycleMutation::adopt_legacy_retirement(
+                            &entry, &history,
+                        ) {
+                            Ok(Some(command)) => store.commit_lifecycle(command).await.map(|_| ()),
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
+                        };
+                    if let Err(error) = result {
+                        errors.push(format!("Legacy Memory retirement {}: {error}", entry.id));
+                    }
+                }
+                // A distinct scan cursor includes rejected/unmaterializable
+                // rows. They stay held and will be retried on the next sweep.
+                store
+                    .kv_put(LEGACY_CURSOR, page.after_id.as_deref().unwrap_or(""))
+                    .await?;
+            }
+            Err(error) => errors.push(format!("Legacy Memory retirement scan: {error}")),
+        }
         let after = store.kv_get(CURSOR).await?.filter(|v| !v.is_empty());
         let mut page = store
             .pending_memory_cleanup(after.as_deref(), limit)
@@ -1984,9 +2016,8 @@ impl CognitiveContextManager {
         }
         if page.is_empty() {
             store.kv_put(CURSOR, "").await?;
-            return Ok(Vec::new());
+            return Ok(errors);
         }
-        let mut errors = Vec::new();
         for pending in &page {
             let knowledge_receipt = if pending.knowledge_receipt_digest.is_some() {
                 // This is the original Memory owner's durable reference to an

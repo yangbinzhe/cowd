@@ -26,9 +26,10 @@ pub use mutation::{
     auxiliary_source_cuts, filter_auxiliary_snapshot, filter_auxiliary_source_frame,
     lifecycle_retired, live_source_revision, retire_auxiliary_support,
     source_frame_matches_original_lineage, source_root_is_current, validate_auxiliary_replacement,
-    MemoryCleanupPending, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation,
-    MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceAccess,
-    MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead, VerifiedMemoryRetirement,
+    MemoryCleanupPending, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLegacyLifecyclePage,
+    MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryRetirementVerificationError,
+    MemorySourceAccess, MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead,
+    VerifiedMemoryRetirement,
 };
 mod ephemeral;
 pub mod vector;
@@ -248,6 +249,15 @@ pub trait MemoryStore: MemorySourceFenceReader + Send + Sync {
     /// Read an immutable original receipt by its exact operation identity. This
     /// does not admit a mutation or rebind its original source cut.
     async fn lifecycle_receipt(&self, mutation_id: &str) -> Result<Option<MemoryLifecycleReceipt>>;
+    /// Bounded, read-only original bodies/history without a stored typed fence.
+    /// Ordered by body ID, with the aggregate bytes reserved before cloning.
+    /// Explicit recovery compiles these witnesses and uses commit_lifecycle;
+    /// this read never adopts a scope or writes a new source identity.
+    async fn legacy_lifecycle_page(
+        &self,
+        after_entry_id: Option<&str>,
+        limit: usize,
+    ) -> Result<MemoryLegacyLifecyclePage>;
     /// Bounded original pending obligations. Confirmations require exact identity/epoch.
     async fn pending_memory_cleanup(
         &self,

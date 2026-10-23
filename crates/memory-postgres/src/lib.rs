@@ -16,10 +16,10 @@ use memory::{
     store::{
         AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryCleanupPending,
         MemoryDiscoveryPage, MemoryDiscoveryQuery, MemoryEntryRevision, MemoryExtractionOrigin,
-        MemoryKeyValue, MemoryLayerAggregate, MemoryLifecycleMutation, MemoryLifecycleReceipt,
-        MemoryScanCursor, MemoryScanPage, MemorySourceFence, MemorySourceFenceReader, MemoryStore,
-        MemoryStoreAggregate, MemoryStoreCapabilities, Result as MemoryResult,
-        SymbolMemoryReference, TaggedLookup, VerbatimEntry,
+        MemoryKeyValue, MemoryLayerAggregate, MemoryLegacyLifecyclePage, MemoryLifecycleMutation,
+        MemoryLifecycleReceipt, MemoryScanCursor, MemoryScanPage, MemorySourceFence,
+        MemorySourceFenceReader, MemoryStore, MemoryStoreAggregate, MemoryStoreCapabilities,
+        Result as MemoryResult, SymbolMemoryReference, TaggedLookup, VerbatimEntry,
     },
     MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
     MaintenanceQueueBackend, MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer,
@@ -1010,6 +1010,59 @@ impl MemoryStore for PostgresMemoryStore {
             Ok(receipt)
         })
         .await
+    }
+
+    async fn legacy_lifecycle_page(
+        &self,
+        after_entry_id: Option<&str>,
+        limit: usize,
+    ) -> MemoryResult<MemoryLegacyLifecyclePage> {
+        if limit == 0 || limit > 256 {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        let store = self.clone();
+        let after = after_entry_id.map(str::to_owned);
+        run_memory_blocking(move || {
+            let mut connection = store.executor.checkout_online_read().map_err(storage_memory_error)?;
+            let budget = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES as i64;
+            // Reserve the complete page in SQL. Oversized individual sources
+            // expose identity/size only; later independent sources can progress.
+            let rows = connection.query(
+                "WITH candidates AS MATERIALIZED (
+                   SELECT e.id,e.scope_key,e.payload,k.value,
+                          (octet_length(e.id)::bigint+octet_length(e.scope_key)::bigint+octet_length(e.payload::text)::bigint+octet_length(k.value)::bigint) AS bytes
+                   FROM memory_entries e JOIN memory_kv k ON k.key='memory_lifecycle:'||e.id
+                   WHERE ($1::TEXT IS NULL OR e.id>$1)
+                     AND NOT EXISTS(SELECT 1 FROM memory_source_fences f WHERE f.source_ref='memory:'||e.id)
+                   ORDER BY e.id LIMIT $2
+                 ), reserved AS (
+                   SELECT *,(sum(CASE WHEN bytes<=$3 THEN bytes ELSE 0 END) OVER(ORDER BY id))::bigint AS used FROM candidates
+                 )
+                 SELECT id,bytes,used,
+                        CASE WHEN bytes<=$3 AND used<=$3 THEN payload END,
+                        CASE WHEN bytes<=$3 AND used<=$3 THEN value END,
+                        CASE WHEN bytes<=$3 AND used<=$3 THEN scope_key END
+                 FROM reserved ORDER BY id",
+                &[&after,&(limit as i64),&budget],
+            ).map_err(postgres_memory_error)?;
+            let mut page = MemoryLegacyLifecyclePage::default();
+            for row in rows {
+                let id: String = row.try_get(0).map_err(postgres_memory_error)?;
+                let bytes: i64 = row.try_get(1).map_err(postgres_memory_error)?;
+                let used: i64 = row.try_get(2).map_err(postgres_memory_error)?;
+                if bytes > budget {
+                    page.unavailable_ids.push(id.clone());
+                } else if used > budget {
+                    break;
+                } else {
+                    let entry = entry_from_json(row.try_get(3).map_err(postgres_memory_error)?)?;
+                    if entry.id.to_string() != id || entry.scope.scope_key() != row.try_get::<_,String>(5).map_err(postgres_memory_error)? { return Err(MemoryError::StaleSource); }
+                    page.entries.push((entry,row.try_get(4).map_err(postgres_memory_error)?));
+                }
+                page.after_id = Some(id);
+            }
+            Ok(page)
+        }).await
     }
 
     async fn pending_memory_cleanup(
