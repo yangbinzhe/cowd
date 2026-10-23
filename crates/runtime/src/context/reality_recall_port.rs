@@ -699,6 +699,8 @@ mod tests {
             },
             effective_capabilities: vec![AgentCapability::Read],
             skill_refs: Vec::new(),
+            skill_tool_pins: None,
+            skill_tool_refs: None,
             tool_contract_refs: Vec::new(),
             data_lease: harness_contract::agent::AgentDataLease {
                 session_id: "session:test".to_string(),

@@ -98,8 +98,9 @@ where
         .with_artifact_store(Arc::clone(services.artifact_store()))
         .with_skill_profiles(config.skill_profiles)
         .with_agent_skill_profile(config.agent_skill_profile)
-        .with_skill_prompt_assets(config.skill_prompt_assets)
         .with_skill_instruction_source(config.skill_instruction_source)
+        .with_skill_binding_pins(config.skill_binding_pins)
+        .with_skill_binding_tool_refs(config.skill_binding_tool_refs)
         .with_memory_identity(
             config.memory_agent_id,
             config.memory_definition_lineage_id,

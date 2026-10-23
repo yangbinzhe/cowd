@@ -286,6 +286,7 @@ pub enum SkillRevisionReviewAction {
     FirstInstall,
     Activate,
     Rollback,
+    Deactivate,
 }
 
 impl SkillRevisionReviewAction {
@@ -295,6 +296,7 @@ impl SkillRevisionReviewAction {
             Self::FirstInstall => "skill.revision.first_install",
             Self::Activate => "skill.revision.activate",
             Self::Rollback => "skill.revision.rollback",
+            Self::Deactivate => "skill.revision.deactivate",
         }
     }
 }
@@ -366,6 +368,53 @@ pub struct SkillActivePointer {
     pub approval_ref: String,
     pub activated_at_ms: u64,
     pub installation: Option<SkillInstallationEvidence>,
+    /// Missing historical state remains observable but cannot authorize a pin.
+    pub revoked: Option<bool>,
+    pub revocation_generation: Option<u64>,
+}
+
+/// A captured original approval, carried with the actual instruction packet.
+/// It is revalidated at the existing Provider dispatch fence, never a grant
+/// merely because it was cached or accepted by an instruction loader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillInstructionPin {
+    pub installation: SkillInstallationEvidence,
+    pub pointer_generation: u64,
+    pub revocation_generation: u64,
+    pub approval_ref: String,
+    pub skill_name: String,
+    pub instruction_sha256: String,
+    pub instruction_version: Option<String>,
+    pub tool_refs: Vec<String>,
+}
+
+fn skill_reference_matches(reference: &str, id: &str, name: &str, version: Option<&str>) -> bool {
+    reference.eq_ignore_ascii_case(id)
+        || reference.eq_ignore_ascii_case(name)
+        || version.is_some_and(|version| reference.eq_ignore_ascii_case(&format!("{id}@{version}")))
+}
+impl SkillCapabilityProfile {
+    #[must_use]
+    pub fn matches_reference(&self, reference: &str) -> bool {
+        skill_reference_matches(
+            reference,
+            &self.skill_id,
+            &self.name,
+            self.version.as_deref(),
+        )
+    }
+}
+impl SkillInstructionPin {
+    #[must_use]
+    pub fn matches_reference(&self, reference: &str) -> bool {
+        skill_reference_matches(
+            reference,
+            &self.installation.skill_id,
+            &self.skill_name,
+            self.instruction_version.as_deref(),
+        )
+    }
 }
 
 #[cfg(test)]

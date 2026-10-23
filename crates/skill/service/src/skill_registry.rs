@@ -335,7 +335,7 @@ fn list_root_skills(root: &SkillRegistryRoot) -> std::io::Result<Vec<SkillInfo>>
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?
             .into_iter()
-            .map(|entry| skill_info_from_path(root, &entry.prompt_path, || entry.pointer.skill_id))
+            .map(|entry| skill_info_from_path(root, &entry.prompt_path, || entry.receipt.skill_id))
             .collect();
     }
     let mut skills = Vec::new();

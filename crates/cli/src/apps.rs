@@ -65,6 +65,29 @@ impl AppsCliError {
     }
 }
 
+/// Shared authenticated Gateway transport, including the existing CLI surface
+/// selector. Skill management does not open another local activation store.
+pub(super) fn skill_request(
+    method: reqwest::Method,
+    segments: &[&str],
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let gateway = GatewayAppsClient::from_environment();
+    let client = gateway.client.as_ref().map_err(Clone::clone)?;
+    let mut url = reqwest::Url::parse(&gateway.base_url).map_err(|e| e.to_string())?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| "Gateway URL cannot hold path segments")?;
+        path.clear().extend(segments.iter().copied());
+    }
+    let mut request = client.request(method, url);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    gateway.execute(request).map_err(|e| e.to_string())
+}
+
 trait AppsApi {
     fn get(&self, path: &str) -> Result<serde_json::Value, AppsCliError>;
     fn post(&self, path: &str) -> Result<serde_json::Value, AppsCliError>;

@@ -746,7 +746,7 @@ fn generalized_paired_write_skill_isolation() {
             replay_manifest: None,
         }
     };
-    let catalog = crate::RuntimeSkillCatalog::new(Vec::new(), Vec::new());
+    let catalog = crate::RuntimeSkillCatalog::new(Vec::new());
     let shared_write = validate_evolution_scenario_isolation(
         &scenario(vec!["write:shared-output".to_string()], Vec::new()),
         None,
@@ -1239,8 +1239,8 @@ fn concurrent_task_terminal_observation_replays_the_committed_receipt() {
     );
 }
 
-#[test]
-fn runtime_skill_catalog_is_available_to_delegated_execution_services() {
+#[tokio::test]
+async fn runtime_skill_catalog_is_available_to_delegated_execution_services() {
     let services = RuntimeServices::in_memory().expect("in-memory runtime services");
     let profile = SkillCapabilityProfile {
         skill_id: "delegated-review".to_string(),
@@ -1256,23 +1256,50 @@ fn runtime_skill_catalog_is_available_to_delegated_execution_services() {
         inspection_summary: vec!["review source changes".to_string()],
         structured_dependencies: Vec::new(),
     };
-    services.replace_skill_catalog(crate::RuntimeSkillCatalog::new(
+    services.replace_skill_catalog(crate::skill::test_support::catalog(
         vec![profile],
         vec![crate::RuntimeSkillPromptAsset {
             skill_id: "delegated-review".to_string(),
             version: Some("1.0.0".to_string()),
             content: "Review evidence before returning.".to_string(),
+            pin: crate::skill::test_support::pin(
+                "delegated-review",
+                Some("1.0.0"),
+                "Review evidence before returning.",
+                &[],
+            ),
             source_ref: "skill://delegated-review/SKILL.md".to_string(),
             tool_refs: Vec::new(),
         }],
     ));
 
     let catalog = services.skill_catalog();
-    assert_eq!(catalog.profiles()[0].skill_id, "delegated-review");
-    assert_eq!(
-        catalog.prompt_assets()[0].source_ref,
-        "skill://delegated-review/SKILL.md"
-    );
+    assert_eq!(catalog.profiles().unwrap()[0].skill_id, "delegated-review");
+    let asset = catalog
+        .instruction_source()
+        .unwrap()
+        .load_instruction(
+            &crate::SkillInvocation {
+                skill_id: "delegated-review".into(),
+                skill_version: Some("1.0.0".into()),
+                adapter: SkillAdapterKind::PromptOnly,
+                entrypoint: None,
+            },
+            &crate::RuntimeSkillUsageContext {
+                workspace_identity: "workspace".into(),
+                workload_fingerprint: "workload".into(),
+                config_revision: "config".into(),
+                evaluation_environment: "test".into(),
+                execution_id: "execution".into(),
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                observed_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(asset.source_ref, "skill://delegated-review/SKILL.md");
 }
 
 struct TestExecutionHost;

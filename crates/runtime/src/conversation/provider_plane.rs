@@ -703,6 +703,65 @@ where
         request: &mut ApiRequest,
     ) -> Result<Option<Arc<crate::step_snapshot::BoundStep>>, RuntimeError> {
         let started = Instant::now();
+        let mut pins = request.prompt.skill_instruction_pins()?;
+        let mut tool_ids = self
+            .skill_exposed_tool_ids
+            .lock()
+            .map_err(|_| RuntimeError::new("Skill tool provenance is poisoned"))?
+            .clone();
+        tool_ids.extend(self.skill_binding_tool_refs.iter().cloned());
+        let definitions = self
+            .api_client
+            .step_tool_definitions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<BTreeSet<_>>();
+        let actual_tool_ids = tool_ids
+            .intersection(&definitions)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for (_, pin) in self
+            .skill_instruction_pins
+            .lock()
+            .map_err(|_| RuntimeError::new("Skill pin provenance is poisoned"))?
+            .values()
+        {
+            if pin
+                .tool_refs
+                .iter()
+                .any(|tool| actual_tool_ids.contains(tool))
+                && !pins.contains(pin)
+            {
+                pins.push(pin.clone());
+            }
+        }
+        for pin in &self.skill_binding_pins {
+            if pin
+                .tool_refs
+                .iter()
+                .any(|tool| actual_tool_ids.contains(tool))
+                && !pins.contains(pin)
+            {
+                pins.push(pin.clone());
+            }
+        }
+        if actual_tool_ids
+            .iter()
+            .any(|tool| !pins.iter().any(|pin| pin.tool_refs.contains(tool)))
+        {
+            return Err(RuntimeError::new(
+                "Skill-derived wire schema has no original pin",
+            ));
+        }
+        request.preparation.bind_skill_tool_refs(actual_tool_ids);
+        if !pins.is_empty() {
+            let source = self.skill_instruction_source.clone().ok_or_else(|| {
+                RuntimeError::new("Skill pins require the original approval source")
+            })?;
+            source.validate_pins(&pins).map_err(RuntimeError::new)?;
+            request.preparation.bind_skill_source(source, pins);
+        }
         let result = self.bind_provider_step_inner(request);
         crate::execution_core::performance::observe_duration(
             "request_step_binding_ms",
@@ -1923,7 +1982,21 @@ where
             .lock()
             .map(|tool_refs| tool_refs.clone())
             .unwrap_or_default();
+        if first_step {
+            self.skill_exposed_tool_ids
+                .lock()
+                .map_err(|_| RuntimeError::new("Skill tool provenance is poisoned"))?
+                .clear();
+        }
         if !active_skill_tool_refs.is_empty() {
+            // Pure exposure candidate only. bind_provider_step binds the
+            // actual surviving schema contribution to its original pins.
+            let prior = exposure
+                .bootstrap
+                .iter()
+                .chain(exposure.active.iter())
+                .cloned()
+                .collect::<BTreeSet<_>>();
             let mut skill_discovery = discovery.clone();
             skill_discovery.activation_candidates = active_skill_tool_refs.into_iter().collect();
             let allowed_ids = exposure
@@ -1939,6 +2012,16 @@ where
                 supports_dynamic_exposure: true,
             };
             let activation = ToolExposurePlanner.activate(&mut exposure, &skill_discovery, &policy);
+            let current = exposure
+                .bootstrap
+                .iter()
+                .chain(exposure.active.iter())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            self.skill_exposed_tool_ids
+                .lock()
+                .map_err(|_| RuntimeError::new("Skill tool provenance is poisoned"))?
+                .extend(current.difference(&prior).cloned());
             tracing::info!(
                 activated = ?activation.activated_ids().collect::<Vec<_>>(),
                 "runtime Skill tool references applied to the current provider request"

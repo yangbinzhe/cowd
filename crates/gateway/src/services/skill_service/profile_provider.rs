@@ -8,17 +8,18 @@ use std::{
 };
 
 use async_trait::async_trait;
+use harness_contract::skill::{SkillActivePointer, SkillInstallationEvidence, SkillInstructionPin};
 use harness_contract::skill::{
     SkillAdapterKind, SkillCapabilityProfile, SkillLifecycleStatus, SkillUsageKind,
 };
+use runtime::RuntimeSkillInstructionSource;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use skill::{profile_skill_catalog_entry, profile_skill_package, SkillInfo, SkillRegistry};
+use skill::{profile_skill_catalog_entry, SkillInfo, SkillRegistry};
 
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeSkillAssets {
     pub profiles: Vec<SkillCapabilityProfile>,
-    pub prompt_assets: Vec<runtime::RuntimeSkillPromptAsset>,
     pub instruction_source: Option<Arc<dyn runtime::RuntimeSkillInstructionSource>>,
 }
 
@@ -27,7 +28,6 @@ impl std::fmt::Debug for RuntimeSkillAssets {
         formatter
             .debug_struct("RuntimeSkillAssets")
             .field("profiles", &self.profiles.len())
-            .field("prompt_assets", &self.prompt_assets.len())
             .field("has_instruction_source", &self.instruction_source.is_some())
             .finish()
     }
@@ -37,6 +37,7 @@ impl std::fmt::Debug for RuntimeSkillAssets {
 pub(crate) struct WorkspaceSkillSnapshot {
     pub skills: Vec<SkillInfo>,
     pub assets: RuntimeSkillAssets,
+    pub discovery_error: Option<String>,
 }
 
 struct CachedWorkspaceSkillSnapshot {
@@ -87,21 +88,21 @@ pub(crate) fn workspace_skill_snapshot(workspace_root: &Path) -> Arc<WorkspaceSk
         return Arc::clone(&cached.snapshot);
     }
     let registry = SkillRegistry::discover(workspace_root);
-    let skills = registry.list().unwrap_or_else(|error| {
-        tracing::debug!(
-            %error,
-            workspace_root = %workspace_root.display(),
-            "skill snapshot discovery degraded"
-        );
-        Vec::new()
-    });
+    let (skills, discovery_error) = match registry.list() {
+        Ok(skills) => (skills, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     let assets = runtime_skill_assets_from_snapshot(
         workspace_root,
         &skills,
         Arc::clone(&cell.usage),
         Arc::clone(&cell.metrics),
     );
-    let snapshot = Arc::new(WorkspaceSkillSnapshot { skills, assets });
+    let snapshot = Arc::new(WorkspaceSkillSnapshot {
+        skills,
+        assets,
+        discovery_error,
+    });
     *current = Some(CachedWorkspaceSkillSnapshot {
         snapshot: Arc::clone(&snapshot),
     });
@@ -225,14 +226,6 @@ fn runtime_skill_assets_from_snapshot(
 const SKILL_INSTRUCTION_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-struct SkillInstructionDescriptor {
-    root: PathBuf,
-    profile: SkillCapabilityProfile,
-    inspected_profile: Arc<OnceLock<Result<SkillCapabilityProfile, String>>>,
-    inspection_flight: Arc<tokio::sync::Mutex<()>>,
-}
-
-#[derive(Debug, Clone)]
 struct CachedSkillInstruction {
     asset: runtime::RuntimeSkillPromptAsset,
     bytes: usize,
@@ -250,7 +243,6 @@ struct SkillInstructionCache {
 struct WorkspaceSkillInstructionSource {
     workspace_root: PathBuf,
     managed_store: Result<skill::ManagedSkillStore, String>,
-    descriptors: Arc<HashMap<String, SkillInstructionDescriptor>>,
     cache: Mutex<SkillInstructionCache>,
     flights: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     usage: Arc<RuntimeSkillUsageRelay>,
@@ -260,30 +252,14 @@ struct WorkspaceSkillInstructionSource {
 impl WorkspaceSkillInstructionSource {
     fn new(
         workspace_root: &Path,
-        profiles: &[SkillCapabilityProfile],
+        _profiles: &[SkillCapabilityProfile],
         usage: Arc<RuntimeSkillUsageRelay>,
         metrics: Arc<SkillInstructionCacheMetrics>,
     ) -> Self {
-        let descriptors = profiles
-            .iter()
-            .cloned()
-            .map(|profile| {
-                (
-                    profile.skill_id.clone(),
-                    SkillInstructionDescriptor {
-                        root: PathBuf::from(&profile.source_root),
-                        profile,
-                        inspected_profile: Arc::new(OnceLock::new()),
-                        inspection_flight: Arc::new(tokio::sync::Mutex::new(())),
-                    },
-                )
-            })
-            .collect();
         Self {
             workspace_root: workspace_root.to_path_buf(),
             managed_store: skill::ManagedSkillStore::default_for_user()
                 .map_err(|error| error.to_string()),
-            descriptors: Arc::new(descriptors),
             cache: Mutex::new(SkillInstructionCache::default()),
             flights: Mutex::new(HashMap::new()),
             usage,
@@ -291,17 +267,81 @@ impl WorkspaceSkillInstructionSource {
         }
     }
 
-    fn cache_key(descriptor: &SkillInstructionDescriptor, revision: &str) -> String {
-        format!(
-            "{}:{}:{}",
-            descriptor.profile.skill_id,
-            revision,
-            descriptor
-                .profile
-                .version
-                .as_deref()
-                .unwrap_or("unversioned")
-        )
+    fn pointer(&self, skill_id: &str) -> Result<SkillActivePointer, String> {
+        let pointer = self
+            .usage
+            .active_pointer(skill_id)?
+            .ok_or("Skill has no original human approval")?;
+        self.check_pointer(&pointer)?;
+        Ok(pointer)
+    }
+
+    fn check_pointer(&self, pointer: &SkillActivePointer) -> Result<(), String> {
+        let installation = pointer
+            .installation
+            .as_ref()
+            .ok_or("Skill installation authority is unavailable")?;
+        if pointer.revoked != Some(false)
+            || pointer.revocation_generation.is_none()
+            || pointer.generation == 0
+            || pointer.approval_ref.is_empty()
+            || installation.skill_id != pointer.skill_id
+            || installation.revision != pointer.active_revision
+            || installation.scope_ref != self.scope()?
+        {
+            return Err(
+                "Skill approval is revoked, unknown or belongs to a different installation".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn scope(&self) -> Result<String, String> {
+        let store = self.managed_store.as_ref().map_err(Clone::clone)?;
+        let workspace = configured_namespace_path(&self.workspace_root)?;
+        let root = configured_namespace_path(store.root())?;
+        let bytes = serde_json::to_vec(&("cowd.skill.installation.scope.v1", workspace, root))
+            .map_err(|e| e.to_string())?;
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
+    fn evidence(
+        &self,
+        receipt: &skill::SkillInstallReceiptV1,
+    ) -> Result<SkillInstallationEvidence, String> {
+        Ok(SkillInstallationEvidence {
+            scope_ref: self.scope()?,
+            skill_id: receipt.skill_id.clone(),
+            revision: receipt.revision.clone(),
+            receipt_id: receipt.install_id.clone(),
+            receipt_digest: format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(receipt).map_err(|e| e.to_string())?)
+            ),
+            inspection_fingerprint: receipt.plan_digest.clone(),
+        })
+    }
+
+    fn installed(&self, pointer: &SkillActivePointer) -> Result<skill::InstalledRevision, String> {
+        self.check_pointer(pointer)?;
+        let evidence = pointer
+            .installation
+            .as_ref()
+            .ok_or("Skill installation is unavailable")?;
+        let installed = self
+            .managed_store
+            .as_ref()
+            .map_err(Clone::clone)?
+            .resolve_installed(
+                &pointer.skill_id,
+                &pointer.active_revision,
+                &evidence.receipt_id,
+            )
+            .map_err(|e| e.to_string())?;
+        if self.evidence(&installed.receipt)? != *evidence {
+            return Err("Skill receipt changed after original approval".into());
+        }
+        Ok(installed)
     }
 
     fn cached(&self, key: &str) -> Option<runtime::RuntimeSkillPromptAsset> {
@@ -322,12 +362,28 @@ impl WorkspaceSkillInstructionSource {
     }
 
     fn insert(&self, key: String, asset: runtime::RuntimeSkillPromptAsset) {
-        let bytes = asset
-            .content
-            .len()
-            .saturating_add(asset.skill_id.len())
-            .saturating_add(asset.source_ref.len())
-            .saturating_add(asset.tool_refs.iter().map(String::len).sum::<usize>());
+        let pin = &asset.pin;
+        let installation = &pin.installation;
+        let bytes = std::mem::size_of::<CachedSkillInstruction>()
+            .saturating_add(key.capacity())
+            .saturating_add(asset.content.capacity())
+            .saturating_add(asset.skill_id.capacity())
+            .saturating_add(asset.source_ref.capacity())
+            .saturating_add(asset.version.as_ref().map_or(0, String::capacity))
+            .saturating_add(asset.tool_refs.capacity() * std::mem::size_of::<String>())
+            .saturating_add(asset.tool_refs.iter().map(String::capacity).sum::<usize>())
+            .saturating_add(pin.tool_refs.capacity() * std::mem::size_of::<String>())
+            .saturating_add(pin.tool_refs.iter().map(String::capacity).sum::<usize>())
+            .saturating_add(pin.instruction_version.as_ref().map_or(0, String::capacity))
+            .saturating_add(pin.approval_ref.capacity())
+            .saturating_add(pin.skill_name.capacity())
+            .saturating_add(pin.instruction_sha256.capacity())
+            .saturating_add(installation.scope_ref.capacity())
+            .saturating_add(installation.skill_id.capacity())
+            .saturating_add(installation.revision.capacity())
+            .saturating_add(installation.receipt_id.capacity())
+            .saturating_add(installation.receipt_digest.capacity())
+            .saturating_add(installation.inspection_fingerprint.capacity());
         if bytes > SKILL_INSTRUCTION_CACHE_MAX_BYTES {
             self.metrics.oversized.fetch_add(1, Ordering::Relaxed);
             return;
@@ -380,68 +436,179 @@ impl WorkspaceSkillInstructionSource {
         if let Some(flight) = flights.get(key).and_then(Weak::upgrade) {
             return flight;
         }
+        flights.retain(|_, flight| flight.strong_count() > 0);
         let flight = Arc::new(tokio::sync::Mutex::new(()));
         flights.insert(key.to_string(), Arc::downgrade(&flight));
         flight
-    }
-
-    async fn inspected_profile(
-        descriptor: &SkillInstructionDescriptor,
-    ) -> Result<SkillCapabilityProfile, String> {
-        if let Some(profile) = descriptor.inspected_profile.get() {
-            return profile.clone();
-        }
-        let _inspection = descriptor.inspection_flight.lock().await;
-        if let Some(profile) = descriptor.inspected_profile.get() {
-            return profile.clone();
-        }
-        let root = descriptor.root.clone();
-        let name = descriptor.profile.name.clone();
-        let version = descriptor.profile.version.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            profile_skill_package(&root, &name, version).map_err(|error| {
-                format!("failed to inspect Skill package before activation: {error}")
-            })
-        })
-        .await
-        .map_err(|error| format!("Skill package inspector failed: {error}"))?;
-        let _ = descriptor.inspected_profile.set(result.clone());
-        result
     }
 }
 
 #[async_trait]
 impl runtime::RuntimeSkillInstructionSource for WorkspaceSkillInstructionSource {
+    fn installation_scope(&self) -> Result<String, String> {
+        self.scope()
+    }
+
+    fn approved_profiles(&self) -> Result<Option<Vec<SkillCapabilityProfile>>, String> {
+        let store = self.managed_store.as_ref().map_err(Clone::clone)?;
+        let mut profiles = Vec::new();
+        for skill_id in store.installed_skill_ids().map_err(|e| e.to_string())? {
+            let Some(pointer) = self.usage.active_pointer(&skill_id)? else {
+                continue;
+            };
+            // Missing legacy authority is held. A source read error is never
+            // turned into an empty successful catalog.
+            if pointer.revoked != Some(false)
+                || pointer.revocation_generation.is_none()
+                || pointer.installation.is_none()
+            {
+                continue;
+            }
+            let evidence = pointer
+                .installation
+                .as_ref()
+                .ok_or("Skill installation is unavailable")?;
+            if evidence.skill_id != skill_id || evidence.revision != pointer.active_revision {
+                return Err("Skill catalog pointer identity mismatch".into());
+            }
+            if evidence.scope_ref != self.scope()? {
+                continue;
+            }
+            self.check_pointer(&pointer)?;
+            let entry = store
+                .installed_entry(&skill_id, &pointer.active_revision, &evidence.receipt_id)
+                .map_err(|e| e.to_string())?;
+            if self.evidence(&entry.receipt)? != *evidence {
+                return Err("approved Skill catalog receipt changed".into());
+            }
+            let profile = match entry.receipt.profile {
+                Some(mut profile) => {
+                    profile.source_root = entry.package_root.to_string_lossy().into_owned();
+                    profile
+                }
+                None => self.installed(&pointer)?.profile,
+            };
+            if profile.skill_id != skill_id
+                || profile.package_fingerprint != pointer.active_revision
+            {
+                return Err("Skill catalog identity mismatch".into());
+            }
+            profiles.push(profile);
+        }
+        Ok(Some(profiles))
+    }
+
+    fn required_tool_pins(&self, refs: &[String]) -> Result<Vec<SkillInstructionPin>, String> {
+        let profiles = self
+            .approved_profiles()?
+            .ok_or("approved Skill catalog is unavailable")?;
+        let mut pins = Vec::new();
+        for reference in refs {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.matches_reference(reference))
+                .ok_or("required Skill has no approved catalog entry")?;
+            let pointer = self.pointer(&profile.skill_id)?;
+            let asset = asset_from_installed(self.installed(&pointer)?, &pointer)?;
+            if !asset.pin.matches_reference(reference) {
+                return Err("Skill reference changed during admission".into());
+            }
+            if !pins.contains(&asset.pin) {
+                pins.push(asset.pin);
+            }
+        }
+        self.validate_pins(&pins)?;
+        Ok(pins)
+    }
+
     fn inspect_revision(
         &self,
         skill_id: &str,
         revision: &str,
         receipt_id: &str,
-    ) -> Result<harness_contract::skill::SkillInstallationEvidence, String> {
-        let store = self.managed_store.as_ref().map_err(Clone::clone)?;
-        let installed = store
+    ) -> Result<SkillInstallationEvidence, String> {
+        let installed = self
+            .managed_store
+            .as_ref()
+            .map_err(Clone::clone)?
             .resolve_installed(skill_id, revision, receipt_id)
-            .map_err(|error| error.to_string())?;
-        let workspace = self
-            .workspace_root
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
-        let store_root = store
-            .root()
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
-        let scope =
-            serde_json::to_vec(&("cowd.skill.installation.scope.v1", workspace, store_root))
-                .map_err(|error| error.to_string())?;
-        let receipt = serde_json::to_vec(&installed.receipt).map_err(|error| error.to_string())?;
-        Ok(harness_contract::skill::SkillInstallationEvidence {
-            scope_ref: format!("sha256:{:x}", Sha256::digest(scope)),
-            skill_id: installed.receipt.skill_id,
-            revision: installed.receipt.revision,
-            receipt_id: installed.receipt.install_id,
-            receipt_digest: format!("sha256:{:x}", Sha256::digest(receipt)),
-            inspection_fingerprint: installed.inspection_fingerprint,
-        })
+            .map_err(|e| e.to_string())?;
+        self.evidence(&installed.receipt)
+    }
+
+    fn validate_pins(&self, pins: &[SkillInstructionPin]) -> Result<(), String> {
+        for pin in pins {
+            let skill_id = &pin.installation.skill_id;
+            let original = self
+                .usage
+                .pointer_at_generation(skill_id, pin.pointer_generation)?
+                .ok_or("original Skill approval is unavailable")?;
+            self.check_pointer(&original)?;
+            if original.installation.as_ref() != Some(&pin.installation)
+                || original.approval_ref != pin.approval_ref
+                || original.revocation_generation != Some(pin.revocation_generation)
+            {
+                return Err("Skill pin does not authenticate to its original approval".into());
+            }
+            let current = self.pointer(skill_id)?;
+            if current.generation < original.generation
+                || current.revocation_generation != Some(pin.revocation_generation)
+            {
+                return Err("Skill pin was revoked".into());
+            }
+            let asset = asset_from_installed(self.installed(&original)?, &original)?;
+            if asset.pin != *pin {
+                return Err("Skill instruction bytes changed".into());
+            }
+            // Capture the native source again after package I/O. Upgrades may
+            // retain an approved immutable old pin; revocation never may.
+            let current = self.pointer(skill_id)?;
+            if current.revocation_generation != Some(pin.revocation_generation) {
+                return Err("Skill pin revoked during verification".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn profiles_for_pins(
+        &self,
+        pins: &[SkillInstructionPin],
+    ) -> Result<Vec<SkillCapabilityProfile>, String> {
+        self.validate_pins(pins)?;
+        pins.iter()
+            .map(|pin| {
+                let pointer = self
+                    .usage
+                    .pointer_at_generation(&pin.installation.skill_id, pin.pointer_generation)?
+                    .ok_or("original Skill approval is unavailable")?;
+                let installed = self.installed(&pointer)?;
+                let profile = installed.profile.clone();
+                if asset_from_installed(installed, &pointer)?.pin != *pin {
+                    return Err("original Skill profile pin mismatch".into());
+                }
+                Ok(profile)
+            })
+            .collect()
+    }
+
+    async fn load_pinned_instruction(
+        &self,
+        pin: &SkillInstructionPin,
+        invocation: &runtime::SkillInvocation,
+        usage_context: &runtime::RuntimeSkillUsageContext,
+    ) -> Result<Option<runtime::RuntimeSkillPromptAsset>, String> {
+        self.validate_pins(std::slice::from_ref(pin))?;
+        if pin.installation.skill_id != invocation.skill_id
+            || pin.instruction_version != invocation.skill_version
+        {
+            return Err("Skill invocation does not match its original Binding pin".into());
+        }
+        let pointer = self
+            .usage
+            .pointer_at_generation(&invocation.skill_id, pin.pointer_generation)?
+            .ok_or("original Skill approval is unavailable")?;
+        self.load_for_pointer(pointer, invocation, usage_context)
+            .await
     }
 
     async fn load_instruction(
@@ -449,161 +616,181 @@ impl runtime::RuntimeSkillInstructionSource for WorkspaceSkillInstructionSource 
         invocation: &runtime::SkillInvocation,
         usage_context: &runtime::RuntimeSkillUsageContext,
     ) -> Result<Option<runtime::RuntimeSkillPromptAsset>, String> {
-        let Some(descriptor) = self.descriptors.get(&invocation.skill_id).cloned() else {
-            return Ok(None);
-        };
-        let inspected = match Self::inspected_profile(&descriptor).await {
-            Ok(profile) => profile,
-            Err(error) => {
-                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
-                let unavailable_revision =
-                    format!("uninspectable:{}", descriptor.profile.package_fingerprint);
+        self.load_for_pointer(
+            self.pointer(&invocation.skill_id)?,
+            invocation,
+            usage_context,
+        )
+        .await
+    }
+}
+
+impl WorkspaceSkillInstructionSource {
+    async fn load_for_pointer(
+        &self,
+        pointer: SkillActivePointer,
+        invocation: &runtime::SkillInvocation,
+        usage_context: &runtime::RuntimeSkillUsageContext,
+    ) -> Result<Option<runtime::RuntimeSkillPromptAsset>, String> {
+        let key = format!(
+            "{}:{}:{}",
+            pointer.skill_id,
+            pointer.generation,
+            pointer
+                .revocation_generation
+                .ok_or("unknown Skill revocation epoch")?
+        );
+        let result = async {
+            let flight = self.flight(&key);
+            let _guard = flight.lock().await;
+            let asset = if let Some(asset) = self.cached(&key) {
                 self.usage.record(
                     invocation,
-                    &unavailable_revision,
+                    &pointer.active_revision,
                     usage_context,
-                    SkillUsageKind::Failure,
+                    SkillUsageKind::Hit,
                 );
-                return Err(error);
-            }
-        };
-        let revision = inspected.package_fingerprint.clone();
-        match self.usage.active_pointer(&invocation.skill_id) {
-            Ok(Some(pointer)) if pointer.active_revision != revision => {
-                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+                asset
+            } else {
+                self.metrics.misses.fetch_add(1, Ordering::Relaxed);
                 self.usage.record(
                     invocation,
-                    &revision,
+                    &pointer.active_revision,
                     usage_context,
-                    SkillUsageKind::Failure,
+                    SkillUsageKind::Miss,
                 );
-                return Err(format!(
-                    "Skill {} revision {} is not the approved active revision {}",
-                    invocation.skill_id, revision, pointer.active_revision
-                ));
-            }
-            Err(error) => {
-                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+                let installed = self.installed(&pointer)?;
+                let asset = asset_from_installed(installed, &pointer)?;
+                self.metrics.loads.fetch_add(1, Ordering::Relaxed);
                 self.usage.record(
                     invocation,
-                    &revision,
+                    &pointer.active_revision,
                     usage_context,
-                    SkillUsageKind::Failure,
+                    SkillUsageKind::Load,
                 );
-                return Err(format!(
-                    "Skill {} active revision could not be verified: {error}",
-                    invocation.skill_id
-                ));
+                asset
+            };
+            if asset.skill_id != invocation.skill_id || asset.version != invocation.skill_version {
+                return Err("selected Skill instruction identity/version changed".into());
             }
-            Ok(Some(_)) | Ok(None) => {}
-        }
-        let key = Self::cache_key(&descriptor, &revision);
-        if let Some(asset) = self.cached(&key) {
-            self.usage
-                .record(invocation, &revision, usage_context, SkillUsageKind::Hit);
-            return Ok(Some(asset));
-        }
-        self.metrics.misses.fetch_add(1, Ordering::Relaxed);
-        self.usage
-            .record(invocation, &revision, usage_context, SkillUsageKind::Miss);
-        let flight = self.flight(&key);
-        let _guard = flight.lock().await;
-        if let Some(asset) = self.cached(&key) {
-            self.usage
-                .record(invocation, &revision, usage_context, SkillUsageKind::Hit);
-            return Ok(Some(asset));
-        }
-        let root = descriptor.root.clone();
-        let loaded =
-            tokio::task::spawn_blocking(move || load_prompt_asset(&root, &inspected)).await;
-        let asset = match loaded {
-            Ok(Ok(asset)) => asset,
-            Ok(Err(error)) => {
-                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
-                self.usage.record(
-                    invocation,
-                    &revision,
-                    usage_context,
-                    SkillUsageKind::Failure,
-                );
-                return Err(error);
-            }
-            Err(error) => {
-                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
-                self.usage.record(
-                    invocation,
-                    &revision,
-                    usage_context,
-                    SkillUsageKind::Failure,
-                );
-                return Err(format!("Skill instruction loader failed: {error}"));
-            }
-        };
-        if let Some(asset) = asset.as_ref() {
+            self.validate_pins(std::slice::from_ref(&asset.pin))?;
             self.insert(key, asset.clone());
-            self.metrics.loads.fetch_add(1, Ordering::Relaxed);
-            self.usage
-                .record(invocation, &revision, usage_context, SkillUsageKind::Load);
+            Ok(Some(asset))
         }
-        Ok(asset)
+        .await;
+        if result.is_err() {
+            self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+            self.usage.record(
+                invocation,
+                &pointer.active_revision,
+                usage_context,
+                SkillUsageKind::Failure,
+            );
+        }
+        result
     }
 }
 
-fn load_prompt_asset(
-    root: &Path,
-    profile: &SkillCapabilityProfile,
-) -> Result<Option<runtime::RuntimeSkillPromptAsset>, String> {
-    if profile.lifecycle_status == SkillLifecycleStatus::Blocked {
-        return Err(format!(
-            "Skill {} is blocked by package inspection: {}",
-            profile.skill_id,
-            profile.inspection_summary.join(", ")
-        ));
+// Namespace identity is configured, not inferred from retained body existence.
+// Existing ancestors resolve normally; dangling symlinks and read errors hold.
+fn configured_namespace_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err("Skill namespace has a dangling symlink".into())
+                    }
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                    _ => {}
+                }
+                let component = ancestor
+                    .file_name()
+                    .ok_or_else(|| error.to_string())?
+                    .to_os_string();
+                missing.push(component);
+                ancestor = ancestor.parent().ok_or_else(|| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
-    if !profile.adapters.contains(&SkillAdapterKind::PromptOnly) {
-        return Ok(None);
-    }
-    Ok(prompt_asset_for_profile(root, profile))
 }
 
-fn prompt_asset_for_profile(
-    root: &Path,
-    profile: &SkillCapabilityProfile,
-) -> Option<runtime::RuntimeSkillPromptAsset> {
+fn instruction_tool_refs(skill_id: &str) -> Vec<String> {
+    if skill_id.starts_with("lark-") {
+        vec!["lark_cli_read".into(), "lark_cli_write".into()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn asset_from_installed(
+    installed: skill::InstalledRevision,
+    pointer: &SkillActivePointer,
+) -> Result<runtime::RuntimeSkillPromptAsset, String> {
+    let profile = &installed.profile;
+    if profile.lifecycle_status == SkillLifecycleStatus::Blocked
+        || !profile.adapters.contains(&SkillAdapterKind::PromptOnly)
+    {
+        return Err("Skill package has no admitted PromptOnly instruction".into());
+    }
     let entrypoint = profile
         .entrypoints
         .iter()
-        .find(|entrypoint| entrypoint.adapter == SkillAdapterKind::PromptOnly)?;
-    let root = root.canonicalize().ok()?;
-    let path = root.join(&entrypoint.path).canonicalize().ok()?;
-    if !path.starts_with(&root) || !path.is_file() {
-        tracing::warn!(
-            skill = %profile.skill_id,
-            path = %path.display(),
-            "runtime skill prompt asset escaped package root or is not a file"
-        );
-        return None;
-    }
-    let content = std::fs::read_to_string(&path).ok()?;
-    let (content, tool_refs) = if profile.skill_id.starts_with("lark-") {
-        (
-            format!(
+        .find(|entry| entry.adapter == SkillAdapterKind::PromptOnly && entry.path == "SKILL.md")
+        .ok_or("installed Skill prompt entrypoint is unavailable")?;
+    let content = installed.prompt;
+    let tool_refs = instruction_tool_refs(&profile.skill_id);
+    let content = if profile.skill_id.starts_with("lark-") {
+        format!(
                 "# Cowd Lark execution bridge\n\nUse this Skill only when the current user request is explicitly about Feishu/Lark operations (messaging, docs, sheets, slides, tasks, calendar, or contacts). For any other task, ignore this Skill and use normal workspace tools. When used, call `lark_cli_read` for reads and `lark_cli_write` for mutations; pass only argv entries after `lark-cli`. Never use Bash to locate credentials, never ask the user to repeat configured app credentials, and never run CLI auth/config/profile/update commands. The gateway supplies a short-lived bot token, enforces the official CLI risk class, and applies Cowd approval policy. If an operation requires user identity rather than bot identity, explain that boundary instead of silently changing identity.\n\n{content}"
-            ),
-            vec!["lark_cli_read".to_string(), "lark_cli_write".to_string()],
-        )
+            )
     } else {
-        (content, Vec::new())
+        content
     };
     if content.trim().is_empty() {
-        return None;
+        return Err("Skill instruction is empty".into());
     }
-    Some(runtime::RuntimeSkillPromptAsset {
+    let pin = SkillInstructionPin {
+        installation: pointer
+            .installation
+            .clone()
+            .ok_or("Skill installation is unavailable")?,
+        pointer_generation: pointer.generation,
+        revocation_generation: pointer
+            .revocation_generation
+            .ok_or("unknown Skill revocation epoch")?,
+        approval_ref: pointer.approval_ref.clone(),
+        skill_name: profile.name.clone(),
+        instruction_sha256: format!("sha256:{:x}", Sha256::digest(content.as_bytes())),
+        instruction_version: profile.version.clone(),
+        tool_refs: tool_refs.clone(),
+    };
+    Ok(runtime::RuntimeSkillPromptAsset {
         skill_id: profile.skill_id.clone(),
         version: profile.version.clone(),
         content,
-        source_ref: format!("skill://{}/{}", profile.skill_id, entrypoint.path),
+        source_ref: format!(
+            "skill://{}/{}@{}",
+            profile.skill_id, entrypoint.path, pointer.active_revision
+        ),
         tool_refs,
+        pin,
     })
 }
 
@@ -675,7 +862,21 @@ impl RuntimeSkillUsageRelay {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .cloned();
-        sink.map_or(Ok(None), |sink| sink.active_pointer(skill_id))
+        sink.ok_or("Skill pointer source is not attached")?
+            .active_pointer(skill_id)
+    }
+    fn pointer_at_generation(
+        &self,
+        skill_id: &str,
+        generation: u64,
+    ) -> Result<Option<SkillActivePointer>, String> {
+        let sink = self
+            .sink
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or("Skill pointer source is not attached")?;
+        sink.pointer_at_generation(skill_id, generation)
     }
 }
 
@@ -729,321 +930,686 @@ impl SkillInstructionCacheMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::skill::{SkillActivePointer, SkillAdapterKind};
-    use std::time::{Duration, Instant};
+    use harness_contract::skill::{SkillRevisionReview, SkillRevisionReviewDecision};
+    use runtime::{RuntimeSkillInstructionSource, RuntimeSkillUsageSink};
+    use std::time::Duration;
 
     struct TempWorkspace {
-        root: std::path::PathBuf,
+        root: PathBuf,
     }
-
     impl TempWorkspace {
         fn new(label: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "cowd-runtime-skill-{label}-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&root).expect("temp workspace should be created");
+            let root =
+                std::env::temp_dir().join(format!("cowd-skill-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
             Self { root }
         }
     }
-
+    fn remove_owned_tree(path: &Path) {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(if metadata.is_dir() { 0o700 } else { 0o600 }),
+            );
+        }
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    remove_owned_tree(&entry.path());
+                }
+            }
+            let _ = std::fs::remove_dir(path);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
     impl Drop for TempWorkspace {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            remove_owned_tree(&self.root);
         }
     }
 
     fn usage_context(label: &str) -> runtime::RuntimeSkillUsageContext {
         runtime::RuntimeSkillUsageContext {
-            workspace_identity: "workspace".to_string(),
+            workspace_identity: "workspace".into(),
             workload_fingerprint: format!("workload:{label}"),
-            config_revision: "config".to_string(),
-            evaluation_environment: "test".to_string(),
+            config_revision: "config".into(),
+            evaluation_environment: "test".into(),
             execution_id: format!("execution:{label}"),
-            session_id: "session".to_string(),
+            session_id: "session".into(),
             turn_id: format!("turn:{label}"),
             observed_at_ms: 1,
         }
     }
 
-    struct FixedPointerSink {
-        pointer: SkillActivePointer,
+    struct Fixture {
+        temp: TempWorkspace,
+        source: Arc<WorkspaceSkillInstructionSource>,
+        store: Arc<runtime::RuntimeEventStore>,
+        recorder: Arc<runtime::RuntimeSkillUsageRecorder>,
+        governance: runtime::SkillRevisionGovernanceService,
+        principal: runtime::VerifiedPrincipal,
+        verifier: runtime::PrincipalVerifier,
     }
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let temp = TempWorkspace::new(label);
+            let store = Arc::new(runtime::RuntimeEventStore::for_test());
+            let recorder =
+                Arc::new(runtime::RuntimeSkillUsageRecorder::new(store.clone()).unwrap());
+            let relay = Arc::new(RuntimeSkillUsageRelay::default());
+            relay.attach(recorder.clone());
+            let managed = skill::ManagedSkillStore::new(temp.root.join("installed"));
+            let mut source = WorkspaceSkillInstructionSource::new(
+                &temp.root,
+                &[],
+                relay,
+                Arc::new(SkillInstructionCacheMetrics::default()),
+            );
+            source.managed_store = Ok(managed);
+            let source = Arc::new(source);
+            let catalog =
+                runtime::RuntimeSkillCatalog::default().with_instruction_source(source.clone());
+            let governance = runtime::SkillRevisionGovernanceService::new(
+                store.clone(),
+                Arc::new(runtime::ApprovalQueue::new(store.clone())),
+                Arc::new(RwLock::new(catalog)),
+            );
+            let (signed, public_key) = auth_broker::test_support::issue_human_principal(
+                temp.root.join("authority"),
+                "test-local-human",
+                vec!["skill.revision.manage".into()],
+                None,
+            )
+            .unwrap();
+            let verifier =
+                runtime::PrincipalVerifier::from_base64(&signed.key_id, &public_key).unwrap();
+            let principal = verifier.verify(&signed).unwrap();
+            Self {
+                temp,
+                source,
+                store,
+                recorder,
+                governance,
+                principal,
+                verifier,
+            }
+        }
+        fn stage(&self, name: &str, version: &str, body: &str) -> skill::SkillInstallReceiptV1 {
+            let path = self.temp.root.join("package");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("SKILL.md"), format!("---\nname: {name}\nversion: {version}\ndescription: Review evidence.\n---\n{body}\n")).unwrap();
+            let managed = self.source.managed_store.as_ref().unwrap().clone();
+            let workspace = self.temp.root.clone();
+            std::thread::spawn(move || {
+                let lifecycle = skill::SkillLifecycle::new(managed).unwrap();
+                let plan = lifecycle.plan(path.to_str().unwrap(), &workspace).unwrap();
+                lifecycle
+                    .commit(
+                        path.to_str().unwrap(),
+                        &workspace,
+                        &plan.package_digest,
+                        false,
+                        "human:test-stage",
+                    )
+                    .unwrap()
+            })
+            .join()
+            .expect("bounded installer fixture thread")
+        }
 
-    impl runtime::RuntimeSkillUsageSink for FixedPointerSink {
-        fn observe(
+        fn approve(&self, review: &SkillRevisionReview) -> SkillActivePointer {
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 60_000;
+            let (signed, _) = auth_broker::test_support::issue_decision_lease_for_capabilities(
+                self.temp.root.join("authority"),
+                "test-local-human",
+                vec!["skill.revision.manage".into()],
+                &review.review_id,
+                review.action.action_key(),
+                review.scope_ref(),
+                &review.evidence_digest,
+                expires,
+            )
+            .unwrap();
+            let lease = self
+                .verifier
+                .verify_decision_lease(
+                    &signed,
+                    &self.principal,
+                    &runtime::DecisionLeaseExpectation::new(
+                        &review.review_id,
+                        review.action.action_key(),
+                        review.scope_ref(),
+                        &review.evidence_digest,
+                    ),
+                )
+                .unwrap();
+            self.governance
+                .decide_review(
+                    &self.principal,
+                    &lease,
+                    &review.review_id,
+                    SkillRevisionReviewDecision::Approve,
+                    "explicit human decision",
+                )
+                .unwrap()
+                .unwrap()
+        }
+        fn first(
             &self,
-            _invocation: &runtime::SkillInvocation,
-            _skill_revision: &str,
-            _context: &runtime::RuntimeSkillUsageContext,
-            _usage: SkillUsageKind,
-        ) -> Option<String> {
-            None
+            receipt: &skill::SkillInstallReceiptV1,
+            request: &str,
+        ) -> SkillActivePointer {
+            let review = self
+                .governance
+                .request_first_install(
+                    &self.principal,
+                    request,
+                    &receipt.skill_id,
+                    &receipt.revision,
+                    &receipt.install_id,
+                )
+                .unwrap();
+            self.approve(&review)
         }
-
-        fn health(&self) -> runtime::RuntimeSkillUsageSinkHealth {
-            runtime::RuntimeSkillUsageSinkHealth::default()
+        fn upgrade(&self, receipt: &skill::SkillInstallReceiptV1) -> SkillActivePointer {
+            // Independent closed draft inputs at this domain seam. The
+            // original maintenance projector/receipt chain has its own gates;
+            // this reader test does not claim to exercise that worker.
+            let current = self.governance.pointer(&receipt.skill_id).unwrap().unwrap();
+            let draft: harness_contract::skill::SkillMaintenanceDraft = serde_json::from_value(serde_json::json!({
+                "draft_id":"maintenance", "skill_id":receipt.skill_id, "base_revision":current.active_revision, "proposed_revision":receipt.revision,
+                "workspace_identity":"workspace", "workload_fingerprint":"workload", "config_revision":"config", "evaluation_environment":"test",
+                "canonical_counts":{"hits":0,"misses":0,"loads":0,"failures":1}, "legacy_counts":{"hits":0,"misses":0,"loads":0,"failures":0},
+                "evidence_receipt_ids":["original-usage"], "outcome_refs":["outcome:execution"], "evidence_digest":"closed-original-evidence", "target":"new revision", "recommendation":"revise",
+                "validation":{"receipt_schema_valid":true,"evidence_closed":true,"outcome_association_count":1,"verified_success_count":0,"terminal_failure_count":1,"missing_outcome_count":0,"notes":[]}, "created_at_ms":1,"schema_version":1
+            })).unwrap();
+            let review = self
+                .governance
+                .request_activation(
+                    &self.principal,
+                    "maintenance",
+                    &draft,
+                    &receipt.revision,
+                    &receipt.install_id,
+                )
+                .unwrap();
+            self.approve(&review)
         }
-
-        fn active_pointer(&self, _skill_id: &str) -> Result<Option<SkillActivePointer>, String> {
-            Ok(Some(self.pointer.clone()))
+        fn invocation(
+            receipt: &skill::SkillInstallReceiptV1,
+            version: &str,
+        ) -> runtime::SkillInvocation {
+            runtime::SkillInvocation {
+                skill_id: receipt.skill_id.clone(),
+                skill_version: Some(version.into()),
+                adapter: SkillAdapterKind::PromptOnly,
+                entrypoint: None,
+            }
+        }
+        async fn close(&self) {
+            let report = self
+                .recorder
+                .shutdown_and_drain(Duration::from_secs(2))
+                .await;
+            assert!(report.clean, "{report:?}");
         }
     }
 
-    struct UnavailablePointerSink;
-
-    impl runtime::RuntimeSkillUsageSink for UnavailablePointerSink {
-        fn observe(
-            &self,
-            _invocation: &runtime::SkillInvocation,
-            _skill_revision: &str,
-            _context: &runtime::RuntimeSkillUsageContext,
-            _usage: SkillUsageKind,
-        ) -> Option<String> {
-            None
-        }
-
-        fn health(&self) -> runtime::RuntimeSkillUsageSinkHealth {
-            runtime::RuntimeSkillUsageSinkHealth::default()
-        }
-
-        fn active_pointer(&self, _skill_id: &str) -> Result<Option<SkillActivePointer>, String> {
-            Err("pointer store unavailable".to_string())
-        }
-    }
-
-    #[test]
-    fn runtime_skill_profile_provider_uses_workspace_registry() {
-        let temp = TempWorkspace::new("profile-provider");
-        let skill_root = temp
-            .root
-            .join(".cowd")
-            .join("skills")
-            .join("release-review");
-        std::fs::create_dir_all(&skill_root).expect("skill root should be created");
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Release Review\ndescription: Review release plans.\ntags: [release, review]\n---\n\nReview release evidence.",
-        )
-        .expect("skill should be written");
-
-        let profiles = runtime_skill_profiles_for_workspace(&temp.root);
-
-        let profile = profiles
+    #[tokio::test]
+    async fn stage_first_human_approval_exact_page_in_and_durable_usage() {
+        let fixture = Fixture::new("bootstrap");
+        let receipt = fixture.stage("Review", "1.0.0", "ORIGINAL_FULL_APPROVED_BYTES");
+        let invocation = Fixture::invocation(&receipt, "1.0.0");
+        assert!(fixture.governance.pointer("review").unwrap().is_none());
+        assert!(!fixture
+            .source
+            .managed_store
+            .as_ref()
+            .unwrap()
+            .root()
+            .join("review/active.json")
+            .exists());
+        assert!(fixture
+            .source
+            .approved_profiles()
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .source
+            .load_instruction(&invocation, &usage_context("unapproved"))
+            .await
+            .is_err());
+        let pointer = fixture.first(&receipt, "first");
+        assert_eq!(
+            (
+                pointer.generation,
+                pointer.revocation_generation,
+                pointer.revoked
+            ),
+            (1, Some(0), Some(false))
+        );
+        let profiles = fixture.source.approved_profiles().unwrap().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].package_fingerprint, receipt.revision);
+        let asset = fixture
+            .source
+            .load_instruction(&invocation, &usage_context("load"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.content, "---\nname: Review\nversion: 1.0.0\ndescription: Review evidence.\n---\nORIGINAL_FULL_APPROVED_BYTES\n");
+        assert_eq!(asset.pin.pointer_generation, 1);
+        let cached = fixture
+            .source
+            .load_instruction(&invocation, &usage_context("hit"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached, asset);
+        let replay = fixture
+            .governance
+            .request_first_install(
+                &fixture.principal,
+                "first",
+                "review",
+                &receipt.revision,
+                &receipt.install_id,
+            )
+            .unwrap();
+        assert_eq!(
+            replay.status,
+            harness_contract::skill::SkillRevisionReviewStatus::Approved
+        );
+        assert!(fixture
+            .governance
+            .request_first_install(
+                &fixture.principal,
+                "foreign-first",
+                "review",
+                &receipt.revision,
+                &receipt.install_id
+            )
+            .is_err());
+        fixture.close().await;
+        let receipts = fixture
+            .store
+            .list_scope(runtime::RuntimeEventScope::Skill, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == runtime::SKILL_USAGE_RECEIPT_EVENT_KIND)
+            .collect::<Vec<_>>();
+        assert!(receipts
             .iter()
-            .find(|profile| profile.skill_id == "release-review")
-            .expect("workspace skill profile should be discovered");
-        assert_eq!(profile.name, "Release Review");
-        assert!(profile.adapters.contains(&SkillAdapterKind::PromptOnly));
-        assert!(profile
-            .entrypoints
-            .iter()
-            .any(|entrypoint| entrypoint.path == "SKILL.md"));
+            .any(|event| event.payload["receipt"]["skill_revision"] == receipt.revision));
+        assert!(fixture.source.metrics.health().hits > 0);
+        assert!(fixture.recorder.health().persisted > 0);
     }
 
     #[tokio::test]
-    async fn runtime_skill_assets_page_in_selected_prompt_only_instruction() {
-        let temp = TempWorkspace::new("prompt-assets");
-        let skill_root = temp
-            .root
-            .join(".cowd")
-            .join("skills")
-            .join("release-review");
-        std::fs::create_dir_all(&skill_root).expect("skill root should be created");
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Release Review\ndescription: Review release plans.\n---\n\n# Release\nRequire explicit evidence.",
-        )
-        .expect("skill should be written");
-
-        let assets = runtime_skill_assets_for_workspace(&temp.root);
-
-        assert!(assets
-            .profiles
-            .iter()
-            .any(|profile| profile.skill_id == "release-review"));
-        assert!(
-            assets.prompt_assets.is_empty(),
-            "cold Skill Markdown must not be resident in the catalog"
-        );
-        let source = assets
-            .instruction_source
-            .expect("workspace Skill source must be available");
-        let invocation = runtime::SkillInvocation {
-            skill_id: "release-review".to_string(),
-            skill_version: None,
-            adapter: SkillAdapterKind::PromptOnly,
-            entrypoint: None,
-        };
-        let asset = source
-            .load_instruction(&invocation, &usage_context("first"))
+    async fn ordinary_upgrade_keeps_original_pin_but_revocation_fences_cache_and_old_instructions()
+    {
+        let fixture = Fixture::new("revoke");
+        let old = fixture.stage("Review", "1.0.0", "OLD_IMMUTABLE_BODY");
+        fixture.first(&old, "first");
+        let old_asset = fixture
+            .source
+            .load_instruction(&Fixture::invocation(&old, "1.0.0"), &usage_context("old"))
             .await
-            .expect("instruction page-in")
-            .expect("prompt asset");
-        assert!(asset.content.contains("Require explicit evidence."));
-        assert!(asset.tool_refs.is_empty());
-
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Release Review\ndescription: Review release plans.\n---\n\n# Changed\nNew generation.",
-        )
-        .expect("Skill update");
-        let pinned = source
-            .load_instruction(&invocation, &usage_context("pinned"))
+            .unwrap()
+            .unwrap();
+        let new = fixture.stage("Review", "2.0.0", "NEW_APPROVED_BODY");
+        fixture.upgrade(&new);
+        fixture
+            .source
+            .validate_pins(std::slice::from_ref(&old_asset.pin))
+            .unwrap();
+        let new_asset = fixture
+            .source
+            .load_instruction(&Fixture::invocation(&new, "2.0.0"), &usage_context("new"))
             .await
-            .expect("pinned generation page-in")
-            .expect("pinned asset");
-        assert!(
-            pinned.content.contains("Require explicit evidence."),
-            "an active catalog generation must remain immutable"
-        );
-
-        invalidate_workspace_skill_snapshot(&temp.root);
-        let reloaded = runtime_skill_assets_for_workspace(&temp.root);
-        let updated = reloaded
-            .instruction_source
-            .expect("reloaded workspace Skill source")
-            .load_instruction(&invocation, &usage_context("reloaded"))
-            .await
-            .expect("updated generation page-in")
-            .expect("updated prompt asset");
-        assert!(
-            updated.content.contains("New generation."),
-            "new turns must observe the atomically published generation"
-        );
-        let health = workspace_skill_cache_health(&temp.root);
-        assert!(health.loads >= 2);
-        assert!(health.hits >= 1);
-        assert!(health.resident_entries >= 1);
-        assert!(health.resident_bytes > 0);
-    }
-
-    #[tokio::test]
-    async fn first_activation_performs_full_package_inspection_and_rejects_blocked_skill() {
-        let temp = TempWorkspace::new("blocked-package");
-        let skill_root = temp.root.join(".cowd").join("skills").join("unsafe-cache");
-        std::fs::create_dir_all(skill_root.join("node_modules"))
-            .expect("heavy dependency directory");
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Unsafe Cache\ndescription: Catalog remains cheap.\n---\n\nNever injected.",
-        )
-        .expect("skill should be written");
-
-        let assets = runtime_skill_assets_for_workspace(&temp.root);
-        assert!(
-            assets
-                .profiles
-                .iter()
-                .any(|profile| profile.skill_id == "unsafe-cache"),
-            "light catalog discovery must not recursively inspect the package"
-        );
-        let invocation = runtime::SkillInvocation {
-            skill_id: "unsafe-cache".to_string(),
-            skill_version: None,
-            adapter: SkillAdapterKind::PromptOnly,
-            entrypoint: None,
-        };
-        let error = assets
-            .instruction_source
-            .expect("instruction source")
-            .load_instruction(&invocation, &usage_context("blocked"))
-            .await
-            .expect_err("full first-use inspection must block heavy package contents");
-        assert!(error.contains("blocked by package inspection"));
-
-        let health = workspace_skill_cache_health(&temp.root);
-        assert_eq!(health.loads, 0);
-        assert_eq!(health.failures, 1);
-        assert_eq!(health.resident_entries, 0);
-    }
-
-    #[tokio::test]
-    async fn approved_pointer_fences_only_future_instruction_activations() {
-        let temp = TempWorkspace::new("active-pointer");
-        let skill_root = temp.root.join(".cowd").join("skills").join("review");
-        std::fs::create_dir_all(&skill_root).expect("skill root");
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Review\nversion: 1.0.0\ndescription: Review evidence.\n---\n\nPinned old content.",
-        )
-        .expect("skill");
-        let sink: Arc<dyn runtime::RuntimeSkillUsageSink> = Arc::new(FixedPointerSink {
-            pointer: SkillActivePointer {
-                skill_id: "review".to_string(),
-                active_revision: "2.0.0".to_string(),
-                previous_revision: Some("1.0.0".to_string()),
-                generation: 1,
-                source_draft_id: Some("draft".to_string()),
-                approval_ref: "approval".to_string(),
-                activated_at_ms: 2,
-                installation: None,
-            },
-        });
-        attach_workspace_skill_usage_sink(&temp.root, sink);
-        let assets = runtime_skill_assets_for_workspace(&temp.root);
-        let invocation = runtime::SkillInvocation {
-            skill_id: "review".to_string(),
-            skill_version: Some("1.0.0".to_string()),
-            adapter: SkillAdapterKind::PromptOnly,
-            entrypoint: None,
-        };
-        let error = assets
-            .instruction_source
-            .expect("source")
-            .load_instruction(&invocation, &usage_context("future-turn"))
-            .await
-            .expect_err("new activation of old revision must be fenced");
-        assert!(error.contains("approved active revision 2.0.0"));
-        assert_eq!(workspace_skill_cache_health(&temp.root).failures, 1);
-    }
-
-    #[tokio::test]
-    async fn approved_full_package_fingerprint_allows_exact_revision_page_in() {
-        let temp = TempWorkspace::new("approved-exact-pointer");
-        let skill_root = temp.root.join(".cowd").join("skills").join("review");
-        std::fs::create_dir_all(&skill_root).expect("skill root");
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Review\nversion: 1.0.0\ndescription: Review evidence.\n---\n\nApproved content.",
-        )
-        .expect("skill");
-        let inspected = profile_skill_package(&skill_root, "Review", Some("1.0.0".to_string()))
-            .expect("full inspection");
-        let sink: Arc<dyn runtime::RuntimeSkillUsageSink> = Arc::new(FixedPointerSink {
-            pointer: SkillActivePointer {
-                skill_id: "review".to_string(),
-                active_revision: inspected.package_fingerprint,
-                previous_revision: None,
-                generation: 1,
-                source_draft_id: Some("draft".to_string()),
-                approval_ref: "approval".to_string(),
-                activated_at_ms: 2,
-                installation: None,
-            },
-        });
-        attach_workspace_skill_usage_sink(&temp.root, sink);
-        let asset = runtime_skill_assets_for_workspace(&temp.root)
-            .instruction_source
-            .expect("source")
-            .load_instruction(
-                &runtime::SkillInvocation {
-                    skill_id: "review".to_string(),
-                    skill_version: Some("1.0.0".to_string()),
-                    adapter: SkillAdapterKind::PromptOnly,
-                    entrypoint: None,
-                },
-                &usage_context("approved-exact"),
+            .unwrap()
+            .unwrap();
+        assert!(new_asset.content.contains("NEW_APPROVED_BODY"));
+        let pinned_profiles = fixture
+            .source
+            .profiles_for_pins(std::slice::from_ref(&old_asset.pin))
+            .unwrap();
+        assert_eq!(pinned_profiles[0].version.as_deref(), Some("1.0.0"));
+        let old_again = fixture
+            .source
+            .load_pinned_instruction(
+                &old_asset.pin,
+                &Fixture::invocation(&old, "1.0.0"),
+                &usage_context("queued-old-binding"),
             )
             .await
-            .expect("approved revision")
-            .expect("prompt");
-        assert!(asset.content.contains("Approved content."));
+            .unwrap()
+            .unwrap();
+        assert!(old_again.content.contains("OLD_IMMUTABLE_BODY"));
+        assert!(!old_again.content.contains("NEW_APPROVED_BODY"));
+        assert_eq!(old_again.pin, old_asset.pin);
+        assert!(fixture
+            .source
+            .load_pinned_instruction(
+                &old_asset.pin,
+                &Fixture::invocation(&new, "2.0.0"),
+                &usage_context("wrong-binding-version")
+            )
+            .await
+            .is_err());
+        let mut forged = old_asset.pin.clone();
+        forged.pointer_generation = 2;
+        assert!(fixture.source.validate_pins(&[forged]).is_err());
+        // Revocation depends on original approval/scope, not intact body I/O.
+        let installed = fixture
+            .source
+            .managed_store
+            .as_ref()
+            .unwrap()
+            .installed_entry("review", &new.revision, &new.install_id)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &installed.package_root,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(installed.package_root.join("SKILL.md")).unwrap();
+        let review = fixture
+            .governance
+            .request_deactivation(
+                &fixture.principal,
+                "revoke",
+                "review",
+                2,
+                "human revokes damaged package",
+            )
+            .unwrap();
+        let pointer = fixture.approve(&review);
+        assert_eq!(
+            (
+                pointer.generation,
+                pointer.revocation_generation,
+                pointer.revoked
+            ),
+            (3, Some(1), Some(true))
+        );
+        assert!(fixture
+            .source
+            .profiles_for_pins(std::slice::from_ref(&old_asset.pin))
+            .is_err());
+        assert!(fixture
+            .source
+            .load_pinned_instruction(
+                &old_asset.pin,
+                &Fixture::invocation(&old, "1.0.0"),
+                &usage_context("revoked-old-binding")
+            )
+            .await
+            .is_err());
+        assert!(fixture
+            .source
+            .validate_pins(&[old_asset.pin, new_asset.pin])
+            .is_err());
+        assert!(fixture
+            .source
+            .load_instruction(
+                &Fixture::invocation(&old, "1.0.0"),
+                &usage_context("revoked")
+            )
+            .await
+            .is_err());
+        assert!(fixture
+            .source
+            .approved_profiles()
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fixture
+                .governance
+                .request_deactivation(
+                    &fixture.principal,
+                    "revoke",
+                    "review",
+                    2,
+                    "human revokes damaged package"
+                )
+                .unwrap()
+                .review_id,
+            review.review_id
+        );
+        assert!(fixture
+            .governance
+            .request_deactivation(
+                &fixture.principal,
+                "new-revoke",
+                "review",
+                2,
+                "stale generation"
+            )
+            .is_err());
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn human_can_revoke_after_installed_bytes_are_erased_and_old_pin_stays_invalid() {
+        let fixture = Fixture::new("erased-store");
+        let receipt = fixture.stage("Review", "1.0.0", "ERASED_APPROVED_BYTES");
+        fixture.first(&receipt, "first");
+        let asset = fixture
+            .source
+            .load_instruction(
+                &Fixture::invocation(&receipt, "1.0.0"),
+                &usage_context("before-erasure"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = fixture.source.installation_scope().unwrap();
+        remove_owned_tree(fixture.source.managed_store.as_ref().unwrap().root());
+        assert_eq!(fixture.source.installation_scope().unwrap(), scope);
+        assert!(fixture
+            .source
+            .validate_pins(std::slice::from_ref(&asset.pin))
+            .is_err());
+        let review = fixture
+            .governance
+            .request_deactivation(
+                &fixture.principal,
+                "revoke-erased",
+                "review",
+                1,
+                "erase supersedes original pin",
+            )
+            .unwrap();
+        assert_eq!(fixture.approve(&review).revoked, Some(true));
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn late_page_in_after_human_revocation_cannot_publish_old_cache() {
+        let fixture = Fixture::new("late-cache");
+        let receipt = fixture.stage("Review", "1.0.0", "APPROVED_BUT_REVOKED_BEFORE_PUBLICATION");
+        fixture.first(&receipt, "first");
+        let flight = fixture.source.flight("review:1:0");
+        let guard = flight.lock().await;
+        let invocation = Fixture::invocation(&receipt, "1.0.0");
+        let context = usage_context("late");
+        let future = fixture.source.load_instruction(&invocation, &context);
+        futures::pin_mut!(future);
+        assert!(
+            futures::poll!(future.as_mut()).is_pending(),
+            "actual original page-in is waiting at its existing flight"
+        );
+        let review = fixture
+            .governance
+            .request_deactivation(
+                &fixture.principal,
+                "revoke",
+                "review",
+                1,
+                "revoke while original page-in waits",
+            )
+            .unwrap();
+        fixture.approve(&review);
+        drop(guard);
+        assert!(future.await.is_err());
+        assert!(fixture.source.cache.lock().unwrap().entries.is_empty());
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn foreign_scope_is_excluded_without_blocking_local_approved_catalog() {
+        let fixture = Fixture::new("scope");
+        let foreign = fixture.stage("Foreign Review", "1.0.0", "FOREIGN_WORKSPACE_BODY");
+        fixture.first(&foreign, "foreign");
+        let other = fixture.temp.root.join("other-workspace");
+        std::fs::create_dir_all(&other).unwrap();
+        let mut source = WorkspaceSkillInstructionSource::new(
+            &other,
+            &[],
+            fixture.source.usage.clone(),
+            fixture.source.metrics.clone(),
+        );
+        source.managed_store = fixture.source.managed_store.clone();
+        let source = Arc::new(source);
+        let governance = runtime::SkillRevisionGovernanceService::new(
+            fixture.store.clone(),
+            Arc::new(runtime::ApprovalQueue::new(fixture.store.clone())),
+            Arc::new(RwLock::new(
+                runtime::RuntimeSkillCatalog::default().with_instruction_source(source.clone()),
+            )),
+        );
+        let local = fixture.stage("Local Review", "1.0.0", "LOCAL_WORKSPACE_BODY");
+        let review = governance
+            .request_first_install(
+                &fixture.principal,
+                "local",
+                &local.skill_id,
+                &local.revision,
+                &local.install_id,
+            )
+            .unwrap();
+        // Same original store and human authority; the service still validates
+        // the actual source's distinct workspace scope at decision time.
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        let (signed, _) = auth_broker::test_support::issue_decision_lease_for_capabilities(
+            fixture.temp.root.join("authority"),
+            "test-local-human",
+            vec!["skill.revision.manage".into()],
+            &review.review_id,
+            review.action.action_key(),
+            review.scope_ref(),
+            &review.evidence_digest,
+            expires,
+        )
+        .unwrap();
+        let lease = fixture
+            .verifier
+            .verify_decision_lease(
+                &signed,
+                &fixture.principal,
+                &runtime::DecisionLeaseExpectation::new(
+                    &review.review_id,
+                    review.action.action_key(),
+                    review.scope_ref(),
+                    &review.evidence_digest,
+                ),
+            )
+            .unwrap();
+        governance
+            .decide_review(
+                &fixture.principal,
+                &lease,
+                &review.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "local approval",
+            )
+            .unwrap();
+        let profiles = source.approved_profiles().unwrap().unwrap();
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-review"]
+        );
+        assert!(source
+            .load_instruction(
+                &Fixture::invocation(&foreign, "1.0.0"),
+                &usage_context("foreign")
+            )
+            .await
+            .is_err());
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_receipt_and_unknown_native_pointer_cannot_authorize_page_in() {
+        let fixture = Fixture::new("corruption");
+        let receipt = fixture.stage("Review", "1.0.0", "APPROVED_BODY");
+        fixture.first(&receipt, "first");
+        let path = fixture
+            .source
+            .managed_store
+            .as_ref()
+            .unwrap()
+            .root()
+            .join("review/receipts")
+            .join(format!("{}.json", receipt.install_id));
+        let mut altered = serde_json::to_value(&receipt).unwrap();
+        altered["profile"]["name"] = serde_json::json!("foreign injected catalog metadata");
+        std::fs::write(path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(fixture.source.approved_profiles().is_err());
+        assert!(fixture
+            .source
+            .load_instruction(
+                &Fixture::invocation(&receipt, "1.0.0"),
+                &usage_context("corrupt")
+            )
+            .await
+            .is_err());
+        fixture
+            .store
+            .append(runtime::RuntimeEventInput {
+                stream_id: format!("skill-revision-pointer:{:x}", Sha256::digest(b"review")),
+                scope: runtime::RuntimeEventScope::Skill,
+                kind: "foreign-pointer".into(),
+                status: None,
+                actor: None,
+                refs: vec![],
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        assert!(fixture.source.approved_profiles().is_err());
+        fixture.close().await;
     }
 
     #[test]
     fn installed_revision_reader_binds_original_receipt_scope_and_full_bytes() {
-        use runtime::RuntimeSkillInstructionSource;
         let temp = TempWorkspace::new("installed-reader");
         let package_root = temp.root.join("package");
         std::fs::create_dir_all(&package_root).unwrap();
@@ -1110,125 +1676,158 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_active_pointer_fails_closed_before_page_in() {
-        let temp = TempWorkspace::new("unavailable-pointer");
-        let skill_root = temp.root.join(".cowd").join("skills").join("review");
-        std::fs::create_dir_all(&skill_root).expect("skill root");
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Review\ndescription: Review evidence.\n---\n\nNever loaded.",
-        )
-        .expect("skill");
-        let sink: Arc<dyn runtime::RuntimeSkillUsageSink> = Arc::new(UnavailablePointerSink);
-        attach_workspace_skill_usage_sink(&temp.root, sink);
-        let assets = runtime_skill_assets_for_workspace(&temp.root);
-        let invocation = runtime::SkillInvocation {
-            skill_id: "review".to_string(),
-            skill_version: None,
-            adapter: SkillAdapterKind::PromptOnly,
-            entrypoint: None,
-        };
-        let error = assets
-            .instruction_source
-            .expect("source")
-            .load_instruction(&invocation, &usage_context("pointer-unavailable"))
+    async fn approved_lark_instruction_preserves_original_bridge_and_tool_refs() {
+        let fixture = Fixture::new("lark-bridge");
+        let receipt = fixture.stage(
+            "Lark Im",
+            "1.0.0",
+            "Use lark-cli to read authorized messages.",
+        );
+        fixture.first(&receipt, "first");
+        let asset = fixture
+            .source
+            .load_instruction(
+                &Fixture::invocation(&receipt, "1.0.0"),
+                &usage_context("lark"),
+            )
             .await
-            .expect_err("pointer verification failure must block page-in");
-        assert!(error.contains("active revision could not be verified"));
-        let health = workspace_skill_cache_health(&temp.root);
-        assert_eq!(health.loads, 0);
-        assert_eq!(health.failures, 1);
+            .unwrap()
+            .unwrap();
+        assert!(asset.content.contains("# Cowd Lark execution bridge"));
+        assert!(asset
+            .content
+            .contains("Never use Bash to locate credentials"));
+        assert!(asset
+            .content
+            .contains("Use lark-cli to read authorized messages."));
+        assert_eq!(asset.tool_refs, vec!["lark_cli_read", "lark_cli_write"]);
+        assert_eq!(
+            fixture
+                .source
+                .required_tool_refs(&["lark-im@1.0.0".into()])
+                .unwrap(),
+            std::collections::BTreeSet::from(["lark_cli_read".into(), "lark_cli_write".into()])
+        );
+        assert!(fixture
+            .source
+            .required_tool_refs(&["lark-im@foreign".into()])
+            .is_err());
+        assert_eq!(
+            fixture
+                .source
+                .required_tool_pins(&["Lark Im".into()])
+                .unwrap()[0]
+                .installation
+                .skill_id,
+            "lark-im"
+        );
+        fixture.source.validate_pins(&[asset.pin]).unwrap();
+        fixture.close().await;
     }
 
-    #[tokio::test]
-    async fn canonical_runtime_usage_receipts_are_persisted_off_the_load_path() {
-        let temp = TempWorkspace::new("usage-events");
-        let skill_root = temp.root.join(".cowd").join("skills").join("research");
-        std::fs::create_dir_all(&skill_root).expect("skill root");
-        std::fs::write(
-            skill_root.join("SKILL.md"),
-            "---\nname: Research\ndescription: Investigate evidence.\n---\n\nInvestigate.",
-        )
-        .expect("skill");
-        let store = Arc::new(runtime::RuntimeEventStore::for_test());
-        let recorder = Arc::new(
-            runtime::RuntimeSkillUsageRecorder::new(Arc::clone(&store)).expect("usage worker"),
-        );
-        let usage_sink: Arc<dyn runtime::RuntimeSkillUsageSink> = recorder.clone();
-        let source = runtime_skill_assets_for_workspace(&temp.root)
-            .instruction_source
-            .expect("instruction source");
-        attach_workspace_skill_usage_sink(&temp.root, usage_sink);
-
-        let invocation = runtime::SkillInvocation {
-            skill_id: "research".to_string(),
-            skill_version: None,
-            adapter: SkillAdapterKind::PromptOnly,
-            entrypoint: None,
-        };
-        source
-            .load_instruction(&invocation, &usage_context("usage-first"))
-            .await
-            .expect("first load")
-            .expect("prompt");
-        source
-            .load_instruction(&invocation, &usage_context("usage-hit"))
-            .await
-            .expect("cache hit")
-            .expect("prompt");
-
-        let drained = recorder.shutdown_and_drain(Duration::from_secs(2)).await;
-        assert!(drained.clean, "{drained:?}");
-        let events = store
-            .list_scope(runtime::RuntimeEventScope::Skill, 10)
-            .expect("original Skill receipts");
-        assert!(
-            events
-                .iter()
-                .any(|event| event.kind == runtime::SKILL_USAGE_RECEIPT_EVENT_KIND),
-            "usage telemetry must persist through the selected RuntimeEventStore"
-        );
-        let expected_revision = profile_skill_package(&skill_root, "Research", None)
-            .expect("full inspection")
-            .package_fingerprint;
-        assert!(
-            events.iter().any(|event| {
-                event.kind == runtime::SKILL_USAGE_RECEIPT_EVENT_KIND
-                    && event
-                        .payload
-                        .get("receipt")
-                        .and_then(|receipt| receipt.get("skill_revision"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(expected_revision.as_str())
-            }),
-            "Receipt and active pointer must use the full immutable package fingerprint"
-        );
-        assert!(
-            workspace_skill_cache_health(&temp.root).usage_persisted > 0,
-            "health projection must expose asynchronous persistence"
+    #[test]
+    fn runtime_skill_profile_provider_uses_workspace_registry() {
+        let temp = TempWorkspace::new("discovery");
+        let path = temp.root.join(".cowd/skills/release-review");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("SKILL.md"), "---\nname: Release Review\ndescription: Review release plans.\n---\nRequire explicit evidence.").unwrap();
+        let profiles = runtime_skill_profiles_for_workspace(&temp.root);
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.skill_id == "release-review")
+            .unwrap();
+        assert_eq!(profile.name, "Release Review");
+        assert!(profile.adapters.contains(&SkillAdapterKind::PromptOnly));
+        assert!(profile
+            .entrypoints
+            .iter()
+            .any(|entry| entry.path == "SKILL.md"));
+        assert_eq!(
+            workspace_skill_cache_health(&temp.root).resident_entries,
+            0,
+            "management discovery must not materialize cold instructions"
         );
     }
 
     #[tokio::test]
-    #[ignore = "run scripts/test/lark-live.sh with COWD_LIVE_LARK_SKILL_TEST=1"]
+    async fn first_activation_performs_full_package_inspection_and_rejects_blocked_skill() {
+        let fixture = Fixture::new("blocked");
+        let path = fixture.temp.root.join("blocked");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("SKILL.md"), "---\nname: Unsafe Cache\ndescription: Never injected.\n---\nNever execute package code.").unwrap();
+        let managed = fixture.source.managed_store.as_ref().unwrap().clone();
+        let workspace = fixture.temp.root.clone();
+        std::thread::spawn(move || {
+            let lifecycle = skill::SkillLifecycle::new(managed).unwrap();
+            let plan = lifecycle.plan(path.to_str().unwrap(), &workspace).unwrap();
+            assert!(plan.installable);
+            assert!(plan.blockers.is_empty());
+            std::fs::create_dir_all(path.join("node_modules")).unwrap();
+            std::fs::write(path.join("node_modules/package.json"), "{}").unwrap();
+            assert!(matches!(lifecycle.plan(path.to_str().unwrap(), &workspace),
+                Err(skill::SkillLifecycleError::InvalidPackage(reason)) if reason.contains("node_modules")));
+            assert!(lifecycle
+                .commit(
+                    path.to_str().unwrap(),
+                    &workspace,
+                    &plan.package_digest,
+                    true,
+                    "human:test"
+                )
+                .is_err());
+        })
+        .join()
+        .expect("blocked installer fixture thread");
+        assert!(fixture
+            .governance
+            .pointer("unsafe-cache")
+            .unwrap()
+            .is_none());
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires configured original Lark skill packages; content-only gate, no Lark requests"]
     async fn live_cowd_lark_skills_are_discovered_and_selected_by_runtime() {
         assert_eq!(
             std::env::var("COWD_LIVE_LARK_SKILL_TEST").as_deref(),
-            Ok("1"),
-            "live Lark skill test requires COWD_LIVE_LARK_SKILL_TEST=1"
+            Ok("1")
         );
-        let assets = runtime_skill_assets_for_workspace(Path::new("."));
-        for (query, expected) in [
-            ("请使用 lark-base 查询多维表格", "lark-base"),
-            ("请使用 lark-im 搜索群聊消息", "lark-im"),
-        ] {
+        let discovered = runtime_skill_assets_for_workspace(Path::new("."));
+        let fixture = Fixture::new("live-lark");
+        for expected in ["lark-base", "lark-im"] {
+            let original = discovered
+                .profiles
+                .iter()
+                .find(|profile| profile.skill_id == expected)
+                .expect("configured original Lark package");
+            let managed = fixture.source.managed_store.as_ref().unwrap().clone();
+            let workspace = fixture.temp.root.clone();
+            let original_root = original.source_root.clone();
+            let receipt = std::thread::spawn(move || {
+                let lifecycle = skill::SkillLifecycle::new(managed).unwrap();
+                let plan = lifecycle.plan(&original_root, &workspace).unwrap();
+                lifecycle
+                    .commit(
+                        &original_root,
+                        &workspace,
+                        &plan.package_digest,
+                        false,
+                        "human:isolated-test",
+                    )
+                    .unwrap()
+            })
+            .join()
+            .expect("configured original package fixture thread");
+            fixture.first(&receipt, expected);
+            let profiles = fixture.source.approved_profiles().unwrap().unwrap();
             let decision = runtime::skill::SkillActivationEngine::activate(
                 runtime::skill::SkillActivationInput {
-                    session_id: "lark-live-skill-test".to_string(),
+                    session_id: "lark-gate".into(),
                     turn_index: 0,
-                    query: query.to_string(),
-                    capability_refs: Vec::new(),
-                    available_profiles: assets.profiles.clone(),
+                    query: format!("请使用 {expected} 查询消息和多维表格"),
+                    capability_refs: vec![],
+                    available_profiles: profiles,
                     agent_profile: harness_contract::skill::AgentSkillProfile {
                         adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
                         ..Default::default()
@@ -1237,23 +1836,19 @@ mod tests {
             );
             let selected = decision
                 .activations
-                .first()
-                .and_then(|activation| activation.selected_invocation.as_ref())
-                .expect("Lark skill should be selected");
-            assert_eq!(selected.skill_id, expected);
-            let prompt = assets
-                .instruction_source
-                .as_ref()
-                .expect("live Skill instruction source")
+                .iter()
+                .filter_map(|activation| activation.selected_invocation.as_ref())
+                .find(|invocation| invocation.skill_id == expected)
+                .expect("selected approved Lark skill");
+            let asset = fixture
+                .source
                 .load_instruction(selected, &usage_context(expected))
                 .await
-                .expect("live Skill page-in")
-                .expect("selected Lark skill should have a prompt asset");
-            assert!(prompt.content.contains("lark-cli"));
-            assert_eq!(
-                prompt.tool_refs,
-                vec!["lark_cli_read".to_string(), "lark_cli_write".to_string()]
-            );
+                .unwrap()
+                .unwrap();
+            assert!(asset.content.contains("lark-cli"));
+            assert_eq!(asset.tool_refs, vec!["lark_cli_read", "lark_cli_write"]);
         }
+        fixture.close().await;
     }
 }

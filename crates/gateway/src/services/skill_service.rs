@@ -490,46 +490,14 @@ impl SkillService {
                     .status(id)
                     .map_err(std::io::Error::other)?;
                 Ok(format!(
-                    "Skill status\n  Name             {}\n  Active           {}\n  Revisions        {}\n  Receipts         {}",
+                    "Skill staged inventory\n  Name             {}\n  Revisions        {}\n  Receipts         {}",
                     status.skill_id,
-                    status
-                        .active
-                        .as_ref()
-                        .map_or("none", |pointer| pointer.revision.as_str()),
                     status.revisions.len(),
                     status.receipts.len(),
                 ))
             }
-            Some(args) if args.starts_with("rollback ") => {
-                let parts = args["rollback ".len()..]
-                    .split_whitespace()
-                    .collect::<Vec<_>>();
-                if parts.len() != 2 {
-                    return Ok(render_skills_usage(Some("install")));
-                }
-                let receipt = skill::ManagedSkillStore::default_for_user()
-                    .map_err(std::io::Error::other)?
-                    .rollback(parts[0], parts[1], "cli:slash")
-                    .map_err(std::io::Error::other)?;
-                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
-                Ok(format!(
-                    "Skill rolled back\n  Name             {}\n  Revision         {}\n  Receipt          {}",
-                    receipt.name, receipt.revision, receipt.install_id
-                ))
-            }
-            Some(args) if args.starts_with("remove ") => {
-                let id = args["remove ".len()..].trim();
-                let previous = skill::ManagedSkillStore::default_for_user()
-                    .map_err(std::io::Error::other)?
-                    .deactivate(id, "cli:slash")
-                    .map_err(std::io::Error::other)?;
-                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
-                Ok(format!(
-                    "Skill deactivated\n  Name             {id}\n  Previous         {}",
-                    previous
-                        .as_ref()
-                        .map_or("none", |pointer| pointer.revision.as_str())
-                ))
+            Some(args) if args.starts_with("rollback ") || args.starts_with("remove ") => {
+                Err(std::io::Error::other("Skill revision changes require an authenticated human Gateway review; use cowd skill rollback/remove with explicit receipt/request/generation"))
             }
             Some("view") => Ok(render_skills_usage(Some("view"))),
             Some(args) if args.starts_with("view ") => {
@@ -624,37 +592,8 @@ impl SkillService {
                     .map_err(std::io::Error::other)?;
                 serde_json::to_value(status).map_err(std::io::Error::other)
             }
-            Some(args) if args.starts_with("rollback ") => {
-                let parts = args["rollback ".len()..]
-                    .split_whitespace()
-                    .collect::<Vec<_>>();
-                if parts.len() != 2 {
-                    return Ok(render_skills_usage_json(Some("install")));
-                }
-                let receipt = skill::ManagedSkillStore::default_for_user()
-                    .map_err(std::io::Error::other)?
-                    .rollback(parts[0], parts[1], "cli:slash")
-                    .map_err(std::io::Error::other)?;
-                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
-                Ok(serde_json::json!({
-                    "kind": "skills.rollback.receipt",
-                    "schema_version": 1,
-                    "receipt": receipt,
-                }))
-            }
-            Some(args) if args.starts_with("remove ") => {
-                let id = args["remove ".len()..].trim();
-                let previous = skill::ManagedSkillStore::default_for_user()
-                    .map_err(std::io::Error::other)?
-                    .deactivate(id, "cli:slash")
-                    .map_err(std::io::Error::other)?;
-                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
-                Ok(serde_json::json!({
-                    "kind": "skills.deactivation.receipt",
-                    "schema_version": 1,
-                    "skill_id": id,
-                    "previous_active": previous,
-                }))
+            Some(args) if args.starts_with("rollback ") || args.starts_with("remove ") => {
+                Err(std::io::Error::other("Skill revision changes require an authenticated human Gateway review; use cowd skill rollback/remove with explicit receipt/request/generation"))
             }
             Some("view") => Ok(render_skills_usage_json(Some("view"))),
             Some(args) if args.starts_with("view ") => {
@@ -721,7 +660,7 @@ impl SkillService {
                 if let Ok(available) = collect_skill_catalog(workspace_root) {
                     let names = available
                         .iter()
-                        .filter(|skill| skill.status == "ready")
+                        .filter(|skill| skill.status != "shadowed")
                         .map(|skill| skill.name.clone())
                         .collect::<Vec<_>>();
                     if !names.is_empty() {
@@ -975,33 +914,18 @@ impl SkillService {
         result
     }
 
-    pub(crate) fn delete_managed(
+    pub(crate) fn managed_skill_id(
         &self,
         workspace_root: &Path,
         id: &str,
-        actor: &str,
-    ) -> Result<serde_json::Value, SkillServiceError> {
+    ) -> Result<String, SkillServiceError> {
         let item = find_catalog_item(workspace_root, id)?;
         if item.source != "UserCowdManaged" {
             return Err(SkillServiceError::BadRequest(
-                "workspace, imported agent, and legacy Cowd skills are read-only".to_string(),
+                "only managed Skill approvals can be revoked".into(),
             ));
         }
-        let skill_id = skill::stable_skill_id(&item.name);
-        let previous = skill::ManagedSkillStore::default_for_user()
-            .map_err(|error| SkillServiceError::Internal(error.to_string()))?
-            .deactivate(&skill_id, actor)
-            .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
-        Ok(serde_json::json!({
-            "kind": "skills.management.deleted",
-            "schema_version": 1,
-            "receipt": {
-                "skill_id": skill_id,
-                "deactivated": previous.is_some(),
-                "previous_active": previous,
-            },
-            "changed_refs": [id],
-        }))
+        Ok(skill::stable_skill_id(&item.name))
     }
 
     pub(crate) fn files(
@@ -1157,6 +1081,9 @@ fn skill_action_blockers(
     inspection_error: Option<&str>,
 ) -> Vec<String> {
     let mut blockers = Vec::new();
+    if matches!(action, SkillActionKind::Run) {
+        blockers.push("PromptOnly activation belongs to the original Runtime turn with human-approved immutable pins; this management endpoint does not dispatch instructions".into());
+    }
     if let Some(error) = inspection_error {
         blockers.push(format!("inspection_failed: {error}"));
     }

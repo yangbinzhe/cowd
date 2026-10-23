@@ -88,6 +88,7 @@ pub struct PromptContextPacket {
     /// Provenance only. Travels with exactly this packet through final packing;
     /// it is never rendered as model instructions or reused as a read grant.
     pub(crate) memory_source_readset: Vec<memory::store::MemoryEntryRevision>,
+    pub(crate) skill_pin: Option<(String, harness_contract::skill::SkillInstructionPin)>,
     /// A normalized, deterministic representation of ContextItem.score. The
     /// final provider packer uses it with source admission rules so a late
     /// packet is not preferred merely because it arrived first.
@@ -105,6 +106,7 @@ impl PromptContextPacket {
             content: item.content.clone(),
             evidence: item.evidence.clone(),
             memory_source_readset: Vec::new(),
+            skill_pin: None,
             utility_score_milli: (item.score.max(0.0) * 1_000.0).round() as i64,
         }
     }
@@ -342,6 +344,45 @@ impl PromptAssembly {
                 readsets.get(&packet.source_id).cloned().unwrap_or_default();
         }
         self
+    }
+
+    pub(crate) fn with_skill_instruction_pins(
+        mut self,
+        pins: &BTreeMap<String, (String, harness_contract::skill::SkillInstructionPin)>,
+    ) -> Result<Self, crate::RuntimeError> {
+        use sha2::{Digest, Sha256};
+        for packet in &mut self.contextual_packets {
+            if let Some((digest, pin)) = pins.get(&packet.source_id) {
+                if digest != &format!("sha256:{:x}", Sha256::digest(packet.content.as_bytes())) {
+                    return Err(crate::RuntimeError::new(
+                        "Skill packet changed during context assembly",
+                    ));
+                }
+                packet.skill_pin = Some((digest.clone(), pin.clone()));
+            }
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn skill_instruction_pins(
+        &self,
+    ) -> Result<Vec<harness_contract::skill::SkillInstructionPin>, crate::RuntimeError> {
+        use sha2::{Digest, Sha256};
+        self.contextual_packets
+            .iter()
+            .filter_map(|packet| {
+                packet.skill_pin.as_ref().map(|(digest, pin)| {
+                    if digest != &format!("sha256:{:x}", Sha256::digest(packet.content.as_bytes()))
+                    {
+                        Err(crate::RuntimeError::new(
+                            "prepared Skill packet bytes changed",
+                        ))
+                    } else {
+                        Ok(pin.clone())
+                    }
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn memory_source_readset(&self) -> Vec<memory::store::MemoryEntryRevision> {
@@ -802,6 +843,7 @@ mod tests {
         for source_id in ["first", "second"] {
             assembly.contextual_packets.push(PromptContextPacket {
                 memory_source_readset: Vec::new(),
+                skill_pin: None,
                 authority: ContextAuthority::Project,
                 source: ContextSourceKind::Workspace,
                 role: ContextRole::Evidence,
@@ -833,6 +875,7 @@ mod tests {
         ] {
             assembly.contextual_packets.push(PromptContextPacket {
                 memory_source_readset: Vec::new(),
+                skill_pin: None,
                 authority: ContextAuthority::Derived,
                 source,
                 role: ContextRole::Evidence,
@@ -866,6 +909,7 @@ mod tests {
         ] {
             assembly.contextual_packets.push(PromptContextPacket {
                 memory_source_readset: Vec::new(),
+                skill_pin: None,
                 authority: ContextAuthority::Derived,
                 source,
                 role: ContextRole::Evidence,
@@ -891,6 +935,7 @@ mod tests {
         let mut assembly = PromptAssembly::new(vec!["builtin".to_string()]);
         assembly.contextual_packets.push(PromptContextPacket {
             memory_source_readset: Vec::new(),
+            skill_pin: None,
             authority: ContextAuthority::Session,
             source: ContextSourceKind::Conversation,
             role: ContextRole::TaskState,
@@ -910,6 +955,7 @@ mod tests {
         let mut assembly = PromptAssembly::new(vec!["builtin".to_string()]);
         assembly.contextual_packets.push(PromptContextPacket {
             memory_source_readset: Vec::new(),
+            skill_pin: None,
             authority: ContextAuthority::Session,
             source: ContextSourceKind::Conversation,
             role: ContextRole::TaskState,
@@ -920,6 +966,7 @@ mod tests {
         });
         assembly.contextual_packets.push(PromptContextPacket {
             memory_source_readset: Vec::new(),
+            skill_pin: None,
             authority: ContextAuthority::Derived,
             source: ContextSourceKind::Memory,
             role: ContextRole::Evidence,
@@ -1121,5 +1168,65 @@ mod memory_readset_packing_tests {
                 .contains("original-a"),
             "readset metadata is not model instruction text"
         );
+    }
+}
+
+#[cfg(test)]
+mod skill_pin_packing_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    #[test]
+    fn only_final_whole_skill_packets_carry_pins_and_changed_bytes_refuse() {
+        let small = ContextItem::new(
+            "small",
+            ContextSourceKind::Memory,
+            ContextRole::Evidence,
+            "ORIGINAL_SMALL_SKILL",
+        );
+        let mut big = ContextItem::new(
+            "big",
+            ContextSourceKind::Memory,
+            ContextRole::Evidence,
+            "LARGE_SKILL ".repeat(2000),
+        );
+        big.score = 0.1;
+        let a = crate::skill::test_support::pin("small", None, "ORIGINAL_SMALL_SKILL", &[]);
+        let b = crate::skill::test_support::pin("big", None, &big.content, &[]);
+        let pins = BTreeMap::from([
+            (
+                "small".into(),
+                (
+                    format!("sha256:{:x}", Sha256::digest(small.content.as_bytes())),
+                    a.clone(),
+                ),
+            ),
+            (
+                "big".into(),
+                (
+                    format!("sha256:{:x}", Sha256::digest(big.content.as_bytes())),
+                    b,
+                ),
+            ),
+        ]);
+        let mut prompt = PromptAssembly::default();
+        prompt.push_context_item(&small);
+        prompt.push_context_item(&big);
+        let prompt = prompt.with_skill_instruction_pins(&pins).unwrap();
+        let (mut packed, _, omitted, _) = prompt.pack_for_hard_cap(512).unwrap();
+        assert_eq!(omitted, vec!["big"]);
+        assert_eq!(packed.skill_instruction_pins().unwrap(), vec![a]);
+        assert!(!packed
+            .contextual_messages()
+            .join("\n")
+            .contains("unit-human-approval"));
+        packed.contextual_packets[0]
+            .content
+            .push_str("FOREIGN_BYTES");
+        assert!(packed.skill_instruction_pins().is_err());
+        let mut changed = PromptAssembly::default();
+        let mut small = small;
+        small.content = "ALTERED_BEFORE_PACKING".into();
+        changed.push_context_item(&small);
+        assert!(changed.with_skill_instruction_pins(&pins).is_err());
     }
 }

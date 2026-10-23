@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::super::program::AgenticTaskAttemptProjection;
 use super::*;
 use super::{admission::*, heartbeat::agentic_graph_is_terminal, helpers::*};
@@ -2085,7 +2087,16 @@ impl RuntimeServices {
                 .insert(node_id.clone(), ExecutionNodeStatus::Planned);
             graph.nodes.push(node);
             let mut graph = self
-                .compile_graph_agent_intents(graph)
+                .compile_graph_agent_intents_with_skill_pins(
+                    graph,
+                    &BTreeMap::from([(
+                        node_id.clone(),
+                        (
+                            admission.skill_tool_pins,
+                            admission.skill_tool_contributions,
+                        ),
+                    )]),
+                )
                 .map_err(|error| error.to_string())?;
             let compiled_node = graph
                 .nodes

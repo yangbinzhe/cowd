@@ -301,8 +301,9 @@ where
     pub cache_cohort_user_prefix: Vec<String>,
     pub skill_profiles: Vec<SkillCapabilityProfile>,
     pub agent_skill_profile: AgentSkillProfile,
-    pub skill_prompt_assets: Vec<crate::RuntimeSkillPromptAsset>,
     pub skill_instruction_source: Option<Arc<dyn crate::RuntimeSkillInstructionSource>>,
+    pub skill_binding_pins: Vec<harness_contract::skill::SkillInstructionPin>,
+    pub skill_binding_tool_refs: Vec<String>,
     /// Runtime-owned Agent instance identity for scoped memory operations.
     pub memory_agent_id: String,
     /// Exact Agent Definition lineage permitted for reusable cognitive recall.

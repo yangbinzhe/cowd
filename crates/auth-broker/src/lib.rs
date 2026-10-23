@@ -1515,10 +1515,33 @@ pub mod test_support {
         evidence_digest: impl Into<String>,
         expires_at_ms: u64,
     ) -> Result<(SignedDecisionLease, String), AuthBrokerError> {
+        issue_decision_lease_for_capabilities(
+            root,
+            credential,
+            Vec::new(),
+            review_id,
+            action,
+            scope,
+            evidence_digest,
+            expires_at_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_decision_lease_for_capabilities(
+        root: impl AsRef<Path>,
+        credential: &str,
+        capabilities: Vec<String>,
+        review_id: impl Into<String>,
+        action: impl Into<String>,
+        scope: impl Into<String>,
+        evidence_digest: impl Into<String>,
+        expires_at_ms: u64,
+    ) -> Result<(SignedDecisionLease, String), AuthBrokerError> {
         let authority = LocalAuthority::open_or_initialize(
             root,
             credential,
-            catalog_for_capabilities(Vec::new()),
+            catalog_for_capabilities(capabilities),
         )?;
         let lease = authority.issue_decision_lease(
             credential,

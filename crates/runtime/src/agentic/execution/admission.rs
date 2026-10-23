@@ -7,6 +7,8 @@ pub(super) struct AgenticExecutionAdmission {
     pub(super) effective_capabilities: Vec<AgentCapability>,
     pub(super) allowed_tools: Vec<String>,
     pub(super) allowed_skills: Vec<String>,
+    pub(super) skill_tool_pins: Vec<harness_contract::skill::SkillInstructionPin>,
+    pub(super) skill_tool_contributions: Vec<String>,
     pub(super) permission_ceiling: PermissionMode,
     /// Requested capabilities that had no usable tool in the admitted ToolHost
     /// snapshot (diagnostic; a degradation, not a failure).
@@ -52,7 +54,8 @@ pub(super) fn resolve_agentic_execution_admission(
         }
     }
     let skill_catalog = services.skill_catalog();
-    let (allowed_skills, skill_tool_refs) = effective_skill_grants(&catalog_entry, &skill_catalog);
+    let (allowed_skills, skill_tool_refs, skill_tool_pins) =
+        effective_skill_grants(&catalog_entry, &skill_catalog)?;
     let resolved = resolve_agent_capability(AgentCapabilityRequest {
         role_id: member.agent_id.clone(),
         allowed_capabilities: required.clone(),
@@ -60,12 +63,13 @@ pub(super) fn resolve_agentic_execution_admission(
     });
     let mut requested_tools = resolved.allowed_tools.clone();
     requested_tools.extend(AGENT_ACTION_TOOL_IDS.iter().map(|tool| (*tool).to_string()));
-    requested_tools.extend(skill_tool_refs.iter().cloned());
     requested_tools.insert("artifact_publish".into());
     if required.iter().any(|capability| capability == "write") {
         requested_tools.insert("artifact_materialize".into());
     }
 
+    let independent_tools = requested_tools.clone();
+    requested_tools.extend(skill_tool_refs.iter().cloned());
     let session_ceiling = services
         .session_execution_policy(&context.session_id)
         .map(|policy| lower_permission(context.permission_ceiling, policy.permission_mode))
@@ -89,15 +93,31 @@ pub(super) fn resolve_agentic_execution_admission(
         effective_capabilities_after_intersection(&required, &missing_capabilities)?;
     constrain_tools_to_effective_capabilities(&mut allowed_tools, &effective_capabilities);
 
+    let skill_tool_contributions =
+        contributed_skill_tools(&skill_tool_refs, &independent_tools, &allowed_tools);
     Ok(AgenticExecutionAdmission {
         catalog_entry,
         effective_capabilities,
         allowed_tools,
         allowed_skills,
+        skill_tool_pins,
+        skill_tool_contributions,
         permission_ceiling: session_ceiling,
         missing_capabilities,
         missing_tool_alternatives,
     })
+}
+
+pub(super) fn contributed_skill_tools(
+    skill: &BTreeSet<String>,
+    independent: &BTreeSet<String>,
+    admitted: &[String],
+) -> Vec<String> {
+    skill
+        .difference(independent)
+        .filter(|tool| admitted.contains(tool))
+        .cloned()
+        .collect()
 }
 
 fn constrain_tools_to_effective_capabilities(
@@ -303,8 +323,15 @@ pub(super) fn capability_from_name(capability: &str) -> Option<AgentCapability> 
 pub(super) fn effective_skill_grants(
     entry: &AgentCatalogEntry,
     catalog: &RuntimeSkillCatalog,
-) -> (Vec<String>, BTreeSet<String>) {
-    let profiles = catalog.profiles();
+) -> Result<
+    (
+        Vec<String>,
+        BTreeSet<String>,
+        Vec<harness_contract::skill::SkillInstructionPin>,
+    ),
+    String,
+> {
+    let profiles = catalog.profiles()?;
     let mut allowed_skills = entry
         .skill_refs
         .iter()
@@ -321,31 +348,26 @@ pub(super) fn effective_skill_grants(
         .collect::<Vec<_>>();
     allowed_skills.sort();
     allowed_skills.dedup();
-    let tool_refs = catalog
-        .prompt_assets()
+    let pins = if allowed_skills.is_empty() {
+        Vec::new()
+    } else {
+        catalog
+            .instruction_source()
+            .ok_or("Skill grants require the original approved instruction source")?
+            .required_tool_pins(&allowed_skills)?
+    };
+    let tool_refs = pins
         .iter()
-        .filter(|asset| {
-            allowed_skills.iter().any(|skill_ref| {
-                skill_ref.eq_ignore_ascii_case(&asset.skill_id)
-                    || asset.version.as_ref().is_some_and(|version| {
-                        skill_ref.eq_ignore_ascii_case(&format!("{}@{version}", asset.skill_id))
-                    })
-            })
-        })
-        .flat_map(|asset| asset.tool_refs.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    (allowed_skills, tool_refs)
+        .flat_map(|pin| pin.tool_refs.iter().cloned())
+        .collect();
+    Ok((allowed_skills, tool_refs, pins))
 }
 
 pub(super) fn skill_ref_matches_profile(
-    skill_ref: &str,
+    reference: &str,
     profile: &harness_contract::skill::SkillCapabilityProfile,
 ) -> bool {
-    skill_ref.eq_ignore_ascii_case(&profile.skill_id)
-        || skill_ref.eq_ignore_ascii_case(&profile.name)
-        || profile.version.as_ref().is_some_and(|version| {
-            skill_ref.eq_ignore_ascii_case(&format!("{}@{version}", profile.skill_id))
-        })
+    profile.matches_reference(reference)
 }
 
 pub(super) fn lower_permission(left: PermissionMode, right: PermissionMode) -> PermissionMode {

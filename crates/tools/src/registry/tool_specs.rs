@@ -798,16 +798,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Govern,
             tier: ToolTier::Orchestration,
             permission_key: "skill",
-            description: "Manage local or GitHub skills through ONE entry point. action=install_plan (source): acquire as inert content, inspect every bounded file, return the canonical SHA-256 tree digest plus blockers/warnings; nothing is activated. action=install_commit (source, expected_digest, allow_warnings?): re-acquire, require the exact digest, enforce blockers, atomically activate an immutable revision and emit a provenance receipt. action=status (skill_id): read the active pointer, revision history and receipts. action=rollback (skill_id, revision): atomically reactivate an existing revision after digest verification. action=deactivate (skill_id): remove the active pointer while retaining immutable revisions. Boundary: it never executes packaged code and never deletes revisions, and a digest mismatch refuses.",
+            description: "Manage local or GitHub skills through ONE entry point. action=install_plan (source): acquire as inert content, inspect every bounded file, return the canonical SHA-256 tree digest plus blockers/warnings; nothing is activated. action=install_commit (source, expected_digest, allow_warnings?): re-acquire, require the exact digest, enforce blockers, stage an immutable revision and emit a provenance receipt. action=status (skill_id): read staged revision history and receipts. Activation, rollback and revocation require an authenticated human through the original Gateway approval owner. Boundary: it never executes packaged code and never deletes revisions, and a digest mismatch refuses.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["install_plan", "install_commit", "status", "rollback", "deactivate"] },
+                    "action": { "type": "string", "enum": ["install_plan", "install_commit", "status"] },
                     "source": { "type": "string", "minLength": 1 },
                     "expected_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
                     "allow_warnings": { "type": "boolean", "default": false },
-                    "skill_id": { "type": "string", "minLength": 1 },
-                    "revision": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                    "skill_id": { "type": "string", "minLength": 1 }
                 },
                 "required": ["action"],
                 "additionalProperties": false

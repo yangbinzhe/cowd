@@ -86,7 +86,13 @@ pub(super) fn collect_skill_catalog(
     workspace_root: &Path,
 ) -> Result<Vec<SkillCatalogItem>, SkillServiceError> {
     let mut items = Vec::new();
-    for skill in workspace_skill_snapshot(workspace_root).skills.clone() {
+    let snapshot = workspace_skill_snapshot(workspace_root);
+    if let Some(error) = &snapshot.discovery_error {
+        return Err(SkillServiceError::Internal(format!(
+            "Skill inventory read failed: {error}"
+        )));
+    }
+    for skill in snapshot.skills.clone() {
         items.push(local_skill_catalog_item(skill));
     }
     items.sort_by(|left, right| {
@@ -117,7 +123,16 @@ fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
         .ok()
         .and_then(|profile| serde_json::to_value(profile).ok());
     SkillCatalogItem {
-        id: format!("local:{}", skill.name),
+        id: if skill.source == skill::SkillRegistrySource::UserCowdManaged {
+            use sha2::{Digest, Sha256};
+            format!(
+                "installed:{}:{:x}",
+                skill::stable_skill_id(&skill.name),
+                Sha256::digest(skill.path.to_string_lossy().as_bytes())
+            )
+        } else {
+            format!("local:{}", skill.name)
+        },
         name: skill.name,
         description: skill.description,
         scope: "local".to_string(),
@@ -125,8 +140,10 @@ fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
         domain: None,
         status: if skill.shadowed_by.is_some() {
             "shadowed".to_string()
+        } else if skill.source == skill::SkillRegistrySource::UserCowdManaged {
+            "installed".to_string()
         } else {
-            "ready".to_string()
+            "discovered".to_string()
         },
         risk: "operator_review".to_string(),
         tags: skill.tags,

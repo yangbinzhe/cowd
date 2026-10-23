@@ -255,6 +255,7 @@ pub async fn activity_detail(
         for profile in services
             .skill_catalog()
             .profiles()
+            .map_err(RuntimeServicesError::Invariant)?
             .into_iter()
             .filter(|profile| profile.skill_id == skill_id)
         {

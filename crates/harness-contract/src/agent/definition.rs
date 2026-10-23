@@ -678,6 +678,13 @@ pub struct AgentBindingSnapshot {
     pub skill_refs: Vec<String>,
     #[serde(default)]
     pub tool_contract_refs: Vec<String>,
+    /// Original Skill read cut captured before tools entered the Binding.
+    /// Missing legacy provenance is readable but cannot execute Skill grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_tool_pins: Option<Vec<crate::skill::SkillInstructionPin>>,
+    /// Only tools added by the Skill admission, excluding independent grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_tool_refs: Option<Vec<String>>,
     pub data_lease: AgentDataLease,
     /// Present when Runtime selected a concrete authorized release assignment
     /// (including Canary). Existing persisted Bindings remain readable, but
@@ -719,6 +726,54 @@ impl AgentBindingSnapshot {
         )?;
         validate_unique_non_empty("binding.skill_refs", &self.skill_refs)?;
         validate_unique_non_empty("binding.tool_contract_refs", &self.tool_contract_refs)?;
+        if !self.skill_refs.is_empty()
+            && (self.skill_tool_pins.is_none() || self.skill_tool_refs.is_none())
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "original Skill binding provenance is unavailable".into(),
+            });
+        }
+        if let Some(pins) = &self.skill_tool_pins {
+            if self
+                .skill_refs
+                .iter()
+                .any(|reference| !pins.iter().any(|pin| pin.matches_reference(reference)))
+            {
+                return Err(ValidationError::InvalidContract {
+                    message: "Skill binding source coverage is incomplete".into(),
+                });
+            }
+            for pin in pins {
+                if pin.pointer_generation == 0
+                    || pin.approval_ref.is_empty()
+                    || !self
+                        .skill_refs
+                        .iter()
+                        .any(|reference| pin.matches_reference(reference))
+                {
+                    return Err(ValidationError::InvalidContract {
+                        message: "Skill binding pin does not match its declared reference".into(),
+                    });
+                }
+            }
+        }
+        if let Some(tools) = &self.skill_tool_refs {
+            validate_unique_non_empty("binding.skill_tool_refs", tools)?;
+            if tools.iter().any(|tool| {
+                !self.tool_contract_refs.contains(tool)
+                    || !self
+                        .skill_tool_pins
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|pin| pin.tool_refs.contains(tool))
+            }) {
+                return Err(ValidationError::InvalidContract {
+                    message: "Skill tool contribution is outside the original Binding source"
+                        .into(),
+                });
+            }
+        }
         self.data_lease.validate()?;
         if let Some(release) = &self.release {
             release.validate()?;

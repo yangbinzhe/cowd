@@ -230,8 +230,10 @@ where
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
             skill_task_objective: None,
-            skill_prompt_assets: Vec::new(),
             skill_instruction_source: None,
+            skill_binding_pins: Vec::new(),
+            skill_binding_tool_refs: Vec::new(),
+            skill_instruction_pins: std::sync::Mutex::new(BTreeMap::new()),
             memory_source_uses: Arc::new(std::sync::Mutex::new((String::new(), Some(Vec::new())))),
             memory_agent_id: "primary".to_string(),
             memory_definition_lineage_id: None,
@@ -267,6 +269,7 @@ where
             tool_exposure_state: std::sync::Mutex::new(None),
             turn_tool_exposure_metrics: std::sync::Mutex::new(TurnProviderState::default()),
             active_skill_tool_refs: std::sync::Mutex::new(BTreeSet::new()),
+            skill_exposed_tool_ids: std::sync::Mutex::new(BTreeSet::new()),
             tool_exposure_revision: AtomicU64::new(0),
             tool_exposure_digest: AtomicU64::new(0),
             request_compiler: crate::PreparedRequestCompiler::new(
@@ -728,14 +731,6 @@ where
         self
     }
 
-    /// Provide prompt assets already inspected by the Skill layer. Only an
-    /// asset selected by Runtime is injected for a single model request.
-    #[must_use]
-    pub fn with_skill_prompt_assets(mut self, assets: Vec<RuntimeSkillPromptAsset>) -> Self {
-        self.skill_prompt_assets = assets;
-        self
-    }
-
     /// Attach the Gateway-owned lazy instruction source pinned to this
     /// Runtime catalog generation.
     #[must_use]
@@ -744,6 +739,20 @@ where
         source: Option<Arc<dyn crate::RuntimeSkillInstructionSource>>,
     ) -> Self {
         self.skill_instruction_source = source;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_skill_binding_tool_refs(mut self, refs: Vec<String>) -> Self {
+        self.skill_binding_tool_refs = refs;
+        self
+    }
+
+    pub(crate) fn with_skill_binding_pins(
+        mut self,
+        pins: Vec<harness_contract::skill::SkillInstructionPin>,
+    ) -> Self {
+        self.skill_binding_pins = pins;
         self
     }
 

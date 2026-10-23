@@ -495,6 +495,36 @@ async fn missing_or_wrong_version_second_skill_never_leaks_partial_prompt_or_too
     }
 }
 
+struct SkillCatalogExecutor(tools::ToolHost);
+#[async_trait::async_trait]
+impl ToolExecutor for SkillCatalogExecutor {
+    // This is a selection/exposure unit with a recording API, not a live
+    // Provider Step. Use canonical Host metadata without claiming an actual
+    // production Provider lease; wire binding has separate HTTP fence gates.
+    fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+        let mut receipt = self.0.pin_snapshot().catalog_receipt();
+        receipt
+            .descriptors
+            .retain(|descriptor| descriptor.canonical_id == "lark_cli_read");
+        receipt
+            .activation_candidates
+            .retain(|tool| tool == "lark_cli_read");
+        receipt
+    }
+    fn available_tool_names(&self) -> Vec<String> {
+        vec!["lark_cli_read".into()]
+    }
+    async fn execute_output(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+        Err(crate::ToolError::new(
+            "Skill activation fixture does not execute a tool",
+        ))
+    }
+}
+
 async fn verify_first_model_skill_activation(failure: Option<&str>) {
     let store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
@@ -538,13 +568,47 @@ async fn verify_first_model_skill_activation(failure: Option<&str>) {
         inspection_summary: vec!["release evidence planning".to_string()],
         structured_dependencies: Vec::new(),
     };
+    let mut assets = vec![crate::RuntimeSkillPromptAsset {
+        skill_id: "release-evidence".into(),
+        version: Some("1.0.0".into()),
+        content: "Require release evidence before accepting completion.".into(),
+        source_ref: "skill://release-evidence/SKILL.md".into(),
+        tool_refs: vec!["lark_cli_read".into()],
+        pin: crate::skill::test_support::pin(
+            "release-evidence",
+            Some("1.0.0"),
+            "Require release evidence before accepting completion.",
+            &["lark_cli_read"],
+        ),
+    }];
     let mut runtime = ConversationRuntime::new(
         session,
         PromptRecordingApi {
             requests: Arc::clone(&requests),
             projections: Arc::clone(&projections),
         },
-        StaticToolExecutor::new().register("lark_cli_read", |_| Ok("{}".to_string())),
+        SkillCatalogExecutor(tools::ToolHost::new(
+            "skill-activation",
+            std::env::temp_dir(),
+            tools::ToolHostSnapshot::new(
+                Arc::new(
+                    tools::ToolCatalog::builtin()
+                        .with_runtime_tools(vec![tools::RuntimeToolDefinition {
+                            name: "lark_cli_read".into(),
+                            description: Some("Canonical admitted Skill read tool".into()),
+                            input_schema: serde_json::json!({"type":"object"}),
+                            required_permission: PermissionMode::ReadOnly,
+                            effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                                resolver_id: "builtin.readonly".into(),
+                                resolver_version: 1,
+                            },
+                        }])
+                        .unwrap(),
+                ),
+                Arc::new(tools::lsp_client::LspRegistry::new()),
+                None,
+            ),
+        )),
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
         vec!["system".to_string()],
     )
@@ -552,18 +616,15 @@ async fn verify_first_model_skill_activation(failure: Option<&str>) {
     .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
         Arc::clone(&store),
     ))
-    .with_skill_profiles(vec![profile])
+    .with_skill_profiles(vec![profile.clone()])
     .with_agent_skill_profile(AgentSkillProfile {
         adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
         ..AgentSkillProfile::default()
     })
-    .with_skill_prompt_assets(vec![super::RuntimeSkillPromptAsset {
-        skill_id: "release-evidence".to_string(),
-        version: Some("1.0.0".to_string()),
-        content: "Require release evidence before accepting completion.".to_string(),
-        source_ref: "skill://release-evidence/SKILL.md".to_string(),
-        tool_refs: vec!["lark_cli_read".to_string()],
-    }]);
+    .with_skill_instruction_source(Some(Arc::new(crate::skill::test_support::Instructions(
+        assets.clone(),
+        vec![profile],
+    ))));
     runtime.model = Some("test-model".to_string());
     let query = if failure.is_some() {
         "prepare release evidence and release-verification"
@@ -577,9 +638,14 @@ async fn verify_first_model_skill_activation(failure: Option<&str>) {
         second.version = Some("2.0.0".into());
         runtime.skill_profiles.push(second);
         if failure == "version" {
-            let mut asset = runtime.skill_prompt_assets[0].clone();
+            let mut asset = assets[0].clone();
             asset.skill_id = "release-verification".into();
-            runtime.skill_prompt_assets.push(asset);
+            assets.push(asset);
+            runtime.skill_instruction_source =
+                Some(Arc::new(crate::skill::test_support::Instructions(
+                    assets.clone(),
+                    runtime.skill_profiles.clone(),
+                )));
         }
     }
     runtime
@@ -610,18 +676,25 @@ async fn verify_first_model_skill_activation(failure: Option<&str>) {
             .events
             .iter()
             .any(|event| event.kind == "skill_candidates"));
-        runtime
-            .skill_prompt_assets
-            .retain(|asset| asset.skill_id != "release-verification");
-        runtime
-            .skill_prompt_assets
-            .push(super::RuntimeSkillPromptAsset {
-                skill_id: "release-verification".into(),
-                version: Some("2.0.0".into()),
-                content: "SECOND_SKILL_VERIFIED_VERSION".into(),
-                source_ref: "skill://release-verification/SKILL.md".into(),
-                tool_refs: vec![],
-            });
+        assets.retain(|asset| asset.skill_id != "release-verification");
+        assets.push(crate::RuntimeSkillPromptAsset {
+            skill_id: "release-verification".into(),
+            version: Some("2.0.0".into()),
+            content: "SECOND_SKILL_VERIFIED_VERSION".into(),
+            pin: crate::skill::test_support::pin(
+                "release-verification",
+                Some("2.0.0"),
+                "SECOND_SKILL_VERIFIED_VERSION",
+                &[],
+            ),
+            source_ref: "skill://release-verification/SKILL.md".into(),
+            tool_refs: vec![],
+        });
+        runtime.skill_instruction_source =
+            Some(Arc::new(crate::skill::test_support::Instructions(
+                assets.clone(),
+                runtime.skill_profiles.clone(),
+            )));
     }
 
     runtime
@@ -3059,6 +3132,8 @@ async fn runtime_reality_binding_injects_only_leased_fact_evidence_into_the_prom
         },
         effective_capabilities: vec![AgentCapability::Read],
         skill_refs: Vec::new(),
+        skill_tool_pins: None,
+        skill_tool_refs: None,
         tool_contract_refs: Vec::new(),
         data_lease: AgentDataLease {
             session_id: "session-primary".to_string(),
@@ -4036,5 +4111,208 @@ async fn persisted_knowledge_is_read_without_memory_and_enters_original_prompt()
                 && item.source_id == receipt.canon.canon_id
                 && item.content.contains("must retain approval evidence")),
         "persisted required knowledge is independent from whether Memory produced a packet"
+    );
+}
+
+#[tokio::test]
+async fn active_runtime_reads_first_approval_and_upgrade_from_original_source_each_turn() {
+    struct MutableSource(
+        std::sync::RwLock<(
+            Vec<SkillCapabilityProfile>,
+            Vec<crate::RuntimeSkillPromptAsset>,
+        )>,
+    );
+    #[async_trait::async_trait]
+    impl crate::RuntimeSkillInstructionSource for MutableSource {
+        fn approved_profiles(&self) -> Result<Option<Vec<SkillCapabilityProfile>>, String> {
+            Ok(Some(
+                self.0
+                    .read()
+                    .unwrap()
+                    .0
+                    .last()
+                    .cloned()
+                    .into_iter()
+                    .collect(),
+            ))
+        }
+        fn profiles_for_pins(
+            &self,
+            pins: &[harness_contract::skill::SkillInstructionPin],
+        ) -> Result<Vec<SkillCapabilityProfile>, String> {
+            self.validate_pins(pins)?;
+            pins.iter()
+                .map(|pin| {
+                    self.0
+                        .read()
+                        .unwrap()
+                        .0
+                        .iter()
+                        .find(|profile| {
+                            profile.skill_id == pin.installation.skill_id
+                                && profile.version == pin.instruction_version
+                        })
+                        .cloned()
+                        .ok_or_else(|| "exact original profile unavailable".into())
+                })
+                .collect()
+        }
+        async fn load_pinned_instruction(
+            &self,
+            pin: &harness_contract::skill::SkillInstructionPin,
+            _: &crate::SkillInvocation,
+            _: &crate::RuntimeSkillUsageContext,
+        ) -> Result<Option<crate::RuntimeSkillPromptAsset>, String> {
+            self.validate_pins(std::slice::from_ref(pin))?;
+            Ok(self
+                .0
+                .read()
+                .unwrap()
+                .1
+                .iter()
+                .find(|asset| &asset.pin == pin)
+                .cloned())
+        }
+        fn validate_pins(
+            &self,
+            pins: &[harness_contract::skill::SkillInstructionPin],
+        ) -> Result<(), String> {
+            if pins.iter().all(|pin| {
+                self.0
+                    .read()
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|asset| &asset.pin == pin)
+            }) {
+                Ok(())
+            } else {
+                Err("unknown source pin".into())
+            }
+        }
+        async fn load_instruction(
+            &self,
+            invocation: &crate::SkillInvocation,
+            _: &crate::RuntimeSkillUsageContext,
+        ) -> Result<Option<crate::RuntimeSkillPromptAsset>, String> {
+            Ok(self
+                .0
+                .read()
+                .unwrap()
+                .1
+                .iter()
+                .rev()
+                .find(|asset| asset.skill_id == invocation.skill_id)
+                .cloned())
+        }
+    }
+    let source = Arc::new(MutableSource(std::sync::RwLock::new((vec![], vec![]))));
+    let runtime = ConversationRuntime::new(
+        Session::new(),
+        MockApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_model_context_window(32_000)
+    .with_agent_skill_profile(AgentSkillProfile {
+        explicit_grants: vec!["review".into()],
+        adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
+        ..Default::default()
+    })
+    .with_skill_instruction_source(Some(source.clone()));
+    runtime
+        .begin_turn_strategy("source-refresh-turn", "review evidence")
+        .unwrap();
+    runtime
+        .activate_skills_for_turn("review evidence")
+        .await
+        .unwrap();
+    assert!(runtime.take_next_model_context_items().is_empty());
+    for (version, body) in [
+        ("1.0.0", "FIRST_HUMAN_APPROVED_BODY"),
+        ("2.0.0", "UPGRADED_APPROVED_BODY"),
+    ] {
+        let profile = SkillCapabilityProfile {
+            skill_id: "review".into(),
+            name: "Review".into(),
+            version: Some(version.into()),
+            source_root: "unit://review".into(),
+            package_fingerprint: format!("unit:{version}"),
+            kind: SkillKind::Workflow,
+            lifecycle_status: SkillLifecycleStatus::UsablePrompt,
+            adapters: vec![SkillAdapterKind::PromptOnly],
+            risk_level: SkillRiskLevel::Low,
+            entrypoints: vec![],
+            inspection_summary: vec![],
+            structured_dependencies: vec![],
+        };
+        let asset = crate::RuntimeSkillPromptAsset {
+            skill_id: "review".into(),
+            version: Some(version.into()),
+            content: body.into(),
+            source_ref: "skill://review/SKILL.md".into(),
+            tool_refs: vec![],
+            pin: crate::skill::test_support::pin("review", Some(version), body, &[]),
+        };
+        {
+            let mut rows = source.0.write().unwrap();
+            rows.0.push(profile);
+            rows.1.push(asset);
+        }
+        runtime
+            .activate_skills_for_turn("review evidence")
+            .await
+            .unwrap();
+        let items = runtime.take_next_model_context_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source_version.as_deref(), Some(version));
+        assert!(items[0].content.contains(body));
+        assert!(
+            runtime.skill_profiles.is_empty(),
+            "same Runtime remains on its original empty constructor catalog"
+        );
+    }
+    let original_pin = source.0.read().unwrap().1[0].pin.clone();
+    let bound = ConversationRuntime::new(
+        Session::new(),
+        MockApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_model_context_window(32_000)
+    .with_agent_skill_profile(AgentSkillProfile {
+        explicit_grants: vec!["review@1.0.0".into()],
+        task_skill_refs: vec!["review@1.0.0".into()],
+        adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
+        ..Default::default()
+    })
+    .with_skill_binding_pins(vec![original_pin.clone()])
+    .with_skill_instruction_source(Some(source.clone()));
+    bound
+        .begin_turn_strategy("queued-original-binding", "review evidence")
+        .unwrap();
+    bound
+        .activate_skills_for_turn("review evidence")
+        .await
+        .unwrap();
+    let items = bound.take_next_model_context_items();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].source_version.as_deref(), Some("1.0.0"));
+    assert!(items[0].content.contains("FIRST_HUMAN_APPROVED_BODY"));
+    assert!(!items[0].content.contains("UPGRADED_APPROVED_BODY"));
+    assert_eq!(
+        bound
+            .skill_instruction_pins
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .1,
+        original_pin
     );
 }

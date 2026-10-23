@@ -1081,7 +1081,39 @@ fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
     )
     .expect("status");
     let status: serde_json::Value = serde_json::from_str(&status).expect("status json");
-    assert_eq!(status["active"]["revision"], digest);
+    assert!(
+        status.get("active").is_none(),
+        "staged metadata is not an approval"
+    );
+    assert!(status["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|revision| revision.as_str() == Some(digest)));
+    assert_eq!(receipt["activation"], "staged_only_pending_human_approval");
+    let store = config.join("skill-store/v1");
+    assert!(!store.join("reviewed-skill/active.json").exists());
+    let before = fs::read_dir(store.join("reviewed-skill/receipts"))
+        .unwrap()
+        .count();
+    for action in ["rollback", "deactivate"] {
+        let rejected = execute_in_workspace(
+            &root,
+            "skill",
+            &json!({"action":action,"skill_id":"reviewed-skill"}),
+        );
+        assert!(
+            rejected.is_err(),
+            "model must not mint a human approval: {action}"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(store.join("reviewed-skill/receipts"))
+            .unwrap()
+            .count(),
+        before
+    );
+    assert!(!store.join("reviewed-skill/active.json").exists());
 
     let outside = temp_path("outside-skill");
     fs::create_dir_all(&outside).expect("outside source");

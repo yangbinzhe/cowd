@@ -271,7 +271,7 @@ pub(crate) fn original_static_file_scopes(
                 Some(store_root.clone()),
                 ProofEffectPurpose::InputRead,
             );
-            if action != "status" && action != "install_plan" {
+            if action == "install_commit" {
                 add(write, Some(store_root), ProofEffectPurpose::BusinessEffect);
             }
             if matches!(action, "install_plan" | "install_commit") {

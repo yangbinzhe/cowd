@@ -173,43 +173,46 @@ impl Fixture {
     }
 
     pub fn catalog(&self) -> crate::RuntimeSkillCatalog {
-        let producer = crate::RuntimeSkillCatalog::new(
-            vec![SkillCapabilityProfile {
-                skill_id: "paired-evidence".into(),
-                name: "Paired evidence".into(),
-                version: Some("1.0.0".into()),
-                source_root: self
-                    .host
-                    .root
-                    .join("skills/paired-evidence")
-                    .display()
-                    .to_string(),
-                package_fingerprint: format!("{:x}", Sha256::digest(ASSET.as_bytes())),
-                kind: SkillKind::Workflow,
-                lifecycle_status: SkillLifecycleStatus::UsablePrompt,
-                adapters: vec![SkillAdapterKind::PromptOnly],
-                risk_level: SkillRiskLevel::Low,
-                entrypoints: vec![SkillEntrypoint {
-                    runtime: SkillDetectedRuntime::Markdown,
-                    path: "SKILL.md".into(),
-                    adapter: SkillAdapterKind::PromptOnly,
-                    command_hint: None,
-                }],
-                inspection_summary: vec!["write and independently verify isolated evidence".into()],
-                structured_dependencies: vec![],
+        let mut profiles = vec![SkillCapabilityProfile {
+            skill_id: "paired-evidence".into(),
+            name: "Paired evidence".into(),
+            version: Some("1.0.0".into()),
+            source_root: self
+                .host
+                .root
+                .join("skills/paired-evidence")
+                .display()
+                .to_string(),
+            package_fingerprint: format!("{:x}", Sha256::digest(ASSET.as_bytes())),
+            kind: SkillKind::Workflow,
+            lifecycle_status: SkillLifecycleStatus::UsablePrompt,
+            adapters: vec![SkillAdapterKind::PromptOnly],
+            risk_level: SkillRiskLevel::Low,
+            entrypoints: vec![SkillEntrypoint {
+                runtime: SkillDetectedRuntime::Markdown,
+                path: "SKILL.md".into(),
+                adapter: SkillAdapterKind::PromptOnly,
+                command_hint: None,
             }],
-            vec![crate::RuntimeSkillPromptAsset {
-                skill_id: "paired-evidence".into(),
-                version: Some("1.0.0".into()),
-                content: std::fs::read_to_string(
-                    self.host.root.join("skills/paired-evidence/SKILL.md"),
-                )
-                .unwrap(),
-                source_ref: "skill://paired-evidence/SKILL.md".into(),
-                tool_refs: vec!["edit".into(), "read_file".into()],
-            }],
-        );
-        let mut profiles = producer.profiles();
+            inspection_summary: vec!["write and independently verify isolated evidence".into()],
+            structured_dependencies: vec![],
+        }];
+        let mut assets = vec![crate::RuntimeSkillPromptAsset {
+            skill_id: "paired-evidence".into(),
+            pin: crate::skill::test_support::pin(
+                "paired-evidence",
+                Some("1.0.0"),
+                ASSET,
+                &["edit", "read_file"],
+            ),
+            version: Some("1.0.0".into()),
+            content: std::fs::read_to_string(
+                self.host.root.join("skills/paired-evidence/SKILL.md"),
+            )
+            .unwrap(),
+            source_ref: "skill://paired-evidence/SKILL.md".into(),
+            tool_refs: vec!["edit".into(), "read_file".into()],
+        }];
         let mut verification = profiles[0].clone();
         verification.skill_id = "paired-verification".into();
         verification.name = "Paired verification".into();
@@ -222,9 +225,14 @@ impl Fixture {
             .to_string();
         verification.package_fingerprint = format!("{:x}", Sha256::digest(VERIFY_ASSET.as_bytes()));
         profiles.push(verification);
-        let mut assets = producer.prompt_assets();
         assets.push(crate::RuntimeSkillPromptAsset {
             skill_id: "paired-verification".into(),
+            pin: crate::skill::test_support::pin(
+                "paired-verification",
+                Some("2.0.0"),
+                VERIFY_ASSET,
+                &["read_file"],
+            ),
             version: Some("2.0.0".into()),
             content: std::fs::read_to_string(
                 self.host.root.join("skills/paired-verification/SKILL.md"),
@@ -233,7 +241,7 @@ impl Fixture {
             source_ref: "skill://paired-verification/SKILL.md".into(),
             tool_refs: vec!["read_file".into()],
         });
-        crate::RuntimeSkillCatalog::new(profiles, assets)
+        crate::skill::test_support::catalog(profiles, assets)
     }
 
     pub async fn install_sessions(&self, services: &Arc<RuntimeServices>) {

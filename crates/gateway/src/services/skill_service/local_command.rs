@@ -218,7 +218,7 @@ mod tests {
 pub(super) fn render_skills_usage(topic: Option<&str>) -> String {
     match topic {
         Some("create" | "edit" | "delete" | "generate" | "managed") => {
-            "Skills - Managed In WebUI/TUI\n\nCreation and editing remain human definition-management operations.\nAcquisition, review, atomic activation, status, rollback, and deactivation use the same governed Skill lifecycle in CLI, TUI, Gateway, and model tools.".to_string()
+            "Skills - Managed In WebUI/TUI\n\nCreation and editing remain human definition-management operations.\nAcquisition stages inert immutable bytes. Activation, rollback and revocation require an authenticated human through the Runtime approval owner; model tools cannot approve.".to_string()
         }
         Some("view") => "Skills - View\n\nUsage: /skill view <name>".to_string(),
         Some("install") => "Skills - Install\n\nUsage:\n  /skill plan <source>\n  /skill install <source> --expected-digest <sha256:digest> [--allow-warnings]\n\nInstall re-acquires the reviewed source, verifies the exact SHA-256 tree digest, and atomically publishes an immutable revision. It never executes package content or grants permissions.".to_string(),
@@ -226,7 +226,7 @@ pub(super) fn render_skills_usage(topic: Option<&str>) -> String {
             "Skills",
             "  Usage            /skills [list|view <name>|plan <source>|install <source> --expected-digest <digest>|status <name>|rollback <name> <digest>|remove <name>|help|<skill> [args]]",
             "  Alias            /skill",
-            "  Direct CLI       cowd skill [list|show|validate|plan|install|status|rollback|remove]",
+            "  Direct CLI       cowd skill [list|show|validate|plan|install|status|approve-first|activate|rollback|remove|decide|active]",
             "  Local controls   immutable revisions, atomic active pointer, durable receipts",
             "  Managed in UI    create, edit, delete, generate, validate, run, governance",
         ]

@@ -53,11 +53,26 @@ enum SkillRevisionInput {
         reason_evidence_digest: String,
         receipt_id: String,
     },
+    Deactivate {
+        skill_id: String,
+        expected_generation: u64,
+        reason_evidence_digest: String,
+    },
 }
 
 impl SkillRevisionInput {
     fn matches_review(&self, review: &SkillRevisionReview) -> bool {
         match self {
+            Self::Deactivate {
+                skill_id,
+                expected_generation,
+                ..
+            } => {
+                review.action == SkillRevisionReviewAction::Deactivate
+                    && review.skill_id == *skill_id
+                    && review.expected_generation == *expected_generation
+                    && review.draft_id.is_none()
+            }
             Self::FirstInstall {
                 skill_id,
                 target_revision,
@@ -185,6 +200,79 @@ impl SkillRevisionGovernanceService {
             ));
         }
         Ok(installed)
+    }
+
+    fn configured_scope(&self) -> Result<String, SkillRevisionGovernanceError> {
+        let source = self
+            .catalog
+            .read()
+            .map_err(|_| SkillRevisionGovernanceError::Store("Skill catalog lock failed".into()))?
+            .instruction_source()
+            .ok_or_else(|| {
+                SkillRevisionGovernanceError::InvalidRequest(
+                    "Skill scope reader is unavailable".into(),
+                )
+            })?;
+        source
+            .installation_scope()
+            .map_err(SkillRevisionGovernanceError::InvalidRequest)
+    }
+
+    pub fn request_deactivation(
+        &self,
+        principal: &VerifiedPrincipal,
+        request_id: &str,
+        skill_id: &str,
+        expected_generation: u64,
+        reason_evidence_digest: &str,
+    ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
+        require_human(principal)?;
+        if request_id.trim().is_empty()
+            || skill_id.trim().is_empty()
+            || reason_evidence_digest.trim().is_empty()
+            || expected_generation == 0
+        {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "deactivation identity, generation and reason are required".into(),
+            ));
+        }
+        let input = SkillRevisionInput::Deactivate {
+            skill_id: skill_id.into(),
+            expected_generation,
+            reason_evidence_digest: reason_evidence_digest.into(),
+        };
+        if let Some(existing) = self.existing_request(request_id, &input)? {
+            return Ok(existing);
+        }
+        let cut = self.pointer_snapshot(skill_id)?;
+        let pointer = cut.0.as_ref().ok_or_else(|| {
+            SkillRevisionGovernanceError::InvalidRequest("no approved pointer to revoke".into())
+        })?;
+        if pointer.generation != expected_generation || pointer.revoked == Some(true) {
+            return Err(SkillRevisionGovernanceError::GenerationChanged);
+        }
+        let installation = pointer.installation.clone().ok_or_else(|| {
+            SkillRevisionGovernanceError::InvalidRequest(
+                "original Skill scope is unknown; source stays held".into(),
+            )
+        })?;
+        if installation.scope_ref != self.configured_scope()? {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "Skill revocation scope mismatch".into(),
+            ));
+        }
+        self.request_review(
+            request_id,
+            SkillRevisionReviewAction::Deactivate,
+            None,
+            skill_id,
+            &pointer.active_revision,
+            pointer.previous_revision.clone(),
+            &digest_json(&json!({"pointer":pointer,"reason":reason_evidence_digest})),
+            cut.clone(),
+            input,
+            installation,
+        )
     }
 
     pub fn request_first_install(
@@ -587,29 +675,71 @@ impl SkillRevisionGovernanceService {
                     "original installed Skill evidence is unavailable".into(),
                 )
             })?;
-            let actual = self.installed(
-                &review.skill_id,
-                &review.target_revision,
-                &installation.receipt_id,
-            )?;
-            if &actual != installation {
-                return Err(SkillRevisionGovernanceError::InvalidRequest(
-                    "installed Skill bytes, inspection or scope changed after review".into(),
-                ));
+            if review.action == SkillRevisionReviewAction::Deactivate {
+                let original = current
+                    .as_ref()
+                    .ok_or(SkillRevisionGovernanceError::GenerationChanged)?;
+                if original.revoked == Some(true)
+                    || original.active_revision != review.target_revision
+                    || original.installation.as_ref() != Some(installation)
+                    || installation.scope_ref != self.configured_scope()?
+                {
+                    return Err(SkillRevisionGovernanceError::InvalidRequest(
+                        "Skill revocation source changed".into(),
+                    ));
+                }
+            } else {
+                let actual = self.installed(
+                    &review.skill_id,
+                    &review.target_revision,
+                    &installation.receipt_id,
+                )?;
+                if &actual != installation {
+                    return Err(SkillRevisionGovernanceError::InvalidRequest(
+                        "installed Skill bytes, inspection or scope changed after review".into(),
+                    ));
+                }
             }
             if review.action == SkillRevisionReviewAction::FirstInstall && current.is_some() {
                 return Err(SkillRevisionGovernanceError::GenerationChanged);
             }
         }
+        let revoke = review.action == SkillRevisionReviewAction::Deactivate;
+        let epoch = current
+            .as_ref()
+            .and_then(|pointer| pointer.revocation_generation)
+            .unwrap_or(0);
+        let epoch = if approved && revoke {
+            epoch
+                .checked_add(1)
+                .ok_or(SkillRevisionGovernanceError::GenerationChanged)?
+        } else {
+            epoch
+        };
+        let next_generation = if approved {
+            current_generation
+                .checked_add(1)
+                .ok_or(SkillRevisionGovernanceError::GenerationChanged)?
+        } else {
+            current_generation
+        };
         let pointer = approved.then(|| SkillActivePointer {
             skill_id: review.skill_id.clone(),
             active_revision: review.target_revision.clone(),
             previous_revision: review.previous_revision.clone(),
-            generation: current_generation.saturating_add(1),
-            source_draft_id: review.draft_id.clone(),
+            generation: next_generation,
+            source_draft_id: if revoke {
+                current
+                    .as_ref()
+                    .and_then(|pointer| pointer.source_draft_id.clone())
+            } else {
+                review.draft_id.clone()
+            },
             approval_ref: review.approval_id.clone(),
             activated_at_ms: now_ms(),
             installation: review.installation.clone(),
+            revoked: Some(revoke),
+            revocation_generation: Some(epoch),
         });
         let approval_stream = format!("approval:{}", review.approval_id);
         let review_stream = review_stream(&review.review_id);
@@ -662,7 +792,7 @@ impl SkillRevisionGovernanceService {
                     stream_id: pointer_stream,
                     scope: RuntimeEventScope::Skill,
                     kind: POINTER_CHANGED_KIND.to_string(),
-                    status: Some("active".to_string()),
+                    status: Some(if revoke { "revoked" } else { "active" }.to_string()),
                     actor: Some("runtime.skill_revision_governance".to_string()),
                     refs: vec![skill_ref(&review.skill_id)],
                     payload: json!({"pointer": pointer}),
@@ -867,10 +997,39 @@ fn pointer_snapshot_from_store(
     else {
         return Ok((None, 0));
     };
+    let pointer = decode_pointer(&event, skill_id)?;
+    Ok((Some(pointer), event.sequence))
+}
+
+pub(crate) fn pointer_at_generation_from_store(
+    event_store: &RuntimeEventStore,
+    skill_id: &str,
+    generation: u64,
+) -> Result<Option<SkillActivePointer>, String> {
+    if generation == 0 {
+        return Err("Skill pointer generation must be positive".into());
+    }
+    let events = event_store.list_stream_after(
+        &pointer_stream(skill_id),
+        generation - 1,
+        generation,
+        1,
+        64 * 1024,
+    )?;
+    match events.as_slice() {
+        [] => Ok(None),
+        [event] if event.sequence == generation => decode_pointer(event, skill_id).map(Some),
+        _ => Err("Skill pointer generation source is incomplete".into()),
+    }
+}
+
+fn decode_pointer(
+    event: &crate::runtime_event_store::DurableRuntimeEvent,
+    skill_id: &str,
+) -> Result<SkillActivePointer, String> {
     if event.kind != POINTER_CHANGED_KIND
-        || event.stream_id != stream
+        || event.stream_id != pointer_stream(skill_id)
         || event.scope != RuntimeEventScope::Skill
-        || event.status.as_deref() != Some("active")
         || event.actor.as_deref() != Some("runtime.skill_revision_governance")
     {
         return Err("unknown Skill pointer source".into());
@@ -883,10 +1042,18 @@ fn pointer_snapshot_from_store(
             .ok_or("Skill pointer payload is missing")?,
     )
     .map_err(|error| error.to_string())?;
-    if pointer.skill_id != skill_id || pointer.generation != event.sequence {
-        return Err("Skill pointer source identity/generation mismatch".into());
+    let expected_status = if pointer.revoked == Some(true) {
+        "revoked"
+    } else {
+        "active"
+    };
+    if pointer.skill_id != skill_id
+        || pointer.generation != event.sequence
+        || event.status.as_deref() != Some(expected_status)
+    {
+        return Err("Skill pointer source identity/generation/state mismatch".into());
     }
-    Ok((Some(pointer), event.sequence))
+    Ok(pointer)
 }
 
 fn require_human(principal: &VerifiedPrincipal) -> Result<(), SkillRevisionGovernanceError> {
@@ -946,6 +1113,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::RuntimeSkillInstructionSource for InstalledSource {
+        fn installation_scope(&self) -> Result<String, String> {
+            Ok(self.scope.into())
+        }
         fn inspect_revision(
             &self,
             skill_id: &str,
@@ -1048,6 +1218,95 @@ mod tests {
             review.scope_ref(),
             &review.evidence_digest,
         )
+    }
+
+    #[test]
+    fn deactivation_uses_original_human_cut_and_epoch_while_denial_preserves_authority() {
+        let service = service();
+        approve_first(&service);
+        let principal = crate::security::test_human_interactive_principal();
+        let review = service
+            .request_deactivation(&principal, "revoke", "review", 1, "human safety reason")
+            .unwrap();
+        assert!(service
+            .request_deactivation(&principal, "revoke", "review", 1, "changed reason")
+            .is_err());
+        assert!(service
+            .request_deactivation(&principal, "stale", "review", 2, "wrong generation")
+            .is_err());
+        assert!(service
+            .decide_review(
+                &principal,
+                &crate::security::test_verified_decision_lease(
+                    &review.review_id,
+                    "skill.revision.rollback",
+                    review.scope_ref(),
+                    &review.evidence_digest
+                ),
+                &review.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "wrong action"
+            )
+            .is_err());
+        service
+            .decide_review(
+                &principal,
+                &lease(&review),
+                &review.review_id,
+                SkillRevisionReviewDecision::Deny,
+                "keep original",
+            )
+            .unwrap();
+        let original = service.pointer("review").unwrap().unwrap();
+        assert_eq!(
+            (
+                original.generation,
+                original.revocation_generation,
+                original.revoked
+            ),
+            (1, Some(0), Some(false))
+        );
+        let review = service
+            .request_deactivation(
+                &principal,
+                "revoke-approved",
+                "review",
+                1,
+                "explicit human revoke",
+            )
+            .unwrap();
+        let revoked = service
+            .decide_review(
+                &principal,
+                &lease(&review),
+                &review.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "revoke",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                revoked.generation,
+                revoked.revocation_generation,
+                revoked.revoked
+            ),
+            (2, Some(1), Some(true))
+        );
+        assert_eq!(
+            active_pointer_from_store(&service.event_store, "review").unwrap(),
+            Some(revoked)
+        );
+        assert_eq!(
+            pointer_at_generation_from_store(&service.event_store, "review", 1).unwrap(),
+            Some(original)
+        );
+        assert!(pointer_at_generation_from_store(&service.event_store, "review", 0).is_err());
+        assert!(
+            pointer_at_generation_from_store(&service.event_store, "review", 3)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

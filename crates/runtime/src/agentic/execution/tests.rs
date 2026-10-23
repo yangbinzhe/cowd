@@ -2858,6 +2858,18 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
 
 #[test]
 fn admission_intersects_multiple_definition_skills_and_custom_tools() {
+    assert_eq!(
+        super::admission::contributed_skill_tools(
+            &BTreeSet::from([
+                "read_file".into(),
+                "custom_data_lookup".into(),
+                "not_admitted".into()
+            ]),
+            &BTreeSet::from(["read_file".into()]),
+            &["read_file".into(), "custom_data_lookup".into()]
+        ),
+        vec!["custom_data_lookup"]
+    );
     let services = RuntimeServices::in_memory().expect("runtime");
     let mut entry = services
         .agent_runtime()
@@ -2881,13 +2893,19 @@ fn admission_intersects_multiple_definition_skills_and_custom_tools() {
         inspection_summary: vec!["custom analysis".to_string()],
         structured_dependencies: Vec::new(),
     };
-    let catalog = RuntimeSkillCatalog::new(
+    let catalog = crate::skill::test_support::catalog(
         vec![profile("skill.one", None), profile("skill.two", Some("2"))],
         vec![
             crate::RuntimeSkillPromptAsset {
                 skill_id: "skill.one".to_string(),
                 version: None,
                 content: "one".to_string(),
+                pin: crate::skill::test_support::pin(
+                    "skill.one",
+                    None,
+                    "one",
+                    &["custom_data_lookup"],
+                ),
                 source_ref: "skill://one".to_string(),
                 tool_refs: vec!["custom_data_lookup".to_string()],
             },
@@ -2895,13 +2913,26 @@ fn admission_intersects_multiple_definition_skills_and_custom_tools() {
                 skill_id: "skill.two".to_string(),
                 version: Some("2".to_string()),
                 content: "two".to_string(),
+                pin: crate::skill::test_support::pin(
+                    "skill.two",
+                    Some("2"),
+                    "two",
+                    &["custom_report_reader"],
+                ),
                 source_ref: "skill://two@2".to_string(),
                 tool_refs: vec!["custom_report_reader".to_string()],
             },
         ],
     );
-    let (skills, skill_tools) = effective_skill_grants(&entry, &catalog);
+    let (skills, skill_tools, skill_pins) = effective_skill_grants(&entry, &catalog).unwrap();
     assert_eq!(skills, vec!["skill.one", "skill.two@2"]);
+    assert_eq!(
+        skill_pins
+            .iter()
+            .map(|pin| pin.installation.skill_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["skill.one", "skill.two"]
+    );
     assert_eq!(
         skill_tools,
         BTreeSet::from([

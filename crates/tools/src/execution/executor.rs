@@ -1598,7 +1598,7 @@ fn run_skill_install_commit(
         "kind": "skill_install_receipt",
         "schema_version": 1,
         "receipt": receipt,
-        "activation": "active_pointer_published",
+        "activation": "staged_only_pending_human_approval",
         "execution": "none",
         "capabilities_granted": [],
     }))
@@ -1638,38 +1638,6 @@ fn run_skill_status(input: SkillStatusInput) -> Result<String, String> {
             .status(&input.skill_id)
             .map_err(|error| error.to_string())?,
     )
-}
-
-fn run_skill_rollback(lease: &ToolHostLease, input: SkillRollbackInput) -> Result<String, String> {
-    let store = skill::ManagedSkillStore::default_for_user().map_err(|error| error.to_string())?;
-    let receipt = store
-        .rollback(
-            &input.skill_id,
-            &input.revision,
-            &format!("model:{}", lease.workspace_id()),
-        )
-        .map_err(|error| error.to_string())?;
-    to_pretty_json(json!({
-        "kind": "skill_rollback_receipt",
-        "schema_version": 1,
-        "receipt": receipt,
-        "execution": "none",
-    }))
-}
-
-fn run_skill_deactivate(lease: &ToolHostLease, input: SkillStatusInput) -> Result<String, String> {
-    let store = skill::ManagedSkillStore::default_for_user().map_err(|error| error.to_string())?;
-    let previous = store
-        .deactivate(&input.skill_id, &format!("model:{}", lease.workspace_id()))
-        .map_err(|error| error.to_string())?;
-    to_pretty_json(json!({
-        "kind": "skill_deactivation_receipt",
-        "schema_version": 1,
-        "skill_id": input.skill_id,
-        "previous_active": previous,
-        "revisions_retained": true,
-        "execution": "none",
-    }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1990,13 +1958,6 @@ struct SkillInstallCommitInput {
 #[serde(deny_unknown_fields)]
 struct SkillStatusInput {
     skill_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SkillRollbackInput {
-    skill_id: String,
-    revision: String,
 }
 
 #[derive(Debug, Deserialize)]

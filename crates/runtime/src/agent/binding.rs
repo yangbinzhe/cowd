@@ -32,6 +32,8 @@ pub struct AgentBindingRequest {
     pub granted_capabilities: Vec<AgentCapability>,
     pub allowed_tool_contract_refs: Vec<String>,
     pub allowed_skill_refs: Vec<String>,
+    pub(crate) skill_tool_pins: Option<Vec<harness_contract::skill::SkillInstructionPin>>,
+    pub(crate) skill_tool_refs: Option<Vec<String>>,
     pub fact_boundaries: Vec<String>,
     pub fact_refs: Vec<String>,
     pub matrix_snapshot_refs: Vec<String>,
@@ -58,6 +60,8 @@ impl AgentBindingRequest {
             granted_capabilities: Vec::new(),
             allowed_tool_contract_refs: Vec::new(),
             allowed_skill_refs: Vec::new(),
+            skill_tool_pins: None,
+            skill_tool_refs: None,
             fact_boundaries: Vec::new(),
             fact_refs: Vec::new(),
             matrix_snapshot_refs: Vec::new(),
@@ -278,6 +282,8 @@ impl AgentBindingCompiler {
             model_policy: manifest.model_policy.clone(),
             effective_capabilities,
             skill_refs,
+            skill_tool_pins: request.skill_tool_pins,
+            skill_tool_refs: request.skill_tool_refs,
             tool_contract_refs,
             data_lease,
             release,
@@ -565,6 +571,74 @@ mod tests {
             compiler.compile(request),
             Err(AgentBindingError::EmptyEffectiveCapability)
         ));
+    }
+
+    #[test]
+    fn skill_binding_persists_exact_source_cut_and_rejects_missing_or_foreign_pins() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(&temp);
+        let compiler = AgentBindingCompiler::new(Arc::clone(&registry));
+        let definition_id =
+            AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap();
+        let mut resolved = registry
+            .resolve_agent(&definition_id, RevisionSelector::LatestApprovedStable)
+            .unwrap();
+        // A resolver input with a declared Skill ceiling; source authentication
+        // is tested at Runtime admission and by the native Gateway source.
+        resolved.revision.manifest.capability_contract.skill_refs = vec!["skill.one@1".into()];
+        let mut request = AgentBindingRequest::new(
+            definition_id,
+            RevisionSelector::LatestApprovedStable,
+            "instance-skill",
+            "session-skill",
+            "task-skill",
+        );
+        request.granted_capabilities = vec![AgentCapability::Read];
+        request.allowed_skill_refs = vec!["skill.one@1".into()];
+        request.allowed_tool_contract_refs = vec!["read_file".into()];
+        assert!(compiler
+            .compile_resolved(request.clone(), resolved.clone(), None)
+            .is_err());
+        let pin = crate::skill::test_support::pin(
+            "skill.one",
+            Some("1"),
+            "immutable instruction",
+            &["read_file"],
+        );
+        request.skill_tool_pins = Some(vec![pin.clone()]);
+        request.skill_tool_refs = Some(vec!["read_file".into()]);
+        let snapshot = compiler
+            .compile_resolved(request.clone(), resolved.clone(), None)
+            .unwrap()
+            .snapshot;
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            encoded["skill_tool_pins"][0]["installation"]["skill_id"],
+            "skill.one"
+        );
+        assert_eq!(encoded["skill_tool_pins"][0]["instruction_version"], "1");
+        assert_eq!(
+            encoded["skill_tool_pins"][0]["tool_refs"],
+            serde_json::json!(["read_file"])
+        );
+        let decoded: AgentBindingSnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.skill_tool_pins, Some(vec![pin]));
+        assert_eq!(decoded.skill_tool_refs, Some(vec!["read_file".into()]));
+        assert_eq!(
+            recompute_binding_digest(&decoded).unwrap(),
+            decoded.binding_digest
+        );
+        decoded.validate().unwrap();
+        let mut missing = decoded.clone();
+        missing.skill_tool_pins = None;
+        assert!(missing.validate().is_err());
+        request.skill_tool_pins = Some(vec![crate::skill::test_support::pin(
+            "foreign",
+            Some("1"),
+            "foreign",
+            &["read_file"],
+        )]);
+        assert!(compiler.compile_resolved(request, resolved, None).is_err());
     }
 
     #[test]

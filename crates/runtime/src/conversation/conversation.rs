@@ -549,7 +549,7 @@ use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::skill::{
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
-    RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
+    SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
 };
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
@@ -4333,10 +4333,11 @@ pub struct ConversationRuntime<C, T> {
     /// Original delegated objective, not the generic child-turn start hint.
     /// Selection-only context: the Provider already receives its scoped brief.
     skill_task_objective: Option<String>,
-    /// Gateway-inspected PromptOnly assets keyed by Skill identity. Runtime
-    /// chooses among these assets but never discovers or reads packages.
-    skill_prompt_assets: Vec<RuntimeSkillPromptAsset>,
     skill_instruction_source: Option<Arc<dyn crate::RuntimeSkillInstructionSource>>,
+    skill_binding_pins: Vec<harness_contract::skill::SkillInstructionPin>,
+    skill_binding_tool_refs: Vec<String>,
+    skill_instruction_pins:
+        std::sync::Mutex<BTreeMap<String, (String, harness_contract::skill::SkillInstructionPin)>>,
     /// Immutable identity supplied by Runtime for memory operations. A child
     /// Agent Run uses its Binding instance ID rather than the primary-turn
     /// placeholder, so concurrent instances do not share an ambient author.
@@ -4422,6 +4423,7 @@ pub struct ConversationRuntime<C, T> {
     /// Runtime folds these into the first provider exposure so Skill guidance
     /// and its executable capability arrive atomically.
     active_skill_tool_refs: std::sync::Mutex<BTreeSet<String>>,
+    skill_exposed_tool_ids: std::sync::Mutex<BTreeSet<String>>,
     /// Provider visibility changes must be monotonically ordered. A governed
     /// text-only checkpoint temporarily withdraws every schema; the next
     /// normal model step must be able to restore the catalog rather than be

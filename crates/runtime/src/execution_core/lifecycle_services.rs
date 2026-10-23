@@ -1252,6 +1252,7 @@ impl RuntimeServices {
             .clone();
         request.allowed_tool_contract_refs = scenario.allowed_tools.clone();
         request.allowed_skill_refs = scenario.allowed_skills.clone();
+        self.prepare_skill_binding_request(&mut request, None)?;
         let compiler = AgentBindingCompiler::new(Arc::clone(&self.definition_registry));
         let compiled = match evaluation {
             Some(evaluation) => compiler.compile_evaluation_resolved(request, resolved, evaluation),
@@ -2763,6 +2764,7 @@ impl RuntimeServices {
                 request.granted_capabilities = definition.granted_capabilities.clone();
                 request.allowed_tool_contract_refs = definition.allowed_tool_contract_refs.clone();
                 request.allowed_skill_refs = definition.allowed_skill_refs.clone();
+                self.prepare_skill_binding_request(&mut request, None)?;
                 let compiled = AgentBindingCompiler::new(Arc::clone(&self.definition_registry))
                     .compile(request)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;

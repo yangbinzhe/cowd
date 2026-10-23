@@ -62,6 +62,7 @@ pub struct RuntimeSkillPromptAsset {
     /// this PromptOnly Skill. Unknown or policy-ineligible tools fail closed.
     #[serde(default)]
     pub tool_refs: Vec<String>,
+    pub pin: harness_contract::skill::SkillInstructionPin,
 }
 
 /// Runtime-facing, read-only page-in boundary for one selected Skill.
@@ -70,6 +71,59 @@ pub struct RuntimeSkillPromptAsset {
 /// asks for the exact immutable instruction selected for the current turn.
 #[async_trait]
 pub trait RuntimeSkillInstructionSource: Send + Sync {
+    fn installation_scope(&self) -> Result<String, String> {
+        Err("Skill installation scope is unavailable".into())
+    }
+
+    /// Resolve only original approved metadata. Sources that supply a static
+    /// test catalog still need approved pins on every returned instruction.
+    fn approved_profiles(&self) -> Result<Option<Vec<SkillCapabilityProfile>>, String> {
+        Ok(None)
+    }
+
+    fn profiles_for_pins(
+        &self,
+        _pins: &[harness_contract::skill::SkillInstructionPin],
+    ) -> Result<Vec<SkillCapabilityProfile>, String> {
+        Err("exact approved Skill profile reading is unavailable".into())
+    }
+
+    async fn load_pinned_instruction(
+        &self,
+        _pin: &harness_contract::skill::SkillInstructionPin,
+        _invocation: &SkillInvocation,
+        _usage_context: &RuntimeSkillUsageContext,
+    ) -> Result<Option<RuntimeSkillPromptAsset>, String> {
+        Err("exact approved Skill instruction reading is unavailable".into())
+    }
+
+    fn required_tool_pins(
+        &self,
+        skill_refs: &[String],
+    ) -> Result<Vec<harness_contract::skill::SkillInstructionPin>, String> {
+        if skill_refs.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err("approved Skill tool metadata is unavailable".into())
+        }
+    }
+    fn required_tool_refs(
+        &self,
+        skill_refs: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        Ok(self
+            .required_tool_pins(skill_refs)?
+            .into_iter()
+            .flat_map(|pin| pin.tool_refs)
+            .collect())
+    }
+
+    fn validate_pins(
+        &self,
+        _pins: &[harness_contract::skill::SkillInstructionPin],
+    ) -> Result<(), String> {
+        Err("Skill approval pin verification is unavailable".into())
+    }
     /// Synchronous bounded package verification at the original governance
     /// boundary. Caller JSON/digests do not substitute for this trusted port.
     fn inspect_revision(
@@ -140,6 +194,14 @@ pub trait RuntimeSkillUsageSink: Send + Sync {
     ) -> Result<Option<harness_contract::skill::SkillActivePointer>, String> {
         Ok(None)
     }
+
+    fn pointer_at_generation(
+        &self,
+        _skill_id: &str,
+        _generation: u64,
+    ) -> Result<Option<harness_contract::skill::SkillActivePointer>, String> {
+        Err("original Skill approval version reader is unavailable".into())
+    }
 }
 
 /// Runtime-owned snapshot of inspected Skill capabilities and bounded
@@ -148,7 +210,6 @@ pub trait RuntimeSkillUsageSink: Send + Sync {
 #[derive(Clone, Default)]
 pub struct RuntimeSkillCatalog {
     profiles: Arc<[SkillCapabilityProfile]>,
-    prompt_assets: Arc<[RuntimeSkillPromptAsset]>,
     instruction_source: Option<Arc<dyn RuntimeSkillInstructionSource>>,
 }
 
@@ -157,7 +218,6 @@ impl fmt::Debug for RuntimeSkillCatalog {
         formatter
             .debug_struct("RuntimeSkillCatalog")
             .field("profiles", &self.profiles.len())
-            .field("prompt_assets", &self.prompt_assets.len())
             .field("has_instruction_source", &self.instruction_source.is_some())
             .finish()
     }
@@ -165,13 +225,9 @@ impl fmt::Debug for RuntimeSkillCatalog {
 
 impl RuntimeSkillCatalog {
     #[must_use]
-    pub fn new(
-        profiles: Vec<SkillCapabilityProfile>,
-        prompt_assets: Vec<RuntimeSkillPromptAsset>,
-    ) -> Self {
+    pub fn new(profiles: Vec<SkillCapabilityProfile>) -> Self {
         Self {
             profiles: profiles.into(),
-            prompt_assets: prompt_assets.into(),
             instruction_source: None,
         }
     }
@@ -186,13 +242,13 @@ impl RuntimeSkillCatalog {
     }
 
     #[must_use]
-    pub fn profiles(&self) -> Vec<SkillCapabilityProfile> {
-        self.profiles.to_vec()
-    }
-
-    #[must_use]
-    pub fn prompt_assets(&self) -> Vec<RuntimeSkillPromptAsset> {
-        self.prompt_assets.to_vec()
+    pub fn profiles(&self) -> Result<Vec<SkillCapabilityProfile>, String> {
+        if let Some(source) = &self.instruction_source {
+            if let Some(profiles) = source.approved_profiles()? {
+                return Ok(profiles);
+            }
+        }
+        Ok(self.profiles.to_vec())
     }
 
     #[must_use]
@@ -904,5 +960,137 @@ mod tests {
                         && candidate.source == RuntimeSkillCandidateSource::Profile
                 })
         );
+    }
+}
+
+/// Explicit read-only instruction source for unit fixtures. Production callers
+/// must supply the configured native approval source; no constructor installs
+/// a test authority implicitly.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use harness_contract::skill::{SkillInstallationEvidence, SkillInstructionPin};
+    use sha2::{Digest, Sha256};
+    pub(crate) fn pin(
+        skill_id: &str,
+        version: Option<&str>,
+        content: &str,
+        tools: &[&str],
+    ) -> SkillInstructionPin {
+        SkillInstructionPin {
+            installation: SkillInstallationEvidence {
+                scope_ref: "unit-workspace".into(),
+                skill_id: skill_id.into(),
+                revision: "unit-revision".into(),
+                receipt_id: "unit-receipt".into(),
+                receipt_digest: "unit-receipt-digest".into(),
+                inspection_fingerprint: "unit-inspection".into(),
+            },
+            pointer_generation: 1,
+            revocation_generation: 0,
+            approval_ref: "unit-human-approval".into(),
+            skill_name: skill_id.into(),
+            instruction_sha256: format!("sha256:{:x}", Sha256::digest(content.as_bytes())),
+            instruction_version: version.map(str::to_owned),
+            tool_refs: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+        }
+    }
+    pub(crate) struct Instructions(
+        pub Vec<RuntimeSkillPromptAsset>,
+        pub Vec<SkillCapabilityProfile>,
+    );
+    #[async_trait]
+    impl RuntimeSkillInstructionSource for Instructions {
+        fn profiles_for_pins(
+            &self,
+            pins: &[SkillInstructionPin],
+        ) -> Result<Vec<SkillCapabilityProfile>, String> {
+            self.validate_pins(pins)?;
+            pins.iter()
+                .map(|pin| {
+                    self.1
+                        .iter()
+                        .find(|profile| {
+                            profile.skill_id == pin.installation.skill_id
+                                && profile.version == pin.instruction_version
+                        })
+                        .cloned()
+                        .ok_or_else(|| "unit exact profile unavailable".into())
+                })
+                .collect()
+        }
+        async fn load_pinned_instruction(
+            &self,
+            pin: &SkillInstructionPin,
+            invocation: &SkillInvocation,
+            context: &RuntimeSkillUsageContext,
+        ) -> Result<Option<RuntimeSkillPromptAsset>, String> {
+            self.validate_pins(std::slice::from_ref(pin))?;
+            let asset = self.load_instruction(invocation, context).await?;
+            if asset.as_ref().is_some_and(|asset| asset.pin == *pin) {
+                Ok(asset)
+            } else {
+                Err("unit pinned instruction unavailable".into())
+            }
+        }
+        fn required_tool_pins(&self, refs: &[String]) -> Result<Vec<SkillInstructionPin>, String> {
+            let mut pins = Vec::new();
+            for reference in refs {
+                let asset = self
+                    .0
+                    .iter()
+                    .find(|asset| asset.pin.matches_reference(reference))
+                    .ok_or("unit approved Skill reference unavailable")?;
+                if asset.tool_refs != asset.pin.tool_refs
+                    || asset.version != asset.pin.instruction_version
+                {
+                    return Err("unit immutable tool metadata mismatch".into());
+                }
+                self.validate_pins(std::slice::from_ref(&asset.pin))?;
+                if !pins.contains(&asset.pin) {
+                    pins.push(asset.pin.clone());
+                }
+            }
+            Ok(pins)
+        }
+        fn validate_pins(&self, pins: &[SkillInstructionPin]) -> Result<(), String> {
+            if pins.iter().all(|pin| {
+                self.0.iter().any(|asset| {
+                    asset.pin == *pin
+                        && pin.instruction_sha256
+                            == format!("sha256:{:x}", Sha256::digest(asset.content.as_bytes()))
+                })
+            }) {
+                Ok(())
+            } else {
+                Err("unit approval does not authenticate this pin".into())
+            }
+        }
+        async fn load_instruction(
+            &self,
+            invocation: &SkillInvocation,
+            _: &RuntimeSkillUsageContext,
+        ) -> Result<Option<RuntimeSkillPromptAsset>, String> {
+            Ok(self
+                .0
+                .iter()
+                .find(|asset| asset.skill_id == invocation.skill_id)
+                .cloned())
+        }
+    }
+    pub(crate) fn catalog(
+        profiles: Vec<SkillCapabilityProfile>,
+        mut assets: Vec<RuntimeSkillPromptAsset>,
+    ) -> RuntimeSkillCatalog {
+        for asset in &mut assets {
+            if let Some(profile) = profiles
+                .iter()
+                .find(|profile| profile.skill_id == asset.skill_id)
+            {
+                asset.pin.skill_name = profile.name.clone();
+            }
+        }
+        RuntimeSkillCatalog::new(profiles.clone())
+            .with_instruction_source(Arc::new(Instructions(assets, profiles)))
     }
 }

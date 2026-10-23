@@ -336,6 +336,13 @@ impl RuntimeSkillUsageSink for RuntimeSkillUsageRecorder {
     ) -> Result<Option<harness_contract::skill::SkillActivePointer>, String> {
         super::governance::active_pointer_from_store(&self.store, skill_id)
     }
+    fn pointer_at_generation(
+        &self,
+        skill_id: &str,
+        generation: u64,
+    ) -> Result<Option<harness_contract::skill::SkillActivePointer>, String> {
+        super::governance::pointer_at_generation_from_store(&self.store, skill_id, generation)
+    }
 }
 
 pub(crate) fn skill_usage_stream_prefix(skill_id: &str) -> String {

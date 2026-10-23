@@ -2666,6 +2666,11 @@ impl AgentRuntime {
             return Err("AgentTaskPacket binding data lease does not match task identity".into());
         }
         if let Some(services) = self.services() {
+            services
+                .validate_agent_binding_release(binding)
+                .map_err(|error| {
+                    format!("AgentTaskPacket original Binding authority is not runnable: {error}")
+                })?;
             let resolved = if binding.evaluation.is_some() {
                 services
                     .validate_agent_evaluation_binding(binding)
@@ -2683,11 +2688,6 @@ impl AgentRuntime {
             } else if binding.release.as_ref().is_some_and(|release| {
                 release.channel == harness_contract::agent::ReleaseChannel::Canary
             }) {
-                services
-                    .validate_agent_binding_release(binding)
-                    .map_err(|error| {
-                        format!("AgentTaskPacket Canary Binding is not runnable: {error}")
-                    })?;
                 services
                     .definition_registry()
                     .resolve_agent_canary(&binding.definition_ref)
@@ -6416,6 +6416,8 @@ mod tests {
             },
             effective_capabilities: vec![AgentCapability::Read],
             skill_refs: Vec::new(),
+            skill_tool_pins: None,
+            skill_tool_refs: None,
             tool_contract_refs: Vec::new(),
             data_lease: harness_contract::agent::AgentDataLease {
                 session_id: "session-1".to_string(),
@@ -6431,6 +6433,42 @@ mod tests {
             evaluation: None,
             display: None,
             binding_digest: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn stable_and_process_bindings_reject_unknown_skill_pins_before_definition_or_launch() {
+        let services = RuntimeServices::in_memory().unwrap();
+        services.replace_skill_catalog(
+            crate::RuntimeSkillCatalog::default().with_instruction_source(Arc::new(
+                crate::skill::test_support::Instructions(vec![], vec![]),
+            )),
+        );
+        let runtime = AgentRuntime::new(services.event_store().clone(), configured_registry());
+        runtime.bind_services(services.clone());
+        for process in [false, true] {
+            let mut packet = task("revoked-skill");
+            let binding = packet.binding.as_mut().unwrap();
+            binding.skill_refs = vec!["review".into()];
+            binding.skill_tool_pins = Some(vec![crate::skill::test_support::pin(
+                "review",
+                None,
+                "OLD",
+                &["read_file"],
+            )]);
+            binding.skill_tool_refs = Some(vec!["read_file".into()]);
+            binding.tool_contract_refs = vec!["read_file".into()];
+            if process {
+                binding.executor = harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
+                    command_ref: "external/worker".into(),
+                    command_digest: "a".repeat(64),
+                };
+            }
+            let error = runtime.ensure_runtime_binding(packet).unwrap_err();
+            assert!(
+                error.contains("unit approval does not authenticate this pin"),
+                "{error}"
+            );
         }
     }
 

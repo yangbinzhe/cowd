@@ -93,9 +93,14 @@ pub enum ProviderPreparationFailure {
 #[derive(Clone, Default)]
 pub struct ProviderRequestPreparation {
     prepared: Option<Arc<PreparedRuntimeRequest>>,
+    skill_tool_refs: std::collections::BTreeSet<String>,
     dispatch_lease: Option<Arc<crate::execution_core::graph::ExecutionResourceLease>>,
     policy_source: Option<(crate::permissions::SessionExecutionPolicyControl, u64)>,
     preparation_scope: Option<(crate::execution_core::graph::ExecutionServiceClass, String)>,
+    skill_source: Option<(
+        Arc<dyn crate::RuntimeSkillInstructionSource>,
+        Vec<harness_contract::skill::SkillInstructionPin>,
+    )>,
 }
 impl std::fmt::Debug for ProviderRequestPreparation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -144,6 +149,53 @@ impl ProviderRequestPreparation {
     ) {
         self.policy_source = Some((source, revision));
     }
+    pub(crate) fn bind_skill_tool_refs(&mut self, tools: std::collections::BTreeSet<String>) {
+        self.skill_tool_refs = tools;
+    }
+    fn retain_actual_skill_pins(
+        &mut self,
+        prompt_pins: &[harness_contract::skill::SkillInstructionPin],
+        tool_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<(), RuntimeError> {
+        let Some((_, pins)) = self.skill_source.as_mut() else {
+            if !prompt_pins.is_empty()
+                || self
+                    .skill_tool_refs
+                    .iter()
+                    .any(|tool| tool_ids.contains(tool))
+            {
+                return Err(RuntimeError::preparation(
+                    ProviderPreparationFailure::SourceChanged,
+                    "actual Skill inputs have no original dispatch source",
+                ));
+            }
+            return Ok(());
+        };
+        if prompt_pins.iter().any(|pin| !pins.contains(pin)) {
+            return Err(RuntimeError::preparation(
+                ProviderPreparationFailure::SourceChanged,
+                "actual Skill packet does not match its dispatch source",
+            ));
+        }
+        pins.retain(|pin| {
+            prompt_pins.contains(pin)
+                || pin
+                    .tool_refs
+                    .iter()
+                    .any(|tool| self.skill_tool_refs.contains(tool) && tool_ids.contains(tool))
+        });
+        if pins.is_empty() {
+            self.skill_source = None;
+        }
+        Ok(())
+    }
+    pub(crate) fn bind_skill_source(
+        &mut self,
+        source: Arc<dyn crate::RuntimeSkillInstructionSource>,
+        pins: Vec<harness_contract::skill::SkillInstructionPin>,
+    ) {
+        self.skill_source = Some((source, pins));
+    }
     pub(crate) fn retain_dispatch_lease(
         &mut self,
         lease: Option<Arc<crate::execution_core::graph::ExecutionResourceLease>>,
@@ -158,6 +210,10 @@ struct ProviderDispatchSourceFence {
     transport: Arc<crate::ProviderTransportPool>,
     transport_fingerprint: crate::TransportProfileFingerprint,
     policy: Option<(crate::permissions::SessionExecutionPolicyControl, u64)>,
+    skill_source: Option<(
+        Arc<dyn crate::RuntimeSkillInstructionSource>,
+        Vec<harness_contract::skill::SkillInstructionPin>,
+    )>,
 }
 impl ProviderDispatchSourceFence {
     fn validate(&self) -> Result<(), RuntimeError> {
@@ -183,6 +239,14 @@ impl ProviderDispatchSourceFence {
                 ProviderPreparationFailure::SourceChanged,
                 "Session policy changed before HTTP; bind a fresh Step",
             ));
+        }
+        if let Some((source, pins)) = &self.skill_source {
+            source.validate_pins(pins).map_err(|error| {
+                RuntimeError::preparation(
+                    ProviderPreparationFailure::SourceChanged,
+                    format!("Skill approval changed before HTTP: {error}"),
+                )
+            })?;
         }
         Ok(())
     }
@@ -910,6 +974,7 @@ impl ProviderRuntimeClient {
             transport: Arc::clone(&self.transport_pool),
             transport_fingerprint: entry.request_context.transport_fingerprint,
             policy: None,
+            skill_source: None,
         };
         Ok(PreparedControlAnalysis {
             entry,
@@ -1407,6 +1472,25 @@ impl ProviderRuntimeClient {
         let dispatch_activity = activity.clone();
         let producer = match tokio::runtime::Handle::try_current() {
             Ok(handle) => Some(handle.spawn(async move {
+                let pins = match request.prompt.skill_instruction_pins() {
+                    Ok(pins) => pins,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+                let tool_ids = owner
+                    .active_tool_definitions()
+                    .into_iter()
+                    .map(|definition| definition.name)
+                    .collect();
+                if let Err(error) = request
+                    .preparation
+                    .retain_actual_skill_pins(&pins, &tool_ids)
+                {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
                 if let Err(error) = owner.prepare_frozen_request(&mut request, &snapshot).await {
                     let _ = sender.send(Err(error)).await;
                     return;
@@ -1508,6 +1592,7 @@ impl ProviderRuntimeClient {
                     transport: owner.transport_pool.clone(),
                     transport_fingerprint: entry.request_context.transport_fingerprint,
                     policy: request.preparation.policy_source.take(),
+                    skill_source: request.preparation.skill_source.take(),
                 };
                 if let Err(error) = fence.validate() {
                     let _ = sender.send(Err(error)).await;
@@ -3503,6 +3588,7 @@ mod tests {
         attempts: std::sync::atomic::AtomicUsize,
         refuse: std::sync::atomic::AtomicBool,
         advance_policy: Option<crate::permissions::SessionExecutionPolicyControl>,
+        revoke_skill: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     #[async_trait::async_trait]
@@ -3518,6 +3604,9 @@ mod tests {
                 return Err(crate::RuntimeError::new("fixture durable write refused"));
             }
             self.records.lock().unwrap().push(evidence);
+            if let Some(revoked) = &self.revoke_skill {
+                revoked.store(true, Ordering::SeqCst);
+            }
             if let Some(source) = &self.advance_policy {
                 let mut policy = source.snapshot();
                 policy.revision += 1;
@@ -4122,6 +4211,187 @@ mod tests {
         assert!(!request.budget.executable);
     }
 
+    struct SkillFenceSource {
+        pin: harness_contract::skill::SkillInstructionPin,
+        revoked: Arc<std::sync::atomic::AtomicBool>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::RuntimeSkillInstructionSource for SkillFenceSource {
+        fn validate_pins(
+            &self,
+            pins: &[harness_contract::skill::SkillInstructionPin],
+        ) -> Result<(), String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if !self.revoked.load(Ordering::SeqCst) && pins == std::slice::from_ref(&self.pin) {
+                Ok(())
+            } else {
+                Err("original approval revoked or mismatched".into())
+            }
+        }
+        async fn load_instruction(
+            &self,
+            _: &crate::SkillInvocation,
+            _: &crate::RuntimeSkillUsageContext,
+        ) -> Result<Option<crate::RuntimeSkillPromptAsset>, String> {
+            Err("wire fence fixture does not page in".into())
+        }
+    }
+    fn bind_skill_fixture(
+        client: &ProviderRuntimeClient,
+        request: &mut ApiRequest,
+    ) -> Arc<SkillFenceSource> {
+        use sha2::{Digest, Sha256};
+        let item = crate::context_runtime::ContextItem::new(
+            "skill:approved",
+            crate::context_runtime::ContextSourceKind::Task,
+            crate::context_runtime::ContextRole::Instruction,
+            "ORIGINAL_APPROVED_WIRE_SKILL",
+        );
+        let pin = crate::skill::test_support::pin(
+            "approved",
+            None,
+            "ORIGINAL_APPROVED_WIRE_SKILL",
+            &["read_file"],
+        );
+        request.prompt.push_context_item(&item);
+        request.prompt = request
+            .prompt
+            .clone()
+            .with_skill_instruction_pins(&std::collections::BTreeMap::from([(
+                "skill:approved".into(),
+                (
+                    format!("sha256:{:x}", Sha256::digest(item.content.as_bytes())),
+                    pin.clone(),
+                ),
+            )]))
+            .unwrap();
+        let source = Arc::new(SkillFenceSource {
+            pin: pin.clone(),
+            revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        request
+            .preparation
+            .bind_skill_source(source.clone(), vec![pin]);
+        let step = request.bound_step.as_ref().unwrap();
+        let snapshot = step.snapshot().clone();
+        request.bound_step = Some(Arc::new(
+            crate::step_snapshot::BoundStep::bind(
+                snapshot.identity,
+                step.lease().clone(),
+                &client.step_tool_definitions().unwrap(),
+                &json!({}),
+                &crate::step_snapshot::request_material(request),
+                snapshot.related_revisions,
+                snapshot.expires_at_ms,
+            )
+            .unwrap(),
+        ));
+        source
+    }
+
+    #[test]
+    fn omitted_skill_without_contributing_tools_drops_its_dispatch_dependency() {
+        let pin = crate::skill::test_support::pin("omitted", None, "OMITTED_BODY", &["skill_tool"]);
+        let source = Arc::new(SkillFenceSource {
+            pin: pin.clone(),
+            revoked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        for (contributed, actual) in [
+            (vec!["skill_tool"], vec!["independent_tool"]),
+            // Even the same tool name is independent when it entered through
+            // the original explicit capability grant, rather than this Skill.
+            (vec![], vec!["skill_tool"]),
+        ] {
+            let mut preparation = super::ProviderRequestPreparation::default();
+            preparation.bind_skill_source(source.clone(), vec![pin.clone()]);
+            preparation.bind_skill_tool_refs(contributed.into_iter().map(str::to_owned).collect());
+            preparation
+                .retain_actual_skill_pins(&[], &actual.into_iter().map(str::to_owned).collect())
+                .unwrap();
+            assert!(preparation.skill_source.is_none());
+            assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_revocation_at_original_wire_commit_fences_actual_http_and_missing_source_refuses(
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        for condition in [
+            "revoked_before_dispatch",
+            "revoked_at_wire_commit",
+            "missing_source",
+            "tool_without_instruction",
+        ] {
+            let (mut client, mut request) = step_wire_fixture(
+                format!("http://{}/v1", listener.local_addr().unwrap()),
+                root.path(),
+            );
+            request.budget.set_context_window_source("configured");
+            let source = bind_skill_fixture(&client, &mut request);
+            let recorder = Arc::new(StepWireRecorder {
+                revoke_skill: (matches!(
+                    condition,
+                    "revoked_at_wire_commit" | "tool_without_instruction"
+                ))
+                .then(|| source.revoked.clone()),
+                ..Default::default()
+            });
+            client.configure_provider_wire_evidence(Some(recorder.clone()));
+            if condition == "revoked_before_dispatch" {
+                source.revoked.store(true, Ordering::SeqCst);
+            }
+            if condition == "missing_source" {
+                request.preparation.skill_source = None;
+            }
+            if condition == "tool_without_instruction" {
+                request.prompt.contextual_packets.clear();
+                request
+                    .preparation
+                    .bind_skill_tool_refs(std::collections::BTreeSet::from(["read_file".into()]));
+                let step = request.bound_step.as_ref().unwrap();
+                let snapshot = step.snapshot().clone();
+                request.bound_step = Some(Arc::new(
+                    crate::step_snapshot::BoundStep::bind(
+                        snapshot.identity,
+                        step.lease().clone(),
+                        &client.step_tool_definitions().unwrap(),
+                        &json!({}),
+                        &crate::step_snapshot::request_material(&request),
+                        snapshot.related_revisions,
+                        snapshot.expires_at_ms,
+                    )
+                    .unwrap(),
+                ));
+            }
+            let events = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.stream(request).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+            assert!(events.iter().any(|event|matches!(event,Err(error) if error.preparation_failure()==Some(super::ProviderPreparationFailure::SourceChanged))),"{condition}: {events:?}");
+            assert_eq!(
+                recorder.records.lock().unwrap().len(),
+                usize::from(matches!(
+                    condition,
+                    "revoked_at_wire_commit" | "tool_without_instruction"
+                )),
+                "{condition}"
+            );
+            assert_eq!(client.transport_pool.stats().in_flight, 0);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn bound_step_wire_digest_matches_sent_bytes_and_is_recorded_before_http() {
         use sha2::Digest;
@@ -4160,6 +4430,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let (mut client, mut request) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
         request.budget.set_context_window_source("configured");
+        let skill_source = bind_skill_fixture(&client, &mut request);
         client.prepare_request_budget(&mut request).await.unwrap();
         let budget_input = request.budget.rendered_input_tokens;
         let snapshot = request.bound_step.as_ref().unwrap().snapshot().clone();
@@ -4168,6 +4439,11 @@ mod tests {
         assert!(events.iter().all(Result::is_ok), "{events:?}");
         assert!(events.iter().any(|event| matches!(event, Ok(AssistantEvent::MessageStop))));
         let sent_body = fixture.await.unwrap();
+        assert!(String::from_utf8_lossy(&sent_body).contains("ORIGINAL_APPROVED_WIRE_SKILL"));
+        assert!(
+            skill_source.reads.load(Ordering::SeqCst) >= 2,
+            "original source checked again at actual HTTP"
+        );
         let records = recorder.records.lock().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(

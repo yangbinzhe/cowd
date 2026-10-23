@@ -697,8 +697,7 @@ async fn build_and_apply_tool_host_snapshot(
     })
     .await
     .map_err(|error| format!("failed to rebuild Skill catalog snapshot: {error}"))?;
-    let mut skill_catalog =
-        runtime::RuntimeSkillCatalog::new(skill_assets.profiles, skill_assets.prompt_assets);
+    let mut skill_catalog = runtime::RuntimeSkillCatalog::new(skill_assets.profiles);
     if let Some(source) = skill_assets.instruction_source {
         skill_catalog = skill_catalog.with_instruction_source(source);
     }

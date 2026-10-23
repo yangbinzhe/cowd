@@ -2022,7 +2022,76 @@ impl RuntimeServices {
     /// Runtime composition root. Gateway, Teams and Surfaces submit only a
     /// restricted request; they never resolve Definition paths or construct
     /// executable snapshots themselves.
+    pub(crate) fn prepare_skill_binding_request(
+        &self,
+        request: &mut AgentBindingRequest,
+        captured: Option<&(
+            Vec<harness_contract::skill::SkillInstructionPin>,
+            Vec<String>,
+        )>,
+    ) -> Result<(), RuntimeServicesError> {
+        if request.allowed_skill_refs.is_empty() {
+            if captured.is_some_and(|(pins, tools)| !pins.is_empty() || !tools.is_empty()) {
+                return Err(RuntimeServicesError::Invariant(
+                    "Skill pins outside the Binding ceiling".into(),
+                ));
+            }
+            request.skill_tool_pins = None;
+            request.skill_tool_refs = None;
+            return Ok(());
+        }
+        let source = self.skill_catalog().instruction_source().ok_or_else(|| {
+            RuntimeServicesError::Invariant("Skill Binding has no original approval source".into())
+        })?;
+        let pins = match captured {
+            Some((pins, _)) => pins.clone(),
+            None => source
+                .required_tool_pins(&request.allowed_skill_refs)
+                .map_err(RuntimeServicesError::Invariant)?,
+        };
+        if request
+            .allowed_skill_refs
+            .iter()
+            .any(|reference| !pins.iter().any(|pin| pin.matches_reference(reference)))
+            || pins.iter().any(|pin| {
+                !request
+                    .allowed_skill_refs
+                    .iter()
+                    .any(|reference| pin.matches_reference(reference))
+            })
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "Skill Binding does not match its original source read cut".into(),
+            ));
+        }
+        source
+            .validate_pins(&pins)
+            .map_err(RuntimeServicesError::Invariant)?;
+        // Generic callers already supply independently authorized tools. Only
+        // original Agentic admission may contribute an additional Skill set.
+        let tools = captured.map(|(_, tools)| tools.clone()).unwrap_or_default();
+        if tools.iter().any(|tool| {
+            !request.allowed_tool_contract_refs.contains(tool)
+                || !pins.iter().any(|pin| pin.tool_refs.contains(tool))
+        }) {
+            return Err(RuntimeServicesError::Invariant(
+                "foreign Skill tool contribution".into(),
+            ));
+        }
+        request.skill_tool_refs = Some(tools);
+        request.skill_tool_pins = Some(pins);
+        Ok(())
+    }
+
     pub fn compile_agent_binding(
+        &self,
+        mut request: AgentBindingRequest,
+    ) -> Result<CompiledAgentBinding, RuntimeServicesError> {
+        self.prepare_skill_binding_request(&mut request, None)?;
+        self.compile_agent_binding_captured(request)
+    }
+
+    fn compile_agent_binding_captured(
         &self,
         request: AgentBindingRequest,
     ) -> Result<CompiledAgentBinding, RuntimeServicesError> {
@@ -2073,15 +2142,27 @@ impl RuntimeServices {
         &self,
         intent: AgentTaskIntent,
     ) -> Result<AgentTaskPacket, RuntimeServicesError> {
+        self.compile_agent_task_intent_captured(intent, None)
+    }
+
+    fn compile_agent_task_intent_captured(
+        &self,
+        intent: AgentTaskIntent,
+        pins: Option<&(
+            Vec<harness_contract::skill::SkillInstructionPin>,
+            Vec<String>,
+        )>,
+    ) -> Result<AgentTaskPacket, RuntimeServicesError> {
         let execution_identity = self.prepare_agent_task_intent(&intent)?;
         let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
         let selected = intent
             .selected_agent_id
             .as_deref()
             .and_then(|agent_id| self.agent_runtime.catalog().get(agent_id));
-        let request = request_for_intent(&intent, selected)
+        let mut request = request_for_intent(&intent, selected)
             .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
-        let compiled = self.compile_agent_binding(request)?;
+        self.prepare_skill_binding_request(&mut request, pins)?;
+        let compiled = self.compile_agent_binding_captured(request)?;
         let mut packet = compiled
             .snapshot
             .compile_task_packet(intent, execution_identity)
@@ -2231,6 +2312,36 @@ impl RuntimeServices {
         &self,
         binding: &harness_contract::agent::AgentBindingSnapshot,
     ) -> Result<(), RuntimeServicesError> {
+        binding
+            .validate()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let pins = binding
+            .skill_tool_pins
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|pin| {
+                pin.tool_refs.iter().any(|tool| {
+                    binding
+                        .skill_tool_refs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains(tool)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pins.is_empty() {
+            self.skill_catalog()
+                .instruction_source()
+                .ok_or_else(|| {
+                    RuntimeServicesError::Invariant(
+                        "Agent Skill tools have no original approval source".into(),
+                    )
+                })?
+                .validate_pins(&pins)
+                .map_err(RuntimeServicesError::Invariant)?;
+        }
         let Some(release) = &binding.release else {
             return Ok(());
         };
@@ -2260,7 +2371,35 @@ impl RuntimeServices {
         &self,
         mut graph: ExecutionGraph,
     ) -> Result<ExecutionGraph, RuntimeServicesError> {
-        self.compile_agent_task_nodes(&mut graph.nodes)?;
+        self.compile_agent_task_nodes_captured(
+            &mut graph.nodes,
+            &std::collections::BTreeMap::new(),
+        )?;
+        Ok(graph)
+    }
+
+    pub(crate) fn compile_graph_agent_intents_with_skill_pins(
+        &self,
+        mut graph: ExecutionGraph,
+        pins: &std::collections::BTreeMap<
+            String,
+            (
+                Vec<harness_contract::skill::SkillInstructionPin>,
+                Vec<String>,
+            ),
+        >,
+    ) -> Result<ExecutionGraph, RuntimeServicesError> {
+        if pins.keys().any(|id| {
+            !graph
+                .nodes
+                .iter()
+                .any(|node| &node.id == id && node.kind == ExecutionNodeKind::AgentTask)
+        }) {
+            return Err(RuntimeServicesError::Invariant(
+                "unconsumed Skill admission source".into(),
+            ));
+        }
+        self.compile_agent_task_nodes_captured(&mut graph.nodes, pins)?;
         Ok(graph)
     }
 
@@ -2269,6 +2408,20 @@ impl RuntimeServices {
     pub fn compile_agent_task_nodes(
         &self,
         nodes: &mut [harness_contract::execution_graph::ExecutionNodeSpec],
+    ) -> Result<(), RuntimeServicesError> {
+        self.compile_agent_task_nodes_captured(nodes, &std::collections::BTreeMap::new())
+    }
+
+    fn compile_agent_task_nodes_captured(
+        &self,
+        nodes: &mut [harness_contract::execution_graph::ExecutionNodeSpec],
+        pins: &std::collections::BTreeMap<
+            String,
+            (
+                Vec<harness_contract::skill::SkillInstructionPin>,
+                Vec<String>,
+            ),
+        >,
     ) -> Result<(), RuntimeServicesError> {
         for node in nodes {
             if node.kind != ExecutionNodeKind::AgentTask {
@@ -2286,7 +2439,7 @@ impl RuntimeServices {
                     intent.node_id, node.id
                 )));
             }
-            let packet = self.compile_agent_task_intent(intent)?;
+            let packet = self.compile_agent_task_intent_captured(intent, pins.get(&node.id))?;
             if let Some(work) = node.work.as_mut() {
                 work.model_profile = packet
                     .binding
@@ -4196,6 +4349,19 @@ impl RuntimeServices {
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 
+    pub fn request_skill_deactivation(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        request_id: &str,
+        skill_id: &str,
+        expected_generation: u64,
+        reason: &str,
+    ) -> Result<harness_contract::skill::SkillRevisionReview, RuntimeServicesError> {
+        self.skill_revision_governance
+            .request_deactivation(principal, request_id, skill_id, expected_generation, reason)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
     pub fn skill_revision_review(
         &self,
         review_id: &str,
@@ -4484,6 +4650,7 @@ fn validate_evolution_scenario_isolation(
     }
     let installed_skills = skill_catalog
         .profiles()
+        .map_err(RuntimeServicesError::Invariant)?
         .into_iter()
         .map(|profile| profile.skill_id)
         .collect::<BTreeSet<_>>();

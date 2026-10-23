@@ -1881,13 +1881,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     tracing::info!(
         elapsed_ms = skill_catalog_started_at.elapsed().as_millis() as u64,
         profiles = startup_skill_assets.profiles.len(),
-        prompt_assets = startup_skill_assets.prompt_assets.len(),
         "runtime skill catalog startup projection completed"
     );
-    let mut startup_skill_catalog = runtime::RuntimeSkillCatalog::new(
-        startup_skill_assets.profiles,
-        startup_skill_assets.prompt_assets,
-    );
+    let mut startup_skill_catalog =
+        runtime::RuntimeSkillCatalog::new(startup_skill_assets.profiles);
     if let Some(source) = startup_skill_assets.instruction_source {
         startup_skill_catalog = startup_skill_catalog.with_instruction_source(source);
     }

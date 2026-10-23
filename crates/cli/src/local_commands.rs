@@ -279,7 +279,7 @@ fn print_skills(args: &[String], output: OutputFormat) -> Result<(), String> {
                         let marker = if skill.shadowed_by.is_some() {
                             "shadowed"
                         } else {
-                            "active"
+                            "installed"
                         };
                         println!("  - {} ({marker})", skill.name);
                     }
@@ -407,66 +407,76 @@ fn print_skills(args: &[String], output: OutputFormat) -> Result<(), String> {
                 OutputFormat::Text => {
                     println!("Skill status");
                     println!("  Name             {}", status.skill_id);
-                    println!(
-                        "  Active           {}",
-                        status
-                            .active
-                            .as_ref()
-                            .map_or("none", |pointer| pointer.revision.as_str())
-                    );
                     println!("  Revisions        {}", status.revisions.len());
                     println!("  Receipts         {}", status.receipts.len());
                 }
             }
         }
-        "rollback" if args.len() == 3 => {
-            let store = skill::ManagedSkillStore::default_for_user()
-                .map_err(|error| error.to_string())?;
-            let receipt = store
-                .rollback(&args[1], &args[2], "cli:local-user")
-                .map_err(|error| error.to_string())?;
-            match output {
-                OutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&receipt).map_err(|error| error.to_string())?
-                ),
-                OutputFormat::Text => println!(
-                    "Skill rolled back\n  Name             {}\n  Revision         {}\n  Receipt          {}",
-                    receipt.name, receipt.revision, receipt.install_id
-                ),
-            }
-        }
-        "remove" if args.len() == 2 => {
-            let store = skill::ManagedSkillStore::default_for_user()
-                .map_err(|error| error.to_string())?;
-            let pointer = store
-                .deactivate(&args[1], "cli:local-user")
-                .map_err(|error| error.to_string())?;
-            match output {
-                OutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "kind": "skill_deactivation_receipt",
-                        "skill_id": args[1],
-                        "previous_active": pointer,
-                    }))
-                    .map_err(|error| error.to_string())?
-                ),
-                OutputFormat::Text => println!(
-                    "Skill deactivated\n  Name             {}\n  Previous         {}",
-                    args[1],
-                    pointer.as_ref().map_or("none", |value| value.revision.as_str())
-                ),
-            }
+        "approve-first" | "activate" | "rollback" | "remove" | "decide" | "active" => {
+            let value = skill_governance_request(args)?;
+            println!("{}", serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?);
         }
         _ => {
             return Err(
-                "cowd skill is limited to static skill management; usage: cowd skill list | show <name> | validate <name> | plan <source> | install <source> --expected-digest <sha256:digest> [--allow-warnings] | status <name> | rollback <name> <sha256:digest> | remove <name>"
+                "cowd skill is limited to static skill management; usage: cowd skill list | show <name> | validate <name> | plan <source> | install <source> --expected-digest <sha256:digest> [--allow-warnings] | status <name> | approve-first/activate/rollback/remove/decide/active (authenticated Gateway)"
                     .to_string(),
             )
         }
     }
     Ok(())
+}
+
+fn skill_governance_request(args: &[String]) -> Result<serde_json::Value, String> {
+    use reqwest::Method;
+    let usage = "usage: cowd skill approve-first <skill> <revision> <receipt-id> <request-id> | activate <draft> <revision> <receipt-id> <request-id> | rollback <skill> <revision> <receipt-id> <request-id> <evidence> | remove <skill> <generation> <request-id> <reason> | decide <review-id> <approve|deny> <reason> | active <skill>";
+    let (method, path, body) = match args[0].as_str() {
+        "approve-first" if args.len() == 5 => (
+            Method::POST,
+            vec!["api", "skills", &args[1], "first-install-reviews"],
+            Some(
+                serde_json::json!({"target_revision":args[2],"receipt_id":args[3],"request_id":args[4]}),
+            ),
+        ),
+        "activate" if args.len() == 5 => (
+            Method::POST,
+            vec![
+                "api",
+                "skills",
+                "maintenance",
+                &args[1],
+                "activation-reviews",
+            ],
+            Some(
+                serde_json::json!({"target_revision":args[2],"receipt_id":args[3],"request_id":args[4]}),
+            ),
+        ),
+        "rollback" if args.len() == 6 => (
+            Method::POST,
+            vec!["api", "skills", &args[1], "rollback-reviews"],
+            Some(
+                serde_json::json!({"target_revision":args[2],"receipt_id":args[3],"request_id":args[4],"evidence_digest":args[5]}),
+            ),
+        ),
+        "remove" if args.len() == 5 => (
+            Method::DELETE,
+            vec!["api", "skills", &args[1]],
+            Some(
+                serde_json::json!({"expected_generation":args[2].parse::<u64>().map_err(|_| usage)?,"request_id":args[3],"reason":args[4]}),
+            ),
+        ),
+        "decide" if args.len() == 4 && matches!(args[2].as_str(), "approve" | "deny") => (
+            Method::POST,
+            vec!["api", "skills", "revision-reviews", &args[1], "decision"],
+            Some(serde_json::json!({"decision":args[2],"reason":args[3]})),
+        ),
+        "active" if args.len() == 2 => (
+            Method::GET,
+            vec!["api", "skills", &args[1], "active-pointer"],
+            None,
+        ),
+        _ => return Err(usage.into()),
+    };
+    super::apps::skill_request(method, &path, body.as_ref())
 }
 
 fn print_doctor(args: &[String], output: OutputFormat) -> Result<(), String> {

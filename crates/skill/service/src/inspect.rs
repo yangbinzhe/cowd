@@ -146,13 +146,53 @@ pub fn profile_skill_package(
 ) -> std::io::Result<SkillCapabilityProfile> {
     let source_root = package_root(root);
     let inspection = inspect_skill_package(&source_root)?;
+    let fingerprint = package_fingerprint(&source_root, &inspection.detected_files)?;
+    let dependencies = structured_dependencies_from_skill_md(&source_root)?;
+    Ok(profile_from_inspection(
+        &source_root,
+        name,
+        version,
+        fingerprint,
+        &inspection,
+        dependencies,
+    ))
+}
+
+/// Same capability interpretation for the managed owner's verified snapshot.
+/// Neither the manifest/dependencies nor inspection are read from the path.
+pub(crate) fn profile_captured_package(
+    root: &Path,
+    name: &str,
+    version: Option<String>,
+    revision: &str,
+    inspection: &SkillInspectionReport,
+    prompt: &str,
+) -> std::io::Result<SkillCapabilityProfile> {
+    Ok(profile_from_inspection(
+        root,
+        name,
+        version,
+        revision.into(),
+        inspection,
+        structured_dependencies_from_text(prompt)?,
+    ))
+}
+
+fn profile_from_inspection(
+    source_root: &Path,
+    name: &str,
+    version: Option<String>,
+    fingerprint: String,
+    inspection: &SkillInspectionReport,
+    dependencies: Vec<SkillStructuredDependency>,
+) -> SkillCapabilityProfile {
     let risk_level = inspection
         .risk_signals
         .iter()
         .map(|signal| signal.level)
         .max()
         .unwrap_or(SkillRiskLevel::Low);
-    let kind = infer_kind(&inspection);
+    let kind = infer_kind(inspection);
     let lifecycle_status = if inspection.blocked_reasons.is_empty() {
         if inspection
             .recommended_adapters
@@ -167,20 +207,20 @@ pub fn profile_skill_package(
         SkillLifecycleStatus::Blocked
     };
 
-    Ok(SkillCapabilityProfile {
+    SkillCapabilityProfile {
         skill_id: stable_skill_id(name),
         name: name.to_string(),
         version,
         source_root: source_root.display().to_string(),
-        package_fingerprint: package_fingerprint(&source_root, &inspection.detected_files)?,
+        package_fingerprint: fingerprint,
         kind,
         lifecycle_status,
         adapters: inspection.recommended_adapters.clone(),
         risk_level,
         entrypoints: inspection.entrypoints.clone(),
-        inspection_summary: inspection_summary(&inspection),
-        structured_dependencies: structured_dependencies_from_skill_md(&source_root)?,
-    })
+        inspection_summary: inspection_summary(inspection),
+        structured_dependencies: dependencies,
+    }
 }
 
 /// Build the small catalog profile used for Skill discovery and selection.
@@ -610,7 +650,11 @@ fn structured_dependencies_from_skill_md(
         return Ok(Vec::new());
     }
     let raw = fs::read_to_string(skill_md)?;
-    let Some((frontmatter, _)) = extract_frontmatter(&raw) else {
+    structured_dependencies_from_text(&raw)
+}
+
+fn structured_dependencies_from_text(raw: &str) -> std::io::Result<Vec<SkillStructuredDependency>> {
+    let Some((frontmatter, _)) = extract_frontmatter(raw) else {
         return Ok(Vec::new());
     };
     let value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter)

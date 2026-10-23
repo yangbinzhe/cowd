@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use harness_contract::skill::{SkillAdapterKind, SkillInspectionReport};
+use harness_contract::skill::{SkillAdapterKind, SkillCapabilityProfile, SkillInspectionReport};
 use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -142,6 +142,11 @@ pub struct SkillInstallReceiptV1 {
     pub installed_at_unix_ms: u64,
     pub previous_revision: Option<String>,
     pub revision: String,
+    /// Derived catalog metadata, never an activation grant. Empty source_root
+    /// is portable; the exact store reader resolves the immutable address.
+    /// Absence preserves the original bytes/identity of historical receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<SkillCapabilityProfile>,
 }
 
 /// Verified content of one retained immutable installation. This is evidence,
@@ -155,22 +160,13 @@ pub struct InstalledRevision {
     pub inspection_fingerprint: String,
     /// Taken from the very bytes verified against the receipt, never reread.
     pub prompt: String,
+    pub profile: SkillCapabilityProfile,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManagedSkillActivePointerV1 {
-    pub schema_version: u32,
-    pub skill_id: String,
-    pub revision: String,
-    pub package_digest: String,
-    pub receipt_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedSkillEntryV1 {
-    pub pointer: ManagedSkillActivePointerV1,
+    pub receipt: SkillInstallReceiptV1,
     pub skill_dir: PathBuf,
     pub package_root: PathBuf,
     pub prompt_path: PathBuf,
@@ -182,7 +178,6 @@ pub struct ManagedSkillEntryV1 {
 pub struct SkillLifecycleStatusV1 {
     pub schema_version: u32,
     pub skill_id: String,
-    pub active: Option<ManagedSkillActivePointerV1>,
     pub revisions: Vec<String>,
     pub receipts: Vec<SkillInstallReceiptV1>,
 }
@@ -247,6 +242,60 @@ impl ManagedSkillStore {
         &self.root
     }
 
+    /// Directory identities only: no unapproved package body/receipt is read
+    /// merely to discover an approved Skill in the same store.
+    pub fn installed_skill_ids(&self) -> Result<Vec<String>, SkillLifecycleError> {
+        match fs::symlink_metadata(&self.root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(SkillLifecycleError::InvalidPackage(
+                    "invalid Skill store directory".into(),
+                ))
+            }
+            Ok(_) => {}
+        }
+        let mut ids = Vec::new();
+        for item in fs::read_dir(&self.root)? {
+            let item = item?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !item.file_type()?.is_dir() {
+                continue;
+            }
+            let id = validate_skill_id(&name)?;
+            if ids.len() >= 4096 {
+                return Err(SkillLifecycleError::InvalidPackage(
+                    "installed Skill directory budget exceeded".into(),
+                ));
+            }
+            ids.push(id);
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Bounded metadata observation. Callers granting use must compare the
+    /// original approved receipt digest; page-in must resolve full bytes.
+    pub fn installed_entry(
+        &self,
+        skill_id: &str,
+        revision: &str,
+        receipt_id: &str,
+    ) -> Result<ManagedSkillEntryV1, SkillLifecycleError> {
+        let (receipt, package_root) =
+            self.read_installed_receipt(skill_id, revision, receipt_id)?;
+        let skill_dir = self.root.join(skill_id);
+        Ok(ManagedSkillEntryV1 {
+            prompt_path: package_root.join("SKILL.md"),
+            receipt_path: skill_dir
+                .join("receipts")
+                .join(format!("{receipt_id}.json")),
+            receipt,
+            skill_dir,
+            package_root,
+        })
+    }
+
     pub fn resolve_installed(
         &self,
         skill_id: &str,
@@ -255,6 +304,7 @@ impl ManagedSkillStore {
     ) -> Result<InstalledRevision, SkillLifecycleError> {
         let (receipt, package_root, verified) =
             self.resolve_installed_package(skill_id, revision, receipt_id)?;
+        let profile = captured_profile(&verified, &package_root)?;
         let prompt = verified
             .files
             .into_iter()
@@ -272,6 +322,7 @@ impl ManagedSkillStore {
             inspection: verified.plan.inspection,
             inspection_fingerprint,
             prompt,
+            profile,
         })
     }
 
@@ -281,6 +332,33 @@ impl ManagedSkillStore {
         revision: &str,
         receipt_id: &str,
     ) -> Result<(SkillInstallReceiptV1, PathBuf, CollectedPackage), SkillLifecycleError> {
+        let (receipt, package_root) =
+            self.read_installed_receipt(skill_id, revision, receipt_id)?;
+        let verified = collect_package(&package_root, receipt.source.clone())?;
+        let inspection_fingerprint = plan_evidence_digest(&verified.plan)?;
+        let catalog_profile = captured_profile(&verified, Path::new(""))?;
+        if !receipt_matches_plan(&receipt, &verified.plan)?
+            || receipt.plan_digest != inspection_fingerprint
+            || receipt
+                .profile
+                .as_ref()
+                .is_some_and(|profile| profile != &catalog_profile)
+            || !verified.plan.blockers.is_empty()
+            || (!verified.plan.warnings.is_empty() && !receipt.warnings_accepted)
+        {
+            return Err(SkillLifecycleError::InvalidPackage(
+                "installed revision failed full receipt/content/inspection verification".into(),
+            ));
+        }
+        Ok((receipt, package_root, verified))
+    }
+
+    fn read_installed_receipt(
+        &self,
+        skill_id: &str,
+        revision: &str,
+        receipt_id: &str,
+    ) -> Result<(SkillInstallReceiptV1, PathBuf), SkillLifecycleError> {
         let skill_id = validate_skill_id(skill_id)?;
         let revision = normalize_digest(revision)?;
         if !uuid::Uuid::parse_str(receipt_id).is_ok_and(|id| id.to_string() == receipt_id) {
@@ -314,18 +392,7 @@ impl ManagedSkillStore {
                 "installed receipt identity mismatch".into(),
             ));
         }
-        let verified = collect_package(&package_root, receipt.source.clone())?;
-        let inspection_fingerprint = plan_evidence_digest(&verified.plan)?;
-        if !receipt_matches_plan(&receipt, &verified.plan)?
-            || receipt.plan_digest != inspection_fingerprint
-            || !verified.plan.blockers.is_empty()
-            || (!verified.plan.warnings.is_empty() && !receipt.warnings_accepted)
-        {
-            return Err(SkillLifecycleError::InvalidPackage(
-                "installed revision failed full receipt/content/inspection verification".into(),
-            ));
-        }
-        Ok((receipt, package_root, verified))
+        Ok((receipt, package_root))
     }
 
     pub fn status(&self, skill_id: &str) -> Result<SkillLifecycleStatusV1, SkillLifecycleError> {
@@ -334,7 +401,6 @@ impl ManagedSkillStore {
         if !skill_dir.is_dir() {
             return Err(SkillLifecycleError::NotFound(skill_id));
         }
-        let active = read_active_pointer(&skill_dir).transpose()?;
         let mut revisions = list_names(skill_dir.join("revisions"), true)?;
         for revision in &mut revisions {
             *revision = normalize_digest(revision)?;
@@ -366,85 +432,9 @@ impl ManagedSkillStore {
         Ok(SkillLifecycleStatusV1 {
             schema_version: SKILL_STORE_SCHEMA_VERSION,
             skill_id,
-            active,
             revisions,
             receipts,
         })
-    }
-
-    pub fn rollback(
-        &self,
-        skill_id: &str,
-        revision: &str,
-        actor: &str,
-    ) -> Result<SkillInstallReceiptV1, SkillLifecycleError> {
-        let skill_id = validate_skill_id(skill_id)?;
-        let digest = normalize_digest(revision)?;
-        let _lock = self.lock()?;
-        let skill_dir = self.root.join(&skill_id);
-        let package_root = skill_dir.join("revisions").join(digest_hex(&digest)?);
-        if !package_root.is_dir() {
-            return Err(SkillLifecycleError::NotFound(format!(
-                "{skill_id} revision {digest}"
-            )));
-        }
-        let source = SkillSourceIdentityV1 {
-            kind: SkillSourceKindV1::Generated,
-            locator: format!("managed:{skill_id}@{digest}"),
-            requested_ref: Some(digest.clone()),
-            resolved_ref: Some(digest.clone()),
-        };
-        let collected = collect_package(&package_root, source)?;
-        if collected.plan.package_digest != digest {
-            return Err(SkillLifecycleError::DigestMismatch {
-                expected: digest,
-                actual: collected.plan.package_digest,
-            });
-        }
-        if collected.plan.skill_id != skill_id {
-            return Err(SkillLifecycleError::InvalidPackage(
-                "revision manifest Skill id does not match its managed store owner".to_string(),
-            ));
-        }
-        if !collected.plan.blockers.is_empty() {
-            return Err(SkillLifecycleError::Blocked(
-                collected.plan.blockers.join("; "),
-            ));
-        }
-        let prior_receipt =
-            find_verified_receipt_for_revision(&skill_dir, &skill_id, &digest, &collected.plan)?;
-        let (_, _, prior_package) =
-            self.resolve_installed_package(&skill_id, &digest, &prior_receipt.install_id)?;
-        self.publish(
-            &prior_package,
-            !prior_package.plan.warnings.is_empty(),
-            actor,
-        )
-    }
-
-    pub fn deactivate(
-        &self,
-        skill_id: &str,
-        actor: &str,
-    ) -> Result<Option<ManagedSkillActivePointerV1>, SkillLifecycleError> {
-        let skill_id = validate_skill_id(skill_id)?;
-        let _lock = self.lock()?;
-        let skill_dir = self.root.join(&skill_id);
-        let Some(pointer) = read_active_pointer(&skill_dir).transpose()? else {
-            return Ok(None);
-        };
-        let inactive_dir = skill_dir.join("inactive");
-        create_private_dir_all(&inactive_dir)?;
-        let target = inactive_dir.join(format!(
-            "{}-{}-{}.json",
-            unix_ms(),
-            sanitize_actor(actor),
-            uuid::Uuid::new_v4()
-        ));
-        fs::rename(skill_dir.join("active.json"), &target)?;
-        sync_dir(&inactive_dir)?;
-        sync_dir(&skill_dir)?;
-        Ok(Some(pointer))
     }
 
     fn commit(
@@ -516,9 +506,6 @@ impl ManagedSkillStore {
             sync_dir(&revisions_dir)?;
         }
 
-        let previous_revision = read_active_pointer(&skill_dir)
-            .transpose()?
-            .map(|pointer| pointer.revision);
         let install_id = uuid::Uuid::new_v4().to_string();
         let receipt = SkillInstallReceiptV1 {
             schema_version: SKILL_STORE_SCHEMA_VERSION,
@@ -538,19 +525,12 @@ impl ManagedSkillStore {
             warnings_accepted,
             actor: sanitize_actor(actor),
             installed_at_unix_ms: unix_ms(),
-            previous_revision,
+            previous_revision: None,
             revision: package.plan.package_digest.clone(),
+            profile: Some(captured_profile(package, Path::new(""))?),
         };
         let receipt_path = receipts_dir.join(format!("{install_id}.json"));
         write_new_json(&receipt_path, &receipt)?;
-        let pointer = ManagedSkillActivePointerV1 {
-            schema_version: SKILL_STORE_SCHEMA_VERSION,
-            skill_id: package.plan.skill_id.clone(),
-            revision: package.plan.package_digest.clone(),
-            package_digest: package.plan.package_digest.clone(),
-            receipt_id: install_id,
-        };
-        write_active_pointer(&skill_dir, &pointer)?;
         Ok(receipt)
     }
 
@@ -747,79 +727,85 @@ pub fn default_managed_skill_store_root() -> std::io::Result<PathBuf> {
 pub fn list_managed_skill_entries(
     store_root: &Path,
 ) -> Result<Vec<ManagedSkillEntryV1>, SkillLifecycleError> {
-    if !store_root.is_dir() {
-        return Ok(Vec::new());
-    }
-    reject_symlink(store_root)?;
+    let store = ManagedSkillStore::new(store_root);
     let mut entries = Vec::new();
-    for entry in fs::read_dir(store_root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() || file_type.is_symlink() {
-            continue;
+    let mut metadata_bytes = 0usize;
+    for skill_id in store.installed_skill_ids()? {
+        for item in fs::read_dir(store_root.join(&skill_id).join("receipts"))? {
+            let path = item?.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            if entries.len() >= 4096 {
+                return Err(SkillLifecycleError::InvalidPackage(
+                    "installed inventory exceeds 4096 entries".into(),
+                ));
+            }
+            let remaining = (8 * 1024 * 1024usize).saturating_sub(metadata_bytes);
+            let (receipt, bytes) = read_json_bounded_with_size::<SkillInstallReceiptV1>(
+                &path,
+                remaining.min(256 * 1024) as u64,
+            )?;
+            metadata_bytes = metadata_bytes.saturating_add(bytes);
+            if metadata_bytes > 8 * 1024 * 1024 {
+                return Err(SkillLifecycleError::InvalidPackage(
+                    "installed inventory exceeds metadata budget".into(),
+                ));
+            }
+            let expected_name = format!("{}.json", receipt.install_id);
+            if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+                || receipt.skill_id != skill_id
+            {
+                return Err(SkillLifecycleError::InvalidPackage(
+                    "installed inventory receipt identity mismatch".into(),
+                ));
+            }
+            entries.push(store.installed_entry(
+                &skill_id,
+                &receipt.revision,
+                &receipt.install_id,
+            )?);
         }
-        let skill_dir = entry.path();
-        let Some(pointer) = read_active_pointer(&skill_dir).transpose()? else {
-            continue;
-        };
-        if entry.file_name().to_string_lossy() != pointer.skill_id {
-            return Err(SkillLifecycleError::InvalidPackage(format!(
-                "active pointer Skill id does not match {}",
-                skill_dir.display()
-            )));
-        }
-        let installed = ManagedSkillStore::new(store_root).resolve_installed(
-            &pointer.skill_id,
-            &pointer.revision,
-            &pointer.receipt_id,
-        )?;
-        if installed.receipt.package_digest != pointer.package_digest {
-            return Err(SkillLifecycleError::InvalidPackage(
-                "active pointer does not match installed receipt".into(),
-            ));
-        }
-        let package_root = installed.package_root;
-        let prompt_path = package_root.join("SKILL.md");
-        let receipt_path = skill_dir
-            .join("receipts")
-            .join(format!("{}.json", pointer.receipt_id));
-        entries.push(ManagedSkillEntryV1 {
-            pointer,
-            skill_dir,
-            package_root,
-            prompt_path,
-            receipt_path,
-        });
     }
-    entries.sort_by(|left, right| left.pointer.skill_id.cmp(&right.pointer.skill_id));
+    entries.sort_by(|a, b| {
+        (
+            &a.receipt.skill_id,
+            &a.receipt.revision,
+            &a.receipt.install_id,
+        )
+            .cmp(&(
+                &b.receipt.skill_id,
+                &b.receipt.revision,
+                &b.receipt.install_id,
+            ))
+    });
+    // Re-installing identical inert bytes does not create a second capability.
+    entries.dedup_by(|a, b| {
+        a.receipt.skill_id == b.receipt.skill_id && a.receipt.revision == b.receipt.revision
+    });
     Ok(entries)
 }
 
-fn find_verified_receipt_for_revision(
-    skill_dir: &Path,
-    skill_id: &str,
-    revision: &str,
-    plan: &SkillInstallPlanV1,
-) -> Result<SkillInstallReceiptV1, SkillLifecycleError> {
-    let receipt_dir = skill_dir.join("receipts");
-    if receipt_dir.is_dir() {
-        for name in list_names(&receipt_dir, false)? {
-            if !name.ends_with(".json") {
-                continue;
-            }
-            let receipt =
-                read_json_bounded::<SkillInstallReceiptV1>(&receipt_dir.join(name), 256 * 1024)?;
-            if receipt.skill_id == skill_id
-                && receipt.revision == revision
-                && receipt_matches_plan(&receipt, plan)?
-            {
-                return Ok(receipt);
-            }
-        }
-    }
-    Err(SkillLifecycleError::InvalidPackage(format!(
-        "revision {revision} has no matching durable install receipt"
-    )))
+fn captured_profile(
+    package: &CollectedPackage,
+    root: &Path,
+) -> Result<SkillCapabilityProfile, SkillLifecycleError> {
+    let prompt = package
+        .files
+        .iter()
+        .find(|file| file.relative == "SKILL.md")
+        .ok_or_else(|| SkillLifecycleError::InvalidPackage("installed prompt missing".into()))?;
+    let prompt = std::str::from_utf8(&prompt.bytes)
+        .map_err(|_| SkillLifecycleError::InvalidPackage("installed prompt is not UTF-8".into()))?;
+    crate::inspect::profile_captured_package(
+        root,
+        &package.plan.name,
+        package.plan.version.clone(),
+        &package.plan.package_digest,
+        &package.plan.inspection,
+        prompt,
+    )
+    .map_err(SkillLifecycleError::Io)
 }
 
 fn receipt_matches_plan(
@@ -1574,44 +1560,6 @@ fn github_token() -> Option<String> {
         .filter(|token| !token.trim().is_empty())
 }
 
-fn read_active_pointer(
-    skill_dir: &Path,
-) -> Option<Result<ManagedSkillActivePointerV1, SkillLifecycleError>> {
-    let path = skill_dir.join("active.json");
-    path.is_file().then(|| {
-        reject_symlink(&path)?;
-        let pointer = read_json_bounded::<ManagedSkillActivePointerV1>(&path, 64 * 1024)?;
-        if pointer.schema_version != SKILL_STORE_SCHEMA_VERSION
-            || pointer.skill_id != validate_skill_id(&pointer.skill_id)?
-            || normalize_digest(&pointer.revision)? != pointer.package_digest
-        {
-            return Err(SkillLifecycleError::InvalidPackage(format!(
-                "invalid active pointer {}",
-                path.display()
-            )));
-        }
-        Ok(pointer)
-    })
-}
-
-fn write_active_pointer(
-    skill_dir: &Path,
-    pointer: &ManagedSkillActivePointerV1,
-) -> Result<(), SkillLifecycleError> {
-    let mut temporary = TempBuilder::new()
-        .prefix("active-")
-        .tempfile_in(skill_dir)?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), pointer)?;
-    temporary.as_file_mut().write_all(b"\n")?;
-    temporary.as_file_mut().sync_all()?;
-    set_private_file_mode(temporary.path())?;
-    let (file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
-    drop(file);
-    fs::rename(temporary_path, skill_dir.join("active.json"))?;
-    sync_dir(skill_dir)?;
-    Ok(())
-}
-
 fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<(), SkillLifecycleError> {
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     serde_json::to_writer_pretty(&mut file, value)?;
@@ -1628,6 +1576,13 @@ fn read_json_bounded<T: for<'de> Deserialize<'de>>(
     path: &Path,
     max_bytes: u64,
 ) -> Result<T, SkillLifecycleError> {
+    read_json_bounded_with_size(path, max_bytes).map(|(value, _)| value)
+}
+
+fn read_json_bounded_with_size<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(T, usize), SkillLifecycleError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(SkillLifecycleError::InvalidPackage(
@@ -1657,7 +1612,7 @@ fn read_json_bounded<T: for<'de> Deserialize<'de>>(
             "metadata changed or exceeded read budget".into(),
         ));
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok((serde_json::from_slice(&bytes)?, bytes.len()))
 }
 
 fn list_names(
@@ -2113,65 +2068,76 @@ mod tests {
     }
 
     #[test]
-    fn plan_commit_replace_rollback_and_deactivate_are_evidence_bound() {
-        let temp = tempfile::tempdir().expect("temp");
+    fn plan_commit_stages_exact_revisions_without_authorizing_activation() {
+        let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         package(&source, "demo-skill", "First revision");
-        let lifecycle = SkillLifecycle::new(ManagedSkillStore::new(temp.path().join("store")))
-            .expect("lifecycle");
+        let lifecycle =
+            SkillLifecycle::new(ManagedSkillStore::new(temp.path().join("store"))).unwrap();
+        let first_plan = lifecycle
+            .plan(source.to_str().unwrap(), temp.path())
+            .unwrap();
         let first = lifecycle
-            .plan(source.to_str().expect("source"), temp.path())
-            .expect("first plan");
-        let receipt = lifecycle
             .commit(
-                source.to_str().expect("source"),
+                source.to_str().unwrap(),
                 temp.path(),
-                &first.package_digest,
+                &first_plan.package_digest,
                 false,
                 "human:test",
             )
-            .expect("first commit");
-        assert_eq!(receipt.revision, first.package_digest);
-        let entries = list_managed_skill_entries(lifecycle.store().root()).expect("entries");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].pointer.skill_id, "demo-skill");
-
+            .unwrap();
+        assert_eq!(first.revision, first_plan.package_digest);
+        assert!(first.previous_revision.is_none());
+        assert!(!lifecycle
+            .store()
+            .root()
+            .join("demo-skill/active.json")
+            .exists());
         package(&source, "demo-skill", "Second revision");
+        let second_plan = lifecycle
+            .plan(source.to_str().unwrap(), temp.path())
+            .unwrap();
         let second = lifecycle
-            .plan(source.to_str().expect("source"), temp.path())
-            .expect("second plan");
-        lifecycle
             .commit(
-                source.to_str().expect("source"),
+                source.to_str().unwrap(),
                 temp.path(),
-                &second.package_digest,
+                &second_plan.package_digest,
                 false,
                 "human:test",
             )
-            .expect("second commit");
-        let rollback = lifecycle
+            .unwrap();
+        let old = lifecycle
             .store()
-            .rollback("demo-skill", &first.package_digest, "human:test")
-            .expect("rollback");
-        assert_eq!(rollback.revision, first.package_digest);
-        assert_eq!(rollback.previous_revision, Some(second.package_digest));
-        assert!(lifecycle
+            .resolve_installed("demo-skill", &first.revision, &first.install_id)
+            .unwrap();
+        let new = lifecycle
             .store()
-            .deactivate("demo-skill", "human:test")
-            .expect("deactivate")
-            .is_some());
-        assert!(list_managed_skill_entries(lifecycle.store().root())
-            .expect("entries")
-            .is_empty());
+            .resolve_installed("demo-skill", &second.revision, &second.install_id)
+            .unwrap();
+        assert!(old.prompt.ends_with("First revision\n"));
+        assert!(new.prompt.ends_with("Second revision\n"));
+        assert_eq!(old.profile.version.as_deref(), Some("1.0.0"));
+        let entries = list_managed_skill_entries(lifecycle.store().root()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.receipt.skill_id == "demo-skill"));
         assert_eq!(
             lifecycle
                 .store()
                 .status("demo-skill")
-                .expect("status")
+                .unwrap()
                 .revisions
                 .len(),
             2
         );
+        assert!(!lifecycle
+            .store()
+            .root()
+            .join("demo-skill/active.json")
+            .exists());
+        // Native approval/rollback/revocation belongs to the separate existing
+        // human governance owner, covered at that actual transaction boundary.
     }
 
     #[test]
@@ -2346,7 +2312,11 @@ mod tests {
         )
         .expect("tamper receipt");
         assert!(matches!(
-            list_managed_skill_entries(lifecycle.store().root()),
+            lifecycle.store().resolve_installed(
+                "extension",
+                &receipt.revision,
+                &receipt.install_id
+            ),
             Err(SkillLifecycleError::InvalidPackage(_))
         ));
     }

@@ -333,19 +333,66 @@ async fn skill_create_handler(
     Ok((StatusCode::CREATED, Json(result)))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillDeactivationRequest {
+    request_id: String,
+    expected_generation: u64,
+    reason: String,
+}
+
 async fn skill_delete_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     AxumPath(id): AxumPath<String>,
+    Json(request): Json<SkillDeactivationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    require_skill_manager(&principal)?;
-    let service = state.services.skill.clone();
-    let workspace_root = state.workspace_root.clone();
-    let actor = format!("gateway:{}", principal.0.claims().principal_id);
-    let result =
-        run_skill_blocking(move || service.delete_managed(&workspace_root, &id, &actor)).await?;
-    crate::services::invalidate_workspace_skill_snapshot(&state.workspace_root);
-    Ok(Json(result))
+    require_skill_revision_principal(&principal)?;
+    // Accept the original stable ID directly, so missing body bytes cannot
+    // prevent a human from revoking the durable approval. Catalog UI IDs are
+    // resolved through the existing management projection only when needed.
+    let runtime = runtime_skill_services(&state)?;
+    let skill_id = if runtime
+        .skill_active_pointer(&id)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        id.clone()
+    } else {
+        state
+            .services
+            .skill
+            .managed_skill_id(&state.workspace_root, &id)
+            .map_err(skill_error)?
+    };
+    let review = runtime
+        .request_skill_deactivation(
+            &principal.0,
+            &request.request_id,
+            &skill_id,
+            request.expected_generation,
+            &request.reason,
+        )
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let pointer = if review.status == harness_contract::skill::SkillRevisionReviewStatus::Approved {
+        runtime
+            .skill_active_pointer(&skill_id)
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        let lease = issue_skill_revision_decision_lease(&state, &principal, &review)?;
+        runtime
+            .decide_skill_revision_review(
+                &principal.0,
+                &lease,
+                &review.review_id,
+                harness_contract::skill::SkillRevisionReviewDecision::Approve,
+                &request.reason,
+            )
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
+    };
+    Ok(Json(
+        serde_json::json!({"kind":"skills.revision_decision", "owner":"runtime", "pointer":pointer, "review_id":review.review_id, "immutable_revisions_retained":true}),
+    ))
 }
 
 async fn run_skill_blocking<T, F>(operation: F) -> Result<T, (StatusCode, Json<ErrorResponse>)>

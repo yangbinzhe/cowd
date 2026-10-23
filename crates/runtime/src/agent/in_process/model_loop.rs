@@ -410,7 +410,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             skill_profiles: if binding.skill_refs.is_empty() {
                 Vec::new()
             } else {
-                skill_catalog.profiles()
+                skill_catalog.instruction_source().ok_or("Agent Skill source is unavailable")?
+                    .profiles_for_pins(binding.skill_tool_pins.as_deref().ok_or("Agent Skill pins are unavailable")?)?
             },
             agent_skill_profile: harness_contract::skill::AgentSkillProfile {
                 baseline_skill_refs: Vec::new(),
@@ -421,11 +422,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 hidden_skill_refs: Vec::new(),
                 adapter_ceiling: Vec::new(),
             },
-            skill_prompt_assets: if binding.skill_refs.is_empty() {
-                Vec::new()
-            } else {
-                skill_catalog.prompt_assets()
-            },
+            skill_binding_pins: binding.skill_tool_pins.clone().unwrap_or_default(),
+            skill_binding_tool_refs: binding.skill_tool_refs.clone().unwrap_or_default(),
             skill_instruction_source: (!binding.skill_refs.is_empty())
                 .then(|| skill_catalog.instruction_source())
                 .flatten(),

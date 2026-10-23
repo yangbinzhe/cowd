@@ -128,12 +128,8 @@ pub(crate) fn execute_with_lease(
                 Some("install_commit") => from_value::<SkillInstallCommitInput>(&rest)
                     .and_then(|parsed| run_skill_install_commit(lease, parsed)),
                 Some("status") => from_value::<SkillStatusInput>(&rest).and_then(run_skill_status),
-                Some("rollback") => from_value::<SkillRollbackInput>(&rest)
-                    .and_then(|parsed| run_skill_rollback(lease, parsed)),
-                Some("deactivate") => from_value::<SkillStatusInput>(&rest)
-                    .and_then(|parsed| run_skill_deactivate(lease, parsed)),
                 other => Err(format!(
-                    "skill action must be install_plan|install_commit|status|rollback|deactivate, got {other:?}"
+                    "skill action must be install_plan|install_commit|status, got {other:?}"
                 )),
             }
         }

@@ -275,7 +275,25 @@ where
         if let Ok(mut tool_refs) = self.active_skill_tool_refs.lock() {
             tool_refs.clear();
         }
-        if self.skill_profiles.is_empty() {
+        self.skill_instruction_pins
+            .lock()
+            .map_err(|_| RuntimeError::new("Skill pin provenance is poisoned"))?
+            .clear();
+        let profiles = match self.skill_instruction_source.as_ref() {
+            Some(source) if !self.skill_binding_pins.is_empty() => source
+                .profiles_for_pins(&self.skill_binding_pins)
+                .map_err(RuntimeError::new)?,
+            Some(source) => source
+                .approved_profiles()
+                .map_err(RuntimeError::new)?
+                .unwrap_or_else(|| self.skill_profiles.clone()),
+            None => self.skill_profiles.clone(),
+        };
+        if profiles.is_empty() {
+            self.skill_instruction_pins
+                .lock()
+                .map_err(|_| RuntimeError::new("Skill pin provenance is poisoned"))?
+                .clear();
             return Ok(());
         }
 
@@ -288,7 +306,7 @@ where
                 |objective| format!("{objective}\n\n{user_input}"),
             ),
             capability_refs: Vec::new(),
-            available_profiles: self.skill_profiles.clone(),
+            available_profiles: profiles,
             agent_profile: self.agent_skill_profile.clone(),
         });
 
@@ -296,6 +314,7 @@ where
         // tool exposure. A missing later Skill must not leave ghost input for
         // the next Provider attempt.
         let mut prepared_items = Vec::new();
+        let mut prepared_pins = BTreeMap::new();
         let mut prepared_tools = Vec::new();
         for activation in &decision.activations {
             if let Some(invocation) = activation.selected_invocation.as_ref() {
@@ -336,20 +355,36 @@ where
                     observed_at_ms: now_ms(),
                 };
                 let asset = match self.skill_instruction_source.as_ref() {
-                    Some(source) => source
-                        .load_instruction(invocation, &usage_context)
-                        .await
-                        .map_err(|error| {
+                    Some(source) => {
+                        let loaded = if self.skill_binding_pins.is_empty() {
+                            source.load_instruction(invocation, &usage_context).await
+                        } else {
+                            let pin = self
+                                .skill_binding_pins
+                                .iter()
+                                .find(|pin| {
+                                    pin.installation.skill_id == invocation.skill_id
+                                        && pin.instruction_version == invocation.skill_version
+                                })
+                                .ok_or_else(|| {
+                                    RuntimeError::new("selected Skill has no original Binding pin")
+                                })?;
+                            source
+                                .load_pinned_instruction(pin, invocation, &usage_context)
+                                .await
+                        };
+                        loaded.map_err(|error| {
                             RuntimeError::new(format!(
                                 "runtime skill `{}` instruction page-in failed: {error}",
                                 invocation.skill_id
                             ))
-                        })?,
-                    None => self
-                        .skill_prompt_assets
-                        .iter()
-                        .find(|asset| asset.skill_id == invocation.skill_id)
-                        .cloned(),
+                        })?
+                    }
+                    None => {
+                        return Err(RuntimeError::new(
+                            "Skill instruction requires the original approval source",
+                        ))
+                    }
                 };
                 if asset.is_none()
                     && invocation.adapter == harness_contract::skill::SkillAdapterKind::PromptOnly
@@ -389,6 +424,29 @@ where
                     item.source_version = asset.version.clone();
                     item.source_reason = Some("runtime selected prompt-only skill".to_string());
                     item.evidence = vec![asset.source_ref.clone()];
+                    use sha2::{Digest, Sha256};
+                    if asset.pin.instruction_sha256
+                        != format!("sha256:{:x}", Sha256::digest(asset.content.as_bytes()))
+                        || asset.pin.installation.skill_id != asset.skill_id
+                        || asset.pin.instruction_version != asset.version
+                        || asset.pin.tool_refs != asset.tool_refs
+                    {
+                        return Err(RuntimeError::new(
+                            "Skill instruction does not match its original pin",
+                        ));
+                    }
+                    self.skill_instruction_source
+                        .as_ref()
+                        .ok_or_else(|| RuntimeError::new("Skill approval source is unavailable"))?
+                        .validate_pins(std::slice::from_ref(&asset.pin))
+                        .map_err(RuntimeError::new)?;
+                    prepared_pins.insert(
+                        format!("skill:{}", asset.skill_id),
+                        (
+                            format!("sha256:{:x}", Sha256::digest(item.content.as_bytes())),
+                            asset.pin,
+                        ),
+                    );
                     prepared_items.push(item);
                 }
             }
@@ -446,6 +504,10 @@ where
         if let Ok(mut tool_refs) = self.active_skill_tool_refs.lock() {
             tool_refs.extend(prepared_tools);
         }
+        *self
+            .skill_instruction_pins
+            .lock()
+            .map_err(|_| RuntimeError::new("Skill pin provenance is poisoned"))? = prepared_pins;
         for item in prepared_items {
             self.push_next_model_context_item(item);
         }
@@ -2164,7 +2226,7 @@ where
         envelope: ContextEnvelope,
         knowledge: Option<KnowledgeTurnReport>,
         clock_stamp: &crate::prompt::RuntimeClockStamp,
-    ) -> PromptAssembly {
+    ) -> Result<PromptAssembly, RuntimeError> {
         let fact_decision = self
             .runtime_fact_decision_for_context(user_input, &envelope)
             .await;
@@ -2179,7 +2241,11 @@ where
         prompt.set_cache_cohort_user_prefix(self.cache_cohort_user_prefix());
         prompt.set_immutable_user_prefix(self.immutable_user_prefix());
         self.remember_context_envelope(envelope).await;
-        prompt
+        let pins = self
+            .skill_instruction_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prompt.with_skill_instruction_pins(&pins)
     }
 
     pub(super) async fn remember_context_governance_report(
@@ -2907,7 +2973,7 @@ where
             );
             return Ok(self
                 .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
-                .await
+                .await?
                 .with_memory_source_readsets(&source_readsets));
         };
 
@@ -3046,7 +3112,7 @@ where
                 );
                 Ok(self
                     .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
-                    .await
+                    .await?
                     .with_memory_source_readsets(&source_readsets))
             }
             Err(err) => {
@@ -3076,7 +3142,7 @@ where
                 );
                 Ok(self
                     .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
-                    .await
+                    .await?
                     .with_memory_source_readsets(&source_readsets))
             }
         }
