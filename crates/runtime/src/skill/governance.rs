@@ -3,10 +3,7 @@
 //! Maintenance Drafts are inert evidence. A pointer can move only through a
 //! pending approval and a one-time verified human decision lease.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::Arc;
 
 use harness_contract::{
     core::TaskRisk,
@@ -56,72 +53,14 @@ pub enum SkillRevisionGovernanceError {
 pub struct SkillRevisionGovernanceService {
     event_store: Arc<RuntimeEventStore>,
     approvals: Arc<ApprovalQueue>,
-    pointer_cache: Arc<SkillRevisionPointerCache>,
-}
-
-/// Shared, read-through view of approved Skill revisions.
-///
-/// The Gateway page-in path and Runtime governance service receive the same
-/// instance from the composition root. Normal Skill activation therefore
-/// performs no durable-store read, while every approved pointer transaction
-/// updates the cache before the decision is returned.
-#[derive(Debug, Default)]
-pub struct SkillRevisionPointerCache {
-    pointers: RwLock<BTreeMap<String, Option<SkillActivePointer>>>,
-}
-
-impl SkillRevisionPointerCache {
-    #[must_use]
-    pub fn pointer(
-        &self,
-        event_store: &RuntimeEventStore,
-        skill_id: &str,
-    ) -> Result<Option<SkillActivePointer>, String> {
-        if let Some(pointer) = self
-            .pointers
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(skill_id)
-            .cloned()
-        {
-            return Ok(pointer);
-        }
-        let pointer = active_pointer_from_store(event_store, skill_id)?;
-        self.pointers
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(skill_id.to_string(), pointer.clone());
-        Ok(pointer)
-    }
-
-    fn publish(&self, skill_id: &str, pointer: Option<SkillActivePointer>) {
-        self.pointers
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(skill_id.to_string(), pointer);
-    }
 }
 
 impl SkillRevisionGovernanceService {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>, approvals: Arc<ApprovalQueue>) -> Self {
-        Self::with_pointer_cache(
-            event_store,
-            approvals,
-            Arc::new(SkillRevisionPointerCache::default()),
-        )
-    }
-
-    #[must_use]
-    pub fn with_pointer_cache(
-        event_store: Arc<RuntimeEventStore>,
-        approvals: Arc<ApprovalQueue>,
-        pointer_cache: Arc<SkillRevisionPointerCache>,
-    ) -> Self {
         Self {
             event_store,
             approvals,
-            pointer_cache,
         }
     }
 
@@ -438,10 +377,6 @@ impl SkillRevisionGovernanceService {
                 lease,
             )
             .map_err(|error| SkillRevisionGovernanceError::Store(error.to_string()))?;
-        if approved {
-            self.pointer_cache
-                .publish(&review.skill_id, pointer.clone());
-        }
         self.approvals.refresh();
         Ok(pointer)
     }
@@ -484,16 +419,11 @@ impl SkillRevisionGovernanceService {
         Ok(review)
     }
 
-    pub(crate) fn pointer_cache(&self) -> Arc<SkillRevisionPointerCache> {
-        Arc::clone(&self.pointer_cache)
-    }
-
     pub fn pointer(
         &self,
         skill_id: &str,
     ) -> Result<Option<SkillActivePointer>, SkillRevisionGovernanceError> {
-        self.pointer_cache
-            .pointer(&self.event_store, skill_id)
+        active_pointer_from_store(&self.event_store, skill_id)
             .map_err(SkillRevisionGovernanceError::Store)
     }
 
@@ -621,6 +551,63 @@ mod tests {
             review.scope_ref(),
             &review.evidence_digest,
         )
+    }
+
+    #[tokio::test]
+    async fn original_pointer_readers_observe_later_commits_without_cached_absence_or_generation() {
+        use crate::RuntimeSkillUsageSink;
+        let reader = service();
+        let writer = SkillRevisionGovernanceService::new(
+            Arc::clone(&reader.event_store),
+            Arc::clone(&reader.approvals),
+        );
+        let observer =
+            crate::RuntimeSkillUsageRecorder::new(Arc::clone(&reader.event_store)).unwrap();
+        assert!(reader.pointer("review").unwrap().is_none());
+        assert!(observer.active_pointer("review").unwrap().is_none());
+        let principal = crate::security::test_human_interactive_principal();
+        let review = writer
+            .request_activation(&principal, "new", &draft(), "1.1.0", "sha256:inspection")
+            .unwrap();
+        writer
+            .decide_review(
+                &principal,
+                &lease(&review),
+                &review.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "validated",
+            )
+            .unwrap();
+        assert_eq!(reader.pointer("review").unwrap().unwrap().generation, 1);
+        let current = observer.active_pointer("review").unwrap().unwrap();
+        assert_eq!(current.active_revision, "1.1.0");
+        assert_eq!(current.generation, 1);
+        let rollback = writer
+            .request_rollback(&principal, "back", "review", "1.0.0", "sha256:regression")
+            .unwrap();
+        writer
+            .decide_review(
+                &principal,
+                &lease(&rollback),
+                &rollback.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "regression",
+            )
+            .unwrap();
+        let current = observer.active_pointer("review").unwrap().unwrap();
+        assert_eq!(current.active_revision, "1.0.0");
+        assert_eq!(current.generation, 2);
+        assert_eq!(reader.pointer("review").unwrap().unwrap().generation, 2);
+        assert!(
+            service().pointer("review").unwrap().is_none(),
+            "another original store cannot borrow this pointer"
+        );
+        assert!(
+            observer
+                .shutdown_and_drain(std::time::Duration::from_secs(2))
+                .await
+                .clean
+        );
     }
 
     #[test]

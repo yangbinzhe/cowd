@@ -176,7 +176,6 @@ pub struct RuntimeServicesBuilder {
     knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     skill_catalog: crate::RuntimeSkillCatalog,
-    skill_revision_pointer_cache: Option<Arc<crate::SkillRevisionPointerCache>>,
     mission_schedule_policy: crate::MissionSchedulePolicy,
     hot_state_config: crate::execution_core::hot_state::HotStateConfig,
     approval_config: ApprovalConfig,
@@ -959,7 +958,6 @@ impl RuntimeServices {
             knowledge_activation: None,
             evolution_eval_runner: None,
             skill_catalog: crate::RuntimeSkillCatalog::default(),
-            skill_revision_pointer_cache: None,
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
             hot_state_config: crate::execution_core::hot_state::HotStateConfig::default(),
             approval_config: ApprovalConfig::default(),
@@ -1050,7 +1048,6 @@ impl RuntimeServices {
             None,
             None,
             crate::RuntimeSkillCatalog::default(),
-            None,
             crate::MissionSchedulePolicy::default(),
             crate::execution_core::hot_state::HotStateConfig::default(),
             ApprovalConfig::default(),
@@ -1110,7 +1107,6 @@ impl RuntimeServices {
         knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
         evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
         skill_catalog: crate::RuntimeSkillCatalog,
-        skill_revision_pointer_cache: Option<Arc<crate::SkillRevisionPointerCache>>,
         mission_schedule_policy: crate::MissionSchedulePolicy,
         hot_state_config: crate::execution_core::hot_state::HotStateConfig,
         approval_config: ApprovalConfig,
@@ -1205,12 +1201,10 @@ impl RuntimeServices {
         let skill_maintenance_projector = Arc::new(crate::SkillMaintenanceProjector::new(
             Arc::clone(&event_store),
         ));
-        let skill_revision_governance =
-            Arc::new(crate::SkillRevisionGovernanceService::with_pointer_cache(
-                Arc::clone(&event_store),
-                Arc::clone(&approval_queue),
-                skill_revision_pointer_cache.unwrap_or_default(),
-            ));
+        let skill_revision_governance = Arc::new(crate::SkillRevisionGovernanceService::new(
+            Arc::clone(&event_store),
+            Arc::clone(&approval_queue),
+        ));
         let approval_policy_controls = Arc::clone(&session_execution_policy_controls);
         install_builtin_executors(
             &executor_registry,
@@ -1858,11 +1852,8 @@ impl RuntimeServices {
         }
         if slot.1.is_none() {
             slot.1 = Some(Arc::new(
-                crate::RuntimeSkillUsageRecorder::with_pointer_cache(
-                    Arc::clone(&self.event_store),
-                    self.skill_revision_governance.pointer_cache(),
-                )
-                .map_err(|e| format!("Skill usage worker failed to start: {e}"))?,
+                crate::RuntimeSkillUsageRecorder::new(Arc::clone(&self.event_store))
+                    .map_err(|e| format!("Skill usage worker failed to start: {e}"))?,
             ));
         }
         Ok(Arc::clone(slot.1.as_ref().unwrap()))

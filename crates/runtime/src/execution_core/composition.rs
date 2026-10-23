@@ -160,17 +160,6 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Share the approved Skill pointer cache with the package page-in
-    /// adapter. This keeps durable pointer reads off the normal turn path.
-    #[must_use]
-    pub fn skill_revision_pointer_cache(
-        mut self,
-        cache: Arc<crate::SkillRevisionPointerCache>,
-    ) -> Self {
-        self.skill_revision_pointer_cache = Some(cache);
-        self
-    }
-
     /// Bind builtin Definitions to the installation bundle selected by the
     /// launcher. User and workspace Definitions are never inferred from this
     /// path; it is only the trusted builtin scope root.
@@ -329,7 +318,6 @@ impl RuntimeServicesBuilder {
             self.knowledge_activation,
             self.evolution_eval_runner,
             self.skill_catalog,
-            self.skill_revision_pointer_cache,
             self.mission_schedule_policy,
             self.hot_state_config,
             self.approval_config,

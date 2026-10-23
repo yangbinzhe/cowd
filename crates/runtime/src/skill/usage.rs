@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 
 use super::{
     RuntimeSkillUsageContext, RuntimeSkillUsageSink, RuntimeSkillUsageSinkHealth, SkillInvocation,
-    governance::SkillRevisionPointerCache,
 };
 use crate::{
     RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
@@ -46,7 +45,6 @@ pub struct SkillUsageShutdownReport {
 #[derive(Debug)]
 pub struct RuntimeSkillUsageRecorder {
     store: Arc<RuntimeEventStore>,
-    pointer_cache: Arc<SkillRevisionPointerCache>,
     sender: Mutex<Option<mpsc::SyncSender<SkillUsageReceipt>>>,
     worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     join_task: Mutex<Option<tokio::task::JoinHandle<bool>>>,
@@ -61,31 +59,17 @@ pub struct RuntimeSkillUsageRecorder {
 
 impl RuntimeSkillUsageRecorder {
     pub fn new(store: Arc<RuntimeEventStore>) -> std::io::Result<Self> {
-        Self::with_pointer_cache(store, Arc::new(SkillRevisionPointerCache::default()))
-    }
-
-    pub fn with_pointer_cache(
-        store: Arc<RuntimeEventStore>,
-        pointer_cache: Arc<SkillRevisionPointerCache>,
-    ) -> std::io::Result<Self> {
-        Self::start(
-            store,
-            pointer_cache,
-            SKILL_USAGE_QUEUE_CAPACITY,
-            persist_receipt,
-            |work| {
-                std::thread::Builder::new()
-                    .name("cowd-runtime-skill-usage".into())
-                    .spawn(work)
-            },
-        )
+        Self::start(store, SKILL_USAGE_QUEUE_CAPACITY, persist_receipt, |work| {
+            std::thread::Builder::new()
+                .name("cowd-runtime-skill-usage".into())
+                .spawn(work)
+        })
     }
 
     // The only production writer is persist_receipt. These private seams permit
     // short deterministic IO/panic/start fault tests without another runtime.
     fn start(
         store: Arc<RuntimeEventStore>,
-        pointer_cache: Arc<SkillRevisionPointerCache>,
         capacity: usize,
         persist: impl Fn(&RuntimeEventStore, &SkillUsageReceipt) -> Result<(), String> + Send + 'static,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
@@ -124,7 +108,6 @@ impl RuntimeSkillUsageRecorder {
         }))?;
         Ok(Self {
             store,
-            pointer_cache,
             sender: Mutex::new(Some(sender)),
             worker: Arc::new(Mutex::new(Some(worker))),
             join_task: Mutex::new(None),
@@ -351,7 +334,7 @@ impl RuntimeSkillUsageSink for RuntimeSkillUsageRecorder {
         &self,
         skill_id: &str,
     ) -> Result<Option<harness_contract::skill::SkillActivePointer>, String> {
-        self.pointer_cache.pointer(&self.store, skill_id)
+        super::governance::active_pointer_from_store(&self.store, skill_id)
     }
 }
 
@@ -714,7 +697,6 @@ mod tests {
         let recorder = Arc::new(
             RuntimeSkillUsageRecorder::start(
                 store.clone(),
-                Arc::new(SkillRevisionPointerCache::default()),
                 1,
                 move |store, receipt| {
                     if let Some(entered) = entered.lock().unwrap().take() {
@@ -804,7 +786,6 @@ mod tests {
     async fn usage_start_failure_io_failure_and_worker_panic_cannot_be_clean() {
         let failed = RuntimeSkillUsageRecorder::start(
             Arc::new(RuntimeEventStore::for_test()),
-            Arc::new(SkillRevisionPointerCache::default()),
             1,
             persist_receipt,
             |_| Err(std::io::Error::other("controlled thread start refusal")),
@@ -813,7 +794,6 @@ mod tests {
         for panic_worker in [false, true] {
             let recorder = RuntimeSkillUsageRecorder::start(
                 Arc::new(RuntimeEventStore::for_test()),
-                Arc::new(SkillRevisionPointerCache::default()),
                 1,
                 move |_, _| {
                     assert!(!panic_worker, "controlled usage worker panic");

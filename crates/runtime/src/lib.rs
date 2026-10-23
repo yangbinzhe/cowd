@@ -749,9 +749,7 @@ pub use session_relation_graph::{
     SessionProxy, SessionRelation, SessionRelationGraph, SessionRelationKind, SessionRouteCommand,
     SessionRouteReceipt,
 };
-pub use skill::governance::{
-    SkillRevisionGovernanceError, SkillRevisionGovernanceService, SkillRevisionPointerCache,
-};
+pub use skill::governance::{SkillRevisionGovernanceError, SkillRevisionGovernanceService};
 pub use skill::maintenance::{
     SkillMaintenanceProjectionHealth, SkillMaintenanceProjector, SkillMaintenanceSnapshot,
 };

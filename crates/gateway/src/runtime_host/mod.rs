@@ -1804,7 +1804,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             ),
         )));
     let session_runtime_port = crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
-    let skill_revision_pointer_cache = Arc::new(runtime::SkillRevisionPointerCache::default());
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .runtime_build_identity(crate::compiled_runtime_build_identity())
@@ -1861,7 +1860,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .agent
                     .max_parallel_agents,
             )
-            .skill_revision_pointer_cache(Arc::clone(&skill_revision_pointer_cache))
             .session_ports(
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
