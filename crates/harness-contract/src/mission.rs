@@ -157,9 +157,9 @@ pub struct MissionOrganizationDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_model: Option<String>,
     #[serde(default)]
-    pub provider_input_tokens: u64,
+    pub provider_input_tokens: Option<u64>,
     #[serde(default)]
-    pub provider_output_tokens: u64,
+    pub provider_output_tokens: Option<u64>,
     #[serde(default)]
     pub elapsed_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

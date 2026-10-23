@@ -57,8 +57,8 @@ pub struct AutomaticGovernanceReport {
     pub semantic_dismissed: usize,
     pub semantic_requires_review: usize,
     pub semantic_model: Option<String>,
-    pub semantic_input_tokens: u32,
-    pub semantic_output_tokens: u32,
+    pub semantic_input_tokens: Option<u32>,
+    pub semantic_output_tokens: Option<u32>,
     pub pending_human_review: usize,
     pub affected_memory_ids: Vec<MemoryId>,
     pub affected_knowledge_pack_ids: Vec<String>,
@@ -126,8 +126,8 @@ pub struct SemanticGovernanceDecision {
 #[serde(default)]
 pub struct SemanticGovernanceResponse {
     pub model: Option<String>,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
     pub decisions: Vec<SemanticGovernanceDecision>,
 }
 

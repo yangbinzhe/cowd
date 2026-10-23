@@ -411,6 +411,10 @@ pub struct ExecutionUsage {
     /// fallback before any provider output is emitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Whether the original Provider producer observed complete usage. Legacy
+    /// aggregate counters without an authenticated observation remain unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_usage_observed: Option<bool>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Provider-reported cache population tokens. These are not cache hits.

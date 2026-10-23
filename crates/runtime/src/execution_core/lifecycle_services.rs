@@ -231,8 +231,13 @@ impl RuntimeServices {
             service_time,
             result_class,
         );
-        if u64::from(completion.input_tokens).saturating_add(u64::from(completion.output_tokens))
-            > crate::evolution::analyst::ANALYSIS_TOTAL_TOKEN_BUDGET
+        if completion
+            .input_tokens
+            .zip(completion.output_tokens)
+            .is_some_and(|(input, output)| {
+                u64::from(input).saturating_add(u64::from(output))
+                    > crate::evolution::analyst::ANALYSIS_TOTAL_TOKEN_BUDGET
+            })
         {
             self.evolution_analyst
                 .fail(

@@ -1003,6 +1003,23 @@ impl ScopedNodeBackend for Backend {
     }
 }
 
+fn decode_result_usage(usage: &Value) -> Result<Option<(u64, u64)>, String> {
+    let fields = usage
+        .as_object()
+        .ok_or("structured Provider usage must be an object")?;
+    let input = fields
+        .get("input_tokens")
+        .ok_or("structured input usage missing")?;
+    let output = fields
+        .get("output_tokens")
+        .ok_or("structured output usage missing")?;
+    match (input.as_u64(), output.as_u64()) {
+        (Some(input), Some(output)) => Ok(Some((input, output))),
+        (None, None) if input.is_null() && output.is_null() => Ok(None),
+        _ => Err("structured Provider usage is malformed or incomplete".into()),
+    }
+}
+
 async fn result_outcome(
     services: &RuntimeServices,
     task: &TaskAggregate,
@@ -1052,14 +1069,12 @@ async fn result_outcome(
     {
         return Err("prepared structured result identity/size/digest conflict".into());
     }
+    let observed_usage = decode_result_usage(&stored["usage"])?;
     let usage = ExecutionUsage {
         model: stored["model"].as_str().map(str::to_owned),
-        input_tokens: stored["usage"]["input_tokens"]
-            .as_u64()
-            .ok_or("structured input usage unknown")?,
-        output_tokens: stored["usage"]["output_tokens"]
-            .as_u64()
-            .ok_or("structured output usage unknown")?,
+        provider_usage_observed: Some(observed_usage.is_some()),
+        input_tokens: observed_usage.map_or(0, |(input, _)| input),
+        output_tokens: observed_usage.map_or(0, |(_, output)| output),
         ..Default::default()
     };
     Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
@@ -1151,6 +1166,34 @@ mod tests {
             evidence_refs: Vec::new(),
         }
     }
+    #[test]
+    fn result_cost_unknown_and_known_zero_are_independent_of_valid_business_output() {
+        assert_eq!(
+            decode_result_usage(&json!({"input_tokens":null,"output_tokens":null})).unwrap(),
+            None
+        );
+        assert_eq!(
+            decode_result_usage(&json!({"input_tokens":0,"output_tokens":0})).unwrap(),
+            Some((0, 0))
+        );
+        assert_eq!(
+            decode_result_usage(&json!({"input_tokens":17,"output_tokens":23})).unwrap(),
+            Some((17, 23))
+        );
+        for invalid in [
+            json!({}),
+            json!(null),
+            json!("unknown"),
+            json!({"input_tokens":0}),
+            json!({"input_tokens":0,"output_tokens":null}),
+            json!({"input_tokens":-1,"output_tokens":0}),
+            json!({"input_tokens":"0","output_tokens":0}),
+            json!({"input_tokens":1.5,"output_tokens":0}),
+        ] {
+            assert!(decode_result_usage(&invalid).is_err(), "{invalid}");
+        }
+    }
+
     #[test]
     fn bounded_json_decoder_preserves_outer_fence_tolerance_and_rejects_ambiguous_values() {
         for body in [

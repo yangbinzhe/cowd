@@ -54,8 +54,8 @@ impl MissionOrganizer {
             candidate_count: 0,
             provider_invoked: false,
             provider_model: None,
-            provider_input_tokens: 0,
-            provider_output_tokens: 0,
+            provider_input_tokens: None,
+            provider_output_tokens: None,
             elapsed_ms: 0,
             rejected_reason: None,
             evidence_refs: vec![EvidenceRef::observed("task", task.task_id.clone())],
@@ -290,8 +290,8 @@ impl MissionOrganizer {
         .await
         .map_err(|_| "Mission organizer Provider decision timed out after 15 seconds".to_string())??;
         decision.provider_model = Some(completion.model.clone());
-        decision.provider_input_tokens = u64::from(completion.input_tokens);
-        decision.provider_output_tokens = u64::from(completion.output_tokens);
+        decision.provider_input_tokens = completion.input_tokens.map(u64::from);
+        decision.provider_output_tokens = completion.output_tokens.map(u64::from);
         if let Some(request_id) = completion.request_id {
             decision
                 .evidence_refs
@@ -690,8 +690,8 @@ mod tests {
             candidate_count: 2,
             provider_invoked: true,
             provider_model: Some("test-model".to_string()),
-            provider_input_tokens: 0,
-            provider_output_tokens: 0,
+            provider_input_tokens: None,
+            provider_output_tokens: None,
             elapsed_ms: 0,
             rejected_reason: None,
             evidence_refs: vec![EvidenceRef::observed("task", "task-root")],

@@ -381,8 +381,8 @@ pub struct EvolutionAnalysisModelOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionAnalysisUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
     pub stop_reason: Option<String>,
 }
 

@@ -2752,8 +2752,8 @@ fn postgres_task_store_preserves_restart_and_per_task_concurrency() {
         candidate_count: 0,
         provider_invoked: false,
         provider_model: None,
-        provider_input_tokens: 0,
-        provider_output_tokens: 0,
+        provider_input_tokens: None,
+        provider_output_tokens: None,
         elapsed_ms: 0,
         rejected_reason: None,
         evidence_refs: vec![EvidenceRef::observed(

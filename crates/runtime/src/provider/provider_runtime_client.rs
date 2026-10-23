@@ -559,8 +559,8 @@ pub struct ProviderControlCompletion {
     pub text: String,
     pub model: String,
     pub request_id: Option<String>,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
     pub stop_reason: Option<String>,
 }
 
@@ -990,27 +990,7 @@ impl ProviderRuntimeClient {
                 return Err(error.to_string());
             }
         };
-        let text = response
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                OutputContentBlock::Text { text }
-                | OutputContentBlock::ReasoningSummary { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if text.trim().is_empty() {
-            return Err("provider control analysis returned no text".to_string());
-        }
-        Ok(ProviderControlCompletion {
-            text,
-            model: response.model,
-            request_id: response.request_id,
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            stop_reason: response.stop_reason,
-        })
+        control_completion(response)
     }
 
     /// Install the explicit tool schema set selected by Runtime.
@@ -1120,6 +1100,35 @@ impl ProviderRuntimeClient {
             cache_hits: self.tool_schema_cache_hits.load(Ordering::Relaxed),
         }
     }
+}
+
+fn control_completion(response: MessageResponse) -> Result<ProviderControlCompletion, String> {
+    let text = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } | OutputContentBlock::ReasoningSummary { text } => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return Err("provider control analysis returned no text".to_string());
+    }
+    Ok(ProviderControlCompletion {
+        text,
+        model: response.model,
+        request_id: response.request_id,
+        input_tokens: response
+            .usage_observed
+            .then_some(response.usage.input_tokens),
+        output_tokens: response
+            .usage_observed
+            .then_some(response.usage.output_tokens),
+        stop_reason: response.stop_reason,
+    })
 }
 
 fn tool_exposure_digest(exposure: Option<&ToolExposureProjection>) -> u64 {
@@ -2921,6 +2930,37 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
+    fn control_completion_keeps_absent_usage_unknown_and_reported_zero_known() {
+        for observed in [false, true] {
+            let completion = super::control_completion(MessageResponse {
+                id: "control-usage".into(),
+                kind: "message".into(),
+                role: "assistant".into(),
+                content: vec![OutputContentBlock::Text {
+                    text: "valid business result".into(),
+                }],
+                model: "fixture-model".into(),
+                stop_reason: Some("stop".into()),
+                stop_sequence: None,
+                usage: Usage::default(),
+                usage_observed: observed,
+                cache_dimensions_observed: false,
+                request_id: None,
+            })
+            .unwrap();
+            assert_eq!(completion.text, "valid business result");
+            assert_eq!(
+                completion.input_tokens,
+                if observed { Some(0) } else { None }
+            );
+            assert_eq!(
+                completion.output_tokens,
+                if observed { Some(0) } else { None }
+            );
+        }
+    }
+
+    #[test]
     fn absent_provider_usage_is_not_promoted_to_known_zero() {
         let events = response_to_events(MessageResponse {
             id: "no-usage".to_string(),
@@ -3811,7 +3851,10 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], "untrusted input");
         assert_eq!(total, (bytes.len() as u64 + 3) / 4 + 32);
         assert_eq!(completion.text, "ok");
-        assert_eq!((completion.input_tokens, completion.output_tokens), (7, 2));
+        assert_eq!(
+            (completion.input_tokens, completion.output_tokens),
+            (Some(7), Some(2))
+        );
         assert_eq!(client.wire_preparation_count(), 1);
         assert_eq!(
             manager

@@ -852,8 +852,8 @@ mod tests {
             text: serde_json::to_string(&valid_output()).unwrap(),
             model: "deepseek-v4".to_string(),
             request_id: Some("request".to_string()),
-            input_tokens: 100,
-            output_tokens: 200,
+            input_tokens: Some(100),
+            output_tokens: Some(200),
             stop_reason: Some("end_turn".to_string()),
         };
         assert_eq!(

@@ -76,8 +76,8 @@ impl SemanticGovernanceResolver for CanonicalFirstResolver {
             .collect();
         Ok(SemanticGovernanceResponse {
             model: Some("governance-test".to_string()),
-            input_tokens: 120,
-            output_tokens: 40,
+            input_tokens: Some(120),
+            output_tokens: Some(40),
             decisions,
         })
     }
@@ -313,8 +313,8 @@ async fn semantic_governance_resolves_only_low_risk_derived_conflicts() {
     assert_eq!(report.semantic_considered, 1);
     assert_eq!(report.semantic_auto_applied, 1);
     assert_eq!(report.semantic_model.as_deref(), Some("governance-test"));
-    assert_eq!(report.semantic_input_tokens, 120);
-    assert_eq!(report.semantic_output_tokens, 40);
+    assert_eq!(report.semantic_input_tokens, Some(120));
+    assert_eq!(report.semantic_output_tokens, Some(40));
     assert_eq!(report.pending_human_review, 0);
     assert_eq!(
         MemoryKernel::new(Arc::clone(&manager))
