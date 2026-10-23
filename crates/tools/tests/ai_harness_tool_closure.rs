@@ -77,26 +77,42 @@ fn live_tool_readonly_closure_reads_fixture_and_returns_evidence() {
 
 #[test]
 fn live_tool_write_descriptor_requires_runtime_authorization() {
-    let root = std::env::temp_dir().join(format!("cowd-tool-deny-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("cowd-tool-deny-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).expect("temp root");
     let target = root.join("blocked.txt");
 
     let host = test_host("deny-test", &root);
-    let input = json!({"action": "write", "path": target, "content": "must not be written"});
-    let effect = host.pin_snapshot().describe_effect("edit", &input);
+    let input = json!({"action": "write", "path": target, "content": "authorized write"});
+    let lease = host.pin_snapshot();
+    let effect = lease.describe_effect("edit", &input);
     assert_eq!(
         effect.required_permission,
         ToolPermissionMode::WorkspaceWrite
     );
+    let mut denied = authorize(&lease, "edit", &input);
+    denied.authorization_lease.ceiling = ToolPermissionMode::ReadOnly;
+    let error = lease.execute(&denied, "edit", &input).unwrap_err();
+    assert!(matches!(
+        error,
+        tools::ToolHostError::LeasePermissionDenied {
+            authorized: ToolPermissionMode::ReadOnly,
+            required: ToolPermissionMode::WorkspaceWrite,
+        }
+    ));
     assert!(
         !target.exists(),
         "Tools must not execute before Runtime authorizes"
     );
+    lease
+        .execute(&authorize(&lease, "edit", &input), "edit", &input)
+        .expect("the same write must succeed with its required authorization");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "authorized write");
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn orchestrate_escalates_to_its_writes_while_a_read_program_stays_readonly() {
-    let root = std::env::temp_dir().join(format!("cowd-tool-batch-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("cowd-tool-batch-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).expect("temp root");
     let fixture = root.join("batch.txt");
     fs::write(&fixture, "batch evidence").expect("fixture write");
@@ -136,7 +152,20 @@ fn orchestrate_escalates_to_its_writes_while_a_read_program_stays_readonly() {
         ToolPermissionMode::WorkspaceWrite,
         "a write sub-call must escalate the whole program"
     );
+    let mut denied = authorize(&lease, "tool_orchestrate", &write_program);
+    denied.authorization_lease.ceiling = ToolPermissionMode::ReadOnly;
+    let error = lease
+        .execute(&denied, "tool_orchestrate", &write_program)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        tools::ToolHostError::LeasePermissionDenied {
+            authorized: ToolPermissionMode::ReadOnly,
+            required: ToolPermissionMode::WorkspaceWrite,
+        }
+    ));
     assert!(!root.join("bad.txt").exists());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -163,7 +192,10 @@ fn lease_blocks_external_and_control_plane_paths_for_workspace_file_tools() {
     };
 
     denied("read_file", json!({"path": "../outside.txt"}));
-    denied("edit", json!({"action": "write", "path": outside, "content": "no"}));
+    denied(
+        "edit",
+        json!({"action": "write", "path": outside, "content": "no"}),
+    );
     denied(
         "edit",
         json!({"action": "replace", "path": ".cowd/runtime.sqlite", "old_string": "control", "new_string": "no"}),

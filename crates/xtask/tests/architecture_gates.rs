@@ -51,8 +51,7 @@ fn run_gate(name: &str, program: &str, arguments: &[&str]) {
 }
 
 /// Assert a search returns nothing. ripgrep exits 0 when it matches and 1 when
-/// it does not, so the "clean" answer is either exit 1 or empty stdout; the
-/// empty-output assertion is the one that cannot be misread.
+/// it does not. Only exit 1 with empty stdout is a clean search result.
 fn assert_no_matches(name: &str, program: &str, arguments: &[&str]) {
     let output = Command::new(program)
         .args(arguments)
@@ -60,10 +59,33 @@ fn assert_no_matches(name: &str, program: &str, arguments: &[&str]) {
         .output()
         .unwrap_or_else(|error| panic!("`{name}`: spawn {program}: {error}"));
     let matches = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "`{name}` search did not report no matches: {:?}\n--- stdout ---\n{matches}\n--- stderr ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
     assert!(
-        matches.trim().is_empty(),
+        output.stdout.is_empty(),
         "`{name}` expected no matches, found:\n{matches}",
     );
+}
+
+#[test]
+fn no_matches_gate_rejects_search_errors_and_actual_matches() {
+    assert_no_matches("clean search", "bash", &["-c", "exit 1"]);
+    for script in [
+        "printf 'search failed' >&2; exit 2",
+        "printf 'matched source'; exit 0",
+        "exit 0",
+        "printf ' '; exit 1",
+    ] {
+        assert!(std::panic::catch_unwind(|| {
+            assert_no_matches("invalid search", "bash", &["-c", script]);
+        })
+        .is_err());
+    }
 }
 
 #[test]
