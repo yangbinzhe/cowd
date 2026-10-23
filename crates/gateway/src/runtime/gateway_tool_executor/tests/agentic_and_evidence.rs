@@ -2583,20 +2583,38 @@ mod cross_channel_contract_invariants {
     #[tokio::test]
     async fn repair_is_a_fixed_point() {
         let executor = executor();
-        for (label, input) in corpus() {
-            let Ok(first) = executor.validate_tool_input("agent_action_batch", &input) else {
-                continue;
+        let cases = corpus().into_iter().chain(std::iter::once((
+            "root-unknown-field",
+            serde_json::json!({"actions": [
+                {"tool": "team_create", "input": {"name": "Alpha", "mission": "invariants"}}
+            ], "invented": 1})
+            .to_string(),
+        )));
+        for (label, input) in cases {
+            // Only the root object forbids extensions; actions.items is open.
+            let expected_acceptance = match label {
+                "legal" | "string-typed" | "unknown-field" => true,
+                "missing-required" | "root-unknown-field" => false,
+                _ => panic!("{label}: corpus case has no independent contract expectation"),
             };
-            let second = executor
-                .validate_tool_input("agent_action_batch", &first)
-                .unwrap_or_else(|error| {
-                    panic!("{label}: the repaired bytes must still be legal: {error}")
-                });
+            let result = executor.validate_tool_input("agent_action_batch", &input);
             assert_eq!(
-                first, second,
-                "{label}: repairing an already-repaired frame changed it, so the transcript \\
-                 and the dispatched bytes could disagree"
+                result.is_ok(),
+                expected_acceptance,
+                "{label}: schema-boundary acceptance violates its declared contract: {result:?}"
             );
+            if let Ok(first) = result {
+                let second = executor
+                    .validate_tool_input("agent_action_batch", &first)
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: the repaired bytes must still be legal: {error}")
+                    });
+                assert_eq!(
+                    first, second,
+                    "{label}: repairing an already-repaired frame changed it, so the transcript \\
+                     and the dispatched bytes could disagree"
+                );
+            }
         }
     }
 
@@ -2609,21 +2627,39 @@ mod cross_channel_contract_invariants {
     #[tokio::test]
     async fn the_same_frame_hashes_identically_after_repair() {
         let executor = executor();
-        for (label, input) in corpus() {
-            let Ok(repaired) = executor.validate_tool_input("agent_action_batch", &input) else {
-                continue;
+        let cases = corpus().into_iter().chain(std::iter::once((
+            "root-unknown-field",
+            serde_json::json!({"actions": [
+                {"tool": "team_create", "input": {"name": "Alpha", "mission": "invariants"}}
+            ], "invented": 1})
+            .to_string(),
+        )));
+        for (label, input) in cases {
+            // A legal entry extension is distinct from a forbidden root field.
+            let expected_acceptance = match label {
+                "legal" | "string-typed" | "unknown-field" => true,
+                "missing-required" | "root-unknown-field" => false,
+                _ => panic!("{label}: corpus case has no independent contract expectation"),
             };
-            let again = executor
-                .validate_tool_input("agent_action_batch", &input)
-                .expect("the same input must decide the same way twice");
-            // Byte equality is the whole invariant: the repetition guard keys on a
-            // hash of these bytes, so identical bytes are necessarily an identical
-            // key and the guard sees a repeat.
+            let result = executor.validate_tool_input("agent_action_batch", &input);
             assert_eq!(
-                repaired, again,
-                "{label}: the same frame produced different bytes, so the repetition guard \
-                 would not recognise it as a repeat"
+                result.is_ok(),
+                expected_acceptance,
+                "{label}: schema-boundary acceptance violates its declared contract: {result:?}"
             );
+            if let Ok(repaired) = result {
+                let again = executor
+                    .validate_tool_input("agent_action_batch", &input)
+                    .expect("the same input must decide the same way twice");
+                // Byte equality is the whole invariant: the repetition guard keys on a
+                // hash of these bytes, so identical bytes are necessarily an identical
+                // key and the guard sees a repeat.
+                assert_eq!(
+                    repaired, again,
+                    "{label}: the same frame produced different bytes, so the repetition guard \
+                     would not recognise it as a repeat"
+                );
+            }
         }
     }
 
