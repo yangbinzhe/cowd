@@ -3017,3 +3017,238 @@ async fn actual_consumed_source_cut_fences_a_new_extraction_origin_and_target() 
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn original_ancestor_cuts_fence_transitive_derivatives_in_every_layer() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation,
+        MemorySourceFenceReader, MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let mut ancestor = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "original ancestor A",
+    );
+    ancestor.scope = MemoryScope::Project("project-a".into());
+    store.insert(&ancestor).await.unwrap();
+    let original = MemoryEntryRevision::of(&ancestor).unwrap();
+    let turn = MemoryTurnContext::new("session-a", "agent-a")
+        .with_project_id(Some("project-a".into()))
+        .with_source_readset(Some(vec![original.clone()]));
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000011";
+    let mut derivatives = Vec::new();
+    for layer in [
+        MemoryLayer::L0,
+        MemoryLayer::L1,
+        MemoryLayer::L2,
+        MemoryLayer::L3,
+        MemoryLayer::L4,
+    ] {
+        let mut b = entry(
+            layer,
+            MemorySource::AutoExtracted,
+            "B derives from original A",
+        );
+        b.scope = ancestor.scope.clone();
+        b.session_id = Some("session-a".into());
+        b.source_agent = Some("agent-a".into());
+        b.tags = vec![batch.into()];
+        let origin = MemoryExtractionOrigin::for_entry(&turn, &b, batch).unwrap();
+        store.write_extraction(&b, &origin, None).await.unwrap();
+        let b_cut = MemoryEntryRevision::of(&b).unwrap();
+        let b_turn = turn.clone().with_source_readset(Some(vec![b_cut]));
+        let mut c = b.clone();
+        c.id = uuid::Uuid::new_v4();
+        c.title = "C derives from B in a later turn".into();
+        let c_origin = MemoryExtractionOrigin::for_entry(&b_turn, &c, batch).unwrap();
+        store.write_extraction(&c, &c_origin, None).await.unwrap();
+        derivatives.push((b, c, c_origin));
+    }
+    ancestor.content = "corrected original source A".into();
+    store.update(&ancestor, &original).await.unwrap();
+    for (b, c, origin) in &derivatives {
+        for id in [b.id, c.id] {
+            assert!(store
+                .read_source_revision(&format!("memory:{id}"), 1024 * 1024)
+                .unwrap()
+                .unwrap()
+                .revision
+                .is_none());
+        }
+        let mut late = c.clone();
+        late.id = uuid::Uuid::new_v4();
+        assert!(store.write_extraction(&late, origin, None).await.is_err());
+        assert!(store.get(&late.id).await.unwrap().is_none());
+        assert!(
+            store.get(&b.id).await.unwrap().is_some(),
+            "stale lineage does not fabricate body erasure"
+        );
+    }
+    let current = MemoryEntryRevision::of(&ancestor).unwrap();
+    ancestor.content = "original ancestor A content".into();
+    store.update(&ancestor, &current).await.unwrap();
+    for (b, _, _) in &derivatives {
+        assert!(store
+            .read_source_revision(&format!("memory:{}", b.id), 1024 * 1024)
+            .unwrap()
+            .unwrap()
+            .revision
+            .is_some());
+    }
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: ancestor.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "irreversible original source retirement".into(),
+        session_id: "session-a".into(),
+        agent_id: "agent-a".into(),
+        occurred_at: Utc::now(),
+    };
+    store
+        .commit_lifecycle(MemoryLifecycleMutation::new(&ancestor, None, event).unwrap())
+        .await
+        .unwrap();
+    for (b, c, origin) in derivatives {
+        assert!(store
+            .read_source_revision(&format!("memory:{}", b.id), 1024 * 1024)
+            .unwrap()
+            .unwrap()
+            .revision
+            .is_none());
+        let mut late = c;
+        late.id = uuid::Uuid::new_v4();
+        assert!(store.write_extraction(&late, &origin, None).await.is_err());
+    }
+    let independent = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "independent source remains usable",
+    );
+    store.insert(&independent).await.unwrap();
+    assert!(store
+        .read_source_revision(&format!("memory:{}", independent.id), 1024 * 1024)
+        .unwrap()
+        .unwrap()
+        .revision
+        .is_some());
+}
+
+#[tokio::test]
+async fn shared_original_ancestor_is_materialized_once_in_a_native_source_frame() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryEntryRevision, MemoryExtractionOrigin, MemorySourceFenceReader,
+        MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let mut a = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "large shared original",
+    );
+    a.content = "x".repeat(5 * 1024 * 1024);
+    a.scope = MemoryScope::Project("project-a".into());
+    store.insert(&a).await.unwrap();
+    let turn = MemoryTurnContext::new("s", "a")
+        .with_project_id(Some("project-a".into()))
+        .with_source_readset(Some(vec![MemoryEntryRevision::of(&a).unwrap()]));
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000014";
+    let mut parents = Vec::new();
+    for name in ["B1", "B2"] {
+        let mut b = entry(MemoryLayer::L3, MemorySource::AutoExtracted, name);
+        b.scope = a.scope.clone();
+        b.session_id = Some("s".into());
+        b.source_agent = Some("a".into());
+        b.tags = vec![batch.into()];
+        store
+            .write_extraction(
+                &b,
+                &MemoryExtractionOrigin::for_entry(&turn, &b, batch).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        parents.push(MemoryEntryRevision::of(&b).unwrap());
+    }
+    let mut c = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "shared-ancestor child C",
+    );
+    c.scope = a.scope;
+    c.session_id = Some("s".into());
+    c.source_agent = Some("a".into());
+    c.tags = vec![batch.into()];
+    let origin =
+        MemoryExtractionOrigin::for_entry(&turn.with_source_readset(Some(parents)), &c, batch)
+            .unwrap();
+    store.write_extraction(&c, &origin, None).await.unwrap();
+    let read = store
+        .read_source_revision(&format!("memory:{}", c.id), 8 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert!(read.revision.is_some());
+    assert!(read.materialized_bytes > 5 * 1024 * 1024);
+    assert!(
+        read.materialized_bytes < 6 * 1024 * 1024,
+        "the 5MiB original is not materialized again for each sibling"
+    );
+    assert!(store
+        .read_source_revision(&format!("memory:{}", c.id), 4 * 1024 * 1024)
+        .is_err());
+}
+
+#[tokio::test]
+async fn retired_derivative_uses_only_its_original_fence_not_a_large_ancestor() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation,
+        MemorySourceFenceReader, MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let mut a = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "large original",
+    );
+    a.content = "x".repeat(1024 * 1024);
+    store.insert(&a).await.unwrap();
+    let turn = MemoryTurnContext::new("s", "a")
+        .with_source_readset(Some(vec![MemoryEntryRevision::of(&a).unwrap()]));
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000015";
+    let mut b = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "retired derivative",
+    );
+    b.session_id = Some("s".into());
+    b.source_agent = Some("a".into());
+    b.tags = vec![batch.into()];
+    store
+        .write_extraction(
+            &b,
+            &MemoryExtractionOrigin::for_entry(&turn, &b, batch).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: b.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "independent B retirement".into(),
+        session_id: "s".into(),
+        agent_id: "a".into(),
+        occurred_at: Utc::now(),
+    };
+    store
+        .commit_lifecycle(MemoryLifecycleMutation::new(&b, None, event).unwrap())
+        .await
+        .unwrap();
+    let read = store
+        .read_source_revision(&format!("memory:{}", b.id), 4096)
+        .unwrap()
+        .unwrap();
+    assert!(read.fence.retired);
+    assert!(read.revision.is_none());
+    assert!(read.materialized_bytes < 4096);
+}

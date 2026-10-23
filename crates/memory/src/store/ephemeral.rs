@@ -216,47 +216,149 @@ fn bounded_extraction_binding(
     Ok((Some(serde_json::from_str(raw)?), raw.len()))
 }
 
-fn validate_extraction_sources(state: &State, origin: &MemoryExtractionOrigin) -> Result<()> {
-    let mut remaining = crate::knowledge::KNOWLEDGE_READ_MAX_BYTES;
-    let mut frame = BTreeMap::new();
-    for expected in origin.source_readset() {
-        if !frame.contains_key(&expected.memory_id) {
-            let entry = state
+fn read_single_memory_source(
+    state: &State,
+    source_ref: &str,
+    budget_bytes: usize,
+    origin: Option<&MemoryExtractionOrigin>,
+) -> Result<Option<MemorySourceRevisionRead>> {
+    let id = source_ref
+        .strip_prefix("memory:")
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .filter(|id| format!("memory:{id}") == source_ref)
+        .ok_or_else(|| MemoryError::Store("invalid Memory source identity".into()))?;
+    if let Some(fence) = state
+        .source_fences
+        .get(source_ref)
+        .filter(|fence| fence.retired)
+    {
+        let bytes = fence.read_bytes(budget_bytes)?;
+        if fence.source_ref != source_ref
+            || state
                 .entries
-                .get(&expected.memory_id.to_string())
-                .ok_or(MemoryError::StaleSource)?;
-            let (binding, origin_bytes) =
-                bounded_extraction_binding(state, expected.memory_id, remaining)?;
-            remaining = remaining
-                .checked_sub(origin_bytes)
-                .ok_or(MemoryError::SourceReadLimit)?;
-            if binding
-                .as_ref()
-                .map(MemoryExtractionOrigin::retirement_ref)
-                .transpose()?
-                .is_some_and(|key| state.source_fences.contains_key(&key))
-            {
-                return Err(MemoryError::StaleSource);
-            }
-            let read = live_source_revision(
-                &format!("memory:{}", expected.memory_id),
-                entry,
-                state
-                    .kv
-                    .get(&format!("memory_lifecycle:{}", expected.memory_id))
-                    .map(String::as_str),
-                state
-                    .source_fences
-                    .get(&format!("memory:{}", expected.memory_id)),
-                remaining,
-            )?;
+                .get(&id.to_string())
+                .is_some_and(|entry| entry.scope.scope_key() != fence.scope_key)
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        let read = MemorySourceRevisionRead {
+            origin_retired: false,
+            access: None,
+            packet_content_digest: None,
+            packet_atom: None,
+            fence: fence.clone(),
+            revision: None,
+            materialized_bytes: bytes,
+        };
+        return Ok(Some(read));
+    }
+    let Some(entry) = state.entries.get(&id.to_string()) else {
+        if state.source_fences.contains_key(source_ref) {
+            return Err(MemoryError::Store("live Memory source body missing".into()));
+        }
+        return Ok(None);
+    };
+    let origin_bytes = 0;
+    let origin_retired = origin
+        .map(MemoryExtractionOrigin::retirement_ref)
+        .transpose()?
+        .is_some_and(|key| state.source_fences.contains_key(&key));
+    let mut read = live_source_revision(
+        source_ref,
+        entry,
+        state
+            .kv
+            .get(&format!("memory_lifecycle:{id}"))
+            .map(String::as_str),
+        state.source_fences.get(source_ref),
+        budget_bytes
+            .checked_sub(origin_bytes)
+            .ok_or(MemoryError::SourceReadLimit)?,
+    )?;
+    read.materialized_bytes += origin_bytes;
+    read.origin_retired = origin_retired;
+    if origin_retired {
+        read.revision = None;
+        read.access = None;
+    }
+    Ok(Some(read))
+}
+
+// One original State guard, one bounded frame. Original origin bindings are
+// immutable; their captured ancestor cuts must never be replaced by fresh heads.
+fn read_memory_source_frame(
+    state: &State,
+    roots: &[MemoryId],
+    budget_bytes: usize,
+) -> Result<(
+    BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
+    bool,
+    usize,
+)> {
+    let mut remaining = budget_bytes;
+    let mut origins = BTreeMap::new();
+    let mut todo = roots.to_vec();
+    while let Some(id) = todo.pop() {
+        if origins.contains_key(&id) {
+            continue;
+        }
+        if origins.len() >= crate::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        remaining = remaining
+            .checked_sub(16)
+            .ok_or(MemoryError::SourceReadLimit)?;
+        // A known irreversible retirement is sufficient to exclude this source.
+        // Its old ancestors must not be hydrated just to rediscover that fact.
+        if state
+            .source_fences
+            .get(&format!("memory:{id}"))
+            .is_some_and(|fence| fence.retired)
+        {
+            origins.insert(id, None);
+            continue;
+        }
+        let (origin, bytes) = bounded_extraction_binding(state, id, remaining)?;
+        remaining = remaining
+            .checked_sub(bytes)
+            .ok_or(MemoryError::SourceReadLimit)?;
+        if let Some(origin) = &origin {
+            todo.extend(origin.source_readset().iter().map(|cut| cut.memory_id));
+        }
+        origins.insert(id, origin);
+    }
+    let mut frame = BTreeMap::new();
+    for (id, origin) in &origins {
+        let read =
+            read_single_memory_source(state, &format!("memory:{id}"), remaining, origin.as_ref())?;
+        if let Some(read) = &read {
             remaining = remaining
                 .checked_sub(read.materialized_bytes)
                 .ok_or(MemoryError::SourceReadLimit)?;
-            frame.insert(expected.memory_id, read);
         }
-        let read = &frame[&expected.memory_id];
-        if read.fence.retired || read.revision.as_ref() != Some(expected) {
+        frame.insert(*id, read);
+    }
+    let valid = super::mutation::source_frame_matches_original_lineage(&origins, &frame);
+    Ok((frame, valid, budget_bytes - remaining))
+}
+
+fn validate_extraction_sources(state: &State, origin: &MemoryExtractionOrigin) -> Result<()> {
+    let roots = origin
+        .source_readset()
+        .iter()
+        .map(|cut| cut.memory_id)
+        .collect::<Vec<_>>();
+    let (frame, valid, _) =
+        read_memory_source_frame(state, &roots, crate::knowledge::KNOWLEDGE_READ_MAX_BYTES)?;
+    if !valid {
+        return Err(MemoryError::StaleSource);
+    }
+    for expected in origin.source_readset() {
+        let read = frame
+            .get(&expected.memory_id)
+            .and_then(Option::as_ref)
+            .ok_or(MemoryError::StaleSource)?;
+        if read.fence.retired || read.origin_retired || read.revision.as_ref() != Some(expected) {
             return Err(MemoryError::StaleSource);
         }
     }
@@ -1170,62 +1272,13 @@ impl EphemeralMemoryStore {
             .strip_prefix("memory:")
             .and_then(|id| uuid::Uuid::parse_str(id).ok())
             .filter(|id| format!("memory:{id}") == source_ref)
-            .ok_or_else(|| MemoryError::Store("invalid Memory source identity".into()))?;
-        if let Some(fence) = state
-            .source_fences
-            .get(source_ref)
-            .filter(|fence| fence.retired)
-        {
-            let bytes = fence.read_bytes(budget_bytes)?;
-            if fence.source_ref != source_ref
-                || state
-                    .entries
-                    .get(&id.to_string())
-                    .is_some_and(|entry| entry.scope.scope_key() != fence.scope_key)
-            {
-                return Err(MemoryError::StaleSource);
-            }
-            let read = MemorySourceRevisionRead {
-                origin_retired: false,
-                access: None,
-                packet_content_digest: None,
-                packet_atom: None,
-                fence: fence.clone(),
-                revision: None,
-                materialized_bytes: bytes,
-            };
-            return Ok(Some(MemorySourceRevisionGuard {
-                _state: state,
-                read,
-            }));
-        }
-        let Some(entry) = state.entries.get(&id.to_string()) else {
-            if state.source_fences.contains_key(source_ref) {
-                return Err(MemoryError::Store("live Memory source body missing".into()));
-            }
+            .ok_or(MemoryError::StaleSource)?;
+        let (mut frame, valid, used) = read_memory_source_frame(&state, &[id], budget_bytes)?;
+        let Some(mut read) = frame.remove(&id).flatten() else {
             return Ok(None);
         };
-        let (origin, origin_bytes) = bounded_extraction_binding(&state, id, budget_bytes)?;
-        let origin_retired = origin
-            .as_ref()
-            .map(MemoryExtractionOrigin::retirement_ref)
-            .transpose()?
-            .is_some_and(|key| state.source_fences.contains_key(&key));
-        let mut read = live_source_revision(
-            source_ref,
-            entry,
-            state
-                .kv
-                .get(&format!("memory_lifecycle:{id}"))
-                .map(String::as_str),
-            state.source_fences.get(source_ref),
-            budget_bytes
-                .checked_sub(origin_bytes)
-                .ok_or(MemoryError::SourceReadLimit)?,
-        )?;
-        read.materialized_bytes += origin_bytes;
-        read.origin_retired = origin_retired;
-        if origin_retired {
+        read.materialized_bytes = used;
+        if !valid {
             read.revision = None;
             read.access = None;
         }

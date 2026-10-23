@@ -670,3 +670,139 @@ impl MemoryLifecycleMutation {
         Ok((raw, receipt, pending))
     }
 }
+
+/// Pure check over a native transaction's original bounded frame. Missing,
+/// conflicting, cyclic or retired ancestral cuts cannot authorize a derivative.
+pub fn source_frame_matches_original_lineage(
+    origins: &std::collections::BTreeMap<MemoryId, Option<MemoryExtractionOrigin>>,
+    frame: &std::collections::BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
+) -> bool {
+    let mut done = std::collections::BTreeSet::new();
+    let mut active = std::collections::BTreeSet::new();
+    for root in origins.keys() {
+        let mut todo = vec![(*root, false)];
+        while let Some((id, leaving)) = todo.pop() {
+            if leaving {
+                active.remove(&id);
+                done.insert(id);
+                continue;
+            }
+            if active.contains(&id) {
+                return false;
+            }
+            if done.contains(&id) {
+                continue;
+            }
+            let Some(origin) = origins.get(&id) else {
+                return false;
+            };
+            active.insert(id);
+            todo.push((id, true));
+            if let Some(origin) = origin {
+                for expected in origin.source_readset() {
+                    if !frame
+                        .get(&expected.memory_id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|read| {
+                            !read.fence.retired
+                                && !read.origin_retired
+                                && read.revision.as_ref() == Some(expected)
+                        })
+                    {
+                        return false;
+                    }
+                    todo.push((expected.memory_id, false));
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod original_lineage_frame_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    fn cut(id: u128) -> MemoryEntryRevision {
+        MemoryEntryRevision {
+            memory_id: uuid::Uuid::from_u128(id),
+            scope_key: "project:a".into(),
+            body_digest: format!("body-{id}"),
+        }
+    }
+    fn read(cut: MemoryEntryRevision) -> MemorySourceRevisionRead {
+        MemorySourceRevisionRead {
+            origin_retired: false,
+            access: None,
+            packet_content_digest: None,
+            packet_atom: None,
+            fence: MemorySourceFence {
+                source_ref: format!("memory:{}", cut.memory_id),
+                scope_key: cut.scope_key.clone(),
+                delete_epoch: 0,
+                retired: false,
+            },
+            revision: Some(cut),
+            materialized_bytes: 1,
+        }
+    }
+    #[test]
+    fn shared_ancestors_are_legal_but_missing_foreign_conflicting_and_cyclic_cuts_are_not() {
+        let a = cut(1);
+        let b = cut(2);
+        let c = cut(3);
+        let origin = MemoryExtractionOrigin {
+            scope_key: "project:a".into(),
+            session_id: "s".into(),
+            agent_id: "a".into(),
+            batch_tag: "batch".into(),
+            turn_ref: None,
+            source_readset: vec![a.clone()],
+        };
+        let mut origins = BTreeMap::from([
+            (a.memory_id, None),
+            (b.memory_id, Some(origin.clone())),
+            (c.memory_id, Some(origin.clone())),
+        ]);
+        let frame = BTreeMap::from([
+            (a.memory_id, Some(read(a.clone()))),
+            (b.memory_id, Some(read(b.clone()))),
+            (c.memory_id, Some(read(c.clone()))),
+        ]);
+        assert!(source_frame_matches_original_lineage(&origins, &frame));
+        let mut missing = frame.clone();
+        missing.remove(&a.memory_id);
+        assert!(!source_frame_matches_original_lineage(&origins, &missing));
+        let mut foreign = frame.clone();
+        foreign
+            .get_mut(&a.memory_id)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .revision
+            .as_mut()
+            .unwrap()
+            .scope_key = "project:foreign".into();
+        assert!(!source_frame_matches_original_lineage(&origins, &foreign));
+        let mut retired = frame.clone();
+        retired
+            .get_mut(&a.memory_id)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .origin_retired = true;
+        assert!(!source_frame_matches_original_lineage(&origins, &retired));
+        let mut conflict = origin.clone();
+        conflict.source_readset.push(MemoryEntryRevision {
+            body_digest: "different-old-cut".into(),
+            ..a.clone()
+        });
+        origins.insert(b.memory_id, Some(conflict));
+        assert!(!source_frame_matches_original_lineage(&origins, &frame));
+        origins.insert(b.memory_id, Some(origin.clone()));
+        let mut cycle = origin;
+        cycle.source_readset = vec![b];
+        origins.insert(a.memory_id, Some(cycle));
+        assert!(!source_frame_matches_original_lineage(&origins, &frame));
+    }
+}

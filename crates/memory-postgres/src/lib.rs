@@ -2292,47 +2292,31 @@ fn write_entry(
     origin: Option<&MemoryExtractionOrigin>,
 ) -> MemoryResult<()> {
     let id = entry.id.to_string();
-    // Lock the original target and all source bodies in one deterministic
-    // order, including absent IDs, before origin/row locks and any writes.
-    let mut body_ids = vec![id.clone()];
-    if let Some(origin) = origin {
-        body_ids.extend(
+    let roots = origin
+        .map(|origin| {
             origin
                 .source_readset()
                 .iter()
-                .map(|cut| cut.memory_id.to_string()),
-        );
-    }
-    body_ids.sort();
-    body_ids.dedup();
-    for body_id in body_ids {
-        let sql = if body_id == id {
-            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))"
-        } else {
-            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))"
-        };
-        client
-            .query_one(sql, &[&format!("cowd-memory:body:{body_id}")])
-            .map_err(postgres_memory_error)?;
+                .map(|cut| cut.memory_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (frame, valid, _) = read_memory_source_frame(
+        client,
+        &roots,
+        memory::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+        true,
+        Some(entry.id),
+    )?;
+    if !valid {
+        return Err(MemoryError::StaleSource);
     }
     if let Some(origin) = origin {
-        let mut remaining = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES;
-        let mut frame = std::collections::BTreeMap::new();
         for expected in origin.source_readset() {
-            if !frame.contains_key(&expected.memory_id) {
-                let read = read_live_memory_source(
-                    client,
-                    &format!("memory:{}", expected.memory_id),
-                    remaining,
-                    true,
-                )?
+            let read = frame
+                .get(&expected.memory_id)
+                .and_then(Option::as_ref)
                 .ok_or(MemoryError::StaleSource)?;
-                remaining = remaining
-                    .checked_sub(read.materialized_bytes)
-                    .ok_or(MemoryError::SourceReadLimit)?;
-                frame.insert(expected.memory_id, read);
-            }
-            let read = &frame[&expected.memory_id];
             if read.fence.retired || read.origin_retired || read.revision.as_ref() != Some(expected)
             {
                 return Err(MemoryError::StaleSource);
@@ -2941,6 +2925,134 @@ mod tests;
 // All original body/lifecycle writers acquire this body row before changing
 // history or its source fence. The dependent Knowledge commit holds the same
 // row shared until its own transaction commits; no copied writer authority.
+// Prepare only original immutable origin metadata, before taking ANY body
+// advisory lock. The complete closure is then locked once in UUID order and
+// its metadata readset is revalidated; no recursive reverse lock acquisition.
+fn validate_original_origin_snapshot(
+    tx: &mut impl PostgresClient,
+    raw_origins: &std::collections::BTreeMap<MemoryId, Option<String>>,
+) -> MemoryResult<()> {
+    for (id, raw) in raw_origins {
+        let key = MemoryExtractionOrigin::binding_key(*id);
+        let matches = if let Some(raw) = raw {
+            tx.query_opt("SELECT value=$2 FROM memory_kv WHERE key=$1", &[&key, raw])
+                .map_err(postgres_memory_error)?
+                .map(|row| row.try_get::<_, bool>(0))
+                .transpose()
+                .map_err(postgres_memory_error)?
+                .unwrap_or(false)
+        } else {
+            tx.query_opt("SELECT 1 FROM memory_kv WHERE key=$1", &[&key])
+                .map_err(postgres_memory_error)?
+                .is_none()
+        };
+        if !matches {
+            return Err(MemoryError::StaleSource);
+        }
+    }
+    Ok(())
+}
+
+fn read_memory_source_frame(
+    tx: &mut impl PostgresClient,
+    roots: &[MemoryId],
+    budget_bytes: usize,
+    include_body: bool,
+    target: Option<MemoryId>,
+) -> MemoryResult<(
+    std::collections::BTreeMap<MemoryId, Option<memory::store::MemorySourceRevisionRead>>,
+    bool,
+    usize,
+)> {
+    let mut remaining = budget_bytes;
+    let mut origins = std::collections::BTreeMap::new();
+    let mut raw_origins = std::collections::BTreeMap::new();
+    let mut retired = std::collections::BTreeSet::new();
+    let mut todo = roots.to_vec();
+    while let Some(id) = todo.pop() {
+        if origins.contains_key(&id) {
+            continue;
+        }
+        if origins.len() >= memory::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        remaining = remaining
+            .checked_sub(16)
+            .ok_or(MemoryError::SourceReadLimit)?;
+        // Metadata-only irreversible retirement may short-circuit ancestry.
+        // The typed current fence is still revalidated under its body lock.
+        if tx.query_opt("SELECT 1 FROM memory_source_fences WHERE source_ref=$1 AND payload->>'retired'='true'", &[&format!("memory:{id}")]).map_err(postgres_memory_error)?.is_some() {
+            origins.insert(id,None);
+            retired.insert(id);
+            continue;
+        }
+        let key = MemoryExtractionOrigin::binding_key(id);
+        let row = tx.query_opt("SELECT octet_length(value)::bigint,CASE WHEN octet_length(value)::bigint <= $2::bigint THEN value END FROM memory_kv WHERE key=$1", &[&key,&i64::try_from(remaining).map_err(|_|MemoryError::SourceReadLimit)?]).map_err(postgres_memory_error)?;
+        let raw = row
+            .map(|row| -> MemoryResult<String> {
+                let bytes =
+                    usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
+                        .map_err(|_| MemoryError::SourceReadLimit)?;
+                remaining = remaining
+                    .checked_sub(bytes)
+                    .ok_or(MemoryError::SourceReadLimit)?;
+                row.try_get::<_, Option<String>>(1)
+                    .map_err(postgres_memory_error)?
+                    .ok_or(MemoryError::SourceReadLimit)
+            })
+            .transpose()?;
+        let origin: Option<MemoryExtractionOrigin> = raw
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(json_memory_error)?;
+        if include_body {
+            if let Some(origin) = &origin {
+                todo.extend(origin.source_readset().iter().map(|cut| cut.memory_id));
+            }
+        }
+        origins.insert(id, origin);
+        raw_origins.insert(id, raw);
+    }
+    let mut bodies = origins
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    bodies.extend(target);
+    for id in bodies {
+        let sql = if Some(id) == target {
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))"
+        } else {
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))"
+        };
+        tx.query_one(sql, &[&format!("cowd-memory:body:{id}")])
+            .map_err(postgres_memory_error)?;
+    }
+    // Same body locks fence all binding producers; generic KV cannot mutate it.
+    validate_original_origin_snapshot(tx, &raw_origins)?;
+    let mut frame = std::collections::BTreeMap::new();
+    for (id, origin) in &origins {
+        let read = read_single_memory_source(
+            tx,
+            &format!("memory:{id}"),
+            remaining,
+            include_body,
+            origin.as_ref(),
+        )?;
+        if retired.contains(id) && !read.as_ref().is_some_and(|read| read.fence.retired) {
+            return Err(MemoryError::StaleSource);
+        }
+        if let Some(read) = &read {
+            remaining = remaining
+                .checked_sub(read.materialized_bytes)
+                .ok_or(MemoryError::SourceReadLimit)?;
+        }
+        frame.insert(*id, read);
+    }
+    let valid = memory::store::source_frame_matches_original_lineage(&origins, &frame);
+    Ok((frame, valid, budget_bytes - remaining))
+}
+
 fn read_live_memory_source(
     tx: &mut impl PostgresClient,
     source_ref: &str,
@@ -2951,30 +3063,34 @@ fn read_live_memory_source(
         .strip_prefix("memory:")
         .and_then(|id| uuid::Uuid::parse_str(id).ok())
         .filter(|id| format!("memory:{id}") == source_ref)
+        .ok_or(MemoryError::StaleSource)?;
+    let (mut frame, valid, used) =
+        read_memory_source_frame(tx, &[id], budget_bytes, include_body, None)?;
+    let Some(mut read) = frame.remove(&id).flatten() else {
+        return Ok(None);
+    };
+    read.materialized_bytes = used;
+    if include_body && !valid {
+        read.revision = None;
+        read.access = None;
+    }
+    Ok(Some(read))
+}
+
+fn read_single_memory_source(
+    tx: &mut impl PostgresClient,
+    source_ref: &str,
+    budget_bytes: usize,
+    include_body: bool,
+    origin: Option<&MemoryExtractionOrigin>,
+) -> MemoryResult<Option<memory::store::MemorySourceRevisionRead>> {
+    let id = source_ref
+        .strip_prefix("memory:")
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .filter(|id| format!("memory:{id}") == source_ref)
         .ok_or(MemoryError::StaleSource)?
         .to_string();
-    tx.query_one(
-        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))",
-        &[&format!("cowd-memory:body:{id}")],
-    )
-    .map_err(postgres_memory_error)?;
-    let row = tx.query_opt("SELECT octet_length(value)::bigint,CASE WHEN octet_length(value)::bigint<=$2::bigint THEN value END FROM memory_kv WHERE key='memory_extraction_origin:'||$1", &[&id,&i64::try_from(budget_bytes).map_err(|_|MemoryError::SourceReadLimit)?]).map_err(postgres_memory_error)?;
-    let mut origin_bytes = 0usize;
-    let origin = row
-        .map(|row| -> MemoryResult<MemoryExtractionOrigin> {
-            origin_bytes =
-                usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
-                    .map_err(|_| MemoryError::SourceReadLimit)?;
-            if origin_bytes > budget_bytes {
-                return Err(MemoryError::SourceReadLimit);
-            }
-            let raw = row
-                .try_get::<_, Option<String>>(1)
-                .map_err(postgres_memory_error)?
-                .ok_or(MemoryError::SourceReadLimit)?;
-            serde_json::from_str(&raw).map_err(json_memory_error)
-        })
-        .transpose()?;
+    let origin_bytes = 0;
     let mut origin_retired = false;
     if let Some(origin) = origin {
         let key = origin.key()?;

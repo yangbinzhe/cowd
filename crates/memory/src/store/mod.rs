@@ -23,10 +23,10 @@ pub mod blob;
 mod mutation;
 pub(crate) use mutation::reserved_source_bytes;
 pub use mutation::{
-    lifecycle_retired, live_source_revision, MemoryCleanupPending, MemoryEntryRevision,
-    MemoryExtractionOrigin, MemoryLifecycleMutation, MemoryLifecycleReceipt,
-    MemoryRetirementVerificationError, MemorySourceAccess, MemorySourceFence,
-    MemorySourceFenceReader, MemorySourceRevisionRead, VerifiedMemoryRetirement,
+    lifecycle_retired, live_source_revision, source_frame_matches_original_lineage,
+    MemoryCleanupPending, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation,
+    MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceAccess,
+    MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead, VerifiedMemoryRetirement,
 };
 mod ephemeral;
 pub mod vector;
