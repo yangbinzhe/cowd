@@ -24,8 +24,9 @@ mod mutation;
 pub(crate) use mutation::reserved_source_bytes;
 pub use mutation::{
     lifecycle_retired, live_source_revision, MemoryCleanupPending, MemoryEntryRevision,
-    MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryRetirementVerificationError,
-    MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead, VerifiedMemoryRetirement,
+    MemoryExtractionOrigin, MemoryLifecycleMutation, MemoryLifecycleReceipt,
+    MemoryRetirementVerificationError, MemorySourceAccess, MemorySourceFence,
+    MemorySourceFenceReader, MemorySourceRevisionRead, VerifiedMemoryRetirement,
 };
 mod ephemeral;
 pub mod vector;
@@ -213,12 +214,21 @@ pub struct MemoryStoreAggregate {
 
 /// The primary storage trait that all backends must implement.
 #[async_trait]
-pub trait MemoryStore: Send + Sync {
+pub trait MemoryStore: MemorySourceFenceReader + Send + Sync {
     /// Return the selected store's durable/rebuildable capability verdict.
     fn capabilities(&self) -> MemoryStoreCapabilities;
     /// Create an absent body and its L2/L3/L4 verbatim atomically. Exact existing
     /// body replay is read-only; a different existing body is a conflict.
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId>;
+
+    /// Automatic input-origin binding and body write are one native transaction.
+    /// `None` creates; replacement also requires the original target cut.
+    async fn write_extraction(
+        &self,
+        entry: &MemoryEntry,
+        origin: &MemoryExtractionOrigin,
+        expected: Option<&MemoryEntryRevision>,
+    ) -> Result<MemoryId>;
 
     /// Retrieve a memory entry by its ID.
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>>;

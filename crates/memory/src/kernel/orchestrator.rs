@@ -561,6 +561,31 @@ impl MemoryOrchestrator {
     /// Source and conflict governance belongs to MemoryKernel. Free-form
     /// memory content is never registered as an unscoped, verified fact.
     async fn remember_resolved(&self, entry: MemoryEntry) -> Result<MemoryId> {
+        self.validate_ordinary_write(&entry)?;
+
+        let layer = entry.layer;
+        let id = match layer {
+            MemoryLayer::L0 => self.l0.insert(entry).await?,
+            MemoryLayer::L1 => self.l1.insert(entry).await?,
+            MemoryLayer::L2 => self.l2.insert(entry).await?,
+            MemoryLayer::L3 => self.l3.insert(entry).await?,
+            // L4 is deliberately absent from ordinary memory writes.  A
+            // caller must use the typed promotion command below after Runtime
+            // has produced a governed candidate and receipt.
+            MemoryLayer::L4 => {
+                return Err(MemoryError::WriteDenied {
+                    layer: "L4".to_string(),
+                    write_source: "ordinary_memory_write_requires_l4_promotion_service".to_string(),
+                });
+            }
+        };
+
+        // The original store commits body and verbatim together, after the
+        // layer resolves its canonical entry. No second durable write follows.
+        Ok(id)
+    }
+
+    fn validate_ordinary_write(&self, entry: &MemoryEntry) -> Result<()> {
         if entry.layer == MemoryLayer::L4 {
             return Err(MemoryError::WriteDenied {
                 layer: "L4".to_string(),
@@ -583,26 +608,44 @@ impl MemoryOrchestrator {
             }
         }
 
-        let layer = entry.layer;
-        let id = match layer {
-            MemoryLayer::L0 => self.l0.insert(entry).await?,
-            MemoryLayer::L1 => self.l1.insert(entry).await?,
-            MemoryLayer::L2 => self.l2.insert(entry).await?,
-            MemoryLayer::L3 => self.l3.insert(entry).await?,
-            // L4 is deliberately absent from ordinary memory writes.  A
-            // caller must use the typed promotion command below after Runtime
-            // has produced a governed candidate and receipt.
-            MemoryLayer::L4 => {
-                return Err(MemoryError::WriteDenied {
-                    layer: "L4".to_string(),
-                    write_source: "ordinary_memory_write_requires_l4_promotion_service".to_string(),
-                });
-            }
-        };
+        Ok(())
+    }
 
-        // The original store commits body and verbatim together, after the
-        // layer resolves its canonical entry. No second durable write follows.
-        Ok(id)
+    /// Original automatic producer route: layer normalization and write guard
+    /// precede the single native origin/body transaction. No ambient Agent state.
+    pub(crate) async fn write_extraction_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        batch_tag: &str,
+        mut entry: MemoryEntry,
+        expected: Option<&crate::store::MemoryEntryRevision>,
+    ) -> Result<MemoryId> {
+        entry.session_id = Some(turn.session_id.clone());
+        entry.source_agent = Some(turn.agent_id.clone());
+        entry.scope = scoped_entry_scope(turn, &entry);
+        self.validate_ordinary_write(&entry)?;
+        if entry.layer == MemoryLayer::L0 {
+            entry.priority = Priority::Critical;
+            entry.staleness = 0.0;
+        }
+        let origin = crate::store::MemoryExtractionOrigin::for_entry(turn, &entry, batch_tag)?;
+        self.store.write_extraction(&entry, &origin, expected).await
+    }
+
+    pub(crate) async fn remember_extraction_batch_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        batch_tag: &str,
+        entries: Vec<MemoryEntry>,
+    ) -> Result<Vec<MemoryId>> {
+        let mut ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            ids.push(
+                self.write_extraction_for_turn(turn, batch_tag, entry, None)
+                    .await?,
+            );
+        }
+        Ok(ids)
     }
 
     /// Persist an entry with the immutable Runtime turn that produced it.

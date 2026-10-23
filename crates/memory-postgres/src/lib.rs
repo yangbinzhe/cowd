@@ -15,9 +15,9 @@ use memory::{
     same_memory_key,
     store::{
         AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryCleanupPending,
-        MemoryDiscoveryPage, MemoryDiscoveryQuery, MemoryEntryRevision, MemoryKeyValue,
-        MemoryLayerAggregate, MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryScanCursor,
-        MemoryScanPage, MemorySourceFence, MemorySourceFenceReader, MemoryStore,
+        MemoryDiscoveryPage, MemoryDiscoveryQuery, MemoryEntryRevision, MemoryExtractionOrigin,
+        MemoryKeyValue, MemoryLayerAggregate, MemoryLifecycleMutation, MemoryLifecycleReceipt,
+        MemoryScanCursor, MemoryScanPage, MemorySourceFence, MemorySourceFenceReader, MemoryStore,
         MemoryStoreAggregate, MemoryStoreCapabilities, Result as MemoryResult,
         SymbolMemoryReference, TaggedLookup, VerbatimEntry,
     },
@@ -592,7 +592,7 @@ impl PostgresMemoryStore {
             .checkout_critical()
             .map_err(storage_memory_error)?;
         let mut tx = connection.transaction().map_err(postgres_memory_error)?;
-        write_entry(&mut tx, entry, None)?;
+        write_entry(&mut tx, entry, None, None)?;
         tx.commit().map_err(postgres_memory_error)
     }
 
@@ -606,7 +606,7 @@ impl PostgresMemoryStore {
             .checkout_critical()
             .map_err(storage_memory_error)?;
         let mut tx = connection.transaction().map_err(postgres_memory_error)?;
-        write_entry(&mut tx, entry, Some(expected))?;
+        write_entry(&mut tx, entry, Some(expected), None)?;
         tx.commit().map_err(postgres_memory_error)
     }
 
@@ -716,9 +716,15 @@ impl PostgresMemoryStore {
         Ok(())
     }
 
-    fn load_json_rows<T: DeserializeOwned>(&self, scope_key: &str, table: &str) -> MemoryResult<Vec<T>> {
+    fn load_json_rows<T: DeserializeOwned>(
+        &self,
+        scope_key: &str,
+        table: &str,
+    ) -> MemoryResult<Vec<T>> {
         let sql = match table {
-            "memory_entities" => "SELECT payload FROM memory_entities WHERE scope_key=$1 ORDER BY id",
+            "memory_entities" => {
+                "SELECT payload FROM memory_entities WHERE scope_key=$1 ORDER BY id"
+            }
             "memory_triples" => "SELECT payload FROM memory_triples WHERE scope_key=$1 ORDER BY id",
             _ => {
                 return Err(MemoryError::Store(format!(
@@ -756,7 +762,10 @@ impl PostgresMemoryStore {
             )
             .map_err(postgres_memory_error)?;
         transaction
-            .execute("DELETE FROM memory_triples WHERE scope_key=$1", &[&scope_key])
+            .execute(
+                "DELETE FROM memory_triples WHERE scope_key=$1",
+                &[&scope_key],
+            )
             .map_err(postgres_memory_error)?;
         for triple in triples {
             let payload = serde_json::to_value(triple).map_err(json_memory_error)?;
@@ -885,6 +894,29 @@ impl MemoryStore for PostgresMemoryStore {
         .await
     }
 
+    async fn write_extraction(
+        &self,
+        entry: &MemoryEntry,
+        origin: &MemoryExtractionOrigin,
+        expected: Option<&MemoryEntryRevision>,
+    ) -> MemoryResult<MemoryId> {
+        let store = self.clone();
+        let entry = entry.clone();
+        let origin = origin.clone();
+        let expected = expected.cloned();
+        run_memory_blocking(move || {
+            let mut connection = store
+                .executor
+                .checkout_critical()
+                .map_err(storage_memory_error)?;
+            let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+            write_entry(&mut tx, &entry, expected.as_ref(), Some(&origin))?;
+            tx.commit().map_err(postgres_memory_error)?;
+            Ok(entry.id)
+        })
+        .await
+    }
+
     async fn get(&self, id: &MemoryId) -> MemoryResult<Option<MemoryEntry>> {
         let store = self.clone();
         let id = id.to_string();
@@ -947,6 +979,9 @@ impl MemoryStore for PostgresMemoryStore {
             // One per-target transaction lock also serializes the absent-history
             // case, where a SELECT FOR UPDATE of a missing KV row is insufficient.
             let target=command.event.memory_id.to_string();
+            tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", &[&format!("cowd-memory:body:{target}")]).map_err(postgres_memory_error)?;
+            let origin = extraction_binding(&mut tx, &target)?;
+            if let Some((key, _)) = &origin { lock_extraction_origin(&mut tx, key)?; }
             let row=tx.query_opt("SELECT payload FROM memory_entries WHERE id=$1 FOR UPDATE", &[&target]).map_err(postgres_memory_error)?;
             if let Some(row)=tx.query_opt("SELECT payload FROM memory_lifecycle_receipts WHERE mutation_id=$1", &[&command.mutation_id]).map_err(postgres_memory_error)? {
                 let receipt:MemoryLifecycleReceipt=serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
@@ -959,6 +994,14 @@ impl MemoryStore for PostgresMemoryStore {
             let history:Option<String>=tx.query_opt("SELECT value FROM memory_kv WHERE key=$1 FOR UPDATE", &[&key]).map_err(postgres_memory_error)?.map(|r|r.try_get(0)).transpose().map_err(postgres_memory_error)?;
             let source:Option<MemorySourceFence>=tx.query_opt("SELECT payload FROM memory_source_fences WHERE source_ref=$1 FOR UPDATE", &[&source_ref]).map_err(postgres_memory_error)?.map(|r|r.try_get::<_,serde_json::Value>(0)).transpose().map_err(postgres_memory_error)?.map(serde_json::from_value).transpose().map_err(json_memory_error)?;
             let (raw,receipt,pending)=command.validate_cut(&entry,history.as_deref(),source.as_ref())?;
+            if receipt.source.retired && command.revokes_origin() {
+                if let Some((_, origin)) = origin {
+                    let fence = origin.retirement_fence(&receipt.source)?;
+                    let payload = serde_json::to_value(&fence).map_err(json_memory_error)?;
+                    let epoch = i64::try_from(fence.delete_epoch).map_err(|_|MemoryError::StaleSource)?;
+                    tx.execute("INSERT INTO memory_source_fences(source_ref,scope_key,delete_epoch,payload) VALUES($1,$2,$3,$4) ON CONFLICT(source_ref) DO NOTHING", &[&fence.source_ref,&fence.scope_key,&epoch,&payload]).map_err(postgres_memory_error)?;
+                }
+            }
             let payload=serde_json::to_value(&receipt.source).map_err(json_memory_error)?;
             let epoch=i64::try_from(receipt.source.delete_epoch).map_err(|_|MemoryError::Store("Memory delete epoch overflow".into()))?;
             tx.execute("INSERT INTO memory_kv(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", &[&key,&raw]).map_err(postgres_memory_error)?;
@@ -2188,6 +2231,9 @@ impl KnowledgeStore for PostgresKnowledgeStore {
 }
 
 fn guard_legacy_lifecycle_kv(client: &mut impl PostgresClient, key: &str) -> MemoryResult<()> {
+    if key.starts_with("memory_extraction_origin:") {
+        return Err(MemoryError::StaleSource);
+    }
     if let Some(id) = key.strip_prefix("memory_lifecycle:") {
         client
             .query_opt(
@@ -2211,10 +2257,39 @@ fn guard_legacy_lifecycle_kv(client: &mut impl PostgresClient, key: &str) -> Mem
     Ok(())
 }
 
+fn extraction_binding(
+    client: &mut impl PostgresClient,
+    id: &str,
+) -> MemoryResult<Option<(String, MemoryExtractionOrigin)>> {
+    client
+        .query_opt(
+            "SELECT value FROM memory_kv WHERE key='memory_extraction_origin:'||$1",
+            &[&id],
+        )
+        .map_err(postgres_memory_error)?
+        .map(|row| {
+            let raw: String = row.try_get(0).map_err(postgres_memory_error)?;
+            let origin: MemoryExtractionOrigin =
+                serde_json::from_str(&raw).map_err(json_memory_error)?;
+            Ok((origin.key()?, origin))
+        })
+        .transpose()
+}
+fn lock_extraction_origin(client: &mut impl PostgresClient, key: &str) -> MemoryResult<()> {
+    client
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&format!("cowd-memory:extraction:{key}")],
+        )
+        .map_err(postgres_memory_error)?;
+    Ok(())
+}
+
 fn write_entry(
     client: &mut impl PostgresClient,
     entry: &MemoryEntry,
     expected: Option<&MemoryEntryRevision>,
+    origin: Option<&MemoryExtractionOrigin>,
 ) -> MemoryResult<()> {
     let id = entry.id.to_string();
     // A missing row cannot be locked FOR UPDATE. Serialize exact same-ID
@@ -2225,6 +2300,43 @@ fn write_entry(
             &[&format!("cowd-memory:body:{id}")],
         )
         .map_err(postgres_memory_error)?;
+    let binding = extraction_binding(client, &id)?;
+    let requested = origin
+        .map(|origin| -> MemoryResult<(String, MemoryExtractionOrigin)> {
+            origin.validate_entry(entry)?;
+            Ok((origin.key()?, origin.clone()))
+        })
+        .transpose()?;
+    if let Some((key, requested)) = &requested {
+        if binding
+            .as_ref()
+            .is_some_and(|(bound_key, bound)| bound_key != key || bound != requested)
+            || (expected.is_some() && binding.is_none())
+        {
+            return Err(MemoryError::StaleSource);
+        }
+    } else if binding.is_none()
+        && entry
+            .tags
+            .iter()
+            .any(|tag| tag.starts_with("extraction-batch:"))
+    {
+        return Err(MemoryError::StaleSource);
+    }
+    let active_origin = requested.as_ref().or(binding.as_ref());
+    if let Some((key, _)) = active_origin {
+        lock_extraction_origin(client, key)?;
+        if client
+            .query_opt(
+                "SELECT 1 FROM memory_source_fences WHERE source_ref=$1",
+                &[&format!("memory-origin:{key}")],
+            )
+            .map_err(postgres_memory_error)?
+            .is_some()
+        {
+            return Err(MemoryError::StaleSource);
+        }
+    }
     // Same-target row lock orders lifecycle retirement against existing-body
     // writers. The source tombstone remains even when a body is later erased.
     let current = client
@@ -2270,6 +2382,20 @@ fn write_entry(
         return Err(MemoryError::Store(
             "legacy retired Memory source write".into(),
         ));
+    }
+    if let Some((key, origin)) = requested {
+        if current.is_some() && binding.is_none() {
+            return Err(MemoryError::StaleSource);
+        }
+        if binding.is_none() {
+            let payload = serde_json::to_string(&origin).map_err(json_memory_error)?;
+            client
+                .execute(
+                    "INSERT INTO memory_kv(key,value) VALUES('memory_extraction_origin:'||$1,$2)",
+                    &[&id, &payload],
+                )
+                .map_err(postgres_memory_error)?;
+        }
     }
     let next = match expected {
         Some(expected) => expected.validate_replace(
@@ -2788,6 +2914,44 @@ fn read_live_memory_source(
         .filter(|id| format!("memory:{id}") == source_ref)
         .ok_or(MemoryError::StaleSource)?
         .to_string();
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))",
+        &[&format!("cowd-memory:body:{id}")],
+    )
+    .map_err(postgres_memory_error)?;
+    let row = tx.query_opt("SELECT octet_length(value)::bigint,CASE WHEN octet_length(value)::bigint<=$2::bigint THEN value END FROM memory_kv WHERE key='memory_extraction_origin:'||$1", &[&id,&i64::try_from(budget_bytes).map_err(|_|MemoryError::SourceReadLimit)?]).map_err(postgres_memory_error)?;
+    let mut origin_bytes = 0usize;
+    let origin = row
+        .map(|row| -> MemoryResult<MemoryExtractionOrigin> {
+            origin_bytes =
+                usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
+                    .map_err(|_| MemoryError::SourceReadLimit)?;
+            if origin_bytes > budget_bytes {
+                return Err(MemoryError::SourceReadLimit);
+            }
+            let raw = row
+                .try_get::<_, Option<String>>(1)
+                .map_err(postgres_memory_error)?
+                .ok_or(MemoryError::SourceReadLimit)?;
+            serde_json::from_str(&raw).map_err(json_memory_error)
+        })
+        .transpose()?;
+    let mut origin_retired = false;
+    if let Some(origin) = origin {
+        let key = origin.key()?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))",
+            &[&format!("cowd-memory:extraction:{key}")],
+        )
+        .map_err(postgres_memory_error)?;
+        origin_retired = tx
+            .query_opt(
+                "SELECT 1 FROM memory_source_fences WHERE source_ref=$1",
+                &[&origin.retirement_ref()?],
+            )
+            .map_err(postgres_memory_error)?
+            .is_some();
+    }
     // Read lengths under the original row lock before transferring any scope,
     // history or body. Long authorized metadata uses the same remaining budget,
     // rather than an unrelated per-field cutoff.
@@ -2802,7 +2966,10 @@ fn read_live_memory_source(
         .map_err(postgres_memory_error)?
         .map(|n| usize::try_from(n).map_err(|_| MemoryError::SourceReadLimit))
         .transpose()?;
-    let mut used = body_scope_bytes.unwrap_or(0);
+    let mut used = body_scope_bytes
+        .unwrap_or(0)
+        .checked_add(origin_bytes)
+        .ok_or(MemoryError::SourceReadLimit)?;
     let remaining = budget_bytes
         .checked_sub(used)
         .ok_or(MemoryError::SourceReadLimit)?;
@@ -2853,6 +3020,10 @@ fn read_live_memory_source(
     if body_scope.is_none() {
         return match stored_fence {
             Some(fence) if fence.retired => Ok(Some(memory::store::MemorySourceRevisionRead {
+                origin_retired,
+                access: None,
+                packet_content_digest: None,
+                packet_atom: None,
                 fence,
                 revision: None,
                 materialized_bytes: used,
@@ -2861,27 +3032,32 @@ fn read_live_memory_source(
             None => Ok(None),
         };
     }
-    let fence = if let Some(fence) = stored_fence {
-        fence
-    } else {
+    let history = if include_body && stored_fence.as_ref().is_none_or(|fence| !fence.retired)
+        || stored_fence.is_none()
+    {
         let remaining = budget_bytes
             .checked_sub(used)
             .ok_or(MemoryError::SourceReadLimit)?;
         let row=tx.query_opt("SELECT octet_length(value)::bigint,CASE WHEN octet_length(value)::bigint<=$2::bigint THEN value END FROM memory_kv WHERE key=$1 FOR SHARE", &[&format!("memory_lifecycle:{id}"),&i64::try_from(remaining).map_err(|_|MemoryError::SourceReadLimit)?]).map_err(postgres_memory_error)?;
-        let history = row
-            .map(|row| -> MemoryResult<String> {
-                used = used
-                    .checked_add(
-                        usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
-                            .map_err(|_| MemoryError::SourceReadLimit)?,
-                    )
-                    .filter(|n| *n <= budget_bytes)
-                    .ok_or(MemoryError::SourceReadLimit)?;
-                row.try_get::<_, Option<String>>(1)
-                    .map_err(postgres_memory_error)?
-                    .ok_or(MemoryError::SourceReadLimit)
-            })
-            .transpose()?;
+        row.map(|row| -> MemoryResult<String> {
+            used = used
+                .checked_add(
+                    usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
+                        .map_err(|_| MemoryError::SourceReadLimit)?,
+                )
+                .filter(|n| *n <= budget_bytes)
+                .ok_or(MemoryError::SourceReadLimit)?;
+            row.try_get::<_, Option<String>>(1)
+                .map_err(postgres_memory_error)?
+                .ok_or(MemoryError::SourceReadLimit)
+        })
+        .transpose()?
+    } else {
+        None
+    };
+    let fence = if let Some(fence) = stored_fence {
+        fence
+    } else {
         MemorySourceFence {
             source_ref: source_ref.into(),
             scope_key: body_scope.clone().unwrap(),
@@ -2894,6 +3070,10 @@ fn read_live_memory_source(
     };
     if fence.retired || !include_body {
         return Ok(Some(memory::store::MemorySourceRevisionRead {
+            origin_retired,
+            access: None,
+            packet_content_digest: None,
+            packet_atom: None,
             fence,
             revision: None,
             materialized_bytes: used,
@@ -2920,9 +3100,25 @@ fn read_live_memory_source(
             "Memory source/body scope mismatch".into(),
         ));
     }
-    let mut read =
-        memory::store::live_source_revision(source_ref, &entry, None, Some(&fence), budget_bytes)?;
-    read.materialized_bytes = read.materialized_bytes.max(used);
+    let mut read = memory::store::live_source_revision(
+        source_ref,
+        &entry,
+        history.as_deref(),
+        Some(&fence),
+        budget_bytes
+            .checked_sub(origin_bytes)
+            .ok_or(MemoryError::SourceReadLimit)?,
+    )?;
+    read.materialized_bytes = read
+        .materialized_bytes
+        .checked_add(origin_bytes)
+        .ok_or(MemoryError::SourceReadLimit)?
+        .max(used);
+    read.origin_retired = origin_retired;
+    if origin_retired {
+        read.revision = None;
+        read.access = None;
+    }
     Ok(Some(read))
 }
 

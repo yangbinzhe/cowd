@@ -45,7 +45,9 @@ impl KnowledgeActivationRuntime {
         profile: &str,
         project_id: Option<&str>,
         packet: &MemoryContextPacket,
+        mut usage: memory::MemoryPacketUse,
     ) -> Result<Option<RuntimeKnowledgeActivation>, memory::KnowledgeStoreError> {
+        self.fabric.validate_packet_for_use(packet, &mut usage)?;
         let packet = filter_packet_for_turn_intent(packet, intent);
         let mut projected = Vec::new();
         for item in &packet.selected {
@@ -57,16 +59,16 @@ impl KnowledgeActivationRuntime {
             };
             let governance = governance_from_memory_item(item);
             let policy = activation_policy_from_memory_item(item);
-            let namespace = namespace_from_memory_item(item, project_id);
+            let namespace = namespace_from_memory_item(item);
             projected.push(
                 KnowledgeIngestionService::new()
                     .project_for_turn(namespace, policy, governance, document),
             );
         }
 
-        let (plan, canon_packs, warnings) = self
-            .fabric
-            .activate_with_turn_projection(session_id, intent, profile, project_id, &projected)?;
+        let (plan, canon_packs, warnings) = self.fabric.activate_with_turn_projection(
+            session_id, intent, profile, project_id, &projected, usage,
+        )?;
         if plan.active_pack_ids.is_empty() {
             return Ok(None);
         }
@@ -126,8 +128,10 @@ impl KnowledgeActivationRuntime {
                 },
                 content.clone(),
             );
-            item.authority = ContextAuthority::Project;
-            item.visibility = ContextVisibility::Shared;
+            // This derived view was authorized for this invocation. It does
+            // not widen a private source into shared project authority.
+            item.authority = ContextAuthority::Derived;
+            item.visibility = ContextVisibility::Private;
             item.score = if pointer_only { 0.42 } else { 0.88 };
             item.evidence = canon
                 .evidence_refs
@@ -179,14 +183,25 @@ impl KnowledgeActivationRuntime {
         profile: &str,
         packet: &MemoryContextPacket,
     ) -> Option<RuntimeKnowledgeActivation> {
-        self.activate_from_packet_for_project(
-            session_id,
-            intent,
-            profile,
-            Some("test-workspace"),
-            packet,
-        )
-        .unwrap()
+        let runtime = Self::with_fabric(
+            self.fabric
+                .clone()
+                .with_memory_sources(std::sync::Arc::new(tests::PacketSources::new(packet))),
+        );
+        runtime
+            .activate_from_packet_for_project(
+                session_id,
+                intent,
+                profile,
+                Some("test-workspace"),
+                packet,
+                memory::MemoryPacketUse::new(
+                    memory::MemoryTurnContext::new(session_id, "test-agent")
+                        .with_project_id(Some("test-workspace".into())),
+                    8 * 1024 * 1024,
+                ),
+            )
+            .unwrap()
     }
 }
 
@@ -260,7 +275,7 @@ fn suppression_reason_for_turn_intent(
     item: &memory::MemoryPacketItem,
     intent: &str,
 ) -> Option<String> {
-    let item_text = normalize_turn_text(&format!("{} {}", item.atom.title, item.reason));
+    let item_text = normalize_turn_text(&format!("{} {}", item.atom.title, item.content_preview));
     let intent_text = normalize_turn_text(intent);
 
     if turn_requests_tools_or_orchestration(&intent_text)
@@ -596,7 +611,10 @@ fn document_from_memory_item(item: &memory::MemoryPacketItem) -> Option<Document
     let atom = &item.atom;
     let category_is_knowledge = matches!(
         atom.layer,
-        memory::MemoryLayer::L2 | memory::MemoryLayer::L3 | memory::MemoryLayer::L4
+        memory::MemoryLayer::L0
+            | memory::MemoryLayer::L2
+            | memory::MemoryLayer::L3
+            | memory::MemoryLayer::L4
     );
     let role_is_knowledge = matches!(
         item.role,
@@ -608,14 +626,13 @@ fn document_from_memory_item(item: &memory::MemoryPacketItem) -> Option<Document
     Some(DocumentContent {
         title: atom.title.clone(),
         body: format!(
-            "{}\ncontent: {}\nreason: {}\nevidence: {}",
+            "{}\ncontent: {}\nevidence: {}",
             atom.title,
             item.content_preview,
-            item.reason,
             atom.evidence_pointer.as_deref().unwrap_or("memory packet")
         ),
-        source: atom.evidence_pointer.clone(),
-        memory_source_revision: None,
+        source: Some(format!("memory:{}", atom.id)),
+        memory_source_revision: Some(item.source_revision.clone()),
         author: Some("memory.kernel".to_string()),
         created_at: None,
         modified_at: None,
@@ -681,14 +698,16 @@ fn activation_policy_from_memory_item(
     }
 }
 
-fn namespace_from_memory_item(
-    item: &memory::MemoryPacketItem,
-    project_id: Option<&str>,
-) -> KnowledgeNamespace {
-    if matches!(item.atom.layer, memory::MemoryLayer::L0) {
-        KnowledgeNamespace::SharedLibrary("global".to_string())
-    } else {
-        KnowledgeNamespace::Project(project_id.unwrap_or("unscoped-workspace").to_string())
+fn namespace_from_memory_item(item: &memory::MemoryPacketItem) -> KnowledgeNamespace {
+    match &item.source_scope {
+        memory::MemoryScope::Global => KnowledgeNamespace::SharedLibrary("global".into()),
+        memory::MemoryScope::Project(project) => KnowledgeNamespace::Project(project.clone()),
+        memory::MemoryScope::Session(id)
+        | memory::MemoryScope::Task(id)
+        | memory::MemoryScope::AgentDefinitionLineage(id)
+        | memory::MemoryScope::AgentInstance(id)
+        | memory::MemoryScope::TeamRun(id)
+        | memory::MemoryScope::LegacyUnresolvedAgent(id) => KnowledgeNamespace::Corpus(id.clone()),
     }
 }
 
@@ -700,23 +719,107 @@ mod tests {
         MemoryPacketRole, MemoryState,
     };
 
+    fn packet_entry(item: &MemoryPacketItem) -> memory::MemoryEntry {
+        memory::MemoryEntry {
+            id: item.atom.id,
+            layer: item.atom.layer,
+            category: memory::MemoryCategory::Reference,
+            priority: memory::Priority::Normal,
+            source: memory::MemorySource::UserExplicit,
+            title: item.atom.title.clone(),
+            content: item.content_preview.clone(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: item.atom.confidence,
+            access_count: 0,
+            staleness: if item.role == MemoryPacketRole::Warning {
+                0.9
+            } else {
+                0.0
+            },
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            updated_at: chrono::DateTime::UNIX_EPOCH,
+            last_accessed_at: None,
+            scope: item.source_scope.clone(),
+            session_id: None,
+            source_agent: Some("test-agent".into()),
+            visibility: memory::AgentVisibility::Private,
+        }
+    }
+    pub(super) struct PacketSources(Vec<memory::MemoryEntry>);
+    impl PacketSources {
+        pub(super) fn new(packet: &MemoryContextPacket) -> Self {
+            Self(packet.selected.iter().map(packet_entry).collect())
+        }
+    }
+    impl memory::store::MemorySourceFenceReader for PacketSources {
+        fn read_source_fence(
+            &self,
+            _: &str,
+        ) -> memory::store::Result<Option<memory::store::MemorySourceFence>> {
+            panic!("activation uses its bounded source revision reader")
+        }
+        fn read_source_revision(
+            &self,
+            source: &str,
+            budget: usize,
+        ) -> memory::store::Result<Option<memory::store::MemorySourceRevisionRead>> {
+            self.0
+                .iter()
+                .find(|entry| source == format!("memory:{}", entry.id))
+                .map(|entry| memory::store::live_source_revision(source, entry, None, None, budget))
+                .transpose()
+        }
+    }
     fn packet_item(title: &str, layer: MemoryLayer, role: MemoryPacketRole) -> MemoryPacketItem {
-        MemoryPacketItem {
+        let id = uuid::Uuid::new_v4();
+        let scope = if layer == MemoryLayer::L0 {
+            memory::MemoryScope::Global
+        } else {
+            memory::MemoryScope::Project("test-workspace".into())
+        };
+        let mut item = MemoryPacketItem {
             atom: MemoryAtomView {
-                id: uuid::Uuid::new_v4(),
+                id,
                 layer,
                 information_state: MemoryInformationState::Orientation,
                 state: MemoryState::Active,
-                evidence_pointer: Some(format!("memory:{title}")),
+                evidence_pointer: Some(format!("memory:{id}")),
                 explicit_authority: layer == MemoryLayer::L0,
-                confidence: 0.91,
+                confidence: if role == MemoryPacketRole::Conflict {
+                    0.2
+                } else {
+                    0.91
+                },
                 salience: 4.0,
                 title: title.to_string(),
             },
             role,
             reason: "must be applied to this task".to_string(),
             content_preview: format!("{title} full policy body"),
+            source_revision: memory::store::MemoryEntryRevision {
+                memory_id: id,
+                scope_key: scope.scope_key(),
+                body_digest: String::new(),
+            },
+            source_scope: scope,
+        };
+        let entry = packet_entry(&item);
+        item.atom = MemoryAtomView::from_entry(&entry, MemoryInformationState::Orientation);
+        item.role = match item.atom.state {
+            MemoryState::Conflicted => MemoryPacketRole::Conflict,
+            MemoryState::Stale => MemoryPacketRole::Warning,
+            _ => MemoryPacketRole::Orientation,
+        };
+        item.reason = match item.role {
+            MemoryPacketRole::Conflict => "memory has low confidence and needs review",
+            MemoryPacketRole::Warning => "memory is stale and should be treated cautiously",
+            _ => "active explainable orientation memory",
         }
+        .into();
+        item.source_revision = memory::store::MemoryEntryRevision::of(&entry).unwrap();
+        item
     }
 
     #[derive(Default)]
@@ -799,7 +902,6 @@ mod tests {
     fn runtime_packet_activation_never_writes_or_contaminates_the_next_turn() {
         let store = std::sync::Arc::new(ReadOnlyKnowledgeStore::default());
         let fabric = KnowledgeFabric::with_store(store.clone());
-        let runtime = KnowledgeActivationRuntime::with_fabric(fabric.clone());
         let mut packet = MemoryContextPacket {
             selected: vec![packet_item(
                 "Safety policy must stop without approval",
@@ -811,6 +913,14 @@ mod tests {
             truncated: false,
             recall_report: RecallReport::default(),
         };
+        packet.selected[0].source_scope = memory::MemoryScope::Project("project-a".into());
+        packet.selected[0].source_revision =
+            memory::store::MemoryEntryRevision::of(&packet_entry(&packet.selected[0])).unwrap();
+        let runtime = KnowledgeActivationRuntime::with_fabric(
+            fabric
+                .clone()
+                .with_memory_sources(std::sync::Arc::new(PacketSources::new(&packet))),
+        );
         let active = runtime
             .activate_from_packet_for_project(
                 "one",
@@ -818,6 +928,11 @@ mod tests {
                 "profile",
                 Some("project-a"),
                 &packet,
+                memory::MemoryPacketUse::new(
+                    memory::MemoryTurnContext::new("one", "test-agent")
+                        .with_project_id(Some("project-a".into())),
+                    8 * 1024 * 1024,
+                ),
             )
             .unwrap()
             .expect("a read-only store must still produce the current blocking context");
@@ -833,6 +948,11 @@ mod tests {
                 "profile",
                 Some("project-a"),
                 &packet,
+                memory::MemoryPacketUse::new(
+                    memory::MemoryTurnContext::new("two", "test-agent")
+                        .with_project_id(Some("project-a".into())),
+                    8 * 1024 * 1024
+                ),
             )
             .unwrap()
             .is_none());
@@ -865,19 +985,20 @@ mod tests {
             )
             .expect("knowledge should activate");
 
-        assert!(
-            activation
-                .items
-                .iter()
-                .all(|item| item.source == ContextSourceKind::Knowledge)
-        );
+        assert!(activation
+            .items
+            .iter()
+            .all(|item| item.source == ContextSourceKind::Knowledge));
         assert!(activation.debug_fragment.contains("### Context: Knowledge"));
-        assert!(
-            activation
-                .items
-                .iter()
-                .any(|item| item.content.contains("full policy body"))
-        );
+        assert!(activation
+            .items
+            .iter()
+            .any(|item| item.content.contains("full policy body")));
+        assert!(activation
+            .items
+            .iter()
+            .all(|item| item.visibility == ContextVisibility::Private
+                && item.authority == ContextAuthority::Derived));
         assert!(!activation.report.active_pack_ids.is_empty());
         assert!(!activation.report.evidence_refs.is_empty());
     }
@@ -896,11 +1017,9 @@ mod tests {
             recall_report: RecallReport::default(),
         };
 
-        assert!(
-            KnowledgeActivationRuntime::new()
-                .activate_from_packet("s1", "architecture evidence review", "MainTurn", &packet)
-                .is_none()
-        );
+        assert!(KnowledgeActivationRuntime::new()
+            .activate_from_packet("s1", "architecture evidence review", "MainTurn", &packet)
+            .is_none());
     }
 
     #[test]
@@ -917,11 +1036,9 @@ mod tests {
             recall_report: RecallReport::default(),
         };
 
-        assert!(
-            KnowledgeActivationRuntime::new()
-                .activate_from_packet("s1", "分析记忆架构", "DeepInvestigation", &packet)
-                .is_none()
-        );
+        assert!(KnowledgeActivationRuntime::new()
+            .activate_from_packet("s1", "分析记忆架构", "DeepInvestigation", &packet)
+            .is_none());
     }
 
     #[test]
@@ -931,9 +1048,10 @@ mod tests {
             MemoryLayer::L0,
             MemoryPacketRole::Supporting,
         );
-        item.reason = "background reference".to_string();
         item.content_preview =
             "payroll reimbursement calendar and office expense process".to_string();
+        item.source_revision =
+            memory::store::MemoryEntryRevision::of(&packet_entry(&item)).unwrap();
         let packet = MemoryContextPacket {
             selected: vec![item],
             omitted: Vec::new(),
@@ -1013,11 +1131,9 @@ mod tests {
             "Architecture policy must retain evidence"
         );
         assert_eq!(filtered.omitted.len(), 1);
-        assert!(
-            filtered.omitted[0]
-                .reason
-                .contains("explicit user request requires tools")
-        );
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("explicit user request requires tools"));
     }
 
     #[test]
@@ -1037,11 +1153,9 @@ mod tests {
         let filtered = filter_packet_for_turn_intent(&packet, "不要使用工具，纯文字回答");
 
         assert!(filtered.selected.is_empty());
-        assert!(
-            filtered.omitted[0]
-                .reason
-                .contains("explicit user request forbids tools")
-        );
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("explicit user request forbids tools"));
     }
 
     #[test]
@@ -1058,16 +1172,14 @@ mod tests {
             recall_report: RecallReport::default(),
         };
 
-        assert!(
-            KnowledgeActivationRuntime::new()
-                .activate_from_packet(
-                    "s1",
-                    "请最多两个关键代码点说明问题",
-                    "DeepInvestigation",
-                    &packet,
-                )
-                .is_none()
-        );
+        assert!(KnowledgeActivationRuntime::new()
+            .activate_from_packet(
+                "s1",
+                "请最多两个关键代码点说明问题",
+                "DeepInvestigation",
+                &packet,
+            )
+            .is_none());
     }
 
     #[test]
@@ -1087,11 +1199,9 @@ mod tests {
         let filtered = filter_packet_for_turn_intent(&packet, "Use at most three code references.");
 
         assert!(filtered.selected.is_empty());
-        assert!(
-            filtered.omitted[0]
-                .reason
-                .contains("current instruction caps code evidence to 3")
-        );
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("current instruction caps code evidence to 3"));
         assert!(filtered.omitted[0].reason.contains("requires at least 5"));
     }
 
@@ -1112,10 +1222,8 @@ mod tests {
         let filtered = filter_packet_for_turn_intent(&packet, "不要往后推，一次性全部解决");
 
         assert!(filtered.selected.is_empty());
-        assert!(
-            filtered.omitted[0]
-                .reason
-                .contains("forbids deferring the work")
-        );
+        assert!(filtered.omitted[0]
+            .reason
+            .contains("forbids deferring the work"));
     }
 }

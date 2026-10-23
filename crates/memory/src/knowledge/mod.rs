@@ -581,6 +581,26 @@ pub fn validate_memory_dependencies(
     Ok(())
 }
 
+fn memory_source_access_allowed(
+    read: &crate::store::MemorySourceRevisionRead,
+    ctx: Option<&crate::MemoryTurnContext>,
+) -> bool {
+    let Some(access) = &read.access else {
+        return false;
+    };
+    match ctx {
+        Some(ctx) => access.visible_to_ctx(ctx),
+        // A project selector is not an Agent identity or a cognitive read lease.
+        None => {
+            matches!(access.visibility, crate::AgentVisibility::Shared)
+                && matches!(
+                    access.scope,
+                    crate::MemoryScope::Global | crate::MemoryScope::Project(_)
+                )
+        }
+    }
+}
+
 pub fn memory_scope_allows(namespace: &KnowledgeNamespace, scope_key: &str) -> bool {
     use crate::MemoryScope;
     match namespace {
@@ -702,7 +722,10 @@ impl KnowledgeFabric {
         if read.fence.source_ref != source_ref {
             return Err(KnowledgeStoreError::StaleRead);
         }
-        if read.fence.retired || !memory_scope_allows(namespace, &read.fence.scope_key) {
+        if read.fence.retired
+            || read.origin_retired
+            || !memory_scope_allows(namespace, &read.fence.scope_key)
+        {
             return Ok(false);
         }
         let expected = expected.ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
@@ -797,8 +820,12 @@ impl KnowledgeFabric {
         namespace: &KnowledgeNamespace,
         query: &str,
     ) -> Result<KnowledgeNamespaceSearchResult, KnowledgeStoreError> {
-        let (packs, canon) =
-            self.read_complete_candidates(KnowledgeCandidateScope::Namespace(namespace.clone()))?;
+        let (packs, canon) = self.read_complete_candidates(
+            KnowledgeCandidateScope::Namespace(namespace.clone()),
+            None,
+            &mut { KNOWLEDGE_READ_MAX_BYTES },
+            &mut BTreeMap::new(),
+        )?;
         let state = KnowledgeFabricState {
             packs: packs
                 .into_iter()
@@ -854,19 +881,20 @@ impl KnowledgeFabric {
     fn read_complete_candidates(
         &self,
         scope: KnowledgeCandidateScope,
+        ctx: Option<&crate::MemoryTurnContext>,
+        remaining: &mut usize,
+        source_frame: &mut BTreeMap<String, crate::store::MemorySourceRevisionRead>,
     ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError> {
         let mut cursor = None;
         let mut packs = Vec::new();
         let mut canon = BTreeMap::new();
-        let mut remaining = KNOWLEDGE_READ_MAX_BYTES;
-        let mut source_frame = BTreeMap::new();
         let mut rows = 0usize;
         loop {
             let mut page = self.store.read_candidate_page(
                 &scope,
                 cursor.as_ref(),
                 KNOWLEDGE_CANDIDATE_PAGE_SIZE,
-                remaining,
+                *remaining,
             )?;
             if let Some(previous) = &cursor {
                 previous.validate(&scope, &page.revision)?;
@@ -877,7 +905,7 @@ impl KnowledgeFabric {
             if rows > KNOWLEDGE_READ_MAX_ROWS {
                 return Err(KnowledgeStoreError::ReadLimit);
             }
-            remaining = remaining
+            *remaining = remaining
                 .checked_sub(page.materialized_bytes)
                 .ok_or(KnowledgeStoreError::ReadLimit)?;
             if page.next.is_some() && page.packs.is_empty() {
@@ -920,10 +948,19 @@ impl KnowledgeFabric {
                         &source.source_ref,
                         &pack.namespace,
                         source.memory_body_revision.as_deref(),
-                        &mut remaining,
-                        &mut source_frame,
+                        remaining,
+                        source_frame,
                     ) {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            if source.source_ref.starts_with("memory:")
+                                && !memory_source_access_allowed(
+                                    &source_frame[&source.source_ref],
+                                    ctx,
+                                )
+                            {
+                                denied = true;
+                            }
+                        }
                         Ok(false) => denied = true,
                         Err(error) => {
                             if read_error.is_none() {
@@ -982,7 +1019,31 @@ impl KnowledgeFabric {
         ),
         KnowledgeStoreError,
     > {
-        self.activate_with_turn_projection(session_id, intent, profile, project_id, &[])
+        self.activate_with_turn_projection(
+            session_id,
+            intent,
+            profile,
+            project_id,
+            &[],
+            crate::kernel::MemoryPacketUse::public_read(KNOWLEDGE_READ_MAX_BYTES),
+        )
+    }
+
+    pub fn validate_packet_for_use(
+        &self,
+        packet: &crate::MemoryContextPacket,
+        usage: &mut crate::kernel::MemoryPacketUse,
+    ) -> Result<(), KnowledgeStoreError> {
+        if packet.selected.is_empty() {
+            return Ok(());
+        }
+        let reader = self
+            .memory_sources
+            .as_ref()
+            .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+        usage
+            .validate(packet, reader.as_ref())
+            .map_err(memory_source_error)
     }
 
     /// Evaluate persisted knowledge and ephemeral turn views through the same
@@ -995,6 +1056,7 @@ impl KnowledgeFabric {
         profile: &str,
         project_id: Option<&str>,
         projected: &[KnowledgeTurnProjection],
+        mut usage: crate::kernel::MemoryPacketUse,
     ) -> Result<
         (
             KnowledgeActivationPlan,
@@ -1003,10 +1065,37 @@ impl KnowledgeFabric {
         ),
         KnowledgeStoreError,
     > {
-        let (packs, canon) =
-            self.read_complete_candidates(KnowledgeCandidateScope::Activation {
+        let ctx = usage.ctx.as_ref();
+        if ctx.is_some_and(|ctx| {
+            ctx.session_id != session_id || ctx.project_id.as_deref() != project_id
+        }) {
+            return Err(KnowledgeStoreError::StaleRead);
+        }
+        let remaining = &mut usage.remaining;
+        let source_frame = &mut usage.sources;
+        let (packs, canon) = self.read_complete_candidates(
+            KnowledgeCandidateScope::Activation {
                 project_id: project_id.map(str::to_owned),
-            })?;
+            },
+            ctx,
+            remaining,
+            source_frame,
+        )?;
+        let mut eligible_turn = Vec::new();
+        for view in projected {
+            let source = &view.receipt.corpus;
+            if self.validate_memory_source_cut(
+                &source.source_ref.id,
+                &source.namespace,
+                source.memory_body_revision.as_deref(),
+                remaining,
+                source_frame,
+            )? && (!source.source_ref.id.starts_with("memory:")
+                || memory_source_access_allowed(&source_frame[&source.source_ref.id], ctx))
+            {
+                eligible_turn.push(view);
+            }
+        }
         let state = KnowledgeFabricState {
             packs: packs
                 .into_iter()
@@ -1018,7 +1107,7 @@ impl KnowledgeFabric {
                 .collect(),
             ..KnowledgeFabricState::default()
         };
-        let turn = projected
+        let turn = eligible_turn
             .iter()
             .map(|view| {
                 let item = &view.receipt;
@@ -3080,6 +3169,7 @@ mod tests {
                 "profile",
                 Some("project-a"),
                 &[turn.clone()],
+                crate::kernel::MemoryPacketUse::public_read(KNOWLEDGE_READ_MAX_BYTES),
             )
             .unwrap();
         assert_eq!(plan.active_pack_ids.len(), 2);
@@ -3106,6 +3196,7 @@ mod tests {
                 "profile",
                 Some("project-b"),
                 &[turn],
+                crate::kernel::MemoryPacketUse::public_read(KNOWLEDGE_READ_MAX_BYTES),
             )
             .unwrap();
         assert!(foreign.active_pack_ids.is_empty());
@@ -3879,6 +3970,10 @@ mod tests {
                     .0
                     .clone()
                     .map(|fence| crate::store::MemorySourceRevisionRead {
+                        origin_retired: false,
+                        access: None,
+                        packet_content_digest: None,
+                        packet_atom: None,
                         revision: Some(crate::store::MemoryEntryRevision {
                             memory_id: uuid::Uuid::parse_str(
                                 "00000000-0000-0000-0000-000000000001",

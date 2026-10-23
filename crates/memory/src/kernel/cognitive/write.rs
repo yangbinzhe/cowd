@@ -72,7 +72,7 @@ impl CognitiveContextManager {
 
                 match self
                     .orchestrator
-                    .remember_batch_for_turn(turn, heuristic_entries.clone())
+                    .remember_extraction_batch_for_turn(turn, &batch_tag, heuristic_entries.clone())
                     .await
                 {
                     Ok(ids) => {

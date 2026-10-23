@@ -678,3 +678,82 @@ async fn automatic_governance_admission_is_single_owner_until_completion() {
     mgr.finish_automatic_governance(&manual.run_id);
     assert!(mgr.automatic_governance_run_status().is_none());
 }
+
+#[test]
+fn automatic_origin_distinguishes_a_later_independent_message_turn() {
+    let turn = MemoryTurnContext::new("session-a", "agent-a");
+    let first = vec![user_message(1, "remember this source")];
+    let later = vec![user_message(2, "remember this source")];
+    assert_eq!(
+        extraction_batch_tag(&turn, &first),
+        extraction_batch_tag(&turn, &first)
+    );
+    assert_ne!(
+        extraction_batch_tag(&turn, &first),
+        extraction_batch_tag(&turn, &later)
+    );
+}
+
+#[tokio::test]
+async fn duplicate_projection_retirement_keeps_the_same_turns_independent_fact_live() {
+    use crate::store::{EphemeralMemoryStore, MemorySourceFenceReader};
+    let store = Arc::new(EphemeralMemoryStore::default());
+    let orchestrator = MemoryOrchestrator::from_store(test_config(), store.clone(), None).unwrap();
+    let turn = MemoryTurnContext::new("semantic-dedup-test", "root-agent")
+        .with_project_id(Some("project-a".into()));
+    let batch = extraction_batch_tag(
+        &turn,
+        &[user_message(1, "first fact and a distinct second fact")],
+    );
+    let mut entries = vec![
+        semantic_entry(
+            MemoryLayer::L3,
+            MemoryCategory::Reference,
+            MemoryScope::Project("project-a".into()),
+            "duplicate fact",
+            &[],
+        ),
+        semantic_entry(
+            MemoryLayer::L3,
+            MemoryCategory::Reference,
+            MemoryScope::Project("project-a".into()),
+            "independent new fact",
+            &[],
+        ),
+    ];
+    canonicalize_automatic_entries(&turn, &batch, &mut entries);
+    orchestrator
+        .remember_extraction_batch_for_turn(&turn, &batch, entries.clone())
+        .await
+        .unwrap();
+    let existing = semantic_entry(
+        MemoryLayer::L3,
+        MemoryCategory::Reference,
+        MemoryScope::Project("project-a".into()),
+        "already known equivalent fact",
+        &[],
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let index = RwLock::new(VectorIndex::new(temp.path().join("index.json"), 2).unwrap());
+    archive_fresh_automatic_duplicate(&orchestrator, &index, &turn, &entries[0], &existing, 0.99)
+        .await
+        .unwrap();
+    let duplicate = store
+        .read_source_revision(&format!("memory:{}", entries[0].id), 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert!(duplicate.fence.retired);
+    let independent = store
+        .read_source_revision(&format!("memory:{}", entries[1].id), 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert!(!independent.origin_retired);
+    assert!(independent.revision.is_some());
+    let mut late = entries[1].clone();
+    late.id = uuid::Uuid::new_v4();
+    late.title = "new semantic detail".into();
+    orchestrator
+        .write_extraction_for_turn(&turn, &batch, late, None)
+        .await
+        .unwrap();
+}

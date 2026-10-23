@@ -52,6 +52,8 @@ pub struct MemoryLifecycleMutation {
     pub expected_entry_digest: String,
     pub expected_history: Option<String>,
     pub event: MemoryLifecycleEvent,
+    #[serde(default = "origin_revocation_default", skip_deserializing)]
+    revoke_origin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,8 +177,40 @@ impl VerifiedMemoryRetirement {
     }
 }
 
+/// Read-only source facts, never an authorization grant. The current caller's
+/// scope and cognitive read leases are checked at the actual use boundary.
+#[derive(Debug, Clone)]
+pub struct MemorySourceAccess {
+    pub scope: crate::MemoryScope,
+    pub visibility: crate::AgentVisibility,
+    pub source_agent: Option<String>,
+    pub layer: crate::MemoryLayer,
+    pub source: crate::MemorySource,
+    pub always_active: bool,
+}
+impl MemorySourceAccess {
+    pub fn of(entry: &MemoryEntry) -> Self {
+        Self {
+            scope: entry.scope.clone(),
+            visibility: entry.visibility.clone(),
+            source_agent: entry.source_agent.clone(),
+            layer: entry.layer,
+            source: entry.source,
+            always_active: entry
+                .tags
+                .iter()
+                .any(|tag| matches!(tag.as_str(), "memory-policy:always" | "always-active")),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MemorySourceRevisionRead {
+    pub origin_retired: bool,
+    /// Facts read from the original body in the same cut as its revision.
+    pub access: Option<MemorySourceAccess>,
+    pub packet_content_digest: Option<String>,
+    pub packet_atom: Option<crate::MemoryAtomView>,
     pub revision: Option<MemoryEntryRevision>,
     pub fence: MemorySourceFence,
     pub materialized_bytes: usize,
@@ -241,7 +275,24 @@ pub fn live_source_revision(
         retired: false,
     });
     source.retired |= lifecycle_retired(entry.id, history)?;
+    let mut atom =
+        crate::MemoryAtomView::from_entry(entry, crate::MemoryInformationState::Orientation);
+    if let Some(history) = history {
+        let events: Vec<MemoryLifecycleEvent> = serde_json::from_str(history)?;
+        if let Some(event) = events.last() {
+            atom.state = event.to;
+        }
+    }
     Ok(MemorySourceRevisionRead {
+        origin_retired: false,
+        packet_atom: Some(atom),
+        access: (!source.retired).then(|| MemorySourceAccess::of(entry)),
+        packet_content_digest: (!source.retired).then(|| {
+            crate::kernel::packet_content_digest(
+                &entry.title,
+                &crate::kernel::truncate_memory_content_preview(&entry.content),
+            )
+        }),
         revision: if source.retired {
             None
         } else {
@@ -250,6 +301,69 @@ pub fn live_source_revision(
         fence: source,
         materialized_bytes,
     })
+}
+
+/// Immutable identity of one automatic extraction input in the original owner.
+/// Retirement is recorded against this origin, so a late paraphrase/new UUID
+/// cannot turn the same deleted input into a fresh source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryExtractionOrigin {
+    scope_key: String,
+    session_id: String,
+    agent_id: String,
+    batch_tag: String,
+}
+impl MemoryExtractionOrigin {
+    pub fn for_entry(
+        turn: &crate::MemoryTurnContext,
+        entry: &MemoryEntry,
+        batch_tag: &str,
+    ) -> Result<Self> {
+        let origin = Self {
+            scope_key: entry.scope.scope_key(),
+            session_id: turn.session_id.clone(),
+            agent_id: turn.agent_id.clone(),
+            batch_tag: batch_tag.into(),
+        };
+        origin.validate_entry(entry)?;
+        Ok(origin)
+    }
+    pub fn validate_entry(&self, entry: &MemoryEntry) -> Result<()> {
+        let batch = self
+            .batch_tag
+            .strip_prefix("extraction-batch:")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok());
+        if batch.is_none_or(|id| self.batch_tag != format!("extraction-batch:{id}"))
+            || entry.source != crate::MemorySource::AutoExtracted
+            || self.scope_key != entry.scope.scope_key()
+            || entry.session_id.as_deref() != Some(self.session_id.as_str())
+            || entry.source_agent.as_deref() != Some(self.agent_id.as_str())
+            || !entry.tags.contains(&self.batch_tag)
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        Ok(())
+    }
+    pub fn binding_key(id: MemoryId) -> String {
+        format!("memory_extraction_origin:{id}")
+    }
+    pub fn retirement_fence(&self, original: &MemorySourceFence) -> Result<MemorySourceFence> {
+        Ok(MemorySourceFence {
+            source_ref: format!("memory-origin:{}", self.key()?),
+            scope_key: self.scope_key.clone(),
+            delete_epoch: original.delete_epoch,
+            retired: true,
+        })
+    }
+    pub fn retirement_ref(&self) -> Result<String> {
+        Ok(format!("memory-origin:{}", self.key()?))
+    }
+    pub fn key(&self) -> Result<String> {
+        let mut hash = Sha256::new();
+        hash.update(b"cowd:memory-extraction-origin:v1\0");
+        hash.update(serde_json::to_vec(self)?);
+        Ok(format!("sha256:{:x}", hash.finalize()))
+    }
 }
 
 /// A compare-and-swap witness for the original body, not an authorization grant.
@@ -321,6 +435,10 @@ fn typed_digest(domain: &str, value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn origin_revocation_default() -> bool {
+    true
+}
+
 impl MemoryLifecycleMutation {
     /// A retry carries the original source cut. Observation time is assigned by
     /// the first commit, while a later transition over a different history is
@@ -336,6 +454,7 @@ impl MemoryLifecycleMutation {
             expected_entry_digest: MemoryEntryRevision::of(entry)?.body_digest,
             expected_history,
             event,
+            revoke_origin: true,
         };
         let mutation_id = if matches!(
             command.event.to,
@@ -361,6 +480,25 @@ impl MemoryLifecycleMutation {
         Ok(command)
     }
 
+    /// Retiring a redundant projection is not revoking its original input.
+    pub(crate) fn redundant_projection(
+        entry: &MemoryEntry,
+        history: Option<String>,
+        event: MemoryLifecycleEvent,
+    ) -> Result<Self> {
+        let mut command = Self::new(entry, history, event)?;
+        command.revoke_origin = false;
+        let mutation_id = typed_digest(
+            "cowd.memory.redundant-projection.id.v1",
+            &command.input_cut(),
+        )?;
+        command.mutation_id = mutation_id;
+        Ok(command)
+    }
+    pub fn revokes_origin(&self) -> bool {
+        self.revoke_origin
+    }
+
     fn input_cut(&self) -> impl Serialize + '_ {
         (
             &self.scope_key,
@@ -377,7 +515,11 @@ impl MemoryLifecycleMutation {
 
     pub fn command_digest(&self) -> Result<String> {
         typed_digest(
-            "cowd.memory.lifecycle.command.v2",
+            if self.revoke_origin {
+                "cowd.memory.lifecycle.command.v2"
+            } else {
+                "cowd.memory.redundant-projection.command.v1"
+            },
             &(&self.mutation_id, self.input_cut()),
         )
     }

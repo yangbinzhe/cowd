@@ -2880,8 +2880,12 @@ where
             let mut dynamic_items = runtime_reality_context_items;
             dynamic_items.extend(session_context_items);
             dynamic_items.extend(next_model_context_items);
-            let knowledge_report =
-                self.append_knowledge_context(user_input, &empty_packet, &mut dynamic_items)?;
+            let knowledge_report = self.append_knowledge_context(
+                user_input,
+                &empty_packet,
+                &mut dynamic_items,
+                memory::MemoryPacketUse::new(self.memory_turn_context(), 8 * 1024 * 1024),
+            )?;
             let envelope = self.build_context_envelope(
                 user_input,
                 dynamic_items,
@@ -2932,6 +2936,11 @@ where
         );
         match memory_packet {
             Ok(packet) => {
+                let memory_use = kernel
+                    .validate_packet_for_turn(&memory_ctx, &packet, 8 * 1024 * 1024)
+                    .map_err(|error| {
+                        RuntimeError::new(format!("Memory packet use validation failed: {error}"))
+                    })?;
                 let packet =
                     crate::knowledge_activation::filter_packet_for_turn_intent(&packet, user_input);
                 if let Some(cb) = &self.memory_callback {
@@ -2982,11 +2991,8 @@ where
                         context_item.score = item.atom.confidence;
                         context_item.source_id = Some(item.atom.id.to_string());
                         context_item.source_reason = Some(item.reason.clone());
-                        context_item.source_version = item
-                            .atom
-                            .evidence_pointer
-                            .as_ref()
-                            .map(|evidence| format!("evidence:{evidence}"));
+                        context_item.source_version =
+                            Some(item.source_revision.body_digest.clone());
                         if let Some(evidence) = item.atom.evidence_pointer.as_ref() {
                             context_item.evidence.push(evidence.clone());
                         }
@@ -3006,8 +3012,12 @@ where
                 dynamic_items.extend(runtime_reality_context_items);
                 dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
-                let knowledge_report =
-                    self.append_knowledge_context(user_input, &packet, &mut dynamic_items)?;
+                let knowledge_report = self.append_knowledge_context(
+                    user_input,
+                    &packet,
+                    &mut dynamic_items,
+                    memory_use,
+                )?;
                 let envelope = self.build_context_envelope(
                     user_input,
                     dynamic_items,
@@ -3029,8 +3039,12 @@ where
                 let mut dynamic_items = runtime_reality_context_items;
                 dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
-                let knowledge_report =
-                    self.append_knowledge_context(user_input, &empty_packet, &mut dynamic_items)?;
+                let knowledge_report = self.append_knowledge_context(
+                    user_input,
+                    &empty_packet,
+                    &mut dynamic_items,
+                    memory::MemoryPacketUse::new(self.memory_turn_context(), 8 * 1024 * 1024),
+                )?;
                 let envelope = self.build_context_envelope(
                     user_input,
                     dynamic_items,
@@ -3051,7 +3065,9 @@ where
         user_input: &str,
         packet: &memory::MemoryContextPacket,
         dynamic_items: &mut Vec<ContextItem>,
+        memory_use: memory::MemoryPacketUse,
     ) -> Result<Option<harness_contract::knowledge::KnowledgeTurnReport>, RuntimeError> {
+        let memory_project = memory_use.context().and_then(|ctx| ctx.project_id.clone());
         let activation = self
             .knowledge_activation
             .as_ref()
@@ -3060,8 +3076,9 @@ where
                     &self.session_id().to_string(),
                     user_input,
                     &format!("{:?}", self.context_profile()),
-                    Some(&self.checkpoint_workspace_id),
+                    memory_project.as_deref(),
                     packet,
+                    memory_use,
                 )
             })
             .transpose()

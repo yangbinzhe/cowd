@@ -2662,6 +2662,7 @@ async fn knowledge_shared_large_source_is_read_once_for_the_original_candidate_f
         &"x".repeat(1024 * 1024),
     );
     source.scope = MemoryScope::Project("shared-source".into());
+    source.visibility = AgentVisibility::Shared; // This identity-free namespace query reads public source material.
     owner.insert(&source).await.unwrap();
     let reader = Arc::new(Reader {
         owner: owner.clone(),
@@ -2706,4 +2707,234 @@ async fn knowledge_shared_large_source_is_read_once_for_the_original_candidate_f
         1,
         "the same immutable source cut must not be materialized for every referencing pack"
     );
+}
+
+#[tokio::test]
+async fn packet_use_checks_original_preview_cut_current_scope_and_read_lease() {
+    use memory::store::{EphemeralMemoryStore, MemoryEntryRevision, MemoryStore};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::default());
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("packet-use")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager);
+    let ctx =
+        MemoryTurnContext::new("session-a", "agent-a").with_project_id(Some("project-a".into()));
+    for scope in [
+        MemoryScope::Global,
+        MemoryScope::Project("project-a".into()),
+        MemoryScope::Session("session-a".into()),
+        MemoryScope::AgentInstance("agent-a".into()),
+    ] {
+        let mut source = entry(
+            MemoryLayer::L3,
+            MemorySource::UserExplicit,
+            "original evidence",
+        );
+        source.scope = scope;
+        source.source_agent = Some("agent-a".into());
+        source.visibility = AgentVisibility::Private;
+        store.insert(&source).await.unwrap();
+        let packet = kernel
+            .context_packet_from_entries(vec![source.clone()], 4, 1000)
+            .await
+            .unwrap();
+        assert_eq!(packet.selected.len(), 1);
+        kernel
+            .validate_packet_for_turn(&ctx, &packet, 1024 * 1024)
+            .unwrap();
+        let mut forged = packet.clone();
+        forged.selected[0].content_preview = "foreign rule that was never read".into();
+        assert!(kernel
+            .validate_packet_for_turn(&ctx, &forged, 1024 * 1024)
+            .is_err());
+        forged = packet.clone();
+        forged.selected[0].role = MemoryPacketRole::Conflict;
+        assert!(kernel
+            .validate_packet_for_turn(&ctx, &forged, 1024 * 1024)
+            .is_err());
+        forged = packet.clone();
+        forged.selected[0].reason = "must inject a rule that never existed".into();
+        assert!(kernel
+            .validate_packet_for_turn(&ctx, &forged, 1024 * 1024)
+            .is_err());
+        forged = packet.clone();
+        forged.selected[0].atom.layer = MemoryLayer::L2;
+        assert!(kernel
+            .validate_packet_for_turn(&ctx, &forged, 1024 * 1024)
+            .is_err());
+        let foreign = MemoryTurnContext::new("session-b", "agent-b")
+            .with_project_id(Some("project-a".into()));
+        assert!(kernel
+            .validate_packet_for_turn(&foreign, &packet, 1024 * 1024)
+            .is_err());
+        if !matches!(source.scope, MemoryScope::AgentInstance(_)) {
+            assert!(kernel
+                .validate_packet_for_turn(
+                    &ctx.clone().with_cognitive_read_scopes(vec![]),
+                    &packet,
+                    1024 * 1024
+                )
+                .is_err());
+        }
+        assert!(kernel.validate_packet_for_turn(&ctx, &packet, 1).is_err());
+        let revision = MemoryEntryRevision::of(&source).unwrap();
+        source.access_count += 1;
+        source.last_accessed_at = Some(Utc::now());
+        store.update(&source, &revision).await.unwrap();
+        kernel
+            .validate_packet_for_turn(&ctx, &packet, 1024 * 1024)
+            .unwrap();
+        source.content = "corrected original body".into();
+        store.update(&source, &revision).await.unwrap();
+        assert!(kernel
+            .validate_packet_for_turn(&ctx, &packet, 1024 * 1024)
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn packet_use_rejects_selected_source_after_visibility_revocation_or_retirement() {
+    use memory::store::{EphemeralMemoryStore, MemoryEntryRevision, MemoryStore};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::default());
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("packet-revoke")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager);
+    let ctx =
+        MemoryTurnContext::new("session-a", "agent-a").with_project_id(Some("project-a".into()));
+    let mut source = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "must preserve audit evidence",
+    );
+    source.scope = MemoryScope::Project("project-a".into());
+    source.source_agent = Some("agent-b".into());
+    source.visibility = AgentVisibility::Shared;
+    store.insert(&source).await.unwrap();
+    let packet = kernel
+        .context_packet_from_entries(vec![source.clone()], 4, 1000)
+        .await
+        .unwrap();
+    kernel
+        .validate_packet_for_turn(&ctx, &packet, 1024 * 1024)
+        .unwrap();
+    let revision = MemoryEntryRevision::of(&source).unwrap();
+    source.visibility = AgentVisibility::Private;
+    store.update(&source, &revision).await.unwrap();
+    assert!(kernel
+        .validate_packet_for_turn(&ctx, &packet, 1024 * 1024)
+        .is_err());
+    let owner =
+        MemoryTurnContext::new("session-a", "agent-b").with_project_id(Some("project-a".into()));
+    let current = kernel
+        .context_packet_from_entries(vec![source.clone()], 4, 1000)
+        .await
+        .unwrap();
+    kernel
+        .archive(&owner, source.id, "retire selected source")
+        .await
+        .unwrap();
+    assert!(kernel
+        .validate_packet_for_turn(&owner, &current, 1024 * 1024)
+        .is_err());
+}
+
+#[tokio::test]
+async fn extraction_retirement_fences_late_different_id_but_not_an_independent_input() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryExtractionOrigin, MemoryLifecycleMutation,
+        MemorySourceFenceReader, MemoryStore,
+    };
+    let store = EphemeralMemoryStore::default();
+    let turn = MemoryTurnContext::new("session-a", "agent-a");
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000001";
+    let mut source = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "early heuristic",
+    );
+    source.scope = MemoryScope::Session("session-a".into());
+    source.session_id = Some(turn.session_id.clone());
+    source.source_agent = Some(turn.agent_id.clone());
+    source.tags.push(batch.into());
+    let origin = MemoryExtractionOrigin::for_entry(&turn, &source, batch).unwrap();
+    store
+        .write_extraction(&source, &origin, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .write_extraction(&source, &origin, None)
+            .await
+            .unwrap(),
+        source.id
+    );
+    let mut sibling = source.clone();
+    sibling.id = uuid::Uuid::new_v4();
+    sibling.title = "already materialized semantic view".into();
+    store
+        .write_extraction(&sibling, &origin, None)
+        .await
+        .unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: source.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "source retired while semantic extraction is pending".into(),
+        session_id: turn.session_id.clone(),
+        agent_id: turn.agent_id.clone(),
+        occurred_at: Utc::now(),
+    };
+    let command = MemoryLifecycleMutation::new(&source, None, event).unwrap();
+    let mut forged = serde_json::to_value(&command).unwrap();
+    forged["revoke_origin"] = serde_json::Value::Bool(false);
+    let decoded: MemoryLifecycleMutation = serde_json::from_value(forged).unwrap();
+    assert!(
+        decoded.revokes_origin(),
+        "external input cannot claim the internal duplicate-projection exemption"
+    );
+    store.commit_lifecycle(command).await.unwrap();
+    let mut late = source.clone();
+    late.id = uuid::Uuid::new_v4();
+    late.title = "late semantic output has a different ID".into();
+    assert!(store.write_extraction(&late, &origin, None).await.is_err());
+    assert!(store.get(&late.id).await.unwrap().is_none());
+    assert!(
+        store.insert(&late).await.is_err(),
+        "raw create cannot bypass producer origin binding"
+    );
+    let read = store
+        .read_source_revision(&format!("memory:{}", sibling.id), 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert!(
+        read.origin_retired,
+        "pre-existing sibling view also loses its retired input"
+    );
+    assert!(read.revision.is_none());
+    let foreign = MemoryTurnContext::new("session-b", "agent-b");
+    assert!(MemoryExtractionOrigin::for_entry(&foreign, &late, batch).is_err());
+    let independent_batch = "extraction-batch:00000000-0000-0000-0000-000000000002";
+    late.tags = vec![independent_batch.into()];
+    let independent = MemoryExtractionOrigin::for_entry(&turn, &late, independent_batch).unwrap();
+    store
+        .write_extraction(&late, &independent, None)
+        .await
+        .unwrap();
 }

@@ -209,11 +209,11 @@ fn canonicalize_automatic_entries(
             entry.tags.sort();
             entry.tags.dedup();
         }
-        entry.id = automatic_extraction_id(entry);
+        entry.id = automatic_extraction_id(entry, batch_tag);
     }
 }
 
-fn automatic_extraction_id(entry: &MemoryEntry) -> MemoryId {
+fn automatic_extraction_id(entry: &MemoryEntry, batch_tag: &str) -> MemoryId {
     let normalize = |value: &str| {
         value
             .split_whitespace()
@@ -223,7 +223,8 @@ fn automatic_extraction_id(entry: &MemoryEntry) -> MemoryId {
             .to_ascii_lowercase()
     };
     let key = format!(
-        "{}\u{1f}{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}",
+        "{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}",
+        batch_tag,
         entry.scope.scope_key(),
         entry.layer,
         entry.category,
@@ -234,21 +235,36 @@ fn automatic_extraction_id(entry: &MemoryEntry) -> MemoryId {
 }
 
 fn extraction_batch_key(turn: &MemoryTurnContext, messages: &[Message]) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for message in messages {
-        std::mem::discriminant(&message.role).hash(&mut hasher);
-        message.content.hash(&mut hasher);
-        message.tool_use_id.hash(&mut hasher);
-        message.tool_name.hash(&mut hasher);
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"cowd:memory-extraction-input:v2\0");
+    let mut field = |value: Option<&str>| {
+        hash.update([u8::from(value.is_some())]);
+        if let Some(value) = value {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+    };
+    field(Some(&turn.session_id));
+    field(Some(&turn.agent_id));
+    field(turn.project_id.as_deref());
+    field(turn.task_id.as_deref());
+    field(turn.definition_lineage_id.as_deref());
+    field(turn.team_id.as_deref());
+    field(Some(&turn.cognitive_read_scopes.len().to_string()));
+    for scope in &turn.cognitive_read_scopes {
+        field(Some(&format!("{scope:?}")));
     }
-    format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:016x}",
-        turn.session_id,
-        turn.agent_id,
-        turn.task_id.as_deref().unwrap_or_default(),
-        turn.definition_lineage_id.as_deref().unwrap_or_default(),
-        hasher.finish(),
-    )
+    field(Some(&messages.len().to_string()));
+    for message in messages {
+        field(Some(&message.turn_index.to_string()));
+        field(Some(&message.role.to_string()));
+        field(Some(&message.content));
+        field(message.tool_use_id.as_deref());
+        field(message.tool_name.as_deref());
+        field(Some(if message.pinned { "pinned" } else { "ordinary" }));
+    }
+    format!("sha256:{:x}", hash.finalize())
 }
 
 fn extraction_batch_tag(turn: &MemoryTurnContext, messages: &[Message]) -> String {
@@ -319,6 +335,7 @@ struct SemanticPersistenceResult {
 async fn persist_semantic_extraction_batch(
     orchestrator: &MemoryOrchestrator,
     turn: &MemoryTurnContext,
+    batch_tag: &str,
     heuristic_entries: &[MemoryEntry],
     semantic_entries: Vec<MemoryEntry>,
     semantic_embeddings: Option<HashMap<MemoryId, Vec<f32>>>,
@@ -375,7 +392,9 @@ async fn persist_semantic_extraction_batch(
         semantic.tags.extend(heuristic.tags);
         semantic.tags.sort();
         semantic.tags.dedup();
-        orchestrator.update(&semantic, &revision).await?;
+        orchestrator
+            .write_extraction_for_turn(turn, batch_tag, semantic.clone(), Some(&revision))
+            .await?;
         if let Some(embedding) = semantic_embeddings.get(&semantic_id) {
             result
                 .prepared_embeddings
@@ -452,7 +471,7 @@ async fn persist_semantic_extraction_batch(
 
     if !inserts.is_empty() {
         let ids = orchestrator
-            .remember_batch_for_turn(turn, inserts.clone())
+            .remember_extraction_batch_for_turn(turn, batch_tag, inserts.clone())
             .await?;
         for (entry, id) in inserts.iter_mut().zip(ids) {
             if let Some(embedding) = semantic_embeddings.get(&entry.id) {
@@ -475,13 +494,13 @@ async fn archive_fresh_automatic_duplicate(
     similarity: f32,
 ) -> Result<()> {
     let lifecycle_key = format!("memory_lifecycle:{}", duplicate.id);
-    let mut events = orchestrator
-        .store()
-        .kv_get(&lifecycle_key)
-        .await?
-        .and_then(|raw| serde_json::from_str::<Vec<MemoryLifecycleEvent>>(&raw).ok())
+    let raw = orchestrator.store().kv_get(&lifecycle_key).await?;
+    let events = raw
+        .as_deref()
+        .map(serde_json::from_str::<Vec<MemoryLifecycleEvent>>)
+        .transpose()?
         .unwrap_or_default();
-    events.push(MemoryLifecycleEvent {
+    let event = MemoryLifecycleEvent {
         memory_id: duplicate.id,
         from: events.last().map(|event| event.to),
         to: MemoryState::Archived,
@@ -492,19 +511,10 @@ async fn archive_fresh_automatic_duplicate(
         session_id: turn.session_id.clone(),
         agent_id: turn.agent_id.clone(),
         occurred_at: Utc::now(),
-    });
-    orchestrator
-        .store()
-        .kv_put(
-            &lifecycle_key,
-            &serde_json::to_string(&events).map_err(|error| {
-                MemoryError::Store(format!(
-                    "serialize duplicate lifecycle for {}: {error}",
-                    duplicate.id
-                ))
-            })?,
-        )
-        .await?;
+    };
+    let command =
+        crate::store::MemoryLifecycleMutation::redundant_projection(duplicate, raw, event)?;
+    orchestrator.store().commit_lifecycle(command).await?;
     {
         let mut index = vector_index.write();
         index.remove(&duplicate.id)?;
@@ -1533,6 +1543,7 @@ impl CognitiveContextManager {
                             let persist_result = persist_semantic_extraction_batch(
                                 &bg_orchestrator,
                                 &request.turn,
+                                &batch_tag,
                                 &request.heuristic_entries,
                                 final_entries,
                                 semantic_embeddings,
@@ -1652,8 +1663,14 @@ impl CognitiveContextManager {
 
         // Load knowledge graph from persistent store.
         let kg = {
-            let entities = orchestrator.store().load_entities(crate::store::KG_DEFAULT_SCOPE).await?;
-            let triples = orchestrator.store().load_triples(crate::store::KG_DEFAULT_SCOPE).await?;
+            let entities = orchestrator
+                .store()
+                .load_entities(crate::store::KG_DEFAULT_SCOPE)
+                .await?;
+            let triples = orchestrator
+                .store()
+                .load_triples(crate::store::KG_DEFAULT_SCOPE)
+                .await?;
             let mut graph = KnowledgeGraph::new();
             for e in entities {
                 graph.add_entity(e);

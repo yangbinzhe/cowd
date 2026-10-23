@@ -2174,3 +2174,78 @@ async fn real_postgres_knowledge_source_cut_refuses_changed_body_and_reopens_ori
     drop(reopened);
     drop(std::mem::ManuallyDrop::into_inner(fixture));
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_extraction_origin_retirement_fences_new_ids_after_reopen() {
+    use memory::store::{MemoryExtractionOrigin, MemoryLifecycleMutation, MemorySourceFenceReader};
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = PostgresMemoryStore::new(executor.clone()).unwrap();
+    let turn = memory::MemoryTurnContext::new("session-snapshot", "test-agent");
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000001";
+    let mut source = memory_entry(uuid::Uuid::new_v4(), "early extraction");
+    source.source = MemorySource::AutoExtracted;
+    source.tags.push(batch.into());
+    let origin = MemoryExtractionOrigin::for_entry(&turn, &source, batch).unwrap();
+    store
+        .write_extraction(&source, &origin, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .write_extraction(&source, &origin, None)
+            .await
+            .unwrap(),
+        source.id
+    );
+    let mut sibling = source.clone();
+    sibling.id = uuid::Uuid::new_v4();
+    sibling.title = "another derived view".into();
+    store
+        .write_extraction(&sibling, &origin, None)
+        .await
+        .unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: source.id,
+        from: None,
+        to: memory::MemoryState::Archived,
+        reason: "retirement while original semantic request is outstanding".into(),
+        session_id: turn.session_id.clone(),
+        agent_id: turn.agent_id.clone(),
+        occurred_at: chrono::Utc::now(),
+    };
+    let command = MemoryLifecycleMutation::new(&source, None, event).unwrap();
+    store.commit_lifecycle(command.clone()).await.unwrap();
+    drop(store);
+    let reopened = PostgresMemoryStore::new(executor).unwrap();
+    reopened.commit_lifecycle(command).await.unwrap();
+    let mut late = source.clone();
+    late.id = uuid::Uuid::new_v4();
+    late.content = "late paraphrase, different target ID".into();
+    assert!(reopened
+        .write_extraction(&late, &origin, None)
+        .await
+        .is_err());
+    assert!(reopened.get(&late.id).await.unwrap().is_none());
+    assert!(reopened.insert(&late).await.is_err());
+    let read = reopened
+        .read_source_revision(&format!("memory:{}", sibling.id), 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert!(read.origin_retired);
+    assert!(read.revision.is_none());
+    let independent_batch = "extraction-batch:00000000-0000-0000-0000-000000000002";
+    late.tags = vec![independent_batch.into()];
+    let independent = MemoryExtractionOrigin::for_entry(&turn, &late, independent_batch).unwrap();
+    reopened
+        .write_extraction(&late, &independent, None)
+        .await
+        .unwrap();
+    let read = reopened
+        .read_source_revision(&format!("memory:{}", late.id), 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert!(!read.origin_retired);
+    assert!(read.revision.is_some());
+}

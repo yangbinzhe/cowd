@@ -349,6 +349,22 @@ impl NoopStore {
     }
 }
 
+impl crate::store::MemorySourceFenceReader for NoopStore {
+    fn read_source_fence(
+        &self,
+        _: &str,
+    ) -> crate::store::Result<Option<crate::store::MemorySourceFence>> {
+        Err(crate::MemoryError::Store("shared layer is disabled".into()))
+    }
+    fn read_source_revision(
+        &self,
+        _: &str,
+        _: usize,
+    ) -> crate::store::Result<Option<crate::store::MemorySourceRevisionRead>> {
+        Err(crate::MemoryError::Store("shared layer is disabled".into()))
+    }
+}
+
 #[async_trait]
 impl crate::store::MemoryStore for NoopStore {
     fn capabilities(&self) -> crate::store::MemoryStoreCapabilities {
@@ -362,6 +378,14 @@ impl crate::store::MemoryStore for NoopStore {
     }
     async fn insert(&self, entry: &MemoryEntry) -> crate::store::Result<MemoryId> {
         Ok(entry.id)
+    }
+    async fn write_extraction(
+        &self,
+        _: &MemoryEntry,
+        _: &crate::store::MemoryExtractionOrigin,
+        _: Option<&crate::store::MemoryEntryRevision>,
+    ) -> crate::store::Result<MemoryId> {
+        Err(crate::MemoryError::Store("shared layer is disabled".into()))
     }
     async fn get(&self, _id: &MemoryId) -> crate::store::Result<Option<MemoryEntry>> {
         Ok(None)
@@ -516,7 +540,11 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(Vec::new())
     }
 
-    async fn save_entities(&self, _scope_key: &str, _entities: &[Entity]) -> crate::store::Result<()> {
+    async fn save_entities(
+        &self,
+        _scope_key: &str,
+        _entities: &[Entity],
+    ) -> crate::store::Result<()> {
         Ok(())
     }
 
@@ -524,7 +552,11 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(Vec::new())
     }
 
-    async fn save_triples(&self, _scope_key: &str, _triples: &[Triple]) -> crate::store::Result<()> {
+    async fn save_triples(
+        &self,
+        _scope_key: &str,
+        _triples: &[Triple],
+    ) -> crate::store::Result<()> {
         Ok(())
     }
 

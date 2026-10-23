@@ -183,8 +183,8 @@ pub use kernel::{
     MemoryAtomView, MemoryContextPacket, MemoryContextPacketMode, MemoryDegradation,
     MemoryDiscoveryItem, MemoryDiscoveryResult, MemoryHealth, MemoryInformationState, MemoryKernel,
     MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent, MemoryLink,
-    MemoryLinkKind, MemoryPacketItem, MemoryPacketRole, MemoryPath, MemoryPrimitive,
-    MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext, OmittedMemory,
+    MemoryLinkKind, MemoryPacketItem, MemoryPacketRole, MemoryPacketUse, MemoryPath,
+    MemoryPrimitive, MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext, OmittedMemory,
 };
 pub use knowledge::{
     ActivationGovernor, CanonExtractor, ClassificationResult, ConflictGovernor, ConflictStrategy,

@@ -9,7 +9,7 @@ pub mod reality_recall;
 pub use discovery::{MemoryDiscoveryItem, MemoryDiscoveryResult};
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -215,6 +215,87 @@ pub struct MemoryPacketItem {
     pub reason: String,
     #[serde(default)]
     pub content_preview: String,
+    /// The original source cut that produced this preview; never refreshed at use.
+    pub source_revision: crate::store::MemoryEntryRevision,
+    pub source_scope: MemoryScope,
+}
+
+/// One ephemeral use-time source frame and budget, shared by Memory preview and
+/// Knowledge activation. It cannot be deserialized or reused for another caller.
+#[derive(Debug)]
+pub struct MemoryPacketUse {
+    pub(crate) ctx: Option<MemoryTurnContext>,
+    pub(crate) remaining: usize,
+    pub(crate) sources: BTreeMap<String, crate::store::MemorySourceRevisionRead>,
+}
+impl MemoryPacketUse {
+    pub fn new(ctx: MemoryTurnContext, budget_bytes: usize) -> Self {
+        Self {
+            ctx: Some(ctx),
+            remaining: budget_bytes,
+            sources: BTreeMap::new(),
+        }
+    }
+    pub(crate) fn public_read(budget_bytes: usize) -> Self {
+        Self {
+            ctx: None,
+            remaining: budget_bytes,
+            sources: BTreeMap::new(),
+        }
+    }
+    pub fn context(&self) -> Option<&MemoryTurnContext> {
+        self.ctx.as_ref()
+    }
+    pub(crate) fn validate(
+        &mut self,
+        packet: &MemoryContextPacket,
+        reader: &dyn crate::store::MemorySourceFenceReader,
+    ) -> Result<(), MemoryError> {
+        let ctx = self.ctx.as_ref().ok_or(MemoryError::StaleSource)?;
+        for item in &packet.selected {
+            let source_ref = format!("memory:{}", item.atom.id);
+            if !self.sources.contains_key(&source_ref) {
+                let reservation = std::mem::take(&mut self.remaining);
+                if reservation == 0 {
+                    return Err(MemoryError::SourceReadLimit);
+                }
+                let read = reader
+                    .read_source_revision(&source_ref, reservation)?
+                    .ok_or(MemoryError::StaleSource)?;
+                self.remaining = reservation
+                    .checked_sub(read.materialized_bytes)
+                    .ok_or(MemoryError::SourceReadLimit)?;
+                self.sources.insert(source_ref.clone(), read);
+            }
+            let read = &self.sources[&source_ref];
+            let access = read.access.as_ref().ok_or(MemoryError::StaleSource)?;
+            let atom = read.packet_atom.as_ref().ok_or(MemoryError::StaleSource)?;
+            let (role, reason) = packet_role_and_reason(atom);
+            let reason_valid = item.reason == reason
+                || item
+                    .reason
+                    .strip_prefix(&format!("{reason}; usage_feedback:selected_count="))
+                    .is_some_and(|count| {
+                        !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
+                    });
+            if read.fence.source_ref != source_ref
+                || read.fence.retired
+                || read.origin_retired
+                || read.revision.as_ref() != Some(&item.source_revision)
+                || access.scope != item.source_scope
+                || atom != &item.atom
+                || role != item.role
+                || !reason_valid
+                || access.layer != item.atom.layer
+                || !access.visible_to_ctx(ctx)
+                || read.packet_content_digest.as_deref()
+                    != Some(packet_content_digest(&item.atom.title, &item.content_preview).as_str())
+            {
+                return Err(MemoryError::StaleSource);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -789,6 +870,19 @@ impl MemoryKernel {
         Ok(states)
     }
 
+    /// Validate the actual packet against one bounded original source frame.
+    /// A packet's saved scope/revision is a readset, never the current read grant.
+    pub fn validate_packet_for_turn(
+        &self,
+        ctx: &MemoryTurnContext,
+        packet: &MemoryContextPacket,
+        budget_bytes: usize,
+    ) -> MemoryKernelResult<MemoryPacketUse> {
+        let mut usage = MemoryPacketUse::new(ctx.clone(), budget_bytes);
+        usage.validate(packet, self.manager.orchestrator().store().as_ref())?;
+        Ok(usage)
+    }
+
     pub async fn context_packet(
         &self,
         ctx: &MemoryTurnContext,
@@ -1206,7 +1300,10 @@ impl MemoryKernel {
                 .entry(entry.layer)
                 .and_modify(|used| *used = used.saturating_add(item_tokens))
                 .or_insert(item_tokens);
+            let source_revision = crate::store::MemoryEntryRevision::of(&entry)?;
             selected.push(MemoryPacketItem {
+                source_revision,
+                source_scope: entry.scope.clone(),
                 atom,
                 role,
                 reason,
@@ -1780,40 +1877,44 @@ pub(crate) fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
 }
 
 fn memory_entry_visible_to_ctx(entry: &MemoryEntry, ctx: &MemoryTurnContext) -> bool {
-    let visibility_granted = match &entry.visibility {
-        AgentVisibility::Private => {
-            entry.source_agent.as_deref() == Some(ctx.agent_id.as_str())
-                || matches!(&entry.scope, MemoryScope::AgentInstance(owner) if owner == &ctx.agent_id)
+    crate::store::MemorySourceAccess::of(entry).visible_to_ctx(ctx)
+}
+
+impl crate::store::MemorySourceAccess {
+    pub fn visible_to_ctx(&self, ctx: &MemoryTurnContext) -> bool {
+        let entry = self;
+        let visibility_granted = match &entry.visibility {
+            AgentVisibility::Private => {
+                entry.source_agent.as_deref() == Some(ctx.agent_id.as_str())
+                    || matches!(&entry.scope, MemoryScope::AgentInstance(owner) if owner == &ctx.agent_id)
+            }
+            AgentVisibility::TeamScoped(team) => {
+                ctx.team_id.as_deref() == Some(team.as_str())
+                    && ctx
+                        .cognitive_read_scopes
+                        .contains(&harness_contract::agent::CognitiveReadScope::Team)
+            }
+            AgentVisibility::Shared => true,
+        };
+        if !visibility_granted {
+            return false;
         }
-        AgentVisibility::TeamScoped(team) => {
-            ctx.team_id.as_deref() == Some(team.as_str())
-                && ctx
-                    .cognitive_read_scopes
-                    .contains(&harness_contract::agent::CognitiveReadScope::Team)
+        // Historic extraction treated every UserPreference as globally readable.
+        // A private inferred topic preference is not workspace-wide authority even
+        // when an older row already carries `scope=global`.
+        if matches!(entry.scope, MemoryScope::Global)
+            && entry.layer != MemoryLayer::L0
+            && matches!(entry.visibility, AgentVisibility::Private)
+            && matches!(
+                entry.source,
+                MemorySource::AutoExtracted | MemorySource::Compression | MemorySource::Prefetch
+            )
+            && !entry.always_active
+        {
+            return false;
         }
-        AgentVisibility::Shared => true,
-    };
-    if !visibility_granted {
-        return false;
+        memory_scope_visible_to_ctx(&entry.scope, ctx)
     }
-    // Historic extraction treated every UserPreference as globally readable.
-    // A private inferred topic preference is not workspace-wide authority even
-    // when an older row already carries `scope=global`.
-    if matches!(entry.scope, MemoryScope::Global)
-        && entry.layer != MemoryLayer::L0
-        && matches!(entry.visibility, AgentVisibility::Private)
-        && matches!(
-            entry.source,
-            MemorySource::AutoExtracted | MemorySource::Compression | MemorySource::Prefetch
-        )
-        && !entry
-            .tags
-            .iter()
-            .any(|tag| matches!(tag.as_str(), "memory-policy:always" | "always-active"))
-    {
-        return false;
-    }
-    memory_scope_visible_to_ctx(&entry.scope, ctx)
 }
 
 fn memory_binding_search_scopes(ctx: &MemoryTurnContext) -> Vec<MemoryScope> {
@@ -2079,7 +2180,7 @@ fn memory_entry_from_packet_item(item: &MemoryPacketItem) -> MemoryEntry {
     }
 }
 
-fn truncate_memory_content_preview(content: &str) -> String {
+pub(crate) fn truncate_memory_content_preview(content: &str) -> String {
     const MAX_CHARS: usize = 480;
     let mut chars = content.chars();
     let preview = chars.by_ref().take(MAX_CHARS).collect::<String>();
@@ -2929,4 +3030,14 @@ mod tests {
         let revoked = joined.with_cognitive_read_scopes(vec![CognitiveReadScope::Project]);
         assert!(!memory_entry_visible_to_ctx(&entry, &revoked));
     }
+}
+
+pub(crate) fn packet_content_digest(title: &str, preview: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"cowd:memory-packet-content:v1\0");
+    hash.update((title.len() as u64).to_be_bytes());
+    hash.update(title.as_bytes());
+    hash.update(preview.as_bytes());
+    format!("sha256:{:x}", hash.finalize())
 }

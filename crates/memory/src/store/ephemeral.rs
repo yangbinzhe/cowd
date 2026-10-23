@@ -155,6 +155,80 @@ fn is_inactive(state: &State, id: &MemoryId) -> bool {
         .is_some_and(|state| matches!(state.as_str(), "Archived" | "Superseded"))
 }
 
+fn insert_original_entry(state: &mut State, entry: &MemoryEntry) -> Result<MemoryId> {
+    if state
+        .source_fences
+        .get(&format!("memory:{}", entry.id))
+        .is_some_and(|f| {
+            f.source_ref != format!("memory:{}", entry.id)
+                || f.retired
+                || f.scope_key != entry.scope.scope_key()
+        })
+    {
+        return Err(MemoryError::Store(
+            "retired or foreign Memory source write".into(),
+        ));
+    }
+    if lifecycle_retired(
+        entry.id,
+        state
+            .kv
+            .get(&format!("memory_lifecycle:{}", entry.id))
+            .map(String::as_str),
+    )? {
+        return Err(MemoryError::Store(
+            "legacy retired Memory source write".into(),
+        ));
+    }
+    if let Some(current) = state.entries.get(&entry.id.to_string()) {
+        if MemoryEntryRevision::of(current)? == MemoryEntryRevision::of(entry)? {
+            return Ok(entry.id);
+        }
+        return Err(MemoryError::Store(
+            "Memory create target already exists".into(),
+        ));
+    }
+    put_discovery_entry(state, entry);
+    Ok(entry.id)
+}
+
+fn extraction_binding(state: &State, id: MemoryId) -> Result<Option<MemoryExtractionOrigin>> {
+    state
+        .kv
+        .get(&MemoryExtractionOrigin::binding_key(id))
+        .map(|raw| serde_json::from_str(raw).map_err(MemoryError::from))
+        .transpose()
+}
+
+fn validate_extraction_origin(
+    state: &State,
+    entry: &MemoryEntry,
+    origin: Option<&MemoryExtractionOrigin>,
+) -> Result<()> {
+    let binding = extraction_binding(state, entry.id)?;
+    if let Some(origin) = origin {
+        origin.validate_entry(entry)?;
+        if binding.as_ref().is_some_and(|bound| bound != origin)
+            || state.source_fences.contains_key(&origin.retirement_ref()?)
+        {
+            return Err(MemoryError::StaleSource);
+        }
+    } else if binding.is_none()
+        && entry
+            .tags
+            .iter()
+            .any(|tag| tag.starts_with("extraction-batch:"))
+    {
+        return Err(MemoryError::StaleSource);
+    }
+    if let Some(bound) = binding {
+        if state.source_fences.contains_key(&bound.retirement_ref()?) {
+            return Err(MemoryError::StaleSource);
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl MemoryStore for EphemeralMemoryStore {
     fn capabilities(&self) -> MemoryStoreCapabilities {
@@ -169,39 +243,48 @@ impl MemoryStore for EphemeralMemoryStore {
 
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId> {
         let mut state = self.write()?;
-        if state
-            .source_fences
-            .get(&format!("memory:{}", entry.id))
-            .is_some_and(|f| {
-                f.source_ref != format!("memory:{}", entry.id)
-                    || f.retired
-                    || f.scope_key != entry.scope.scope_key()
-            })
+        validate_extraction_origin(&state, entry, None)?;
+        insert_original_entry(&mut state, entry)
+    }
+    async fn write_extraction(
+        &self,
+        entry: &MemoryEntry,
+        origin: &MemoryExtractionOrigin,
+        expected: Option<&MemoryEntryRevision>,
+    ) -> Result<MemoryId> {
+        let mut state = self.write()?;
+        validate_extraction_origin(&state, entry, Some(origin))?;
+        if state.entries.contains_key(&entry.id.to_string())
+            && extraction_binding(&state, entry.id)?.is_none()
         {
-            return Err(MemoryError::Store(
-                "retired or foreign Memory source write".into(),
-            ));
+            return Err(MemoryError::StaleSource);
         }
-        if lifecycle_retired(
-            entry.id,
-            state
-                .kv
-                .get(&format!("memory_lifecycle:{}", entry.id))
-                .map(String::as_str),
-        )? {
-            return Err(MemoryError::Store(
-                "legacy retired Memory source write".into(),
-            ));
-        }
-        if let Some(current) = state.entries.get(&entry.id.to_string()) {
-            if MemoryEntryRevision::of(current)? == MemoryEntryRevision::of(entry)? {
-                return Ok(entry.id);
+        if let Some(expected) = expected {
+            let current = state
+                .entries
+                .get(&entry.id.to_string())
+                .ok_or(MemoryError::StaleSource)?;
+            if extraction_binding(&state, entry.id)?.as_ref() != Some(origin) {
+                return Err(MemoryError::StaleSource);
             }
-            return Err(MemoryError::Store(
-                "Memory create target already exists".into(),
-            ));
+            if lifecycle_retired(
+                entry.id,
+                state
+                    .kv
+                    .get(&format!("memory_lifecycle:{}", entry.id))
+                    .map(String::as_str),
+            )? {
+                return Err(MemoryError::StaleSource);
+            }
+            let next = expected.validate_replace(current, entry)?;
+            put_discovery_entry(&mut state, &next);
+        } else {
+            insert_original_entry(&mut state, entry)?;
         }
-        put_discovery_entry(&mut state, entry);
+        state.kv.insert(
+            MemoryExtractionOrigin::binding_key(entry.id),
+            serde_json::to_string(origin)?,
+        );
         Ok(entry.id)
     }
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>> {
@@ -209,6 +292,7 @@ impl MemoryStore for EphemeralMemoryStore {
     }
     async fn update(&self, entry: &MemoryEntry, expected: &MemoryEntryRevision) -> Result<()> {
         let mut state = self.write()?;
+        validate_extraction_origin(&state, entry, None)?;
         if state
             .source_fences
             .get(&format!("memory:{}", entry.id))
@@ -274,6 +358,15 @@ impl MemoryStore for EphemeralMemoryStore {
             state.kv.get(&key).map(String::as_str),
             state.source_fences.get(&source_ref),
         )?;
+        if receipt.source.retired && command.revokes_origin() {
+            if let Some(origin) = extraction_binding(&state, entry.id)? {
+                let fence = origin.retirement_fence(&receipt.source)?;
+                state
+                    .source_fences
+                    .entry(fence.source_ref.clone())
+                    .or_insert(fence);
+            }
+        }
         state.kv.insert(key, raw);
         bump_discovery(&mut state, &entry.scope);
         state
@@ -855,6 +948,9 @@ impl MemoryStore for EphemeralMemoryStore {
         Ok(self.read()?.symbol_memory.clone())
     }
     async fn kv_put(&self, k: &str, v: &str) -> Result<()> {
+        if k.starts_with("memory_extraction_origin:") {
+            return Err(MemoryError::StaleSource);
+        }
         let mut state = self.write()?;
         if k.strip_prefix("memory_lifecycle:")
             .is_some_and(|id| state.source_fences.contains_key(&format!("memory:{id}")))
@@ -879,6 +975,9 @@ impl MemoryStore for EphemeralMemoryStore {
         Ok(self.read()?.kv.get(k).cloned())
     }
     async fn kv_delete(&self, key: &str) -> Result<()> {
+        if key.starts_with("memory_extraction_origin:") {
+            return Err(MemoryError::StaleSource);
+        }
         let mut state = self.write()?;
         if key
             .strip_prefix("memory_lifecycle:")
@@ -983,7 +1082,10 @@ mod scope_tests {
             vec!["a3".to_string()],
             "saving a scope replaces that scope's set"
         );
-        assert_eq!(store.load_entities("scope-b").await.expect("load b").len(), 1);
+        assert_eq!(
+            store.load_entities("scope-b").await.expect("load b").len(),
+            1
+        );
     }
 }
 
@@ -1020,6 +1122,10 @@ impl EphemeralMemoryStore {
                 return Err(MemoryError::StaleSource);
             }
             let read = MemorySourceRevisionRead {
+                origin_retired: false,
+                access: None,
+                packet_content_digest: None,
+                packet_atom: None,
                 fence: fence.clone(),
                 revision: None,
                 materialized_bytes: bytes,
@@ -1035,7 +1141,14 @@ impl EphemeralMemoryStore {
             }
             return Ok(None);
         };
-        let read = live_source_revision(
+        let origin = extraction_binding(&state, id)?;
+        let origin_bytes = reserved_source_bytes(&origin, budget_bytes)?;
+        let origin_retired = origin
+            .as_ref()
+            .map(MemoryExtractionOrigin::retirement_ref)
+            .transpose()?
+            .is_some_and(|key| state.source_fences.contains_key(&key));
+        let mut read = live_source_revision(
             source_ref,
             entry,
             state
@@ -1043,8 +1156,16 @@ impl EphemeralMemoryStore {
                 .get(&format!("memory_lifecycle:{id}"))
                 .map(String::as_str),
             state.source_fences.get(source_ref),
-            budget_bytes,
+            budget_bytes
+                .checked_sub(origin_bytes)
+                .ok_or(MemoryError::SourceReadLimit)?,
         )?;
+        read.materialized_bytes += origin_bytes;
+        read.origin_retired = origin_retired;
+        if origin_retired {
+            read.revision = None;
+            read.access = None;
+        }
         Ok(Some(MemorySourceRevisionGuard {
             _state: state,
             read,
