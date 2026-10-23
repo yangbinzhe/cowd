@@ -253,6 +253,14 @@ const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         )",
         "CREATE INDEX IF NOT EXISTS idx_knowledge_usage_pack_time ON knowledge_usage(pack_id, occurred_at DESC)",
     ],
+}, PostgresMigrationSpec {
+    id: "knowledge.0002.ingestion-receipts",
+    domain: KNOWLEDGE_DOMAIN,
+    version: 2,
+    description: "commit immutable ingestion receipts with original knowledge writes",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS knowledge_ingestion_receipt (request_key TEXT PRIMARY KEY, input_digest TEXT NOT NULL, payload JSONB NOT NULL)",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -1496,7 +1504,10 @@ impl PostgresKnowledgeStore {
 }
 
 impl KnowledgeStore for PostgresKnowledgeStore {
-    fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError> {
+    fn save_receipt(
+        &self,
+        receipt: &KnowledgeIngestionReceipt,
+    ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
         let store = self.clone();
         let receipt = receipt.clone();
         run_driver_sync(
@@ -1506,6 +1517,23 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     .checkout_critical()
                     .map_err(storage_knowledge_error)?;
                 let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                let (key, digest) = memory::knowledge::knowledge_ingestion_identity(&receipt)?;
+                let inserted = tx.execute("INSERT INTO knowledge_ingestion_receipt(request_key,input_digest,payload) VALUES($1,$2,$3) ON CONFLICT(request_key) DO NOTHING", &[&key,&digest,&serde_json::to_value(&receipt).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
+                if inserted == 0 {
+                    let row = tx.query_one("SELECT input_digest, payload FROM knowledge_ingestion_receipt WHERE request_key=$1", &[&key]).map_err(postgres_knowledge_error)?;
+                    let original_digest: String =
+                        row.try_get(0).map_err(postgres_knowledge_error)?;
+                    if original_digest != digest {
+                        return Err(KnowledgeStoreError::Backend(
+                            "knowledge ingestion identity conflict".into(),
+                        ));
+                    }
+                    let payload: serde_json::Value =
+                        row.try_get(1).map_err(postgres_knowledge_error)?;
+                    let original = serde_json::from_value(payload).map_err(json_knowledge_error)?;
+                    tx.commit().map_err(postgres_knowledge_error)?;
+                    return Ok(original);
+                }
                 upsert_knowledge_json(
                     &mut tx,
                     "knowledge_corpus",
@@ -1534,74 +1562,11 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     tx.execute("INSERT INTO knowledge_chunk(chunk_id,corpus_id,ordinal,title,text,payload) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(chunk_id) DO UPDATE SET corpus_id=EXCLUDED.corpus_id,ordinal=EXCLUDED.ordinal,title=EXCLUDED.title,text=EXCLUDED.text,payload=EXCLUDED.payload", &[&chunk.chunk_id,&chunk.corpus_id,&i64::try_from(chunk.ordinal).map_err(|_|KnowledgeStoreError::Backend("knowledge chunk ordinal overflow".to_string()))?,&chunk.title,&chunk.text,&serde_json::to_value(chunk).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
                 }
                 tx.commit().map_err(postgres_knowledge_error)?;
-                Ok(())
+                Ok(receipt)
             },
             || {
                 KnowledgeStoreError::Backend(
                     "PostgreSQL knowledge write thread panicked".to_string(),
-                )
-            },
-        )
-    }
-
-    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError> {
-        let store = self.clone();
-        let pack = pack.clone();
-        run_driver_sync(
-            move || {
-                let mut connection = store
-                    .executor
-                    .checkout_critical()
-                    .map_err(storage_knowledge_error)?;
-                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
-                upsert_knowledge_json(
-                    &mut tx,
-                    "knowledge_pack",
-                    "pack_id",
-                    &pack.pack_id,
-                    &pack.namespace.key(),
-                    Some(knowledge_label(&pack.state)?),
-                    &pack.updated_at.to_rfc3339(),
-                    &pack,
-                )?;
-                tx.commit().map_err(postgres_knowledge_error)?;
-                Ok(())
-            },
-            || {
-                KnowledgeStoreError::Backend(
-                    "PostgreSQL knowledge pack write thread panicked".to_string(),
-                )
-            },
-        )
-    }
-
-    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError> {
-        let store = self.clone();
-        let conflict = conflict.clone();
-        run_driver_sync(
-            move || {
-                let mut connection = store
-                    .executor
-                    .checkout_critical()
-                    .map_err(storage_knowledge_error)?;
-                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
-                tx.execute(
-                    "INSERT INTO knowledge_conflict(conflict_id,pack_id,state,detected_at,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(conflict_id) DO UPDATE SET pack_id=EXCLUDED.pack_id,state=EXCLUDED.state,detected_at=EXCLUDED.detected_at,payload=EXCLUDED.payload",
-                    &[
-                        &conflict.conflict_id,
-                        &conflict.pack_id,
-                        &knowledge_label(&conflict.state)?,
-                        &conflict.detected_at.to_rfc3339(),
-                        &serde_json::to_value(&conflict).map_err(json_knowledge_error)?,
-                    ],
-                )
-                .map_err(postgres_knowledge_error)?;
-                tx.commit().map_err(postgres_knowledge_error)?;
-                Ok(())
-            },
-            || {
-                KnowledgeStoreError::Backend(
-                    "PostgreSQL knowledge conflict write thread panicked".to_string(),
                 )
             },
         )
@@ -1616,7 +1581,12 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     .executor
                     .checkout_background()
                     .map_err(storage_knowledge_error)?;
-                connection.execute("INSERT INTO knowledge_usage(signal_id,pack_id,session_id,occurred_at,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(signal_id) DO UPDATE SET pack_id=EXCLUDED.pack_id,session_id=EXCLUDED.session_id,occurred_at=EXCLUDED.occurred_at,payload=EXCLUDED.payload", &[&signal.signal_id,&signal.pack_id,&signal.session_id,&signal.occurred_at.to_rfc3339(),&serde_json::to_value(&signal).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
+                let changed = connection.execute("INSERT INTO knowledge_usage(signal_id,pack_id,session_id,occurred_at,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(signal_id) DO UPDATE SET payload=knowledge_usage.payload WHERE knowledge_usage.payload=EXCLUDED.payload", &[&signal.signal_id,&signal.pack_id,&signal.session_id,&signal.occurred_at.to_rfc3339(),&serde_json::to_value(&signal).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
+                if changed != 1 {
+                    return Err(KnowledgeStoreError::Backend(
+                        "knowledge usage identity conflict".into(),
+                    ));
+                }
                 Ok(())
             },
             || {
@@ -1626,6 +1596,101 @@ impl KnowledgeStore for PostgresKnowledgeStore {
             },
         )
     }
+    fn read_candidates(
+        &self,
+        namespace: Option<&harness_contract::knowledge::KnowledgeNamespace>,
+    ) -> Result<
+        (
+            Vec<KnowledgePack>,
+            Vec<harness_contract::knowledge::KnowledgeCanonPack>,
+        ),
+        KnowledgeStoreError,
+    > {
+        let store = self.clone();
+        let namespace = namespace.map(|ns| ns.key());
+        run_driver_sync(
+            move || {
+                let mut connection = store
+                    .executor
+                    .checkout_online_read()
+                    .map_err(storage_knowledge_error)?;
+                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    .map_err(postgres_knowledge_error)?;
+                let row = tx.query_one("WITH selected AS (SELECT payload FROM knowledge_pack WHERE ($1::text IS NULL OR namespace_key=$1) UNION ALL SELECT canon.payload FROM knowledge_canon canon JOIN knowledge_pack pack ON canon.canon_id=pack.payload->>'canon_pack_ref' WHERE ($1::text IS NULL OR pack.namespace_key=$1)) SELECT count(*), COALESCE(sum(octet_length(payload::text)),0)::bigint FROM selected", &[&namespace]).map_err(postgres_knowledge_error)?;
+                check_knowledge_frame_budget(&row)?;
+                let packs = tx.query("SELECT payload FROM knowledge_pack WHERE ($1::text IS NULL OR namespace_key=$1) ORDER BY pack_id", &[&namespace]).map_err(postgres_knowledge_error)?.iter().map(|row| {
+                let value: serde_json::Value = row.try_get(0).map_err(postgres_knowledge_error)?;
+                serde_json::from_value(value).map_err(json_knowledge_error)
+            }).collect::<Result<Vec<_>,_>>()?;
+                let canon = tx.query("SELECT canon.payload FROM knowledge_canon canon JOIN knowledge_pack pack ON canon.canon_id=pack.payload->>'canon_pack_ref' WHERE ($1::text IS NULL OR pack.namespace_key=$1) ORDER BY canon.canon_id", &[&namespace]).map_err(postgres_knowledge_error)?.iter().map(|row| {
+                let value: serde_json::Value = row.try_get(0).map_err(postgres_knowledge_error)?;
+                serde_json::from_value(value).map_err(json_knowledge_error)
+            }).collect::<Result<Vec<_>,_>>()?;
+                tx.commit().map_err(postgres_knowledge_error)?;
+                Ok((packs, canon))
+            },
+            || {
+                KnowledgeStoreError::Backend(
+                    "PostgreSQL knowledge candidate read thread panicked".into(),
+                )
+            },
+        )
+    }
+
+    fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+        let store = self.clone();
+        run_driver_sync(
+            move || {
+                let mut connection = store
+                    .executor
+                    .checkout_online_read()
+                    .map_err(storage_knowledge_error)?;
+                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    .map_err(postgres_knowledge_error)?;
+                let snapshot = bounded_knowledge_snapshot(&mut tx, false)?;
+                tx.commit().map_err(postgres_knowledge_error)?;
+                Ok(snapshot)
+            },
+            || {
+                KnowledgeStoreError::Backend(
+                    "PostgreSQL knowledge maintenance read thread panicked".into(),
+                )
+            },
+        )
+    }
+    fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError> {
+        let store = self.clone();
+        run_driver_sync(
+            move || {
+                let mut connection = store
+                    .executor
+                    .checkout_online_read()
+                    .map_err(storage_knowledge_error)?;
+                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    .map_err(postgres_knowledge_error)?;
+                let snapshot = bounded_knowledge_snapshot(&mut tx, false)?;
+                let count: i64 = tx
+                    .query_one("SELECT count(*) FROM knowledge_usage", &[])
+                    .map_err(postgres_knowledge_error)?
+                    .try_get(0)
+                    .map_err(postgres_knowledge_error)?;
+                let count = usize::try_from(count).map_err(|_| KnowledgeStoreError::ReadLimit)?;
+                let projection =
+                    memory::knowledge::knowledge_projection_from_metadata(snapshot, count)?;
+                tx.commit().map_err(postgres_knowledge_error)?;
+                Ok(projection)
+            },
+            || {
+                KnowledgeStoreError::Backend(
+                    "PostgreSQL knowledge projection read thread panicked".into(),
+                )
+            },
+        )
+    }
+
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
         let store = self.clone();
         run_driver_sync(
@@ -1634,22 +1699,63 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     .executor
                     .checkout_online_read()
                     .map_err(storage_knowledge_error)?;
-                Ok(KnowledgeSnapshot {
-                    corpus: knowledge_rows(&mut connection, "knowledge_corpus", "corpus_id")?,
-                    packs: knowledge_rows(&mut connection, "knowledge_pack", "pack_id")?,
-                    canon: knowledge_rows(&mut connection, "knowledge_canon", "canon_id")?,
-                    conflicts: knowledge_rows(
-                        &mut connection,
-                        "knowledge_conflict",
-                        "conflict_id",
-                    )?,
-                    chunks: knowledge_rows(&mut connection, "knowledge_chunk", "chunk_id")?,
-                    usage: knowledge_rows(&mut connection, "knowledge_usage", "signal_id")?,
-                })
+                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    .map_err(postgres_knowledge_error)?;
+                let snapshot = bounded_knowledge_snapshot(&mut tx, true)?;
+                tx.commit().map_err(postgres_knowledge_error)?;
+                Ok(snapshot)
+            },
+            || KnowledgeStoreError::Backend("PostgreSQL knowledge read thread panicked".into()),
+        )
+    }
+
+    fn commit_maintenance(
+        &self,
+        expected: &KnowledgeSnapshot,
+        packs: &[KnowledgePack],
+        conflicts: &[KnowledgeConflictRecord],
+    ) -> Result<(), KnowledgeStoreError> {
+        let store = self.clone();
+        let expected = expected.clone();
+        let packs = packs.to_vec();
+        let conflicts = conflicts.to_vec();
+        run_driver_sync(
+            move || {
+                let mut connection = store
+                    .executor
+                    .checkout_critical()
+                    .map_err(storage_knowledge_error)?;
+                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                // Original writers acquire ROW EXCLUSIVE on these tables. Taking
+                // the conflicting locks before reading closes the CAS/write gap,
+                // including inserts of previously absent corpus/pack/conflict IDs.
+                tx.batch_execute("LOCK TABLE knowledge_corpus, knowledge_pack, knowledge_conflict IN SHARE ROW EXCLUSIVE MODE").map_err(postgres_knowledge_error)?;
+                let current = bounded_knowledge_snapshot(&mut tx, false)?;
+                if !memory::knowledge::same_knowledge_maintenance_inputs(&expected, &current)? {
+                    return Err(KnowledgeStoreError::StaleRead);
+                }
+                for pack in &packs {
+                    upsert_knowledge_json(
+                        &mut tx,
+                        "knowledge_pack",
+                        "pack_id",
+                        &pack.pack_id,
+                        &pack.namespace.key(),
+                        Some(knowledge_label(&pack.state)?),
+                        &pack.updated_at.to_rfc3339(),
+                        pack,
+                    )?;
+                }
+                for conflict in &conflicts {
+                    tx.execute("INSERT INTO knowledge_conflict(conflict_id,pack_id,state,detected_at,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(conflict_id) DO UPDATE SET pack_id=EXCLUDED.pack_id,state=EXCLUDED.state,detected_at=EXCLUDED.detected_at,payload=EXCLUDED.payload", &[&conflict.conflict_id,&conflict.pack_id,&knowledge_label(&conflict.state)?,&conflict.detected_at.to_rfc3339(),&serde_json::to_value(conflict).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
+                }
+                tx.commit().map_err(postgres_knowledge_error)?;
+                Ok(())
             },
             || {
                 KnowledgeStoreError::Backend(
-                    "PostgreSQL knowledge read thread panicked".to_string(),
+                    "PostgreSQL knowledge maintenance thread panicked".into(),
                 )
             },
         )
@@ -1968,6 +2074,53 @@ fn upsert_knowledge_json<T: Serialize>(
     }
     .map_err(postgres_knowledge_error)?;
     Ok(())
+}
+
+fn check_knowledge_frame_budget(row: &Row) -> Result<(), KnowledgeStoreError> {
+    let count: i64 = row.try_get(0).map_err(postgres_knowledge_error)?;
+    let bytes: i64 = row.try_get(1).map_err(postgres_knowledge_error)?;
+    if count < 0
+        || bytes < 0
+        || count as u64 > memory::knowledge::KNOWLEDGE_READ_MAX_ROWS as u64
+        || bytes as u64 > memory::knowledge::KNOWLEDGE_READ_MAX_BYTES as u64
+    {
+        return Err(KnowledgeStoreError::ReadLimit);
+    }
+    Ok(())
+}
+
+fn bounded_knowledge_snapshot(
+    connection: &mut impl PostgresClient,
+    include_history: bool,
+) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+    // Count/size only: no JSON payload crosses the driver boundary until the
+    // entire consistent read frame is reserved. Overflow is never truncation.
+    let tables = if include_history {
+        "SELECT payload FROM knowledge_corpus UNION ALL SELECT payload FROM knowledge_pack UNION ALL SELECT payload FROM knowledge_canon UNION ALL SELECT payload FROM knowledge_conflict UNION ALL SELECT payload FROM knowledge_chunk UNION ALL SELECT payload FROM knowledge_usage"
+    } else {
+        "SELECT payload FROM knowledge_corpus UNION ALL SELECT payload FROM knowledge_pack UNION ALL SELECT payload FROM knowledge_canon UNION ALL SELECT payload FROM knowledge_conflict"
+    };
+    let sql = format!("SELECT count(*), COALESCE(sum(octet_length(payload::text)),0)::bigint FROM ({tables}) AS frame");
+    let row = connection
+        .query_one(&sql, &[])
+        .map_err(postgres_knowledge_error)?;
+    check_knowledge_frame_budget(&row)?;
+    Ok(KnowledgeSnapshot {
+        corpus: knowledge_rows(connection, "knowledge_corpus", "corpus_id")?,
+        packs: knowledge_rows(connection, "knowledge_pack", "pack_id")?,
+        canon: knowledge_rows(connection, "knowledge_canon", "canon_id")?,
+        conflicts: knowledge_rows(connection, "knowledge_conflict", "conflict_id")?,
+        chunks: if include_history {
+            knowledge_rows(connection, "knowledge_chunk", "chunk_id")?
+        } else {
+            Vec::new()
+        },
+        usage: if include_history {
+            knowledge_rows(connection, "knowledge_usage", "signal_id")?
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 fn knowledge_rows<T: DeserializeOwned>(

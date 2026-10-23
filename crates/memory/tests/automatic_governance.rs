@@ -437,15 +437,17 @@ async fn actionable_knowledge_conflicts_are_counted_as_human_review() {
         .unwrap(),
     );
     let knowledge = KnowledgeFabric::new();
-    let receipt = knowledge.ingest_document(
-        KnowledgeNamespace::Project("cowd".to_string()),
-        KnowledgeActivationPolicy::DefaultForProjectGroup,
-        KnowledgeGovernanceLevel::Required,
-        DocumentContent::new(
-            "Conflicting retention rule",
-            "must retain transient payload\nmust not retain transient payload",
-        ),
-    );
+    let receipt = knowledge
+        .ingest_document(
+            KnowledgeNamespace::Project("cowd".to_string()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            DocumentContent::new(
+                "Conflicting retention rule",
+                "must retain transient payload\nmust not retain transient payload",
+            ),
+        )
+        .unwrap();
     assert_eq!(receipt.conflicts.len(), 1);
 
     let report = run_automatic_governance(

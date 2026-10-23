@@ -2842,6 +2842,7 @@ where
             &crate::prompt::RuntimeClockStamp::now(),
         )
         .await
+        .expect("test context preparation succeeds")
     }
 
     pub(super) async fn prepare_reality_context_with_budget_and_items(
@@ -2850,8 +2851,15 @@ where
         total_budget_tokens: u64,
         next_model_context_items: Vec<ContextItem>,
         clock_stamp: &crate::prompt::RuntimeClockStamp,
-    ) -> PromptAssembly {
+    ) -> Result<PromptAssembly, RuntimeError> {
         let _perf_start = std::time::Instant::now();
+        let empty_packet = memory::MemoryContextPacket {
+            selected: Vec::new(),
+            omitted: Vec::new(),
+            token_estimate: 0,
+            truncated: false,
+            recall_report: Default::default(),
+        };
 
         let Some(mgr) = self.memory_manager.as_ref() else {
             let (runtime_reality_context_items, session_context_items) = tokio::join!(
@@ -2872,6 +2880,8 @@ where
             let mut dynamic_items = runtime_reality_context_items;
             dynamic_items.extend(session_context_items);
             dynamic_items.extend(next_model_context_items);
+            let knowledge_report =
+                self.append_knowledge_context(user_input, &empty_packet, &mut dynamic_items)?;
             let envelope = self.build_context_envelope(
                 user_input,
                 dynamic_items,
@@ -2880,9 +2890,9 @@ where
                 total_budget_tokens,
                 &clock_stamp,
             );
-            return self
-                .finalize_context_prompt(user_input, envelope, None, clock_stamp)
-                .await;
+            return Ok(self
+                .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
+                .await);
         };
 
         let mem_messages = self.memory_context_messages().await;
@@ -2924,36 +2934,6 @@ where
             Ok(packet) => {
                 let packet =
                     crate::knowledge_activation::filter_packet_for_turn_intent(&packet, user_input);
-                if packet.selected.is_empty() {
-                    tracing::debug!(entries = 0, "memory context packet prepared");
-                    if let Some(cb) = &self.memory_callback {
-                        cb.on_memory_update(Vec::new(), "no memories found");
-                    }
-                    let omissions = packet
-                        .omitted
-                        .iter()
-                        .map(|omitted| ContextOmission {
-                            source: ContextSourceKind::Memory,
-                            reason: format!("{}: {}", omitted.reason, omitted.title),
-                            token_estimate: 0,
-                        })
-                        .collect();
-                    let mut dynamic_items = runtime_reality_context_items;
-                    dynamic_items.extend(session_context_items);
-                    dynamic_items.extend(next_model_context_items);
-                    let envelope = self.build_context_envelope(
-                        user_input,
-                        dynamic_items,
-                        omissions,
-                        Vec::new(),
-                        total_budget_tokens,
-                        &clock_stamp,
-                    );
-                    return self
-                        .finalize_context_prompt(user_input, envelope, None, clock_stamp)
-                        .await;
-                }
-
                 if let Some(cb) = &self.memory_callback {
                     let entries: Vec<(String, String, f64)> = packet
                         .selected
@@ -3013,15 +2993,6 @@ where
                         context_item
                     })
                     .collect::<Vec<_>>();
-                let knowledge_activation = self.knowledge_activation.as_ref().and_then(|runtime| {
-                    runtime.activate_from_packet_for_project(
-                        &session_id,
-                        user_input,
-                        &format!("{:?}", self.context_profile()),
-                        Some(&self.checkpoint_workspace_id),
-                        &packet,
-                    )
-                });
                 let omissions = packet
                     .omitted
                     .iter()
@@ -3035,12 +3006,8 @@ where
                 dynamic_items.extend(runtime_reality_context_items);
                 dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
-                let mut knowledge_report = None;
-                if let Some(activation) = knowledge_activation {
-                    knowledge_report = Some(activation.report.clone());
-                    dynamic_items.extend(activation.items);
-                    self.set_turn_knowledge_report(activation.report);
-                }
+                let knowledge_report =
+                    self.append_knowledge_context(user_input, &packet, &mut dynamic_items)?;
                 let envelope = self.build_context_envelope(
                     user_input,
                     dynamic_items,
@@ -3049,8 +3016,9 @@ where
                     total_budget_tokens,
                     &clock_stamp,
                 );
-                self.finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
-                    .await
+                Ok(self
+                    .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
+                    .await)
             }
             Err(err) => {
                 tracing::warn!(%err, "memory: prepare_context failed, using base system prompt");
@@ -3061,6 +3029,8 @@ where
                 let mut dynamic_items = runtime_reality_context_items;
                 dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
+                let knowledge_report =
+                    self.append_knowledge_context(user_input, &empty_packet, &mut dynamic_items)?;
                 let envelope = self.build_context_envelope(
                     user_input,
                     dynamic_items,
@@ -3069,10 +3039,42 @@ where
                     total_budget_tokens,
                     &clock_stamp,
                 );
-                self.finalize_context_prompt(user_input, envelope, None, clock_stamp)
-                    .await
+                Ok(self
+                    .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
+                    .await)
             }
         }
+    }
+
+    fn append_knowledge_context(
+        &self,
+        user_input: &str,
+        packet: &memory::MemoryContextPacket,
+        dynamic_items: &mut Vec<ContextItem>,
+    ) -> Result<Option<harness_contract::knowledge::KnowledgeTurnReport>, RuntimeError> {
+        let activation = self
+            .knowledge_activation
+            .as_ref()
+            .map(|runtime| {
+                runtime.activate_from_packet_for_project(
+                    &self.session_id().to_string(),
+                    user_input,
+                    &format!("{:?}", self.context_profile()),
+                    Some(&self.checkpoint_workspace_id),
+                    packet,
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                RuntimeError::new(format!("Knowledge activation read failed: {error}"))
+            })?
+            .flatten();
+        let Some(activation) = activation else {
+            return Ok(None);
+        };
+        dynamic_items.extend(activation.items);
+        self.set_turn_knowledge_report(activation.report.clone());
+        Ok(Some(activation.report))
     }
 
     pub(super) async fn runtime_reality_context_items(&self, user_input: &str) -> Vec<ContextItem> {

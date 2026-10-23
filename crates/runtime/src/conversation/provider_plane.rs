@@ -1762,7 +1762,7 @@ where
         budget: u64,
         items: Vec<ContextItem>,
         clock_stamp: &crate::prompt::RuntimeClockStamp,
-    ) -> PromptAssembly {
+    ) -> Result<PromptAssembly, RuntimeError> {
         let policy_revision = self
             .permission_policy
             .execution_policy_control()
@@ -1770,9 +1770,9 @@ where
             .revision;
         let mut prompt = self
             .prepare_reality_context_with_budget_and_items(user_input, budget, items, clock_stamp)
-            .await;
+            .await?;
         prompt.context_policy_revision = Some(policy_revision);
-        prompt
+        Ok(prompt)
     }
 
     /// Execute one Provider step while optionally dispatching completed,
@@ -2095,7 +2095,7 @@ where
                 one_shot_context_items.clone(),
                 &clock_stamp,
             )
-            .await;
+            .await?;
         crate::execution_core::performance::observe_duration(
             "context_select_ms",
             context_select_started.elapsed(),
@@ -2242,7 +2242,7 @@ where
                             one_shot_context_items,
                             &clock_stamp,
                         )
-                        .await;
+                        .await?;
                     apply_runtime_controls(&mut prompt);
                     self.record_context_event(
                         "context_preflight_compaction",

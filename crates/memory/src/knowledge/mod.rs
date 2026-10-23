@@ -18,6 +18,7 @@ use harness_contract::knowledge::{
 };
 use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,14 +190,35 @@ pub enum KnowledgeStoreError {
     Json(#[from] serde_json::Error),
     #[error("backend error: {0}")]
     Backend(String),
+    #[error("knowledge maintenance read set changed")]
+    StaleRead,
+    #[error("knowledge read exceeds the bounded frame")]
+    ReadLimit,
 }
 
 pub trait KnowledgeStore: Send + Sync {
-    fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError>;
-    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError>;
-    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError>;
+    fn save_receipt(
+        &self,
+        receipt: &KnowledgeIngestionReceipt,
+    ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError>;
     fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError>;
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
+    fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
+    fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError>;
+    /// Policy reads reserve only pack/canon inputs. Usage/chunk history cannot
+    /// exhaust the online activation budget; namespace filters precede reads.
+    fn read_candidates(
+        &self,
+        namespace: Option<&KnowledgeNamespace>,
+    ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError>;
+    /// Compare the original domain read set and apply every maintenance write
+    /// in one transaction. A conflicting read is never silently retried.
+    fn commit_maintenance(
+        &self,
+        expected: &KnowledgeSnapshot,
+        packs: &[KnowledgePack],
+        conflicts: &[KnowledgeConflictRecord],
+    ) -> Result<(), KnowledgeStoreError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +268,154 @@ struct KnowledgeFabricState {
     conflicts: BTreeMap<String, KnowledgeConflictRecord>,
     chunks: BTreeMap<String, KnowledgeChunk>,
     usage: Vec<KnowledgeUsageSignal>,
+    ingestion_receipts: BTreeMap<String, (String, KnowledgeIngestionReceipt)>,
+}
+
+/// A read is complete or refused; these limits never truncate a policy input.
+pub const KNOWLEDGE_READ_MAX_ROWS: usize = 4096;
+pub const KNOWLEDGE_READ_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+impl KnowledgeFabricState {
+    fn from_snapshot(snapshot: KnowledgeSnapshot) -> Self {
+        Self {
+            corpus: snapshot
+                .corpus
+                .into_iter()
+                .map(|v| (v.corpus_id.clone(), v))
+                .collect(),
+            packs: snapshot
+                .packs
+                .into_iter()
+                .map(|v| (v.pack_id.clone(), v))
+                .collect(),
+            canon: snapshot
+                .canon
+                .into_iter()
+                .map(|v| (v.canon_id.clone(), v))
+                .collect(),
+            conflicts: snapshot
+                .conflicts
+                .into_iter()
+                .map(|v| (v.conflict_id.clone(), v))
+                .collect(),
+            chunks: snapshot
+                .chunks
+                .into_iter()
+                .map(|v| (v.chunk_id.clone(), v))
+                .collect(),
+            usage: snapshot.usage,
+            ingestion_receipts: BTreeMap::new(),
+        }
+    }
+}
+
+struct Budget(usize);
+impl std::io::Write for Budget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("knowledge read budget"))?;
+        if self.0 > KNOWLEDGE_READ_MAX_BYTES {
+            return Err(std::io::Error::other("knowledge read budget"));
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn bounded_state_snapshot(
+    state: &KnowledgeFabricState,
+    include_history: bool,
+) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+    // Count serialized bytes into a bounded sink before cloning any payload.
+    let rows = state.corpus.len()
+        + state.packs.len()
+        + state.canon.len()
+        + state.conflicts.len()
+        + if include_history {
+            state.chunks.len() + state.usage.len()
+        } else {
+            0
+        };
+    if rows > KNOWLEDGE_READ_MAX_ROWS {
+        return Err(KnowledgeStoreError::ReadLimit);
+    }
+    let mut budget = Budget(0);
+    macro_rules! count {
+        ($items:expr) => {
+            for item in $items {
+                serde_json::to_writer(&mut budget, item)
+                    .map_err(|_| KnowledgeStoreError::ReadLimit)?;
+            }
+        };
+    }
+    count!(state.corpus.values());
+    count!(state.packs.values());
+    count!(state.canon.values());
+    count!(state.conflicts.values());
+    if include_history {
+        count!(state.chunks.values());
+        count!(&state.usage);
+    }
+    Ok(KnowledgeSnapshot {
+        corpus: state.corpus.values().cloned().collect(),
+        packs: state.packs.values().cloned().collect(),
+        canon: state.canon.values().cloned().collect(),
+        conflicts: state.conflicts.values().cloned().collect(),
+        chunks: if include_history {
+            state.chunks.values().cloned().collect()
+        } else {
+            Vec::new()
+        },
+        usage: if include_history {
+            state.usage.clone()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+/// Stable request identity and full typed input commitment. Generated commit
+/// times are excluded explicitly; semantic fields and payloads remain bound.
+/// The immutable receipt is written in the same original store transaction.
+pub fn knowledge_ingestion_identity(
+    receipt: &KnowledgeIngestionReceipt,
+) -> Result<(String, String), KnowledgeStoreError> {
+    fn digest(domain: &str, value: &impl Serialize) -> Result<String, KnowledgeStoreError> {
+        let mut hash = Sha256::new();
+        hash.update(domain.as_bytes());
+        hash.update([0]);
+        hash.update(serde_json::to_vec(value)?);
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    let key = digest(
+        "cowd.knowledge.ingestion.identity.v1",
+        &(&receipt.pack.pack_id, &receipt.corpus.corpus_id),
+    )?;
+    let mut input = receipt.clone();
+    let epoch = DateTime::<Utc>::UNIX_EPOCH;
+    input.corpus.created_at = epoch;
+    input.corpus.updated_at = epoch;
+    input.pack.created_at = epoch;
+    input.pack.updated_at = epoch;
+    input.canon.updated_at = epoch;
+    for conflict in &mut input.conflicts {
+        conflict.detected_at = epoch;
+    }
+    let commitment = digest("cowd.knowledge.ingestion.input.v1", &input)?;
+    Ok((key, commitment))
+}
+
+/// Only the original maintenance inputs participate; usage telemetry cannot
+/// invalidate an unrelated pack maintenance transaction.
+pub fn same_knowledge_maintenance_inputs(
+    a: &KnowledgeSnapshot,
+    b: &KnowledgeSnapshot,
+) -> Result<bool, KnowledgeStoreError> {
+    Ok(serde_json::to_value((&a.corpus, &a.packs, &a.conflicts))?
+        == serde_json::to_value((&b.corpus, &b.packs, &b.conflicts))?)
 }
 
 #[derive(Debug, Clone)]
@@ -253,10 +423,15 @@ pub struct KnowledgeTurnProjection {
     receipt: KnowledgeIngestionReceipt,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct KnowledgeFabric {
-    state: Arc<RwLock<KnowledgeFabricState>>,
-    store: Option<Arc<dyn KnowledgeStore>>,
+    store: Arc<dyn KnowledgeStore>,
+}
+
+impl Default for KnowledgeFabric {
+    fn default() -> Self {
+        Self::with_store(Arc::new(InMemoryKnowledgeStore::new()))
+    }
 }
 
 impl KnowledgeFabric {
@@ -265,55 +440,11 @@ impl KnowledgeFabric {
         Self::default()
     }
 
+    /// The original store is the sole authority. Construction neither loads a
+    /// mirror nor turns a failed read into an empty, apparently healthy fabric.
     #[must_use]
     pub fn with_store(store: Arc<dyn KnowledgeStore>) -> Self {
-        let fabric = Self {
-            state: Arc::new(RwLock::new(KnowledgeFabricState::default())),
-            store: Some(store),
-        };
-        fabric.reload_from_store();
-        fabric
-    }
-
-    pub fn reload_from_store(&self) {
-        let Some(store) = self.store.as_ref() else {
-            return;
-        };
-        let Ok(snapshot) = store.snapshot() else {
-            return;
-        };
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = KnowledgeFabricState {
-            corpus: snapshot
-                .corpus
-                .into_iter()
-                .map(|item| (item.corpus_id.clone(), item))
-                .collect(),
-            packs: snapshot
-                .packs
-                .into_iter()
-                .map(|item| (item.pack_id.clone(), item))
-                .collect(),
-            canon: snapshot
-                .canon
-                .into_iter()
-                .map(|item| (item.canon_id.clone(), item))
-                .collect(),
-            conflicts: snapshot
-                .conflicts
-                .into_iter()
-                .map(|item| (item.conflict_id.clone(), item))
-                .collect(),
-            chunks: snapshot
-                .chunks
-                .into_iter()
-                .map(|item| (item.chunk_id.clone(), item))
-                .collect(),
-            usage: snapshot.usage,
-        };
+        Self { store }
     }
 
     pub fn ingest_document(
@@ -322,43 +453,23 @@ impl KnowledgeFabric {
         activation_policy: KnowledgeActivationPolicy,
         governance_level: KnowledgeGovernanceLevel,
         content: DocumentContent,
-    ) -> KnowledgeIngestionReceipt {
-        let mut receipt = KnowledgeIngestionService::new().prepare_document(
+    ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
+        let input_bytes = content
+            .body
+            .len()
+            .saturating_add(content.title.len())
+            .saturating_add(content.source.as_ref().map_or(0, String::len));
+        if input_bytes > KNOWLEDGE_READ_MAX_BYTES {
+            return Err(KnowledgeStoreError::ReadLimit);
+        }
+        let receipt = KnowledgeIngestionService::new().prepare_document(
             namespace,
             activation_policy,
             governance_level,
             content,
             false,
         );
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .corpus
-            .insert(receipt.corpus.corpus_id.clone(), receipt.corpus.clone());
-        state
-            .packs
-            .insert(receipt.pack.pack_id.clone(), receipt.pack.clone());
-        state
-            .canon
-            .insert(receipt.canon.canon_id.clone(), receipt.canon.clone());
-        for chunk in &receipt.chunks {
-            state.chunks.insert(chunk.chunk_id.clone(), chunk.clone());
-        }
-        for conflict in &receipt.conflicts {
-            state
-                .conflicts
-                .insert(conflict.conflict_id.clone(), conflict.clone());
-        }
-        if let Some(store) = self.store.as_ref() {
-            if let Err(err) = store.save_receipt(&receipt) {
-                receipt
-                    .warnings
-                    .push(format!("knowledge store persist failed: {err}"));
-            }
-        }
-        receipt
+        self.store.save_receipt(&receipt)
     }
 
     #[must_use]
@@ -368,11 +479,14 @@ impl KnowledgeFabric {
         intent: &str,
         profile: &str,
         project_id: Option<&str>,
-    ) -> (
-        KnowledgeActivationPlan,
-        Vec<KnowledgeCanonPack>,
-        Vec<KnowledgeComplianceWarning>,
-    ) {
+    ) -> Result<
+        (
+            KnowledgeActivationPlan,
+            Vec<KnowledgeCanonPack>,
+            Vec<KnowledgeComplianceWarning>,
+        ),
+        KnowledgeStoreError,
+    > {
         ActivationGovernor::new().activate(self, session_id, intent, profile, project_id)
     }
 
@@ -381,11 +495,19 @@ impl KnowledgeFabric {
         &self,
         namespace: &KnowledgeNamespace,
         query: &str,
-    ) -> KnowledgeNamespaceSearchResult {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ) -> Result<KnowledgeNamespaceSearchResult, KnowledgeStoreError> {
+        let (packs, canon) = self.store.read_candidates(Some(namespace))?;
+        let state = KnowledgeFabricState {
+            packs: packs
+                .into_iter()
+                .map(|pack| (pack.pack_id.clone(), pack))
+                .collect(),
+            canon: canon
+                .into_iter()
+                .map(|canon| (canon.canon_id.clone(), canon))
+                .collect(),
+            ..KnowledgeFabricState::default()
+        };
         let query_lc = query.to_ascii_lowercase();
         let mut packs = Vec::new();
         let mut canon = Vec::new();
@@ -418,29 +540,17 @@ impl KnowledgeFabric {
                 }
             }
         }
-        KnowledgeNamespaceSearchResult {
+        Ok(KnowledgeNamespaceSearchResult {
             namespace: namespace.clone(),
             query: query.to_string(),
             packs,
             canon,
             blocked_namespaces,
-        }
+        })
     }
 
-    #[must_use]
-    pub fn snapshot(&self) -> KnowledgeSnapshot {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        KnowledgeSnapshot {
-            corpus: state.corpus.values().cloned().collect(),
-            packs: state.packs.values().cloned().collect(),
-            canon: state.canon.values().cloned().collect(),
-            conflicts: state.conflicts.values().cloned().collect(),
-            chunks: state.chunks.values().cloned().collect(),
-            usage: state.usage.clone(),
-        }
+    pub fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+        self.store.snapshot()
     }
 
     fn activate_inner(
@@ -449,11 +559,14 @@ impl KnowledgeFabric {
         intent: &str,
         profile: &str,
         project_id: Option<&str>,
-    ) -> (
-        KnowledgeActivationPlan,
-        Vec<KnowledgeCanonPack>,
-        Vec<KnowledgeComplianceWarning>,
-    ) {
+    ) -> Result<
+        (
+            KnowledgeActivationPlan,
+            Vec<KnowledgeCanonPack>,
+            Vec<KnowledgeComplianceWarning>,
+        ),
+        KnowledgeStoreError,
+    > {
         self.activate_with_turn_projection(session_id, intent, profile, project_id, &[])
     }
 
@@ -467,15 +580,26 @@ impl KnowledgeFabric {
         profile: &str,
         project_id: Option<&str>,
         projected: &[KnowledgeTurnProjection],
-    ) -> (
-        KnowledgeActivationPlan,
-        Vec<KnowledgeCanonPack>,
-        Vec<KnowledgeComplianceWarning>,
-    ) {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ) -> Result<
+        (
+            KnowledgeActivationPlan,
+            Vec<KnowledgeCanonPack>,
+            Vec<KnowledgeComplianceWarning>,
+        ),
+        KnowledgeStoreError,
+    > {
+        let (packs, canon) = self.store.read_candidates(None)?;
+        let state = KnowledgeFabricState {
+            packs: packs
+                .into_iter()
+                .map(|pack| (pack.pack_id.clone(), pack))
+                .collect(),
+            canon: canon
+                .into_iter()
+                .map(|canon| (canon.canon_id.clone(), canon))
+                .collect(),
+            ..KnowledgeFabricState::default()
+        };
         let turn = projected
             .iter()
             .map(|view| {
@@ -576,16 +700,11 @@ impl KnowledgeFabric {
             token_estimate,
             generated_at: Utc::now(),
         };
-        (plan, canon_packs, warnings)
+        Ok((plan, canon_packs, warnings))
     }
 
-    pub fn record_usage(&self, signal: KnowledgeUsageSignal) {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .usage
-            .push(signal.clone());
-        UsageFeedbackLoop::new().record(self.store.as_deref(), &signal);
+    pub fn record_usage(&self, signal: KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
+        UsageFeedbackLoop::new().record(self.store.as_ref(), &signal)
     }
 
     /// Quarantine every active knowledge pack derived from one source.
@@ -595,11 +714,9 @@ impl KnowledgeFabric {
     /// stop participating in activation and Matrix projection while its
     /// corpus/canon evidence remains available for audit.
     pub fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
+        let expected = self.store.maintenance_inputs()?;
+        let mut state = KnowledgeFabricState::from_snapshot(expected.clone());
         let quarantined = {
-            let mut state = self
-                .state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let corpus_ids = state
                 .corpus
                 .values()
@@ -627,12 +744,9 @@ impl KnowledgeFabric {
                 })
                 .collect::<Vec<_>>()
         };
-        if let Some(store) = self.store.as_ref() {
-            for pack in &quarantined {
-                store.save_pack(pack)?;
-            }
-        }
-        self.retire_inactive_conflicts()?;
+        let resolved = retire_conflicts_in_state(&mut state);
+        self.store
+            .commit_maintenance(&expected, &quarantined, &resolved)?;
         Ok(quarantined.into_iter().map(|pack| pack.pack_id).collect())
     }
 
@@ -644,37 +758,10 @@ impl KnowledgeFabric {
     /// behavior, so the decision is persisted while all source evidence stays
     /// intact.
     pub fn retire_inactive_conflicts(&self) -> Result<Vec<String>, KnowledgeStoreError> {
-        let resolved = {
-            let mut state = self
-                .state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let inactive_pack_states = state
-                .packs
-                .values()
-                .filter(|pack| !knowledge_state_is_actionable(pack.state))
-                .map(|pack| (pack.pack_id.clone(), pack.state))
-                .collect::<BTreeMap<_, _>>();
-            state
-                .conflicts
-                .values_mut()
-                .filter_map(|conflict| {
-                    let pack_id = conflict.pack_id.as_deref()?;
-                    let pack_state = inactive_pack_states.get(pack_id).copied()?;
-                    if conflict.decision.is_some() {
-                        return None;
-                    }
-                    conflict.decision = Some("source_pack_inactive".to_string());
-                    conflict.state = pack_state;
-                    Some(conflict.clone())
-                })
-                .collect::<Vec<_>>()
-        };
-        if let Some(store) = self.store.as_ref() {
-            for conflict in &resolved {
-                store.save_conflict(conflict)?;
-            }
-        }
+        let expected = self.store.maintenance_inputs()?;
+        let mut state = KnowledgeFabricState::from_snapshot(expected.clone());
+        let resolved = retire_conflicts_in_state(&mut state);
+        self.store.commit_maintenance(&expected, &[], &resolved)?;
         Ok(resolved
             .into_iter()
             .map(|conflict| conflict.conflict_id)
@@ -690,11 +777,9 @@ impl KnowledgeFabric {
     pub fn consolidate_exact_duplicates(
         &self,
     ) -> Result<KnowledgeConsolidationReport, KnowledgeStoreError> {
+        let expected = self.store.maintenance_inputs()?;
+        let mut state = KnowledgeFabricState::from_snapshot(expected.clone());
         let (mut report, changed_packs) = {
-            let mut state = self
-                .state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut corpus_groups = BTreeMap::<String, BTreeSet<String>>::new();
             for corpus in state.corpus.values() {
                 corpus_groups
@@ -797,11 +882,9 @@ impl KnowledgeFabric {
             (report, changed.into_values().collect::<Vec<_>>())
         };
 
-        if let Some(store) = self.store.as_ref() {
-            for pack in &changed_packs {
-                store.save_pack(pack)?;
-            }
-        }
+        let resolved = retire_conflicts_in_state(&mut state);
+        self.store
+            .commit_maintenance(&expected, &changed_packs, &resolved)?;
         report.canonical_pack_ids.sort();
         report.canonical_pack_ids.dedup();
         report.superseded_pack_ids.sort();
@@ -826,29 +909,36 @@ impl KnowledgeFabric {
     }
 
     #[must_use]
-    pub fn projection(&self) -> serde_json::Value {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        serde_json::json!({
-            "kind": "memory.knowledge_fabric",
-            "health": health_from_state(&state),
-            "namespace_tree": knowledge_namespace_tree(&state),
-            "activation_policy_distribution": knowledge_activation_policy_distribution(&state),
-            "governance_distribution": knowledge_governance_distribution(&state),
-            "conflict_projection": knowledge_conflict_projection(&state),
-            "maintenance_candidates": knowledge_maintenance_candidates(&state),
-            "recall_quality": knowledge_recall_quality_projection(&state),
-            "corpus": state.corpus.values().collect::<Vec<_>>(),
-            "packs": state.packs.values().collect::<Vec<_>>(),
-            "canon": state.canon.values().collect::<Vec<_>>(),
-            "conflicts": state.conflicts.values().collect::<Vec<_>>(),
-            "usage_signal_count": state.usage.len(),
-        })
+    pub fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError> {
+        self.store.projection()
     }
 }
 
+/// Render the original projection from bounded metadata and a native usage
+/// aggregate. No chunk or usage history is exported to answer online health.
+pub fn knowledge_projection_from_metadata(
+    snapshot: KnowledgeSnapshot,
+    usage_signal_count: usize,
+) -> Result<serde_json::Value, KnowledgeStoreError> {
+    let state = KnowledgeFabricState::from_snapshot(snapshot);
+    let mut health = health_from_state(&state);
+    health.usage_signal_count = usage_signal_count;
+    Ok(serde_json::json!({
+        "kind": "memory.knowledge_fabric",
+        "health": health,
+        "namespace_tree": knowledge_namespace_tree(&state),
+        "activation_policy_distribution": knowledge_activation_policy_distribution(&state),
+        "governance_distribution": knowledge_governance_distribution(&state),
+        "conflict_projection": knowledge_conflict_projection(&state),
+        "maintenance_candidates": knowledge_maintenance_candidates(&state),
+        "recall_quality": knowledge_recall_quality_projection(&state),
+        "corpus": state.corpus.values().collect::<Vec<_>>(),
+        "packs": state.packs.values().collect::<Vec<_>>(),
+        "canon": state.canon.values().collect::<Vec<_>>(),
+        "conflicts": state.conflicts.values().collect::<Vec<_>>(),
+        "usage_signal_count": usage_signal_count,
+    }))
+}
 #[derive(Debug, Clone, Default)]
 pub struct KnowledgeIngestionService {
     classifier: DocumentClassifier,
@@ -901,7 +991,8 @@ impl KnowledgeIngestionService {
         let corpus_id = format!(
             "corpus-{}",
             stable_hash(&format!(
-                "{}:{}",
+                "{}:{}:{}",
+                namespace.key(),
                 content.source.clone().unwrap_or_default(),
                 content.body
             ))
@@ -1001,7 +1092,7 @@ impl KnowledgeIngestionService {
         activation_policy: KnowledgeActivationPolicy,
         governance_level: KnowledgeGovernanceLevel,
         documents: Vec<DocumentContent>,
-    ) -> Vec<KnowledgeIngestionReceipt> {
+    ) -> Vec<Result<KnowledgeIngestionReceipt, KnowledgeStoreError>> {
         documents
             .into_iter()
             .map(|document| {
@@ -1074,11 +1165,14 @@ impl ActivationGovernor {
         intent: &str,
         profile: &str,
         project_id: Option<&str>,
-    ) -> (
-        KnowledgeActivationPlan,
-        Vec<KnowledgeCanonPack>,
-        Vec<KnowledgeComplianceWarning>,
-    ) {
+    ) -> Result<
+        (
+            KnowledgeActivationPlan,
+            Vec<KnowledgeCanonPack>,
+            Vec<KnowledgeComplianceWarning>,
+        ),
+        KnowledgeStoreError,
+    > {
         fabric.activate_inner(session_id, intent, profile, project_id)
     }
 }
@@ -1092,21 +1186,45 @@ impl UsageFeedbackLoop {
         Self
     }
 
-    pub fn record(&self, store: Option<&dyn KnowledgeStore>, signal: &KnowledgeUsageSignal) {
-        if let Some(store) = store {
-            let _ = store.record_usage(signal);
-        }
+    pub fn record(
+        &self,
+        store: &dyn KnowledgeStore,
+        signal: &KnowledgeUsageSignal,
+    ) -> Result<(), KnowledgeStoreError> {
+        store.record_usage(signal)
     }
 }
 
 impl std::fmt::Debug for KnowledgeFabric {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Debug must not perform I/O or hide a failed read as an empty health.
         formatter
             .debug_struct("KnowledgeFabric")
-            .field("has_store", &self.store.is_some())
-            .field("health", &self.snapshot().health())
-            .finish()
+            .finish_non_exhaustive()
     }
+}
+
+fn retire_conflicts_in_state(state: &mut KnowledgeFabricState) -> Vec<KnowledgeConflictRecord> {
+    let inactive_pack_states = state
+        .packs
+        .values()
+        .filter(|pack| !knowledge_state_is_actionable(pack.state))
+        .map(|pack| (pack.pack_id.clone(), pack.state))
+        .collect::<BTreeMap<_, _>>();
+    state
+        .conflicts
+        .values_mut()
+        .filter_map(|conflict| {
+            let pack_id = conflict.pack_id.as_deref()?;
+            let pack_state = inactive_pack_states.get(pack_id).copied()?;
+            if conflict.decision.is_some() {
+                return None;
+            }
+            conflict.decision = Some("source_pack_inactive".to_string());
+            conflict.state = pack_state;
+            Some(conflict.clone())
+        })
+        .collect::<Vec<_>>()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1122,11 +1240,23 @@ impl InMemoryKnowledgeStore {
 }
 
 impl KnowledgeStore for InMemoryKnowledgeStore {
-    fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError> {
+    fn save_receipt(
+        &self,
+        receipt: &KnowledgeIngestionReceipt,
+    ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
         let mut state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (key, digest) = knowledge_ingestion_identity(receipt)?;
+        if let Some((original_digest, original)) = state.ingestion_receipts.get(&key) {
+            if original_digest != &digest {
+                return Err(KnowledgeStoreError::Backend(
+                    "knowledge ingestion identity conflict".into(),
+                ));
+            }
+            return Ok(original.clone());
+        }
         state
             .corpus
             .insert(receipt.corpus.corpus_id.clone(), receipt.corpus.clone());
@@ -1144,34 +1274,93 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 .conflicts
                 .insert(conflict.conflict_id.clone(), conflict.clone());
         }
-        Ok(())
-    }
-
-    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError> {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .packs
-            .insert(pack.pack_id.clone(), pack.clone());
-        Ok(())
-    }
-
-    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError> {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .conflicts
-            .insert(conflict.conflict_id.clone(), conflict.clone());
-        Ok(())
+        state
+            .ingestion_receipts
+            .insert(key, (digest, receipt.clone()));
+        Ok(receipt.clone())
     }
 
     fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
-        self.state
+        let mut state = self
+            .state
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = state
             .usage
-            .push(signal.clone());
+            .iter()
+            .find(|item| item.signal_id == signal.signal_id)
+        {
+            if serde_json::to_value(existing)? != serde_json::to_value(signal)? {
+                return Err(KnowledgeStoreError::Backend(
+                    "knowledge usage identity conflict".into(),
+                ));
+            }
+            return Ok(());
+        }
+        state.usage.push(signal.clone());
         Ok(())
+    }
+
+    fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bounded_state_snapshot(&state, false)
+    }
+    fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        knowledge_projection_from_metadata(
+            bounded_state_snapshot(&state, false)?,
+            state.usage.len(),
+        )
+    }
+
+    fn read_candidates(
+        &self,
+        namespace: Option<&KnowledgeNamespace>,
+    ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut budget = Budget(0);
+        let mut rows = 0;
+        // Borrowed references only before admission; never clone and truncate.
+        let mut packs = Vec::new();
+        let mut canons = Vec::new();
+        for pack in state
+            .packs
+            .values()
+            .filter(|pack| namespace.is_none_or(|ns| &pack.namespace == ns))
+        {
+            rows += 1;
+            if rows > KNOWLEDGE_READ_MAX_ROWS {
+                return Err(KnowledgeStoreError::ReadLimit);
+            }
+            serde_json::to_writer(&mut budget, pack).map_err(|_| KnowledgeStoreError::ReadLimit)?;
+            packs.push(pack);
+            if let Some(canon) = pack
+                .canon_pack_ref
+                .as_ref()
+                .and_then(|id| state.canon.get(id))
+            {
+                rows += 1;
+                if rows > KNOWLEDGE_READ_MAX_ROWS {
+                    return Err(KnowledgeStoreError::ReadLimit);
+                }
+                serde_json::to_writer(&mut budget, canon)
+                    .map_err(|_| KnowledgeStoreError::ReadLimit)?;
+                canons.push(canon);
+            }
+        }
+        Ok((
+            packs.into_iter().cloned().collect(),
+            canons.into_iter().cloned().collect(),
+        ))
     }
 
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
@@ -1179,14 +1368,32 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(KnowledgeSnapshot {
-            corpus: state.corpus.values().cloned().collect(),
-            packs: state.packs.values().cloned().collect(),
-            canon: state.canon.values().cloned().collect(),
-            conflicts: state.conflicts.values().cloned().collect(),
-            chunks: state.chunks.values().cloned().collect(),
-            usage: state.usage.clone(),
-        })
+        bounded_state_snapshot(&state, true)
+    }
+
+    fn commit_maintenance(
+        &self,
+        expected: &KnowledgeSnapshot,
+        packs: &[KnowledgePack],
+        conflicts: &[KnowledgeConflictRecord],
+    ) -> Result<(), KnowledgeStoreError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = bounded_state_snapshot(&state, false)?;
+        if !same_knowledge_maintenance_inputs(expected, &current)? {
+            return Err(KnowledgeStoreError::StaleRead);
+        }
+        for pack in packs {
+            state.packs.insert(pack.pack_id.clone(), pack.clone());
+        }
+        for conflict in conflicts {
+            state
+                .conflicts
+                .insert(conflict.conflict_id.clone(), conflict.clone());
+        }
+        Ok(())
     }
 }
 
@@ -1338,6 +1545,19 @@ impl DocumentIngestor {
             self.governance_level,
             content.clone(),
         );
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return IngestionResult {
+                    success: false,
+                    metadata: classification.metadata,
+                    layer: classification.suggested_layer,
+                    error: Some(error.to_string()),
+                    warnings,
+                    knowledge_receipt: None,
+                }
+            }
+        };
         IngestionResult {
             success: receipt.pack.state != KnowledgeObjectState::Quarantined,
             metadata: classification.metadata,
@@ -2069,16 +2289,18 @@ mod tests {
     #[test]
     fn turn_projection_preserves_durable_rules_and_does_not_survive_the_turn() {
         let fabric = KnowledgeFabric::new();
-        let durable = fabric.ingest_document(
-            KnowledgeNamespace::Project("project-a".into()),
-            KnowledgeActivationPolicy::DefaultForDomain,
-            KnowledgeGovernanceLevel::Required,
-            DocumentContent::new(
-                "Safety policy",
-                "The operator must retain the original audit evidence.",
-            ),
-        );
-        let before = serde_json::to_value(fabric.snapshot()).unwrap();
+        let durable = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("project-a".into()),
+                KnowledgeActivationPolicy::DefaultForDomain,
+                KnowledgeGovernanceLevel::Required,
+                DocumentContent::new(
+                    "Safety policy",
+                    "The operator must retain the original audit evidence.",
+                ),
+            )
+            .unwrap();
+        let before = serde_json::to_value(fabric.snapshot().unwrap()).unwrap();
         let turn = KnowledgeIngestionService::new().project_for_turn(
             KnowledgeNamespace::Project("project-a".into()),
             KnowledgeActivationPolicy::DefaultForDomain,
@@ -2086,13 +2308,15 @@ mod tests {
             DocumentContent::new("Safety policy", "A temporary suggestion for this turn."),
         );
         assert_ne!(durable.pack.pack_id, turn.receipt.pack.pack_id);
-        let (plan, canons, warnings) = fabric.activate_with_turn_projection(
-            "session",
-            "safety policy",
-            "profile",
-            Some("project-a"),
-            &[turn.clone()],
-        );
+        let (plan, canons, warnings) = fabric
+            .activate_with_turn_projection(
+                "session",
+                "safety policy",
+                "profile",
+                Some("project-a"),
+                &[turn.clone()],
+            )
+            .unwrap();
         assert_eq!(plan.active_pack_ids.len(), 2);
         assert!(plan.active_pack_ids.contains(&durable.pack.pack_id));
         assert!(canons.iter().any(|canon| canon
@@ -2102,16 +2326,23 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.level == KnowledgeGovernanceLevel::Required));
-        assert_eq!(serde_json::to_value(fabric.snapshot()).unwrap(), before);
-        let (next, _, _) = fabric.activate("next", "safety policy", "profile", Some("project-a"));
-        assert_eq!(next.active_pack_ids, vec![durable.pack.pack_id]);
-        let (foreign, _, _) = fabric.activate_with_turn_projection(
-            "foreign",
-            "safety policy",
-            "profile",
-            Some("project-b"),
-            &[turn],
+        assert_eq!(
+            serde_json::to_value(fabric.snapshot().unwrap()).unwrap(),
+            before
         );
+        let (next, _, _) = fabric
+            .activate("next", "safety policy", "profile", Some("project-a"))
+            .unwrap();
+        assert_eq!(next.active_pack_ids, vec![durable.pack.pack_id]);
+        let (foreign, _, _) = fabric
+            .activate_with_turn_projection(
+                "foreign",
+                "safety policy",
+                "profile",
+                Some("project-b"),
+                &[turn],
+            )
+            .unwrap();
         assert!(foreign.active_pack_ids.is_empty());
     }
 
@@ -2128,18 +2359,26 @@ mod tests {
             KnowledgeActivationPolicy::OnDemand,
         ] {
             let fabric = KnowledgeFabric::new();
-            fabric.ingest_document(
-                KnowledgeNamespace::Project("cowd".into()),
-                policy,
-                KnowledgeGovernanceLevel::Required,
-                DocumentContent::new("Safety policy", "The operator must retain audit evidence."),
-            );
+            fabric
+                .ingest_document(
+                    KnowledgeNamespace::Project("cowd".into()),
+                    policy,
+                    KnowledgeGovernanceLevel::Required,
+                    DocumentContent::new(
+                        "Safety policy",
+                        "The operator must retain audit evidence.",
+                    ),
+                )
+                .unwrap();
             for project in [None, Some("cow"), Some("cowd-other")] {
-                let (plan, _, _) =
-                    fabric.activate("foreign", "safety policy cowd", "profile", project);
+                let (plan, _, _) = fabric
+                    .activate("foreign", "safety policy cowd", "profile", project)
+                    .unwrap();
                 assert!(plan.active_pack_ids.is_empty(), "{policy:?} {project:?}");
             }
-            let (own, _, _) = fabric.activate("own", "safety policy", "profile", Some("cowd"));
+            let (own, _, _) = fabric
+                .activate("own", "safety policy", "profile", Some("cowd"))
+                .unwrap();
             assert_eq!(
                 own.active_pack_ids.is_empty(),
                 policy == KnowledgeActivationPolicy::ExplicitOnly,
@@ -2159,7 +2398,7 @@ mod tests {
                 "Architecture Supply Chain Policy",
                 "Architecture: default process\n必须保留证据链\nStep 1. inspect demand\nStep 2. review supplier risk",
             ),
-        );
+        ).unwrap();
 
         assert!(receipt.corpus.corpus_id.starts_with("corpus-"));
         assert_eq!(
@@ -2183,21 +2422,25 @@ mod tests {
             "The project must use the governed runtime path.",
         );
         document.source = Some("memory:archived-source".to_string());
-        let receipt = fabric.ingest_document(
-            KnowledgeNamespace::Project("cowd".to_string()),
-            KnowledgeActivationPolicy::OnDemand,
-            KnowledgeGovernanceLevel::Advisory,
-            document,
-        );
+        let receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("cowd".to_string()),
+                KnowledgeActivationPolicy::OnDemand,
+                KnowledgeGovernanceLevel::Advisory,
+                document,
+            )
+            .unwrap();
         let quarantined = fabric.quarantine_source("memory:archived-source").unwrap();
         assert_eq!(quarantined, vec![receipt.pack.pack_id.clone()]);
-        let (activation, _, _) =
-            fabric.activate("session", "governed runtime", "main_turn", Some("cowd"));
+        let (activation, _, _) = fabric
+            .activate("session", "governed runtime", "main_turn", Some("cowd"))
+            .unwrap();
         assert!(activation.active_pack_ids.is_empty());
 
         let reloaded = KnowledgeFabric::with_store(store);
         let pack = reloaded
             .snapshot()
+            .unwrap()
             .packs
             .into_iter()
             .find(|pack| pack.pack_id == receipt.pack.pack_id)
@@ -2208,17 +2451,20 @@ mod tests {
     #[test]
     fn activation_selects_default_pack_and_reports_required_rules() {
         let fabric = KnowledgeFabric::new();
-        let receipt = fabric.ingest_document(
-            KnowledgeNamespace::Domain("architecture".to_string()),
-            KnowledgeActivationPolicy::DefaultForDomain,
-            KnowledgeGovernanceLevel::Required,
-            DocumentContent::new(
-                "Architecture Rules",
-                "must retain evidence before final answer",
-            ),
-        );
-        let (plan, _canon, warnings) =
-            fabric.activate("s1", "architecture review", "DeepInvestigation", None);
+        let receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::Domain("architecture".to_string()),
+                KnowledgeActivationPolicy::DefaultForDomain,
+                KnowledgeGovernanceLevel::Required,
+                DocumentContent::new(
+                    "Architecture Rules",
+                    "must retain evidence before final answer",
+                ),
+            )
+            .unwrap();
+        let (plan, _canon, warnings) = fabric
+            .activate("s1", "architecture review", "DeepInvestigation", None)
+            .unwrap();
 
         assert!(plan.active_pack_ids.contains(&receipt.pack.pack_id));
         assert!(!warnings.is_empty());
@@ -2232,25 +2478,31 @@ mod tests {
     #[test]
     fn namespace_blocks_irrelevant_project_knowledge_without_polluting_global_context() {
         let fabric = KnowledgeFabric::new();
-        let project_receipt = fabric.ingest_document(
-            KnowledgeNamespace::Project("cowd".to_string()),
-            KnowledgeActivationPolicy::DefaultForProjectGroup,
-            KnowledgeGovernanceLevel::Required,
-            DocumentContent::new("Cowd Runtime Rules", "must record context turn report"),
-        );
-        let unrelated_receipt = fabric.ingest_document(
-            KnowledgeNamespace::Project("erp".to_string()),
-            KnowledgeActivationPolicy::DefaultForProjectGroup,
-            KnowledgeGovernanceLevel::Required,
-            DocumentContent::new("ERP Billing Rules", "must reconcile invoice ledger"),
-        );
+        let project_receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("cowd".to_string()),
+                KnowledgeActivationPolicy::DefaultForProjectGroup,
+                KnowledgeGovernanceLevel::Required,
+                DocumentContent::new("Cowd Runtime Rules", "must record context turn report"),
+            )
+            .unwrap();
+        let unrelated_receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("erp".to_string()),
+                KnowledgeActivationPolicy::DefaultForProjectGroup,
+                KnowledgeGovernanceLevel::Required,
+                DocumentContent::new("ERP Billing Rules", "must reconcile invoice ledger"),
+            )
+            .unwrap();
 
-        let (plan, _, _) = fabric.activate(
-            "s1",
-            "context turn report",
-            "DeepInvestigation",
-            Some("cowd"),
-        );
+        let (plan, _, _) = fabric
+            .activate(
+                "s1",
+                "context turn report",
+                "DeepInvestigation",
+                Some("cowd"),
+            )
+            .unwrap();
 
         assert!(plan.active_pack_ids.contains(&project_receipt.pack.pack_id));
         assert!(!plan
@@ -2273,11 +2525,11 @@ mod tests {
                 "Operations Contradiction Pack",
                 "must keep supplier recovery evidence\nmust not keep supplier recovery evidence",
             ),
-        );
+        ).unwrap();
 
         assert!(!receipt.conflicts.is_empty());
         assert!(receipt.pack.matrix_refs.is_empty());
-        let projection = fabric.projection();
+        let projection = fabric.projection().unwrap();
         assert_eq!(
             projection["health"]["unresolved_conflict_count"]
                 .as_u64()
@@ -2314,7 +2566,7 @@ mod tests {
                 "Fact governance",
                 "禁止未经验证的对话直接晋升为事实\n所有事实断言必须经过证据验证流程后才能被采纳，不可绕过治理机制",
             ),
-        );
+        ).unwrap();
 
         assert!(receipt.conflicts.is_empty());
         assert_eq!(receipt.pack.state, KnowledgeObjectState::Active);
@@ -2329,23 +2581,25 @@ mod tests {
             "must retain speculative output\nmust not retain speculative output",
         );
         document.source = Some("memory:retired-conflict".to_string());
-        let receipt = fabric.ingest_document(
-            KnowledgeNamespace::Project("cowd".to_string()),
-            KnowledgeActivationPolicy::OnDemand,
-            KnowledgeGovernanceLevel::Advisory,
-            document,
-        );
+        let receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("cowd".to_string()),
+                KnowledgeActivationPolicy::OnDemand,
+                KnowledgeGovernanceLevel::Advisory,
+                document,
+            )
+            .unwrap();
         assert!(!receipt.conflicts.is_empty());
 
         fabric.quarantine_source("memory:retired-conflict").unwrap();
-        let projection = fabric.projection();
+        let projection = fabric.projection().unwrap();
         assert_eq!(projection["health"]["unresolved_conflict_count"], 0);
         assert!(projection["maintenance_candidates"]
             .as_array()
             .is_some_and(Vec::is_empty));
 
         let reloaded = KnowledgeFabric::with_store(store);
-        let snapshot = reloaded.snapshot();
+        let snapshot = reloaded.snapshot().unwrap();
         assert_eq!(snapshot.health().unresolved_conflict_count, 0);
         assert!(snapshot
             .conflicts
@@ -2369,25 +2623,29 @@ mod tests {
             "Every release must retain a verified evidence chain.",
         );
         second.source = Some("file:///imports/operations-copy.md".to_string());
-        let first_receipt = fabric.ingest_document(
-            KnowledgeNamespace::SharedLibrary("operations".to_string()),
-            KnowledgeActivationPolicy::DefaultForDomain,
-            KnowledgeGovernanceLevel::Required,
-            first,
-        );
-        let second_receipt = fabric.ingest_document(
-            KnowledgeNamespace::SharedLibrary("operations".to_string()),
-            KnowledgeActivationPolicy::OnDemand,
-            KnowledgeGovernanceLevel::Advisory,
-            second,
-        );
+        let first_receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::SharedLibrary("operations".to_string()),
+                KnowledgeActivationPolicy::DefaultForDomain,
+                KnowledgeGovernanceLevel::Required,
+                first,
+            )
+            .unwrap();
+        let second_receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::SharedLibrary("operations".to_string()),
+                KnowledgeActivationPolicy::OnDemand,
+                KnowledgeGovernanceLevel::Advisory,
+                second,
+            )
+            .unwrap();
 
         let report = fabric.consolidate_exact_duplicates().unwrap();
         assert_eq!(report.superseded_pack_ids.len(), 1);
         assert!(report
             .canonical_pack_ids
             .contains(&first_receipt.pack.pack_id));
-        let snapshot = fabric.snapshot();
+        let snapshot = fabric.snapshot().unwrap();
         let canonical = snapshot
             .packs
             .iter()
@@ -2413,27 +2671,31 @@ mod tests {
     fn derived_knowledge_store_preserves_corpus_pack_canon_conflict_and_usage() {
         let store = Arc::new(InMemoryKnowledgeStore::new());
         let fabric = KnowledgeFabric::with_store(store.clone());
-        let receipt = fabric.ingest_document(
-            KnowledgeNamespace::SharedLibrary("quality".to_string()),
-            KnowledgeActivationPolicy::DefaultForDomain,
-            KnowledgeGovernanceLevel::Blocking,
-            DocumentContent::new(
-                "Quality Blocking Rules",
-                "must keep inspection evidence\nmust not keep inspection evidence",
-            ),
-        );
-        fabric.record_usage(KnowledgeUsageSignal {
-            signal_id: "usage-1".to_string(),
-            session_id: "s1".to_string(),
-            pack_id: receipt.pack.pack_id.clone(),
-            action: "selected".to_string(),
-            summary: "selected during test".to_string(),
-            score_delta_bp: 5,
-            occurred_at: Utc::now(),
-        });
+        let receipt = fabric
+            .ingest_document(
+                KnowledgeNamespace::SharedLibrary("quality".to_string()),
+                KnowledgeActivationPolicy::DefaultForDomain,
+                KnowledgeGovernanceLevel::Blocking,
+                DocumentContent::new(
+                    "Quality Blocking Rules",
+                    "must keep inspection evidence\nmust not keep inspection evidence",
+                ),
+            )
+            .unwrap();
+        fabric
+            .record_usage(KnowledgeUsageSignal {
+                signal_id: "usage-1".to_string(),
+                session_id: "s1".to_string(),
+                pack_id: receipt.pack.pack_id.clone(),
+                action: "selected".to_string(),
+                summary: "selected during test".to_string(),
+                score_delta_bp: 5,
+                occurred_at: Utc::now(),
+            })
+            .unwrap();
 
         let reloaded = KnowledgeFabric::with_store(store);
-        let snapshot = reloaded.snapshot();
+        let snapshot = reloaded.snapshot().unwrap();
         assert_eq!(snapshot.corpus.len(), 1);
         assert_eq!(snapshot.packs.len(), 1);
         assert_eq!(snapshot.canon.len(), 1);
@@ -2454,16 +2716,366 @@ mod tests {
                 "must validate demand before sourcing\nStep 1. validate demand",
             )],
         );
-        let search = fabric.search_namespace(
-            &KnowledgeNamespace::Domain("manufacturing".to_string()),
-            "manufacturing demand",
-        );
-        assert!(receipts[0].pack.matrix_refs.is_empty());
+        let search = fabric
+            .search_namespace(
+                &KnowledgeNamespace::Domain("manufacturing".to_string()),
+                "manufacturing demand",
+            )
+            .unwrap();
+        assert!(receipts[0].as_ref().unwrap().pack.matrix_refs.is_empty());
         assert_eq!(search.packs.len(), 1);
         assert!(!search.canon.is_empty());
         assert!(search.canon[0]
             .rules
             .iter()
             .any(|rule| rule.governance_level == KnowledgeGovernanceLevel::Required));
+    }
+    struct FaultingKnowledgeStore {
+        inner: InMemoryKnowledgeStore,
+        mode: std::sync::atomic::AtomicU8,
+    }
+
+    impl FaultingKnowledgeStore {
+        fn mode(&self) -> u8 {
+            self.mode.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set(&self, mode: u8) {
+            self.mode.store(mode, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl KnowledgeStore for FaultingKnowledgeStore {
+        fn save_receipt(
+            &self,
+            receipt: &KnowledgeIngestionReceipt,
+        ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
+            if self.mode() == 1 {
+                return Err(KnowledgeStoreError::Backend(
+                    "write refused before commit".into(),
+                ));
+            }
+            let saved = self.inner.save_receipt(receipt)?;
+            if self.mode() == 2 {
+                return Err(KnowledgeStoreError::Backend(
+                    "response lost after commit".into(),
+                ));
+            }
+            Ok(saved)
+        }
+        fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
+            if self.mode() == 1 {
+                return Err(KnowledgeStoreError::Backend("usage write refused".into()));
+            }
+            self.inner.record_usage(signal)
+        }
+        fn read_candidates(
+            &self,
+            namespace: Option<&KnowledgeNamespace>,
+        ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError> {
+            if self.mode() == 3 {
+                return Err(KnowledgeStoreError::Backend("read refused".into()));
+            }
+            self.inner.read_candidates(namespace)
+        }
+        fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+            if self.mode() == 3 {
+                return Err(KnowledgeStoreError::Backend("read refused".into()));
+            }
+            self.inner.maintenance_inputs()
+        }
+        fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError> {
+            if self.mode() == 3 {
+                return Err(KnowledgeStoreError::Backend("read refused".into()));
+            }
+            self.inner.projection()
+        }
+        fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
+            if self.mode() == 3 {
+                return Err(KnowledgeStoreError::Backend("read refused".into()));
+            }
+            self.inner.snapshot()
+        }
+        fn commit_maintenance(
+            &self,
+            expected: &KnowledgeSnapshot,
+            packs: &[KnowledgePack],
+            conflicts: &[KnowledgeConflictRecord],
+        ) -> Result<(), KnowledgeStoreError> {
+            self.inner.commit_maintenance(expected, packs, conflicts)
+        }
+    }
+
+    fn faulting_fabric() -> (Arc<FaultingKnowledgeStore>, KnowledgeFabric) {
+        let store = Arc::new(FaultingKnowledgeStore {
+            inner: InMemoryKnowledgeStore::new(),
+            mode: std::sync::atomic::AtomicU8::new(0),
+        });
+        (store.clone(), KnowledgeFabric::with_store(store))
+    }
+
+    fn ingest_fault_test(
+        fabric: &KnowledgeFabric,
+    ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
+        let mut document = DocumentContent::new("durable rule", "must retain approval evidence");
+        document.source = Some("memory:durable-rule".into());
+        fabric.ingest_document(
+            KnowledgeNamespace::Project("cowd".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document,
+        )
+    }
+
+    #[test]
+    fn knowledge_refused_ingestion_does_not_publish_a_receipt_or_phantom_pack() {
+        let (store, fabric) = faulting_fabric();
+        store.set(1);
+        assert!(ingest_fault_test(&fabric).is_err());
+        assert!(fabric.snapshot().unwrap().packs.is_empty());
+        let result = DocumentIngestor::new()
+            .with_fabric(fabric)
+            .ingest(&DocumentContent::new("write denied", "body"));
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(result.knowledge_receipt.is_none());
+        assert!(store.inner.snapshot().unwrap().packs.is_empty());
+    }
+
+    #[test]
+    fn knowledge_lost_commit_response_stays_unknown_and_reopen_retry_is_idempotent() {
+        let (store, fabric) = faulting_fabric();
+        store.set(2);
+        assert!(
+            ingest_fault_test(&fabric).is_err(),
+            "lost response is not a successful receipt"
+        );
+        let original = store.inner.snapshot().unwrap();
+        assert_eq!(original.packs.len(), 1);
+        store.set(0);
+        drop(fabric);
+        let reopened = KnowledgeFabric::with_store(store);
+        let receipt = ingest_fault_test(&reopened).unwrap();
+        assert_eq!(
+            receipt.pack, original.packs[0],
+            "retry returns original committed timestamps and identity"
+        );
+        reopened.quarantine_source("memory:durable-rule").unwrap();
+        let repeated = ingest_fault_test(&reopened).unwrap();
+        assert_eq!(
+            repeated.pack, receipt.pack,
+            "immutable ingestion receipt is historical, not current lifecycle"
+        );
+        let current = reopened.snapshot().unwrap();
+        assert_eq!(current.packs.len(), 1);
+        assert_eq!(
+            current.packs[0].state,
+            KnowledgeObjectState::Quarantined,
+            "retry cannot resurrect a quarantined source"
+        );
+    }
+
+    #[test]
+    fn knowledge_read_failure_reaches_activation_search_projection_and_maintenance() {
+        let (store, fabric) = faulting_fabric();
+        ingest_fault_test(&fabric).unwrap();
+        store.set(3);
+        assert!(fabric
+            .activate("s", "approval", "main", Some("cowd"))
+            .is_err());
+        assert!(fabric
+            .search_namespace(&KnowledgeNamespace::Project("cowd".into()), "")
+            .is_err());
+        assert!(fabric.projection().is_err());
+        assert!(fabric.quarantine_source("memory:durable-rule").is_err());
+        assert!(fabric.consolidate_exact_duplicates().is_err());
+        assert_eq!(
+            store.inner.snapshot().unwrap().packs[0].state,
+            KnowledgeObjectState::Active
+        );
+    }
+
+    #[test]
+    fn knowledge_usage_failure_unknown_duplicate_idempotent_changed_identity_refused() {
+        let (store, fabric) = faulting_fabric();
+        let signal = KnowledgeUsageSignal {
+            signal_id: "one".into(),
+            session_id: "session".into(),
+            pack_id: "pack".into(),
+            action: "selected".into(),
+            summary: "real observed selection".into(),
+            score_delta_bp: 1,
+            occurred_at: Utc::now(),
+        };
+        store.set(1);
+        assert!(fabric.record_usage(signal.clone()).is_err());
+        assert!(fabric.snapshot().unwrap().usage.is_empty());
+        store.set(0);
+        fabric.record_usage(signal.clone()).unwrap();
+        fabric.record_usage(signal.clone()).unwrap();
+        let mut wrong = signal.clone();
+        wrong.session_id = "foreign".into();
+        assert!(fabric.record_usage(wrong).is_err());
+        let current = fabric.snapshot().unwrap();
+        assert_eq!(current.usage.len(), 1);
+        assert_eq!(current.usage[0].session_id, "session");
+    }
+
+    #[test]
+    fn knowledge_maintenance_cas_rejects_foreign_change_without_partial_updates() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let receipt = ingest_fault_test(&fabric).unwrap();
+        let old = fabric.snapshot().unwrap();
+        let mut changed = receipt.pack.clone();
+        changed.governance_level = KnowledgeGovernanceLevel::Blocking;
+        store
+            .commit_maintenance(
+                &store.maintenance_inputs().unwrap(),
+                &[changed.clone()],
+                &[],
+            )
+            .unwrap();
+        let mut stale = receipt.pack.clone();
+        stale.state = KnowledgeObjectState::Quarantined;
+        assert!(matches!(
+            store.commit_maintenance(&old, &[stale], &[]),
+            Err(KnowledgeStoreError::StaleRead)
+        ));
+        let current = fabric.snapshot().unwrap();
+        assert_eq!(current.packs[0], changed);
+    }
+
+    #[test]
+    fn knowledge_ingestion_same_identity_changed_policy_refused_namespace_remains_distinct() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let receipt = ingest_fault_test(&fabric).unwrap();
+        let mut wrong = receipt.clone();
+        wrong.pack.governance_level = KnowledgeGovernanceLevel::Blocking;
+        assert!(store.save_receipt(&wrong).is_err());
+        let other = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("foreign".into()),
+                KnowledgeActivationPolicy::OnDemand,
+                KnowledgeGovernanceLevel::Advisory,
+                DocumentContent::new("durable rule", "must retain approval evidence"),
+            )
+            .unwrap();
+        assert_ne!(receipt.corpus.corpus_id, other.corpus.corpus_id);
+        assert_ne!(receipt.pack.pack_id, other.pack.pack_id);
+        assert_eq!(fabric.snapshot().unwrap().packs.len(), 2);
+    }
+
+    #[test]
+    fn knowledge_oversized_read_is_an_error_not_a_truncated_success() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let receipt = ingest_fault_test(&fabric).unwrap();
+        let mut pack = receipt.pack;
+        pack.name = "x".repeat(KNOWLEDGE_READ_MAX_BYTES + 1);
+        store
+            .commit_maintenance(&store.maintenance_inputs().unwrap(), &[pack], &[])
+            .unwrap();
+        assert!(matches!(
+            fabric.snapshot(),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+        assert!(matches!(
+            fabric.activate("s", "approval", "main", Some("cowd")),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+    }
+    #[test]
+    fn knowledge_online_reads_do_not_materialize_or_budget_usage_history() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store);
+        let receipt = ingest_fault_test(&fabric).unwrap();
+        for i in 0..=KNOWLEDGE_READ_MAX_ROWS {
+            fabric
+                .record_usage(KnowledgeUsageSignal {
+                    signal_id: format!("signal-{i}"),
+                    session_id: "s".into(),
+                    pack_id: receipt.pack.pack_id.clone(),
+                    action: "observed".into(),
+                    summary: "selection".into(),
+                    score_delta_bp: 0,
+                    occurred_at: Utc::now(),
+                })
+                .unwrap();
+        }
+        assert!(
+            matches!(fabric.snapshot(), Err(KnowledgeStoreError::ReadLimit)),
+            "full export is a separate bounded query"
+        );
+        let plan = fabric
+            .activate("s", "approval", "main", Some("cowd"))
+            .unwrap()
+            .0;
+        assert!(plan.active_pack_ids.contains(&receipt.pack.pack_id));
+        let projection = fabric.projection().unwrap();
+        assert_eq!(
+            projection["usage_signal_count"],
+            KNOWLEDGE_READ_MAX_ROWS + 1
+        );
+        assert_eq!(
+            projection["health"]["usage_signal_count"],
+            KNOWLEDGE_READ_MAX_ROWS + 1
+        );
+        assert_eq!(
+            fabric.quarantine_source("memory:durable-rule").unwrap(),
+            vec![receipt.pack.pack_id]
+        );
+    }
+
+    #[test]
+    fn knowledge_namespace_filter_precedes_materialization_budget() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let receipt = ingest_fault_test(&fabric).unwrap();
+        let other = fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("foreign".into()),
+                KnowledgeActivationPolicy::OnDemand,
+                KnowledgeGovernanceLevel::Advisory,
+                DocumentContent::new("foreign", "foreign content"),
+            )
+            .unwrap();
+        let mut oversized = other.pack;
+        oversized.name = "x".repeat(KNOWLEDGE_READ_MAX_BYTES + 1);
+        store
+            .commit_maintenance(&store.maintenance_inputs().unwrap(), &[oversized], &[])
+            .unwrap();
+        let own = fabric
+            .search_namespace(&KnowledgeNamespace::Project("cowd".into()), "")
+            .unwrap();
+        assert_eq!(own.packs.len(), 1);
+        assert_eq!(own.packs[0].pack_id, receipt.pack.pack_id);
+        assert!(matches!(
+            fabric.search_namespace(&KnowledgeNamespace::Project("foreign".into()), ""),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+    }
+    #[test]
+    fn knowledge_collection_reports_each_commit_instead_of_hiding_a_partial_batch() {
+        let fabric = KnowledgeFabric::new();
+        let receipts = KnowledgeIngestionService::new().ingest_collection(
+            &fabric,
+            KnowledgeNamespace::Project("cowd".into()),
+            KnowledgeActivationPolicy::OnDemand,
+            KnowledgeGovernanceLevel::Advisory,
+            vec![
+                DocumentContent::new("first", "first durable body"),
+                DocumentContent::new("too large", "x".repeat(KNOWLEDGE_READ_MAX_BYTES + 1)),
+                DocumentContent::new("last", "last durable body"),
+            ],
+        );
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts[0].is_ok());
+        assert!(matches!(&receipts[1], Err(KnowledgeStoreError::ReadLimit)));
+        assert!(receipts[2].is_ok());
+        let state = fabric.snapshot().unwrap();
+        assert_eq!(state.packs.len(), 2);
+        assert!(state.packs.iter().any(|pack| pack.name == "first"));
+        assert!(state.packs.iter().any(|pack| pack.name == "last"));
     }
 }

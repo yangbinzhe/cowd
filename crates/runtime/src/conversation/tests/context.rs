@@ -2686,7 +2686,8 @@ async fn a_preparation_renders_the_clock_it_was_given() {
             Vec::new(),
             &stamp,
         )
-        .await;
+        .await
+        .unwrap();
     // Past the stamp's one-second resolution, so a minted stamp would differ.
     std::thread::sleep(std::time::Duration::from_millis(1_100));
     let second = rt
@@ -2696,7 +2697,8 @@ async fn a_preparation_renders_the_clock_it_was_given() {
             Vec::new(),
             &stamp,
         )
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(
         clock_segment(&first),
@@ -3947,5 +3949,139 @@ async fn goal_state_is_emitted_as_a_volatile_tail_section() {
             .iter()
             .any(|packet| packet.source_id.starts_with("workspace:")),
         "stable packets must keep their packing path"
+    );
+}
+
+struct RefusingKnowledgeReader;
+
+fn refused_knowledge_read<T>() -> Result<T, memory::KnowledgeStoreError> {
+    Err(memory::KnowledgeStoreError::Backend(
+        "injected original knowledge read refusal".into(),
+    ))
+}
+
+impl memory::KnowledgeStore for RefusingKnowledgeReader {
+    fn save_receipt(
+        &self,
+        _: &memory::KnowledgeIngestionReceipt,
+    ) -> Result<memory::KnowledgeIngestionReceipt, memory::KnowledgeStoreError> {
+        refused_knowledge_read()
+    }
+    fn record_usage(
+        &self,
+        _: &harness_contract::knowledge::KnowledgeUsageSignal,
+    ) -> Result<(), memory::KnowledgeStoreError> {
+        refused_knowledge_read()
+    }
+    fn snapshot(&self) -> Result<memory::KnowledgeSnapshot, memory::KnowledgeStoreError> {
+        refused_knowledge_read()
+    }
+    fn maintenance_inputs(&self) -> Result<memory::KnowledgeSnapshot, memory::KnowledgeStoreError> {
+        refused_knowledge_read()
+    }
+    fn projection(&self) -> Result<serde_json::Value, memory::KnowledgeStoreError> {
+        refused_knowledge_read()
+    }
+    fn read_candidates(
+        &self,
+        _: Option<&harness_contract::knowledge::KnowledgeNamespace>,
+    ) -> Result<
+        (
+            Vec<harness_contract::knowledge::KnowledgePack>,
+            Vec<harness_contract::knowledge::KnowledgeCanonPack>,
+        ),
+        memory::KnowledgeStoreError,
+    > {
+        refused_knowledge_read()
+    }
+    fn commit_maintenance(
+        &self,
+        _: &memory::KnowledgeSnapshot,
+        _: &[harness_contract::knowledge::KnowledgePack],
+        _: &[harness_contract::knowledge::KnowledgeConflictRecord],
+    ) -> Result<(), memory::KnowledgeStoreError> {
+        refused_knowledge_read()
+    }
+}
+
+#[tokio::test]
+async fn knowledge_read_refusal_prevents_original_prompt_preparation_without_memory() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rt = ConversationRuntime::new(
+        Session::new(),
+        PromptRecordingApi {
+            requests: requests.clone(),
+            projections: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_knowledge_activation(
+        crate::knowledge_activation::KnowledgeActivationRuntime::with_fabric(
+            memory::KnowledgeFabric::with_store(Arc::new(RefusingKnowledgeReader)),
+        ),
+    );
+    let error = rt
+        .prepare_reality_context_with_budget_and_items(
+            "approval evidence",
+            8192,
+            Vec::new(),
+            &crate::prompt::RuntimeClockStamp::now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected original knowledge read refusal"));
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "unknown required knowledge cannot reach Provider dispatch"
+    );
+}
+
+#[tokio::test]
+async fn persisted_knowledge_is_read_without_memory_and_enters_original_prompt() {
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    let fabric = memory::KnowledgeFabric::new();
+    let receipt = fabric
+        .ingest_document(
+            KnowledgeNamespace::SharedLibrary("policy".into()),
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeGovernanceLevel::Required,
+            memory::DocumentContent::new("approval safety policy", "must retain approval evidence"),
+        )
+        .unwrap();
+    let rt = ConversationRuntime::new(
+        Session::new(),
+        MockApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["system".into()],
+    )
+    .without_memory()
+    .with_knowledge_activation(
+        crate::knowledge_activation::KnowledgeActivationRuntime::with_fabric(fabric),
+    );
+    let prompt = rt
+        .prepare_reality_context_with_budget_and_items(
+            "approval evidence",
+            8192,
+            Vec::new(),
+            &crate::prompt::RuntimeClockStamp::now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        prompt
+            .contextual_packets
+            .iter()
+            .any(|item| item.source == ContextSourceKind::Knowledge
+                && item.source_id == receipt.canon.canon_id
+                && item.content.contains("must retain approval evidence")),
+        "persisted required knowledge is independent from whether Memory produced a packet"
     );
 }

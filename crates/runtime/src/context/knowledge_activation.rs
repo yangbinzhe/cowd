@@ -45,7 +45,7 @@ impl KnowledgeActivationRuntime {
         profile: &str,
         project_id: Option<&str>,
         packet: &MemoryContextPacket,
-    ) -> Option<RuntimeKnowledgeActivation> {
+    ) -> Result<Option<RuntimeKnowledgeActivation>, memory::KnowledgeStoreError> {
         let packet = filter_packet_for_turn_intent(packet, intent);
         let mut projected = Vec::new();
         for item in &packet.selected {
@@ -66,9 +66,9 @@ impl KnowledgeActivationRuntime {
 
         let (plan, canon_packs, warnings) = self
             .fabric
-            .activate_with_turn_projection(session_id, intent, profile, project_id, &projected);
+            .activate_with_turn_projection(session_id, intent, profile, project_id, &projected)?;
         if plan.active_pack_ids.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut items = Vec::new();
@@ -163,12 +163,12 @@ impl KnowledgeActivationRuntime {
         let report = self
             .fabric
             .turn_report(&plan, compliance_decision.warnings.clone());
-        Some(RuntimeKnowledgeActivation {
+        Ok(Some(RuntimeKnowledgeActivation {
             items,
             debug_fragment: fragment,
             report,
             compliance_decision,
-        })
+        }))
     }
 
     #[cfg(test)]
@@ -186,6 +186,7 @@ impl KnowledgeActivationRuntime {
             Some("test-workspace"),
             packet,
         )
+        .unwrap()
     }
 }
 
@@ -737,26 +738,43 @@ mod tests {
         fn save_receipt(
             &self,
             _: &memory::KnowledgeIngestionReceipt,
-        ) -> Result<(), memory::KnowledgeStoreError> {
-            self.reject_write()
-        }
-        fn save_pack(
-            &self,
-            _: &harness_contract::knowledge::KnowledgePack,
-        ) -> Result<(), memory::KnowledgeStoreError> {
-            self.reject_write()
-        }
-        fn save_conflict(
-            &self,
-            _: &harness_contract::knowledge::KnowledgeConflictRecord,
-        ) -> Result<(), memory::KnowledgeStoreError> {
-            self.reject_write()
+        ) -> Result<memory::KnowledgeIngestionReceipt, memory::KnowledgeStoreError> {
+            self.reject_write()?;
+            unreachable!("write rejection always returns Err")
         }
         fn record_usage(
             &self,
             _: &harness_contract::knowledge::KnowledgeUsageSignal,
         ) -> Result<(), memory::KnowledgeStoreError> {
             self.reject_write()
+        }
+        fn commit_maintenance(
+            &self,
+            _: &memory::KnowledgeSnapshot,
+            _: &[harness_contract::knowledge::KnowledgePack],
+            _: &[harness_contract::knowledge::KnowledgeConflictRecord],
+        ) -> Result<(), memory::KnowledgeStoreError> {
+            self.reject_write()
+        }
+        fn read_candidates(
+            &self,
+            namespace: Option<&harness_contract::knowledge::KnowledgeNamespace>,
+        ) -> Result<
+            (
+                Vec<harness_contract::knowledge::KnowledgePack>,
+                Vec<harness_contract::knowledge::KnowledgeCanonPack>,
+            ),
+            memory::KnowledgeStoreError,
+        > {
+            memory::KnowledgeStore::read_candidates(&self.inner, namespace)
+        }
+        fn maintenance_inputs(
+            &self,
+        ) -> Result<memory::KnowledgeSnapshot, memory::KnowledgeStoreError> {
+            memory::KnowledgeStore::maintenance_inputs(&self.inner)
+        }
+        fn projection(&self) -> Result<serde_json::Value, memory::KnowledgeStoreError> {
+            memory::KnowledgeStore::projection(&self.inner)
         }
         fn snapshot(&self) -> Result<memory::KnowledgeSnapshot, memory::KnowledgeStoreError> {
             memory::KnowledgeStore::snapshot(&self.inner)
@@ -787,11 +805,12 @@ mod tests {
                 Some("project-a"),
                 &packet,
             )
+            .unwrap()
             .expect("a read-only store must still produce the current blocking context");
         assert!(!active.items.is_empty());
         assert!(!active.compliance_decision.allows_execution());
         assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(fabric.snapshot().packs.is_empty());
+        assert!(fabric.snapshot().unwrap().packs.is_empty());
         packet.selected.clear();
         assert!(runtime
             .activate_from_packet_for_project(
@@ -801,6 +820,7 @@ mod tests {
                 Some("project-a"),
                 &packet,
             )
+            .unwrap()
             .is_none());
         assert!(memory::KnowledgeStore::snapshot(store.as_ref())
             .unwrap()

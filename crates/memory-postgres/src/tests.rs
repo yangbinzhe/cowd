@@ -242,12 +242,14 @@ async fn real_postgres_memory_roundtrip() {
             .expect("PostgreSQL Knowledge owner"),
     );
     let fabric = KnowledgeFabric::with_store(knowledge_target.clone());
-    let receipt = fabric.ingest_document(
-        KnowledgeNamespace::Project(format!("project-{marker}")),
-        KnowledgeActivationPolicy::OnDemand,
-        KnowledgeGovernanceLevel::Required,
-        DocumentContent::new("Real PG", format!("knowledge {marker}")),
-    );
+    let receipt = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project(format!("project-{marker}")),
+            KnowledgeActivationPolicy::OnDemand,
+            KnowledgeGovernanceLevel::Required,
+            DocumentContent::new("Real PG", format!("knowledge {marker}")),
+        )
+        .unwrap();
     knowledge_target
         .record_usage(&KnowledgeUsageSignal {
             signal_id: format!("usage-{marker}"),
@@ -353,15 +355,17 @@ fn real_postgres_knowledge_roundtrip_and_usage_persist_across_reopen() {
         PostgresKnowledgeStore::new(fixture.reconnect()).expect("owned knowledge namespace"),
     );
     let fabric = KnowledgeFabric::with_store(store.clone());
-    let receipt = fabric.ingest_document(
-        KnowledgeNamespace::Project("pg-knowledge".to_string()),
-        KnowledgeActivationPolicy::OnDemand,
-        KnowledgeGovernanceLevel::Advisory,
-        DocumentContent::new(
-            "durable postgres knowledge",
-            "knowledge roundtrip body marker",
-        ),
-    );
+    let receipt = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("pg-knowledge".to_string()),
+            KnowledgeActivationPolicy::OnDemand,
+            KnowledgeGovernanceLevel::Advisory,
+            DocumentContent::new(
+                "durable postgres knowledge",
+                "knowledge roundtrip body marker",
+            ),
+        )
+        .unwrap();
     assert!(
         receipt
             .warnings
@@ -608,6 +612,211 @@ async fn real_postgres_memory_get_is_readonly_even_when_updates_are_forbidden() 
         "lookup must leave the complete original record unchanged"
     );
     drop(connection);
+    drop(store);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_refusal_rolls_back_receipt_and_all_original_rows() {
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("CREATE FUNCTION refuse_canon() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused canon'; END $$; CREATE TRIGGER refuse_canon BEFORE INSERT ON knowledge_canon FOR EACH ROW EXECUTE FUNCTION refuse_canon()").unwrap();
+    let document = memory::DocumentContent::new("durable rule", "must retain approval evidence");
+    let ingest = || {
+        fabric.ingest_document(
+            KnowledgeNamespace::Project("cowd".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document.clone(),
+        )
+    };
+    assert!(ingest().is_err());
+    let row = connection.query_one("SELECT (SELECT count(*) FROM knowledge_ingestion_receipt), (SELECT count(*) FROM knowledge_corpus), (SELECT count(*) FROM knowledge_pack), (SELECT count(*) FROM knowledge_canon)", &[]).unwrap();
+    for column in 0..4 {
+        assert_eq!(
+            row.get::<_, i64>(column),
+            0,
+            "a failed transaction must leave no partial receipt or materialization"
+        );
+    }
+    assert!(store.snapshot().unwrap().packs.is_empty());
+    connection
+        .batch_execute("DROP TRIGGER refuse_canon ON knowledge_canon; DROP FUNCTION refuse_canon()")
+        .unwrap();
+    let original = ingest().unwrap();
+    let repeated = ingest().unwrap();
+    assert_eq!(repeated.pack, original.pack);
+    assert_eq!(store.snapshot().unwrap().packs.len(), 1);
+    drop(connection);
+    drop(fabric);
+    drop(store);
+    drop(executor);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_maintenance_is_atomic_and_rejects_stale_read_sets() {
+    use harness_contract::knowledge::KnowledgeObjectState;
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let mut document = memory::DocumentContent::new(
+        "conflicted rule",
+        "must retain approval evidence\nmust not retain approval evidence",
+    );
+    document.source = Some("memory:conflicted".into());
+    let receipt = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("cowd".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document.clone(),
+        )
+        .unwrap();
+    assert!(
+        !receipt.conflicts.is_empty(),
+        "the late-write refusal must actually be exercised"
+    );
+    let original = store.snapshot().unwrap();
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("CREATE FUNCTION refuse_conflict_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused conflict update'; END $$; CREATE TRIGGER refuse_conflict_update BEFORE UPDATE ON knowledge_conflict FOR EACH ROW EXECUTE FUNCTION refuse_conflict_update()").unwrap();
+    assert!(fabric.quarantine_source("memory:conflicted").is_err());
+    assert_eq!(
+        serde_json::to_value(store.snapshot().unwrap()).unwrap(),
+        serde_json::to_value(&original).unwrap(),
+        "the earlier pack change must roll back when conflict retirement fails"
+    );
+    connection.batch_execute("DROP TRIGGER refuse_conflict_update ON knowledge_conflict; DROP FUNCTION refuse_conflict_update()").unwrap();
+    let mut changed = receipt.pack.clone();
+    changed.governance_level = KnowledgeGovernanceLevel::Blocking;
+    store
+        .commit_maintenance(
+            &store.maintenance_inputs().unwrap(),
+            &[changed.clone()],
+            &[],
+        )
+        .unwrap();
+    let mut stale = receipt.pack.clone();
+    stale.state = KnowledgeObjectState::Quarantined;
+    assert!(matches!(
+        store.commit_maintenance(&original, &[stale], &[]),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(store.snapshot().unwrap().packs[0], changed);
+    fabric.quarantine_source("memory:conflicted").unwrap();
+    // Rebuilt owner observes the same original transaction, not an in-process mirror.
+    drop(fabric);
+    drop(store);
+    let reopened_store = Arc::new(PostgresKnowledgeStore::new(fixture.reconnect()).unwrap());
+    let reopened = KnowledgeFabric::with_store(reopened_store.clone());
+    let replayed = reopened
+        .ingest_document(
+            KnowledgeNamespace::Project("cowd".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document,
+        )
+        .unwrap();
+    assert_eq!(
+        replayed.pack, receipt.pack,
+        "receipt replay returns the immutable original fact"
+    );
+    let current = reopened_store.snapshot().unwrap();
+    assert_eq!(current.packs[0].state, KnowledgeObjectState::Quarantined);
+    assert_eq!(
+        current.conflicts[0].decision.as_deref(),
+        Some("source_pack_inactive")
+    );
+    drop(connection);
+    drop(reopened);
+    drop(reopened_store);
+    drop(executor);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_read_errors_and_oversize_are_not_empty_successes() {
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let receipt = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("cowd".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            memory::DocumentContent::new("policy", "must retain approval evidence"),
+        )
+        .unwrap();
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.execute("UPDATE knowledge_canon SET payload=jsonb_set(payload,'{summary}',to_jsonb(repeat('x',8388609))) WHERE canon_id=$1", &[&receipt.canon.canon_id]).unwrap();
+    assert!(matches!(
+        fabric.activate("s", "approval", "main", Some("cowd")),
+        Err(KnowledgeStoreError::ReadLimit)
+    ));
+    connection
+        .execute(
+            "UPDATE knowledge_canon SET payload=$2 WHERE canon_id=$1",
+            &[
+                &receipt.canon.canon_id,
+                &serde_json::to_value(&receipt.canon).unwrap(),
+            ],
+        )
+        .unwrap();
+    assert!(fabric
+        .activate("s", "approval", "main", Some("cowd"))
+        .unwrap()
+        .0
+        .active_pack_ids
+        .contains(&receipt.pack.pack_id));
+    connection
+        .execute(
+            "UPDATE knowledge_canon SET payload=payload-'summary' WHERE canon_id=$1",
+            &[&receipt.canon.canon_id],
+        )
+        .unwrap();
+    assert!(fabric
+        .activate("s", "approval", "main", Some("cowd"))
+        .is_err());
+    assert!(fabric
+        .search_namespace(&KnowledgeNamespace::Project("cowd".into()), "")
+        .is_err());
+    drop(connection);
+    drop(fabric);
+    drop(store);
+    drop(executor);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_usage_duplicate_is_idempotent_and_changed_identity_rejected() {
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let store = PostgresKnowledgeStore::new(fixture.reconnect()).unwrap();
+    let signal = KnowledgeUsageSignal {
+        signal_id: "one-observation".into(),
+        session_id: "session".into(),
+        pack_id: "pack".into(),
+        action: "selected".into(),
+        summary: "observed".into(),
+        score_delta_bp: 1,
+        occurred_at: chrono::Utc::now(),
+    };
+    store.record_usage(&signal).unwrap();
+    store.record_usage(&signal).unwrap();
+    let mut wrong = signal.clone();
+    wrong.session_id = "foreign".into();
+    assert!(store.record_usage(&wrong).is_err());
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.usage.len(), 1);
+    assert_eq!(snapshot.usage[0].session_id, "session");
     drop(store);
     drop(std::mem::ManuallyDrop::into_inner(fixture));
 }

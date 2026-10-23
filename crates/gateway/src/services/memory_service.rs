@@ -570,14 +570,24 @@ impl MemoryService {
         let durable_fabric = self.knowledge.as_ref();
         let (capability_status, projection_mode, durable, degraded, degraded_reason, projection) =
             match durable_fabric {
-                Some(fabric) => (
-                    RealityCapabilityStatus::EnabledAndWired.as_str(),
-                    "durable_knowledge_store",
-                    true,
-                    false,
-                    serde_json::Value::Null,
-                    fabric.projection(),
-                ),
+                Some(fabric) => match fabric.projection() {
+                    Ok(projection) => (
+                        RealityCapabilityStatus::EnabledAndWired.as_str(),
+                        "durable_knowledge_store",
+                        true,
+                        false,
+                        serde_json::Value::Null,
+                        projection,
+                    ),
+                    Err(error) => (
+                        RealityCapabilityStatus::Degraded.as_str(),
+                        "durable_knowledge_read_failed",
+                        false,
+                        true,
+                        serde_json::json!(error.to_string()),
+                        serde_json::Value::Null,
+                    ),
+                },
                 None => (
                     RealityCapabilityStatus::Degraded.as_str(),
                     "durable_knowledge_store_unavailable",
