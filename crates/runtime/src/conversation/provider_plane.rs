@@ -400,7 +400,8 @@ where
 {
     fn provider_account_key_for_model(&self, model: &str) -> Option<String> {
         self.api_client.provider_name_for_model(model).map(|name| {
-            self.provider_resource_config
+            self.provider_resource_handles()
+                .config
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .account_for(&name, model)
@@ -1614,15 +1615,16 @@ where
         RuntimeError,
     > {
         let started = Instant::now();
-        let lease = if let Some(manager) = &self.provider_admission {
+        let resource_handles = self.provider_resource_handles();
+        let lease = if let Some(manager) = &resource_handles.manager {
             let estimated_tokens = request
                 .budget
                 .input_total_tokens()
                 .saturating_add(request.budget.protocol_overhead_tokens)
                 .saturating_add(request.budget.requested_output_tokens);
             let admission = crate::provider_resources::provider_leaf_admission(
-                &self
-                    .provider_resource_config
+                &resource_handles
+                    .config
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
                 self.api_client.provider_name_for_model(model).as_deref(),
@@ -1678,7 +1680,8 @@ where
         result_class: crate::execution_core::graph::ResourceResultClass,
         failure_scope: Option<model_protocol::provider_failure::ProviderFailureScope>,
     ) {
-        let (Some(manager), Some(lease)) = (&self.provider_admission, lease) else {
+        let handles = self.provider_resource_handles();
+        let (Some(manager), Some(lease)) = (&handles.manager, lease) else {
             return;
         };
         // Balance/credentials/configuration are route availability, not

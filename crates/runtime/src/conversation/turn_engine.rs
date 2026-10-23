@@ -119,6 +119,14 @@ where
             expected_parallel_branches: 1,
             expected_verification_passes: 0,
         });
+        let provider_resources = Arc::new(std::sync::RwLock::new(
+            ConversationProviderResourceHandles {
+                manager: None,
+                config: Arc::new(std::sync::RwLock::new(
+                    crate::ProviderResourceConfig::default(),
+                )),
+            },
+        ));
         let (memory_manager, memory_status) = match memory_composition {
             MemoryManagerComposition::HostSelected(manager) => {
                 let status = (feature_config.memory().enabled && manager.is_none()).then(|| {
@@ -129,7 +137,11 @@ where
                 (manager, status)
             }
             MemoryManagerComposition::Automatic if feature_config.memory().enabled => {
-                initialize_automatic_memory_manager(feature_config, &initial_budget_plan)
+                initialize_automatic_memory_manager(
+                    feature_config,
+                    &initial_budget_plan,
+                    Arc::clone(&provider_resources),
+                )
             }
             MemoryManagerComposition::Automatic => (None, None),
         };
@@ -330,10 +342,7 @@ where
                 Arc::new(crate::execution_core::graph::ScopeLockManager::new()),
             )),
             authorization_negotiator: crate::AuthorizationNegotiator::new(),
-            provider_admission: None,
-            provider_resource_config: Arc::new(std::sync::RwLock::new(
-                crate::ProviderResourceConfig::default(),
-            )),
+            provider_resources,
             execution_service_class:
                 crate::execution_core::graph::ExecutionServiceClass::Interactive,
             tool_timeout: Some(Duration::from_secs(120)),
@@ -386,21 +395,34 @@ where
         self
     }
 
+    pub(super) fn provider_resource_handles(&self) -> ConversationProviderResourceHandles {
+        self.provider_resources
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     #[must_use]
     pub fn with_provider_admission(
-        mut self,
+        self,
         manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
     ) -> Self {
-        self.provider_admission = Some(manager);
+        self.provider_resources
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .manager = Some(manager);
         self
     }
 
     #[must_use]
     pub fn with_provider_resource_config(
-        mut self,
+        self,
         config: Arc<std::sync::RwLock<crate::ProviderResourceConfig>>,
     ) -> Self {
-        self.provider_resource_config = config;
+        self.provider_resources
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config = config;
         self
     }
 

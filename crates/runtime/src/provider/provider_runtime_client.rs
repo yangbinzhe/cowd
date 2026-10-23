@@ -771,14 +771,12 @@ impl ProviderRuntimeClient {
     pub async fn complete_control_analysis(
         &self,
         model: &str,
-        system: impl Into<String>,
-        input: impl Into<String>,
+        system: impl AsRef<str>,
+        input: impl AsRef<str>,
         max_tokens: u32,
     ) -> Result<ProviderControlCompletion, String> {
-        let system = system.into();
-        let input = input.into();
         let prepared = self
-            .prepare_control_analysis(model, &system, &input, max_tokens)
+            .prepare_control_analysis(model, system.as_ref(), input.as_ref(), max_tokens)
             .await?;
         if let Some(admission) = &self.control_admission {
             let manager = self
@@ -827,10 +825,24 @@ impl ProviderRuntimeClient {
             .template_cache
             .resolve(&snapshot, &self.transport_pool, model)?;
         self.validate_control_account(&entry)?;
+        let capacity = snapshot.context_window_resolution(model);
+        if capacity.source == provider::ModelContextWindowSource::Assumed {
+            return Err(
+                "control context capacity is unknown; configure a verified model window".into(),
+            );
+        }
+
         // Count the borrowed input before allocating the protocol message or
         // rendering JSON. This uses the same original resident quota as streams.
         let mut counter = PreparationSourceCounter(0);
         serde_json::to_writer(&mut counter, &(system, input)).map_err(|e| e.to_string())?;
+        if (counter.0 as u64).saturating_add(3) / 4 + u64::from(max_tokens.max(1))
+            > u64::from(capacity.tokens)
+        {
+            return Err(
+                "control request exceeds verified context capacity before materialization".into(),
+            );
+        }
         let resident_bytes = counter
             .0
             .checked_add(65536)
@@ -878,6 +890,7 @@ impl ProviderRuntimeClient {
                 self.reasoning_effort.clone(),
             ),
             protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
+            context_window_limit: Some(capacity.tokens),
             ..MessageRequest::default()
         };
         provider::preflight_message_request(&message).map_err(|e| e.to_string())?;
@@ -885,6 +898,11 @@ impl ProviderRuntimeClient {
             .client
             .prepare_wire(&message)
             .map_err(|e| e.to_string())?;
+        if (wire.body_len() as u64).saturating_add(3) / 4 + u64::from(message.max_tokens)
+            > u64::from(capacity.tokens)
+        {
+            return Err("control prepared wire exceeds verified context capacity".into());
+        }
         self.wire_preparations.fetch_add(1, Ordering::Relaxed);
         let fence = ProviderDispatchSourceFence {
             registry: Arc::clone(&self.registry),
@@ -3470,14 +3488,30 @@ mod tests {
         async fn persist_outcome(&self, _: &super::ProviderRequestEvidenceContext, _: super::ProviderAttemptOutcomeEvidence) -> Result<(), crate::RuntimeError> { Ok(()) }
     }
 
-    fn step_wire_fixture(endpoint: String, workspace: &std::path::Path) -> (ProviderRuntimeClient, ApiRequest) {
-        let registry = Arc::new(ProviderRegistry::new(ProvidersConfig {
-            providers: HashMap::from([("fixture".into(), ProviderConfig {
-                name: "fixture".into(), base_url: endpoint, api_key: "fixture-secret".into(),
-                models: vec!["fixture-model".into()], protocol: Some("completions".into()),
-                parallel_tool_calls: Default::default(), early_tool_start: Default::default(),
-            })]),
-        }).unwrap());
+    fn step_wire_fixture(
+        endpoint: String,
+        workspace: &std::path::Path,
+    ) -> (ProviderRuntimeClient, ApiRequest) {
+        let registry = Arc::new(
+            ProviderRegistry::new_with_context_windows(
+                ProvidersConfig {
+                    providers: HashMap::from([(
+                        "fixture".into(),
+                        ProviderConfig {
+                            name: "fixture".into(),
+                            base_url: endpoint,
+                            api_key: "fixture-secret".into(),
+                            models: vec!["fixture-model".into()],
+                            protocol: Some("completions".into()),
+                            parallel_tool_calls: Default::default(),
+                            early_tool_start: Default::default(),
+                        },
+                    )]),
+                },
+                BTreeMap::from([("fixture-model".into(), 32768)]),
+            )
+            .unwrap(),
+        );
         let host = tools::ToolHost::builtin("wire-fixture", workspace);
         let lease = host.pin_snapshot();
         let definitions = lease.snapshot().catalog.definitions(None).into_iter().filter(|definition| definition.name == "read_file")
@@ -3916,6 +3950,49 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn control_unknown_model_capacity_and_declared_overflow_cannot_render() {
+        let workspace = tempfile::tempdir().unwrap();
+        for mode in ["unknown", "overflow"] {
+            let (mut client, _) =
+                step_wire_fixture("http://127.0.0.1:9/v1".into(), workspace.path());
+            let config = client.registry.pin().config().clone();
+            client.registry = Arc::new(
+                ProviderRegistry::new_with_context_windows(
+                    config,
+                    if mode == "overflow" {
+                        BTreeMap::from([("fixture-model".into(), 1024)])
+                    } else {
+                        BTreeMap::new()
+                    },
+                )
+                .unwrap(),
+            );
+            let failure = match client
+                .prepare_control_analysis(
+                    "fixture-model",
+                    "system",
+                    "input",
+                    if mode == "overflow" { 1024 } else { 32 },
+                )
+                .await
+            {
+                Ok(_) => panic!("invalid capacity must refuse"),
+                Err(error) => error,
+            };
+            assert!(
+                failure.contains(if mode == "unknown" {
+                    "capacity is unknown"
+                } else {
+                    "exceeds verified context"
+                }),
+                "{failure}"
+            );
+            assert_eq!(client.wire_preparation_count(), 0);
+            assert_eq!(client.transport_pool.stats().in_flight, 0);
+        }
     }
 
     #[tokio::test]

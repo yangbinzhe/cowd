@@ -3454,6 +3454,12 @@ pub struct ModelToolCall {
     pub depends_on: Vec<String>,
 }
 
+#[derive(Clone)]
+struct ConversationProviderResourceHandles {
+    manager: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
+    config: Arc<std::sync::RwLock<crate::ProviderResourceConfig>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelStepResult {
     pub intent: ModelStepIntent,
@@ -4442,8 +4448,7 @@ pub struct ConversationRuntime<C, T> {
     /// Every root and delegated Conversation shares the Runtime Provider
     /// admission owner. AgentTask leases govern Agent slots, not Provider
     /// transport, so child conversations must not bypass this boundary.
-    provider_admission: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
-    provider_resource_config: Arc<std::sync::RwLock<crate::ProviderResourceConfig>>,
+    provider_resources: Arc<std::sync::RwLock<ConversationProviderResourceHandles>>,
     /// Runtime-owned service class propagated from the durable graph/Agent
     /// binding. Models and surfaces cannot promote this value.
     execution_service_class: crate::execution_core::graph::ExecutionServiceClass,
@@ -4693,6 +4698,7 @@ fn turn_strategy_event_kind_allowed(kind: &str) -> bool {
 fn initialize_automatic_memory_manager(
     feature_config: &RuntimeFeatureConfig,
     budget_plan: &RuntimeBudgetPlan,
+    provider_resources: Arc<std::sync::RwLock<ConversationProviderResourceHandles>>,
 ) -> (Option<Arc<CognitiveContextManager>>, Option<String>) {
     let mem_cfg = build_cc_memory_config_with_budget(feature_config, budget_plan);
     let llm_summarizer = mem_cfg
@@ -4714,6 +4720,17 @@ fn initialize_automatic_memory_manager(
                 mem_cfg.compression.llm.model.clone(),
                 2048,
             )
+            .map(|summarizer| {
+                summarizer.with_resource_source(move || {
+                    let handles = provider_resources
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    handles
+                        .manager
+                        .as_ref()
+                        .map(|manager| (Arc::clone(manager), Arc::clone(&handles.config)))
+                })
+            })
         })
         .transpose();
     let llm_summarizer = match llm_summarizer {

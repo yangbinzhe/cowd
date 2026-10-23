@@ -2181,6 +2181,41 @@ async fn stale_session_fence_blocks_tool_before_executor_side_effect() {
     );
 }
 
+#[test]
+fn automatic_memory_resource_handle_follows_actual_conversation_injection() {
+    use crate::execution_core::graph::{
+        ExecutionResourceKind, ExecutionResourceManager, ResourceQuota,
+    };
+    let runtime = ConversationRuntime::new_with_features_and_selected_memory(
+        Session::new(),
+        CapacityRecordingApi {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        },
+        Arc::new(StaticToolExecutor::new()),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        SystemPromptBuilder::new().build(),
+        &RuntimeFeatureConfig::default(),
+        None,
+    );
+    let source = Arc::clone(&runtime.provider_resources);
+    let manager = Arc::new(ExecutionResourceManager::new([(
+        ExecutionResourceKind::Provider,
+        ResourceQuota::new(1, 1, 1).unwrap(),
+    )]));
+    let config = Arc::new(std::sync::RwLock::new(
+        crate::ProviderResourceConfig::default(),
+    ));
+    assert!(source.read().unwrap().manager.is_none());
+    let runtime = runtime
+        .with_provider_admission(Arc::clone(&manager))
+        .with_provider_resource_config(Arc::clone(&config));
+    let handles = source.read().unwrap().clone();
+    assert!(Arc::ptr_eq(handles.manager.as_ref().unwrap(), &manager));
+    assert!(Arc::ptr_eq(&handles.config, &config));
+    assert!(Arc::ptr_eq(&runtime.provider_resources, &source));
+}
+
 #[tokio::test]
 async fn ordinary_conversations_share_one_provider_admission_owner() {
     use crate::execution_core::graph::{

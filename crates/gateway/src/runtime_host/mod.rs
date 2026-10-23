@@ -1542,6 +1542,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     );
     let sessions = composition.active_sessions();
     let unified_store = Some(Arc::clone(&selected_storage.session_store));
+    // The existing composition binding is shared by late-bound consumers.
+    let evolution_runtime = Arc::new(OnceLock::<Weak<runtime::RuntimeServices>>::new());
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
             tracing::info!("initialising memory manager over selected storage...");
@@ -1553,8 +1555,19 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     mem_cfg.compression.llm.model.clone(),
                     2048,
                 ) {
-                    Ok(summarizer) => Some(Arc::new(summarizer)
-                        as Arc<dyn memory::compression::llm_summarizer::LlmSummarizer>),
+                    Ok(summarizer) => {
+                        let source = Arc::clone(&evolution_runtime);
+                        Some(Arc::new(summarizer.with_resource_source(move || {
+                            let services = source.get()?.upgrade()?;
+                            Some((
+                                Arc::clone(services.resource_manager()),
+                                services.provider_resource_config(),
+                            ))
+                        }))
+                            as Arc<
+                                dyn memory::compression::llm_summarizer::LlmSummarizer,
+                            >)
+                    }
                     Err(error) => {
                         let error =
                             format!("failed to initialize Runtime Memory summarizer: {error}");
@@ -1776,7 +1789,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // reference is bound only after RuntimeServices exists, avoiding a
     // dependency cycle while keeping Gateway out of scoring and release
     // authorization.
-    let evolution_runtime = Arc::new(OnceLock::<Weak<runtime::RuntimeServices>>::new());
+
     let evolution_scenarios = Arc::new(harness_eval::FileDefinitionEvolutionScenarioCatalog::new(
         approval_dir.join("runtime").join("evolution-scenarios"),
     ));

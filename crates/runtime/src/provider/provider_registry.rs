@@ -22,8 +22,16 @@ pub struct ProviderRegistrySnapshot {
 impl ProviderRegistrySnapshot {
     #[must_use]
     pub fn configured_context_window(&self, model: &str) -> Option<u32> {
-        let resolution = provider::model_context_window_resolution(model, Some(&self.model_context_windows));
-        (resolution.source == provider::ModelContextWindowSource::Configured).then_some(resolution.tokens)
+        let resolution = self.context_window_resolution(model);
+        (resolution.source == provider::ModelContextWindowSource::Configured)
+            .then_some(resolution.tokens)
+    }
+
+    pub(crate) fn context_window_resolution(
+        &self,
+        model: &str,
+    ) -> provider::ModelContextWindowResolution {
+        provider::model_context_window_resolution(model, Some(&self.model_context_windows))
     }
 
     #[must_use]
