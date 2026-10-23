@@ -15,6 +15,11 @@ pub struct MemorySourceFence {
 }
 
 impl MemorySourceFence {
+    /// Reserve borrowed metadata before cloning it into a source snapshot.
+    pub fn read_bytes(&self, budget_bytes: usize) -> Result<usize> {
+        reserved_source_bytes(self, budget_bytes)
+    }
+
     /// A committed typed retirement never becomes live again. Later epochs
     /// preserve all earlier retirement proofs within the exact immutable scope.
     pub fn verifies_retirement(&self, expected: &Self) -> Result<()> {
@@ -117,6 +122,14 @@ pub struct MemoryLifecycleReceipt {
 pub trait MemorySourceFenceReader: Send + Sync {
     fn read_source_fence(&self, source_ref: &str) -> Result<Option<MemorySourceFence>>;
 
+    /// Original live body cut, reserved before materialization. A missing or
+    /// retired source cannot authorize a newly prepared derived write.
+    fn read_source_revision(
+        &self,
+        source_ref: &str,
+        budget_bytes: usize,
+    ) -> Result<Option<MemorySourceRevisionRead>>;
+
     /// Typed retirement is irreversible in the original owner. An older epoch
     /// remains retired after a later retirement; it must not strand its own
     /// durable cleanup obligation. Legacy epoch-zero observations are not proofs.
@@ -160,6 +173,83 @@ impl VerifiedMemoryRetirement {
     pub fn source(&self) -> &MemorySourceFence {
         &self.source
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemorySourceRevisionRead {
+    pub revision: Option<MemoryEntryRevision>,
+    pub fence: MemorySourceFence,
+    pub materialized_bytes: usize,
+}
+
+pub(crate) fn reserved_source_bytes(value: &impl Serialize, budget_bytes: usize) -> Result<usize> {
+    struct Reserved {
+        used: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Reserved {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let next = self
+                .used
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.limit)
+                .ok_or_else(|| std::io::Error::other("Memory source read budget exceeded"))?;
+            self.used = next;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut reserved = Reserved {
+        used: 0,
+        limit: budget_bytes,
+    };
+    serde_json::to_writer(&mut reserved, value).map_err(|error| {
+        if error.is_io() {
+            MemoryError::SourceReadLimit
+        } else {
+            MemoryError::Serialisation(error)
+        }
+    })?;
+    Ok(reserved.used)
+}
+
+/// Shared native predicate; callers must hold the original body/history/fence
+/// read cut until their dependent commit, rather than reloading a later head.
+pub fn live_source_revision(
+    source_ref: &str,
+    entry: &MemoryEntry,
+    history: Option<&str>,
+    fence: Option<&MemorySourceFence>,
+    budget_bytes: usize,
+) -> Result<MemorySourceRevisionRead> {
+    let materialized_bytes = reserved_source_bytes(&(entry, history, fence), budget_bytes)?;
+    if source_ref != format!("memory:{}", entry.id)
+        || fence.is_some_and(|fence| {
+            fence.source_ref != source_ref || fence.scope_key != entry.scope.scope_key()
+        })
+    {
+        return Err(MemoryError::Store(
+            "Memory source/body identity mismatch".into(),
+        ));
+    }
+    let mut source = fence.cloned().unwrap_or(MemorySourceFence {
+        source_ref: source_ref.into(),
+        scope_key: entry.scope.scope_key(),
+        delete_epoch: 0,
+        retired: false,
+    });
+    source.retired |= lifecycle_retired(entry.id, history)?;
+    Ok(MemorySourceRevisionRead {
+        revision: if source.retired {
+            None
+        } else {
+            Some(MemoryEntryRevision::of(entry)?)
+        },
+        fence: source,
+        materialized_bytes,
+    })
 }
 
 /// A compare-and-swap witness for the original body, not an authorization grant.

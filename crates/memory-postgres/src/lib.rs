@@ -1792,6 +1792,7 @@ impl KnowledgeStore for PostgresKnowledgeStore {
         &self,
         receipt: &KnowledgeIngestionReceipt,
     ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
+        memory::knowledge::validate_ingestion_binding(receipt)?;
         let store = self.clone();
         let receipt = receipt.clone();
         run_driver_sync(
@@ -1801,8 +1802,36 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                     .checkout_critical()
                     .map_err(storage_knowledge_error)?;
                 let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
-                tx.batch_execute("LOCK TABLE knowledge_corpus, knowledge_pack, knowledge_conflict IN ROW EXCLUSIVE MODE").map_err(postgres_knowledge_error)?;
                 let (key, digest) = memory::knowledge::knowledge_ingestion_identity(&receipt)?;
+                if let Some(row) = tx.query_opt("SELECT input_digest,payload FROM knowledge_ingestion_receipt WHERE request_key=$1", &[&key]).map_err(postgres_knowledge_error)? {
+                    if row.try_get::<_,String>(0).map_err(postgres_knowledge_error)? != digest { return Err(KnowledgeStoreError::StaleRead); }
+                    let original = serde_json::from_value(row.try_get(1).map_err(postgres_knowledge_error)?).map_err(json_knowledge_error)?;
+                    return Ok(original);
+                }
+                if receipt.corpus.source_ref.id.starts_with("memory:") {
+                    let expected = receipt
+                        .corpus
+                        .memory_body_revision
+                        .as_deref()
+                        .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+                    let read = read_live_memory_source(
+                        &mut tx,
+                        &receipt.corpus.source_ref.id,
+                        memory::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+                        true,
+                    )
+                    .map_err(memory::knowledge::memory_source_error)?
+                    .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+                    memory::knowledge::validate_memory_body_cut(
+                        &receipt.corpus.source_ref.id,
+                        &receipt.corpus.namespace,
+                        expected,
+                        read.revision
+                            .as_ref()
+                            .ok_or(KnowledgeStoreError::StaleRead)?,
+                    )?;
+                }
+                tx.batch_execute("LOCK TABLE knowledge_corpus, knowledge_pack, knowledge_conflict IN ROW EXCLUSIVE MODE").map_err(postgres_knowledge_error)?;
                 let inserted = tx.execute("INSERT INTO knowledge_ingestion_receipt(request_key,input_digest,payload) VALUES($1,$2,$3) ON CONFLICT(request_key) DO NOTHING", &[&key,&digest,&serde_json::to_value(&receipt).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
                 if inserted == 0 {
                     let row = tx.query_one("SELECT input_digest, payload FROM knowledge_ingestion_receipt WHERE request_key=$1", &[&key]).map_err(postgres_knowledge_error)?;
@@ -1822,6 +1851,16 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                 if tx.query_opt("SELECT 1 FROM knowledge_memory_retirement_receipts WHERE source_ref=$1 LIMIT 1", &[&receipt.corpus.source_ref.id]).map_err(postgres_knowledge_error)?.is_some() {
                     return Err(KnowledgeStoreError::StaleRead);
                 }
+                tx.execute("INSERT INTO knowledge_corpus(corpus_id,namespace_key,updated_at,payload) VALUES($1,$2,$3,$4) ON CONFLICT(corpus_id) DO NOTHING", &[&receipt.corpus.corpus_id,&receipt.corpus.namespace.key(),&receipt.corpus.updated_at.to_rfc3339(),&serde_json::to_value(&receipt.corpus).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
+                let row=tx.query_one("SELECT CASE WHEN octet_length(payload::text)<=8388608 THEN payload END FROM knowledge_corpus WHERE corpus_id=$1 FOR UPDATE", &[&receipt.corpus.corpus_id]).map_err(postgres_knowledge_error)?;
+                let original: harness_contract::knowledge::KnowledgeCorpus =
+                    serde_json::from_value(
+                        row.try_get::<_, Option<serde_json::Value>>(0)
+                            .map_err(postgres_knowledge_error)?
+                            .ok_or(KnowledgeStoreError::ReadLimit)?,
+                    )
+                    .map_err(json_knowledge_error)?;
+                memory::knowledge::validate_corpus_identity(&original, &receipt.corpus)?;
                 upsert_knowledge_json(
                     &mut tx,
                     "knowledge_corpus",
@@ -1991,7 +2030,7 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                 let namespaces = packs.iter().map(|p| p.namespace.key()).collect::<Vec<_>>();
                 // Only selected namespace metadata participates; reserve its exact
                 // serialized source strings before transferring them from PG.
-                let lengths=tx.query("SELECT corpus_id,COALESCE(octet_length((payload->'namespace')::text),0)::bigint+COALESCE(octet_length(payload->'source_ref'->>'id'),0)::bigint+octet_length(corpus_id)::bigint FROM knowledge_corpus WHERE corpus_id=ANY($1::text[]) AND namespace_key=ANY($2::text[]) ORDER BY corpus_id", &[&source_ids,&namespaces]).map_err(postgres_knowledge_error)?;
+                let lengths=tx.query("SELECT corpus_id,COALESCE(octet_length((payload->'namespace')::text),0)::bigint+COALESCE(octet_length(payload->'source_ref'->>'id'),0)::bigint+COALESCE(octet_length(payload->>'memory_body_revision'),0)::bigint+octet_length(corpus_id)::bigint FROM knowledge_corpus WHERE corpus_id=ANY($1::text[]) AND namespace_key=ANY($2::text[]) ORDER BY corpus_id", &[&source_ids,&namespaces]).map_err(postgres_knowledge_error)?;
                 for row in lengths {
                     let length: i64 = row.try_get(1).map_err(postgres_knowledge_error)?;
                     bytes = bytes
@@ -2003,8 +2042,8 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                         return Err(KnowledgeStoreError::ReadLimit);
                     }
                 }
-                let sources=tx.query("SELECT corpus_id,payload->'namespace',payload->'source_ref'->>'id' FROM knowledge_corpus WHERE corpus_id=ANY($1::text[]) AND namespace_key=ANY($2::text[]) ORDER BY corpus_id", &[&source_ids,&namespaces]).map_err(postgres_knowledge_error)?.into_iter().map(|row| {
-                    Ok(memory::knowledge::KnowledgeCandidateSource {corpus_id:row.try_get(0).map_err(postgres_knowledge_error)?,namespace:serde_json::from_value(row.try_get(1).map_err(postgres_knowledge_error)?).map_err(json_knowledge_error)?,source_ref:row.try_get(2).map_err(postgres_knowledge_error)?})
+                let sources=tx.query("SELECT corpus_id,payload->'namespace',payload->'source_ref'->>'id',payload->>'memory_body_revision' FROM knowledge_corpus WHERE corpus_id=ANY($1::text[]) AND namespace_key=ANY($2::text[]) ORDER BY corpus_id", &[&source_ids,&namespaces]).map_err(postgres_knowledge_error)?.into_iter().map(|row| {
+                    Ok(memory::knowledge::KnowledgeCandidateSource {corpus_id:row.try_get(0).map_err(postgres_knowledge_error)?,namespace:serde_json::from_value(row.try_get(1).map_err(postgres_knowledge_error)?).map_err(json_knowledge_error)?,source_ref:row.try_get(2).map_err(postgres_knowledge_error)?,memory_body_revision:row.try_get(3).map_err(postgres_knowledge_error)?})
                 }).collect::<Result<Vec<_>,KnowledgeStoreError>>()?;
                 let canon = tx.query("SELECT payload FROM knowledge_canon WHERE canon_id=ANY($1::text[]) ORDER BY canon_id", &[&canon_ids]).map_err(postgres_knowledge_error)?.iter().map(|row| {
                 let value: serde_json::Value = row.try_get(0).map_err(postgres_knowledge_error)?;
@@ -2134,6 +2173,7 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                 if !memory::knowledge::same_knowledge_maintenance_inputs(&expected, &current)? {
                     return Err(KnowledgeStoreError::StaleRead);
                 }
+                memory::knowledge::validate_memory_dependencies(&current, &packs)?;
                 apply_knowledge_maintenance(&mut tx, &packs, &conflicts)?;
                 tx.commit().map_err(postgres_knowledge_error)?;
                 Ok(())
@@ -2733,74 +2773,185 @@ fn knowledge_rows<T: DeserializeOwned>(
 #[path = "tests.rs"]
 mod tests;
 
-impl MemorySourceFenceReader for PostgresMemoryStore {
-    fn read_source_fence(&self, source_ref: &str) -> MemoryResult<Option<MemorySourceFence>> {
-        let id = source_ref
-            .strip_prefix("memory:")
-            .and_then(|id| uuid::Uuid::parse_str(id).ok())
-            .ok_or_else(|| MemoryError::Store("invalid Memory source identity".into()))?;
-        if format!("memory:{id}") != source_ref {
-            return Err(MemoryError::Store(
-                "noncanonical Memory source identity".into(),
-            ));
-        }
-        let mut connection = self
-            .executor
-            .checkout_online_read()
-            .map_err(storage_memory_error)?;
-        // Single snapshot for the persisted fence, original body and legacy history.
-        let row=connection.query_opt("SELECT f.payload,e.scope_key,k.value,f.scope_key,f.delete_epoch FROM (SELECT $1::TEXT AS source_ref) s LEFT JOIN memory_source_fences f ON f.source_ref=s.source_ref LEFT JOIN memory_entries e ON e.id=$2 LEFT JOIN memory_kv k ON k.key='memory_lifecycle:'||e.id", &[&source_ref,&id.to_string()]).map_err(postgres_memory_error)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        if let Some(payload) = row
-            .try_get::<_, Option<serde_json::Value>>(0)
-            .map_err(postgres_memory_error)?
-        {
-            let fence: MemorySourceFence =
-                serde_json::from_value(payload).map_err(json_memory_error)?;
-            let scope: String = row.try_get(3).map_err(postgres_memory_error)?;
-            let epoch: i64 = row.try_get(4).map_err(postgres_memory_error)?;
+// All original body/lifecycle writers acquire this body row before changing
+// history or its source fence. The dependent Knowledge commit holds the same
+// row shared until its own transaction commits; no copied writer authority.
+fn read_live_memory_source(
+    tx: &mut PostgresTransaction<'_>,
+    source_ref: &str,
+    budget_bytes: usize,
+    include_body: bool,
+) -> MemoryResult<Option<memory::store::MemorySourceRevisionRead>> {
+    let id = source_ref
+        .strip_prefix("memory:")
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .filter(|id| format!("memory:{id}") == source_ref)
+        .ok_or(MemoryError::StaleSource)?
+        .to_string();
+    // Read lengths under the original row lock before transferring any scope,
+    // history or body. Long authorized metadata uses the same remaining budget,
+    // rather than an unrelated per-field cutoff.
+    let body_scope_bytes = tx
+        .query_opt(
+            "SELECT octet_length(scope_key)::bigint FROM memory_entries WHERE id=$1 FOR SHARE",
+            &[&id],
+        )
+        .map_err(postgres_memory_error)?
+        .map(|row| row.try_get::<_, i64>(0))
+        .transpose()
+        .map_err(postgres_memory_error)?
+        .map(|n| usize::try_from(n).map_err(|_| MemoryError::SourceReadLimit))
+        .transpose()?;
+    let mut used = body_scope_bytes.unwrap_or(0);
+    let remaining = budget_bytes
+        .checked_sub(used)
+        .ok_or(MemoryError::SourceReadLimit)?;
+    let body_scope = if body_scope_bytes.is_some() {
+        Some(
+            tx.query_one("SELECT scope_key FROM memory_entries WHERE id=$1", &[&id])
+                .map_err(postgres_memory_error)?
+                .try_get::<_, String>(0)
+                .map_err(postgres_memory_error)?,
+        )
+    } else {
+        None
+    };
+    let row=tx.query_opt("SELECT (octet_length(payload::text)+octet_length(scope_key))::bigint,CASE WHEN (octet_length(payload::text)+octet_length(scope_key))::bigint<=$2::bigint THEN payload END,CASE WHEN (octet_length(payload::text)+octet_length(scope_key))::bigint<=$2::bigint THEN scope_key END,delete_epoch FROM memory_source_fences WHERE source_ref=$1 FOR SHARE", &[&source_ref,&i64::try_from(remaining).map_err(|_|MemoryError::SourceReadLimit)?]).map_err(postgres_memory_error)?;
+    let stored_fence = row
+        .map(|row| -> MemoryResult<MemorySourceFence> {
+            let bytes = usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
+                .map_err(|_| MemoryError::SourceReadLimit)?;
+            used = used
+                .checked_add(bytes)
+                .filter(|n| *n <= budget_bytes)
+                .ok_or(MemoryError::SourceReadLimit)?;
+            let fence: MemorySourceFence = serde_json::from_value(
+                row.try_get::<_, Option<serde_json::Value>>(1)
+                    .map_err(postgres_memory_error)?
+                    .ok_or(MemoryError::SourceReadLimit)?,
+            )
+            .map_err(json_memory_error)?;
             if fence.source_ref != source_ref
-                || fence.scope_key != scope
-                || i64::try_from(fence.delete_epoch).ok() != Some(epoch)
+                || fence.scope_key
+                    != row
+                        .try_get::<_, Option<String>>(2)
+                        .map_err(postgres_memory_error)?
+                        .ok_or(MemoryError::SourceReadLimit)?
+                || i64::try_from(fence.delete_epoch).ok()
+                    != Some(row.try_get::<_, i64>(3).map_err(postgres_memory_error)?)
+                || body_scope
+                    .as_ref()
+                    .is_some_and(|scope| scope != &fence.scope_key)
             {
                 return Err(MemoryError::Store(
                     "Memory source fence identity mismatch".into(),
                 ));
             }
-            if let Some(body_scope) = row
-                .try_get::<_, Option<String>>(1)
-                .map_err(postgres_memory_error)?
-            {
-                if body_scope != scope {
-                    return Err(MemoryError::Store(
-                        "Memory source/body scope mismatch".into(),
-                    ));
-                }
-            }
-            if !fence.retired
-                && row
-                    .try_get::<_, Option<String>>(1)
-                    .map_err(postgres_memory_error)?
-                    .is_none()
-            {
-                return Err(MemoryError::Store("live Memory source body missing".into()));
-            }
-            return Ok(Some(fence));
-        }
-        let Some(scope_key) = row
-            .try_get::<_, Option<String>>(1)
-            .map_err(postgres_memory_error)?
-        else {
-            return Ok(None);
+            Ok(fence)
+        })
+        .transpose()?;
+    if body_scope.is_none() {
+        return match stored_fence {
+            Some(fence) if fence.retired => Ok(Some(memory::store::MemorySourceRevisionRead {
+                fence,
+                revision: None,
+                materialized_bytes: used,
+            })),
+            Some(_) => Err(MemoryError::Store("live Memory source body missing".into())),
+            None => Ok(None),
         };
-        let history: Option<String> = row.try_get(2).map_err(postgres_memory_error)?;
-        Ok(Some(MemorySourceFence {
+    }
+    let fence = if let Some(fence) = stored_fence {
+        fence
+    } else {
+        let remaining = budget_bytes
+            .checked_sub(used)
+            .ok_or(MemoryError::SourceReadLimit)?;
+        let row=tx.query_opt("SELECT octet_length(value)::bigint,CASE WHEN octet_length(value)::bigint<=$2::bigint THEN value END FROM memory_kv WHERE key=$1 FOR SHARE", &[&format!("memory_lifecycle:{id}"),&i64::try_from(remaining).map_err(|_|MemoryError::SourceReadLimit)?]).map_err(postgres_memory_error)?;
+        let history = row
+            .map(|row| -> MemoryResult<String> {
+                used = used
+                    .checked_add(
+                        usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
+                            .map_err(|_| MemoryError::SourceReadLimit)?,
+                    )
+                    .filter(|n| *n <= budget_bytes)
+                    .ok_or(MemoryError::SourceReadLimit)?;
+                row.try_get::<_, Option<String>>(1)
+                    .map_err(postgres_memory_error)?
+                    .ok_or(MemoryError::SourceReadLimit)
+            })
+            .transpose()?;
+        MemorySourceFence {
             source_ref: source_ref.into(),
-            scope_key,
+            scope_key: body_scope.clone().unwrap(),
             delete_epoch: 0,
-            retired: memory::store::lifecycle_retired(id, history.as_deref())?,
-        }))
+            retired: memory::store::lifecycle_retired(
+                uuid::Uuid::parse_str(&id).map_err(|_| MemoryError::StaleSource)?,
+                history.as_deref(),
+            )?,
+        }
+    };
+    if fence.retired || !include_body {
+        return Ok(Some(memory::store::MemorySourceRevisionRead {
+            fence,
+            revision: None,
+            materialized_bytes: used,
+        }));
+    }
+    let remaining = budget_bytes
+        .checked_sub(used)
+        .ok_or(MemoryError::SourceReadLimit)?;
+    let row=tx.query_one("SELECT octet_length(payload::text)::bigint,CASE WHEN octet_length(payload::text)::bigint<=$2::bigint THEN payload END FROM memory_entries WHERE id=$1", &[&id,&i64::try_from(remaining).map_err(|_|MemoryError::SourceReadLimit)?]).map_err(postgres_memory_error)?;
+    used = used
+        .checked_add(
+            usize::try_from(row.try_get::<_, i64>(0).map_err(postgres_memory_error)?)
+                .map_err(|_| MemoryError::SourceReadLimit)?,
+        )
+        .filter(|n| *n <= budget_bytes)
+        .ok_or(MemoryError::SourceReadLimit)?;
+    let entry = entry_from_json(
+        row.try_get::<_, Option<serde_json::Value>>(1)
+            .map_err(postgres_memory_error)?
+            .ok_or(MemoryError::SourceReadLimit)?,
+    )?;
+    if Some(entry.scope.scope_key()) != body_scope {
+        return Err(MemoryError::Store(
+            "Memory source/body scope mismatch".into(),
+        ));
+    }
+    let mut read =
+        memory::store::live_source_revision(source_ref, &entry, None, Some(&fence), budget_bytes)?;
+    read.materialized_bytes = read.materialized_bytes.max(used);
+    Ok(Some(read))
+}
+
+impl MemorySourceFenceReader for PostgresMemoryStore {
+    fn read_source_revision(
+        &self,
+        source_ref: &str,
+        budget_bytes: usize,
+    ) -> MemoryResult<Option<memory::store::MemorySourceRevisionRead>> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_memory_error)?;
+        let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+        read_live_memory_source(&mut tx, source_ref, budget_bytes, true)
+    }
+
+    fn read_source_fence(&self, source_ref: &str) -> MemoryResult<Option<MemorySourceFence>> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_memory_error)?;
+        let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+        Ok(read_live_memory_source(
+            &mut tx,
+            source_ref,
+            memory::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+            false,
+        )?
+        .map(|read| read.fence))
     }
 }

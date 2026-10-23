@@ -144,6 +144,7 @@ fn complex_manufacturing_document() -> DocumentContent {
         ]
         .join("\n"),
         source: Some("mock.complex_doc".to_string()),
+        memory_source_revision: None,
         author: Some("user-full-capability-eval".to_string()),
         created_at: Some(Utc::now().to_rfc3339()),
         modified_at: Some(Utc::now().to_rfc3339()),

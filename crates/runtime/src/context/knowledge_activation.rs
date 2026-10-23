@@ -615,6 +615,7 @@ fn document_from_memory_item(item: &memory::MemoryPacketItem) -> Option<Document
             atom.evidence_pointer.as_deref().unwrap_or("memory packet")
         ),
         source: atom.evidence_pointer.clone(),
+        memory_source_revision: None,
         author: Some("memory.kernel".to_string()),
         created_at: None,
         modified_at: None,

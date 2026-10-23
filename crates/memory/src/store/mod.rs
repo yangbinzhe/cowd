@@ -21,10 +21,11 @@ use crate::{
 
 pub mod blob;
 mod mutation;
+pub(crate) use mutation::reserved_source_bytes;
 pub use mutation::{
-    lifecycle_retired, MemoryCleanupPending, MemoryEntryRevision, MemoryLifecycleMutation,
-    MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceFence,
-    MemorySourceFenceReader, VerifiedMemoryRetirement,
+    lifecycle_retired, live_source_revision, MemoryCleanupPending, MemoryEntryRevision,
+    MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryRetirementVerificationError,
+    MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead, VerifiedMemoryRetirement,
 };
 mod ephemeral;
 pub mod vector;

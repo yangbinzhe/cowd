@@ -32,6 +32,8 @@ pub struct DocumentContent {
     pub title: String,
     pub body: String,
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_source_revision: Option<crate::store::MemoryEntryRevision>,
     pub author: Option<String>,
     pub created_at: Option<String>,
     pub modified_at: Option<String>,
@@ -45,6 +47,7 @@ impl DocumentContent {
             title: title.into(),
             body: body.into(),
             source: None,
+            memory_source_revision: None,
             author: None,
             created_at: None,
             modified_at: None,
@@ -507,6 +510,114 @@ pub struct KnowledgeFabric {
     memory_sources: Option<Arc<dyn crate::store::MemorySourceFenceReader>>,
 }
 
+/// Namespace interpretation is shared by the ingress, reader and native
+/// commit owners. A body digest alone is never a scope authorization.
+pub fn memory_source_error(error: crate::MemoryError) -> KnowledgeStoreError {
+    match error {
+        crate::MemoryError::StaleSource => KnowledgeStoreError::StaleRead,
+        crate::MemoryError::SourceReadLimit => KnowledgeStoreError::ReadLimit,
+        error => KnowledgeStoreError::MemorySourceRead(error),
+    }
+}
+
+/// This original ingestion command compiles exactly one document. Multi-source
+/// consolidation belongs to maintenance, which preserves its original inputs.
+pub fn validate_ingestion_binding(
+    receipt: &KnowledgeIngestionReceipt,
+) -> Result<(), KnowledgeStoreError> {
+    if receipt.pack.namespace != receipt.corpus.namespace
+        || receipt.pack.source_corpus_refs.as_slice() != [receipt.corpus.corpus_id.clone()]
+        || receipt.canon.pack_id != receipt.pack.pack_id
+        || receipt.pack.canon_pack_ref.as_deref() != Some(receipt.canon.canon_id.as_str())
+        || receipt.corpus.chunk_count != receipt.chunks.len()
+        || receipt
+            .chunks
+            .iter()
+            .any(|chunk| chunk.corpus_id != receipt.corpus.corpus_id)
+        || receipt
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.pack_id.as_deref() != Some(receipt.pack.pack_id.as_str()))
+        || receipt.corpus.source_ref.ref_type != "knowledge_source"
+        || (!receipt.corpus.source_ref.id.starts_with("memory:")
+            && receipt.corpus.memory_body_revision.is_some())
+    {
+        return Err(KnowledgeStoreError::StaleRead);
+    }
+    Ok(())
+}
+
+pub fn validate_corpus_identity(
+    original: &KnowledgeCorpus,
+    next: &KnowledgeCorpus,
+) -> Result<(), KnowledgeStoreError> {
+    if original.namespace != next.namespace
+        || (original.source_ref.id != next.source_ref.id
+            || original.source_ref.ref_type != next.source_ref.ref_type)
+        || original.source_hash != next.source_hash
+        || original.memory_body_revision != next.memory_body_revision
+    {
+        return Err(KnowledgeStoreError::StaleRead);
+    }
+    Ok(())
+}
+
+pub fn validate_memory_dependencies(
+    current: &KnowledgeSnapshot,
+    packs: &[KnowledgePack],
+) -> Result<(), KnowledgeStoreError> {
+    for next in packs {
+        if let Some(old) = current.packs.iter().find(|old| old.pack_id == next.pack_id) {
+            for id in &old.source_corpus_refs {
+                if current.corpus.iter().any(|corpus| {
+                    &corpus.corpus_id == id && corpus.source_ref.id.starts_with("memory:")
+                }) && (!next.source_corpus_refs.contains(id) || next.namespace != old.namespace)
+                {
+                    return Err(KnowledgeStoreError::StaleRead);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn memory_scope_allows(namespace: &KnowledgeNamespace, scope_key: &str) -> bool {
+    use crate::MemoryScope;
+    match namespace {
+        KnowledgeNamespace::Project(id) => {
+            scope_key == MemoryScope::Project(id.clone()).scope_key()
+        }
+        KnowledgeNamespace::SharedLibrary(id) => {
+            id == "global" && scope_key == MemoryScope::Global.scope_key()
+        }
+        KnowledgeNamespace::Corpus(id) => [
+            MemoryScope::Session(id.clone()),
+            MemoryScope::Task(id.clone()),
+            MemoryScope::AgentDefinitionLineage(id.clone()),
+            MemoryScope::AgentInstance(id.clone()),
+            MemoryScope::TeamRun(id.clone()),
+        ]
+        .iter()
+        .any(|scope| scope.scope_key() == scope_key),
+        _ => false,
+    }
+}
+
+pub fn validate_memory_body_cut(
+    source_ref: &str,
+    namespace: &KnowledgeNamespace,
+    expected: &str,
+    actual: &crate::store::MemoryEntryRevision,
+) -> Result<(), KnowledgeStoreError> {
+    if source_ref != format!("memory:{}", actual.memory_id)
+        || expected != actual.body_digest
+        || !memory_scope_allows(namespace, &actual.scope_key)
+    {
+        return Err(KnowledgeStoreError::StaleRead);
+    }
+    Ok(())
+}
+
 impl Default for KnowledgeFabric {
     fn default() -> Self {
         Self::with_store(Arc::new(InMemoryKnowledgeStore::new()))
@@ -538,47 +649,69 @@ impl KnowledgeFabric {
         self
     }
 
+    #[cfg(test)]
     fn source_allowed(
         &self,
         source_ref: &str,
         namespace: &KnowledgeNamespace,
     ) -> Result<bool, KnowledgeStoreError> {
+        self.validate_memory_source_cut(
+            source_ref,
+            namespace,
+            Some("fixture"),
+            &mut { KNOWLEDGE_READ_MAX_BYTES },
+            &mut BTreeMap::new(),
+        )
+    }
+
+    fn validate_memory_source_cut(
+        &self,
+        source_ref: &str,
+        namespace: &KnowledgeNamespace,
+        expected: Option<&str>,
+        remaining: &mut usize,
+        source_frame: &mut BTreeMap<String, crate::store::MemorySourceRevisionRead>,
+    ) -> Result<bool, KnowledgeStoreError> {
         if !source_ref.starts_with("memory:") {
             return Ok(true);
         }
-        let reader = self
-            .memory_sources
-            .as_ref()
-            .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
-        let fence = reader
-            .read_source_fence(source_ref)
-            .map_err(KnowledgeStoreError::MemorySourceRead)?
-            .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
-        if fence.source_ref != source_ref {
+        if !source_frame.contains_key(source_ref) {
+            let reader = self
+                .memory_sources
+                .as_ref()
+                .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+            // Reserve before IO. If the read fails with an unknown transferred
+            // size, its full reservation stays spent; it is never refunded as 0.
+            let reservation = std::mem::take(remaining);
+            if reservation == 0 {
+                return Err(KnowledgeStoreError::ReadLimit);
+            }
+            let read = reader
+                .read_source_revision(source_ref, reservation)
+                .map_err(memory_source_error)?
+                .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+            if read.fence.source_ref != source_ref {
+                return Err(KnowledgeStoreError::StaleRead);
+            }
+            *remaining = reservation
+                .checked_sub(read.materialized_bytes)
+                .ok_or(KnowledgeStoreError::ReadLimit)?;
+            source_frame.insert(source_ref.to_owned(), read);
+        }
+        let read = &source_frame[source_ref];
+        if read.fence.source_ref != source_ref {
             return Err(KnowledgeStoreError::StaleRead);
         }
-        if fence.retired {
+        if read.fence.retired || !memory_scope_allows(namespace, &read.fence.scope_key) {
             return Ok(false);
         }
-        use crate::MemoryScope;
-        Ok(match namespace {
-            KnowledgeNamespace::Project(id) => {
-                fence.scope_key == MemoryScope::Project(id.clone()).scope_key()
-            }
-            KnowledgeNamespace::SharedLibrary(id) => {
-                id == "global" && fence.scope_key == MemoryScope::Global.scope_key()
-            }
-            KnowledgeNamespace::Corpus(id) => [
-                MemoryScope::Session(id.clone()),
-                MemoryScope::Task(id.clone()),
-                MemoryScope::AgentDefinitionLineage(id.clone()),
-                MemoryScope::AgentInstance(id.clone()),
-                MemoryScope::TeamRun(id.clone()),
-            ]
-            .iter()
-            .any(|scope| scope.scope_key() == fence.scope_key),
-            _ => false,
-        })
+        let expected = expected.ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+        let actual = read
+            .revision
+            .as_ref()
+            .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+        validate_memory_body_cut(source_ref, namespace, expected, actual)?;
+        Ok(true)
     }
 
     pub fn ingest_document(
@@ -592,16 +725,43 @@ impl KnowledgeFabric {
             .body
             .len()
             .saturating_add(content.title.len())
-            .saturating_add(content.source.as_ref().map_or(0, String::len));
+            .saturating_add(content.source.as_ref().map_or(0, String::len))
+            .saturating_add(content.memory_source_revision.as_ref().map_or(0, |cut| {
+                cut.scope_key
+                    .len()
+                    .saturating_add(cut.body_digest.len())
+                    .saturating_add(36)
+            }));
         if input_bytes > KNOWLEDGE_READ_MAX_BYTES {
             return Err(KnowledgeStoreError::ReadLimit);
         }
-        if let Some(source) = &content.source {
-            if !self.source_allowed(source, &namespace)? {
-                return Err(KnowledgeStoreError::Backend(
-                    "unverified or retired Memory ingestion source".into(),
-                ));
+        if let Some(source) = content
+            .source
+            .as_deref()
+            .filter(|source| source.starts_with("memory:"))
+        {
+            let expected = content
+                .memory_source_revision
+                .as_ref()
+                .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+            let mut budget = KNOWLEDGE_READ_MAX_BYTES;
+            let mut source_frame = BTreeMap::new();
+            if !self.validate_memory_source_cut(
+                source,
+                &namespace,
+                Some(&expected.body_digest),
+                &mut budget,
+                &mut source_frame,
+            )? {
+                return Err(KnowledgeStoreError::StaleRead);
             }
+            if source != format!("memory:{}", expected.memory_id)
+                || !memory_scope_allows(&namespace, &expected.scope_key)
+            {
+                return Err(KnowledgeStoreError::StaleRead);
+            }
+        } else if content.memory_source_revision.is_some() {
+            return Err(KnowledgeStoreError::StaleRead);
         }
         let receipt = KnowledgeIngestionService::new().prepare_document(
             namespace,
@@ -610,9 +770,6 @@ impl KnowledgeFabric {
             content,
             false,
         );
-        if !self.source_allowed(&receipt.corpus.source_ref.id, &receipt.corpus.namespace)? {
-            return Err(KnowledgeStoreError::StaleRead);
-        }
         self.store.save_receipt(&receipt)
     }
 
@@ -702,6 +859,7 @@ impl KnowledgeFabric {
         let mut packs = Vec::new();
         let mut canon = BTreeMap::new();
         let mut remaining = KNOWLEDGE_READ_MAX_BYTES;
+        let mut source_frame = BTreeMap::new();
         let mut rows = 0usize;
         loop {
             let mut page = self.store.read_candidate_page(
@@ -758,7 +916,13 @@ impl KnowledgeFabric {
                         denied = true;
                         continue;
                     }
-                    match self.source_allowed(&source.source_ref, &pack.namespace) {
+                    match self.validate_memory_source_cut(
+                        &source.source_ref,
+                        &pack.namespace,
+                        source.memory_body_revision.as_deref(),
+                        &mut remaining,
+                        &mut source_frame,
+                    ) {
                         Ok(true) => {}
                         Ok(false) => denied = true,
                         Err(error) => {
@@ -1240,15 +1404,20 @@ impl KnowledgeIngestionService {
     ) -> KnowledgeIngestionReceipt {
         let classification = self.classify(&content);
         let now = Utc::now();
-        let corpus_id = format!(
-            "corpus-{}",
-            stable_hash(&format!(
-                "{}:{}:{}",
-                namespace.key(),
-                content.source.clone().unwrap_or_default(),
-                content.body
-            ))
+        let mut corpus_input = format!(
+            "{}:{}:{}",
+            namespace.key(),
+            content
+                .source
+                .clone()
+                .unwrap_or_else(|| format!("inline:{}", content.title)),
+            content.body
         );
+        if let Some(cut) = content.memory_source_revision.as_ref() {
+            corpus_input.push_str(":memory-cut:");
+            corpus_input.push_str(&cut.body_digest);
+        }
+        let corpus_id = format!("corpus-{}", stable_hash(&corpus_input));
         let source_ref = KernelRef::new(
             "knowledge_source",
             content
@@ -1264,6 +1433,10 @@ impl KnowledgeIngestionService {
             namespace: namespace.clone(),
             source_ref: source_ref.clone(),
             source_hash: format!("hash-{}", stable_hash(&content.body)),
+            memory_body_revision: content
+                .memory_source_revision
+                .as_ref()
+                .map(|cut| cut.body_digest.clone()),
             state: KnowledgeObjectState::Indexed,
             chunk_count: chunks.len(),
             created_at: now,
@@ -1565,11 +1738,13 @@ fn bounded_source_snapshot(
 #[derive(Debug, Clone)]
 pub struct InMemoryKnowledgeStore {
     state: Arc<RwLock<KnowledgeFabricState>>,
+    memory_owner: Option<Arc<crate::store::EphemeralMemoryStore>>,
 }
 
 impl Default for InMemoryKnowledgeStore {
     fn default() -> Self {
         Self {
+            memory_owner: None,
             state: Arc::new(RwLock::new(KnowledgeFabricState {
                 candidate_store_id: uuid::Uuid::new_v4().to_string(),
                 ..KnowledgeFabricState::default()
@@ -1579,6 +1754,12 @@ impl Default for InMemoryKnowledgeStore {
 }
 
 impl InMemoryKnowledgeStore {
+    #[must_use]
+    pub fn with_memory_owner(mut self, memory: Arc<crate::store::EphemeralMemoryStore>) -> Self {
+        self.memory_owner = Some(memory);
+        self
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -1665,6 +1846,51 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         &self,
         receipt: &KnowledgeIngestionReceipt,
     ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
+        validate_ingestion_binding(receipt)?;
+        // Exact immutable receipt reads remain valid facts after retirement.
+        let (key, digest) = knowledge_ingestion_identity(receipt)?;
+        if let Some((original_digest, original)) = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ingestion_receipts
+            .get(&key)
+        {
+            if original_digest != &digest {
+                return Err(KnowledgeStoreError::Backend(
+                    "knowledge ingestion identity conflict".into(),
+                ));
+            }
+            return Ok(original.clone());
+        }
+        let source_guard = if receipt.corpus.source_ref.id.starts_with("memory:") {
+            let expected = receipt
+                .corpus
+                .memory_body_revision
+                .as_deref()
+                .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+            let owner = self
+                .memory_owner
+                .as_ref()
+                .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+            let guard = owner
+                .source_revision_guard(&receipt.corpus.source_ref.id, KNOWLEDGE_READ_MAX_BYTES)
+                .map_err(memory_source_error)?
+                .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+            validate_memory_body_cut(
+                &receipt.corpus.source_ref.id,
+                &receipt.corpus.namespace,
+                expected,
+                guard
+                    .read
+                    .revision
+                    .as_ref()
+                    .ok_or(KnowledgeStoreError::StaleRead)?,
+            )?;
+            Some(guard)
+        } else {
+            None
+        };
         let mut state = self
             .state
             .write()
@@ -1684,6 +1910,9 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             .any(|(source, _, _)| source == &receipt.corpus.source_ref.id)
         {
             return Err(KnowledgeStoreError::StaleRead);
+        }
+        if let Some(original) = state.corpus.get(&receipt.corpus.corpus_id) {
+            validate_corpus_identity(original, &receipt.corpus)?;
         }
         bump_candidate_revisions(&mut state, std::iter::once(receipt.pack.namespace.clone()))?;
         state
@@ -1706,6 +1935,8 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         state
             .ingestion_receipts
             .insert(key, (digest, receipt.clone()));
+        drop(state);
+        drop(source_guard);
         Ok(receipt.clone())
     }
 
@@ -1820,7 +2051,12 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                     // Reserve borrowed metadata before cloning either string.
                     serde_json::to_writer(
                         &mut budget,
-                        &(&corpus.corpus_id, &corpus.namespace, &corpus.source_ref.id),
+                        &(
+                            &corpus.corpus_id,
+                            &corpus.namespace,
+                            &corpus.source_ref.id,
+                            &corpus.memory_body_revision,
+                        ),
                     )
                     .map_err(|_| KnowledgeStoreError::ReadLimit)?;
                     if budget.0 > budget_bytes {
@@ -1830,6 +2066,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                         corpus_id: id.clone(),
                         namespace: corpus.namespace.clone(),
                         source_ref: corpus.source_ref.id.clone(),
+                        memory_body_revision: corpus.memory_body_revision.clone(),
                     });
                 }
             }
@@ -1880,6 +2117,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         if !same_knowledge_maintenance_inputs(expected, &current)? {
             return Err(KnowledgeStoreError::StaleRead);
         }
+        validate_memory_dependencies(&current, packs)?;
         for pack in packs
             .iter()
             .filter(|pack| knowledge_state_is_actionable(pack.state))
@@ -3632,6 +3870,27 @@ mod tests {
     fn knowledge_live_source_requires_original_identity_and_known_read() {
         struct Reader(Option<crate::store::MemorySourceFence>);
         impl crate::store::MemorySourceFenceReader for Reader {
+            fn read_source_revision(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceRevisionRead>> {
+                Ok(self
+                    .0
+                    .clone()
+                    .map(|fence| crate::store::MemorySourceRevisionRead {
+                        revision: Some(crate::store::MemoryEntryRevision {
+                            memory_id: uuid::Uuid::parse_str(
+                                "00000000-0000-0000-0000-000000000001",
+                            )
+                            .unwrap(),
+                            scope_key: fence.scope_key.clone(),
+                            body_digest: "fixture".into(),
+                        }),
+                        fence,
+                        materialized_bytes: 1,
+                    }))
+            }
             fn read_source_fence(
                 &self,
                 _: &str,
@@ -3685,6 +3944,14 @@ mod tests {
     fn knowledge_retirement_distinguishes_source_read_failure_from_unknown_and_stale() {
         struct FailedReader(bool);
         impl crate::store::MemorySourceFenceReader for FailedReader {
+            fn read_source_revision(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceRevisionRead>> {
+                Err(crate::MemoryError::StaleSource)
+            }
+
             fn read_source_fence(
                 &self,
                 _: &str,
@@ -4121,5 +4388,61 @@ must not retain",
         assert!(second
             .read_candidate_page(&scope, b.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES)
             .is_ok());
+    }
+    #[test]
+    fn knowledge_unknown_source_read_spends_its_reservation_and_cannot_read_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Reader(AtomicUsize);
+        impl crate::store::MemorySourceFenceReader for Reader {
+            fn read_source_fence(
+                &self,
+                _: &str,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceFence>> {
+                panic!("candidate assessment must use its original bounded source frame");
+            }
+            fn read_source_revision(
+                &self,
+                _: &str,
+                budget: usize,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceRevisionRead>> {
+                assert_eq!(budget, 128);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(crate::MemoryError::Store(
+                    "unknown partial source transfer".into(),
+                ))
+            }
+        }
+        let reader = Arc::new(Reader(AtomicUsize::new(0)));
+        let fabric = KnowledgeFabric::new().with_memory_sources(reader.clone());
+        let mut remaining = 128;
+        let mut frame = BTreeMap::new();
+        let source = "memory:00000000-0000-0000-0000-000000000001";
+        let scope = KnowledgeNamespace::Project("A".into());
+        assert!(matches!(
+            fabric.validate_memory_source_cut(
+                source,
+                &scope,
+                Some("original"),
+                &mut remaining,
+                &mut frame
+            ),
+            Err(KnowledgeStoreError::MemorySourceRead(_))
+        ));
+        assert_eq!(
+            remaining, 0,
+            "unknown transferred bytes cannot be refunded as zero cost"
+        );
+        assert!(frame.is_empty());
+        assert!(matches!(
+            fabric.validate_memory_source_cut(
+                source,
+                &scope,
+                Some("original"),
+                &mut remaining,
+                &mut frame
+            ),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+        assert_eq!(reader.0.load(Ordering::SeqCst), 1);
     }
 }

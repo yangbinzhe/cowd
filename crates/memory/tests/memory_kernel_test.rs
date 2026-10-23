@@ -1655,7 +1655,8 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     use memory::KnowledgeStore;
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(EphemeralMemoryStore::new());
-    let knowledge_store = Arc::new(memory::InMemoryKnowledgeStore::new());
+    let knowledge_store =
+        Arc::new(memory::InMemoryKnowledgeStore::new().with_memory_owner(store.clone()));
     let fabric = memory::KnowledgeFabric::with_store(knowledge_store.clone())
         .with_memory_sources(store.clone());
     let mut retired = entry(MemoryLayer::L3, MemorySource::Import, "retire rule");
@@ -1667,6 +1668,8 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     let ingest = |source: &memory::MemoryEntry, title: &str| {
         let mut document = memory::DocumentContent::new(title, "Retain the original evidence.");
         document.source = Some(format!("memory:{}", source.id));
+        document.memory_source_revision =
+            Some(memory::store::MemoryEntryRevision::of(&source).unwrap());
         fabric.ingest_document(
             KnowledgeNamespace::Project("A".into()),
             KnowledgeActivationPolicy::DefaultForProjectGroup,
@@ -1770,6 +1773,8 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     assert!(ingest(&retired, "different pack same retired source").is_err());
     let mut wrong_scope = memory::DocumentContent::new("foreign", "must not import");
     wrong_scope.source = Some(format!("memory:{}", other.id));
+    wrong_scope.memory_source_revision =
+        Some(memory::store::MemoryEntryRevision::of(&other).unwrap());
     assert!(fabric
         .ingest_document(
             KnowledgeNamespace::Project("B".into()),
@@ -1832,6 +1837,7 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     late.canon.pack_id = late.pack.pack_id.clone();
     late.pack.canon_pack_ref = Some(late.canon.canon_id.clone());
     late.chunks.clear();
+    late.corpus.chunk_count = 0;
     late.conflicts.clear();
     assert!(matches!(
         knowledge_store.save_receipt(&late),
@@ -2045,6 +2051,19 @@ async fn knowledge_required_source_read_failure_is_not_empty_success_or_foreign_
         source: String,
     }
     impl MemorySourceFenceReader for Reader {
+        fn read_source_revision(
+            &self,
+            source: &str,
+            budget: usize,
+        ) -> memory::store::Result<Option<memory::store::MemorySourceRevisionRead>> {
+            if source == self.source && self.fail.load(Ordering::SeqCst) {
+                return Err(memory::MemoryError::Store(
+                    "injected source read failure".into(),
+                ));
+            }
+            self.store.read_source_revision(source, budget)
+        }
+
         fn read_source_fence(
             &self,
             source: &str,
@@ -2069,9 +2088,10 @@ async fn knowledge_required_source_read_failure_is_not_empty_success_or_foreign_
         fail: AtomicBool::new(false),
         source: format!("memory:{}", own.id),
     });
-    let fabric =
-        memory::KnowledgeFabric::with_store(Arc::new(memory::InMemoryKnowledgeStore::new()))
-            .with_memory_sources(reader.clone());
+    let fabric = memory::KnowledgeFabric::with_store(Arc::new(
+        memory::InMemoryKnowledgeStore::new().with_memory_owner(store.clone()),
+    ))
+    .with_memory_sources(reader.clone());
     let mut ids = Vec::new();
     for (item, project, governance) in [
         (&own, "A", KnowledgeGovernanceLevel::Blocking),
@@ -2081,6 +2101,8 @@ async fn knowledge_required_source_read_failure_is_not_empty_success_or_foreign_
         store.insert(item).await.unwrap();
         let mut document = memory::DocumentContent::new(&item.title, "must retain evidence");
         document.source = Some(format!("memory:{}", item.id));
+        document.memory_source_revision =
+            Some(memory::store::MemoryEntryRevision::of(&item).unwrap());
         ids.push(
             fabric
                 .ingest_document(
@@ -2120,6 +2142,7 @@ async fn knowledge_required_source_read_failure_is_not_empty_success_or_foreign_
         .contains(&ids[2]));
     let mut rejected = memory::DocumentContent::new("must not persist", "must retain evidence");
     rejected.source = Some(reader.source.clone());
+    rejected.memory_source_revision = Some(memory::store::MemoryEntryRevision::of(&own).unwrap());
     assert!(matches!(
         fabric.ingest_document(
             KnowledgeNamespace::Project("A".into()),
@@ -2202,7 +2225,8 @@ async fn later_retirement_epoch_preserves_earlier_pending_and_exact_receipts() {
     use memory::store::{EphemeralMemoryStore, MemorySourceFenceReader, MemoryStore};
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(EphemeralMemoryStore::new());
-    let knowledge = Arc::new(memory::InMemoryKnowledgeStore::new());
+    let knowledge =
+        Arc::new(memory::InMemoryKnowledgeStore::new().with_memory_owner(store.clone()));
     let fabric = memory::KnowledgeFabric::with_store(knowledge).with_memory_sources(store.clone());
     let mut body = entry(
         MemoryLayer::L3,
@@ -2213,6 +2237,7 @@ async fn later_retirement_epoch_preserves_earlier_pending_and_exact_receipts() {
     store.insert(&body).await.unwrap();
     let mut document = memory::DocumentContent::new("source policy", "retain original evidence");
     document.source = Some(format!("memory:{}", body.id));
+    document.memory_source_revision = Some(memory::store::MemoryEntryRevision::of(&body).unwrap());
     let original = fabric
         .ingest_document(
             KnowledgeNamespace::Project("A".into()),
@@ -2387,4 +2412,298 @@ async fn lifecycle_receipt_binds_original_cut_and_distinguishes_later_observatio
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn knowledge_source_cut_survives_observation_but_refuses_real_replacement() {
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    use memory::store::{EphemeralMemoryStore, MemorySourceFenceReader, MemoryStore};
+    use memory::{DocumentContent, KnowledgeStore};
+    let memory_store = Arc::new(EphemeralMemoryStore::new());
+    let knowledge =
+        Arc::new(memory::InMemoryKnowledgeStore::new().with_memory_owner(memory_store.clone()));
+    let fabric = memory::KnowledgeFabric::with_store(knowledge.clone())
+        .with_memory_sources(memory_store.clone());
+    let mut original = entry(MemoryLayer::L3, MemorySource::Import, "original source cut");
+    original.scope = MemoryScope::Project("snapshot-test".into());
+    memory_store.insert(&original).await.unwrap();
+    let source_ref = format!("memory:{}", original.id);
+    let original_cut = memory::store::MemoryEntryRevision::of(&original).unwrap();
+    let mut document =
+        DocumentContent::new("source-backed policy", "must retain the original evidence");
+    document.source = Some(source_ref.clone());
+    document.memory_source_revision = Some(original_cut.clone());
+    let first = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("snapshot-test".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document.clone(),
+        )
+        .unwrap();
+    let mut observed = original.clone();
+    observed.access_count = 10;
+    memory_store.update(&observed, &original_cut).await.unwrap();
+    assert!(fabric
+        .search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), "")
+        .is_ok());
+    let prepared = |suffix: &str| {
+        let mut receipt = first.clone();
+        receipt.corpus.corpus_id = format!("prepared-corpus-{suffix}");
+        receipt.pack.pack_id = format!("prepared-pack-{suffix}");
+        receipt.pack.source_corpus_refs = vec![receipt.corpus.corpus_id.clone()];
+        receipt.canon.canon_id = format!("prepared-canon-{suffix}");
+        receipt.canon.pack_id = receipt.pack.pack_id.clone();
+        receipt.pack.canon_pack_ref = Some(receipt.canon.canon_id.clone());
+        receipt.chunks.clear();
+        receipt.corpus.chunk_count = 0;
+        receipt.conflicts.clear();
+        receipt
+    };
+    let after_observation = prepared("observation");
+    knowledge.save_receipt(&after_observation).unwrap();
+    let mut correction = original.clone();
+    correction.content = "actual replacement of the authoritative source".into();
+    memory_store
+        .update(&correction, &original_cut)
+        .await
+        .unwrap();
+    let before = serde_json::to_value(knowledge.snapshot().unwrap()).unwrap();
+    assert!(matches!(
+        knowledge.save_receipt(&prepared("stale-body")),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(
+        serde_json::to_value(knowledge.snapshot().unwrap()).unwrap(),
+        before,
+        "refusal must commit no corpus/pack/canon/receipt projection"
+    );
+    assert!(matches!(
+        fabric.ingest_document(
+            KnowledgeNamespace::Project("snapshot-test".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document
+        ),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+    assert!(matches!(
+        fabric.search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), ""),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(
+        knowledge.save_receipt(&first).unwrap().corpus,
+        first.corpus,
+        "an immutable old receipt remains its original fact"
+    );
+    let mut fresh =
+        DocumentContent::new("source-backed policy", "must retain the corrected evidence");
+    fresh.source = Some(source_ref.clone());
+    fresh.memory_source_revision =
+        Some(memory::store::MemoryEntryRevision::of(&correction).unwrap());
+    let current = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("snapshot-test".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            fresh,
+        )
+        .unwrap();
+    assert_ne!(
+        current.corpus.corpus_id, first.corpus.corpus_id,
+        "a different source cut cannot rebind the original corpus identity"
+    );
+    assert!(matches!(
+        memory_store.read_source_revision(&source_ref, 1),
+        Err(memory::MemoryError::SourceReadLimit)
+    ));
+    let mut detached_ingestion = current.clone();
+    detached_ingestion.pack.source_corpus_refs.clear();
+    let before_detached = serde_json::to_value(knowledge.snapshot().unwrap()).unwrap();
+    assert!(matches!(
+        knowledge.save_receipt(&detached_ingestion),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(
+        serde_json::to_value(knowledge.snapshot().unwrap()).unwrap(),
+        before_detached
+    );
+    let mut rebound = current.clone();
+    rebound.pack.pack_id = "rebind-old-corpus-pack".into();
+    rebound.canon.pack_id = rebound.pack.pack_id.clone();
+    rebound.canon.canon_id = "rebind-old-corpus-canon".into();
+    rebound.pack.canon_pack_ref = Some(rebound.canon.canon_id.clone());
+    rebound.corpus.corpus_id = first.corpus.corpus_id.clone();
+    rebound.pack.source_corpus_refs = vec![first.corpus.corpus_id.clone()];
+    rebound.chunks.clear();
+    rebound.corpus.chunk_count = 0;
+    rebound.conflicts.clear();
+    let before_rebind = serde_json::to_value(knowledge.snapshot().unwrap()).unwrap();
+    assert!(matches!(
+        knowledge.save_receipt(&rebound),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(
+        serde_json::to_value(knowledge.snapshot().unwrap()).unwrap(),
+        before_rebind
+    );
+    let mut detached = after_observation.pack.clone();
+    detached.source_corpus_refs.clear();
+    assert!(matches!(
+        knowledge.commit_maintenance(&knowledge.maintenance_inputs().unwrap(), &[detached], &[]),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+    assert_eq!(
+        serde_json::to_value(knowledge.snapshot().unwrap()).unwrap(),
+        before_rebind
+    );
+    let history_key = format!("memory_lifecycle:{}", original.id);
+    // Legal JSON with a huge prefix; the source budget must reject before
+    // history materialization, rather than merely refusing its later digest.
+    memory_store
+        .kv_put(
+            &history_key,
+            &format!(
+                "{}[]",
+                " ".repeat(memory::knowledge::KNOWLEDGE_READ_MAX_BYTES)
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        fabric.search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), ""),
+        Err(memory::KnowledgeStoreError::ReadLimit)
+    ));
+    memory_store.kv_delete(&history_key).await.unwrap();
+    // Long authorized metadata is bounded by the actual total reservation,
+    // not rejected by an invented 4KiB scope/field limit.
+    let mut long_scope = original.clone();
+    long_scope.id = uuid::Uuid::new_v4();
+    long_scope.scope = MemoryScope::Project("\"".repeat(3000));
+    memory_store.insert(&long_scope).await.unwrap();
+    let long_source = format!("memory:{}", long_scope.id);
+    let live = memory_store
+        .read_source_revision(&long_source, memory::knowledge::KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        live.revision.unwrap(),
+        memory::store::MemoryEntryRevision::of(&long_scope).unwrap()
+    );
+    let archive = memory::store::MemoryLifecycleMutation::new(
+        &long_scope,
+        None,
+        memory::MemoryLifecycleEvent {
+            memory_id: long_scope.id,
+            from: None,
+            to: memory::MemoryState::Archived,
+            reason: "long original source scope".into(),
+            session_id: "s".into(),
+            agent_id: "a".into(),
+            occurred_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+    memory_store.commit_lifecycle(archive).await.unwrap();
+    let retired = memory_store
+        .read_source_revision(&long_source, memory::knowledge::KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap()
+        .unwrap();
+    assert!(retired.fence.retired);
+    assert!(retired.revision.is_none());
+    assert!(retired.materialized_bytes > 4096);
+    assert!(matches!(
+        memory_store.read_source_revision(&long_source, 4096),
+        Err(memory::MemoryError::SourceReadLimit)
+    ));
+    let mut foreign = prepared("foreign-scope");
+    foreign.corpus.memory_body_revision = current.corpus.memory_body_revision.clone();
+    foreign.corpus.namespace = KnowledgeNamespace::Project("foreign".into());
+    foreign.pack.namespace = foreign.corpus.namespace.clone();
+    assert!(matches!(
+        knowledge.save_receipt(&foreign),
+        Err(memory::KnowledgeStoreError::StaleRead)
+    ));
+}
+
+#[tokio::test]
+async fn knowledge_shared_large_source_is_read_once_for_the_original_candidate_frame() {
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    use memory::store::{EphemeralMemoryStore, MemorySourceFenceReader, MemoryStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Reader {
+        owner: Arc<EphemeralMemoryStore>,
+        reads: AtomicUsize,
+    }
+    impl MemorySourceFenceReader for Reader {
+        fn read_source_fence(
+            &self,
+            source: &str,
+        ) -> memory::store::Result<Option<memory::store::MemorySourceFence>> {
+            self.owner.read_source_fence(source)
+        }
+        fn read_source_revision(
+            &self,
+            source: &str,
+            budget: usize,
+        ) -> memory::store::Result<Option<memory::store::MemorySourceRevisionRead>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.owner.read_source_revision(source, budget)
+        }
+    }
+    let owner = Arc::new(EphemeralMemoryStore::new());
+    let mut source = entry(
+        MemoryLayer::L3,
+        MemorySource::Import,
+        &"x".repeat(1024 * 1024),
+    );
+    source.scope = MemoryScope::Project("shared-source".into());
+    owner.insert(&source).await.unwrap();
+    let reader = Arc::new(Reader {
+        owner: owner.clone(),
+        reads: AtomicUsize::new(0),
+    });
+    let fabric = memory::KnowledgeFabric::with_store(Arc::new(
+        memory::InMemoryKnowledgeStore::new().with_memory_owner(owner),
+    ))
+    .with_memory_sources(reader.clone());
+    for index in 0..10 {
+        let mut document =
+            memory::DocumentContent::new(format!("policy-{index}"), "must retain source evidence");
+        document.source = Some(format!("memory:{}", source.id));
+        document.memory_source_revision =
+            Some(memory::store::MemoryEntryRevision::of(&source).unwrap());
+        fabric
+            .ingest_document(
+                KnowledgeNamespace::Project("shared-source".into()),
+                KnowledgeActivationPolicy::DefaultForProjectGroup,
+                KnowledgeGovernanceLevel::Required,
+                document,
+            )
+            .unwrap();
+    }
+    reader.reads.store(0, Ordering::SeqCst);
+    let view = fabric
+        .search_namespace(&KnowledgeNamespace::Project("shared-source".into()), "")
+        .unwrap();
+    assert_eq!(
+        view.packs.len(),
+        10,
+        "all ten required policies fit with their one original source"
+    );
+    for index in 0..10 {
+        assert!(view
+            .packs
+            .iter()
+            .any(|pack| pack.name == format!("policy-{index}")));
+    }
+    assert_eq!(
+        reader.reads.load(Ordering::SeqCst),
+        1,
+        "the same immutable source cut must not be materialized for every referencing pack"
+    );
 }

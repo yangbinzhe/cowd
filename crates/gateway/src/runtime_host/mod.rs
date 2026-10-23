@@ -2574,9 +2574,10 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(EphemeralMemoryStore::new());
-        let fabric =
-            memory::KnowledgeFabric::with_store(Arc::new(memory::InMemoryKnowledgeStore::new()))
-                .with_memory_sources(store.clone());
+        let fabric = memory::KnowledgeFabric::with_store(Arc::new(
+            memory::InMemoryKnowledgeStore::new().with_memory_owner(store.clone()),
+        ))
+        .with_memory_sources(store.clone());
         let mut config = MemoryConfig::default();
         config.store.blob_dir = root.path().join("blobs");
         config.store.enable_vector_index = false;
@@ -2608,6 +2609,10 @@ mod tests {
             .unwrap();
         let mut document = memory::DocumentContent::new("derived pack", "Retain evidence.");
         document.source = Some(format!("memory:{id}"));
+        document.memory_source_revision = Some(
+            memory::store::MemoryEntryRevision::of(&store.get(&id).await.unwrap().unwrap())
+                .unwrap(),
+        );
         let receipt = fabric
             .ingest_document(
                 harness_contract::knowledge::KnowledgeNamespace::SharedLibrary("global".into()),

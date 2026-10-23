@@ -10,6 +10,12 @@ pub enum MemoryError {
     )]
     EmbeddingCredentialsRequired,
 
+    #[error("Memory source cut is stale or foreign")]
+    StaleSource,
+
+    #[error("Memory source read budget exceeded")]
+    SourceReadLimit,
+
     #[error("storage error: {0}")]
     Store(String),
 

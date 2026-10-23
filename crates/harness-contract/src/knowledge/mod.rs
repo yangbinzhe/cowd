@@ -264,6 +264,9 @@ pub struct KnowledgeCorpus {
     pub namespace: KnowledgeNamespace,
     pub source_ref: KernelRef,
     pub source_hash: String,
+    /// Exact original Memory body cut, never inferred from a later source head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_body_revision: Option<String>,
     pub state: KnowledgeObjectState,
     pub chunk_count: usize,
     pub created_at: DateTime<Utc>,

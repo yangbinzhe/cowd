@@ -987,7 +987,82 @@ mod scope_tests {
     }
 }
 
+/// Keeps the original Memory read guard alive across the dependent in-memory
+/// Knowledge commit. It owns no writable projection or duplicated source state.
+pub(crate) struct MemorySourceRevisionGuard<'a> {
+    _state: std::sync::RwLockReadGuard<'a, State>,
+    pub read: MemorySourceRevisionRead,
+}
+impl EphemeralMemoryStore {
+    pub(crate) fn source_revision_guard(
+        &self,
+        source_ref: &str,
+        budget_bytes: usize,
+    ) -> Result<Option<MemorySourceRevisionGuard<'_>>> {
+        let state = self.read()?;
+        let id = source_ref
+            .strip_prefix("memory:")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .filter(|id| format!("memory:{id}") == source_ref)
+            .ok_or_else(|| MemoryError::Store("invalid Memory source identity".into()))?;
+        if let Some(fence) = state
+            .source_fences
+            .get(source_ref)
+            .filter(|fence| fence.retired)
+        {
+            let bytes = fence.read_bytes(budget_bytes)?;
+            if fence.source_ref != source_ref
+                || state
+                    .entries
+                    .get(&id.to_string())
+                    .is_some_and(|entry| entry.scope.scope_key() != fence.scope_key)
+            {
+                return Err(MemoryError::StaleSource);
+            }
+            let read = MemorySourceRevisionRead {
+                fence: fence.clone(),
+                revision: None,
+                materialized_bytes: bytes,
+            };
+            return Ok(Some(MemorySourceRevisionGuard {
+                _state: state,
+                read,
+            }));
+        }
+        let Some(entry) = state.entries.get(&id.to_string()) else {
+            if state.source_fences.contains_key(source_ref) {
+                return Err(MemoryError::Store("live Memory source body missing".into()));
+            }
+            return Ok(None);
+        };
+        let read = live_source_revision(
+            source_ref,
+            entry,
+            state
+                .kv
+                .get(&format!("memory_lifecycle:{id}"))
+                .map(String::as_str),
+            state.source_fences.get(source_ref),
+            budget_bytes,
+        )?;
+        Ok(Some(MemorySourceRevisionGuard {
+            _state: state,
+            read,
+        }))
+    }
+}
+
 impl MemorySourceFenceReader for EphemeralMemoryStore {
+    fn read_source_revision(
+        &self,
+        source_ref: &str,
+        budget_bytes: usize,
+    ) -> Result<Option<MemorySourceRevisionRead>> {
+        Ok(self
+            .source_revision_guard(source_ref, budget_bytes)?
+            .map(|guard| guard.read.clone()))
+    }
+
     fn read_source_fence(&self, source_ref: &str) -> Result<Option<MemorySourceFence>> {
         let parsed = source_ref
             .strip_prefix("memory:")
@@ -999,6 +1074,22 @@ impl MemorySourceFenceReader for EphemeralMemoryStore {
             ));
         }
         let state = self.read()?;
+        let history = if state.source_fences.contains_key(source_ref) {
+            None
+        } else {
+            state.kv.get(&format!("memory_lifecycle:{parsed}"))
+        };
+        reserved_source_bytes(
+            &(
+                &state
+                    .entries
+                    .get(&parsed.to_string())
+                    .map(|entry| &entry.scope),
+                &state.source_fences.get(source_ref),
+                history,
+            ),
+            crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+        )?;
         if let Some(fence) = state.source_fences.get(source_ref) {
             if fence.source_ref != source_ref
                 || source_ref
@@ -1026,6 +1117,9 @@ impl MemorySourceFenceReader for EphemeralMemoryStore {
             return Ok(None);
         };
         let history = state.kv.get(&format!("memory_lifecycle:{id}"));
+        if history.is_some_and(|raw| raw.len() > crate::knowledge::KNOWLEDGE_READ_MAX_BYTES) {
+            return Err(MemoryError::SourceReadLimit);
+        }
         Ok(Some(MemorySourceFence {
             source_ref: source_ref.into(),
             scope_key: entry.scope.scope_key(),

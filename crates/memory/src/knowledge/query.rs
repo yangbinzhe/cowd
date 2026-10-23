@@ -78,6 +78,7 @@ pub struct KnowledgeCandidateSource {
     pub corpus_id: String,
     pub namespace: KnowledgeNamespace,
     pub source_ref: String,
+    pub memory_body_revision: Option<String>,
 }
 
 #[derive(Debug, Clone)]
