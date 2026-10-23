@@ -290,6 +290,10 @@ impl MemoryStore for EphemeralMemoryStore {
         Ok(receipt)
     }
 
+    async fn lifecycle_receipt(&self, mutation_id: &str) -> Result<Option<MemoryLifecycleReceipt>> {
+        Ok(self.read()?.lifecycle_receipts.get(mutation_id).cloned())
+    }
+
     async fn pending_memory_cleanup(
         &self,
         after_mutation: Option<&str>,

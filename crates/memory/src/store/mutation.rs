@@ -232,47 +232,63 @@ fn typed_digest(domain: &str, value: &impl Serialize) -> Result<String> {
 }
 
 impl MemoryLifecycleMutation {
-    /// Stable command identity excludes observation time and the mutable read
-    /// cut. Retrying an acknowledged or response-lost command returns its own
-    /// original receipt; a different command cannot borrow that receipt.
+    /// A retry carries the original source cut. Observation time is assigned by
+    /// the first commit, while a later transition over a different history is
+    /// a different command even when its actor, reason and target state match.
     pub fn new(
         entry: &MemoryEntry,
         expected_history: Option<String>,
         event: MemoryLifecycleEvent,
     ) -> Result<Self> {
-        let scope_key = entry.scope.scope_key();
-        let mutation_id = typed_digest(
-            "cowd.memory.lifecycle.id.v1",
-            &(
-                &scope_key,
-                event.memory_id,
-                &event.session_id,
-                &event.agent_id,
-                event.to,
-                &event.reason,
-            ),
-        )?;
-        Ok(Self {
-            mutation_id,
-            scope_key,
+        let mut command = Self {
+            mutation_id: String::new(),
+            scope_key: entry.scope.scope_key(),
             expected_entry_digest: MemoryEntryRevision::of(entry)?.body_digest,
             expected_history,
             event,
-        })
+        };
+        let mutation_id = if matches!(
+            command.event.to,
+            MemoryState::Archived | MemoryState::Superseded
+        ) {
+            // Irreversible retirement is a stable user operation. Confirming it
+            // later uses the original receipt, never a newly rebound read cut.
+            typed_digest(
+                "cowd.memory.retirement.id.v2",
+                &(
+                    &command.scope_key,
+                    command.event.memory_id,
+                    &command.event.session_id,
+                    &command.event.agent_id,
+                    command.event.to,
+                    &command.event.reason,
+                ),
+            )?
+        } else {
+            typed_digest("cowd.memory.lifecycle.id.v2", &command.input_cut())?
+        };
+        command.mutation_id = mutation_id;
+        Ok(command)
+    }
+
+    fn input_cut(&self) -> impl Serialize + '_ {
+        (
+            &self.scope_key,
+            &self.expected_entry_digest,
+            &self.expected_history,
+            self.event.memory_id,
+            self.event.from,
+            self.event.to,
+            &self.event.session_id,
+            &self.event.agent_id,
+            &self.event.reason,
+        )
     }
 
     pub fn command_digest(&self) -> Result<String> {
         typed_digest(
-            "cowd.memory.lifecycle.command.v1",
-            &(
-                &self.mutation_id,
-                &self.scope_key,
-                self.event.memory_id,
-                &self.event.session_id,
-                &self.event.agent_id,
-                self.event.to,
-                &self.event.reason,
-            ),
+            "cowd.memory.lifecycle.command.v2",
+            &(&self.mutation_id, self.input_cut()),
         )
     }
 
@@ -284,6 +300,29 @@ impl MemoryLifecycleMutation {
         {
             return Err(MemoryError::Store(
                 "Memory lifecycle mutation identity collision".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A read-only confirmation of an irreversible original operation is not
+    /// admission of this newly assembled command or its current read cut.
+    pub fn validate_retirement_confirmation(&self, receipt: &MemoryLifecycleReceipt) -> Result<()> {
+        receipt.source.verifies_retirement(&receipt.source)?;
+        if !matches!(
+            self.event.to,
+            MemoryState::Archived | MemoryState::Superseded
+        ) || receipt.mutation_id != self.mutation_id
+            || receipt.source.source_ref != format!("memory:{}", self.event.memory_id)
+            || receipt.source.scope_key != self.scope_key
+            || receipt.event.memory_id != self.event.memory_id
+            || receipt.event.to != self.event.to
+            || receipt.event.session_id != self.event.session_id
+            || receipt.event.agent_id != self.event.agent_id
+            || receipt.event.reason != self.event.reason
+        {
+            return Err(MemoryError::Store(
+                "foreign Memory retirement confirmation".into(),
             ));
         }
         Ok(())

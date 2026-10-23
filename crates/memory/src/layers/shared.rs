@@ -382,6 +382,12 @@ impl crate::store::MemoryStore for NoopStore {
     ) -> crate::store::Result<crate::store::MemoryLifecycleReceipt> {
         Self::unavailable()
     }
+    async fn lifecycle_receipt(
+        &self,
+        _: &str,
+    ) -> crate::store::Result<Option<crate::store::MemoryLifecycleReceipt>> {
+        Self::unavailable()
+    }
     async fn pending_memory_cleanup(
         &self,
         _: Option<&str>,

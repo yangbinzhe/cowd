@@ -130,15 +130,40 @@ async fn real_postgres_memory_body_cas_create_conflict_and_observation_survive_r
         .update(&later_observation, &MemoryEntryRevision::of(&got).unwrap())
         .await
         .unwrap();
+    let receipt = reopened.commit_lifecycle(archive.clone()).await.unwrap();
     assert!(
-        reopened
-            .commit_lifecycle(archive)
-            .await
-            .unwrap()
-            .source
-            .retired,
+        receipt.source.retired,
         "native lifecycle uses the same semantic body cut as correction"
     );
+    assert_eq!(
+        reopened
+            .lifecycle_receipt(&archive.mutation_id)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    assert!(reopened
+        .lifecycle_receipt("unknown-operation")
+        .await
+        .unwrap()
+        .is_none());
+    archive.validate_retirement_confirmation(&receipt).unwrap();
+    for field in ["scope", "actor", "memory", "state", "reason"] {
+        let mut foreign = archive.clone();
+        match field {
+            "scope" => foreign.scope_key = "foreign-scope".into(),
+            "actor" => foreign.event.agent_id = "foreign-agent".into(),
+            "memory" => foreign.event.memory_id = uuid::Uuid::new_v4(),
+            "state" => foreign.event.to = memory::MemoryState::Observed,
+            "reason" => foreign.event.reason = "foreign reason".into(),
+            _ => unreachable!(),
+        }
+        assert!(foreign.validate_retirement_confirmation(&receipt).is_err());
+    }
+    let mut forged = archive.clone();
+    forged.expected_entry_digest = "different cut".into();
+    assert!(reopened.commit_lifecycle(forged).await.is_err());
+    assert_eq!(reopened.commit_lifecycle(archive).await.unwrap(), receipt);
 }
 
 #[tokio::test]
@@ -1833,4 +1858,95 @@ fn real_postgres_knowledge_source_retirement_ignores_foreign_budget_and_reopens(
     drop(connection);
     drop(reopened);
     drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_lifecycle_receipt_binds_cut_and_later_observations_after_reopen() {
+    let fixture = PostgresTestScope::new();
+    let store = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
+    let original = memory_entry(uuid::Uuid::new_v4(), "receipt-cut");
+    store.insert(&original).await.unwrap();
+    let first_event = memory::MemoryLifecycleEvent {
+        memory_id: original.id,
+        from: None,
+        to: memory::MemoryState::Observed,
+        reason: "accepted source observation".into(),
+        session_id: "receipt-session".into(),
+        agent_id: "receipt-agent".into(),
+        occurred_at: chrono::Utc::now(),
+    };
+    let first =
+        memory::store::MemoryLifecycleMutation::new(&original, None, first_event.clone()).unwrap();
+    let receipt = store.commit_lifecycle(first.clone()).await.unwrap();
+    let history_key = format!("memory_lifecycle:{}", original.id);
+    let history = store.kv_get(&history_key).await.unwrap().unwrap();
+    for field in [
+        "body", "history", "from", "scope", "actor", "memory", "state", "reason",
+    ] {
+        let mut forged = first.clone();
+        match field {
+            "body" => forged.expected_entry_digest = "foreign-body".into(),
+            "history" => forged.expected_history = Some("[]".into()),
+            "from" => forged.event.from = Some(memory::MemoryState::Active),
+            "scope" => forged.scope_key = "foreign-scope".into(),
+            "actor" => forged.event.agent_id = "foreign-agent".into(),
+            "memory" => forged.event.memory_id = uuid::Uuid::new_v4(),
+            "state" => forged.event.to = memory::MemoryState::Active,
+            "reason" => forged.event.reason = "foreign reason".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            store.commit_lifecycle(forged).await.is_err(),
+            "replay must bind original {field}"
+        );
+        assert_eq!(
+            store.kv_get(&history_key).await.unwrap().as_deref(),
+            Some(history.as_str())
+        );
+    }
+    let mut second_event = first_event.clone();
+    second_event.from = Some(memory::MemoryState::Observed);
+    second_event.occurred_at += chrono::Duration::seconds(1);
+    let second =
+        memory::store::MemoryLifecycleMutation::new(&original, Some(history), second_event.clone())
+            .unwrap();
+    let second_receipt = store.commit_lifecycle(second).await.unwrap();
+    assert_eq!(second_receipt.event, second_event);
+    let mut third_event = second_event.clone();
+    third_event.occurred_at += chrono::Duration::seconds(1);
+    let third = memory::store::MemoryLifecycleMutation::new(
+        &original,
+        store.kv_get(&history_key).await.unwrap(),
+        third_event.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        store.commit_lifecycle(third).await.unwrap().event,
+        third_event
+    );
+    assert_eq!(
+        store.commit_lifecycle(first.clone()).await.unwrap(),
+        receipt
+    );
+    let events: Vec<memory::MemoryLifecycleEvent> =
+        serde_json::from_str(&store.kv_get(&history_key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(events, vec![first_event, second_event, third_event]);
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    drop(store);
+    let reopened = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
+    assert_eq!(
+        reopened.commit_lifecycle(first.clone()).await.unwrap(),
+        receipt
+    );
+    let mut forged = first;
+    forged.expected_history = Some("[]".into());
+    assert!(reopened.commit_lifecycle(forged).await.is_err());
+    let recovered: Vec<memory::MemoryLifecycleEvent> =
+        serde_json::from_str(&reopened.kv_get(&history_key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(recovered, events);
 }

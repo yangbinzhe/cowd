@@ -1481,6 +1481,13 @@ impl MemoryKernel {
             occurred_at: Utc::now(),
         };
         let command = crate::store::MemoryLifecycleMutation::new(&entry, history, event)?;
+        if from == Some(to) && matches!(to, MemoryState::Archived | MemoryState::Superseded) {
+            if let Some(receipt) = store.lifecycle_receipt(&command.mutation_id).await? {
+                command.validate_retirement_confirmation(&receipt)?;
+                self.manager.notify_memory_cleanup();
+                return Ok(());
+            }
+        }
         store.commit_lifecycle(command).await?;
         self.manager.notify_memory_cleanup();
         Ok(())

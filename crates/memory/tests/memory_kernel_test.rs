@@ -2306,3 +2306,85 @@ async fn later_retirement_epoch_preserves_earlier_pending_and_exact_receipts() {
         "archive is not erase"
     );
 }
+
+#[tokio::test]
+async fn lifecycle_receipt_binds_original_cut_and_distinguishes_later_observations() {
+    use memory::store::{EphemeralMemoryStore, MemoryStore};
+    let store = EphemeralMemoryStore::new();
+    let original = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "original receipt source",
+    );
+    store.insert(&original).await.unwrap();
+    let first_event = memory::MemoryLifecycleEvent {
+        memory_id: original.id,
+        from: None,
+        to: memory::MemoryState::Observed,
+        reason: "accepted source observation".into(),
+        session_id: "receipt-session".into(),
+        agent_id: "receipt-agent".into(),
+        occurred_at: chrono::Utc::now(),
+    };
+    let first =
+        memory::store::MemoryLifecycleMutation::new(&original, None, first_event.clone()).unwrap();
+    let receipt = store.commit_lifecycle(first.clone()).await.unwrap();
+    let history_key = format!("memory_lifecycle:{}", original.id);
+    let history = store.kv_get(&history_key).await.unwrap().unwrap();
+    for field in [
+        "body", "history", "from", "scope", "actor", "memory", "state", "reason",
+    ] {
+        let mut forged = first.clone();
+        match field {
+            "body" => forged.expected_entry_digest = "foreign-body".into(),
+            "history" => forged.expected_history = Some("[]".into()),
+            "from" => forged.event.from = Some(memory::MemoryState::Active),
+            "scope" => forged.scope_key = "foreign-scope".into(),
+            "actor" => forged.event.agent_id = "foreign-agent".into(),
+            "memory" => forged.event.memory_id = uuid::Uuid::new_v4(),
+            "state" => forged.event.to = memory::MemoryState::Active,
+            "reason" => forged.event.reason = "foreign reason".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            store.commit_lifecycle(forged).await.is_err(),
+            "replay must bind original {field}"
+        );
+        assert_eq!(
+            store.kv_get(&history_key).await.unwrap().as_deref(),
+            Some(history.as_str())
+        );
+    }
+    let mut second_event = first_event.clone();
+    second_event.from = Some(memory::MemoryState::Observed);
+    second_event.occurred_at += chrono::Duration::seconds(1);
+    let second =
+        memory::store::MemoryLifecycleMutation::new(&original, Some(history), second_event.clone())
+            .unwrap();
+    let second_receipt = store.commit_lifecycle(second).await.unwrap();
+    assert_eq!(second_receipt.event, second_event);
+    let mut third_event = second_event.clone();
+    third_event.occurred_at += chrono::Duration::seconds(1);
+    let third = memory::store::MemoryLifecycleMutation::new(
+        &original,
+        store.kv_get(&history_key).await.unwrap(),
+        third_event.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        store.commit_lifecycle(third).await.unwrap().event,
+        third_event
+    );
+    assert_eq!(
+        store.commit_lifecycle(first.clone()).await.unwrap(),
+        receipt
+    );
+    let events: Vec<memory::MemoryLifecycleEvent> =
+        serde_json::from_str(&store.kv_get(&history_key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(events, vec![first_event, second_event, third_event]);
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+}

@@ -236,6 +236,9 @@ pub trait MemoryStore: Send + Sync {
         &self,
         command: MemoryLifecycleMutation,
     ) -> Result<MemoryLifecycleReceipt>;
+    /// Read an immutable original receipt by its exact operation identity. This
+    /// does not admit a mutation or rebind its original source cut.
+    async fn lifecycle_receipt(&self, mutation_id: &str) -> Result<Option<MemoryLifecycleReceipt>>;
     /// Bounded original pending obligations. Confirmations require exact identity/epoch.
     async fn pending_memory_cleanup(
         &self,

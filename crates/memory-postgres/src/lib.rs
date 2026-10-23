@@ -974,6 +974,41 @@ impl MemoryStore for PostgresMemoryStore {
         }).await
     }
 
+    async fn lifecycle_receipt(
+        &self,
+        mutation_id: &str,
+    ) -> MemoryResult<Option<MemoryLifecycleReceipt>> {
+        let store = self.clone();
+        let mutation_id = mutation_id.to_owned();
+        run_memory_blocking(move || {
+            let mut connection = store
+                .executor
+                .checkout_online_read()
+                .map_err(storage_memory_error)?;
+            let receipt: Option<MemoryLifecycleReceipt> = connection
+                .query_opt(
+                    "SELECT payload FROM memory_lifecycle_receipts WHERE mutation_id=$1",
+                    &[&mutation_id],
+                )
+                .map_err(postgres_memory_error)?
+                .map(|row| {
+                    serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?)
+                        .map_err(json_memory_error)
+                })
+                .transpose()?;
+            if receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.mutation_id != mutation_id)
+            {
+                return Err(MemoryError::Store(
+                    "Memory lifecycle receipt identity mismatch".into(),
+                ));
+            }
+            Ok(receipt)
+        })
+        .await
+    }
+
     async fn pending_memory_cleanup(
         &self,
         after_mutation: Option<&str>,
