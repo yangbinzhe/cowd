@@ -925,3 +925,267 @@ async fn real_postgres_memory_body_and_verbatim_rollback_and_reopen_together() {
     drop(executor);
     drop(std::mem::ManuallyDrop::into_inner(fixture));
 }
+
+fn postgres_query_rule(
+    fabric: &KnowledgeFabric,
+    namespace: KnowledgeNamespace,
+    title: &str,
+    level: KnowledgeGovernanceLevel,
+) -> memory::KnowledgeIngestionReceipt {
+    fabric
+        .ingest_document(
+            namespace,
+            KnowledgeActivationPolicy::DefaultForDomain,
+            level,
+            DocumentContent::new(title, "must validate source before write"),
+        )
+        .unwrap()
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_scope_is_applied_before_foreign_payload_budget() {
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let store = Arc::new(PostgresKnowledgeStore::new(fixture.reconnect()).unwrap());
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let own = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("A".into()),
+        "A policy",
+        KnowledgeGovernanceLevel::Required,
+    );
+    let foreign = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("B".into()),
+        "B policy",
+        KnowledgeGovernanceLevel::Advisory,
+    );
+    let shared = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::SharedLibrary("global".into()),
+        "shared safety",
+        KnowledgeGovernanceLevel::Blocking,
+    );
+    let mut oversized = foreign.pack.clone();
+    oversized.name = "x".repeat(memory::knowledge::KNOWLEDGE_READ_MAX_BYTES + 1);
+    store
+        .commit_maintenance(&store.maintenance_inputs().unwrap(), &[oversized], &[])
+        .unwrap();
+    let (plan, canon, warnings) = fabric
+        .activate("s", "validate source", "main", Some("A"))
+        .unwrap();
+    assert!(plan.active_pack_ids.contains(&own.pack.pack_id));
+    assert!(plan.active_pack_ids.contains(&shared.pack.pack_id));
+    assert!(!plan.active_pack_ids.contains(&foreign.pack.pack_id));
+    assert!(canon.iter().any(|item| item.pack_id == shared.pack.pack_id));
+    assert!(warnings
+        .iter()
+        .any(|item| item.pack_id == shared.pack.pack_id
+            && item.level == KnowledgeGovernanceLevel::Blocking));
+    assert!(matches!(
+        fabric.activate("s", "validate source", "main", Some("B")),
+        Err(KnowledgeStoreError::ReadLimit)
+    ));
+    drop(fabric);
+    drop(store);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_continuation_preserves_scope_revision_and_restart_identity() {
+    use memory::knowledge::{KnowledgeCandidateScope, KNOWLEDGE_READ_MAX_BYTES};
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let store = Arc::new(PostgresKnowledgeStore::new(fixture.reconnect()).unwrap());
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let first_receipt = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("A".into()),
+        "A first",
+        KnowledgeGovernanceLevel::Required,
+    );
+    postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("A".into()),
+        "A second",
+        KnowledgeGovernanceLevel::Required,
+    );
+    postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::SharedLibrary("global".into()),
+        "shared first",
+        KnowledgeGovernanceLevel::Blocking,
+    );
+    let scope = KnowledgeCandidateScope::Activation {
+        project_id: Some("A".into()),
+    };
+    let first = store
+        .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap();
+    let cursor = first
+        .next
+        .as_ref()
+        .expect("the original read must actually continue")
+        .clone();
+    postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("B".into()),
+        "B late",
+        KnowledgeGovernanceLevel::Required,
+    );
+    // Original idempotent receipt replay must not advance an unchanged source.
+    let replay = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("A".into()),
+        "A first",
+        KnowledgeGovernanceLevel::Required,
+    );
+    assert_eq!(replay.pack, first_receipt.pack);
+    drop(fabric);
+    drop(store);
+    let store = Arc::new(PostgresKnowledgeStore::new(fixture.reconnect()).unwrap());
+    let continued = store
+        .read_candidate_page(&scope, Some(&cursor), 1, KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap();
+    assert_eq!(continued.revision, first.revision);
+    assert_eq!(continued.packs.len(), 1);
+    assert_ne!(continued.packs[0].pack_id, first.packs[0].pack_id);
+    let wrong_scope = KnowledgeCandidateScope::Activation {
+        project_id: Some("B".into()),
+    };
+    assert!(matches!(
+        store.read_candidate_page(&wrong_scope, Some(&cursor), 1, KNOWLEDGE_READ_MAX_BYTES),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("A".into()),
+        "A late",
+        KnowledgeGovernanceLevel::Required,
+    );
+    assert!(matches!(
+        store.read_candidate_page(&scope, Some(&cursor), 1, KNOWLEDGE_READ_MAX_BYTES),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    let fresh = store
+        .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap();
+    postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::SharedLibrary("global".into()),
+        "shared late",
+        KnowledgeGovernanceLevel::Blocking,
+    );
+    assert!(matches!(
+        store.read_candidate_page(&scope, fresh.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    drop(fabric);
+    drop(store);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_canonical_source_change_invalidates_continuation() {
+    use memory::knowledge::{KnowledgeCandidateScope, KNOWLEDGE_READ_MAX_BYTES};
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let first = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("A".into()),
+        "A first",
+        KnowledgeGovernanceLevel::Required,
+    );
+    let second = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("A".into()),
+        "A second",
+        KnowledgeGovernanceLevel::Required,
+    );
+    let scope = KnowledgeCandidateScope::Activation {
+        project_id: Some("A".into()),
+    };
+    let page = store
+        .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap();
+    assert!(page.next.is_some());
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.execute("UPDATE knowledge_canon SET payload=jsonb_set(payload,'{summary}',to_jsonb('changed canonical source'::text)) WHERE canon_id=$1",&[&second.canon.canon_id]).unwrap();
+    assert!(matches!(
+        store.read_candidate_page(&scope, page.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    // A foreign canonical binding is not granted by matching project metadata.
+    let foreign = postgres_query_rule(
+        &fabric,
+        KnowledgeNamespace::Project("B".into()),
+        "B policy",
+        KnowledgeGovernanceLevel::Blocking,
+    );
+    let mut wrong = first.pack;
+    wrong.canon_pack_ref = Some(foreign.canon.canon_id);
+    store
+        .commit_maintenance(&store.maintenance_inputs().unwrap(), &[wrong], &[])
+        .unwrap();
+    assert!(fabric
+        .activate("s", "validate source", "main", Some("A"))
+        .is_err());
+    drop(connection);
+    drop(fabric);
+    drop(store);
+    drop(executor);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_continuation_cannot_borrow_another_store_with_equal_counters() {
+    use memory::knowledge::{KnowledgeCandidateScope, KNOWLEDGE_READ_MAX_BYTES};
+    let left = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let right = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let first = Arc::new(PostgresKnowledgeStore::new(left.reconnect()).unwrap());
+    let second = Arc::new(PostgresKnowledgeStore::new(right.reconnect()).unwrap());
+    for store in [&first, &second] {
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        postgres_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A first",
+            KnowledgeGovernanceLevel::Required,
+        );
+        postgres_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A second",
+            KnowledgeGovernanceLevel::Required,
+        );
+    }
+    let scope = KnowledgeCandidateScope::Activation {
+        project_id: Some("A".into()),
+    };
+    let a = first
+        .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap();
+    let b = second
+        .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+        .unwrap();
+    assert_eq!(a.revision.counters, b.revision.counters);
+    assert_ne!(a.revision.store_id, b.revision.store_id);
+    assert!(a.next.is_some());
+    assert!(b.next.is_some());
+    assert!(matches!(
+        second.read_candidate_page(&scope, a.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES),
+        Err(KnowledgeStoreError::StaleRead)
+    ));
+    assert!(second
+        .read_candidate_page(&scope, b.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES)
+        .is_ok());
+    drop(first);
+    drop(second);
+    drop(std::mem::ManuallyDrop::into_inner(left));
+    drop(std::mem::ManuallyDrop::into_inner(right));
+}

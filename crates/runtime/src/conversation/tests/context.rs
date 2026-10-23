@@ -3982,16 +3982,13 @@ impl memory::KnowledgeStore for RefusingKnowledgeReader {
     fn projection(&self) -> Result<serde_json::Value, memory::KnowledgeStoreError> {
         refused_knowledge_read()
     }
-    fn read_candidates(
+    fn read_candidate_page(
         &self,
-        _: Option<&harness_contract::knowledge::KnowledgeNamespace>,
-    ) -> Result<
-        (
-            Vec<harness_contract::knowledge::KnowledgePack>,
-            Vec<harness_contract::knowledge::KnowledgeCanonPack>,
-        ),
-        memory::KnowledgeStoreError,
-    > {
+        _: &memory::knowledge::KnowledgeCandidateScope,
+        _: Option<&memory::knowledge::KnowledgeCandidateCursor>,
+        _: usize,
+        _: usize,
+    ) -> Result<memory::knowledge::KnowledgeCandidatePage, memory::KnowledgeStoreError> {
         refused_knowledge_read()
     }
     fn commit_maintenance(

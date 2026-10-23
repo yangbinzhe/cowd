@@ -335,17 +335,6 @@ pub trait MemoryStore: Send + Sync {
     // Verbatim sink (zero-loss raw storage)
     // -----------------------------------------------------------------------
 
-    /// Store a verbatim entry that never passes through compression.
-    async fn save_verbatim(
-        &self,
-        id: &str,
-        content: &str,
-        source: &str,
-        layer: i32,
-        timestamp: &str,
-    ) -> Result<()>;
-
-    /// Retrieve a verbatim entry by its ID.
     async fn load_verbatim_by_id(&self, id: &str) -> Result<Option<VerbatimEntry>>;
 
     /// Search verbatim entries whose content matches a SQL LIKE pattern.

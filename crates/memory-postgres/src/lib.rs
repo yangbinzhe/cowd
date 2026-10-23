@@ -261,6 +261,46 @@ const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     statements: &[
         "CREATE TABLE IF NOT EXISTS knowledge_ingestion_receipt (request_key TEXT PRIMARY KEY, input_digest TEXT NOT NULL, payload JSONB NOT NULL)",
     ],
+}, PostgresMigrationSpec {
+    id: "knowledge.0003.scoped-candidate-revisions",
+    domain: KNOWLEDGE_DOMAIN,
+    version: 3,
+    description: "bind bounded Knowledge candidate pages to original scoped source revisions",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS knowledge_candidate_revision (scope_key TEXT PRIMARY KEY, revision BIGINT NOT NULL CHECK(revision>=0))",
+        "CREATE TABLE knowledge_candidate_owner (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK(singleton), store_id TEXT NOT NULL)",
+        "INSERT INTO knowledge_candidate_owner(singleton,store_id) VALUES(TRUE,gen_random_uuid()::text)",
+        "CREATE FUNCTION knowledge_bump_candidate_namespace(ns TEXT) RETURNS void LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO knowledge_candidate_revision(scope_key,revision)
+           SELECT key,1 FROM unnest(ARRAY['ns:'||ns, CASE WHEN starts_with(ns,'project:') OR starts_with(ns,'project_group:') THEN 'act:'||ns ELSE 'act:shared' END]) AS key ORDER BY key
+           ON CONFLICT(scope_key) DO UPDATE SET revision=knowledge_candidate_revision.revision+1;
+         END $$",
+        "CREATE FUNCTION knowledge_pack_candidates_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE old_ns TEXT; new_ns TEXT; ns TEXT;
+         BEGIN
+           IF TG_OP='UPDATE' AND OLD.payload=NEW.payload AND OLD.namespace_key=NEW.namespace_key THEN RETURN NULL; END IF;
+           IF TG_OP <> 'INSERT' THEN old_ns := OLD.namespace_key; END IF;
+           IF TG_OP <> 'DELETE' THEN new_ns := NEW.namespace_key; END IF;
+           FOR ns IN SELECT DISTINCT value FROM unnest(ARRAY[old_ns,new_ns]) AS value WHERE value IS NOT NULL ORDER BY value LOOP
+             PERFORM knowledge_bump_candidate_namespace(ns);
+           END LOOP;
+           RETURN NULL;
+         END $$",
+        "CREATE TRIGGER knowledge_pack_candidate_revision AFTER INSERT OR UPDATE OR DELETE ON knowledge_pack FOR EACH ROW EXECUTE FUNCTION knowledge_pack_candidates_changed()",
+        "CREATE FUNCTION knowledge_canon_candidates_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE old_id TEXT; new_id TEXT; ns TEXT;
+         BEGIN
+           IF TG_OP='UPDATE' AND OLD.payload=NEW.payload AND OLD.canon_id=NEW.canon_id THEN RETURN NULL; END IF;
+           IF TG_OP <> 'INSERT' THEN old_id := OLD.canon_id; END IF;
+           IF TG_OP <> 'DELETE' THEN new_id := NEW.canon_id; END IF;
+           FOR ns IN SELECT DISTINCT namespace_key FROM knowledge_pack WHERE payload->>'canon_pack_ref'=ANY(ARRAY[old_id,new_id]) ORDER BY namespace_key LOOP
+             PERFORM knowledge_bump_candidate_namespace(ns);
+           END LOOP;
+           RETURN NULL;
+         END $$",
+        "CREATE TRIGGER knowledge_canon_candidate_revision AFTER INSERT OR UPDATE OR DELETE ON knowledge_canon FOR EACH ROW EXECUTE FUNCTION knowledge_canon_candidates_changed()",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -1237,25 +1277,6 @@ impl MemoryStore for PostgresMemoryStore {
         let scope_key = scope_key.to_string();
         run_memory_blocking(move || store.load_json_rows(&scope_key, "memory_triples")).await
     }
-    async fn save_verbatim(
-        &self,
-        id: &str,
-        content: &str,
-        source: &str,
-        layer: i32,
-        timestamp: &str,
-    ) -> MemoryResult<()> {
-        let store = self.clone();
-        let id = id.to_string();
-        let content = content.to_string();
-        let source = source.to_string();
-        let timestamp = timestamp.to_string();
-        run_memory_blocking(move || {
-            let mut connection = store.executor.checkout_critical().map_err(storage_memory_error)?;
-            connection.execute("INSERT INTO memory_verbatim(id,content,source,layer,timestamp) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET content=EXCLUDED.content,source=EXCLUDED.source,layer=EXCLUDED.layer,timestamp=EXCLUDED.timestamp", &[&id,&content,&source,&layer,&timestamp]).map_err(postgres_memory_error)?;
-            Ok(())
-        }).await
-    }
     async fn load_verbatim_by_id(&self, id: &str) -> MemoryResult<Option<VerbatimEntry>> {
         let store = self.clone();
         let id = id.to_string();
@@ -1603,18 +1624,22 @@ impl KnowledgeStore for PostgresKnowledgeStore {
             },
         )
     }
-    fn read_candidates(
+    fn read_candidate_page(
         &self,
-        namespace: Option<&harness_contract::knowledge::KnowledgeNamespace>,
-    ) -> Result<
-        (
-            Vec<KnowledgePack>,
-            Vec<harness_contract::knowledge::KnowledgeCanonPack>,
-        ),
-        KnowledgeStoreError,
-    > {
+        scope: &memory::knowledge::KnowledgeCandidateScope,
+        cursor: Option<&memory::knowledge::KnowledgeCandidateCursor>,
+        limit: usize,
+        budget_bytes: usize,
+    ) -> Result<memory::knowledge::KnowledgeCandidatePage, KnowledgeStoreError> {
+        use memory::knowledge::{
+            KnowledgeCandidateCursor, KnowledgeCandidatePage, KnowledgeCandidateScope,
+            KnowledgeSourceRevision, KNOWLEDGE_CANDIDATE_PAGE_SIZE, KNOWLEDGE_READ_MAX_BYTES,
+        };
         let store = self.clone();
-        let namespace = namespace.map(|ns| ns.key());
+        let scope = scope.clone();
+        let cursor = cursor.cloned();
+        let limit = limit.clamp(1, KNOWLEDGE_CANDIDATE_PAGE_SIZE);
+        let budget_bytes = budget_bytes.min(KNOWLEDGE_READ_MAX_BYTES);
         run_driver_sync(
             move || {
                 let mut connection = store
@@ -1624,18 +1649,97 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                 let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
                 tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                     .map_err(postgres_knowledge_error)?;
-                let row = tx.query_one("WITH selected AS (SELECT payload FROM knowledge_pack WHERE ($1::text IS NULL OR namespace_key=$1) UNION ALL SELECT canon.payload FROM knowledge_canon canon JOIN knowledge_pack pack ON canon.canon_id=pack.payload->>'canon_pack_ref' WHERE ($1::text IS NULL OR pack.namespace_key=$1)) SELECT count(*), COALESCE(sum(octet_length(payload::text)),0)::bigint FROM selected", &[&namespace]).map_err(postgres_knowledge_error)?;
-                check_knowledge_frame_budget(&row)?;
-                let packs = tx.query("SELECT payload FROM knowledge_pack WHERE ($1::text IS NULL OR namespace_key=$1) ORDER BY pack_id", &[&namespace]).map_err(postgres_knowledge_error)?.iter().map(|row| {
+                let keys = scope.revision_keys();
+                let mut counters = keys
+                    .iter()
+                    .map(|key| (key.clone(), 0u64))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                for row in tx.query("SELECT scope_key,revision FROM knowledge_candidate_revision WHERE scope_key=ANY($1::text[]) ORDER BY scope_key", &[&keys]).map_err(postgres_knowledge_error)? {
+                let key: String = row.try_get(0).map_err(postgres_knowledge_error)?;
+                let value: i64 = row.try_get(1).map_err(postgres_knowledge_error)?;
+                counters.insert(key, u64::try_from(value).map_err(|_| KnowledgeStoreError::StaleRead)?);
+            }
+                let store_id: String = tx
+                    .query_one(
+                        "SELECT store_id FROM knowledge_candidate_owner WHERE singleton",
+                        &[],
+                    )
+                    .map_err(postgres_knowledge_error)?
+                    .try_get(0)
+                    .map_err(postgres_knowledge_error)?;
+                let revision = KnowledgeSourceRevision { store_id, counters };
+                if let Some(cursor) = &cursor {
+                    cursor.validate(&scope, &revision)?;
+                }
+                let (namespace, project) = match &scope {
+                    KnowledgeCandidateScope::Namespace(namespace) => (Some(namespace.key()), None),
+                    KnowledgeCandidateScope::Activation { project_id } => {
+                        (None, project_id.clone())
+                    }
+                };
+                let after = cursor.as_ref().map(|cursor| cursor.after_pack_id.clone());
+                let fetch = i64::try_from(limit + 1).map_err(|_| KnowledgeStoreError::ReadLimit)?;
+                // Only bounded IDs and lengths cross the driver boundary here.
+                // Exact namespace/project filtering precedes keyset limit and size
+                // reservation; foreign payload cannot consume this page's budget.
+                let metadata = tx.query("WITH page AS (SELECT pack_id,payload FROM knowledge_pack WHERE (($1::text IS NOT NULL AND namespace_key=$1) OR ($1::text IS NULL AND ((NOT starts_with(namespace_key,'project:') AND NOT starts_with(namespace_key,'project_group:')) OR namespace_key='project:'||$2::text OR namespace_key='project_group:'||$2::text))) AND ($3::text IS NULL OR pack_id>$3) ORDER BY pack_id LIMIT $4) SELECT page.pack_id,octet_length(page.payload::text)::bigint,canon.canon_id,COALESCE(octet_length(canon.payload::text),0)::bigint,page.payload->>'canon_pack_ref' FROM page LEFT JOIN knowledge_canon canon ON canon.canon_id=page.payload->>'canon_pack_ref' AND canon.pack_id=page.pack_id ORDER BY page.pack_id", &[&namespace,&project,&after,&fetch]).map_err(postgres_knowledge_error)?;
+                let has_more = metadata.len() > limit;
+                let mut ids = Vec::<String>::new();
+                let mut canon_ids = Vec::<String>::new();
+                let mut bytes = 0usize;
+                for row in metadata.into_iter().take(limit) {
+                    let id: String = row.try_get(0).map_err(postgres_knowledge_error)?;
+                    let pack_bytes: i64 = row.try_get(1).map_err(postgres_knowledge_error)?;
+                    let canon: Option<String> = row.try_get(2).map_err(postgres_knowledge_error)?;
+                    let canon_bytes: i64 = row.try_get(3).map_err(postgres_knowledge_error)?;
+                    let referenced: Option<String> =
+                        row.try_get(4).map_err(postgres_knowledge_error)?;
+                    if referenced.is_some() && canon.is_none() {
+                        return Err(KnowledgeStoreError::Backend(
+                            "Knowledge candidate has no canonical source".into(),
+                        ));
+                    }
+                    for length in [pack_bytes, canon_bytes] {
+                        bytes = bytes
+                            .checked_add(
+                                usize::try_from(length)
+                                    .map_err(|_| KnowledgeStoreError::ReadLimit)?,
+                            )
+                            .ok_or(KnowledgeStoreError::ReadLimit)?;
+                    }
+                    if bytes > budget_bytes {
+                        return Err(KnowledgeStoreError::ReadLimit);
+                    }
+                    ids.push(id);
+                    if let Some(canon) = canon {
+                        canon_ids.push(canon);
+                    }
+                }
+                let packs = tx.query("SELECT payload FROM knowledge_pack WHERE pack_id=ANY($1::text[]) ORDER BY pack_id", &[&ids]).map_err(postgres_knowledge_error)?.iter().map(|row| {
                 let value: serde_json::Value = row.try_get(0).map_err(postgres_knowledge_error)?;
                 serde_json::from_value(value).map_err(json_knowledge_error)
-            }).collect::<Result<Vec<_>,_>>()?;
-                let canon = tx.query("SELECT canon.payload FROM knowledge_canon canon JOIN knowledge_pack pack ON canon.canon_id=pack.payload->>'canon_pack_ref' WHERE ($1::text IS NULL OR pack.namespace_key=$1) ORDER BY canon.canon_id", &[&namespace]).map_err(postgres_knowledge_error)?.iter().map(|row| {
+            }).collect::<Result<Vec<KnowledgePack>,_>>()?;
+                let canon = tx.query("SELECT payload FROM knowledge_canon WHERE canon_id=ANY($1::text[]) ORDER BY canon_id", &[&canon_ids]).map_err(postgres_knowledge_error)?.iter().map(|row| {
                 let value: serde_json::Value = row.try_get(0).map_err(postgres_knowledge_error)?;
                 serde_json::from_value(value).map_err(json_knowledge_error)
-            }).collect::<Result<Vec<_>,_>>()?;
+            }).collect::<Result<Vec<harness_contract::knowledge::KnowledgeCanonPack>,_>>()?;
+                let next = if has_more {
+                    Some(KnowledgeCandidateCursor {
+                        scope,
+                        revision: revision.clone(),
+                        after_pack_id: ids.last().ok_or(KnowledgeStoreError::StaleRead)?.clone(),
+                    })
+                } else {
+                    None
+                };
                 tx.commit().map_err(postgres_knowledge_error)?;
-                Ok((packs, canon))
+                Ok(KnowledgeCandidatePage {
+                    packs,
+                    canon,
+                    revision,
+                    materialized_bytes: bytes,
+                    next,
+                })
             },
             || {
                 KnowledgeStoreError::Backend(

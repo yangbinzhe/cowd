@@ -580,26 +580,6 @@ impl MemoryStore for EphemeralMemoryStore {
             .map(|(_, triple)| triple.clone())
             .collect())
     }
-    async fn save_verbatim(
-        &self,
-        id: &str,
-        content: &str,
-        source: &str,
-        layer: i32,
-        timestamp: &str,
-    ) -> Result<()> {
-        self.write()?.verbatim.insert(
-            id.into(),
-            VerbatimEntry {
-                id: id.into(),
-                content: content.into(),
-                source: source.into(),
-                layer,
-                timestamp: timestamp.into(),
-            },
-        );
-        Ok(())
-    }
     async fn load_verbatim_by_id(&self, id: &str) -> Result<Option<VerbatimEntry>> {
         Ok(self.read()?.verbatim.get(id).cloned())
     }

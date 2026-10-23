@@ -499,17 +499,6 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(Vec::new())
     }
 
-    async fn save_verbatim(
-        &self,
-        _id: &str,
-        _content: &str,
-        _source: &str,
-        _layer: i32,
-        _timestamp: &str,
-    ) -> crate::store::Result<()> {
-        Ok(())
-    }
-
     async fn load_verbatim_by_id(
         &self,
         _id: &str,

@@ -756,17 +756,21 @@ mod tests {
         ) -> Result<(), memory::KnowledgeStoreError> {
             self.reject_write()
         }
-        fn read_candidates(
+        fn read_candidate_page(
             &self,
-            namespace: Option<&harness_contract::knowledge::KnowledgeNamespace>,
-        ) -> Result<
-            (
-                Vec<harness_contract::knowledge::KnowledgePack>,
-                Vec<harness_contract::knowledge::KnowledgeCanonPack>,
-            ),
-            memory::KnowledgeStoreError,
-        > {
-            memory::KnowledgeStore::read_candidates(&self.inner, namespace)
+            scope: &memory::knowledge::KnowledgeCandidateScope,
+            cursor: Option<&memory::knowledge::KnowledgeCandidateCursor>,
+            limit: usize,
+            budget_bytes: usize,
+        ) -> Result<memory::knowledge::KnowledgeCandidatePage, memory::KnowledgeStoreError>
+        {
+            memory::KnowledgeStore::read_candidate_page(
+                &self.inner,
+                scope,
+                cursor,
+                limit,
+                budget_bytes,
+            )
         }
         fn maintenance_inputs(
             &self,

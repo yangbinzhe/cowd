@@ -4,6 +4,12 @@
 //! policy, and usage signals. Runtime consumes its activation result; gateway
 //! exposes projections; matrix stores the structured facts derived from it.
 
+mod query;
+pub use query::{
+    KnowledgeCandidateCursor, KnowledgeCandidatePage, KnowledgeCandidateScope,
+    KnowledgeSourceRevision, KNOWLEDGE_CANDIDATE_PAGE_SIZE,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
@@ -190,7 +196,7 @@ pub enum KnowledgeStoreError {
     Json(#[from] serde_json::Error),
     #[error("backend error: {0}")]
     Backend(String),
-    #[error("knowledge maintenance read set changed")]
+    #[error("knowledge source read set changed")]
     StaleRead,
     #[error("knowledge read exceeds the bounded frame")]
     ReadLimit,
@@ -205,12 +211,15 @@ pub trait KnowledgeStore: Send + Sync {
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
     fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
     fn projection(&self) -> Result<serde_json::Value, KnowledgeStoreError>;
-    /// Policy reads reserve only pack/canon inputs. Usage/chunk history cannot
-    /// exhaust the online activation budget; namespace filters precede reads.
-    fn read_candidates(
+    /// Scope is applied before bounded page admission. All continuations must
+    /// retain the original source revision and exact namespace/project identity.
+    fn read_candidate_page(
         &self,
-        namespace: Option<&KnowledgeNamespace>,
-    ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError>;
+        scope: &KnowledgeCandidateScope,
+        cursor: Option<&KnowledgeCandidateCursor>,
+        limit: usize,
+        budget_bytes: usize,
+    ) -> Result<KnowledgeCandidatePage, KnowledgeStoreError>;
     /// Compare the original domain read set and apply every maintenance write
     /// in one transaction. A conflicting read is never silently retried.
     fn commit_maintenance(
@@ -269,6 +278,8 @@ struct KnowledgeFabricState {
     chunks: BTreeMap<String, KnowledgeChunk>,
     usage: Vec<KnowledgeUsageSignal>,
     ingestion_receipts: BTreeMap<String, (String, KnowledgeIngestionReceipt)>,
+    candidate_revisions: BTreeMap<String, u64>,
+    candidate_store_id: String,
 }
 
 /// A read is complete or refused; these limits never truncate a policy input.
@@ -305,6 +316,8 @@ impl KnowledgeFabricState {
                 .collect(),
             usage: snapshot.usage,
             ingestion_receipts: BTreeMap::new(),
+            candidate_revisions: BTreeMap::new(),
+            candidate_store_id: String::new(),
         }
     }
 }
@@ -496,7 +509,8 @@ impl KnowledgeFabric {
         namespace: &KnowledgeNamespace,
         query: &str,
     ) -> Result<KnowledgeNamespaceSearchResult, KnowledgeStoreError> {
-        let (packs, canon) = self.store.read_candidates(Some(namespace))?;
+        let (packs, canon) =
+            self.read_complete_candidates(KnowledgeCandidateScope::Namespace(namespace.clone()))?;
         let state = KnowledgeFabricState {
             packs: packs
                 .into_iter()
@@ -549,6 +563,72 @@ impl KnowledgeFabric {
         })
     }
 
+    fn read_complete_candidates(
+        &self,
+        scope: KnowledgeCandidateScope,
+    ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError> {
+        let mut cursor = None;
+        let mut packs = Vec::new();
+        let mut canon = BTreeMap::new();
+        let mut remaining = KNOWLEDGE_READ_MAX_BYTES;
+        let mut rows = 0usize;
+        loop {
+            let page = self.store.read_candidate_page(
+                &scope,
+                cursor.as_ref(),
+                KNOWLEDGE_CANDIDATE_PAGE_SIZE,
+                remaining,
+            )?;
+            if let Some(previous) = &cursor {
+                previous.validate(&scope, &page.revision)?;
+            }
+            rows = rows
+                .checked_add(page.packs.len() + page.canon.len())
+                .ok_or(KnowledgeStoreError::ReadLimit)?;
+            if rows > KNOWLEDGE_READ_MAX_ROWS {
+                return Err(KnowledgeStoreError::ReadLimit);
+            }
+            remaining = remaining
+                .checked_sub(page.materialized_bytes)
+                .ok_or(KnowledgeStoreError::ReadLimit)?;
+            if page.next.is_some() && page.packs.is_empty() {
+                return Err(KnowledgeStoreError::Backend(
+                    "Knowledge candidate page made no progress".into(),
+                ));
+            }
+            for pack in &page.packs {
+                if let Some(reference) = &pack.canon_pack_ref {
+                    if !page
+                        .canon
+                        .iter()
+                        .any(|item| &item.canon_id == reference && item.pack_id == pack.pack_id)
+                    {
+                        return Err(KnowledgeStoreError::Backend(
+                            "Knowledge candidate canonical identity mismatch".into(),
+                        ));
+                    }
+                }
+            }
+            for item in page.canon {
+                canon.insert(item.canon_id.clone(), item);
+            }
+            packs.extend(page.packs);
+            match page.next {
+                None => return Ok((packs, canon.into_values().collect())),
+                Some(next) => {
+                    next.validate(&scope, &page.revision)?;
+                    if cursor
+                        .as_ref()
+                        .is_some_and(|previous| next.after_pack_id <= previous.after_pack_id)
+                    {
+                        return Err(KnowledgeStoreError::StaleRead);
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
         self.store.snapshot()
     }
@@ -588,7 +668,10 @@ impl KnowledgeFabric {
         ),
         KnowledgeStoreError,
     > {
-        let (packs, canon) = self.store.read_candidates(None)?;
+        let (packs, canon) =
+            self.read_complete_candidates(KnowledgeCandidateScope::Activation {
+                project_id: project_id.map(str::to_owned),
+            })?;
         let state = KnowledgeFabricState {
             packs: packs
                 .into_iter()
@@ -1227,9 +1310,20 @@ fn retire_conflicts_in_state(state: &mut KnowledgeFabricState) -> Vec<KnowledgeC
         .collect::<Vec<_>>()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InMemoryKnowledgeStore {
     state: Arc<RwLock<KnowledgeFabricState>>,
+}
+
+impl Default for InMemoryKnowledgeStore {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(KnowledgeFabricState {
+                candidate_store_id: uuid::Uuid::new_v4().to_string(),
+                ..KnowledgeFabricState::default()
+            })),
+        }
+    }
 }
 
 impl InMemoryKnowledgeStore {
@@ -1237,6 +1331,27 @@ impl InMemoryKnowledgeStore {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+fn bump_candidate_revisions(
+    state: &mut KnowledgeFabricState,
+    namespaces: impl Iterator<Item = KnowledgeNamespace>,
+) -> Result<(), KnowledgeStoreError> {
+    let keys = namespaces
+        .flat_map(|namespace| query::candidate_revision_keys(&namespace))
+        .collect::<BTreeSet<_>>();
+    if keys
+        .iter()
+        .any(|key| state.candidate_revisions.get(key).copied().unwrap_or(0) == u64::MAX)
+    {
+        return Err(KnowledgeStoreError::Backend(
+            "Knowledge candidate revision exhausted".into(),
+        ));
+    }
+    for key in keys {
+        *state.candidate_revisions.entry(key).or_default() += 1;
+    }
+    Ok(())
 }
 
 impl KnowledgeStore for InMemoryKnowledgeStore {
@@ -1257,6 +1372,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             }
             return Ok(original.clone());
         }
+        bump_candidate_revisions(&mut state, std::iter::once(receipt.pack.namespace.clone()))?;
         state
             .corpus
             .insert(receipt.corpus.corpus_id.clone(), receipt.corpus.clone());
@@ -1319,48 +1435,90 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         )
     }
 
-    fn read_candidates(
+    fn read_candidate_page(
         &self,
-        namespace: Option<&KnowledgeNamespace>,
-    ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError> {
+        scope: &KnowledgeCandidateScope,
+        cursor: Option<&KnowledgeCandidateCursor>,
+        limit: usize,
+        budget_bytes: usize,
+    ) -> Result<KnowledgeCandidatePage, KnowledgeStoreError> {
         let state = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut budget = Budget(0);
-        let mut rows = 0;
-        // Borrowed references only before admission; never clone and truncate.
-        let mut packs = Vec::new();
-        let mut canons = Vec::new();
-        for pack in state
+        let revision = KnowledgeSourceRevision {
+            store_id: state.candidate_store_id.clone(),
+            counters: scope
+                .revision_keys()
+                .into_iter()
+                .map(|key| {
+                    let value = state.candidate_revisions.get(&key).copied().unwrap_or(0);
+                    (key, value)
+                })
+                .collect(),
+        };
+        if let Some(cursor) = cursor {
+            cursor.validate(scope, &revision)?;
+        }
+        let limit = limit.clamp(1, KNOWLEDGE_CANDIDATE_PAGE_SIZE);
+        let budget_bytes = budget_bytes.min(KNOWLEDGE_READ_MAX_BYTES);
+        let selected = state
             .packs
             .values()
-            .filter(|pack| namespace.is_none_or(|ns| &pack.namespace == ns))
-        {
-            rows += 1;
-            if rows > KNOWLEDGE_READ_MAX_ROWS {
+            .filter(|pack| {
+                scope.includes(&pack.namespace)
+                    && cursor.is_none_or(|cursor| pack.pack_id > cursor.after_pack_id)
+            })
+            .take(limit + 1)
+            .collect::<Vec<_>>();
+        let has_more = selected.len() > limit;
+        let mut budget = Budget(0);
+        let mut packs = Vec::new();
+        let mut canon = Vec::new();
+        for pack in selected.into_iter().take(limit) {
+            serde_json::to_writer(&mut budget, pack).map_err(|_| KnowledgeStoreError::ReadLimit)?;
+            if budget.0 > budget_bytes {
                 return Err(KnowledgeStoreError::ReadLimit);
             }
-            serde_json::to_writer(&mut budget, pack).map_err(|_| KnowledgeStoreError::ReadLimit)?;
-            packs.push(pack);
-            if let Some(canon) = pack
+            if let Some(item) = pack
                 .canon_pack_ref
                 .as_ref()
                 .and_then(|id| state.canon.get(id))
             {
-                rows += 1;
-                if rows > KNOWLEDGE_READ_MAX_ROWS {
+                if item.pack_id != pack.pack_id {
+                    return Err(KnowledgeStoreError::Backend(
+                        "Knowledge candidate canonical identity mismatch".into(),
+                    ));
+                }
+                serde_json::to_writer(&mut budget, item)
+                    .map_err(|_| KnowledgeStoreError::ReadLimit)?;
+                if budget.0 > budget_bytes {
                     return Err(KnowledgeStoreError::ReadLimit);
                 }
-                serde_json::to_writer(&mut budget, canon)
-                    .map_err(|_| KnowledgeStoreError::ReadLimit)?;
-                canons.push(canon);
+                canon.push(item);
             }
+            packs.push(pack);
         }
-        Ok((
-            packs.into_iter().cloned().collect(),
-            canons.into_iter().cloned().collect(),
-        ))
+        let next = if has_more {
+            Some(KnowledgeCandidateCursor {
+                scope: scope.clone(),
+                revision: revision.clone(),
+                after_pack_id: packs
+                    .last()
+                    .ok_or(KnowledgeStoreError::StaleRead)?
+                    .pack_id
+                    .clone(),
+            })
+        } else {
+            None
+        };
+        Ok(KnowledgeCandidatePage {
+            packs: packs.into_iter().cloned().collect(),
+            canon: canon.into_iter().cloned().collect(),
+            revision,
+            materialized_bytes: budget.0,
+            next,
+        })
     }
 
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
@@ -1385,6 +1543,18 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         if !same_knowledge_maintenance_inputs(expected, &current)? {
             return Err(KnowledgeStoreError::StaleRead);
         }
+        let namespaces = packs
+            .iter()
+            .flat_map(|pack| {
+                state
+                    .packs
+                    .get(&pack.pack_id)
+                    .map(|old| old.namespace.clone())
+                    .into_iter()
+                    .chain(std::iter::once(pack.namespace.clone()))
+            })
+            .collect::<Vec<_>>();
+        bump_candidate_revisions(&mut state, namespaces.into_iter())?;
         for pack in packs {
             state.packs.insert(pack.pack_id.clone(), pack.clone());
         }
@@ -2508,10 +2678,12 @@ mod tests {
         assert!(!plan
             .active_pack_ids
             .contains(&unrelated_receipt.pack.pack_id));
-        assert!(plan
-            .blocked_namespaces
-            .iter()
-            .any(|item| item.contains("project:erp")));
+        assert!(
+            plan.blocked_namespaces
+                .iter()
+                .all(|item| !item.contains("project:erp")),
+            "foreign project metadata is not fetched for a scoped activation"
+        );
     }
 
     #[test]
@@ -2768,14 +2940,18 @@ mod tests {
             }
             self.inner.record_usage(signal)
         }
-        fn read_candidates(
+        fn read_candidate_page(
             &self,
-            namespace: Option<&KnowledgeNamespace>,
-        ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError> {
+            scope: &KnowledgeCandidateScope,
+            cursor: Option<&KnowledgeCandidateCursor>,
+            limit: usize,
+            budget_bytes: usize,
+        ) -> Result<KnowledgeCandidatePage, KnowledgeStoreError> {
             if self.mode() == 3 {
                 return Err(KnowledgeStoreError::Backend("read refused".into()));
             }
-            self.inner.read_candidates(namespace)
+            self.inner
+                .read_candidate_page(scope, cursor, limit, budget_bytes)
         }
         fn maintenance_inputs(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
             if self.mode() == 3 {
@@ -3077,5 +3253,244 @@ mod tests {
         assert_eq!(state.packs.len(), 2);
         assert!(state.packs.iter().any(|pack| pack.name == "first"));
         assert!(state.packs.iter().any(|pack| pack.name == "last"));
+    }
+    fn ingest_query_rule(
+        fabric: &KnowledgeFabric,
+        namespace: KnowledgeNamespace,
+        title: &str,
+        level: KnowledgeGovernanceLevel,
+    ) -> KnowledgeIngestionReceipt {
+        fabric
+            .ingest_document(
+                namespace,
+                KnowledgeActivationPolicy::DefaultForDomain,
+                level,
+                DocumentContent::new(title, "must validate source before write"),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn knowledge_small_project_ignores_oversize_foreign_project_and_keeps_shared_blocking_rules() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let own = ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A policy",
+            KnowledgeGovernanceLevel::Required,
+        );
+        let foreign = ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("B".into()),
+            "B policy",
+            KnowledgeGovernanceLevel::Advisory,
+        );
+        let shared = ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::SharedLibrary("global".into()),
+            "shared safety",
+            KnowledgeGovernanceLevel::Blocking,
+        );
+        let mut oversized = foreign.pack.clone();
+        oversized.name = "x".repeat(KNOWLEDGE_READ_MAX_BYTES + 1);
+        store
+            .commit_maintenance(&store.maintenance_inputs().unwrap(), &[oversized], &[])
+            .unwrap();
+        let (plan, canon, warnings) = fabric
+            .activate("s", "validate source", "main", Some("A"))
+            .unwrap();
+        assert!(plan.active_pack_ids.contains(&own.pack.pack_id));
+        assert!(plan.active_pack_ids.contains(&shared.pack.pack_id));
+        assert!(!plan.active_pack_ids.contains(&foreign.pack.pack_id));
+        assert!(canon.iter().any(|item| item.pack_id == shared.pack.pack_id));
+        assert!(warnings
+            .iter()
+            .any(|item| item.pack_id == shared.pack.pack_id
+                && item.level == KnowledgeGovernanceLevel::Blocking));
+        assert!(
+            matches!(
+                fabric.activate("s", "validate source", "main", Some("B")),
+                Err(KnowledgeStoreError::ReadLimit)
+            ),
+            "an authorized oversized required set is refused, never silently truncated"
+        );
+    }
+
+    #[test]
+    fn knowledge_foreign_project_row_growth_does_not_block_current_scope() {
+        let fabric = KnowledgeFabric::new();
+        let own = ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A policy",
+            KnowledgeGovernanceLevel::Required,
+        );
+        for i in 0..=(KNOWLEDGE_READ_MAX_ROWS / 2) {
+            ingest_query_rule(
+                &fabric,
+                KnowledgeNamespace::Project("B".into()),
+                &format!("B policy {i}"),
+                KnowledgeGovernanceLevel::Required,
+            );
+        }
+        let plan = fabric
+            .activate("s", "validate source", "main", Some("A"))
+            .unwrap()
+            .0;
+        assert_eq!(plan.active_pack_ids, vec![own.pack.pack_id]);
+        assert!(matches!(
+            fabric.activate("s", "validate source", "main", Some("B")),
+            Err(KnowledgeStoreError::ReadLimit)
+        ));
+    }
+
+    #[test]
+    fn knowledge_continuation_binds_original_scope_and_revisions_without_foreign_starvation() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A first",
+            KnowledgeGovernanceLevel::Required,
+        );
+        ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A second",
+            KnowledgeGovernanceLevel::Required,
+        );
+        ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::SharedLibrary("global".into()),
+            "shared first",
+            KnowledgeGovernanceLevel::Blocking,
+        );
+        let scope = KnowledgeCandidateScope::Activation {
+            project_id: Some("A".into()),
+        };
+        let first = store
+            .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+            .unwrap();
+        let cursor = first
+            .next
+            .as_ref()
+            .expect("a genuine continuation must be exercised");
+        ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("B".into()),
+            "B late",
+            KnowledgeGovernanceLevel::Required,
+        );
+        // An idempotent original receipt is not a new source mutation either.
+        ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A first",
+            KnowledgeGovernanceLevel::Required,
+        );
+        let second = store
+            .read_candidate_page(&scope, Some(cursor), 1, KNOWLEDGE_READ_MAX_BYTES)
+            .unwrap();
+        assert_eq!(second.revision, first.revision);
+        assert_eq!(second.packs.len(), 1);
+        assert_ne!(first.packs[0].pack_id, second.packs[0].pack_id);
+        let foreign = KnowledgeCandidateScope::Activation {
+            project_id: Some("B".into()),
+        };
+        assert!(matches!(
+            store.read_candidate_page(&foreign, Some(cursor), 1, KNOWLEDGE_READ_MAX_BYTES),
+            Err(KnowledgeStoreError::StaleRead)
+        ));
+        ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A late",
+            KnowledgeGovernanceLevel::Required,
+        );
+        assert!(matches!(
+            store.read_candidate_page(&scope, Some(cursor), 1, KNOWLEDGE_READ_MAX_BYTES),
+            Err(KnowledgeStoreError::StaleRead)
+        ));
+        let refreshed = store
+            .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+            .unwrap();
+        ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::SharedLibrary("global".into()),
+            "shared late",
+            KnowledgeGovernanceLevel::Blocking,
+        );
+        assert!(matches!(
+            store.read_candidate_page(&scope, refreshed.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES),
+            Err(KnowledgeStoreError::StaleRead)
+        ));
+    }
+
+    #[test]
+    fn knowledge_candidate_cannot_borrow_foreign_canonical_identity() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let own = ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("A".into()),
+            "A policy",
+            KnowledgeGovernanceLevel::Required,
+        );
+        let foreign = ingest_query_rule(
+            &fabric,
+            KnowledgeNamespace::Project("B".into()),
+            "B policy",
+            KnowledgeGovernanceLevel::Blocking,
+        );
+        let mut wrong = own.pack;
+        wrong.canon_pack_ref = Some(foreign.canon.canon_id);
+        store
+            .commit_maintenance(&store.maintenance_inputs().unwrap(), &[wrong], &[])
+            .unwrap();
+        assert!(fabric
+            .activate("s", "validate source", "main", Some("A"))
+            .is_err());
+    }
+    #[test]
+    fn knowledge_continuation_cannot_borrow_another_store_with_equal_counters() {
+        let first = Arc::new(InMemoryKnowledgeStore::new());
+        let second = Arc::new(InMemoryKnowledgeStore::new());
+        for store in [&first, &second] {
+            let fabric = KnowledgeFabric::with_store(store.clone());
+            ingest_query_rule(
+                &fabric,
+                KnowledgeNamespace::Project("A".into()),
+                "A first",
+                KnowledgeGovernanceLevel::Required,
+            );
+            ingest_query_rule(
+                &fabric,
+                KnowledgeNamespace::Project("A".into()),
+                "A second",
+                KnowledgeGovernanceLevel::Required,
+            );
+        }
+        let scope = KnowledgeCandidateScope::Activation {
+            project_id: Some("A".into()),
+        };
+        let a = first
+            .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+            .unwrap();
+        let b = second
+            .read_candidate_page(&scope, None, 1, KNOWLEDGE_READ_MAX_BYTES)
+            .unwrap();
+        assert_eq!(a.revision.counters, b.revision.counters);
+        assert_ne!(a.revision.store_id, b.revision.store_id);
+        assert!(a.next.is_some());
+        assert!(b.next.is_some());
+        assert!(matches!(
+            second.read_candidate_page(&scope, a.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES),
+            Err(KnowledgeStoreError::StaleRead)
+        ));
+        assert!(second
+            .read_candidate_page(&scope, b.next.as_ref(), 1, KNOWLEDGE_READ_MAX_BYTES)
+            .is_ok());
     }
 }
