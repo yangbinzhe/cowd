@@ -1051,6 +1051,7 @@ where
         let mut presentation_attempt_sequence = 0_u32;
         let mut provider_attempt_sequence = 0_u32;
         let mut billed_usage = TokenUsage::default();
+        let mut billed_usage_observed = true;
         let one_shot_reasoning_effort = self
             .next_model_reasoning_effort
             .lock()
@@ -1294,14 +1295,19 @@ where
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
                 }
                 add_token_usage(&mut billed_usage, usage);
+                billed_usage_observed &= observed_usage.is_some();
                 token_reservations
                     .reconcile(observed_usage)
-                    .map_err(|error| error.with_provider_usage(billed_usage))?;
-                self.reconcile_provider_context_usage(usage);
+                    .map_err(|error| {
+                        error.with_provider_usage(billed_usage_observed.then_some(billed_usage))
+                    })?;
+                if let Some(observed) = observed_usage {
+                    self.reconcile_provider_context_usage(observed);
+                }
                 if let Some(error) = stream_run.failure {
                     let error = error
                         .with_provider_account_key(provider_account_key.clone())
-                        .with_provider_usage(billed_usage);
+                        .with_provider_usage(billed_usage_observed.then_some(billed_usage));
                     if self.cancellation_token.is_cancelled()
                         || error.to_string().to_ascii_lowercase().contains("cancelled")
                     {
@@ -1366,7 +1372,7 @@ where
                     } else {
                         "terminal provider returned tool protocol in a zero-tool presentation step"
                     })
-                    .with_provider_usage(billed_usage);
+                    .with_provider_usage(billed_usage_observed.then_some(billed_usage));
                     return Err(error);
                 }
 
@@ -1495,7 +1501,7 @@ where
         if text.trim().is_empty() {
             return Err(
                 RuntimeError::new("failure explanation provider returned no text")
-                    .with_provider_usage(step.usage),
+                    .with_provider_usage(step.assistant_message.usage),
             );
         }
         Ok(TerminalProviderAnswer {
@@ -1592,7 +1598,7 @@ where
         if text.trim().is_empty() {
             return Err(
                 RuntimeError::new("collaboration synthesizer returned no text")
-                    .with_provider_usage(step.usage),
+                    .with_provider_usage(step.assistant_message.usage),
             );
         }
         Ok(TerminalProviderAnswer {
@@ -2492,19 +2498,23 @@ where
                 "provider_service_ms",
                 provider_started.elapsed(),
             );
-            crate::execution_core::performance::observe_count(
-                "provider_input_tokens",
-                u64::from(usage.input_tokens),
-            );
-            crate::execution_core::performance::observe_count(
-                "provider_output_tokens",
-                u64::from(usage.output_tokens),
-            );
-            let service_ms = provider_started.elapsed().as_millis().max(1) as u64;
-            crate::execution_core::performance::observe_count(
-                "provider_output_tokens_per_second",
-                u64::from(usage.output_tokens).saturating_mul(1_000) / service_ms,
-            );
+            if let Some(observed) = observed_usage {
+                crate::execution_core::performance::observe_count(
+                    "provider_input_tokens",
+                    u64::from(observed.input_tokens),
+                );
+                crate::execution_core::performance::observe_count(
+                    "provider_output_tokens",
+                    u64::from(observed.output_tokens),
+                );
+                let service_ms = provider_started.elapsed().as_millis().max(1) as u64;
+                crate::execution_core::performance::observe_count(
+                    "provider_output_tokens_per_second",
+                    u64::from(observed.output_tokens).saturating_mul(1_000) / service_ms,
+                );
+            } else {
+                crate::execution_core::performance::observe_count("provider_usage_missing", 1);
+            }
             Self::observe_provider_downstream_overload(resource_result_class);
             self.record_provider_resource_outcome(
                 provider_lease.as_deref(),
@@ -2753,10 +2763,12 @@ where
                             );
                         }
                         let refusal_results = self.answer_refused_calls(&refusals);
-                        self.reconcile_provider_context_usage(usage);
-                        self.usage_tracker.record(usage);
-                        if let Some(callback) = &self.tool_callback {
-                            callback.on_usage(&usage);
+                        if let Some(observed) = observed_usage {
+                            self.reconcile_provider_context_usage(observed);
+                            self.usage_tracker.record(observed);
+                            if let Some(callback) = &self.tool_callback {
+                                callback.on_usage(&observed);
+                            }
                         }
                         // Name what IS available, not only what is not. The message
                         // used to list the refused names and stop, so a model that
@@ -2804,7 +2816,7 @@ where
                                 true,
                                 crate::execution_core::graph::ResourceResultClass::Failed,
                             )
-                            .with_provider_usage(usage)
+                            .with_provider_usage(observed_usage)
                             .with_effect_receipts(early_tool_receipts));
                         }
                         // The bound is counted before the answer is built, so a frame
@@ -2830,7 +2842,7 @@ where
                                 true,
                                 crate::execution_core::graph::ResourceResultClass::Failed,
                             )
-                            .with_provider_usage(usage)
+                            .with_provider_usage(observed_usage)
                             .with_effect_receipts(early_tool_receipts)
                             .with_repeated_tool_frame_refusal());
                         }
@@ -2981,7 +2993,7 @@ where
                         true,
                         crate::execution_core::graph::ResourceResultClass::Failed,
                     )
-                    .with_provider_usage(usage)
+                    .with_provider_usage(observed_usage)
                     .with_effect_receipts(early_tool_receipts)
                     .with_repeated_tool_frame_refusal());
                 }
@@ -3011,10 +3023,12 @@ where
                 // permission negotiation so malformed calls cannot create an
                 // invisible approval wait. Host applies the existing bounded
                 // single recovery and then fails closed on repetition.
-                self.reconcile_provider_context_usage(usage);
-                self.usage_tracker.record(usage);
-                if let Some(callback) = &self.tool_callback {
-                    callback.on_usage(&usage);
+                if let Some(observed) = observed_usage {
+                    self.reconcile_provider_context_usage(observed);
+                    self.usage_tracker.record(observed);
+                    if let Some(callback) = &self.tool_callback {
+                        callback.on_usage(&observed);
+                    }
                 }
                 // Answer the step instead of failing it.
                 //
@@ -3160,10 +3174,12 @@ where
                     self.session_head().await.message_count.wrapping_sub(1),
                 );
             }
-            self.reconcile_provider_context_usage(usage);
-            self.usage_tracker.record(usage);
-            if let Some(callback) = &self.tool_callback {
-                callback.on_usage(&usage);
+            if let Some(observed) = observed_usage {
+                self.reconcile_provider_context_usage(observed);
+                self.usage_tracker.record(observed);
+                if let Some(callback) = &self.tool_callback {
+                    callback.on_usage(&observed);
+                }
             }
             self.record_assistant_iteration(
                 self.session_head().await.message_count,

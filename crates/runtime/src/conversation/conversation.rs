@@ -3315,8 +3315,8 @@ impl RuntimeError {
     }
 
     #[must_use]
-    pub const fn with_provider_usage(mut self, usage: TokenUsage) -> Self {
-        self.provider_usage = Some(usage);
+    pub fn with_provider_usage(mut self, usage: impl Into<Option<TokenUsage>>) -> Self {
+        self.provider_usage = usage.into();
         self
     }
 

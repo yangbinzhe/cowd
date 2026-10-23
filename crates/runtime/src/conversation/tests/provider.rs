@@ -1630,6 +1630,12 @@ fn provider_reservation_set_leaves_delegated_untouched_when_evaluation_admission
 fn provider_usage_missing_zero_and_failed_partial_are_distinct_at_original_reducer() {
     let missing = ModelStreamReducer::new(None, None, "missing".into()).finish("completed");
     assert_eq!(missing.observed_usage(true), None);
+    assert_eq!(
+        RuntimeError::new("missing")
+            .with_provider_usage(missing.observed_usage(true))
+            .provider_usage(),
+        None
+    );
     let mut zero = ModelStreamReducer::new(None, None, "zero".into());
     zero.apply(
         AssistantEvent::Usage(TokenUsage::default()),
@@ -1638,6 +1644,12 @@ fn provider_usage_missing_zero_and_failed_partial_are_distinct_at_original_reduc
     .unwrap();
     let zero = zero.finish("completed");
     assert_eq!(zero.observed_usage(true), Some(TokenUsage::default()));
+    assert_eq!(
+        RuntimeError::new("refused after known0")
+            .with_provider_usage(zero.observed_usage(true))
+            .provider_usage(),
+        Some(TokenUsage::default())
+    );
     let mut partial = ModelStreamReducer::new(None, None, "partial".into());
     partial
         .apply(
@@ -1649,6 +1661,12 @@ fn provider_usage_missing_zero_and_failed_partial_are_distinct_at_original_reduc
         )
         .unwrap();
     let partial = partial.finish("failed");
+    assert_eq!(
+        RuntimeError::new("transport failed")
+            .with_provider_usage(partial.observed_usage(false))
+            .provider_usage(),
+        None
+    );
     assert_eq!(
         partial.usage.input_tokens, 17,
         "observed partial evidence is retained"

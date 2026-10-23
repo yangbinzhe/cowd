@@ -1672,6 +1672,7 @@ where
                 super::tests::r1_capture_original_model_step(self.services.event_store().as_ref(), ticket, &step);
                 let usage = ExecutionUsage {
                     model: step.model.clone(),
+                    provider_usage_observed: Some(step.assistant_message.usage.is_some()),
                     input_tokens: u64::from(step.usage.input_tokens),
                     output_tokens: u64::from(step.usage.output_tokens),
                     cache_creation_input_tokens: u64::from(step.usage.cache_creation_input_tokens),
