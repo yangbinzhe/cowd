@@ -2011,6 +2011,16 @@ fn multiple_supplements_keep_distinct_turn_identities_for_one_target() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn batched_execution_history_limits_turn_roots_after_filtering_related_inputs() {
+    exercise_batched_execution_history_root_limit(InputRoutingDecision::RejectDuplicate);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn batched_execution_history_filters_policy_refusal_before_root_limit() {
+    exercise_batched_execution_history_root_limit(InputRoutingDecision::RejectPolicy);
+}
+
+fn exercise_batched_execution_history_root_limit(rejection: InputRoutingDecision) {
     let (_fixture, store) = make_store();
     let session_id = "session-root-recovery";
     store.create_session(&make_record(session_id)).unwrap();
@@ -2052,13 +2062,7 @@ fn batched_execution_history_limits_turn_roots_after_filtering_related_inputs() 
             "user",
             None,
             110,
-            &ingress_request(
-                "root-rejected",
-                1,
-                InputRoutingDecision::RejectDuplicate,
-                None,
-                110,
-            ),
+            &ingress_request("root-rejected", 1, rejection, None, 110),
         )
         .unwrap();
 

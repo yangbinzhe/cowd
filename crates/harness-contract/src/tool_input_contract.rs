@@ -748,6 +748,22 @@ mod tests {
     /// every real tool schema is exercised; this one keeps the unit local.
     fn minimal_schema_errors(schema: &Value, value: &Value, path: &str) -> Vec<String> {
         let mut errors = Vec::new();
+        if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+            let matches = variants
+                .iter()
+                .filter(|variant| minimal_schema_errors(variant, value, path).is_empty())
+                .count();
+            if matches != 1 {
+                errors.push(format!(
+                    "{path}: expected exactly one variant, matched {matches}"
+                ));
+            }
+        }
+        if let Some(expected) = schema.get("const") {
+            if value != expected {
+                errors.push(format!("{path}: not the required constant"));
+            }
+        }
         if let Some(expected) = schema.get("type") {
             let choices: Vec<&str> = match expected {
                 Value::String(one) => vec![one.as_str()],
@@ -872,6 +888,36 @@ mod tests {
         // The instance validates against the schema that produced it.
         let errors = minimal_schema_errors(&schema, &example, "$");
         assert_eq!(errors, Vec::<String>::new(), "{errors:?}");
+
+        let mut wrong_tag = example.clone();
+        wrong_tag["source"] = json!("message_block");
+        assert_eq!(
+            minimal_schema_errors(&schema["oneOf"][0], &wrong_tag, "$"),
+            vec!["$.source: not the required constant".to_string()]
+        );
+        assert_eq!(
+            minimal_schema_errors(&schema, &wrong_tag, "$"),
+            vec!["$: expected exactly one variant, matched 0".to_string()]
+        );
+
+        let mut missing_path = example.clone();
+        missing_path.as_object_mut().expect("object").remove("path");
+        assert_eq!(
+            minimal_schema_errors(&schema["oneOf"][0], &missing_path, "$"),
+            vec!["$: missing required `path`".to_string()]
+        );
+        assert_eq!(
+            minimal_schema_errors(&schema, &missing_path, "$"),
+            vec!["$: expected exactly one variant, matched 0".to_string()]
+        );
+
+        let overlapping_schema = json!({
+            "oneOf": [schema["oneOf"][0].clone(), schema["oneOf"][0].clone()]
+        });
+        assert_eq!(
+            minimal_schema_errors(&overlapping_schema, &example, "$"),
+            vec!["$: expected exactly one variant, matched 2".to_string()]
+        );
     }
 
     /// A schema with nothing to fill in has nothing to exemplify: an example of

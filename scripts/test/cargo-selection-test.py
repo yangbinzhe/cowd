@@ -219,6 +219,44 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(selection.NotStarted, "binary changed"):
             selection.execute(self.root, plan, self.data, self.evidence)
 
+    def test_between_target_artifact_replacement_rejected(self):
+        self.data["packages"][1]["targets"].append({"name": "second", "kind": ["test"], "required-features": []})
+        plan = self.plan()
+        plan["targets"] = [item for item in plan["targets"] if item["package"] == "owner"]
+        original_listing = selection.listed_output
+
+        def replace_after_first_target(root, args, path):
+            output = original_listing(root, args, path)
+            if path.name == "0-ignored.txt":
+                (self.evidence / "owner-second-binary").write_bytes(b"replacement between targets")
+            return output
+
+        with self.mock_cargo(), patch.object(selection, "listed_output", side_effect=replace_after_first_target):
+            with self.assertRaisesRegex(selection.NotStarted, "binary changed"):
+                selection.discover(self.root, plan, self.data, self.evidence)
+
+    def test_host_probe_is_scoped_to_discover_and_preserves_failures(self):
+        original_command = selection.command
+        compiler = "/fixture/custom-rustc"
+        responses = [b"host: fixture-native\n", b"host: next-native\n", b"missing host\n"]
+
+        def command(root, args, **kwargs):
+            if args[0] == compiler:
+                self.assertEqual(args, [compiler, "-vV"])
+                return responses.pop(0)
+            return original_command(root, args, **kwargs)
+
+        with self.mock_cargo(), patch.dict(os.environ, RUSTC=compiler), patch.object(selection, "command", side_effect=command):
+            for host in ["fixture-native", "next-native"]:
+                plan = self.plan()
+                selection.discover(self.root, plan, self.data, self.evidence)
+                self.assertTrue(all(f"target.{host}.runner=" in item["cargo_args"][-1] for item in plan["targets"]))
+            with self.assertRaisesRegex(selection.NotStarted, "cannot determine native"):
+                selection.discover(self.root, self.plan(), self.data, self.evidence)
+        with patch.dict(os.environ, RUSTC=compiler), patch.object(selection, "run_process", return_value=subprocess.CompletedProcess([], 7, b"", b"")):
+            with self.assertRaisesRegex(selection.NotStarted, "command failed .exit 7"):
+                selection.native_host(self.root)
+
     def test_duplicate_discovered_selector_rejected(self):
         with self.assertRaisesRegex(selection.NotStarted, "duplicate"):
             selection.parse_listing(b"same: test\nsame: test\n")

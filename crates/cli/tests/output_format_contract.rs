@@ -5,22 +5,15 @@
     clippy::unreachable
 )]
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn help_json_only_lists_minimal_cli_surface() {
     let root = unique_temp_dir("help-json");
-    fs::create_dir_all(&root).expect("temp dir should exist");
-
-    let parsed = assert_json_command(&root, &["--output-format", "json", "help"]);
+    let parsed = assert_json_command(root.path(), &["--output-format", "json", "help"]);
     assert_eq!(parsed["kind"], "help");
     let message = parsed["message"].as_str().expect("help text");
     assert!(message.contains("Core commands:"));
@@ -49,16 +42,12 @@ fn help_json_only_lists_minimal_cli_surface() {
             "help still exposes forbidden surface: {forbidden}\n{message}"
         );
     }
-
-    fs::remove_dir_all(root).expect("cleanup temp dir");
 }
 
 #[test]
 fn version_emits_json_when_requested() {
     let root = unique_temp_dir("version-json");
-    fs::create_dir_all(&root).expect("temp dir should exist");
-
-    let parsed = assert_json_command(&root, &["--output-format", "json", "version"]);
+    let parsed = assert_json_command(root.path(), &["--output-format", "json", "version"]);
     assert_eq!(parsed["kind"], "version");
     assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
     let git_sha = parsed["git_sha"].as_str().expect("Git SHA is text");
@@ -79,31 +68,37 @@ fn version_emits_json_when_requested() {
 #[test]
 fn resume_slash_commands_remain_tui_only() {
     let root = unique_temp_dir("resume-json");
-    fs::create_dir_all(&root).expect("temp dir should exist");
-
     for slash in ["/status", "/mcp", "/skills", "/version", "/init"] {
-        let output = run_cowd(
-            &root,
+        assert_removed_slash(
+            root.path(),
             &["--output-format", "json", "--resume", "resume-json", slash],
         );
-        assert!(
-            !output.status.success(),
-            "expected resume slash command to fail\nstdout:\n{}\n\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("was removed from the CLI surface"),
-            "{stderr}"
-        );
-        assert!(
-            stderr.contains("run slash commands inside the TUI"),
-            "{stderr}"
-        );
     }
+}
 
-    fs::remove_dir_all(root).expect("cleanup temp dir");
+#[test]
+fn resume_flag_rejects_non_interactive_slash_commands() {
+    let root = unique_temp_dir("resume-plain");
+    assert_removed_slash(root.path(), &["--resume", "latest", "/status"]);
+}
+
+fn assert_removed_slash(current_dir: &Path, args: &[&str]) {
+    let output = run_cowd(current_dir, args);
+    assert!(
+        !output.status.success(),
+        "expected resume slash command to fail\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was removed from the CLI surface"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run slash commands inside the TUI"),
+        "{stderr}"
+    );
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
@@ -125,14 +120,9 @@ fn run_cowd(current_dir: &Path, args: &[&str]) -> Output {
         .expect("cowd should launch")
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_millis();
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "cowd-output-format-{label}-{}-{millis}-{counter}",
-        std::process::id()
-    ))
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("cowd-output-format-{label}-"))
+        .tempdir()
+        .expect("exclusive temporary directory")
 }

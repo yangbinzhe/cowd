@@ -682,7 +682,8 @@ async fn r1_message_ack_authorized_delete_and_archive_do_not_resurrect_receipts(
         .store
         .record_terminal_message_ack(&fixture.command())
         .unwrap();
-    let root = std::path::PathBuf::from("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel/evidence/execution/kernel-terminal-20261016/R1-04/fixtures").join(unique_id("archive"));
+    let archive_owner = tempfile::tempdir().expect("exclusive archive fixture");
+    let root = archive_owner.path().join("archive");
     let unified = session::UnifiedSessionStore::from_backend(Arc::new(real_store(&fixture.scope)));
     let tiered = session::TieredSessionStore::new(
         unified,
@@ -2626,63 +2627,6 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
     for id in [&source, &peer, &branch, &rejected] {
         store.delete_session(id).expect("delete isolated session");
     }
-}
-
-#[test]
-#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn postgres_batched_execution_history_limits_turn_roots_after_filtering_related_inputs() {
-    let fixture = PostgresTestScope::new();
-    let store = real_store(&fixture);
-    let session_id = unique_id("execution-root-recovery");
-    store
-        .create_session(&session(&session_id))
-        .expect("create isolated session");
-    append_runtime_input(
-        &store,
-        &session_id,
-        &runtime_request(
-            "pg-root-recovery",
-            1,
-            InputRoutingDecision::StartNewTurn,
-            None,
-            100,
-        ),
-    );
-    for index in 0..3 {
-        append_runtime_input(
-            &store,
-            &session_id,
-            &runtime_request(
-                &format!("pg-root-supplement-{index}"),
-                1,
-                InputRoutingDecision::SupplementCurrentTurn,
-                Some("turn-pg-root-recovery"),
-                101 + index,
-            ),
-        );
-    }
-    append_runtime_input(
-        &store,
-        &session_id,
-        &runtime_request(
-            "pg-root-rejected",
-            1,
-            InputRoutingDecision::RejectPolicy,
-            None,
-            110,
-        ),
-    );
-
-    let roots = store
-        .session_runtime_outbox_for_sessions(std::slice::from_ref(&session_id), 1)
-        .expect("load root execution history");
-
-    assert_eq!(roots.len(), 1);
-    assert_eq!(roots[0].decision, InputRoutingDecision::StartNewTurn);
-    assert_eq!(roots[0].request_id, "request-pg-root-recovery");
-    store
-        .delete_session(&session_id)
-        .expect("delete isolated session");
 }
 
 #[test]

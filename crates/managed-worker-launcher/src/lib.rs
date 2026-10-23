@@ -837,8 +837,44 @@ mod tests {
 
     #[test]
     fn strict_protocol_rejects_unknown_fields_and_ambiguous_write_roots() {
-        let bad = br#"{"schema_version":1,"unknown":true}"#;
-        assert!(serde_json::from_slice::<LaunchProtocolV1>(bad).is_err());
+        struct FixtureRoot(PathBuf);
+        impl Drop for FixtureRoot {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = root("strict-protocol");
+        fs::create_dir(&path).expect("exclusive fixture directory");
+        let fixture = FixtureRoot(path);
+        let valid = protocol(&fixture.0);
+        let value = serde_json::to_value(&valid).expect("complete protocol");
+        let decoded: LaunchProtocolV1 =
+            serde_json::from_value(value.clone()).expect("valid protocol");
+        assert_eq!(decoded, valid);
+        validate_directories(&decoded.isolation.directories).expect("valid directory policy");
+        let mut unknown = value;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), serde_json::json!(true));
+        let error = serde_json::from_value::<LaunchProtocolV1>(unknown).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `unknown`"),
+            "{error}"
+        );
+        for runtime_is_ancestor in [true, false] {
+            let mut directories = valid.isolation.directories.clone();
+            if runtime_is_ancestor {
+                directories.runtime_dir = fixture.0.clone();
+            } else {
+                directories.data_dir = fixture.0.clone();
+            }
+            let error = validate_directories(&directories).unwrap_err();
+            assert!(
+                matches!(error, LauncherError::InvalidSpec(ref reason) if reason.contains("contains bundle")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

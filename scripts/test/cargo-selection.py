@@ -264,13 +264,17 @@ def validate_executables(root, plan):
             raise NotStarted("binary changed since discovery")
 
 
-def guarded_cargo_args(root, plan, item, admission):
+def native_host(root):
     host = re.search(r"^host: (.+)$", command(root, [os.environ.get("RUSTC", "rustc"), "-vV"]).decode(), re.M)
     if not host:
         raise NotStarted("cannot determine native Cargo runner target")
+    return host[1]
+
+
+def guarded_cargo_args(item, admission, host):
     runner = [sys.executable, str(Path(__file__).resolve()), "launch", str(admission)]
     return ["cargo", "test", "--locked", "-p", item["package"], *item["target_args"], "--all-features",
-            "--config", f"target.{host[1]}.runner=" + json.dumps(runner)]
+            "--config", f"target.{host}.runner=" + json.dumps(runner)]
 
 
 def listed_output(root, args, path):
@@ -299,19 +303,25 @@ def discover(root, plan, data, log_dir):
                          (root / "tests/test-governance/test-inventory.yaml").read_text(), re.M)
     plan["launcher_version"] = workspace_packages(data).get("sandbox-launcher", {}).get("version")
     prepared = {}
+    host = None
     for index, item in enumerate(plan["targets"]):
         item["build_command"] = ["cargo", "test", "--locked", "-p", item["package"], "--all-targets", "--all-features", "--no-run", "--message-format=json"]
-        if item["package"] not in prepared:
+        key = (item["package"], item["features"])
+        if key not in prepared:
             result = run_process(item["build_command"], cwd=root, capture_output=True, timeout=1200)
             write_log(log_dir / f"{index}-build.stderr", result.stderr)
             write_log(log_dir / f"{index}-build.jsonl", result.stdout)
             if result.returncode:
                 raise NotStarted(f"target build failed (exit {result.returncode}); see build logs")
-            prepared[item["package"]] = [json.loads(line) for line in result.stdout.splitlines() if line.startswith(b"{")]
-        artifacts = prepared[item["package"]]
-        check_source(root, plan)
-        item["executables"] = {str(Path(artifact["executable"]).resolve()): digest(Path(artifact["executable"]).read_bytes())
-                               for artifact in artifacts if artifact.get("reason") == "compiler-artifact" and artifact.get("executable")}
+            artifacts = [json.loads(line) for line in result.stdout.splitlines() if line.startswith(b"{")]
+            check_source(root, plan)
+            executables = {str(Path(artifact["executable"]).resolve()): digest(Path(artifact["executable"]).read_bytes())
+                           for artifact in artifacts if artifact.get("reason") == "compiler-artifact" and artifact.get("executable")}
+            prepared[key] = artifacts, executables
+        else:
+            check_source(root, plan)
+        artifacts, executables = prepared[key]
+        item["executables"] = executables
         admission = log_dir / f"{index}-launch-admission.json"
         launch_plan = {**plan, "targets": [item], "executables": item["executables"]}
         admission.write_text(json.dumps(launch_plan))
@@ -328,17 +338,17 @@ def discover(root, plan, data, log_dir):
         if not set(item["required_features"]) <= set(artifact.get("features", [])):
             raise NotStarted("built target lacks required features")
         binary = Path(artifact["executable"])
-        item.update(binary=str(binary), binary_sha256=digest(binary.read_bytes()))
+        item.update(binary=str(binary), binary_sha256=executables[str(binary.resolve())])
         if item["compile_only"]:
             item.update(status="CompiledOnly", selectors=[], ignored={}, expected_selected=0)
             continue
-        item["cargo_args"] = guarded_cargo_args(root, plan, item, admission)
+        if host is None:
+            host = native_host(root)
+        item["cargo_args"] = guarded_cargo_args(item, admission, host)
         validate_executables(root, launch_plan)
         listed = listed_output(root, [*item["cargo_args"], "--", "--list", "--format", "terse"], log_dir / f"{index}-list.txt")
         validate_executables(root, launch_plan)
         ignored = listed_output(root, [*item["cargo_args"], "--", "--list", "--ignored", "--format", "terse"], log_dir / f"{index}-ignored.txt")
-        write_log(log_dir / f"{index}-list.txt", listed)
-        write_log(log_dir / f"{index}-ignored.txt", ignored)
         names, ignored_names = parse_listing(listed), parse_listing(ignored)
         if not ignored_names <= names:
             raise NotStarted("ignored discovery differs from complete discovery")

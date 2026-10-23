@@ -695,7 +695,36 @@ mod tests {
         });
         let output: EvolutionAnalysisModelOutput =
             serde_json::from_value(value.clone()).expect("typed output");
-        assert_eq!(output.digest(), output.digest());
+        let serialized = concat!(
+            r#"{"hypotheses":[{"hypothesis_id":"h1","statement":"hypothesis","supporting_evidence_refs":["observed:test:e1"],"contradicting_evidence_refs":["observed:test:e2"],"uncertainty":"unknown"}],"#,
+            r#""falsification_experiment":{"target_hypothesis_id":"h1","objective":"test","method":["run"],"pass_criterion":"pass","falsification_criterion":"fail","required_evidence_refs":["observed:test:e1"]},"#,
+            r#""suggested_candidate_kind":"architecture_plan","acceptance_scenarios":["scenario"],"expected_value":"value","risks":["risk"],"unknowns":["unknown"]}"#,
+        );
+        let expected_digest =
+            "sha256:70f917cde5629e987c01ff3537cbc10ab6fd9c01f0df0db0bca4d7c394fd775d";
+        assert_eq!(
+            serde_json::to_vec(&output).expect("serialized output"),
+            serialized.as_bytes()
+        );
+        assert_eq!(output.digest(), expected_digest);
+
+        let reordered: EvolutionAnalysisModelOutput = serde_json::from_str(concat!(
+            r#"{"unknowns":["unknown"],"risks":["risk"],"expected_value":"value","acceptance_scenarios":["scenario"],"suggested_candidate_kind":"architecture_plan","#,
+            r#""falsification_experiment":{"required_evidence_refs":["observed:test:e1"],"falsification_criterion":"fail","pass_criterion":"pass","method":["run"],"objective":"test","target_hypothesis_id":"h1"},"#,
+            r#""hypotheses":[{"uncertainty":"unknown","contradicting_evidence_refs":["observed:test:e2"],"supporting_evidence_refs":["observed:test:e1"],"statement":"hypothesis","hypothesis_id":"h1"}]}"#,
+        ))
+        .expect("reordered typed output");
+        assert_eq!(reordered, output);
+        assert_eq!(reordered.digest(), expected_digest);
+
+        let mut changed_value = output.clone();
+        changed_value.expected_value = "different value".into();
+        assert_ne!(changed_value.digest(), expected_digest);
+
+        let mut changed_statement = output.clone();
+        changed_statement.hypotheses[0].statement = "different hypothesis".into();
+        assert_ne!(changed_statement.digest(), expected_digest);
+
         let mut unknown = value;
         unknown
             .as_object_mut()

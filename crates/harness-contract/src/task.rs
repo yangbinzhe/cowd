@@ -934,7 +934,7 @@ mod execution_policy_tests {
                 "session:structured",
             )
         };
-        let mut provenance = TaskApplicationProvenance {
+        let provenance = TaskApplicationProvenance {
             model: "test-model".into(),
             producer_id: "app:fixture".into(),
             workspace_id: "workspace-fixture".into(),
@@ -960,14 +960,37 @@ mod execution_policy_tests {
             .validate()
             .expect("contract and content identities are independently validated");
 
-        provenance.result_schema_digest = "not-a-digest".into();
-        assert!(provenance.validate().is_err());
+        let mut invalid_digest = provenance.clone();
+        invalid_digest.result_schema_digest = "not-a-digest".into();
+        assert_eq!(
+            invalid_digest
+                .validate()
+                .unwrap_err()
+                .split_whitespace()
+                .next(),
+            Some("result_schema_digest")
+        );
 
-        provenance.result_schema_ref.bytes = 64 * 1024 + 1;
-        assert!(provenance.validate().is_err());
+        let mut oversized_schema = provenance.clone();
+        oversized_schema.result_schema_ref.bytes = 64 * 1024 + 1;
+        assert_eq!(
+            oversized_schema
+                .validate()
+                .unwrap_err()
+                .split_whitespace()
+                .next(),
+            Some("result_schema_ref")
+        );
 
-        provenance.result_schema_ref.bytes = 64;
-        provenance.input_ref.durability = crate::context::EvidenceDurability::Pending;
-        assert!(provenance.validate().is_err());
+        let mut pending_input = provenance.clone();
+        pending_input.input_ref.durability = crate::context::EvidenceDurability::Pending;
+        assert_eq!(
+            pending_input
+                .validate()
+                .unwrap_err()
+                .split_whitespace()
+                .next(),
+            Some("input_ref")
+        );
     }
 }

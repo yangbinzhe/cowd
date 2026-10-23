@@ -162,7 +162,7 @@ mod tests {
             0,
             SessionDomainScope::ApplicationTask,
             "application.execution_outcome",
-            serde_json::json!({"a": 1, "b": 2}),
+            serde_json::json!({"a": 1, "b": 2, "items":[1,2]}),
             1234,
         );
         first.event_id = "app-outcome-1".to_string();
@@ -170,7 +170,7 @@ mod tests {
 
         let mut second = SessionDomainEvent::from_session_event(&first).unwrap();
         second.sequence = 99;
-        second.payload = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
+        second.payload = serde_json::from_str(r#"{"items":[1,2],"b":2,"a":1}"#).unwrap();
         let second = second.to_session_event().unwrap();
         assert!(SessionDomainEvent::semantically_equivalent(&first, &second).unwrap());
 
@@ -178,5 +178,28 @@ mod tests {
         changed.payload["b"] = serde_json::json!(3);
         let changed = changed.to_session_event().unwrap();
         assert!(!SessionDomainEvent::semantically_equivalent(&first, &changed).unwrap());
+        let mut reordered = SessionDomainEvent::from_session_event(&first).unwrap();
+        reordered.payload["items"] = serde_json::json!([2, 1]);
+        assert!(!SessionDomainEvent::semantically_equivalent(
+            &first,
+            &reordered.to_session_event().unwrap()
+        )
+        .unwrap());
+        let mut renamed = SessionDomainEvent::from_session_event(&first).unwrap();
+        renamed.event_id = "foreign-event".into();
+        assert!(!SessionDomainEvent::semantically_equivalent(
+            &first,
+            &renamed.to_session_event().unwrap()
+        )
+        .unwrap());
+        let mut foreign_session = first.clone();
+        foreign_session.session_id = "foreign-session".into();
+        assert!(!SessionDomainEvent::semantically_equivalent(&first, &foreign_session).unwrap());
+        let mut changed_time = first.clone();
+        changed_time.created_at_ms += 1;
+        assert!(!SessionDomainEvent::semantically_equivalent(&first, &changed_time).unwrap());
+        let mut malformed = first.clone();
+        malformed.event_json = "{".into();
+        assert!(SessionDomainEvent::semantically_equivalent(&first, &malformed).is_err());
     }
 }

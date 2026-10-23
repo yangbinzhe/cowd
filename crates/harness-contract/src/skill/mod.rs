@@ -397,6 +397,42 @@ mod evolution_tests {
             observed_at_ms: 1,
             schema_version: SKILL_USAGE_RECEIPT_SCHEMA_VERSION,
         };
-        assert_eq!(receipt.digest(), receipt.digest());
+        let digest = receipt.digest();
+        assert_eq!(
+            receipt.receipt_id,
+            "skill-usage-a184892ce1f61d6f801aaf852571cd8a15a5434a63db3b3856156a63c052fce8"
+        );
+        assert_eq!(
+            digest,
+            "sha256:d6f192c047962b5fd386c1231b008d7c2c78df6706694e76b4d9f14c06259648"
+        );
+        let replay: SkillUsageReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert_eq!(replay.receipt_id, receipt.receipt_id);
+        assert_eq!(replay.digest(), digest);
+        for (revision, turn, usage) in [
+            ("1.0.1", "turn", SkillUsageKind::Hit),
+            ("1.0.0", "next-turn", SkillUsageKind::Hit),
+            ("1.0.0", "turn", SkillUsageKind::Miss),
+        ] {
+            let changed_id = SkillUsageReceipt::stable_id(
+                "review",
+                revision,
+                usage,
+                "workspace",
+                "workload",
+                "config",
+                "production",
+                "execution",
+                "session",
+                turn,
+            );
+            assert_ne!(changed_id, receipt.receipt_id);
+            let mut changed = receipt.clone();
+            changed.skill_revision = revision.into();
+            changed.turn_id = turn.into();
+            changed.usage = usage;
+            assert_ne!(changed.digest(), digest);
+        }
     }
 }
