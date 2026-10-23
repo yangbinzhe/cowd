@@ -1747,6 +1747,7 @@ async fn forward_provider_attempt(
     prefix_observation.common_prefix_leader = warmup.is_common_prefix_leader();
     prefix_observation.warmup_bypassed_low_reuse = warmup.bypassed_low_reuse;
     prefix_observation.waited_for_warmup = warmup.waited;
+    prefix_observation.warmup_unobserved_reason = warmup.unobserved_reason.map(str::to_owned);
     if let (Some(context), Some(writer)) = (evidence_context.as_ref(), evidence_writer.as_ref()) {
         if let Err(error) = writer
             .persist(

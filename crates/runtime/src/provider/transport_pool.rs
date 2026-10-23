@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex,
-        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -58,12 +58,128 @@ pub struct ProviderWirePrefixObservation {
     pub common_prefix_leader: bool,
     pub warmup_bypassed_low_reuse: bool,
     pub waited_for_warmup: bool,
+    #[serde(default)]
+    pub warmup_unobserved_reason: Option<String>,
+    #[serde(default)]
+    pub cache_retention_unavailable: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct CachedProviderPrompt {
     request_id: String,
-    bytes: std::sync::Arc<[u8]>,
+    bytes: std::sync::Arc<CachedPromptBytes>,
+}
+
+// Optional optimization residency belongs to this original transport pool,
+// independently of execution admission. Charges follow the actual payload Arc.
+#[derive(Debug, Clone, Copy)]
+struct CacheLimits {
+    identities: usize,
+    payload_bytes: usize,
+    identity_bytes: usize,
+    prompt_bytes: usize,
+    waiters: usize,
+    identity_waiters: usize,
+    wait: Duration,
+}
+impl Default for CacheLimits {
+    fn default() -> Self {
+        Self {
+            identities: MAX_PREFIX_IDENTITIES,
+            payload_bytes: 16 * 1024 * 1024,
+            identity_bytes: 4 * 1024 * 1024,
+            prompt_bytes: 1024 * 1024,
+            waiters: 512,
+            identity_waiters: 128,
+            wait: Duration::from_secs(5),
+        }
+    }
+}
+#[derive(Debug)]
+struct CacheByteBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+impl CacheByteBudget {
+    fn new(limit: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            used: AtomicUsize::new(0),
+            limit,
+        })
+    }
+    fn reserve(self: &std::sync::Arc<Self>, bytes: usize) -> Option<CacheByteReservation> {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|sum| *sum <= self.limit)
+            })
+            .ok()?;
+        Some(CacheByteReservation {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+struct CacheByteReservation {
+    budget: std::sync::Arc<CacheByteBudget>,
+    bytes: usize,
+}
+impl Drop for CacheByteReservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+struct CachedPromptBytes {
+    bytes: Box<[u8]>,
+    _identity: CacheByteReservation,
+    _pool: CacheByteReservation,
+}
+impl std::ops::Deref for CachedPromptBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+impl std::fmt::Debug for CachedPromptBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedPromptBytes")
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+impl CachedPromptBytes {
+    fn reserve(
+        pool: &std::sync::Arc<CacheByteBudget>,
+        entry: &CacheWarmEntry,
+        bytes: &[u8],
+    ) -> Option<std::sync::Arc<Self>> {
+        let identity = entry.resident.reserve(bytes.len())?;
+        let global = pool.reserve(bytes.len())?;
+        Some(std::sync::Arc::new(Self {
+            bytes: bytes.into(),
+            _identity: identity,
+            _pool: global,
+        }))
+    }
+}
+// Constructed immediately after the original registration and before await.
+// Cancellation, timeout and normal wakes all use the same decrement path.
+struct CacheWaiterRegistration {
+    entry: std::sync::Arc<CacheWarmEntry>,
+    global: std::sync::Arc<AtomicUsize>,
+}
+impl Drop for CacheWaiterRegistration {
+    fn drop(&mut self) {
+        let mut state = self
+            .entry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiters = state
+            .waiters
+            .checked_sub(1)
+            .expect("original cache waiter registered once");
+        self.global.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn common_prefix_ratio_bp(first: &[u8], candidate: &[u8]) -> usize {
@@ -92,6 +208,7 @@ enum CacheWarmAdmission {
     Leader(CacheWarmLeaderKind),
     Ready,
     BypassLowReuse,
+    BypassLimit(&'static str),
     Wait,
 }
 
@@ -105,7 +222,8 @@ enum CacheWarmLeaderKind {
 struct CacheWarmState {
     phase: CacheWarmPhase,
     warmed_at: Option<Instant>,
-    first_prompt: Option<std::sync::Arc<[u8]>>,
+    first_prompt: Option<std::sync::Arc<CachedPromptBytes>>,
+    history: VecDeque<CachedProviderPrompt>,
     waiters: usize,
 }
 
@@ -113,19 +231,34 @@ struct CacheWarmState {
 struct CacheWarmEntry {
     state: Mutex<CacheWarmState>,
     changed: tokio::sync::Notify,
+    resident: std::sync::Arc<CacheByteBudget>,
 }
 
 pub(crate) struct ProviderCacheWarmupGuard {
-    entry: std::sync::Arc<CacheWarmEntry>,
+    entry: Option<std::sync::Arc<CacheWarmEntry>>,
     leader: Option<CacheWarmLeaderKind>,
     finished: bool,
     pub waited: bool,
     pub bypassed_low_reuse: bool,
+    pub unobserved_reason: Option<&'static str>,
     persistence_barrier: Duration,
     requires_common_prefix_discovery: bool,
 }
 
 impl ProviderCacheWarmupGuard {
+    fn bypass(reason: &'static str, waited: bool) -> Self {
+        Self {
+            entry: None,
+            leader: None,
+            finished: true,
+            waited,
+            bypassed_low_reuse: false,
+            unobserved_reason: Some(reason),
+            persistence_barrier: Duration::ZERO,
+            requires_common_prefix_discovery: false,
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub const fn is_leader(&self) -> bool {
@@ -156,8 +289,11 @@ impl ProviderCacheWarmupGuard {
         if self.finished {
             return;
         }
-        let mut state = self
+        let entry = self
             .entry
+            .as_ref()
+            .expect("original leader retains its cohort");
+        let mut state = entry
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -179,7 +315,7 @@ impl ProviderCacheWarmupGuard {
         state.warmed_at = success.then(Instant::now);
         self.finished = true;
         drop(state);
-        self.entry.changed.notify_waiters();
+        entry.changed.notify_waiters();
     }
 }
 
@@ -246,7 +382,9 @@ pub struct ProviderTransportPool {
     peak_in_flight: AtomicU64,
     account_failure_fences: Mutex<HashMap<(u64, String), Instant>>,
     account_failure_fence_ttl: Duration,
-    prompt_prefixes: Mutex<HashMap<String, VecDeque<CachedProviderPrompt>>>,
+    cache_limits: CacheLimits,
+    cache_resident: std::sync::Arc<CacheByteBudget>,
+    cache_waiters: std::sync::Arc<AtomicUsize>,
     cache_warm_entries: Mutex<HashMap<String, std::sync::Arc<CacheWarmEntry>>>,
 }
 
@@ -286,14 +424,68 @@ impl ProviderTransportPool {
             peak_in_flight: AtomicU64::new(0),
             account_failure_fences: Mutex::new(HashMap::new()),
             account_failure_fence_ttl,
-            prompt_prefixes: Mutex::new(HashMap::new()),
+            cache_limits: CacheLimits::default(),
+            cache_resident: CacheByteBudget::new(CacheLimits::default().payload_bytes),
+            cache_waiters: std::sync::Arc::new(AtomicUsize::new(0)),
             cache_warm_entries: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Admit one cache cohort. Exactly one cold request primes an identity;
-    /// followers wait without occupying an HTTP in-flight slot. Different
-    /// identities never share this barrier.
+    fn cache_entry(
+        &self,
+        identity: &str,
+        additional_bytes: usize,
+    ) -> Option<std::sync::Arc<CacheWarmEntry>> {
+        if identity.len() > 256 {
+            return None;
+        }
+        let mut entries = self
+            .cache_warm_entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = entries.get(identity) {
+            return Some(entry.clone());
+        }
+        while entries.len() >= self.cache_limits.identities
+            || self
+                .cache_resident
+                .used
+                .load(Ordering::Acquire)
+                .saturating_add(additional_bytes)
+                > self.cache_limits.payload_bytes
+        {
+            // A holder, including a waiter or a finished guard still in use,
+            // pins this exact entry. Never split one active cohort in two.
+            let victim = entries
+                .iter()
+                .filter(|(_, entry)| std::sync::Arc::strong_count(entry) == 1)
+                .max_by_key(|(_, entry)| entry.resident.used.load(Ordering::Acquire))
+                .map(|(key, _)| key.clone());
+            if let Some(victim) = victim {
+                entries.remove(&victim);
+            } else if entries.len() >= self.cache_limits.identities {
+                return None;
+            } else {
+                break;
+            }
+        }
+        let entry = std::sync::Arc::new(CacheWarmEntry {
+            state: Mutex::new(CacheWarmState {
+                phase: CacheWarmPhase::Cold,
+                warmed_at: None,
+                first_prompt: None,
+                history: VecDeque::new(),
+                waiters: 0,
+            }),
+            changed: tokio::sync::Notify::new(),
+            resident: CacheByteBudget::new(self.cache_limits.identity_bytes),
+        });
+        entries.insert(identity.to_owned(), entry.clone());
+        Some(entry)
+    }
+
+    /// Coordinate optional cache warming without unbounded residency or wait.
+    /// A limit bypass is unobserved optimization, never a successful warm fact.
     pub(crate) async fn acquire_cache_warmup(
         &self,
         cache_identity_sha256: &str,
@@ -301,40 +493,15 @@ impl ProviderTransportPool {
         persistence_barrier: Duration,
         requires_common_prefix_discovery: bool,
     ) -> ProviderCacheWarmupGuard {
-        let entry = {
-            let mut entries = self
-                .cache_warm_entries
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !entries.contains_key(cache_identity_sha256)
-                && entries.len() >= MAX_PREFIX_IDENTITIES
-            {
-                if let Some(evicted) = entries.keys().next().cloned() {
-                    entries.remove(&evicted);
-                }
-            }
-            std::sync::Arc::clone(
-                entries
-                    .entry(cache_identity_sha256.to_string())
-                    .or_insert_with(|| {
-                        std::sync::Arc::new(CacheWarmEntry {
-                            state: Mutex::new(CacheWarmState {
-                                phase: CacheWarmPhase::Cold,
-                                warmed_at: None,
-                                first_prompt: None,
-                                waiters: 0,
-                            }),
-                            changed: tokio::sync::Notify::new(),
-                        })
-                    }),
-            )
+        if canonical_prompt.len() > self.cache_limits.prompt_bytes {
+            return ProviderCacheWarmupGuard::bypass("prompt_byte_limit", false);
+        }
+        let Some(entry) = self.cache_entry(cache_identity_sha256, canonical_prompt.len()) else {
+            return ProviderCacheWarmupGuard::bypass("identity_capacity", false);
         };
+        let deadline = tokio::time::Instant::now() + self.cache_limits.wait;
         let mut waited = false;
         loop {
-            // Register the wake before inspecting the phase. `notify_waiters`
-            // does not retain a permit for a future that has not been polled;
-            // without `enable`, a leader completing between the state check
-            // and `.await` can strand a follower indefinitely.
             let notified = entry.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -354,33 +521,32 @@ impl ProviderTransportPool {
                     state.warmed_at = None;
                     state.first_prompt = None;
                 }
-                let exact_extension = state
+                let exact = state
                     .first_prompt
                     .as_deref()
                     .is_some_and(|first| canonical_prompt.starts_with(first));
-                let coordinate_divergent_prefix =
-                    state.first_prompt.as_deref().is_some_and(|first| {
-                        common_prefix_ratio_bp(first, canonical_prompt)
-                            >= MIN_COMMON_PREFIX_COORDINATION_RATIO_BP
-                    });
+                let common = state.first_prompt.as_deref().is_some_and(|first| {
+                    common_prefix_ratio_bp(first, canonical_prompt)
+                        >= MIN_COMMON_PREFIX_COORDINATION_RATIO_BP
+                });
                 match state.phase {
-                    CacheWarmPhase::Cold => {
-                        state.phase = CacheWarmPhase::PrimingFirst;
-                        state.first_prompt = Some(std::sync::Arc::from(canonical_prompt));
-                        CacheWarmAdmission::Leader(CacheWarmLeaderKind::FirstRequest)
-                    }
+                    CacheWarmPhase::Cold => match CachedPromptBytes::reserve(
+                        &self.cache_resident,
+                        &entry,
+                        canonical_prompt,
+                    ) {
+                        Some(bytes) => {
+                            state.first_prompt = Some(bytes);
+                            state.phase = CacheWarmPhase::PrimingFirst;
+                            CacheWarmAdmission::Leader(CacheWarmLeaderKind::FirstRequest)
+                        }
+                        None => CacheWarmAdmission::BypassLimit("resident_byte_capacity"),
+                    },
                     CacheWarmPhase::Warm => CacheWarmAdmission::Ready,
                     CacheWarmPhase::FirstRequestPersisted => {
-                        if exact_extension {
-                            // DeepSeek persists the full first request at its
-                            // input boundary, so an exact extension can reuse
-                            // it without another cold cohort request.
+                        if exact {
                             CacheWarmAdmission::Ready
-                        } else if coordinate_divergent_prefix {
-                            // A different suffix only causes DeepSeek to
-                            // discover/persist the common prefix on this
-                            // second request. Serialize exactly that request,
-                            // then release the rest of the cohort.
+                        } else if common {
                             state.phase = CacheWarmPhase::PrimingCommonPrefix;
                             CacheWarmAdmission::Leader(CacheWarmLeaderKind::CommonPrefix)
                         } else {
@@ -388,12 +554,22 @@ impl ProviderTransportPool {
                         }
                     }
                     CacheWarmPhase::PrimingFirst | CacheWarmPhase::PrimingCommonPrefix => {
-                        if exact_extension
-                            || !requires_common_prefix_discovery
-                            || coordinate_divergent_prefix
-                        {
-                            state.waiters = state.waiters.saturating_add(1);
-                            CacheWarmAdmission::Wait
+                        if exact || !requires_common_prefix_discovery || common {
+                            if state.waiters >= self.cache_limits.identity_waiters
+                                || self
+                                    .cache_waiters
+                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                        count
+                                            .checked_add(1)
+                                            .filter(|sum| *sum <= self.cache_limits.waiters)
+                                    })
+                                    .is_err()
+                            {
+                                CacheWarmAdmission::BypassLimit("waiter_capacity")
+                            } else {
+                                state.waiters += 1;
+                                CacheWarmAdmission::Wait
+                            }
                         } else {
                             CacheWarmAdmission::BypassLowReuse
                         }
@@ -401,47 +577,35 @@ impl ProviderTransportPool {
                 }
             };
             match admission {
-                CacheWarmAdmission::Leader(leader) => {
-                    return ProviderCacheWarmupGuard {
-                        entry: std::sync::Arc::clone(&entry),
-                        leader: Some(leader),
-                        finished: false,
-                        waited,
-                        bypassed_low_reuse: false,
-                        persistence_barrier,
-                        requires_common_prefix_discovery,
-                    };
-                }
-                CacheWarmAdmission::Ready => {
-                    return ProviderCacheWarmupGuard {
-                        entry: std::sync::Arc::clone(&entry),
-                        leader: None,
-                        finished: true,
-                        waited,
-                        bypassed_low_reuse: false,
-                        persistence_barrier,
-                        requires_common_prefix_discovery,
-                    };
-                }
-                CacheWarmAdmission::BypassLowReuse => {
-                    return ProviderCacheWarmupGuard {
-                        entry: std::sync::Arc::clone(&entry),
-                        leader: None,
-                        finished: true,
-                        waited,
-                        bypassed_low_reuse: true,
-                        persistence_barrier,
-                        requires_common_prefix_discovery,
-                    };
-                }
                 CacheWarmAdmission::Wait => {
+                    let registration = CacheWaiterRegistration {
+                        entry: entry.clone(),
+                        global: self.cache_waiters.clone(),
+                    };
                     waited = true;
-                    notified.await;
-                    let mut state = entry
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    state.waiters = state.waiters.saturating_sub(1);
+                    let wake = tokio::time::timeout_at(deadline, notified).await;
+                    drop(registration);
+                    if wake.is_err() {
+                        return ProviderCacheWarmupGuard::bypass("wait_deadline", waited);
+                    }
+                }
+                CacheWarmAdmission::BypassLimit(reason) => {
+                    return ProviderCacheWarmupGuard::bypass(reason, waited)
+                }
+                other => {
+                    return ProviderCacheWarmupGuard {
+                        entry: Some(entry.clone()),
+                        leader: match other {
+                            CacheWarmAdmission::Leader(kind) => Some(kind),
+                            _ => None,
+                        },
+                        finished: !matches!(other, CacheWarmAdmission::Leader(_)),
+                        waited,
+                        bypassed_low_reuse: matches!(other, CacheWarmAdmission::BypassLowReuse),
+                        unobserved_reason: None,
+                        persistence_barrier,
+                        requires_common_prefix_discovery,
+                    }
                 }
             }
         }
@@ -458,18 +622,24 @@ impl ProviderTransportPool {
         prompt: Vec<u8>,
         stable_head_bytes: usize,
     ) -> ProviderWirePrefixObservation {
-        let mut histories = self
-            .prompt_prefixes
+        let prompt_bytes = prompt.len();
+        let unavailable = |reason: &str| ProviderWirePrefixObservation {
+            cache_identity_sha256: cache_identity_sha256.clone(),
+            prompt_bytes: prompt_bytes as u64,
+            cache_retention_unavailable: Some(reason.into()),
+            ..Default::default()
+        };
+        if prompt_bytes > self.cache_limits.prompt_bytes || request_id.len() > 256 {
+            return unavailable("source_byte_limit");
+        }
+        let Some(entry) = self.cache_entry(&cache_identity_sha256, prompt_bytes) else {
+            return unavailable("identity_capacity");
+        };
+        let mut state = entry
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !histories.contains_key(&cache_identity_sha256)
-            && histories.len() >= MAX_PREFIX_IDENTITIES
-        {
-            if let Some(evicted) = histories.keys().next().cloned() {
-                histories.remove(&evicted);
-            }
-        }
-        let history = histories.entry(cache_identity_sha256.clone()).or_default();
+        let history = &mut state.history;
         let best = history
             .iter()
             .map(|candidate| {
@@ -482,9 +652,7 @@ impl ProviderTransportPool {
                 (candidate, lcp)
             })
             .max_by_key(|(_, lcp)| *lcp);
-        let best_bytes = best
-            .map(|(candidate, _)| candidate.bytes.clone())
-            .unwrap_or_default();
+        let best_bytes = best.map(|(candidate, _)| candidate.bytes.clone());
         let predecessor_request_id = best.map(|(candidate, _)| candidate.request_id.clone());
         let reusable_prefix_bytes = best.map_or(0, |(_, lcp)| lcp);
         let exact_extension = best.is_some_and(|(candidate, lcp)| lcp == candidate.bytes.len());
@@ -510,7 +678,7 @@ impl ProviderTransportPool {
             None
         } else {
             let attribution = crate::provider_prefix_attribution::attribute_divergence(
-                &best_bytes,
+                best_bytes.as_ref().map_or(&[][..], |bytes| &bytes[..]),
                 &prompt,
                 &crate::provider_prefix_attribution::canonical_prompt_layout(
                     stable_head_bytes.min(prompt.len()),
@@ -527,17 +695,27 @@ impl ProviderTransportPool {
                 "low provider prompt structural reuse"
             );
         }
-        history.push_back(CachedProviderPrompt {
-            request_id,
-            bytes: prompt.into(),
-        });
-        while history.len() > MAX_PREFIX_PREDECESSORS {
+        drop(best_bytes);
+        // Charge before copying. Eviction of old history releases its bytes
+        // only when all actual holders have dropped the payload.
+        let mut retained = CachedPromptBytes::reserve(&self.cache_resident, &entry, &prompt);
+        while retained.is_none() && !history.is_empty() {
             history.pop_front();
+            retained = CachedPromptBytes::reserve(&self.cache_resident, &entry, &prompt);
         }
+        let cache_retention_unavailable = if let Some(bytes) = retained {
+            history.push_back(CachedProviderPrompt { request_id, bytes });
+            while history.len() > MAX_PREFIX_PREDECESSORS {
+                history.pop_front();
+            }
+            None
+        } else {
+            Some("resident_byte_capacity".into())
+        };
         ProviderWirePrefixObservation {
             cache_identity_sha256,
             predecessor_request_id,
-            prompt_bytes: history.back().map_or(0, |value| value.bytes.len()) as u64,
+            prompt_bytes: prompt_bytes as u64,
             reusable_prefix_bytes: reusable_prefix_bytes as u64,
             structural_reuse_ratio_bp,
             exact_extension,
@@ -548,6 +726,8 @@ impl ProviderTransportPool {
             common_prefix_leader: false,
             warmup_bypassed_low_reuse: false,
             waited_for_warmup: false,
+            warmup_unobserved_reason: None,
+            cache_retention_unavailable,
         }
     }
 
@@ -841,6 +1021,264 @@ mod tests {
         })
         .await
         .expect("cache warmup followers register before the leader finishes");
+    }
+
+    fn small_cache(limits: super::CacheLimits) -> ProviderTransportPool {
+        let mut pool = ProviderTransportPool::new(2);
+        pool.cache_limits = limits;
+        pool.cache_resident = super::CacheByteBudget::new(limits.payload_bytes);
+        pool
+    }
+
+    #[tokio::test]
+    async fn full_identity_table_cannot_evict_an_active_leader_or_split_its_waiters() {
+        let pool = Arc::new(small_cache(super::CacheLimits {
+            identities: 1,
+            ..Default::default()
+        }));
+        let mut leader = pool
+            .acquire_cache_warmup("a", b"prefix", Duration::ZERO, false)
+            .await;
+        let rejected = pool
+            .acquire_cache_warmup("b", b"other", Duration::ZERO, false)
+            .await;
+        assert_eq!(rejected.unobserved_reason, Some("identity_capacity"));
+        assert!(!rejected.is_leader());
+        let original = pool
+            .cache_warm_entries
+            .lock()
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone();
+        let other = pool.clone();
+        let follower = tokio::spawn(async move {
+            other
+                .acquire_cache_warmup("a", b"prefix-more", Duration::ZERO, false)
+                .await
+        });
+        wait_for_cache_waiters(&pool, "a", 1).await;
+        assert!(Arc::ptr_eq(
+            &original,
+            pool.cache_warm_entries.lock().unwrap().get("a").unwrap()
+        ));
+        assert_eq!(pool.cache_warm_entries.lock().unwrap().len(), 1);
+        leader.finish(true);
+        let follower = follower.await.unwrap();
+        assert!(follower.waited);
+        assert!(!follower.is_leader());
+        drop(follower);
+        drop(original);
+        drop(leader);
+        let next = pool
+            .acquire_cache_warmup("b", b"other", Duration::ZERO, false)
+            .await;
+        assert!(next.is_leader());
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_expired_waiters_release_both_original_counts() {
+        use std::sync::atomic::Ordering;
+        let pool = Arc::new(small_cache(super::CacheLimits {
+            waiters: 1,
+            identity_waiters: 1,
+            wait: Duration::from_millis(100),
+            ..Default::default()
+        }));
+        let leader = pool
+            .acquire_cache_warmup("a", b"first", Duration::ZERO, false)
+            .await;
+        let other = pool.clone();
+        let follower = tokio::spawn(async move {
+            other
+                .acquire_cache_warmup("a", b"first-more", Duration::ZERO, false)
+                .await
+        });
+        wait_for_cache_waiters(&pool, "a", 1).await;
+        let rejected = pool
+            .acquire_cache_warmup("a", b"first-tail", Duration::ZERO, false)
+            .await;
+        assert_eq!(rejected.unobserved_reason, Some("waiter_capacity"));
+        assert!(!rejected.is_leader());
+        follower.abort();
+        assert!(matches!(follower.await,Err(error) if error.is_cancelled()));
+        wait_for_cache_waiters(&pool, "a", 0).await;
+        assert_eq!(pool.cache_waiters.load(Ordering::Acquire), 0);
+        let expired = pool
+            .acquire_cache_warmup("a", b"first-tail", Duration::ZERO, false)
+            .await;
+        assert_eq!(expired.unobserved_reason, Some("wait_deadline"));
+        assert!(expired.waited);
+        assert!(!expired.is_leader());
+        wait_for_cache_waiters(&pool, "a", 0).await;
+        assert_eq!(pool.cache_waiters.load(Ordering::Acquire), 0);
+        assert!(leader.is_leader());
+        drop(leader);
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn global_waiter_bound_is_shared_across_independent_cohorts() {
+        use std::sync::atomic::Ordering;
+        let pool = Arc::new(small_cache(super::CacheLimits {
+            waiters: 1,
+            identity_waiters: 2,
+            ..Default::default()
+        }));
+        let leader_a = pool
+            .acquire_cache_warmup("a", b"prefix", Duration::ZERO, false)
+            .await;
+        let mut leader_b = pool
+            .acquire_cache_warmup("b", b"prefix", Duration::ZERO, false)
+            .await;
+        let other = pool.clone();
+        let first = tokio::spawn(async move {
+            other
+                .acquire_cache_warmup("a", b"prefix-more", Duration::ZERO, false)
+                .await
+        });
+        wait_for_cache_waiters(&pool, "a", 1).await;
+        assert_eq!(pool.cache_waiters.load(Ordering::Acquire), 1);
+        let refused = pool
+            .acquire_cache_warmup("b", b"prefix-more", Duration::ZERO, false)
+            .await;
+        assert_eq!(refused.unobserved_reason, Some("waiter_capacity"));
+        assert!(!refused.is_leader());
+        wait_for_cache_waiters(&pool, "b", 0).await;
+        first.abort();
+        assert!(matches!(first.await,Err(error) if error.is_cancelled()));
+        assert_eq!(pool.cache_waiters.load(Ordering::Acquire), 0);
+        let other = pool.clone();
+        let next = tokio::spawn(async move {
+            other
+                .acquire_cache_warmup("b", b"prefix-more", Duration::ZERO, false)
+                .await
+        });
+        wait_for_cache_waiters(&pool, "b", 1).await;
+        leader_b.finish(true);
+        assert!(next.await.unwrap().waited);
+        assert_eq!(pool.cache_waiters.load(Ordering::Acquire), 0);
+        drop(leader_a);
+    }
+
+    #[tokio::test]
+    async fn one_identity_cannot_consume_the_whole_pool_budget() {
+        use std::sync::atomic::Ordering;
+        let pool = small_cache(super::CacheLimits {
+            payload_bytes: 64,
+            identity_bytes: 8,
+            prompt_bytes: 8,
+            ..Default::default()
+        });
+        let first = pool
+            .acquire_cache_warmup("a", b"1234", Duration::ZERO, false)
+            .await;
+        pool.observe_prompt_prefix("a".into(), "r1".into(), b"1234".to_vec(), 0);
+        let later = pool.observe_prompt_prefix("a".into(), "r2".into(), b"1234".to_vec(), 0);
+        assert_eq!(later.predecessor_request_id.as_deref(), Some("r1"));
+        assert!(later.cache_retention_unavailable.is_none());
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 8);
+        let entries = pool.cache_warm_entries.lock().unwrap();
+        let state = entries.get("a").unwrap().state.lock().unwrap();
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].request_id, "r2");
+        drop(state);
+        drop(entries);
+        let independent = pool
+            .acquire_cache_warmup("b", b"abcdefgh", Duration::ZERO, false)
+            .await;
+        assert!(independent.is_leader());
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 16);
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn payload_budget_survives_pool_eviction_until_the_actual_arc_is_dropped() {
+        use std::sync::atomic::Ordering;
+        let pool = small_cache(super::CacheLimits {
+            payload_bytes: 8,
+            identity_bytes: 8,
+            prompt_bytes: 8,
+            ..Default::default()
+        });
+        let leader = pool
+            .acquire_cache_warmup("a", b"12345678", Duration::ZERO, false)
+            .await;
+        let bypass = pool
+            .acquire_cache_warmup("b", b"1234", Duration::ZERO, false)
+            .await;
+        assert_eq!(bypass.unobserved_reason, Some("resident_byte_capacity"));
+        assert!(!bypass.is_leader());
+        let no_copy = pool.observe_prompt_prefix("a".into(), "r0".into(), b"12345678".to_vec(), 0);
+        assert_eq!(
+            no_copy.cache_retention_unavailable.as_deref(),
+            Some("resident_byte_capacity")
+        );
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 8);
+        drop(leader);
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 0);
+        let mut next = pool
+            .acquire_cache_warmup("b", b"1234", Duration::ZERO, false)
+            .await;
+        assert!(next.is_leader());
+        let observed = pool.observe_prompt_prefix("b".into(), "r1".into(), b"1234".to_vec(), 0);
+        assert!(observed.cache_retention_unavailable.is_none());
+        next.finish(true);
+        drop(next);
+        let retained = pool
+            .cache_warm_entries
+            .lock()
+            .unwrap()
+            .get("b")
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .history[0]
+            .bytes
+            .clone();
+        let budget = pool.cache_resident.clone();
+        assert_eq!(budget.used.load(Ordering::Acquire), 8);
+        drop(pool);
+        assert_eq!(budget.used.load(Ordering::Acquire), 4);
+        drop(retained);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn prefix_bytes_and_metadata_are_bounded_and_inactive_payload_can_be_reclaimed() {
+        use std::sync::atomic::Ordering;
+        let pool = small_cache(super::CacheLimits {
+            payload_bytes: 8,
+            identity_bytes: 8,
+            prompt_bytes: 8,
+            ..Default::default()
+        });
+        pool.observe_prompt_prefix("a".into(), "r1".into(), b"12345678".to_vec(), 0);
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 8);
+        let new = pool.observe_prompt_prefix("b".into(), "r2".into(), b"abcd".to_vec(), 0);
+        assert!(new.cache_retention_unavailable.is_none());
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 4);
+        let oversized =
+            pool.observe_prompt_prefix("c".into(), "r3".into(), b"123456789".to_vec(), 0);
+        assert_eq!(oversized.prompt_bytes, 9);
+        assert_eq!(
+            oversized.cache_retention_unavailable.as_deref(),
+            Some("source_byte_limit")
+        );
+        let identity =
+            pool.observe_prompt_prefix("x".repeat(257), "r4".into(), b"data".to_vec(), 0);
+        assert_eq!(
+            identity.cache_retention_unavailable.as_deref(),
+            Some("identity_capacity")
+        );
+        let request = pool.observe_prompt_prefix("d".into(), "x".repeat(257), b"data".to_vec(), 0);
+        assert_eq!(
+            request.cache_retention_unavailable.as_deref(),
+            Some("source_byte_limit")
+        );
+        assert_eq!(pool.cache_resident.used.load(Ordering::Acquire), 4);
+        assert!(pool.cache_warm_entries.lock().unwrap().len() <= 2);
     }
 
     #[test]
