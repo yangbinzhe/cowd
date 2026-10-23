@@ -1138,58 +1138,48 @@ fn direct_eval_candidate_keeps_policy_complete_graph() {
 }
 
 #[test]
-fn explicit_collaboration_requirement_becomes_a_runtime_team_tool_call() {
-    let objective = "这是复杂架构审查，必须实际启动一个多 Agent 协作团队完成分析。";
-    let decision = build_runtime_execution_decision(objective, None);
-    let intent = enforce_explicit_team_requirement(
-        objective,
-        true,
-        &decision,
-        ModelStepIntent::FinalAnswer {
-            text: "我会开始分析。".to_string(),
-        },
-    );
-    let ModelStepIntent::FinalAnswer { .. } = intent else {
-        panic!(
-                "the first step belongs to the model; the final-answer acceptance gate re-prompts later"
-            );
-    };
-}
-
-#[test]
-fn chinese_launch_team_wording_is_enforced_as_an_execution_requirement() {
-    let objective = "发起一个团队，生成公开技术标准的全面深度调研报告";
-    let decision = build_runtime_execution_decision(objective, None);
-    let intent = enforce_explicit_team_requirement(
-        objective,
-        true,
-        &decision,
-        ModelStepIntent::FinalAnswer {
-            text: "无法组队".to_string(),
-        },
-    );
-
-    let ModelStepIntent::FinalAnswer { .. } = intent else {
-        panic!("first-step final answers stay model-owned; the gate re-prompts later");
-    };
-}
-
-#[test]
-fn sequential_team_artifact_request_materializes_a_write_capable_followup_team() {
-    let objective = "用一个团队调研公开技术标准，然后另一个团队负责生成一套 HTML 研究报告网站";
-    let decision = build_runtime_execution_decision(objective, None);
-    let intent = enforce_explicit_team_requirement(
-        objective,
-        true,
-        &decision,
-        ModelStepIntent::FinalAnswer {
-            text: "调研结束。".to_string(),
-        },
-    );
-
-    let ModelStepIntent::FinalAnswer { .. } = intent else {
-        panic!("first-step final answers stay model-owned; the gate re-prompts later");
-    };
+fn first_step_final_answer_remains_model_owned_for_explicit_collaboration() {
+    for (case, objective, response) in [
+        (
+            "explicit_collaboration",
+            "这是复杂架构审查，必须实际启动一个多 Agent 协作团队完成分析。",
+            "我会开始分析。",
+        ),
+        (
+            "chinese_launch",
+            "发起一个团队，生成公开技术标准的全面深度调研报告",
+            "无法组队",
+        ),
+        (
+            "sequential_research_then_html",
+            "用一个团队调研公开技术标准，然后另一个团队负责生成一套 HTML 研究报告网站",
+            "调研结束。",
+        ),
+        (
+            "explicit_non_collaboration_hint_wording",
+            "先自主选择并实际启动合适的协作团队，分别完成三个独立审查。",
+            "我会开始分析。",
+        ),
+        (
+            "ordinal_groups",
+            "第一组研究 Runtime，第二组审查 Gateway，第三组汇总结论",
+            "premature",
+        ),
+    ] {
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: response.to_string(),
+            },
+        );
+        assert!(
+            matches!(intent, ModelStepIntent::FinalAnswer { .. }),
+            "case {case}: the first-step FinalAnswer must remain model-owned"
+        );
+    }
 }
 
 #[test]
@@ -1298,25 +1288,6 @@ fn e2e_negative_team_fixture_is_marker_scoped_and_produces_real_cost_warning() {
 }
 
 #[test]
-fn explicit_team_requirement_overrides_a_non_collaboration_strategy_hint() {
-    let objective = "先自主选择并实际启动合适的协作团队，分别完成三个独立审查。";
-    let decision = build_runtime_execution_decision(objective, None);
-
-    let intent = enforce_explicit_team_requirement(
-        objective,
-        true,
-        &decision,
-        ModelStepIntent::FinalAnswer {
-            text: "我会开始分析。".to_string(),
-        },
-    );
-
-    let ModelStepIntent::FinalAnswer { .. } = intent else {
-        panic!("first-step final answers stay model-owned; the gate re-prompts later");
-    };
-}
-
-#[test]
 fn explicit_team_requirement_does_not_preempt_first_step_model_tool_calls() {
     let objective = "必须实际启动协作团队，再分析这些模块。";
     let decision = build_runtime_execution_decision(objective, None);
@@ -1358,23 +1329,6 @@ fn ordinary_tool_names_never_create_runtime_control_intents() {
         };
         assert_eq!(calls[0].name, name);
     }
-}
-
-#[test]
-fn ordinal_group_constraint_materializes_exactly_three_teams() {
-    let objective = "第一组研究 Runtime，第二组审查 Gateway，第三组汇总结论";
-    let decision = build_runtime_execution_decision(objective, None);
-    let intent = enforce_explicit_team_requirement(
-        objective,
-        true,
-        &decision,
-        ModelStepIntent::FinalAnswer {
-            text: "premature".to_string(),
-        },
-    );
-    let ModelStepIntent::FinalAnswer { .. } = intent else {
-        panic!("first-step final answers stay model-owned; the gate re-prompts later");
-    };
 }
 
 #[test]
