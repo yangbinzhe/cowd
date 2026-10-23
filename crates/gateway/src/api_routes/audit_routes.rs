@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{Extension, Query, State as AxumState},
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -38,7 +39,7 @@ async fn audit_export_handler(
         let approval = state
             .services
             .approval
-            .history(limit + offset, 0, &principal.0)
+            .history(limit.saturating_add(offset), 0, &principal.0)
             .await;
         let items = approval.as_array().cloned().unwrap_or_default();
         let total = items.len();
@@ -48,7 +49,19 @@ async fn audit_export_handler(
     };
     let memory = if include_memory {
         match state.services.memory.manager() {
-            Some(manager) => manager.audit_entries(limit + offset).unwrap_or_default(),
+            Some(manager) => match manager.audit_entries(limit.saturating_add(offset)) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!(%error, "Memory audit export unavailable");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": "Memory audit evidence unavailable"
+                        })),
+                    )
+                        .into_response();
+                }
+            },
             None => Vec::new(),
         }
     } else {
@@ -102,4 +115,5 @@ async fn audit_export_handler(
         "approval": approval,
         "memory": memory,
     }))
+    .into_response()
 }

@@ -197,6 +197,8 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
+    const READ_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
     /// Open (or create) the audit log at `path`.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -226,21 +228,16 @@ impl AuditLog {
 
     /// Query the most recent `n` entries.
     pub fn query_recent(&self, n: usize) -> std::io::Result<Vec<AuditEntry>> {
-        let content = std::fs::read_to_string(&self.path)?;
-        let entries: Vec<AuditEntry> = content
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+        let entries = self.read_entries()?;
         let start = entries.len().saturating_sub(n);
         Ok(entries[start..].to_vec())
     }
 
     /// Query entries by source type.
     pub fn query_by_source(&self, source: WriteSource) -> std::io::Result<Vec<AuditEntry>> {
-        let content = std::fs::read_to_string(&self.path)?;
-        Ok(content
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
+        Ok(self
+            .read_entries()?
+            .into_iter()
             .filter(|e: &AuditEntry| e.source == source)
             .collect())
     }
@@ -251,12 +248,39 @@ impl AuditLog {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> std::io::Result<Vec<AuditEntry>> {
-        let content = std::fs::read_to_string(&self.path)?;
-        Ok(content
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
+        Ok(self
+            .read_entries()?
+            .into_iter()
             .filter(|e: &AuditEntry| e.timestamp >= start && e.timestamp <= end)
             .collect())
+    }
+
+    fn read_entries(&self) -> std::io::Result<Vec<AuditEntry>> {
+        use std::io::Read;
+        let file = std::fs::File::open(&self.path)?;
+        let bytes = file.metadata()?.len();
+        if bytes > Self::READ_MAX_BYTES {
+            return Err(std::io::Error::other("Memory audit read budget exceeded"));
+        }
+        let mut content = String::with_capacity(bytes as usize);
+        // Bound the actual handle too: growth after metadata admission cannot
+        // cause an unbounded allocation or be mistaken for an empty log.
+        file.take(Self::READ_MAX_BYTES + 1)
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > Self::READ_MAX_BYTES {
+            return Err(std::io::Error::other("Memory audit read budget exceeded"));
+        }
+        content
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed Memory audit evidence",
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Return the file path.
@@ -467,6 +491,49 @@ mod tests {
         assert!(guard.is_write_allowed(MemoryLayer::L2));
         assert!(guard.is_write_allowed(MemoryLayer::L1)); // extra layer
         assert!(!guard.is_write_allowed(MemoryLayer::L0));
+    }
+
+    #[test]
+    fn audit_read_errors_are_not_empty_or_partial_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(path.clone()).unwrap();
+        assert!(log.query_recent(10).unwrap().is_empty());
+        log.log(&AuditEntry {
+            timestamp: Utc::now(),
+            operation: AuditOperation::Create,
+            entry_id: "original".into(),
+            layer: "L3".into(),
+            source: WriteSource::User,
+            summary: "retained historical summary".into(),
+            agent_id: None,
+            session_id: None,
+        })
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [original.as_slice(), b"malformed record\n"].concat()).unwrap();
+        assert_eq!(
+            log.query_recent(10).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(log.query_by_source(WriteSource::User).is_err());
+        assert!(log
+            .query_by_time_range(Utc::now() - chrono::Duration::days(1), Utc::now())
+            .is_err());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(log.query_recent(10).is_err());
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(log.query_recent(10).unwrap().len(), 1);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            log.query_recent(10).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[test]

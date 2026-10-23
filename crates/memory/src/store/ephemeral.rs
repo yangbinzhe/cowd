@@ -720,6 +720,29 @@ impl MemoryStore for EphemeralMemoryStore {
         Ok(page)
     }
 
+    async fn memory_cleanup(&self, mutation_id: &str) -> Result<Option<MemoryCleanupPending>> {
+        if mutation_id.is_empty() || mutation_id.len() > 256 {
+            return Err(MemoryError::StaleSource);
+        }
+        let state = self.read()?;
+        let Some(pending) = state.cleanup_pending.get(mutation_id) else {
+            return Ok(None);
+        };
+        let receipt = state
+            .lifecycle_receipts
+            .get(mutation_id)
+            .ok_or(MemoryError::StaleSource)?;
+        reserved_source_bytes(
+            &(pending, receipt),
+            crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+        )?;
+        pending.validate_receipt(receipt)?;
+        if pending.mutation_id != mutation_id {
+            return Err(MemoryError::StaleSource);
+        }
+        Ok(Some(pending.clone()))
+    }
+
     async fn confirm_memory_cleanup(
         &self,
         expected: &MemoryCleanupPending,

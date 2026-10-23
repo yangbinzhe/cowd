@@ -410,6 +410,12 @@ impl crate::store::MemoryStore for NoopStore {
     ) -> crate::store::Result<Vec<crate::store::MemoryCleanupPending>> {
         Self::unavailable()
     }
+    async fn memory_cleanup(
+        &self,
+        _: &str,
+    ) -> crate::store::Result<Option<crate::store::MemoryCleanupPending>> {
+        Self::unavailable()
+    }
     async fn legacy_lifecycle_page(
         &self,
         _: Option<&str>,

@@ -1136,6 +1136,45 @@ impl MemoryStore for PostgresMemoryStore {
         }).await
     }
 
+    async fn memory_cleanup(
+        &self,
+        mutation_id: &str,
+    ) -> MemoryResult<Option<MemoryCleanupPending>> {
+        if mutation_id.is_empty() || mutation_id.len() > 256 {
+            return Err(MemoryError::StaleSource);
+        }
+        let store = self.clone();
+        let mutation_id = mutation_id.to_owned();
+        run_memory_blocking(move || {
+            let mut connection = store.executor.checkout_online_read().map_err(storage_memory_error)?;
+            let budget = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES as i64;
+            let row = connection.query_opt(
+                "SELECT CASE WHEN (octet_length(p.payload::text)+COALESCE(octet_length(r.payload::text),0))::bigint <= $2 THEN p.payload END,p.mutation_id,p.source_ref,p.delete_epoch,p.confirmed,CASE WHEN (octet_length(p.payload::text)+COALESCE(octet_length(r.payload::text),0))::bigint <= $2 THEN r.payload END FROM memory_cleanup_pending p LEFT JOIN memory_lifecycle_receipts r ON r.mutation_id=p.mutation_id WHERE p.mutation_id=$1",
+                &[&mutation_id, &budget],
+            ).map_err(postgres_memory_error)?;
+            let Some(row) = row else { return Ok(None); };
+            let pending: MemoryCleanupPending = serde_json::from_value(
+                row.try_get::<_, Option<serde_json::Value>>(0).map_err(postgres_memory_error)?
+                    .ok_or(MemoryError::SourceReadLimit)?,
+            ).map_err(json_memory_error)?;
+            let receipt: MemoryLifecycleReceipt = serde_json::from_value(
+                row.try_get::<_, Option<serde_json::Value>>(5).map_err(postgres_memory_error)?
+                    .ok_or(MemoryError::StaleSource)?,
+            ).map_err(json_memory_error)?;
+            pending.validate_receipt(&receipt)?;
+            let complete = pending.knowledge_receipt_digest.is_some() && pending.auxiliary_confirmed;
+            if pending.mutation_id != mutation_id
+                || pending.mutation_id != row.try_get::<_, String>(1).map_err(postgres_memory_error)?
+                || pending.source.source_ref != row.try_get::<_, String>(2).map_err(postgres_memory_error)?
+                || i64::try_from(pending.source.delete_epoch).ok() != Some(row.try_get::<_, i64>(3).map_err(postgres_memory_error)?)
+                || complete != row.try_get::<_, bool>(4).map_err(postgres_memory_error)?
+            {
+                return Err(MemoryError::StaleSource);
+            }
+            Ok(Some(pending))
+        }).await
+    }
+
     async fn confirm_memory_cleanup(
         &self,
         expected: &MemoryCleanupPending,

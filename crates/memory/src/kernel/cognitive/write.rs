@@ -345,7 +345,7 @@ impl CognitiveContextManager {
         ctx: &MemoryTurnContext,
         memory_id: MemoryId,
         reason: &str,
-    ) -> Result<crate::store::MemoryLifecycleReceipt> {
+    ) -> Result<crate::store::MemoryErasureResult> {
         let store = self.orchestrator.store();
         if let Some(entry) = store.get(&memory_id).await? {
             return self.erase_original_entry(ctx, &entry, reason).await;
@@ -379,7 +379,7 @@ impl CognitiveContextManager {
             &receipt,
         )?;
         self.notify_memory_cleanup();
-        Ok(receipt)
+        self.erasure_result(receipt).await
     }
 
     pub(super) async fn erase_original_entry(
@@ -387,7 +387,7 @@ impl CognitiveContextManager {
         ctx: &MemoryTurnContext,
         entry: &MemoryEntry,
         reason: &str,
-    ) -> Result<crate::store::MemoryLifecycleReceipt> {
+    ) -> Result<crate::store::MemoryErasureResult> {
         if reason.trim().is_empty() || !crate::kernel::memory_entry_visible_to_ctx(entry, ctx) {
             return Err(MemoryError::StaleSource);
         }
@@ -448,7 +448,34 @@ impl CognitiveContextManager {
                 }
             }
         }
-        Ok(receipt)
+        self.erasure_result(receipt).await
+    }
+
+    async fn erasure_result(
+        &self,
+        receipt: crate::store::MemoryLifecycleReceipt,
+    ) -> Result<crate::store::MemoryErasureResult> {
+        let cleanup = match self
+            .orchestrator
+            .store()
+            .memory_cleanup(&receipt.mutation_id)
+            .await
+        {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                tracing::warn!(%error, mutation_id=%receipt.mutation_id, "Memory body erased; cleanup observation unknown");
+                None
+            }
+        };
+        match crate::store::MemoryErasureResult::observe(receipt.clone(), cleanup) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                // A damaged/foreign observation cannot undo the committed body
+                // fact or become a successful derived-cleanup confirmation.
+                tracing::warn!(%error, mutation_id=%receipt.mutation_id, "Memory cleanup binding unknown after body erasure");
+                crate::store::MemoryErasureResult::observe(receipt, None)
+            }
+        }
     }
 
     /// Update a memory entry's content, tags, and/or priority.

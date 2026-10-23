@@ -4,6 +4,22 @@ use crate::types::MemoryLayer;
 use crate::write_guard::WriteSource;
 
 #[tokio::test]
+async fn missing_audit_reader_is_unknown_not_an_empty_export() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = MemoryConfig::default();
+    config.store.blob_dir = root.path().join("blobs");
+    config.store.enable_vector_index = false;
+    let mut manager = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
+    assert!(manager.audit_entries(10).unwrap().is_empty());
+    // Test-only original owner fault: initialization supplied neither reader.
+    manager.audit_log = None;
+    manager.integrity_checker = None;
+    assert!(manager.audit_entries(10).is_err());
+}
+
+#[tokio::test]
 async fn partial_embedding_is_persisted_by_real_index_before_failure_and_resumes_missing_only() {
     let (url, fail, inputs, server) = crate::embedding::tests::partial_server().await;
     let store: Arc<dyn MemoryStore> = Arc::new(crate::store::EphemeralMemoryStore::default());

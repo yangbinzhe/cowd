@@ -400,7 +400,7 @@ impl L4PromotionService {
             }
             KnowledgeCandidateScope::Global => {}
         }
-        memory::MemoryKernel::new(manager.clone())
+        let erasure = memory::MemoryKernel::new(manager.clone())
             .erase(
                 &context,
                 receipt
@@ -411,6 +411,9 @@ impl L4PromotionService {
             )
             .await
             .map_err(|error| error.to_string())?;
+        tracing::debug!(candidate_id, body_erased=erasure.receipt.body_erased,
+            cleanup_confirmed=?erasure.cleanup_confirmed(), may_retain=?erasure.may_retain,
+            "L4 rollback revoked availability; historical material may remain");
         self.append_state(
             &projection.candidate,
             KnowledgeCandidateState::RolledBack,

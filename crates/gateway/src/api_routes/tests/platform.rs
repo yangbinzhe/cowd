@@ -1888,8 +1888,10 @@
     async fn audit_export_includes_memory_write_audit() {
         let tmp = std::env::temp_dir().join(format!("cowd-api-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
+        let config = test_memory_config(&tmp.join("memory.db"));
+        let audit_path = config.store.blob_dir.join("audit.jsonl");
         let manager = Arc::new(
-            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(config)
                 .await
                 .unwrap(),
         );
@@ -1919,6 +1921,7 @@
         assert_eq!(create_response.status(), StatusCode::CREATED);
 
         let export_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/audit/export?source=memory&limit=10")
@@ -1942,6 +1945,40 @@
         );
         assert_eq!(json["memory"][0]["operation"], "Create");
         assert_eq!(json["memory"][0]["layer"], "L3");
+
+        // Failed evidence reads must not become empty successful exports.
+        std::fs::write(&audit_path, "not a valid audit record\n").unwrap();
+        for fault in ["malformed", "oversize", "missing"] {
+            if fault == "oversize" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&audit_path)
+                    .unwrap()
+                    .set_len(8 * 1024 * 1024 + 1)
+                    .unwrap();
+            } else if fault == "missing" {
+                std::fs::remove_file(&audit_path).unwrap();
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/audit/export?source=memory&limit=10")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{fault}"
+            );
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"], "Memory audit evidence unavailable");
+            assert!(value.get("records").is_none());
+        }
 
         let _ = std::fs::remove_dir_all(tmp);
     }

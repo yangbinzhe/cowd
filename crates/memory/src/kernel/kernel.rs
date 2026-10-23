@@ -826,14 +826,14 @@ impl MemoryKernel {
             .await
     }
 
-    /// Explicit body erasure. The original receipt distinguishes physical body
-    /// removal from still-pending Knowledge/auxiliary cleanup.
+    /// Explicit target body/verbatim erasure, original cleanup observation and
+    /// material that may remain. This never claims all evidence was purged.
     pub async fn erase(
         &self,
         ctx: &MemoryTurnContext,
         memory_id: MemoryId,
         reason: &str,
-    ) -> MemoryKernelResult<crate::store::MemoryLifecycleReceipt> {
+    ) -> MemoryKernelResult<crate::store::MemoryErasureResult> {
         self.manager
             .erase_entry_for_turn(ctx, memory_id, reason)
             .await

@@ -71,6 +71,18 @@ pub struct MemoryCleanupPending {
 }
 
 impl MemoryCleanupPending {
+    pub fn validate_receipt(&self, receipt: &MemoryLifecycleReceipt) -> Result<()> {
+        self.validate()?;
+        receipt.source.verifies_retirement(&receipt.source)?;
+        if self.mutation_id != receipt.mutation_id
+            || self.memory_id != receipt.event.memory_id
+            || self.source != receipt.source
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.source.verifies_retirement(&self.source)?;
         if self.mutation_id.is_empty()
@@ -125,6 +137,53 @@ pub struct MemoryLifecycleReceipt {
     /// until the original Knowledge and auxiliary receipts are confirmed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub body_erased: bool,
+}
+
+/// Read-only observation of an original Erase. The receipt is immutable;
+/// cleanup is the exact original obligation, including a confirmed record.
+/// Missing/unreadable cleanup is unknown, never inferred from an empty page.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MemoryErasureResult {
+    pub receipt: MemoryLifecycleReceipt,
+    pub cleanup: Option<MemoryCleanupPending>,
+    /// These materials may remain. Neither body_erased nor cleanup confirmation
+    /// claims their physical deletion, or that they currently exist.
+    pub may_retain: [&'static str; 3],
+}
+
+impl MemoryErasureResult {
+    pub fn observe(
+        receipt: MemoryLifecycleReceipt,
+        cleanup: Option<MemoryCleanupPending>,
+    ) -> Result<Self> {
+        if !receipt.body_erased
+            || receipt.mutation_id.is_empty()
+            || receipt.source.source_ref != format!("memory:{}", receipt.event.memory_id)
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        receipt.source.verifies_retirement(&receipt.source)?;
+        if let Some(pending) = &cleanup {
+            pending.validate_receipt(&receipt)?;
+        }
+        Ok(Self {
+            receipt,
+            cleanup,
+            may_retain: [
+                "historical_audit_summaries",
+                "immutable_knowledge_evidence",
+                "derived_memory_and_historical_projections",
+            ],
+        })
+    }
+
+    /// Only the original Knowledge/auxiliary obligations, not all retained
+    /// material. None means the confirmation state could not be established.
+    pub fn cleanup_confirmed(&self) -> Option<bool> {
+        self.cleanup.as_ref().map(|pending| {
+            pending.knowledge_receipt_digest.is_some() && pending.auxiliary_confirmed
+        })
+    }
 }
 
 /// A read-only migration page. Unmaterializable rows stay unavailable, but

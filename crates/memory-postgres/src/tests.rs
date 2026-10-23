@@ -3323,3 +3323,148 @@ async fn real_postgres_runtime_turn_writes_keep_original_cuts_and_legacy_unknown
     drop(store);
     drop(executor);
 }
+
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_erasure_result_keeps_exact_cleanup_and_retention_after_reopen() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    let root = std::env::temp_dir().join(format!("cowd-erasure-result-{}", uuid::Uuid::new_v4()));
+    let mut config = memory::MemoryConfig::default();
+    config.store.blob_dir = root.join("blobs");
+    config.store.enable_vector_index = false;
+    let manager = Arc::new(
+        memory::CognitiveContextManager::new_with_selected_store(
+            config.clone(),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = memory::MemoryKernel::new(manager.clone());
+    let ctx = memory::MemoryTurnContext::new("erase-session", "erase-agent");
+    let mut source = memory_entry(uuid::Uuid::new_v4(), "retained-evidence");
+    source.scope = MemoryScope::Global;
+    source.visibility = AgentVisibility::Shared;
+    source.session_id = None;
+    source.source_agent = None;
+    kernel.remember(&ctx, source.clone()).await.unwrap();
+    let result = kernel
+        .erase(&ctx, source.id, "explicit target erasure")
+        .await
+        .unwrap();
+    assert!(result.receipt.body_erased);
+    assert_eq!(result.cleanup_confirmed(), Some(false));
+    assert_eq!(
+        store
+            .memory_cleanup(&result.receipt.mutation_id)
+            .await
+            .unwrap(),
+        result.cleanup
+    );
+    assert!(store
+        .memory_cleanup("absent-original-operation")
+        .await
+        .unwrap()
+        .is_none());
+    let fabric = memory::KnowledgeFabric::with_store(Arc::new(
+        PostgresKnowledgeStore::new(executor.clone()).unwrap(),
+    ))
+    .with_memory_sources(store.clone());
+    assert!(manager
+        .recover_memory_cleanup(&fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    drop(kernel);
+    drop(manager);
+    drop(fabric);
+    drop(store);
+    drop(executor);
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    let manager = Arc::new(
+        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+            .await
+            .unwrap(),
+    );
+    let kernel = memory::MemoryKernel::new(manager.clone());
+    let confirmed = kernel
+        .erase(&ctx, source.id, "explicit target erasure")
+        .await
+        .unwrap();
+    assert_eq!(confirmed.receipt, result.receipt);
+    assert_eq!(confirmed.cleanup_confirmed(), Some(true));
+    assert_eq!(
+        confirmed.may_retain,
+        [
+            "historical_audit_summaries",
+            "immutable_knowledge_evidence",
+            "derived_memory_and_historical_projections",
+        ]
+    );
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    let original = serde_json::to_value(confirmed.cleanup.as_ref().unwrap()).unwrap();
+    let mut foreign = original.clone();
+    foreign["source"]["scope_key"] = serde_json::json!("project:foreign");
+    {
+        let mut c = executor.checkout_critical().unwrap();
+        c.execute(
+            "UPDATE memory_cleanup_pending SET payload=$2 WHERE mutation_id=$1",
+            &[&result.receipt.mutation_id, &foreign],
+        )
+        .unwrap();
+    }
+    assert!(store
+        .memory_cleanup(&result.receipt.mutation_id)
+        .await
+        .is_err());
+    let unknown = kernel
+        .erase(&ctx, source.id, "explicit target erasure")
+        .await
+        .unwrap();
+    assert!(unknown.receipt.body_erased);
+    assert_eq!(unknown.cleanup_confirmed(), None);
+    {
+        let mut c = executor.checkout_critical().unwrap();
+        c.execute(
+            "UPDATE memory_cleanup_pending SET payload=$2,confirmed=FALSE WHERE mutation_id=$1",
+            &[&result.receipt.mutation_id, &original],
+        )
+        .unwrap();
+    }
+    assert!(store
+        .memory_cleanup(&result.receipt.mutation_id)
+        .await
+        .is_err());
+    {
+        let mut c = executor.checkout_critical().unwrap();
+        c.execute(
+            "DELETE FROM memory_cleanup_pending WHERE mutation_id=$1",
+            &[&result.receipt.mutation_id],
+        )
+        .unwrap();
+    }
+    let unknown = kernel
+        .erase(&ctx, source.id, "explicit target erasure")
+        .await
+        .unwrap();
+    assert_eq!(unknown.cleanup_confirmed(), None);
+    assert_eq!(unknown.receipt, result.receipt);
+    assert!(store.get(&source.id).await.unwrap().is_none());
+    assert!(manager.audit_entries(100).unwrap().iter().any(|entry| {
+        entry.entry_id == source.id.to_string() && entry.operation == memory::AuditOperation::Create
+    }));
+    drop(kernel);
+    drop(manager);
+    drop(store);
+    drop(executor);
+}

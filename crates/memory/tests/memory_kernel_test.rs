@@ -3290,12 +3290,22 @@ async fn explicit_erasure_has_its_own_receipt_and_cannot_recreate_or_confirm_a_f
         .await
         .unwrap()
         .is_some());
-    let receipt = kernel
+    let result = kernel
         .erase(&ctx, source.id, "explicit erase")
         .await
         .unwrap();
+    let receipt = result.receipt.clone();
     assert!(receipt.body_erased);
     assert!(receipt.source.retired);
+    assert_eq!(result.cleanup_confirmed(), Some(false));
+    assert_eq!(
+        result.may_retain,
+        [
+            "historical_audit_summaries",
+            "immutable_knowledge_evidence",
+            "derived_memory_and_historical_projections",
+        ]
+    );
     assert!(store.get(&source.id).await.unwrap().is_none());
     assert!(store
         .load_verbatim_by_id(&source.id.to_string())
@@ -3306,7 +3316,8 @@ async fn explicit_erasure_has_its_own_receipt_and_cannot_recreate_or_confirm_a_f
         kernel
             .erase(&ctx, source.id, "explicit erase")
             .await
-            .unwrap(),
+            .unwrap()
+            .receipt,
         receipt
     );
     assert!(kernel
@@ -3365,6 +3376,30 @@ async fn explicit_erasure_has_its_own_receipt_and_cannot_recreate_or_confirm_a_f
         .await
         .unwrap()
         .is_empty());
+    let confirmed = kernel
+        .erase(&ctx, source.id, "explicit erase")
+        .await
+        .unwrap();
+    assert_eq!(confirmed.receipt, receipt);
+    assert_eq!(confirmed.cleanup_confirmed(), Some(true));
+    assert!(store
+        .memory_cleanup(&receipt.mutation_id)
+        .await
+        .unwrap()
+        .is_some());
+    let mut foreign = confirmed.cleanup.clone().unwrap();
+    foreign.source.scope_key = "project:foreign".into();
+    assert!(memory::store::MemoryErasureResult::observe(receipt.clone(), Some(foreign)).is_err());
+    let unknown = memory::store::MemoryErasureResult::observe(receipt.clone(), None).unwrap();
+    assert_eq!(unknown.cleanup_confirmed(), None);
+    assert!(unknown.receipt.body_erased);
+    assert!(
+        manager.audit_entries(100).unwrap().iter().any(|event| {
+            event.entry_id == source.id.to_string()
+                && event.operation == memory::AuditOperation::Create
+        }),
+        "historical audit survives; body-only receipt must disclose retention"
+    );
     assert!(
         store
             .read_source_fence(&format!("memory:{}", source.id))

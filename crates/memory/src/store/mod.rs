@@ -26,7 +26,7 @@ pub use mutation::{
     auxiliary_source_cuts, filter_auxiliary_snapshot, filter_auxiliary_source_frame,
     lifecycle_retired, live_source_revision, read_lifecycle_history, retain_held_auxiliary,
     retire_auxiliary_support, source_frame_matches_original_lineage, source_root_eligibility,
-    validate_auxiliary_replacement, MemoryCleanupPending, MemoryEntryRevision,
+    validate_auxiliary_replacement, MemoryCleanupPending, MemoryEntryRevision, MemoryErasureResult,
     MemoryExtractionOrigin, MemoryLegacyLifecyclePage, MemoryLifecycleMutation,
     MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceAccess,
     MemorySourceEligibility, MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead,
@@ -265,6 +265,9 @@ pub trait MemoryStore: MemorySourceFenceReader + Send + Sync {
         after_mutation: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryCleanupPending>>;
+    /// Exact original obligation, including confirmed records. Absence is
+    /// unknown, not proof of cleanup. This never creates or confirms a record.
+    async fn memory_cleanup(&self, mutation_id: &str) -> Result<Option<MemoryCleanupPending>>;
     async fn confirm_memory_cleanup(
         &self,
         expected: &MemoryCleanupPending,

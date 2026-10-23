@@ -27,8 +27,12 @@ impl CognitiveContextManager {
                         reason = %reason,
                         "drift: pruning entry"
                     );
-                    self.erase_original_entry(turn, entry, &format!("drift prune: {reason}"))
+                    let result = self
+                        .erase_original_entry(turn, entry, &format!("drift prune: {reason}"))
                         .await?;
+                    tracing::debug!(id=%entry.id, body_erased=result.receipt.body_erased,
+                        cleanup_confirmed=?result.cleanup_confirmed(), may_retain=?result.may_retain,
+                        "drift: target body erased; retained material not purged");
                 }
                 crate::drift::DriftVerdict::FlagForReview { reason } => {
                     tracing::debug!(
@@ -476,7 +480,9 @@ impl CognitiveContextManager {
                 .query_recent(limit)
                 .map_err(|e| MemoryError::Store(format!("query audit log: {e}")));
         }
-        Ok(Vec::new())
+        Err(MemoryError::Store(
+            "Memory audit evidence is unavailable".into(),
+        ))
     }
 
     // -----------------------------------------------------------------------
