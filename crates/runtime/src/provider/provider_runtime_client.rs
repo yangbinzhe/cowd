@@ -459,6 +459,7 @@ pub trait ProviderWireEvidenceWriter: Send + Sync {
 #[derive(Clone)]
 pub struct ProviderRuntimeClient {
     preparation_resources: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
+    control_admission: Option<ControlResourceAdmission>,
     wire_preparations: Arc<AtomicU64>,
     registry: Arc<ProviderRegistry>,
     transport_pool: Arc<crate::ProviderTransportPool>,
@@ -563,6 +564,13 @@ pub struct ProviderControlCompletion {
     pub stop_reason: Option<String>,
 }
 
+#[derive(Clone)]
+struct ControlResourceAdmission {
+    config: Arc<std::sync::RwLock<crate::ProviderResourceConfig>>,
+    class: crate::execution_core::graph::ExecutionServiceClass,
+    fairness_key: String,
+}
+
 /// A single non-streaming request. The original Task may record this wire
 /// identity before dispatch; ownership prevents a second send of the carrier.
 /// Body and credentials are deliberately absent from Debug and public access.
@@ -665,6 +673,7 @@ impl ProviderRuntimeClient {
         template_cache.resolve(&snapshot, &transport_pool, &model)?;
         Ok(Self {
             preparation_resources: None,
+            control_admission: None,
             wire_preparations: Arc::new(AtomicU64::new(0)),
             registry,
             transport_pool,
@@ -702,6 +711,26 @@ impl ProviderRuntimeClient {
         manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
     ) -> Self {
         self.preparation_resources = Some(manager);
+        self
+    }
+
+    /// Bind the composition root's existing Provider resource owner. Preparing
+    /// content uses its resident quota; only the actual control leaf acquires
+    /// Provider/account/model/token demands.
+    #[must_use]
+    pub fn with_control_resources(
+        mut self,
+        manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
+        config: Arc<std::sync::RwLock<crate::ProviderResourceConfig>>,
+        class: crate::execution_core::graph::ExecutionServiceClass,
+        fairness_key: impl Into<String>,
+    ) -> Self {
+        self.preparation_resources = Some(manager);
+        self.control_admission = Some(ControlResourceAdmission {
+            config,
+            class,
+            fairness_key: fairness_key.into(),
+        });
         self
     }
 
@@ -751,6 +780,38 @@ impl ProviderRuntimeClient {
         let prepared = self
             .prepare_control_analysis(model, &system, &input, max_tokens)
             .await?;
+        if let Some(admission) = &self.control_admission {
+            let manager = self
+                .preparation_resources
+                .as_ref()
+                .ok_or("control resource owner missing")?;
+            let config = admission
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis() as u64;
+            let request = crate::provider_resources::provider_leaf_admission(
+                &config,
+                Some(&prepared.context().profile.provider_name),
+                &prepared.entry.model,
+                prepared.estimated_total_tokens(),
+                admission.class,
+                &admission.fairness_key,
+                now.saturating_add(1500),
+            );
+            let crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } =
+                manager.admit(request).await.map_err(|e| e.to_string())?
+            else {
+                return Err("control Provider capacity unavailable".into());
+            };
+            return self
+                .complete_admitted_control_analysis(prepared, &lease, &config)
+                .await;
+        }
         self.send_control_analysis(prepared).await
     }
 
@@ -781,11 +842,19 @@ impl ProviderRuntimeClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_millis() as u64;
+            let (class, key) = self.control_admission.as_ref().map_or(
+                (
+                    ExecutionServiceClass::Foreground,
+                    "provider-control-prepare",
+                ),
+                |admission| (admission.class, admission.fairness_key.as_str()),
+            );
             let admission = ResourceAdmissionRequest::new(
-                ExecutionServiceClass::Foreground,
+                class,
                 [(ExecutionResourceKind::ContextBytes, resident_bytes)],
             )
-            .with_fairness_key("provider-control-prepare")
+            .with_parent_class_ceiling(class)
+            .with_fairness_key(key)
             .with_deadline_at_ms(now.saturating_add(5000));
             match manager.admit(admission).await.map_err(|e| e.to_string())? {
                 ResourceAdmissionDecision::Granted { lease, .. } => Some(lease),
@@ -3464,6 +3533,170 @@ mod tests {
             ResourceQuota::new(4 * 1024 * 1024, 4 * 1024 * 1024, 4 * 1024 * 1024).unwrap(),
         ));
         (Arc::new(ExecutionResourceManager::new(quotas)), config)
+    }
+
+    #[tokio::test]
+    async fn control_auto_admission_revalidates_after_original_quota_queue() {
+        use crate::execution_core::graph::*;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (client, _) = step_wire_fixture(
+            format!("http://{}/v1", listener.local_addr().unwrap()),
+            workspace.path(),
+        );
+        let (manager, config) = control_resource_fixture(&client);
+        let client = client.with_control_resources(
+            Arc::clone(&manager),
+            Arc::new(std::sync::RwLock::new(config)),
+            ExecutionServiceClass::Foreground,
+            "queued-control-session",
+        );
+        let ResourceAdmissionDecision::Granted { lease: blocker, .. } = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Foreground,
+                [(ExecutionResourceKind::Provider, 1)],
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("fixture blocker");
+        };
+        let running_client = client.clone();
+        let running = tokio::spawn(async move {
+            running_client
+                .complete_control_analysis("fixture-model", "system", "input", 32)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .queued_waiters
+                != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(client.wire_preparation_count(), 1);
+        assert!(
+            manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases
+                > 0
+        );
+        let mut replacement = client.registry.pin().config().clone();
+        replacement.providers.get_mut("fixture").unwrap().api_key = "new-route-credential".into();
+        client.registry.replace(replacement).unwrap();
+        drop(blocker);
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(failure.contains("profile/transport changed"));
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .queued_waiters,
+            0
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn control_auto_admission_cancel_drops_actual_local_future_without_claiming_remote_exit()
+    {
+        use crate::execution_core::graph::*;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            assert!(socket.read(&mut buffer).await.unwrap() > 0);
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            drop(socket);
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let (client, _) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+        let (manager, config) = control_resource_fixture(&client);
+        let client = client.with_control_resources(
+            Arc::clone(&manager),
+            Arc::new(std::sync::RwLock::new(config)),
+            ExecutionServiceClass::Foreground,
+            "cancelled-control-session",
+        );
+        let running_client = client.clone();
+        let running = tokio::spawn(async move {
+            running_client
+                .complete_control_analysis("fixture-model", "system", "input", 32)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            1
+        );
+        assert!(
+            manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases
+                > 0
+        );
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        assert_eq!(client.transport_pool.stats().in_flight, 0);
+        assert!(
+            !server.is_finished(),
+            "remote completion is still unknown after the local future exits"
+        );
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

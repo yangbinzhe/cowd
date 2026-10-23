@@ -770,7 +770,13 @@ async fn skill_translate_handler(
         model.clone(),
         Vec::new(),
     )
-    .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?
+    .with_control_resources(
+        Arc::clone(runtime_services.resource_manager()),
+        runtime_services.provider_resource_config(),
+        runtime::execution_core::graph::ExecutionServiceClass::Background,
+        format!("skill-translation:{id}"),
+    );
 
     let char_limit = 24_000usize;
     let truncated = content.chars().count() > char_limit;

@@ -258,7 +258,13 @@ impl MissionOrganizer {
             model.clone(),
             Vec::new(),
         )?
-        .with_emit_output(false);
+        .with_emit_output(false)
+        .with_control_resources(
+            Arc::clone(self.services.resource_manager()),
+            self.services.provider_resource_config(),
+            crate::execution_core::graph::ExecutionServiceClass::Background,
+            task.origin_session_id.clone(),
+        );
         decision.provider_invoked = true;
         decision.provider_model = Some(model.clone());
         let completion = tokio::time::timeout(

@@ -36,7 +36,13 @@ impl memory::SemanticGovernanceResolver for GatewaySemanticGovernanceResolver {
             Arc::clone(services.provider_template_cache()),
             model.clone(),
             Vec::new(),
-        )?;
+        )?
+        .with_control_resources(
+            Arc::clone(services.resource_manager()),
+            services.provider_resource_config(),
+            runtime::execution_core::graph::ExecutionServiceClass::Background,
+            "memory-governance",
+        );
         let candidate_count = request.candidates.len();
         let input = serde_json::to_string(&request).map_err(|error| error.to_string())?;
         let completion = client

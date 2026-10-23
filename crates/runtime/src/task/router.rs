@@ -214,7 +214,12 @@ impl TaskRouter {
             model.clone(),
             Vec::new(),
         ) {
-            Ok(client) => client.with_emit_output(false),
+            Ok(client) => client.with_emit_output(false).with_control_resources(
+                std::sync::Arc::clone(services.resource_manager()),
+                services.provider_resource_config(),
+                crate::execution_core::graph::ExecutionServiceClass::Foreground,
+                context.session_id.clone(),
+            ),
             Err(error) => {
                 return Ok(provider_fallback_receipt(
                     self.route(context)?,
