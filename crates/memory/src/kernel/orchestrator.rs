@@ -584,9 +584,6 @@ impl MemoryOrchestrator {
         }
 
         let layer = entry.layer;
-        let source = entry.source;
-        let entry_id = entry.id;
-        let content = entry.content.clone();
         let id = match layer {
             MemoryLayer::L0 => self.l0.insert(entry).await?,
             MemoryLayer::L1 => self.l1.insert(entry).await?,
@@ -603,21 +600,8 @@ impl MemoryOrchestrator {
             }
         };
 
-        // Wire into verbatim sink for persistent layers (L2/L3/L4).
-        // L0/L1 are volatile layers and should NOT be stored verbatim.
-        if matches!(layer, MemoryLayer::L2 | MemoryLayer::L3) {
-            let timestamp = Utc::now().to_rfc3339();
-            self.store
-                .save_verbatim(
-                    &entry_id.to_string(),
-                    &content,
-                    crate::store::source_to_str(source),
-                    crate::store::layer_to_int(layer),
-                    &timestamp,
-                )
-                .await?;
-        }
-
+        // The original store commits body and verbatim together, after the
+        // layer resolves its canonical entry. No second durable write follows.
         Ok(id)
     }
 
@@ -781,18 +765,7 @@ impl MemoryOrchestrator {
             source_agent: Some("runtime-l4-promotion-service".to_string()),
             visibility: crate::types::AgentVisibility::Shared,
         };
-        let entry_id = entry.id;
-        let content = entry.content.clone();
         let id = self.l4.insert_promoted(entry).await?;
-        self.store
-            .save_verbatim(
-                &entry_id.to_string(),
-                &content,
-                crate::store::source_to_str(MemorySource::Import),
-                crate::store::layer_to_int(MemoryLayer::L4),
-                &now.to_rfc3339(),
-            )
-            .await?;
         Ok(id)
     }
 
@@ -1292,5 +1265,62 @@ mod tests {
             store.search_by_layer(MemoryLayer::L0).await.unwrap().len(),
             2
         );
+    }
+    #[tokio::test]
+    async fn original_memory_store_keeps_body_and_verbatim_one_mutation() {
+        let store = in_memory_store();
+        for layer in [
+            MemoryLayer::L0,
+            MemoryLayer::L1,
+            MemoryLayer::L2,
+            MemoryLayer::L3,
+            MemoryLayer::L4,
+        ] {
+            let mut entry = test_entry(layer, "atomic body", "first retained body");
+            store.insert(&entry).await.unwrap();
+            let persistent = matches!(layer, MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4);
+            let verbatim = store
+                .load_verbatim_by_id(&entry.id.to_string())
+                .await
+                .unwrap();
+            assert_eq!(verbatim.is_some(), persistent);
+            if let Some(verbatim) = verbatim {
+                assert_eq!(verbatim.content, "first retained body");
+                assert_eq!(verbatim.source, "AutoExtracted");
+                assert_eq!(verbatim.timestamp, entry.updated_at.to_rfc3339());
+            }
+            entry.content = "corrected retained body".into();
+            entry.updated_at = Utc::now();
+            store.update(&entry).await.unwrap();
+            assert_eq!(
+                store.get(&entry.id).await.unwrap().unwrap().content,
+                "corrected retained body"
+            );
+            if persistent {
+                let verbatim = store
+                    .load_verbatim_by_id(&entry.id.to_string())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(verbatim.content, "corrected retained body");
+                assert_eq!(verbatim.timestamp, entry.updated_at.to_rfc3339());
+            }
+            store.delete(&entry.id).await.unwrap();
+            assert!(store.get(&entry.id).await.unwrap().is_none());
+            assert!(store
+                .load_verbatim_by_id(&entry.id.to_string())
+                .await
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                store.update(&entry).await,
+                Err(MemoryError::NotFound(_))
+            ));
+            assert!(store
+                .load_verbatim_by_id(&entry.id.to_string())
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 }

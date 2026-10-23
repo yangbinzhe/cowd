@@ -509,7 +509,9 @@ impl PostgresMemoryStore {
             .executor
             .checkout_critical()
             .map_err(storage_memory_error)?;
-        write_entry(&mut connection, entry, true)
+        let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+        write_entry(&mut tx, entry, true)?;
+        tx.commit().map_err(postgres_memory_error)
     }
 
     fn update_entry(&self, entry: &MemoryEntry) -> MemoryResult<()> {
@@ -517,7 +519,9 @@ impl PostgresMemoryStore {
             .executor
             .checkout_critical()
             .map_err(storage_memory_error)?;
-        write_entry(&mut connection, entry, false)
+        let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+        write_entry(&mut tx, entry, false)?;
+        tx.commit().map_err(postgres_memory_error)
     }
 
     fn search_memory(
@@ -830,9 +834,12 @@ impl MemoryStore for PostgresMemoryStore {
                 .executor
                 .checkout_critical()
                 .map_err(storage_memory_error)?;
-            connection
-                .execute("DELETE FROM memory_entries WHERE id=$1", &[&id])
+            let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+            tx.execute("DELETE FROM memory_entries WHERE id=$1", &[&id])
                 .map_err(postgres_memory_error)?;
+            tx.execute("DELETE FROM memory_verbatim WHERE id=$1", &[&id])
+                .map_err(postgres_memory_error)?;
+            tx.commit().map_err(postgres_memory_error)?;
             Ok(())
         })
         .await
@@ -1793,7 +1800,7 @@ fn write_entry(
             content=$7,scope_key=$8,session_id=$9,source_agent=$10,created_at=$11,
             updated_at=$12,payload=$13,authority_fingerprint=$14 WHERE id=$1"
     };
-    client
+    let affected = client
         .execute(
             sql,
             &[
@@ -1814,6 +1821,19 @@ fn write_entry(
             ],
         )
         .map_err(postgres_memory_error)?;
+    if affected != 1 {
+        return Err(MemoryError::NotFound(id));
+    }
+    if let Some(verbatim) = memory::store::entry_verbatim(entry) {
+        client.execute("INSERT INTO memory_verbatim(id,content,source,layer,timestamp) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET content=EXCLUDED.content,source=EXCLUDED.source,layer=EXCLUDED.layer,timestamp=EXCLUDED.timestamp", &[&verbatim.id,&verbatim.content,&verbatim.source,&verbatim.layer,&verbatim.timestamp]).map_err(postgres_memory_error)?;
+    } else {
+        client
+            .execute(
+                "DELETE FROM memory_verbatim WHERE id=$1",
+                &[&entry.id.to_string()],
+            )
+            .map_err(postgres_memory_error)?;
+    }
     Ok(())
 }
 

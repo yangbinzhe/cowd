@@ -820,3 +820,108 @@ fn real_postgres_knowledge_usage_duplicate_is_idempotent_and_changed_identity_re
     drop(store);
     drop(std::mem::ManuallyDrop::into_inner(fixture));
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_memory_body_and_verbatim_rollback_and_reopen_together() {
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let executor = fixture.reconnect();
+    let store = PostgresMemoryStore::new(executor.clone()).unwrap();
+    let mut entry = memory_entry(uuid::Uuid::new_v4(), "atomic-verbatim");
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("CREATE FUNCTION refuse_verbatim_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'verbatim transaction refusal'; END $$; CREATE TRIGGER refuse_verbatim_write BEFORE INSERT OR UPDATE OR DELETE ON memory_verbatim FOR EACH ROW EXECUTE FUNCTION refuse_verbatim_write()").unwrap();
+    assert!(store.insert(&entry).await.is_err());
+    assert!(
+        store.get(&entry.id).await.unwrap().is_none(),
+        "body insert must roll back on auxiliary refusal"
+    );
+    assert!(store
+        .load_verbatim_by_id(&entry.id.to_string())
+        .await
+        .unwrap()
+        .is_none());
+    connection
+        .batch_execute("DROP TRIGGER refuse_verbatim_write ON memory_verbatim")
+        .unwrap();
+    store.insert(&entry).await.unwrap();
+    let original = entry.clone();
+    let first = store
+        .load_verbatim_by_id(&entry.id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.content, "portable memory truth atomic-verbatim");
+    assert_eq!(first.source, "Import");
+    assert_eq!(first.layer, 3);
+    connection.batch_execute("CREATE TRIGGER refuse_verbatim_write BEFORE UPDATE OR DELETE ON memory_verbatim FOR EACH ROW EXECUTE FUNCTION refuse_verbatim_write()").unwrap();
+    entry.content = "corrected durable body".into();
+    entry.updated_at = chrono::Utc::now();
+    assert!(store.update(&entry).await.is_err());
+    assert_eq!(
+        store.get(&entry.id).await.unwrap().unwrap().content,
+        original.content,
+        "body update must roll back with refused verbatim update"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .load_verbatim_by_id(&entry.id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&first).unwrap()
+    );
+    assert!(store.delete(&entry.id).await.is_err());
+    assert!(
+        store.get(&entry.id).await.unwrap().is_some(),
+        "delete must roll back when retained text deletion fails"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .load_verbatim_by_id(&entry.id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&first).unwrap()
+    );
+    connection.batch_execute("DROP TRIGGER refuse_verbatim_write ON memory_verbatim; DROP FUNCTION refuse_verbatim_write()").unwrap();
+    store.update(&entry).await.unwrap();
+    drop(store);
+    let reopened = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
+    assert_eq!(
+        reopened.get(&entry.id).await.unwrap().unwrap().content,
+        "corrected durable body"
+    );
+    let corrected = reopened
+        .load_verbatim_by_id(&entry.id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(corrected.content, "corrected durable body");
+    assert_eq!(corrected.timestamp, entry.updated_at.to_rfc3339());
+    reopened.delete(&entry.id).await.unwrap();
+    assert!(reopened.get(&entry.id).await.unwrap().is_none());
+    assert!(reopened
+        .load_verbatim_by_id(&entry.id.to_string())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        reopened.update(&entry).await,
+        Err(MemoryError::NotFound(_))
+    ));
+    assert!(reopened
+        .load_verbatim_by_id(&entry.id.to_string())
+        .await
+        .unwrap()
+        .is_none());
+    drop(connection);
+    drop(reopened);
+    drop(executor);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+}

@@ -74,6 +74,11 @@ fn bump_discovery(state: &mut State, scope: &MemoryScope) {
         .or_default() += 1;
 }
 fn put_discovery_entry(state: &mut State, entry: &MemoryEntry) {
+    if let Some(verbatim) = super::entry_verbatim(entry) {
+        state.verbatim.insert(verbatim.id.clone(), verbatim);
+    } else {
+        state.verbatim.remove(&entry.id.to_string());
+    }
     let previous = state.entries.insert(entry.id.to_string(), entry.clone());
     if previous
         .as_ref()
@@ -179,6 +184,7 @@ impl MemoryStore for EphemeralMemoryStore {
         if let Some(entry) = state.entries.remove(&id.to_string()) {
             bump_discovery(&mut state, &entry.scope);
         }
+        state.verbatim.remove(&id.to_string());
         Ok(())
     }
 

@@ -55,6 +55,23 @@ pub const fn source_to_str(source: crate::types::MemorySource) -> &'static str {
     }
 }
 
+/// The body and its exact retained text are one original Memory mutation.
+/// Volatile layers deliberately have no verbatim record.
+#[must_use]
+pub fn entry_verbatim(entry: &MemoryEntry) -> Option<VerbatimEntry> {
+    matches!(
+        entry.layer,
+        MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4
+    )
+    .then(|| VerbatimEntry {
+        id: entry.id.to_string(),
+        content: entry.content.clone(),
+        source: source_to_str(entry.source).to_string(),
+        layer: layer_to_int(entry.layer),
+        timestamp: entry.updated_at.to_rfc3339(),
+    })
+}
+
 /// Unified result type used throughout the store module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
@@ -192,16 +209,17 @@ pub struct MemoryStoreAggregate {
 pub trait MemoryStore: Send + Sync {
     /// Return the selected store's durable/rebuildable capability verdict.
     fn capabilities(&self) -> MemoryStoreCapabilities;
-    /// Persist a new memory entry and return its assigned ID.
+    /// Persist a memory entry and its L2/L3/L4 verbatim in one transaction.
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId>;
 
     /// Retrieve a memory entry by its ID.
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>>;
 
-    /// Overwrite an existing entry (matched by `entry.id`).
+    /// Update an existing body and matching verbatim atomically; absent is an error.
     async fn update(&self, entry: &MemoryEntry) -> Result<()>;
 
-    /// Permanently remove a memory entry.
+    /// Remove a body and matching verbatim atomically. Source/derived erasure
+    /// obligations remain a separate governed domain contract.
     async fn delete(&self, id: &MemoryId) -> Result<()>;
 
     /// Full-text search across `title` and `content` fields.
