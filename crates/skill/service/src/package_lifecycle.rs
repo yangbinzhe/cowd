@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, TempDir};
 use thiserror::Error;
 
-use crate::skill_manifest::{get_skill_description, get_skill_name, parse_skill_file};
+use crate::skill_manifest::{get_skill_description, get_skill_name, parse_skill_content};
 use crate::skill_security::{scan_skill_content, SecurityFinding, SecurityStatus};
-use crate::{inspect_skill_package, stable_skill_id};
+use crate::stable_skill_id;
 
 pub const SKILL_STORE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SKILL_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
@@ -144,6 +144,19 @@ pub struct SkillInstallReceiptV1 {
     pub revision: String,
 }
 
+/// Verified content of one retained immutable installation. This is evidence,
+/// not an activation grant; the Runtime governance pointer owns approval.
+#[derive(Debug, Clone)]
+pub struct InstalledRevision {
+    pub receipt: SkillInstallReceiptV1,
+    pub package_root: PathBuf,
+    pub inspection: SkillInspectionReport,
+    /// Full original reviewed plan digest, including inventory and inspection.
+    pub inspection_fingerprint: String,
+    /// Taken from the very bytes verified against the receipt, never reread.
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedSkillActivePointerV1 {
@@ -234,6 +247,87 @@ impl ManagedSkillStore {
         &self.root
     }
 
+    pub fn resolve_installed(
+        &self,
+        skill_id: &str,
+        revision: &str,
+        receipt_id: &str,
+    ) -> Result<InstalledRevision, SkillLifecycleError> {
+        let (receipt, package_root, verified) =
+            self.resolve_installed_package(skill_id, revision, receipt_id)?;
+        let prompt = verified
+            .files
+            .into_iter()
+            .find(|file| file.relative == "SKILL.md")
+            .ok_or_else(|| {
+                SkillLifecycleError::InvalidPackage("installed prompt missing".into())
+            })?;
+        let prompt = String::from_utf8(prompt.bytes).map_err(|_| {
+            SkillLifecycleError::InvalidPackage("installed prompt is not UTF-8".into())
+        })?;
+        let inspection_fingerprint = receipt.plan_digest.clone();
+        Ok(InstalledRevision {
+            receipt,
+            package_root,
+            inspection: verified.plan.inspection,
+            inspection_fingerprint,
+            prompt,
+        })
+    }
+
+    fn resolve_installed_package(
+        &self,
+        skill_id: &str,
+        revision: &str,
+        receipt_id: &str,
+    ) -> Result<(SkillInstallReceiptV1, PathBuf, CollectedPackage), SkillLifecycleError> {
+        let skill_id = validate_skill_id(skill_id)?;
+        let revision = normalize_digest(revision)?;
+        if !uuid::Uuid::parse_str(receipt_id).is_ok_and(|id| id.to_string() == receipt_id) {
+            return Err(SkillLifecycleError::InvalidPackage(
+                "invalid install receipt ID".into(),
+            ));
+        }
+        let skill_dir = self.root.join(&skill_id);
+        let revisions = skill_dir.join("revisions");
+        let receipts = skill_dir.join("receipts");
+        let package_root = revisions.join(digest_hex(&revision)?);
+        for path in [&self.root, &skill_dir, &revisions, &receipts, &package_root] {
+            reject_symlink(path)?;
+            if !path.is_dir() {
+                return Err(SkillLifecycleError::InvalidPackage(
+                    "invalid installed revision directory".into(),
+                ));
+            }
+        }
+        let receipt = read_json_bounded::<SkillInstallReceiptV1>(
+            &receipts.join(format!("{receipt_id}.json")),
+            256 * 1024,
+        )?;
+        if receipt.schema_version != SKILL_STORE_SCHEMA_VERSION
+            || receipt.install_id != receipt_id
+            || receipt.skill_id != skill_id
+            || receipt.revision != revision
+            || receipt.package_digest != revision
+        {
+            return Err(SkillLifecycleError::InvalidPackage(
+                "installed receipt identity mismatch".into(),
+            ));
+        }
+        let verified = collect_package(&package_root, receipt.source.clone())?;
+        let inspection_fingerprint = plan_evidence_digest(&verified.plan)?;
+        if !receipt_matches_plan(&receipt, &verified.plan)?
+            || receipt.plan_digest != inspection_fingerprint
+            || !verified.plan.blockers.is_empty()
+            || (!verified.plan.warnings.is_empty() && !receipt.warnings_accepted)
+        {
+            return Err(SkillLifecycleError::InvalidPackage(
+                "installed revision failed full receipt/content/inspection verification".into(),
+            ));
+        }
+        Ok((receipt, package_root, verified))
+    }
+
     pub fn status(&self, skill_id: &str) -> Result<SkillLifecycleStatusV1, SkillLifecycleError> {
         let skill_id = validate_skill_id(skill_id)?;
         let skill_dir = self.root.join(&skill_id);
@@ -319,18 +413,8 @@ impl ManagedSkillStore {
         }
         let prior_receipt =
             find_verified_receipt_for_revision(&skill_dir, &skill_id, &digest, &collected.plan)?;
-        let prior_package = collect_package(&package_root, prior_receipt.source.clone())?;
-        if !prior_package.plan.warnings.is_empty() && !prior_receipt.warnings_accepted {
-            return Err(SkillLifecycleError::Blocked(
-                "the retained revision has warnings without evidence of explicit acceptance"
-                    .to_string(),
-            ));
-        }
-        if prior_receipt.plan_digest != plan_evidence_digest(&prior_package.plan)? {
-            return Err(SkillLifecycleError::InvalidPackage(
-                "retained revision install plan evidence does not match its receipt".to_string(),
-            ));
-        }
+        let (_, _, prior_package) =
+            self.resolve_installed_package(&skill_id, &digest, &prior_receipt.install_id)?;
         self.publish(
             &prior_package,
             !prior_package.plan.warnings.is_empty(),
@@ -684,42 +768,21 @@ pub fn list_managed_skill_entries(
                 skill_dir.display()
             )));
         }
-        let package_root = skill_dir
-            .join("revisions")
-            .join(digest_hex(&pointer.revision)?);
+        let installed = ManagedSkillStore::new(store_root).resolve_installed(
+            &pointer.skill_id,
+            &pointer.revision,
+            &pointer.receipt_id,
+        )?;
+        if installed.receipt.package_digest != pointer.package_digest {
+            return Err(SkillLifecycleError::InvalidPackage(
+                "active pointer does not match installed receipt".into(),
+            ));
+        }
+        let package_root = installed.package_root;
         let prompt_path = package_root.join("SKILL.md");
         let receipt_path = skill_dir
             .join("receipts")
             .join(format!("{}.json", pointer.receipt_id));
-        if !prompt_path.is_file() || !receipt_path.is_file() {
-            return Err(SkillLifecycleError::InvalidPackage(format!(
-                "active pointer for {} references missing immutable evidence",
-                pointer.skill_id
-            )));
-        }
-        reject_symlink(&prompt_path)?;
-        let receipt = read_json_bounded::<SkillInstallReceiptV1>(&receipt_path, 256 * 1024)?;
-        if receipt.skill_id != pointer.skill_id
-            || receipt.revision != pointer.revision
-            || receipt.package_digest != pointer.package_digest
-        {
-            return Err(SkillLifecycleError::InvalidPackage(format!(
-                "active pointer for {} does not match its receipt",
-                pointer.skill_id
-            )));
-        }
-        let verified = collect_package(&package_root, receipt.source.clone())?;
-        if !receipt_matches_plan(&receipt, &verified.plan)?
-            || receipt.revision != pointer.revision
-            || receipt.plan_digest != plan_evidence_digest(&verified.plan)?
-            || !verified.plan.blockers.is_empty()
-            || (!verified.plan.warnings.is_empty() && !receipt.warnings_accepted)
-        {
-            return Err(SkillLifecycleError::InvalidPackage(format!(
-                "active revision for {} failed content, manifest, or security verification",
-                pointer.skill_id
-            )));
-        }
         entries.push(ManagedSkillEntryV1 {
             pointer,
             skill_dir,
@@ -826,7 +889,12 @@ fn acquire_local(source: &str, cwd: &Path) -> Result<AcquiredPackage, SkillLifec
             .tempdir()?;
         let root = temporary.path().join("package");
         create_private_dir_all(&root)?;
-        let bytes = read_stable_regular_file(&canonical, &source_metadata, "SKILL.md")?;
+        let bytes = read_stable_regular_file(
+            &canonical,
+            &source_metadata,
+            "SKILL.md",
+            MAX_SKILL_FILE_BYTES,
+        )?;
         write_collected_files(
             &root,
             &[CollectedFile {
@@ -883,6 +951,15 @@ fn collect_package(
     let mut casefold = BTreeSet::new();
     let mut total_bytes = 0u64;
     collect_package_files(root, root, 0, &mut files, &mut casefold, &mut total_bytes)?;
+    assess_captured_package(root, source, files)
+}
+
+fn assess_captured_package(
+    root: &Path,
+    source: SkillSourceIdentityV1,
+    mut files: Vec<CollectedFile>,
+) -> Result<CollectedPackage, SkillLifecycleError> {
+    let total_bytes = files.iter().map(|file| file.bytes.len() as u64).sum();
     files.sort_by(|left, right| left.relative.as_bytes().cmp(right.relative.as_bytes()));
     if files.is_empty() {
         return Err(SkillLifecycleError::InvalidPackage(
@@ -893,10 +970,10 @@ fn collect_package(
         .iter()
         .find(|file| file.relative == "SKILL.md")
         .ok_or_else(|| SkillLifecycleError::InvalidPackage("SKILL.md is required".to_string()))?;
-    let _prompt_text = std::str::from_utf8(&prompt.bytes).map_err(|_| {
+    let prompt_text = std::str::from_utf8(&prompt.bytes).map_err(|_| {
         SkillLifecycleError::InvalidPackage("SKILL.md must be UTF-8 text".to_string())
     })?;
-    let parsed = parse_skill_file(&root.join("SKILL.md"))
+    let parsed = parse_skill_content(prompt_text)
         .map_err(|error| SkillLifecycleError::InvalidPackage(error.to_string()))?;
     let manifest = parsed.manifest.as_ref();
     let name = get_skill_name(&parsed)
@@ -927,7 +1004,13 @@ fn collect_package(
         }),
     };
     let manifest_digest = canonical_json_digest(&manifest_value)?;
-    let inspection = inspect_skill_package(root)?;
+    let inspection = crate::inspect::inspect_captured_package(
+        root,
+        &files
+            .iter()
+            .map(|file| file.relative.clone())
+            .collect::<Vec<_>>(),
+    );
     let package_class = package_class(&inspection);
     let mut blockers = inspection.blocked_reasons.clone();
     if package_class == SkillPackageClassV1::ExecutableExtension {
@@ -1026,9 +1109,10 @@ fn collect_package_files(
             "package depth exceeds {MAX_SKILL_DEPTH}"
         )));
     }
-    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
+    // Only captured files are ordered for the digest. Directory enumeration
+    // must not first materialize an unbounded list of unrelated entries.
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
@@ -1041,6 +1125,11 @@ fn collect_package_files(
             SkillLifecycleError::InvalidPackage("package path escaped its root".to_string())
         })?;
         let relative = normalized_relative_path(relative_path)?;
+        if casefold.len() >= MAX_SKILL_FILES * (MAX_SKILL_DEPTH + 1) {
+            return Err(SkillLifecycleError::InvalidPackage(
+                "package directory inventory exceeds its bound".into(),
+            ));
+        }
         let folded = relative.to_lowercase();
         if !casefold.insert(folded) {
             return Err(SkillLifecycleError::InvalidPackage(format!(
@@ -1065,17 +1154,22 @@ fn collect_package_files(
             )));
         }
         reject_hard_link(&metadata, &relative)?;
-        let bytes = read_stable_regular_file(&path, &metadata, &relative)?;
+        if files.len() >= MAX_SKILL_FILES {
+            return Err(SkillLifecycleError::InvalidPackage(format!(
+                "package exceeds {MAX_SKILL_FILES} files"
+            )));
+        }
+        let bytes = read_stable_regular_file(
+            &path,
+            &metadata,
+            &relative,
+            MAX_SKILL_FILE_BYTES.min(MAX_SKILL_EXTRACTED_BYTES.saturating_sub(*total_bytes)),
+        )?;
         let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         *total_bytes = total_bytes.saturating_add(byte_len);
         if *total_bytes > MAX_SKILL_EXTRACTED_BYTES {
             return Err(SkillLifecycleError::InvalidPackage(format!(
                 "package exceeds {MAX_SKILL_EXTRACTED_BYTES} bytes"
-            )));
-        }
-        if files.len() >= MAX_SKILL_FILES {
-            return Err(SkillLifecycleError::InvalidPackage(format!(
-                "package exceeds {MAX_SKILL_FILES} files"
             )));
         }
         // ZIP archives do not reliably preserve executable mode. Classify the
@@ -1096,6 +1190,7 @@ fn read_stable_regular_file(
     path: &Path,
     observed: &fs::Metadata,
     display_path: &str,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, SkillLifecycleError> {
     if !observed.is_file() || observed.file_type().is_symlink() {
         return Err(SkillLifecycleError::InvalidPackage(format!(
@@ -1103,9 +1198,9 @@ fn read_stable_regular_file(
         )));
     }
     reject_hard_link(observed, display_path)?;
-    if observed.len() > MAX_SKILL_FILE_BYTES {
+    if observed.len() > max_bytes {
         return Err(SkillLifecycleError::InvalidPackage(format!(
-            "file exceeds {MAX_SKILL_FILE_BYTES} bytes: {display_path}"
+            "file exceeds remaining {max_bytes} byte budget: {display_path}"
         )));
     }
     let mut input = File::open(path)?;
@@ -1117,11 +1212,11 @@ fn read_stable_regular_file(
     }
     let mut bytes = Vec::new();
     (&mut input)
-        .take(MAX_SKILL_FILE_BYTES.saturating_add(1))
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_SKILL_FILE_BYTES {
+    if bytes.len() as u64 > max_bytes {
         return Err(SkillLifecycleError::InvalidPackage(format!(
-            "file exceeds {MAX_SKILL_FILE_BYTES} bytes: {display_path}"
+            "file exceeds remaining {max_bytes} byte budget: {display_path}"
         )));
     }
     let after = input.metadata()?;
@@ -1533,14 +1628,36 @@ fn read_json_bounded<T: for<'de> Deserialize<'de>>(
     path: &Path,
     max_bytes: u64,
 ) -> Result<T, SkillLifecycleError> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(SkillLifecycleError::InvalidPackage(
+            "metadata must be a regular file".into(),
+        ));
+    }
+    reject_hard_link(&metadata, &path.display().to_string())?;
     if metadata.len() > max_bytes {
         return Err(SkillLifecycleError::InvalidPackage(format!(
             "metadata file exceeds {max_bytes} bytes: {}",
             path.display()
         )));
     }
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    let mut input = File::open(path)?;
+    let opened = input.metadata()?;
+    if !same_file_state(&metadata, &opened) {
+        return Err(SkillLifecycleError::InvalidPackage(
+            "metadata changed before read".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut input)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes || !same_file_state(&opened, &input.metadata()?) {
+        return Err(SkillLifecycleError::InvalidPackage(
+            "metadata changed or exceeded read budget".into(),
+        ));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn list_names(
@@ -1849,6 +1966,150 @@ mod tests {
             format!("---\nname: {name}\ndescription: test skill\nversion: 1.0.0\nlicense: MIT\n---\n{body}\n"),
         )
         .expect("skill");
+    }
+
+    #[test]
+    fn exact_installed_reader_preserves_old_bytes_and_rejects_borrowed_or_changed_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let lifecycle =
+            SkillLifecycle::new(ManagedSkillStore::new(temp.path().join("store"))).unwrap();
+        package(&source, "exact", "First exact bytes");
+        let first = lifecycle
+            .plan(source.to_str().unwrap(), temp.path())
+            .unwrap();
+        let first = lifecycle
+            .commit(
+                source.to_str().unwrap(),
+                temp.path(),
+                &first.package_digest,
+                false,
+                "human:test",
+            )
+            .unwrap();
+        package(&source, "exact", "Second exact bytes");
+        let second = lifecycle
+            .plan(source.to_str().unwrap(), temp.path())
+            .unwrap();
+        let second = lifecycle
+            .commit(
+                source.to_str().unwrap(),
+                temp.path(),
+                &second.package_digest,
+                false,
+                "human:test",
+            )
+            .unwrap();
+        let old = lifecycle
+            .store()
+            .resolve_installed("exact", &first.revision, &first.install_id)
+            .unwrap();
+        let new = lifecycle
+            .store()
+            .resolve_installed("exact", &second.revision, &second.install_id)
+            .unwrap();
+        assert!(old.prompt.ends_with("First exact bytes\n"));
+        assert!(new.prompt.ends_with("Second exact bytes\n"));
+        assert_ne!(old.inspection_fingerprint, new.inspection_fingerprint);
+        assert_eq!(
+            old.inspection.recommended_adapters,
+            vec![SkillAdapterKind::PromptOnly]
+        );
+        for (skill, revision, receipt) in [
+            (
+                "foreign",
+                first.revision.as_str(),
+                first.install_id.as_str(),
+            ),
+            ("exact", second.revision.as_str(), first.install_id.as_str()),
+            ("exact", first.revision.as_str(), "../receipt"),
+        ] {
+            assert!(lifecycle
+                .store()
+                .resolve_installed(skill, revision, receipt)
+                .is_err());
+        }
+        let path = old.package_root.join("SKILL.md");
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+        fs::write(
+            &path,
+            "---\nname: exact\ndescription: original scope\n---\nChanged body\n",
+        )
+        .unwrap();
+        assert!(lifecycle
+            .store()
+            .resolve_installed("exact", &first.revision, &first.install_id)
+            .is_err());
+        // An already captured value cannot silently turn into the changed path.
+        assert!(old.prompt.ends_with("First exact bytes\n"));
+        assert!(lifecycle
+            .store()
+            .resolve_installed("exact", &second.revision, &second.install_id)
+            .is_ok());
+    }
+
+    #[test]
+    fn manifest_and_inspection_use_the_captured_inventory_instead_of_rereading_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        package(
+            temp.path(),
+            "foreign-name-on-disk",
+            "Unrelated current contents",
+        );
+        fs::write(temp.path().join("mcp.json"), "{}").unwrap();
+        let captured = assess_captured_package(
+            temp.path(),
+            SkillSourceIdentityV1 {
+                kind: SkillSourceKindV1::Generated,
+                locator: "test:captured".into(),
+                requested_ref: None,
+                resolved_ref: None,
+            },
+            vec![CollectedFile {
+                relative: "SKILL.md".into(),
+                bytes:
+                    b"---\nname: captured\ndescription: captured manifest\n---\nOriginal bytes\n"
+                        .to_vec(),
+                executable: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(captured.plan.skill_id, "captured");
+        assert_eq!(captured.plan.inspection.detected_files, vec!["SKILL.md"]);
+        assert_eq!(captured.plan.package_class, SkillPackageClassV1::Prompt);
+        assert!(captured.plan.blockers.is_empty());
+        // A new admission really reads the new package and must block it.
+        let actual = collect_package(temp.path(), captured.source).unwrap();
+        assert_eq!(actual.plan.skill_id, "foreign-name-on-disk");
+        assert!(!actual.plan.blockers.is_empty());
+    }
+
+    #[test]
+    fn installed_metadata_and_package_reads_obey_their_actual_budget_and_file_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metadata.json");
+        fs::write(&path, b"{\"value\":123456}").unwrap();
+        assert!(read_json_bounded::<serde_json::Value>(&path, 8).is_err());
+        assert_eq!(
+            read_json_bounded::<serde_json::Value>(&path, 64).unwrap()["value"],
+            123456
+        );
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(read_stable_regular_file(&path, &metadata, "metadata.json", 8).is_err());
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("linked.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(read_json_bounded::<serde_json::Value>(&link, 64).is_err());
+        }
     }
 
     #[test]

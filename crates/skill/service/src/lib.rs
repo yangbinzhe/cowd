@@ -23,12 +23,12 @@ pub use inspect::{
     inspect_skill_package, profile_skill_catalog_entry, profile_skill_package, stable_skill_id,
 };
 pub use package_lifecycle::{
-    default_managed_skill_store_root, list_managed_skill_entries, ManagedSkillActivePointerV1,
-    ManagedSkillEntryV1, ManagedSkillStore, SkillInstallPlanV1, SkillInstallReceiptV1,
-    SkillLifecycle, SkillLifecycleError, SkillLifecycleStatusV1, SkillPackageClassV1,
-    SkillPackageFileV1, SkillSourceIdentityV1, SkillSourceKindV1, MAX_SKILL_ARCHIVE_BYTES,
-    MAX_SKILL_DEPTH, MAX_SKILL_EXTRACTED_BYTES, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
-    SKILL_STORE_SCHEMA_VERSION,
+    default_managed_skill_store_root, list_managed_skill_entries, InstalledRevision,
+    ManagedSkillActivePointerV1, ManagedSkillEntryV1, ManagedSkillStore, SkillInstallPlanV1,
+    SkillInstallReceiptV1, SkillLifecycle, SkillLifecycleError, SkillLifecycleStatusV1,
+    SkillPackageClassV1, SkillPackageFileV1, SkillSourceIdentityV1, SkillSourceKindV1,
+    MAX_SKILL_ARCHIVE_BYTES, MAX_SKILL_DEPTH, MAX_SKILL_EXTRACTED_BYTES, MAX_SKILL_FILES,
+    MAX_SKILL_FILE_BYTES, SKILL_STORE_SCHEMA_VERSION,
 };
 pub use run::{
     SkillActionKind, SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord,

@@ -20,6 +20,49 @@ pub fn inspect_skill_package(root: &Path) -> std::io::Result<SkillInspectionRepo
     let mut files = Vec::new();
     let mut skipped_dirs = Vec::new();
     collect_files(&source_root, &source_root, &mut files, &mut skipped_dirs, 0)?;
+    Ok(inspect_inventory(source_root, files, skipped_dirs))
+}
+
+/// Inspect the same inventory whose bounded bytes the managed-store owner has
+/// captured. No second filesystem traversal can change this decision's inputs.
+pub(crate) fn inspect_captured_package(root: &Path, paths: &[String]) -> SkillInspectionReport {
+    let mut files = BTreeSet::new();
+    let mut hidden = BTreeSet::new();
+    for path in paths {
+        let parts = path.split('/').collect::<Vec<_>>();
+        let mut prefix = String::new();
+        let mut skipped = false;
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if part.starts_with('.') {
+                hidden.insert(prefix.clone());
+                skipped = true;
+                break;
+            }
+            files.insert(prefix.clone());
+        }
+        if !skipped {
+            files.insert(path.clone());
+        }
+    }
+    inspect_inventory(
+        root.to_path_buf(),
+        files.into_iter().collect(),
+        hidden
+            .into_iter()
+            .map(|path| SkippedDirectory::new(path, SkippedDirectoryKind::Hidden))
+            .collect(),
+    )
+}
+
+fn inspect_inventory(
+    source_root: PathBuf,
+    mut files: Vec<String>,
+    skipped_dirs: Vec<SkippedDirectory>,
+) -> SkillInspectionReport {
     files.sort();
 
     let mut runtimes = BTreeSet::new();
@@ -85,7 +128,7 @@ pub fn inspect_skill_package(root: &Path) -> std::io::Result<SkillInspectionRepo
         }
     }
 
-    Ok(SkillInspectionReport {
+    SkillInspectionReport {
         source_root: source_root.display().to_string(),
         detected_files: files,
         detected_runtimes: runtimes.into_iter().collect(),
@@ -93,7 +136,7 @@ pub fn inspect_skill_package(root: &Path) -> std::io::Result<SkillInspectionRepo
         risk_signals,
         recommended_adapters: adapters.into_iter().collect(),
         blocked_reasons,
-    })
+    }
 }
 
 pub fn profile_skill_package(
