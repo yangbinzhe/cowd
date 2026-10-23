@@ -6,16 +6,16 @@ use std::{
 
 use reqwest::{
     blocking::Client,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+    header::{HeaderMap, HeaderValue, AUTHORIZATION},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    HarnessEvalRunnerOptions,
     live_scenario_observer::{LiveScenarioObserver, MAX_DRAIN_PAGES_PER_PROBE},
     session_actor::SessionActor,
+    HarnessEvalRunnerOptions,
 };
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -1195,6 +1195,7 @@ impl LiveScenarioRunner {
         let started = Instant::now();
         let mut trace = Vec::new();
         let timeout = spec.timeout.with_cap(self.timeout_cap);
+        let deadline = timeout.observation_deadline(started, started, Duration::ZERO, 0);
         // Resume mode reattaches to a retained session's in-flight turn instead
         // of creating a new session and posting a new prompt: the Runtime
         // recovers the durable execution graph from the same database and
@@ -1209,17 +1210,58 @@ impl LiveScenarioRunner {
                 &self.base_url,
                 session_id,
                 "harness-eval-live",
+                deadline,
             ),
             None => SessionActor::create(
                 &self.client,
                 &self.base_url,
                 self.model.as_deref(),
                 "harness-eval-live",
+                deadline,
             ),
         };
         let Ok(mut actor) = actor else {
             return failed_scenario(spec, started, trace, actor.err().unwrap_or_default());
         };
+        let mut result = self.run_attached_scenario(
+            spec,
+            provider_token_telemetry_limit,
+            started,
+            timeout,
+            resume_session.as_deref(),
+            trace,
+            &mut actor,
+        );
+        let cleanup = actor.finish().map_or_else(
+            |error| json!({"status":"failed","error":error}),
+            |_| json!({"status":"passed"}),
+        );
+        if cleanup.get("status").and_then(Value::as_str) != Some("passed") {
+            result["status"] = json!("failed");
+            if let Some(acceptance) = result.get_mut("acceptance").and_then(Value::as_object_mut) {
+                acceptance.insert("passed".into(), json!(false));
+            }
+        }
+        result["session_actor_cleanup"] = cleanup;
+        let actor_trace = actor.drain_trace();
+        if let Some(trace) = result.get_mut("trace").and_then(Value::as_array_mut) {
+            trace.extend(actor_trace);
+        } else {
+            result["session_actor_trace"] = json!(actor_trace);
+        }
+        result
+    }
+
+    fn run_attached_scenario(
+        &self,
+        spec: LiveScenarioSpec,
+        provider_token_telemetry_limit: Option<u64>,
+        started: Instant,
+        timeout: LiveScenarioTimeout,
+        resume_session: Option<&str>,
+        mut trace: Vec<Value>,
+        actor: &mut SessionActor<'_>,
+    ) -> Value {
         trace.extend(actor.drain_trace());
         let session_id = actor.session_id().to_string();
         let (execution_id, turn_id) = if resume_session.is_some() {
@@ -1319,8 +1361,15 @@ impl LiveScenarioRunner {
         };
 
         let mut observer = LiveScenarioObserver::default();
-        let terminal =
-            self.wait_for_terminal_message(&session_id, execution_id_ref, &timeout, &mut observer);
+        let terminal = self.wait_for_terminal_message(
+            &session_id,
+            execution_id_ref,
+            turn_id_ref,
+            &timeout,
+            &mut observer,
+            actor,
+            started,
+        );
         let Ok(terminal) = terminal else {
             let terminal_error = terminal.err().unwrap_or_default();
             let mut diagnostics = self.capture_diagnostics(
@@ -1335,7 +1384,7 @@ impl LiveScenarioRunner {
                 object.insert("observation_integrity".to_string(), observation_integrity);
             }
             trace.extend(observation_trace);
-            let cleanup = self.cancel_execution_lineage(execution_id_ref, &mut actor, &mut trace);
+            let cleanup = self.cancel_execution_lineage(execution_id_ref, actor, &mut trace);
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("cancellation".to_string(), cleanup);
             }
@@ -1357,7 +1406,15 @@ impl LiveScenarioRunner {
             );
         };
         let terminal_wait = terminal;
-        let response_text = message_text(&terminal_wait.message);
+        let terminal_id = terminal_wait.message_id.clone();
+        let delivery = actor.confirm_terminal_delivery(&terminal_id, turn_id_ref, execution_id_ref);
+        let (response_text, delivery_observation) = match delivery {
+            Ok(delivery) => (
+                message_text(&json!({"blocks":delivery.blocks})),
+                delivery.observation,
+            ),
+            Err(error) => (String::new(), json!({"status":"failed","error":error})),
+        };
         let descendant_wait = self.wait_for_descendant_team_acceptance(
             spec.acceptance,
             &response_text,
@@ -1368,17 +1425,19 @@ impl LiveScenarioRunner {
             &timeout,
             &mut observer,
             &mut trace,
+            actor,
         );
         let timeline = descendant_wait.timeline;
         let projections = descendant_wait.projections;
         let agentic_program = descendant_wait.agentic_program;
         let mut acceptance = descendant_wait.acceptance;
-        let terminal_id = terminal_wait
-            .message
-            .get("id")
-            .or_else(|| terminal_wait.message.get("message_id"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+        let delivery_confirmed = crate::report::delivery_observation_ready(
+            &json!({"execution_id":execution_id,"session_id":session_id,"turn_id":turn_id,"terminal_id":terminal_id,"delivery_observation":delivery_observation}),
+        );
+        acceptance
+            .checks
+            .push(json!({"name":"current_public_terminal_delivery", "passed":delivery_confirmed}));
+        acceptance.passed &= delivery_confirmed;
         let commit_cursor = find_u64_by_key(&timeline, &["commit_cursor", "runtime_commit_cursor"]);
         let metrics = scenario_metrics(
             &timeline,
@@ -1429,18 +1488,7 @@ impl LiveScenarioRunner {
             "evidence": observation_integrity.clone(),
         }));
         acceptance.passed &= observation_passed;
-        let cleanup = actor.finish().map_or_else(
-            |error| json!({"status":"failed","error":error}),
-            |_| json!({"status":"passed"}),
-        );
-        let cleanup_passed = cleanup.get("status").and_then(Value::as_str) == Some("passed");
-        acceptance.checks.push(json!({
-            "name": "session_actor_cleanup",
-            "passed": cleanup_passed,
-        }));
-        acceptance.passed &= cleanup_passed;
         trace.extend(observation_trace);
-        trace.extend(actor.drain_trace());
         json!({
             "scenario_id": spec.id,
             "status": if acceptance.passed { "passed" } else { "failed" },
@@ -1449,6 +1497,9 @@ impl LiveScenarioRunner {
             "execution_id": execution_id,
             "turn_id": turn_id,
             "terminal_id": terminal_id,
+            "terminal_observation": terminal_wait.execution_observation,
+            "delivery_observation": delivery_observation,
+            "business_observation": root_business_observation(&timeline, execution_id_ref),
             "terminal_response_summary": summarize(&response_text, 320),
             "runtime_commit_cursor": commit_cursor,
             "elapsed_ms": started.elapsed().as_millis(),
@@ -1458,7 +1509,6 @@ impl LiveScenarioRunner {
                 "root_terminal_wait": terminal_wait.report,
                 "descendant_team_wait": descendant_wait.report,
             },
-            "session_actor_cleanup": cleanup,
             "trace": trace,
             "production_trace": {
                 "session_id": session_id,
@@ -1476,16 +1526,27 @@ impl LiveScenarioRunner {
         &self,
         session_id: &str,
         root_execution_id: &str,
+        turn_id: &str,
         timeout: &LiveScenarioTimeout,
         observer: &mut LiveScenarioObserver,
+        actor: &mut SessionActor<'_>,
+        scenario_started: Instant,
     ) -> Result<TerminalWait, String> {
         let started = Instant::now();
         let mut next_message_probe = started;
         let mut next_root_probe = started;
         let mut next_session_progress_probe = started;
         let mut root_terminal = RootExecutionTerminal::Pending;
+        let mut execution_observation = Value::Null;
         loop {
             let elapsed_ms = started.elapsed().as_millis() as u64;
+            actor.set_observation_deadline(timeout.observation_deadline(
+                scenario_started,
+                started,
+                Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
+                observer.progress_observations() as usize,
+            ));
+            actor.maintain_receipt_authority()?;
             let now = Instant::now();
             let mut message_polled = false;
             if now >= next_message_probe {
@@ -1512,7 +1573,13 @@ impl LiveScenarioRunner {
                 }
             };
             if now >= next_root_probe
-                || (force_root_probe && root_terminal == RootExecutionTerminal::Pending)
+                || (force_root_probe
+                    && !crate::report::execution_observation_ready(
+                        &execution_observation,
+                        root_execution_id,
+                        session_id,
+                        turn_id,
+                    ))
             {
                 // The session live endpoint and cursor-complete timeline are
                 // the cheap progress plane. A full execution projection can
@@ -1524,6 +1591,10 @@ impl LiveScenarioRunner {
                 let root_path = format!("/api/runtime/executions/{root_execution_id}");
                 match root {
                     Ok(observation) => {
+                        execution_observation =
+                            crate::paired_performance::bounded_execution_observation(
+                                &observation.summary,
+                            );
                         observer.observe_root(
                             &root_path,
                             &Ok(observation.summary),
@@ -1548,31 +1619,33 @@ impl LiveScenarioRunner {
             if root_terminal == RootExecutionTerminal::Completed && !message_polled {
                 self.poll_message_deltas(session_id, elapsed_ms, observer)?;
             }
-            if let Some(message) = observer
-                .assistant_message()
-                .filter(|message| !message_text(message).trim().is_empty())
+            if root_terminal == RootExecutionTerminal::Completed
+                && crate::report::execution_observation_ready(
+                    &execution_observation,
+                    root_execution_id,
+                    session_id,
+                    turn_id,
+                )
             {
-                match &root_terminal {
-                    RootExecutionTerminal::Completed => {
-                        // Close the observation window only after both durable
-                        // delta streams have been drained at the terminal
-                        // boundary. A root can complete between periodic probes.
-                        self.poll_message_deltas(session_id, elapsed_ms, observer)?;
-                        self.poll_timeline_deltas(session_id, elapsed_ms, observer)?;
-                        return Ok(TerminalWait {
-                            message,
-                            report: timeout.report(
-                                started.elapsed(),
-                                Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
-                                observer.progress_observations() as usize,
-                                "root_execution_terminal_and_message",
-                                observer.phase(),
-                                observer.last_active_phase(),
-                            ),
-                        });
-                    }
-                    RootExecutionTerminal::Failed(reason) => return Err(reason.clone()),
-                    RootExecutionTerminal::Pending => {}
+                self.poll_message_deltas(session_id, elapsed_ms, observer)?;
+                self.poll_timeline_deltas(session_id, elapsed_ms, observer)?;
+                if let Some(message_id) = actor.select_terminal_message(
+                    &observer.assistant_message_ids(),
+                    turn_id,
+                    root_execution_id,
+                )? {
+                    return Ok(TerminalWait {
+                        message_id,
+                        execution_observation,
+                        report: timeout.report(
+                            started.elapsed(),
+                            Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
+                            observer.progress_observations() as usize,
+                            "root_execution_terminal_and_message",
+                            observer.phase(),
+                            observer.last_active_phase(),
+                        ),
+                    });
                 }
             }
             let elapsed = started.elapsed();
@@ -1713,7 +1786,11 @@ impl LiveScenarioRunner {
                 let live = projection.get("live").unwrap_or(&Value::Null);
                 let summary = json!({
                     "execution_id": projection.get("execution_id"),
+                    "session_id": projection.get("session_id"),
+                    "turn_id": projection.get("turn_id"),
                     "revision": projection.get("revision"),
+                    "cursor": projection.get("cursor"),
+                    "terminal_axes": projection.get("terminal_axes"),
                     "terminal_state": terminal.as_str(),
                     "node_statuses": statuses,
                     "live_revision": live.get("revision"),
@@ -1742,6 +1819,7 @@ impl LiveScenarioRunner {
             let path = observer.message_path(session_id);
             let response = self.get_json(&path);
             let page = observer.observe_message_page(&path, &response, elapsed_ms)?;
+            response.as_ref().map_err(Clone::clone)?;
             if !page.has_more {
                 return Ok(());
             }
@@ -1766,6 +1844,7 @@ impl LiveScenarioRunner {
             let path = observer.timeline_path(session_id);
             let response = self.get_json(&path);
             let page = observer.observe_timeline_page(&path, &response, elapsed_ms)?;
+            response.as_ref().map_err(Clone::clone)?;
             if !page.has_more {
                 return Ok(());
             }
@@ -1954,11 +2033,35 @@ impl LiveScenarioRunner {
         timeout: &LiveScenarioTimeout,
         observer: &mut LiveScenarioObserver,
         trace: &mut Vec<Value>,
+        actor: &mut SessionActor<'_>,
     ) -> DescendantTeamWait {
         let wait_started = Instant::now();
         let mut observations = 0_usize;
         let mut projection_cache = BTreeMap::new();
         loop {
+            actor.set_observation_deadline(timeout.observation_deadline(
+                scenario_started,
+                wait_started,
+                Duration::from_millis(
+                    observer.since_last_progress_ms(scenario_started.elapsed().as_millis() as u64),
+                ),
+                observer.progress_observations() as usize,
+            ));
+            if let Err(error) = actor.maintain_receipt_authority() {
+                return DescendantTeamWait {
+                    timeline: observer.timeline(),
+                    projections: Vec::new(),
+                    agentic_program: None,
+                    acceptance: LiveAcceptanceResult {
+                        passed: false,
+                        checks: vec![
+                            json!({"name":"receipt_authority","passed":false,"error":error}),
+                        ],
+                        quality: None,
+                    },
+                    report: json!({"terminal_reason":"receipt_authority_unavailable","elapsed_ms":wait_started.elapsed().as_millis()}),
+                };
+            }
             let timeline_error = self
                 .poll_timeline_deltas(
                     session_id,
@@ -2109,7 +2212,7 @@ impl LiveScenarioRunner {
         trace: &mut Vec<Value>,
     ) -> Value {
         let path = format!("/api/sessions/{}/cancel", actor.session_id());
-        let response = actor.post_mutation(
+        let response = actor.post_cleanup_mutation(
             &path,
             json!({
                 "reason": "isolated live evaluation timed out; cancelling owned Session lineage",
@@ -2290,7 +2393,7 @@ fn scenario_tool_calls(usage: &ScenarioTokenUsage, timeline: &Value) -> u64 {
         ))
 }
 
-fn scenario_metrics(
+pub(crate) fn scenario_metrics(
     timeline: &Value,
     projections: &[Value],
     agentic_program: Option<&runtime::AgenticProgramProjection>,
@@ -2595,8 +2698,8 @@ fn ratio_bp(numerator: u64, denominator: u64) -> u64 {
 /// deduplicates pagination/replay copies, making physical Provider attempts
 /// the only additive token source.
 fn provider_attempt_metrics(timeline: &Value) -> ProviderAttemptMetrics {
-    let mut packed = BTreeMap::<String, Value>::new();
-    let mut outcomes = BTreeMap::<String, Value>::new();
+    let mut packed = BTreeMap::<&str, &Value>::new();
+    let mut outcomes = BTreeMap::<&str, &Value>::new();
     collect_provider_attempt_events(timeline, &mut packed, &mut outcomes);
     let mut metrics = ProviderAttemptMetrics::default();
     metrics.attempt_count = packed
@@ -2616,7 +2719,8 @@ fn provider_attempt_metrics(timeline: &Value) -> ProviderAttemptMetrics {
     for (request_id, outcome) in outcomes {
         let usage = outcome.get("usage").unwrap_or(&Value::Null);
         let usage_known = outcome.get("usage_status").and_then(Value::as_str) == Some("known")
-            && usage.is_object();
+            && usage.get("input_tokens").and_then(Value::as_u64).is_some()
+            && usage.get("output_tokens").and_then(Value::as_u64).is_some();
         if !usage_known {
             metrics.usage_unknown_count = metrics.usage_unknown_count.saturating_add(1);
             metrics.cache_dimensions_unknown_count =
@@ -2627,6 +2731,14 @@ fn provider_attempt_metrics(timeline: &Value) -> ProviderAttemptMetrics {
             .get("cache_dimensions_status")
             .and_then(Value::as_str)
             != Some("known")
+            || usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .is_none()
+            || usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .is_none()
         {
             metrics.cache_dimensions_unknown_count =
                 metrics.cache_dimensions_unknown_count.saturating_add(1);
@@ -2710,41 +2822,34 @@ fn provider_attempt_metrics(timeline: &Value) -> ProviderAttemptMetrics {
     metrics
 }
 
-fn collect_provider_attempt_events(
-    value: &Value,
-    packed: &mut BTreeMap<String, Value>,
-    outcomes: &mut BTreeMap<String, Value>,
+fn collect_provider_attempt_events<'record>(
+    value: &'record Value,
+    packed: &mut BTreeMap<&'record str, &'record Value>,
+    outcomes: &mut BTreeMap<&'record str, &'record Value>,
 ) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_provider_attempt_events(item, packed, outcomes);
+    for event in value
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        let Some(request_id) = payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        match event.get("kind").and_then(Value::as_str) {
+            Some("context.provider_request_packed") => {
+                packed.insert(request_id, payload);
             }
+            Some("context.provider_attempt_outcome") => {
+                outcomes.insert(request_id, payload);
+            }
+            _ => {}
         }
-        Value::Object(object) => {
-            let kind = object.get("kind").and_then(Value::as_str);
-            let payload = object.get("payload").unwrap_or(value);
-            let payload_type = payload.get("type").and_then(Value::as_str);
-            if matches!(
-                (kind, payload_type),
-                (Some("context.provider_request_packed"), _) | (_, Some("ProviderRequestPacked"))
-            ) {
-                if let Some(request_id) = payload.get("request_id").and_then(Value::as_str) {
-                    packed.insert(request_id.to_string(), payload.clone());
-                }
-            } else if matches!(
-                (kind, payload_type),
-                (Some("context.provider_attempt_outcome"), _) | (_, Some("ProviderAttemptOutcome"))
-            ) {
-                if let Some(request_id) = payload.get("request_id").and_then(Value::as_str) {
-                    outcomes.insert(request_id.to_string(), payload.clone());
-                }
-            }
-            for child in object.values() {
-                collect_provider_attempt_events(child, packed, outcomes);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -2899,6 +3004,28 @@ struct LiveScenarioTimeout {
 }
 
 impl LiveScenarioTimeout {
+    fn observation_deadline(
+        self,
+        scenario_started: Instant,
+        phase_started: Instant,
+        since_progress: Duration,
+        progress: usize,
+    ) -> Instant {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(phase_started);
+        let remaining = if progress == 0 {
+            self.nominal_wait.saturating_sub(elapsed)
+        } else {
+            self.initial_wait
+                .saturating_sub(elapsed)
+                .max(self.inactivity_wait.saturating_sub(since_progress))
+        };
+        let remaining = self.absolute_wait.map_or(remaining, |limit| {
+            remaining.min(limit.saturating_sub(now.saturating_duration_since(scenario_started)))
+        });
+        now.checked_add(remaining).unwrap_or(now)
+    }
+
     const fn direct() -> Self {
         Self {
             initial_wait: Duration::from_secs(45),
@@ -3022,7 +3149,8 @@ impl LiveScenarioTimeout {
 }
 
 struct TerminalWait {
-    message: Value,
+    message_id: String,
+    execution_observation: Value,
     report: Value,
 }
 
@@ -4939,19 +5067,7 @@ struct RootBusinessOutcome {
 /// graph. A completed execution graph only proves lifecycle closure: the
 /// business outcome may still be partial or failed.
 fn root_business_outcome(timeline: &Value, root_execution_id: &str) -> RootBusinessOutcome {
-    let outcome = timeline
-        .get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|event| {
-            event.get("kind").and_then(Value::as_str) == Some("runtime.outcome.recorded.v1")
-                && event
-                    .pointer("/payload/identity/execution_graph_ref")
-                    .and_then(Value::as_str)
-                    == Some(root_execution_id)
-        });
+    let outcome = root_business_event(timeline, root_execution_id);
     let Some(outcome) = outcome else {
         return RootBusinessOutcome::default();
     };
@@ -4969,6 +5085,45 @@ fn root_business_outcome(timeline: &Value, root_execution_id: &str) -> RootBusin
         event_status,
         terminal_class,
     }
+}
+
+fn root_business_event<'event>(
+    timeline: &'event Value,
+    root_execution_id: &str,
+) -> Option<&'event Value> {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("runtime.outcome.recorded.v1")
+                && event
+                    .pointer("/payload/identity/execution_scope")
+                    .and_then(Value::as_str)
+                    == Some("session")
+                && event
+                    .pointer("/payload/identity/execution_graph_ref")
+                    .and_then(Value::as_str)
+                    == Some(root_execution_id)
+        })
+}
+
+pub(crate) fn root_business_observation(timeline: &Value, root_execution_id: &str) -> Value {
+    let Some(event) = root_business_event(timeline, root_execution_id) else {
+        return Value::Null;
+    };
+    json!({
+        "kind":event.get("kind"),
+        "execution_id":event.pointer("/payload/identity/execution_graph_ref"),
+        "session_id":event.pointer("/payload/identity/session_id"),
+        "turn_id":event.pointer("/payload/identity/turn_id"),
+        "terminal_generation":event.pointer("/payload/identity/terminal_generation"),
+        "execution_scope":event.pointer("/payload/identity/execution_scope"),
+        "event_status":event.get("status"),
+        "terminal_class":event.pointer("/payload/terminal/class"),
+    })
 }
 
 /// Successful tool evidence is a canonical Runtime completion receipt. It is

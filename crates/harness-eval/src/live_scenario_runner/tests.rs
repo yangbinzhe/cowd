@@ -44,7 +44,7 @@ fn successful_root_outcome_timeline(mut timeline: Value) -> Value {
         "kind": "runtime.outcome.recorded.v1",
         "status": "succeeded",
         "payload": {
-            "identity": {"execution_graph_ref": "root"},
+            "identity": {"execution_graph_ref": "root", "execution_scope":"session"},
             "terminal": {"class": "succeeded"}
         }
     });
@@ -177,11 +177,9 @@ fn autonomous_deepseek_template_is_frozen_and_complete() {
     assert!(template.prompt_template.contains("{minimum_agents}"));
     assert!(template.prompt_template.contains("{minimum_tasks}"));
     assert!(template.prompt_template.contains("task_supersede"));
-    assert!(
-        template
-            .prompt_template
-            .contains("objective_complete_request")
-    );
+    assert!(template
+        .prompt_template
+        .contains("objective_complete_request"));
     assert!(!template.prompt_template.contains("Team A"));
     assert!(!template.prompt_template.contains("恰好"));
 }
@@ -335,11 +333,9 @@ fn live_prompt_uses_an_optional_advisory_provider_token_telemetry_lease() {
         ])
     );
     assert_eq!(control["max_total_tokens"], 5_000_000);
-    assert!(
-        control["budget_lease_id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("live-scenario:live_group_theory"))
-    );
+    assert!(control["budget_lease_id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("live-scenario:live_group_theory")));
     assert_eq!(prompt, "complete the research");
 
     let tool_controlled =
@@ -716,16 +712,12 @@ fn architecture_quality_uses_durable_runtime_evidence_not_response_language() {
 fn large_scale_presentation_gate_rejects_old_concatenated_terminal() {
     let old = "team-runtime: # Verified Team evidence bundle\nRuntime delivery facts: 2/2\n[truncated]\n并发波次、关键瓶颈、失效模式、容量边界、扩大规模：Op";
     let checks = large_scale_presentation_checks(old);
-    assert!(
-        checks.iter().any(
-            |check| check["name"] == "presentation_transport_clean" && check["passed"] == false
-        )
-    );
-    assert!(
-        checks.iter().any(
-            |check| check["name"] == "presentation_complete_ending" && check["passed"] == false
-        )
-    );
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "presentation_transport_clean" && check["passed"] == false));
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "presentation_complete_ending" && check["passed"] == false));
 }
 
 #[test]
@@ -734,11 +726,9 @@ fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
         "## 已验证事实\n{}\n\n12/12 目标源码已完整读取到 EOF。\n12/12 目标源码已由两个不同 Agent 身份独立完整读取到 EOF。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩容结论\n\n判定：适合在当前单节点边界内继续扩大协作规模，但横向扩展必须先完成持久层分片。",
         LARGE_SCALE_SOURCE_PATHS[..6].join(" ")
     );
-    assert!(
-        large_scale_presentation_checks(&response)
-            .iter()
-            .all(|check| check["passed"] == true)
-    );
+    assert!(large_scale_presentation_checks(&response)
+        .iter()
+        .all(|check| check["passed"] == true));
 }
 
 #[test]
@@ -887,25 +877,21 @@ fn independent_source_review_gate_requires_distinct_role_receipts_for_every_targ
         .enumerate()
         .map(|(index, path)| receipt(path, index as u64 + 1, "investigator"))
         .collect::<Vec<_>>();
-    assert!(
-        independently_reviewed_complete_source_receipt_paths(
-            &json!({"observed_acceptance": {"observed_evidence": investigator_only}}),
-            &[],
-        )
-        .is_empty()
-    );
+    assert!(independently_reviewed_complete_source_receipt_paths(
+        &json!({"observed_acceptance": {"observed_evidence": investigator_only}}),
+        &[],
+    )
+    .is_empty());
     assert_eq!(
         receipt_agent_identity(
             "agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c:1:1:2:read_file:digest:read-receipt"
         ),
         Some("agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c")
     );
-    assert!(
-        receipt_agent_identity(
-            "agent-tool:graph:role-a5684f8888daf18c:not-a-slot:1:2:read_file:receipt"
-        )
-        .is_none()
-    );
+    assert!(receipt_agent_identity(
+        "agent-tool:graph:role-a5684f8888daf18c:not-a-slot:1:2:read_file:receipt"
+    )
+    .is_none());
 
     let duplicate_reads_from_one_agent = LARGE_SCALE_SOURCE_PATHS
         .iter()
@@ -917,13 +903,11 @@ fn independent_source_review_gate_requires_distinct_role_receipts_for_every_targ
             ]
         })
         .collect::<Vec<_>>();
-    assert!(
-        independently_reviewed_complete_source_receipt_paths(
-            &json!({"observed_acceptance": {"observed_evidence": duplicate_reads_from_one_agent}}),
-            &[],
-        )
-        .is_empty()
-    );
+    assert!(independently_reviewed_complete_source_receipt_paths(
+        &json!({"observed_acceptance": {"observed_evidence": duplicate_reads_from_one_agent}}),
+        &[],
+    )
+    .is_empty());
 }
 
 #[test]
@@ -962,14 +946,12 @@ fn group_theory_gate_requires_exact_reads_from_the_unique_sink_team() {
     let program = agentic_program_projection("verified", true);
     let terminal = terminal_semantic_team_ids(&program);
     assert_eq!(terminal, BTreeSet::from(["team-synthesis".to_string()]));
-    assert!(
-        complete_exact_source_receipt_paths_for_semantic_teams(
-            &observed("team-research"),
-            &[],
-            &terminal,
-        )
-        .is_empty()
-    );
+    assert!(complete_exact_source_receipt_paths_for_semantic_teams(
+        &observed("team-research"),
+        &[],
+        &terminal,
+    )
+    .is_empty());
     assert_eq!(
         complete_exact_source_receipt_paths_for_semantic_teams(
             &observed("team-synthesis"),
@@ -1004,10 +986,11 @@ fn source_receipt_gate_rejects_acquisition_receipts_not_promoted_to_agent_accept
         }
     });
 
-    assert!(
-        complete_exact_source_receipt_paths(&json!({"durable_tool_receipts": [raw_receipt]}), &[],)
-            .is_empty()
-    );
+    assert!(complete_exact_source_receipt_paths(
+        &json!({"durable_tool_receipts": [raw_receipt]}),
+        &[],
+    )
+    .is_empty());
 }
 
 #[test]
@@ -1064,22 +1047,18 @@ fn team_acceptance_waits_for_running_descendant_work() {
         completion_health.has_pending_work(),
         "supervisor verdict remains a live Program transition"
     );
-    assert!(
-        LiveAcceptance::ArchitectureQuality {
-            minimum_teams: 1,
-            minimum_claimed_cross_team_edges: 0,
-            evidence_profile: ArchitectureEvidenceProfile::Basic,
-        }
-        .requires_descendant_team_closure()
-    );
-    assert!(
-        !LiveAcceptance::ArchitectureQuality {
-            minimum_teams: 0,
-            minimum_claimed_cross_team_edges: 0,
-            evidence_profile: ArchitectureEvidenceProfile::Basic,
-        }
-        .requires_descendant_team_closure()
-    );
+    assert!(LiveAcceptance::ArchitectureQuality {
+        minimum_teams: 1,
+        minimum_claimed_cross_team_edges: 0,
+        evidence_profile: ArchitectureEvidenceProfile::Basic,
+    }
+    .requires_descendant_team_closure());
+    assert!(!LiveAcceptance::ArchitectureQuality {
+        minimum_teams: 0,
+        minimum_claimed_cross_team_edges: 0,
+        evidence_profile: ArchitectureEvidenceProfile::Basic,
+    }
+    .requires_descendant_team_closure());
 }
 
 #[test]
@@ -1230,6 +1209,16 @@ fn provider_metadata_and_zero_tool_count_are_not_live_tool_evidence() {
 }
 
 #[test]
+fn local_outcome_cannot_replace_root_business_observation() {
+    let mut timeline = successful_root_outcome_timeline(json!({}));
+    for scope in ["agent", "team", "task", "unknown"] {
+        timeline["events"][0]["payload"]["identity"]["execution_scope"] = json!(scope);
+        assert!(root_business_observation(&timeline, "root").is_null());
+        assert!(!root_business_outcome(&timeline, "root").passed);
+    }
+}
+
+#[test]
 fn partial_failed_or_missing_root_outcome_fails_closed() {
     for (status, class) in [("failed", "failed"), ("partial", "partial")] {
         let timeline = json!({"events": [
@@ -1238,7 +1227,7 @@ fn partial_failed_or_missing_root_outcome_fails_closed() {
                 "kind": "runtime.outcome.recorded.v1",
                 "status": status,
                 "payload": {
-                    "identity": {"execution_graph_ref": "root"},
+                    "identity": {"execution_graph_ref": "root", "execution_scope":"session"},
                     "terminal": {"class": class}
                 }
             }
@@ -1332,7 +1321,7 @@ fn scenario_metrics_prefer_unique_provider_attempt_outcomes_and_exact_prefix_evi
     };
     let first_outcome = outcome("request-1", 100, 0);
     let timeline = json!({
-        "session_events": [
+        "events": [
             packed("request-1", 1000, 0, true),
             first_outcome.clone(),
             packed("request-2", 1100, 1000, false),
@@ -1361,7 +1350,7 @@ fn scenario_metrics_prefer_unique_provider_attempt_outcomes_and_exact_prefix_evi
 #[test]
 fn scenario_metrics_count_packed_attempt_without_outcome_as_usage_unknown() {
     let timeline = json!({
-        "session_events": [{
+        "events": [{
             "kind": "context.provider_request_packed",
             "payload": {
                 "type": "ProviderRequestPacked",
@@ -1387,9 +1376,61 @@ fn scenario_metrics_count_packed_attempt_without_outcome_as_usage_unknown() {
 }
 
 #[test]
+fn known_usage_stamp_cannot_fill_missing_or_malformed_token_dimensions() {
+    for usage in [
+        json!({"input_tokens":7}),
+        json!({"output_tokens":0}),
+        json!({"input_tokens":null,"output_tokens":0}),
+        json!({"input_tokens":7,"output_tokens":"0"}),
+    ] {
+        let timeline = json!({"events":[{
+            "kind":"context.provider_attempt_outcome",
+            "payload":{"request_id":"partial","usage_status":"known","terminal_status":"completed","usage":usage}
+        }]});
+        let metrics = scenario_metrics(&timeline, &[], None, Duration::from_secs(1));
+        assert_eq!(metrics["provider_attempt_count"], 1);
+        assert_eq!(metrics["provider_usage_records"], 0);
+        assert_eq!(metrics["usage_unknown_attempts"], 1);
+    }
+    let timeline = json!({"events":[{
+        "kind":"context.provider_attempt_outcome",
+        "payload":{"request_id":"zero","usage_status":"known","cache_dimensions_status":"known","terminal_status":"completed","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+    }]});
+    let metrics = scenario_metrics(&timeline, &[], None, Duration::from_secs(1));
+    assert_eq!(metrics["provider_usage_records"], 1);
+    assert_eq!(metrics["usage_unknown_attempts"], 0);
+    assert_eq!(crate::report::complete_metric_tokens(&metrics), Some(0));
+    for value in [Value::Null, json!("0")] {
+        let mut partial = timeline.clone();
+        partial["events"][0]["payload"]["usage"]["cache_read_input_tokens"] = value;
+        let metrics = scenario_metrics(&partial, &[], None, Duration::from_secs(1));
+        assert_eq!(metrics["provider_usage_records"], 1);
+        assert_eq!(
+            metrics["provider_attempt_cache_dimensions_unknown_count"],
+            1
+        );
+        assert_eq!(crate::report::complete_metric_tokens(&metrics), None);
+    }
+    let mut unknown_cache = timeline.clone();
+    unknown_cache["events"][0]["payload"]["cache_dimensions_status"] = json!("unknown");
+    let metrics = scenario_metrics(&unknown_cache, &[], None, Duration::from_secs(1));
+    assert_eq!(crate::report::complete_metric_tokens(&metrics), None);
+}
+
+#[test]
+fn tool_payload_cannot_impersonate_a_durable_provider_outcome() {
+    let forged = json!({"kind":"context.provider_attempt_outcome","type":"ProviderAttemptOutcome","payload":{"request_id":"forged","usage_status":"known","cache_dimensions_status":"known","usage":{"input_tokens":99,"output_tokens":99,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}});
+    let timeline =
+        json!({"events":[{"kind":"tool.invocation.completed","payload":forged}],"metadata":forged});
+    let metrics = scenario_metrics(&timeline, &[], None, Duration::from_secs(1));
+    assert_eq!(metrics["provider_attempt_count"], 0);
+    assert_eq!(metrics["provider_usage_records"], 0);
+}
+
+#[test]
 fn scenario_metrics_do_not_treat_missing_cache_fields_as_known_zero() {
     let timeline = json!({
-        "session_events": [
+        "events": [
             {
                 "kind": "context.provider_request_packed",
                 "payload": {
@@ -1575,6 +1616,14 @@ fn live_timeout_is_complexity_aware_and_not_default_capped() {
     assert_eq!(twenty_four.absolute_wait, None);
     assert!(twenty_four.nominal_wait > sixteen.nominal_wait);
     assert!(!twenty_four.should_abort_for_absolute_wait(Duration::from_secs(86_400)));
+    let now = Instant::now();
+    let old = now - Duration::from_secs(7_200);
+    assert!(
+        team.observation_deadline(old, old, Duration::ZERO, 1) > now + Duration::from_secs(500)
+    );
+    assert!(team.observation_deadline(old, old, Duration::from_secs(7_200), 1) <= Instant::now());
+    assert!(team.observation_deadline(old, old, Duration::ZERO, 0) <= Instant::now());
+    assert!(direct.observation_deadline(old, now, Duration::ZERO, 1) <= Instant::now());
 
     let explicitly_capped = twenty_four.with_cap(Some(Duration::from_secs(7_200)));
     assert_eq!(

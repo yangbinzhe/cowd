@@ -1169,11 +1169,16 @@ fn run_sample(
                 .replace("{{EXPECTED_CONTENT}}", &prepared.expected_content)
         },
     );
+    let Some(actor_deadline) = Instant::now().checked_add(options.timeout) else {
+        sample.error = Some("unrepresentable observation deadline".into());
+        return sample;
+    };
     let actor = SessionActor::create(
         client,
         endpoint,
         Some(&options.provider),
         &format!("harness-eval-auto-{}", condition.as_str()),
+        actor_deadline,
     );
     let Ok(mut actor) = actor else {
         sample.error = Some(format!(

@@ -377,7 +377,7 @@ impl HarnessEvalService {
                     total_elapsed_ms: None,
                     provider_rounds: 0,
                     tool_calls: 0,
-                    total_tokens: 0,
+                    total_tokens: None,
                     scenario_count: 0,
                     message: "active harness eval job".to_string(),
                 });
@@ -514,7 +514,7 @@ fn pending_record(
         total_elapsed_ms: None,
         provider_rounds: 0,
         tool_calls: 0,
-        total_tokens: 0,
+        total_tokens: None,
         scenario_count: 0,
         message: message.into(),
     }

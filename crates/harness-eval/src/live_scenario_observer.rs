@@ -579,6 +579,21 @@ impl LiveScenarioObserver {
         }
     }
 
+    pub(crate) fn assistant_message_ids(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .filter_map(|message| {
+                message
+                    .get("id")
+                    .or_else(|| message.get("message_id"))
+                    .and_then(Value::as_str)
+            })
+            .filter(|message_id| !message_id.trim().is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     pub(crate) fn assistant_message(&self) -> Option<Value> {
         self.messages.iter().rev().find_map(|message| {
             (message.get("role").and_then(Value::as_str) == Some("assistant"))
@@ -1275,6 +1290,7 @@ mod tests {
             "retained polling evidence must be at least 90% smaller than full-page replay"
         );
         assert_eq!(observer.assistant_message().unwrap()["id"], "answer");
+        assert_eq!(observer.assistant_message_ids(), vec!["answer"]);
     }
 
     #[test]

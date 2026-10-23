@@ -25,6 +25,7 @@ const WORKLOAD_PROMPT: &str = "只回答 7 乘以 8 的结果。不要调用工�
 
 #[derive(Debug, Clone)]
 pub struct PairedPerformanceOptions {
+    pub allow_real_model: bool,
     pub baseline_url: String,
     pub candidate_url: String,
     pub model: String,
@@ -38,6 +39,17 @@ pub struct PairedPerformanceOptions {
 
 impl PairedPerformanceOptions {
     pub fn validate(&self) -> Result<(), String> {
+        if !self.allow_real_model {
+            return Err("paired performance evaluation requires --allow-real-model".to_string());
+        }
+        if self.timeout.is_zero()
+            || self.poll_interval.is_zero()
+            || Instant::now().checked_add(self.timeout).is_none()
+        {
+            return Err(
+                "paired performance requires finite positive timeout and polling windows".into(),
+            );
+        }
         if self.min_pairs < 5 {
             return Err(
                 "paired performance evaluation requires at least five minimum pairs".to_string(),
@@ -58,7 +70,14 @@ impl PairedPerformanceOptions {
             ("baseline", self.baseline_url.as_str()),
             ("candidate", self.candidate_url.as_str()),
         ] {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+            if !reqwest::Url::parse(url).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            }) {
                 return Err(format!("{label} URL must be an http(s) URL"));
             }
         }
@@ -72,6 +91,20 @@ impl PairedPerformanceOptions {
 pub fn run_paired_performance(options: PairedPerformanceOptions) -> Result<Value, String> {
     options.validate()?;
     validate_metric_definitions()?;
+    let mut evidence_manifest = crate::runner::build_evidence_manifest(
+        &crate::HarnessEvalRunnerOptions {
+            level: crate::HarnessEvalLevel::Deep,
+            provider: Some(options.model.clone()),
+            budget: None,
+            allow_real_model: options.allow_real_model,
+        },
+        crate::report_store::now_ms(),
+        0,
+        0,
+        "unavailable",
+    );
+    evidence_manifest["command"] = json!("harness-eval paired-performance --allow-real-model");
+    evidence_manifest["token_usage"] = json!({"total_tokens":null,"source":"unavailable"});
     let client = build_client(&options)?;
     let baseline = EndpointRunner::new("baseline", &options.baseline_url, &options, &client);
     let candidate = EndpointRunner::new("candidate", &options.candidate_url, &options, &client);
@@ -141,7 +174,7 @@ pub fn run_paired_performance(options: PairedPerformanceOptions) -> Result<Value
         &sampling,
     );
 
-    Ok(json!({
+    let mut report = json!({
         "kind": "harness_eval.paired_public_api_performance",
         "status": gate["status"].as_str().unwrap_or("failed"),
         "measurement": {
@@ -187,7 +220,19 @@ pub fn run_paired_performance(options: PairedPerformanceOptions) -> Result<Value
         "baseline": baseline_summary,
         "candidate": candidate_summary,
         "gate": gate,
-    }))
+        "evidence_manifest": evidence_manifest,
+    });
+    let readiness = crate::evaluate_report_gate(&report);
+    report["status"] = json!(
+        if report["gate"]["status"] == "passed" && readiness.status == "passed" {
+            "passed"
+        } else {
+            "failed"
+        }
+    );
+    report["report_gate"] = serde_json::to_value(readiness)
+        .map_err(|_| "paired report gate serialization failed".to_string())?;
+    Ok(report)
 }
 
 fn build_client(options: &PairedPerformanceOptions) -> Result<Client, String> {
@@ -234,11 +279,20 @@ impl<'a> EndpointRunner<'a> {
     }
 
     fn run(&self, pair_index: usize) -> Value {
+        let Some(deadline) = Instant::now().checked_add(self.timeout) else {
+            return failed_sample(
+                self.label,
+                pair_index,
+                "observation_window",
+                "unrepresentable observation deadline".into(),
+            );
+        };
         let actor = SessionActor::create(
             self.client,
             &self.base_url,
             Some(self.model),
             "harness-eval-paired",
+            deadline,
         );
         let Ok(mut actor) = actor else {
             return failed_sample(
@@ -248,6 +302,31 @@ impl<'a> EndpointRunner<'a> {
                 actor.err().unwrap_or_default(),
             );
         };
+        let mut sample = self.run_attached(pair_index, &mut actor, deadline);
+        let cleanup = actor.finish().map_or_else(
+            |error| json!({"status":"failed","error":error}),
+            |_| json!({"status":"passed"}),
+        );
+        let passed = paired_sample_passed(
+            sample.get("status").and_then(Value::as_str) == Some("passed"),
+            sample
+                .get("first_surface_delta_ms")
+                .is_some_and(Value::is_number),
+            &cleanup,
+        );
+        sample["status"] = json!(if passed { "passed" } else { "failed" });
+        sample["session_id"] = json!(actor.session_id());
+        sample["session_actor_cleanup"] = cleanup;
+        sample["session_actor_trace"] = json!(actor.drain_trace());
+        sample
+    }
+
+    fn run_attached(
+        &self,
+        pair_index: usize,
+        actor: &mut SessionActor<'_>,
+        deadline: Instant,
+    ) -> Value {
         let session_id = actor.session_id().to_string();
 
         let first_delta_observer =
@@ -284,28 +363,33 @@ impl<'a> EndpointRunner<'a> {
             );
         };
 
-        let deadline = started + self.timeout;
         let mut first_surface_delta = None;
         let mut first_durable_assistant_ms = None;
-        let mut assistant_text = None;
+        let mut message_observer = crate::live_scenario_observer::LiveScenarioObserver::default();
         loop {
+            if let Err(error) = actor.maintain_receipt_authority() {
+                return failed_sample(self.label, pair_index, "receipt_authority", error);
+            }
             if first_surface_delta.is_none() {
                 first_surface_delta = first_delta_observer.try_recv().ok();
             }
-            match self.get(&format!("/api/sessions/{session_id}/messages?limit=200")) {
-                Ok(messages) => {
-                    if first_durable_assistant_ms.is_none() {
-                        if let Some(text) = latest_assistant_text(&messages) {
-                            first_durable_assistant_ms = Some(started.elapsed().as_millis() as u64);
-                            assistant_text = Some(text);
-                        }
-                    }
-                }
-                Err(error) => return failed_sample(self.label, pair_index, "poll_messages", error),
+            if let Err(error) =
+                self.drain_message_pages(&session_id, &mut message_observer, started, deadline)
+            {
+                return failed_sample(self.label, pair_index, "poll_messages", error);
             }
-            let terminal = match self.get(&format!("/api/runtime/executions/{execution_id}")) {
-                Ok(projection) => execution_projection_is_terminal(&projection),
-                Err(error) if error.starts_with("HTTP 404 ") => false,
+            if first_durable_assistant_ms.is_none()
+                && message_observer
+                    .assistant_message()
+                    .is_some_and(|message| !message_text(&message).trim().is_empty())
+            {
+                first_durable_assistant_ms = Some(started.elapsed().as_millis() as u64);
+            }
+            let projection = match self
+                .get_before(&format!("/api/runtime/executions/{execution_id}"), deadline)
+            {
+                Ok(projection) => Some(projection),
+                Err(error) if error.starts_with("HTTP 404 ") => None,
                 Err(error) => {
                     return failed_sample(
                         self.label,
@@ -315,47 +399,112 @@ impl<'a> EndpointRunner<'a> {
                     );
                 }
             };
+            let terminal = projection.as_ref().is_some_and(|projection| {
+                projection
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|turn_id| {
+                        crate::report::execution_observation_ready(
+                            projection,
+                            &execution_id,
+                            &session_id,
+                            turn_id,
+                        )
+                    })
+            });
             if terminal {
                 if first_surface_delta.is_none() {
                     first_surface_delta = first_delta_observer
-                        .recv_timeout(Duration::from_millis(500))
+                        .recv_timeout(
+                            Duration::from_millis(500)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        )
                         .ok();
                 }
-                if let (Some(durable_ms), Some(text)) =
-                    (first_durable_assistant_ms, assistant_text.as_deref())
+                let projection = projection.as_ref().unwrap();
+                let turn_id = projection.get("turn_id").and_then(Value::as_str).unwrap();
+                if let Err(error) =
+                    self.drain_message_pages(&session_id, &mut message_observer, started, deadline)
                 {
+                    return failed_sample(self.label, pair_index, "terminal_messages", error);
+                }
+                let candidate = match actor.select_terminal_message(
+                    &message_observer.assistant_message_ids(),
+                    turn_id,
+                    &execution_id,
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        return failed_sample(
+                            self.label,
+                            pair_index,
+                            "terminal_receipt_selection",
+                            error,
+                        );
+                    }
+                };
+                if let (Some(durable_ms), Some(message_id)) =
+                    (first_durable_assistant_ms, candidate.as_ref())
+                {
+                    let delivery =
+                        match actor.confirm_terminal_delivery(message_id, turn_id, &execution_id) {
+                            Ok(delivery) => delivery,
+                            Err(error) => {
+                                return failed_sample(
+                                    self.label,
+                                    pair_index,
+                                    "terminal_receipt",
+                                    error,
+                                );
+                            }
+                        };
+                    let text = message_text(&json!({"blocks":delivery.blocks}));
                     let terminal_wall_ms = started.elapsed().as_millis() as u64;
                     let accepted = text.contains("56");
+                    let delivery_bound = crate::report::delivery_observation_ready(
+                        &json!({"execution_id":execution_id,"session_id":session_id,"turn_id":turn_id,"terminal_id":message_id,"delivery_observation":delivery.observation}),
+                    );
+                    let usage = self.usage_metrics(&session_id, projection, started, deadline);
+                    let business_observation = usage
+                        .as_ref()
+                        .ok()
+                        .and_then(|evidence| evidence.get("business_observation"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let business_passed = crate::report::business_observation_ready(
+                        &json!({"execution_id":execution_id,"session_id":session_id,"turn_id":turn_id,"terminal_observation":bounded_execution_observation(projection),"business_observation":business_observation}),
+                    );
                     let first_surface_delta_ms = first_surface_delta.map(|observed| {
                         u64::try_from(observed.observed_at.duration_since(started).as_millis())
                             .unwrap_or(u64::MAX)
                     });
                     let first_surface_delta_source_cursor =
                         first_surface_delta.and_then(|observed| observed.source_cursor);
-                    let cleanup = actor.finish().map_or_else(
-                        |error| json!({"status":"failed","error":error}),
-                        |_| json!({"status":"passed"}),
-                    );
                     return json!({
                         "endpoint": self.label,
                         "pair_index": pair_index,
-                        "status": if paired_sample_passed(accepted, first_surface_delta_ms.is_some(), &cleanup) { "passed" } else { "failed" },
+                        "status": if accepted && business_passed && delivery_bound && first_surface_delta_ms.is_some() { "passed" } else { "failed" },
                         "session_id": session_id,
                         "execution_id": execution_id,
+                        "turn_id": turn_id,
+                        "terminal_id": message_id,
+                        "terminal_observation": bounded_execution_observation(projection),
+                        "delivery_observation": delivery.observation,
+                        "business_observation": business_observation,
+                        "metrics": usage.as_ref().ok().and_then(|evidence| evidence.get("metrics")).cloned().unwrap_or(Value::Null),
+                        "usage_observation_integrity": usage.as_ref().ok().and_then(|evidence| evidence.get("integrity")).cloned().unwrap_or(Value::Null),
+                        "usage_observation_error": usage.err(),
                         "first_surface_delta_ms": first_surface_delta_ms,
                         "first_surface_delta_source_cursor": first_surface_delta_source_cursor,
                         "first_durable_assistant_ms": durable_ms,
                         "terminal_wall_ms": terminal_wall_ms,
                         "measurement_error": if first_surface_delta_ms.is_none() {
                             Some("no visible TextDelta was observed; durable response was not substituted for TTFT")
-                        } else if cleanup["status"] != "passed" {
-                            Some("session actor cleanup did not confirm release; sample cannot pass")
                         } else {
                             None
                         },
                         "acceptance": {"passed": accepted, "required": "56"},
-                        "response_summary": summarize(text, 240),
-                        "session_actor_cleanup": cleanup,
+                        "response_summary": summarize(&text, 240),
                     });
                 }
             }
@@ -369,6 +518,51 @@ impl<'a> EndpointRunner<'a> {
             }
             thread::sleep(self.poll_interval);
         }
+    }
+
+    fn usage_metrics(
+        &self,
+        session_id: &str,
+        projection: &Value,
+        started: Instant,
+        deadline: Instant,
+    ) -> Result<Value, String> {
+        let mut observer = crate::live_scenario_observer::LiveScenarioObserver::default();
+        for _ in 0..crate::live_scenario_observer::MAX_DRAIN_PAGES_PER_PROBE {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| "provider evidence observation deadline exceeded".to_string())?;
+            let path = observer.timeline_path(session_id);
+            let response = self
+                .client
+                .get(format!("{}{}", self.base_url, path))
+                .timeout(remaining)
+                .send()
+                .map_err(|_| "provider evidence observation transport failed".to_string())
+                .and_then(response_json);
+            if usage_page_drained(
+                &mut observer,
+                &path,
+                &response,
+                started.elapsed().as_millis() as u64,
+            )? {
+                let timeline = observer.timeline();
+                let execution_id = projection
+                    .get("execution_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "provider evidence lacks execution identity".to_string())?;
+                return Ok(
+                    json!({"metrics":crate::live_scenario_runner::scenario_metrics(
+                    &timeline,
+                    std::slice::from_ref(projection),
+                    None,
+                    started.elapsed(),
+                ),"business_observation":crate::live_scenario_runner::root_business_observation(&timeline, execution_id),"integrity":observer.integrity_report()}),
+                );
+            }
+        }
+        Err("provider evidence pagination did not drain within the original page bound".into())
     }
 
     fn get(&self, path: &str) -> Result<Value, String> {
@@ -385,6 +579,62 @@ impl<'a> EndpointRunner<'a> {
             .and_then(|health| health.get("performance").cloned())
             .unwrap_or_else(|| json!({"status": "unavailable"}))
     }
+
+    fn get_before(&self, path: &str, deadline: Instant) -> Result<Value, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("paired observation deadline exceeded".into());
+        }
+        self.client
+            .get(format!("{}{}", self.base_url, path))
+            .timeout(remaining)
+            .send()
+            .map_err(|_| "paired observation transport failed".to_string())
+            .and_then(response_json)
+    }
+
+    fn drain_message_pages(
+        &self,
+        session_id: &str,
+        observer: &mut crate::live_scenario_observer::LiveScenarioObserver,
+        started: Instant,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        for _ in 0..crate::live_scenario_observer::MAX_DRAIN_PAGES_PER_PROBE {
+            let path = observer.message_path(session_id);
+            let response = self.get_before(&path, deadline);
+            let page = observer.observe_message_page(
+                &path,
+                &response,
+                started.elapsed().as_millis() as u64,
+            )?;
+            response.as_ref().map_err(Clone::clone)?;
+            if !page.has_more {
+                return Ok(());
+            }
+        }
+        Err("paired message pagination did not drain within the original page bound".into())
+    }
+}
+
+fn usage_page_drained(
+    observer: &mut crate::live_scenario_observer::LiveScenarioObserver,
+    path: &str,
+    response: &Result<Value, String>,
+    elapsed_ms: u64,
+) -> Result<bool, String> {
+    let page = observer.observe_timeline_page(path, response, elapsed_ms)?;
+    response.as_ref().map_err(Clone::clone)?;
+    if !page.has_more
+        && observer
+            .integrity_report()
+            .get("timeline_drained")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err("provider evidence timeline was not fully drained".into());
+    }
+    Ok(!page.has_more)
 }
 
 fn paired_sample_passed(
@@ -420,21 +670,15 @@ fn validate_reported_metric_ids(process_metrics: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn execution_projection_is_terminal(value: &Value) -> bool {
-    serde_json::from_value::<harness_contract::projection::ExecutionProjection>(value.clone())
-        .is_ok_and(|projection| {
-            !projection.graph.nodes.is_empty()
-                && projection
-                    .graph
-                    .nodes
-                    .iter()
-                    .all(|node| node.status.is_terminal())
-                && projection
-                    .strategy
-                    .as_ref()
-                    .and_then(|strategy| strategy.actual.as_ref())
-                    .is_some()
-        })
+pub(crate) fn bounded_execution_observation(value: &Value) -> Value {
+    json!({
+        "execution_id": value.get("execution_id"),
+        "session_id": value.get("session_id"),
+        "turn_id": value.get("turn_id"),
+        "revision": value.get("revision"),
+        "cursor": value.get("cursor"),
+        "terminal_axes": value.get("terminal_axes"),
+    })
 }
 
 fn response_json(response: reqwest::blocking::Response) -> Result<Value, String> {
@@ -447,17 +691,6 @@ fn response_json(response: reqwest::blocking::Response) -> Result<Value, String>
     } else {
         Err(format!("HTTP {status}: {}", summarize_json(&value)))
     }
-}
-
-fn latest_assistant_text(value: &Value) -> Option<String> {
-    let messages = value
-        .as_array()
-        .or_else(|| value.get("messages").and_then(Value::as_array))?;
-    messages.iter().rev().find_map(|message| {
-        (message.get("role").and_then(Value::as_str) == Some("assistant"))
-            .then(|| message_text(message))
-            .filter(|text| !text.trim().is_empty())
-    })
 }
 
 fn message_text(message: &Value) -> String {
@@ -686,6 +919,58 @@ fn compare(
     })
 }
 
+pub(crate) fn paired_statistics_passed(report: &Value) -> bool {
+    let Some(pairs) = report.get("pairs").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(min_pairs) = report
+        .pointer("/environment/min_pairs")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return false;
+    };
+    let Some(max_pairs) = report
+        .pointer("/environment/max_pairs")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return false;
+    };
+    let Some(target) = report
+        .pointer("/environment/target_relative_ci_half_width_bp")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let Some(poll_ms) = report
+        .pointer("/environment/poll_interval_ms")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    if min_pairs < 5
+        || pairs.len() < min_pairs
+        || pairs.len() > max_pairs
+        || target == 0
+        || target > 10_000
+        || poll_ms == 0
+    {
+        return false;
+    }
+    let Some(sampling) = sequential_confidence(pairs, target) else {
+        return false;
+    };
+    compare(
+        &summarize_samples(pairs, "baseline"),
+        &summarize_samples(pairs, "candidate"),
+        pairs.len(),
+        Duration::from_millis(poll_ms),
+        &sampling,
+    )["status"]
+        == "passed"
+}
+
 fn summarize(value: &str, limit: usize) -> String {
     let mut chars = value.chars();
     let summary = chars.by_ref().take(limit).collect::<String>();
@@ -702,6 +987,89 @@ fn summarize_json(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn later_timeline_page_error_cannot_certify_a_successful_prefix() {
+        let mut observer = crate::live_scenario_observer::LiveScenarioObserver::default();
+        let first = Ok(json!({"events":[{
+            "source":"runtime_lifecycle","stream_id":"session:test","sequence":0,"commit_cursor":1,"transaction_index":0,
+            "kind":"context.provider_attempt_outcome","payload":{"request_id":"original","usage_status":"known","cache_dimensions_status":"known","terminal_status":"completed","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+        }],"next_cursor":"v2:1:1:0","has_more":true}));
+        assert!(!usage_page_drained(&mut observer, "/timeline", &first, 1).unwrap());
+        let prefix = crate::live_scenario_runner::scenario_metrics(
+            &observer.timeline(),
+            &[],
+            None,
+            Duration::from_secs(1),
+        );
+        assert_eq!(prefix["provider_usage_records"], 1);
+        assert!(
+            usage_page_drained(&mut observer, "/timeline", &Err("HTTP 503".into()), 2).is_err()
+        );
+        assert_eq!(observer.integrity_report()["timeline_drained"], false);
+        assert!(usage_page_drained(
+            &mut observer,
+            "/timeline",
+            &Ok(json!({"events":[],"has_more":false})),
+            3
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn message_candidates_come_from_the_original_drained_observer() {
+        let mut observer = crate::live_scenario_observer::LiveScenarioObserver::default();
+        observer.observe_message_page("/messages", &Ok(json!({
+            "messages":[{"id":"user","sequence":0,"role":"user"},{"id":"answer","sequence":1,"role":"assistant"},{"message_id":"later","sequence":2,"role":"assistant"}],
+            "next_seq":3,"has_more":false
+        })), 1).unwrap();
+        let actual = observer
+            .assistant_message_ids()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = ["answer".to_string(), "later".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    fn authorized_options() -> super::PairedPerformanceOptions {
+        super::PairedPerformanceOptions {
+            allow_real_model: true,
+            baseline_url: "http://127.0.0.1:1".into(),
+            candidate_url: "http://127.0.0.1:2".into(),
+            model: "fixture-model".into(),
+            min_pairs: 5,
+            pairs: 5,
+            target_relative_ci_half_width_bp: 500,
+            token: None,
+            timeout: std::time::Duration::from_secs(1),
+            poll_interval: std::time::Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn paired_requires_explicit_authorization_before_building_a_client() {
+        for token in [None, Some("invalid\nheader".to_string())] {
+            let mut options = authorized_options();
+            options.allow_real_model = false;
+            options.token = token;
+            assert!(super::run_paired_performance(options)
+                .unwrap_err()
+                .contains("--allow-real-model"));
+        }
+    }
+
+    #[test]
+    fn authorized_paired_options_validate_without_starting_a_run() {
+        let mut options = authorized_options();
+        assert!(options.validate().is_ok());
+        options.min_pairs = 4;
+        assert!(options.validate().is_err());
+        options.min_pairs = 5;
+        options.pairs = 4;
+        assert!(options.validate().is_err());
+    }
+
     #[test]
     fn r1_integrated_provider_metric_ids_preserve_real_usage_and_unknowns() {
         assert!(super::paired_sample_passed(

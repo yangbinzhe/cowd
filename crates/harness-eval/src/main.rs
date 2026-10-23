@@ -142,6 +142,7 @@ fn run() -> Result<(), String> {
                 .ok_or_else(|| "--poll-interval-ms must be a positive integer".to_string())?;
             let token = std::env::var("COWD_API_TOKEN").ok();
             let report = run_paired_performance(PairedPerformanceOptions {
+                allow_real_model: args[1..].iter().any(|arg| arg == "--allow-real-model"),
                 baseline_url,
                 candidate_url,
                 model,
@@ -195,8 +196,9 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("terminal-gate") => {
-            let evidence_dir = option_value(&args[1..], "--evidence-dir")
-                .unwrap_or_else(|| "../plan/2026-07/0706-AIHarness终局100闭环升级/90-审计证据".to_string());
+            let evidence_dir = option_value(&args[1..], "--evidence-dir").unwrap_or_else(|| {
+                "../plan/2026-07/0706-AIHarness终局100闭环升级/90-审计证据".to_string()
+            });
             let report_json = option_value(&args[1..], "--report-json").map(PathBuf::from);
             let gate = terminal_gate_report_with_report(PathBuf::from(evidence_dir), report_json);
             let gate_json = serde_json::to_string_pretty(&gate)
@@ -290,7 +292,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval provider-cache-calibration --provider <deepseek-model> --stable-context <path> --output <path> --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--min-pairs 5] [--pairs 20] [--target-relative-ci-half-width-bp 500] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]\n  harness-eval certify --manifest <path> --output <dir>"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval provider-cache-calibration --provider <deepseek-model> --stable-context <path> --output <path> --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> --allow-real-model [--min-pairs 5] [--pairs 20] [--target-relative-ci-half-width-bp 500] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]\n  harness-eval certify --manifest <path> --output <dir>"
     );
 }
 

@@ -87,7 +87,7 @@ pub struct HarnessEvalReportSummary {
     pub provider_rounds: usize,
     pub runtime_actions: usize,
     pub tool_calls: usize,
-    pub total_tokens: u32,
+    pub total_tokens: Option<u32>,
     pub scenario_count: usize,
     pub failed_capabilities: usize,
 }
@@ -115,7 +115,7 @@ pub struct HarnessEvalRunRecord {
     pub total_elapsed_ms: Option<u128>,
     pub provider_rounds: usize,
     pub tool_calls: usize,
-    pub total_tokens: u32,
+    pub total_tokens: Option<u32>,
     pub scenario_count: usize,
     pub message: String,
 }
@@ -627,14 +627,38 @@ fn agentic_closure_gate_evidence(closure: &Value) -> String {
     let facts = closure.get("facts").unwrap_or(&Value::Null);
     format!(
         "status={}, program={}, teams={}, agents={}, tasks={}, artifacts={}, topics={}, verified={}",
-        closure.get("status").and_then(Value::as_str).unwrap_or("missing"),
-        facts.get("program_id").and_then(Value::as_str).unwrap_or("missing"),
-        facts.get("teams").and_then(Value::as_u64).unwrap_or_default(),
-        facts.get("agents").and_then(Value::as_u64).unwrap_or_default(),
-        facts.get("active_tasks").and_then(Value::as_u64).unwrap_or_default(),
-        facts.get("artifacts").and_then(Value::as_u64).unwrap_or_default(),
-        facts.get("topics").and_then(Value::as_u64).unwrap_or_default(),
-        facts.get("verified").and_then(Value::as_bool).unwrap_or(false),
+        closure
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("missing"),
+        facts
+            .get("program_id")
+            .and_then(Value::as_str)
+            .unwrap_or("missing"),
+        facts
+            .get("teams")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        facts
+            .get("agents")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        facts
+            .get("active_tasks")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        facts
+            .get("artifacts")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        facts
+            .get("topics")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        facts
+            .get("verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     )
 }
 
@@ -643,8 +667,7 @@ fn agentic_closure_gate_evidence(closure: &Value) -> String {
 /// Terminal tool statuses. `refused` is deliberately absent: a refusal is not an execution
 /// attempt, so it must not change the count. It is still recorded as an event with a status,
 /// so the evidence stays readable - the count and the record are different things.
-pub(crate) const TERMINAL_TOOL_STATUSES: [&str; 4] =
-    ["completed", "failed", "denied", "timed_out"];
+pub(crate) const TERMINAL_TOOL_STATUSES: [&str; 4] = ["completed", "failed", "denied", "timed_out"];
 
 /// The single counting rule: terminal tool events in a record set.
 ///
@@ -804,7 +827,225 @@ fn push_tool_evidence_gate_items(
 }
 
 #[must_use]
+pub(crate) fn observed_usage_source(source: &str) -> bool {
+    !source.is_empty()
+        && source.split('+').all(|part| {
+            matches!(
+                part,
+                "deterministic_smoke"
+                    | "live_gateway_canonical_usage"
+                    | "provider"
+                    | "provider_event"
+                    | "real_provider"
+            )
+        })
+}
+
+pub(crate) fn execution_observation_ready(
+    observation: &Value,
+    execution_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> bool {
+    use harness_contract::projection::{
+        ExecutionTerminalAxes, TerminalEffectSettlement, TerminalExecutionPhase,
+    };
+
+    for (field, expected) in [
+        ("execution_id", execution_id),
+        ("session_id", session_id),
+        ("turn_id", turn_id),
+    ] {
+        if expected.trim().is_empty()
+            || observation.get(field).and_then(Value::as_str) != Some(expected)
+        {
+            return false;
+        }
+    }
+    let revision = observation.get("revision").and_then(Value::as_u64);
+    let cursor = observation.get("cursor").and_then(Value::as_u64);
+    let Some(cursor) = cursor.filter(|cursor| *cursor > 0) else {
+        return false;
+    };
+    if !revision.is_some_and(|revision| revision > 0) {
+        return false;
+    }
+    let Some(axes) = observation
+        .get("terminal_axes")
+        .and_then(|value| serde_json::from_value::<ExecutionTerminalAxes>(value.clone()).ok())
+    else {
+        return false;
+    };
+    axes.execution.phase == TerminalExecutionPhase::Terminal
+        && axes.execution.settlement == TerminalEffectSettlement::ProvenSettled
+        && axes.execution.coverage_complete
+        && !axes.execution.evidence_refs.is_empty()
+        && axes
+            .execution
+            .evidence_refs
+            .iter()
+            .all(|reference| !reference.trim().is_empty())
+        && !axes.source_race
+        && axes.source_cursor > 0
+        && axes.source_cursor <= cursor
+}
+
+pub(crate) fn complete_metric_tokens(metrics: &Value) -> Option<u32> {
+    let attempts = metrics.get("provider_attempt_count")?.as_u64()?;
+    let records = metrics.get("provider_usage_records")?.as_u64()?;
+    let rounds = metrics.get("model_rounds")?.as_u64()?;
+    if records != attempts
+        || attempts < rounds
+        || metrics.get("usage_unknown_attempts")?.as_u64()? != 0
+        || metrics
+            .get("provider_attempt_cache_dimensions_unknown_count")?
+            .as_u64()?
+            != 0
+    {
+        return None;
+    }
+    let input = u32::try_from(metrics.get("input_tokens")?.as_u64()?).ok()?;
+    let output = u32::try_from(metrics.get("output_tokens")?.as_u64()?).ok()?;
+    let cache_creation =
+        u32::try_from(metrics.get("cache_creation_input_tokens")?.as_u64()?).ok()?;
+    let cache_read = u32::try_from(metrics.get("cache_read_input_tokens")?.as_u64()?).ok()?;
+    let total = u32::try_from(metrics.get("total_tokens")?.as_u64()?).ok()?;
+    (input
+        .checked_add(output)?
+        .checked_add(cache_creation)?
+        .checked_add(cache_read)?
+        == total)
+        .then_some(total)
+}
+
+fn timeline_coverage_complete(observation: &Value) -> bool {
+    observation.get("timeline_drained").and_then(Value::as_bool) == Some(true)
+        && observation.get("cursor_monotonic").and_then(Value::as_bool) == Some(true)
+        && observation.get("omitted_changes").and_then(Value::as_u64) == Some(0)
+}
+
+pub(crate) fn canonical_total_tokens(report: &Value) -> Option<u32> {
+    if report.get("kind").and_then(Value::as_str)
+        == Some("harness_eval.paired_public_api_performance")
+    {
+        let mut samples = Vec::new();
+        let pairs = report.get("pairs")?.as_array()?;
+        if pairs.is_empty() {
+            return None;
+        }
+        for pair in pairs {
+            for endpoint in ["baseline", "candidate"] {
+                samples.push(pair.get(endpoint)?);
+            }
+        }
+        for endpoint in ["baseline", "candidate"] {
+            samples.push(report.get("warmup")?.get(endpoint)?);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0_u32;
+        for sample in samples {
+            let identity = (
+                sample.get("endpoint")?.as_str()?,
+                sample.get("execution_id")?.as_str()?,
+            );
+            let metrics = sample.get("metrics")?;
+            if !seen.insert(identity)
+                || metrics.get("provider_attempt_count")?.as_u64()? == 0
+                || !timeline_coverage_complete(sample.get("usage_observation_integrity")?)
+            {
+                return None;
+            }
+            total = total.checked_add(complete_metric_tokens(metrics)?)?;
+        }
+        if let Some(review_trace) = report.get("execution_trace") {
+            let reviewer_total = canonical_total_tokens(&json!({"execution_trace":review_trace}))?;
+            total = total.checked_add(reviewer_total)?;
+        }
+        return Some(total);
+    }
+    let trace = report.get("execution_trace")?;
+    let usage = trace.get("total_usage")?;
+    let source = usage.get("usage_source")?.as_str()?;
+    if !observed_usage_source(source) {
+        return None;
+    }
+    let total = u32::try_from(usage.get("total_tokens")?.as_u64()?).ok()?;
+    let rounds = trace.get("provider_rounds")?.as_u64()?;
+    let live = report
+        .pointer("/live_gateway_scenarios/scenarios")
+        .and_then(Value::as_array);
+    if source.split('+').all(|part| part == "deterministic_smoke")
+        && rounds == 0
+        && live.is_none_or(Vec::is_empty)
+    {
+        return (total == 0
+            && trace.get("rounds")?.as_array()?.is_empty()
+            && trace
+                .pointer("/provider_cache/physical_provider_attempts")?
+                .as_u64()?
+                == 0
+            && trace
+                .pointer("/provider_cache/usage_unknown_attempts")?
+                .as_u64()?
+                == 0)
+            .then_some(0);
+    }
+    let mut observed_rounds = 0_u64;
+    let mut attempts = 0_u64;
+    let mut observed_total = 0_u32;
+    if let Some(scenarios) = live {
+        for scenario in scenarios {
+            if !timeline_coverage_complete(scenario.get("observation_integrity")?) {
+                return None;
+            }
+            let metrics = scenario.get("metrics")?;
+            observed_total = observed_total.checked_add(complete_metric_tokens(metrics)?)?;
+            attempts = attempts.checked_add(metrics.get("provider_attempt_count")?.as_u64()?)?;
+            observed_rounds =
+                observed_rounds.checked_add(metrics.get("model_rounds")?.as_u64()?)?;
+        }
+    }
+    for round in trace.get("rounds")?.as_array()? {
+        if round.get("round_kind").and_then(Value::as_str) == Some("live_gateway_scenario") {
+            continue;
+        }
+        let usage = round.get("usage")?;
+        if !observed_usage_source(usage.get("usage_source")?.as_str()?)
+            || usage.get("usage_source")?.as_str()? == "deterministic_smoke"
+        {
+            return None;
+        }
+        for field in ["input_tokens", "output_tokens"] {
+            u32::try_from(usage.get(field)?.as_u64()?).ok()?;
+        }
+        let metrics = round.get("metrics")?;
+        let round_total = complete_metric_tokens(metrics)?;
+        if u32::try_from(usage.get("total_tokens")?.as_u64()?).ok()? != round_total {
+            return None;
+        }
+        observed_total = observed_total.checked_add(round_total)?;
+        observed_rounds = observed_rounds.checked_add(metrics.get("model_rounds")?.as_u64()?)?;
+        attempts = attempts.checked_add(metrics.get("provider_attempt_count")?.as_u64()?)?;
+    }
+    let cache = trace.get("provider_cache")?;
+    if observed_rounds != rounds
+        || attempts == 0
+        || cache.get("physical_provider_attempts")?.as_u64()? != attempts
+        || cache.get("usage_unknown_attempts")?.as_u64()? != 0
+        || observed_total != total
+    {
+        return None;
+    }
+    Some(total)
+}
+
+#[must_use]
 pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
+    if report.get("kind").and_then(Value::as_str)
+        == Some("harness_eval.paired_public_api_performance")
+    {
+        return paired_report_gate(report);
+    }
     let level = report
         .get("level")
         .and_then(Value::as_str)
@@ -1164,6 +1405,28 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         "keep warm requests append-only and investigate Provider cache-unit misses",
     ));
     push_manifest_gate_item(&mut items, evidence_manifest, real_model_claimed);
+    let usage_required = real_model_claimed
+        || runtime_provider_rounds(trace) > 0
+        || cache
+            .get("physical_provider_attempts")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+        || live_provider_rounds > 0;
+    items.push(if usage_required {
+        HarnessEvalReportGateItem::new(
+            "real_provider_usage_complete",
+            canonical_total_tokens(report).is_some(),
+            true,
+            format!("canonical_total_tokens={:?}, usage_source={usage_source}", canonical_total_tokens(report)),
+            "retain observed token dimensions and complete physical-attempt coverage; estimates are not observed usage",
+        )
+    } else {
+        HarnessEvalReportGateItem::not_required(
+            "real_provider_usage_complete",
+            "no real-provider claim",
+            "deterministic subtotals do not establish real-provider usage",
+        )
+    });
 
     push_execution_level_gate_items(
         &mut items,
@@ -1185,6 +1448,248 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     HarnessEvalReportGate::from_items(items)
 }
 
+pub(crate) fn business_observation_ready(scenario: &Value) -> bool {
+    let observation = scenario.get("business_observation").unwrap_or(&Value::Null);
+    let identity_matches = ["execution_id", "session_id", "turn_id"]
+        .into_iter()
+        .all(|field| {
+            let expected = scenario
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            expected.is_some() && observation.get(field).and_then(Value::as_str) == expected
+        });
+    let goal_outcome = scenario.pointer("/terminal_observation/terminal_axes/outcome/outcome");
+    identity_matches
+        && observation.get("kind").and_then(Value::as_str) == Some("runtime.outcome.recorded.v1")
+        && observation.get("execution_scope").and_then(Value::as_str) == Some("session")
+        && observation.get("event_status").and_then(Value::as_str) == Some("succeeded")
+        && observation.get("terminal_class").and_then(Value::as_str) == Some("succeeded")
+        && goal_outcome.is_some_and(|value| value.is_null() || value.as_str() == Some("satisfied"))
+}
+
+pub(crate) fn delivery_observation_ready(scenario: &Value) -> bool {
+    let delivery = scenario.get("delivery_observation").unwrap_or(&Value::Null);
+    let ack = delivery.get("ack").unwrap_or(&Value::Null);
+    let current = delivery.get("current_context").unwrap_or(&Value::Null);
+    for field in [
+        "session_id",
+        "message_id",
+        "runtime_commit_cursor",
+        "content_digest",
+        "client_binding_sha256",
+    ] {
+        if delivery.get(field).is_none()
+            || delivery.get(field) != ack.get(field)
+            || delivery.get(field) != current.get(field)
+        {
+            return false;
+        }
+    }
+    if current.get("receipt") != Some(ack)
+        || ack.get("received_at_ms") != delivery.get("received_at_ms")
+        || current.get("turn_id") != delivery.get("turn_id")
+        || current.get("execution_id") != delivery.get("execution_id")
+    {
+        return false;
+    }
+    for (observed, expected) in [
+        ("session_id", "session_id"),
+        ("message_id", "terminal_id"),
+        ("turn_id", "turn_id"),
+    ] {
+        let expected = scenario
+            .get(expected)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        if expected.is_none() || delivery.get(observed).and_then(Value::as_str) != expected {
+            return false;
+        }
+    }
+    match delivery.get("execution_id") {
+        Some(Value::Null) => {}
+        Some(Value::String(execution))
+            if scenario.get("execution_id").and_then(Value::as_str) == Some(execution.as_str()) => {
+        }
+        _ => return false,
+    }
+    let Some(cursor) = delivery
+        .get("runtime_commit_cursor")
+        .and_then(Value::as_str)
+        .and_then(|value| harness_contract::live::ReceiptCursor::parse(value).ok())
+    else {
+        return false;
+    };
+    let request = harness_contract::live::SessionMessageAckRequest {
+        runtime_commit_cursor: cursor,
+        content_digest: delivery
+            .get("content_digest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    };
+    delivery.get("status").and_then(Value::as_str) == Some("confirmed")
+        && delivery
+            .get("fresh_context_confirmed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && delivery
+            .get("client_binding_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(valid_sha256)
+        && delivery
+            .get("received_at_ms")
+            .and_then(Value::as_u64)
+            .is_some()
+        && request.validate().is_ok()
+}
+
+fn push_terminal_gate_items(
+    items: &mut Vec<HarnessEvalReportGateItem>,
+    scenarios: &[Value],
+    prefix: &str,
+) {
+    let physically_settled = !scenarios.is_empty()
+        && scenarios.iter().all(|scenario| {
+            let identity = |field| {
+                scenario
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            };
+            execution_observation_ready(
+                scenario.get("terminal_observation").unwrap_or(&Value::Null),
+                identity("execution_id"),
+                identity("session_id"),
+                identity("turn_id"),
+            )
+        });
+    let delivered = !scenarios.is_empty() && scenarios.iter().all(delivery_observation_ready);
+    let cleaned = !scenarios.is_empty()
+        && scenarios.iter().all(|scenario| {
+            scenario
+                .pointer("/session_actor_cleanup/status")
+                .and_then(Value::as_str)
+                == Some("passed")
+        });
+    let business_succeeded =
+        !scenarios.is_empty() && scenarios.iter().all(business_observation_ready);
+    for (suffix, passed, hint) in [
+        (
+            "business_outcome",
+            business_succeeded,
+            "retain the exact original root Runtime successful outcome independently of physical settlement",
+        ),
+        (
+            "execution_physically_settled",
+            physically_settled,
+            "retain exact Runtime terminal axes and complete physical coverage",
+        ),
+        (
+            "current_public_ack",
+            delivered,
+            "consume the exact public payload, ACK it, and re-read its current receipt",
+        ),
+        (
+            "actor_cleanup",
+            cleaned,
+            "retain the original client lease-release and detach outcome",
+        ),
+    ] {
+        items.push(HarnessEvalReportGateItem::new(
+            format!("{prefix}_{suffix}"),
+            passed,
+            true,
+            format!("scenarios={}", scenarios.len()),
+            hint,
+        ));
+    }
+}
+
+fn paired_report_gate(report: &Value) -> HarnessEvalReportGate {
+    let pairs = report
+        .get("pairs")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut scenarios = Vec::new();
+    let mut exact_pairs = !pairs.is_empty();
+    for (index, pair) in pairs.iter().enumerate() {
+        exact_pairs &= pair.get("pair_index").and_then(Value::as_u64) == Some(index as u64);
+        for endpoint in ["baseline", "candidate"] {
+            let sample = pair.get(endpoint).unwrap_or(&Value::Null);
+            exact_pairs &= sample.get("endpoint").and_then(Value::as_str) == Some(endpoint)
+                && sample.get("pair_index").and_then(Value::as_u64) == Some(index as u64);
+            scenarios.push(sample.clone());
+        }
+    }
+    for endpoint in ["baseline", "candidate"] {
+        let warmup = report
+            .pointer(&format!("/warmup/{endpoint}"))
+            .unwrap_or(&Value::Null);
+        exact_pairs &= warmup.get("endpoint").and_then(Value::as_str) == Some(endpoint);
+        scenarios.push(warmup.clone());
+    }
+    let mut observed_executions = std::collections::BTreeSet::new();
+    exact_pairs &= scenarios.iter().all(|sample| {
+        let endpoint = sample.get("endpoint").and_then(Value::as_str);
+        let execution = sample
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        endpoint
+            .zip(execution)
+            .is_some_and(|identity| observed_executions.insert(identity))
+    });
+    let mut items = Vec::new();
+    items.push(HarnessEvalReportGateItem::new(
+        "paired_sample_identity",
+        exact_pairs,
+        true,
+        format!("pairs={}", pairs.len()),
+        "retain exact endpoint and pair indices, including warmups",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "paired_independent_business_and_surface",
+        !scenarios.is_empty()
+            && scenarios.iter().all(|sample| {
+                sample.get("status").and_then(Value::as_str) == Some("passed")
+                    && sample
+                        .pointer("/acceptance/passed")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    && sample
+                        .get("first_surface_delta_ms")
+                        .and_then(Value::as_u64)
+                        .is_some()
+            }),
+        true,
+        format!("samples={}", scenarios.len()),
+        "answer and observed Surface delta remain independent requirements",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "paired_statistics_and_slo",
+        crate::paired_performance::paired_statistics_passed(report),
+        true,
+        "recomputed from original retained pairs and sampling options",
+        "preserve the original statistical and SLO gate",
+    ));
+    push_terminal_gate_items(&mut items, &scenarios, "paired");
+    items.push(HarnessEvalReportGateItem::new(
+        "paired_provider_usage_complete",
+        canonical_total_tokens(report).is_some(),
+        true,
+        "actual per-attempt metrics including both endpoints and warmups",
+        "missing/partial usage is unavailable, not known zero",
+    ));
+    push_manifest_gate_item(
+        &mut items,
+        report.get("evidence_manifest").unwrap_or(&Value::Null),
+        true,
+    );
+    HarnessEvalReportGate::from_items(items)
+}
+
 fn push_deep_live_gate_item(items: &mut Vec<HarnessEvalReportGateItem>, level: &str, live: &Value) {
     if level != "deep" {
         return;
@@ -1198,6 +1703,36 @@ fn push_deep_live_gate_item(items: &mut Vec<HarnessEvalReportGateItem>, level: &
         .get("selected_scenario_ids")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
+    let observed_ids = live_scenarios
+        .iter()
+        .filter_map(|scenario| scenario.get("scenario_id").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_ids = live
+        .get("selected_scenario_ids")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+        });
+    let exact_selection = observed_ids.len() == live_scenarios.len()
+        && selected_ids.as_ref().is_none_or(|selected| {
+            !selected.is_empty()
+                && selected.len() == selected_scenario_count
+                && selected == &observed_ids
+        });
+    items.push(HarnessEvalReportGateItem::new(
+        "deep_selected_scenarios_exact",
+        exact_selection,
+        true,
+        format!(
+            "selected={selected_scenario_count}, observed={}",
+            live_scenarios.len()
+        ),
+        "retain exactly the selected unique scenario identities",
+    ));
+    push_terminal_gate_items(items, &live_scenarios, "deep");
     // A full deep suite requires broad coverage. A focused costly run is
     // judged against exactly its selected set; an unknown selection retains
     // the broad three-scenario floor.
@@ -1332,7 +1867,7 @@ fn push_execution_level_gate_items(
             && context.usage_source != "unavailable",
         true,
         format!(
-            "trace_total_tokens={}, live_total_tokens={}, usage_source={}",
+            "trace_usage_subtotal={}, live_usage_subtotal={}, usage_source={}",
             context.total_tokens, context.live_total_tokens, context.usage_source
         ),
         "record provider usage or explicit deterministic/estimated fallback",
@@ -1372,6 +1907,13 @@ fn push_manifest_gate_item(
         .get("target_repo_dirty_state")
         .and_then(Value::as_str)
         .unwrap_or("missing");
+    let expected = manifest.get("expected_candidate").unwrap_or(&Value::Null);
+    let candidate_matches = complete_candidate_binding(manifest, expected);
+    items.push(if real_model_claimed {
+        HarnessEvalReportGateItem::new("candidate_matches_frozen_expectation", candidate_matches, true, "frozen-launcher observation and separately supplied expectation", "bind observed source/commit to the independent expected candidate; unknown cannot certify")
+    } else {
+        HarnessEvalReportGateItem::not_required("candidate_matches_frozen_expectation", "no real-model candidate claim", "real candidate identity is checked when that claim is made")
+    });
     let complete = manifest.get("kind").and_then(Value::as_str)
         == Some("harness_eval.evidence_manifest")
         && manifest
@@ -1409,6 +1951,31 @@ fn push_manifest_gate_item(
         ),
         "write a complete evidence manifest before accepting the report package",
     ));
+}
+
+fn complete_candidate_binding(observed: &Value, expected: &Value) -> bool {
+    observed.get("identity_source").and_then(Value::as_str) == Some("frozen_launcher")
+        && observed
+            .get("execution_key")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && observed
+            .get("target_repo_dirty_state")
+            .and_then(Value::as_str)
+            == Some("clean")
+        && ["commit", "candidate_source_sha256"]
+            .into_iter()
+            .all(|field| {
+                let actual = observed.get(field).and_then(Value::as_str);
+                let expected = expected.get(field).and_then(Value::as_str);
+                actual.is_some_and(|actual| {
+                    if field == "commit" {
+                        valid_git_commit(actual)
+                    } else {
+                        valid_sha256(actual)
+                    }
+                }) && actual == expected
+            })
 }
 
 fn valid_git_commit(value: &str) -> bool {
@@ -1500,7 +2067,7 @@ fn live_gateway_provider_rounds(live: &Value) -> u64 {
                         .and_then(Value::as_u64)
                         .unwrap_or_default()
                 })
-                .sum()
+                .fold(0_u64, u64::saturating_add)
         })
         .unwrap_or_default()
 }
@@ -1517,7 +2084,7 @@ fn live_gateway_total_tokens(live: &Value) -> u64 {
                         .and_then(Value::as_u64)
                         .unwrap_or_default()
                 })
-                .sum()
+                .fold(0_u64, u64::saturating_add)
         })
         .unwrap_or_default()
 }
@@ -1526,6 +2093,370 @@ fn live_gateway_total_tokens(live: &Value) -> u64 {
 mod gate_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn physical_execution_observation_uses_original_axes_not_business_outcome() {
+        use harness_contract::projection::{
+            ExecutionTerminalAxes, TerminalEffectSettlement, TerminalExecutionPhase,
+        };
+        let mut axes = ExecutionTerminalAxes::default();
+        axes.execution.phase = TerminalExecutionPhase::Terminal;
+        axes.execution.settlement = TerminalEffectSettlement::ProvenSettled;
+        axes.execution.coverage_complete = true;
+        axes.execution.evidence_refs = vec!["effect:settled".to_string()];
+        axes.source_cursor = 7;
+        let mut observation = json!({
+            "execution_id": "execution-1", "session_id": "session-1", "turn_id": "turn-1",
+            "revision": 2, "cursor": 8, "terminal_axes": axes
+        });
+        let ready = |value: &Value| {
+            execution_observation_ready(value, "execution-1", "session-1", "turn-1")
+        };
+        assert!(ready(&observation));
+        axes.outcome.outcome = Some(harness_contract::goal::ObjectiveTerminalKind::Failed);
+        observation["terminal_axes"] = serde_json::to_value(axes).expect("axes");
+        assert!(ready(&observation));
+        for (pointer, value) in [
+            ("/terminal_axes/execution/phase", json!("draining")),
+            ("/terminal_axes/execution/phase", json!("unknown")),
+            ("/terminal_axes/execution/settlement", json!("unknown")),
+            ("/terminal_axes/execution/coverage_complete", json!(false)),
+            ("/terminal_axes/execution/evidence_refs", json!([])),
+            ("/terminal_axes/source_race", json!(true)),
+            ("/terminal_axes/source_cursor", json!(0)),
+            ("/terminal_axes/source_cursor", json!(9)),
+            ("/execution_id", json!("foreign")),
+            ("/session_id", json!("foreign")),
+            ("/turn_id", json!("foreign")),
+            ("/revision", json!(0)),
+            ("/cursor", json!(0)),
+            ("/terminal_axes", Value::Null),
+        ] {
+            let mut invalid = observation.clone();
+            *invalid.pointer_mut(pointer).expect("existing field") = value;
+            assert!(!ready(&invalid), "{pointer}");
+        }
+        assert!(!execution_observation_ready(
+            &observation,
+            "",
+            "session-1",
+            "turn-1"
+        ));
+    }
+
+    fn terminal_sample(endpoint: &str, index: u64) -> Value {
+        let session = format!("session-{endpoint}-{index}");
+        let execution = format!("execution-{endpoint}-{index}");
+        let turn = format!("turn-{endpoint}-{index}");
+        let message = format!("message-{endpoint}-{index}");
+        let digest = format!("session-public-v1:sha256:{}", "a".repeat(64));
+        let ack = json!({"session_id":session,"message_id":message,"runtime_commit_cursor":"9007199254740993","content_digest":digest,"client_binding_sha256":"b".repeat(64),"received_at_ms":100});
+        let current = json!({"session_id":session,"message_id":message,"execution_id":execution,"turn_id":turn,"runtime_commit_cursor":"9007199254740993","content_digest":digest,"client_binding_sha256":"b".repeat(64),"receipt":ack});
+        json!({
+            "endpoint":endpoint,"pair_index":index,"status":"passed",
+            "session_id":session,"execution_id":execution,"turn_id":turn,"terminal_id":message,
+            "acceptance":{"passed":true},"first_surface_delta_ms":1000,"first_durable_assistant_ms":1100,"terminal_wall_ms":2000,
+            "session_actor_cleanup":{"status":"passed"},
+            "terminal_observation":{
+                "execution_id":execution,"session_id":session,"turn_id":turn,"revision":2,"cursor":10,
+                "terminal_axes":{
+                    "outcome":{"goal_id":null,"goal_revision":null,"outcome":null,"terminal_fence":null},
+                    "execution":{"phase":"terminal","settlement":"proven_settled","evidence_refs":["receipt:original"],"coverage_complete":true},
+                    "delivery":{"runtime_terminal_ref":"terminal:original","session_client_evidence":"requires_fresh_context"},
+                    "source_cursor":10,"source_race":false
+                }
+            },
+            "delivery_observation":{
+                "status":"confirmed","session_id":session,"message_id":message,"execution_id":execution,"turn_id":turn,
+                "runtime_commit_cursor":"9007199254740993","content_digest":digest,"client_binding_sha256":"b".repeat(64),"received_at_ms":100,
+                "fresh_context_confirmed":true,"ack":ack,"current_context":current
+            },
+            "business_observation":{"kind":"runtime.outcome.recorded.v1","execution_scope":"session","execution_id":execution,"session_id":session,"turn_id":turn,"event_status":"succeeded","terminal_class":"succeeded"},
+            "usage_observation_integrity":{"timeline_drained":true,"cursor_monotonic":true,"omitted_changes":0},
+            "metrics":{"provider_attempt_count":1,"provider_usage_records":1,"usage_unknown_attempts":0,"provider_attempt_cache_dimensions_unknown_count":0,"model_rounds":1,"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"total_tokens":2}
+        })
+    }
+
+    fn complete_paired_report() -> Value {
+        let pairs = (0..5).map(|index| json!({"pair_index":index,"baseline":terminal_sample("baseline", index),"candidate":terminal_sample("candidate", index)})).collect::<Vec<_>>();
+        json!({
+            "kind":"harness_eval.paired_public_api_performance",
+            "pairs":pairs,"warmup":{"baseline":terminal_sample("baseline",u64::MAX),"candidate":terminal_sample("candidate",u64::MAX)},
+            "environment":{"min_pairs":5,"max_pairs":5,"target_relative_ci_half_width_bp":500,"poll_interval_ms":20},
+            "evidence_manifest":{
+                "kind":"harness_eval.evidence_manifest","repo":"/workspace/cowd","version":"fixture","command":"paired-performance",
+                "commit":"a".repeat(40),"candidate_source_sha256":"b".repeat(64),"target_repo_dirty_state":"clean","identity_source":"frozen_launcher","execution_key":"original-run",
+                "expected_candidate":{"commit":"a".repeat(40),"candidate_source_sha256":"b".repeat(64)}
+            }
+        })
+    }
+
+    #[test]
+    fn canonical_paired_gate_keeps_business_execution_receipt_and_usage_independent() {
+        let valid = complete_paired_report();
+        assert_eq!(evaluate_report_gate(&valid).status, "passed");
+        assert_eq!(canonical_total_tokens(&valid), Some(24));
+        let mut optional_outbox = valid.clone();
+        optional_outbox["pairs"][0]["candidate"]["delivery_observation"]["execution_id"] =
+            Value::Null;
+        optional_outbox["pairs"][0]["candidate"]["delivery_observation"]["current_context"]
+            ["execution_id"] = Value::Null;
+        assert_eq!(evaluate_report_gate(&optional_outbox).status, "passed");
+        let mut reviewed = valid.clone();
+        reviewed["execution_trace"] = json!({"provider_rounds":1,"rounds":[{"usage":{"total_tokens":50,"usage_source":"provider_event"}}],"total_usage":{"total_tokens":50,"usage_source":"provider_event+partial"}});
+        assert_eq!(canonical_total_tokens(&reviewed), None);
+        assert_eq!(
+            gate_item(
+                &evaluate_report_gate(&reviewed),
+                "paired_provider_usage_complete"
+            )
+            .status,
+            "failed"
+        );
+        for (pointer, replacement, item) in [
+            (
+                "/pairs/0/candidate/terminal_observation/terminal_axes/execution/phase",
+                json!("draining"),
+                "paired_execution_physically_settled",
+            ),
+            (
+                "/pairs/0/candidate/acceptance/passed",
+                json!(false),
+                "paired_independent_business_and_surface",
+            ),
+            (
+                "/pairs/0/candidate/business_observation/terminal_class",
+                json!("failed"),
+                "paired_business_outcome",
+            ),
+            (
+                "/pairs/0/candidate/business_observation/execution_scope",
+                json!("agent"),
+                "paired_business_outcome",
+            ),
+            (
+                "/pairs/0/candidate/delivery_observation/runtime_commit_cursor",
+                json!("1"),
+                "paired_current_public_ack",
+            ),
+            (
+                "/pairs/0/candidate/delivery_observation/current_context/receipt",
+                Value::Null,
+                "paired_current_public_ack",
+            ),
+            (
+                "/pairs/0/candidate/metrics/output_tokens",
+                Value::Null,
+                "paired_provider_usage_complete",
+            ),
+            (
+                "/pairs/0/candidate/metrics/cache_read_input_tokens",
+                Value::Null,
+                "paired_provider_usage_complete",
+            ),
+            (
+                "/pairs/0/candidate/usage_observation_integrity/timeline_drained",
+                json!(false),
+                "paired_provider_usage_complete",
+            ),
+            (
+                "/evidence_manifest/commit",
+                json!("c".repeat(40)),
+                "candidate_matches_frozen_expectation",
+            ),
+            (
+                "/evidence_manifest/identity_source",
+                json!("unattested_library"),
+                "candidate_matches_frozen_expectation",
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            let gate = evaluate_report_gate(&invalid);
+            assert_eq!(gate.status, "failed", "{pointer}");
+            assert_eq!(gate_item(&gate, item).status, "failed", "{pointer}");
+            if matches!(
+                item,
+                "paired_independent_business_and_surface" | "paired_business_outcome"
+            ) {
+                assert_eq!(
+                    gate_item(&gate, "paired_execution_physically_settled").status,
+                    "passed"
+                );
+            }
+        }
+        let mut replayed = valid.clone();
+        replayed["pairs"][1]["candidate"] = valid["pairs"][0]["candidate"].clone();
+        replayed["pairs"][1]["candidate"]["pair_index"] = json!(1);
+        assert_eq!(
+            gate_item(&evaluate_report_gate(&replayed), "paired_sample_identity").status,
+            "failed"
+        );
+        let mut empty = valid.clone();
+        empty["pairs"] = json!([]);
+        assert_eq!(evaluate_report_gate(&empty).status, "failed");
+    }
+
+    #[test]
+    fn focused_selection_rejects_equal_count_foreign_and_duplicate_scenarios() {
+        let mut scenario = terminal_sample("candidate", 0);
+        scenario["scenario_id"] = json!("observed");
+        let live = json!({"selected_scenario_ids":["expected"],"scenarios":[scenario]});
+        let mut items = Vec::new();
+        push_deep_live_gate_item(&mut items, "deep", &live);
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.name == "deep_selected_scenarios_exact")
+                .unwrap()
+                .status,
+            "failed"
+        );
+        let mut duplicate = live.clone();
+        duplicate["selected_scenario_ids"] = json!(["observed", "observed"]);
+        duplicate["scenarios"] = json!([live["scenarios"][0], live["scenarios"][0]]);
+        let mut items = Vec::new();
+        push_deep_live_gate_item(&mut items, "deep", &duplicate);
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.name == "deep_selected_scenarios_exact")
+                .unwrap()
+                .status,
+            "failed"
+        );
+    }
+
+    fn complete_usage_report(total: u32) -> Value {
+        json!({
+            "level": "deep", "authorized_real_model": true,
+            "execution_trace": {
+                "provider_rounds": 1, "rounds": [],
+                "total_usage": {"total_tokens": total, "usage_source": "live_gateway_canonical_usage"},
+                "provider_cache": {"physical_provider_attempts": 1, "usage_unknown_attempts": 0}
+            },
+            "live_gateway_scenarios": {"scenarios": [{"observation_integrity":{"timeline_drained":true,"cursor_monotonic":true,"omitted_changes":0},"metrics": {
+                "provider_attempt_count": 1, "provider_usage_records": 1,
+                "usage_unknown_attempts": 0, "model_rounds": 1,
+                "provider_attempt_cache_dimensions_unknown_count":0,
+                "cache_creation_input_tokens":0,"cache_read_input_tokens":0,
+                "input_tokens": total, "output_tokens": 0, "total_tokens": total
+            }}]}
+        })
+    }
+
+    #[test]
+    fn canonical_read_total_distinguishes_known_zero_missing_partial_and_overflow() {
+        let summary = |report: &Value| {
+            HarnessEvalReportSummary::from_report_json(
+                "report".to_string(),
+                "report.json".to_string(),
+                None,
+                report,
+            )
+        };
+        for total in [0, 17, u32::MAX] {
+            let report = complete_usage_report(total);
+            assert_eq!(summary(&report).total_tokens, Some(total));
+            assert_eq!(
+                gate_item(
+                    &evaluate_report_gate(&report),
+                    "real_provider_usage_complete"
+                )
+                .status,
+                "passed"
+            );
+        }
+        let known = complete_usage_report(17);
+        for value in [
+            Value::Null,
+            json!(4294967296_u64),
+            json!(-1),
+            json!(1.5),
+            json!("17"),
+        ] {
+            let mut report = known.clone();
+            report["execution_trace"]["total_usage"]["total_tokens"] = value;
+            assert_eq!(summary(&report).total_tokens, None);
+        }
+        let mut missing = known.clone();
+        missing["execution_trace"]["total_usage"]
+            .as_object_mut()
+            .expect("usage")
+            .remove("total_tokens");
+        assert_eq!(summary(&missing).total_tokens, None);
+        let mut reviewer_without_attempt_coverage = known.clone();
+        reviewer_without_attempt_coverage["execution_trace"]["provider_rounds"] = json!(2);
+        reviewer_without_attempt_coverage["execution_trace"]["provider_cache"]
+            ["physical_provider_attempts"] = json!(2);
+        reviewer_without_attempt_coverage["execution_trace"]["total_usage"] = json!({"total_tokens": 67, "usage_source": "live_gateway_canonical_usage+provider_event"});
+        reviewer_without_attempt_coverage["execution_trace"]["rounds"] = json!([{"usage": {"input_tokens": 40, "output_tokens": 10, "total_tokens": 50, "usage_source": "provider_event"}}]);
+        assert_eq!(
+            summary(&reviewer_without_attempt_coverage).total_tokens,
+            None
+        );
+        for (pointer, value) in [
+            (
+                "/live_gateway_scenarios/scenarios/0/metrics/provider_attempt_count",
+                json!(2),
+            ),
+            (
+                "/live_gateway_scenarios/scenarios/0/metrics/provider_usage_records",
+                Value::Null,
+            ),
+            (
+                "/live_gateway_scenarios/scenarios/0/metrics/usage_unknown_attempts",
+                json!(1),
+            ),
+            (
+                "/live_gateway_scenarios/scenarios/0/metrics/output_tokens",
+                Value::Null,
+            ),
+            (
+                "/live_gateway_scenarios/scenarios/0/metrics/total_tokens",
+                json!(4294967296_u64),
+            ),
+            (
+                "/execution_trace/total_usage/usage_source",
+                json!("deterministic_tool_estimate+provider_event"),
+            ),
+            (
+                "/execution_trace/provider_cache/physical_provider_attempts",
+                json!(2),
+            ),
+        ] {
+            let mut report = known.clone();
+            *report.pointer_mut(pointer).expect("existing field") = value;
+            assert_eq!(summary(&report).total_tokens, None, "{pointer}");
+            assert_eq!(
+                gate_item(
+                    &evaluate_report_gate(&report),
+                    "real_provider_usage_complete"
+                )
+                .status,
+                "failed",
+                "{pointer}"
+            );
+        }
+        let mut partial = known;
+        partial["live_gateway_scenarios"]["scenarios"][0]["metrics"]["provider_attempt_count"] =
+            json!(2);
+        partial["live_gateway_scenarios"]["scenarios"][0]["metrics"]["usage_unknown_attempts"] =
+            json!(1);
+        partial["execution_trace"]["provider_rounds"] = json!(2);
+        partial["execution_trace"]["provider_cache"]["physical_provider_attempts"] = json!(3);
+        partial["execution_trace"]["total_usage"] = json!({"total_tokens": 67, "usage_source": "live_gateway_canonical_usage+provider_event"});
+        partial["execution_trace"]["rounds"] = json!([{"usage": {"input_tokens": 40, "output_tokens": 10, "total_tokens": 50, "usage_source": "provider_event"}}]);
+        assert_eq!(summary(&partial).total_tokens, None);
+        assert_eq!(
+            gate_item(
+                &evaluate_report_gate(&partial),
+                "real_provider_usage_complete"
+            )
+            .status,
+            "failed"
+        );
+    }
 
     fn real_manifest_report(commit: &str, source_sha256: Option<&str>, dirty: &str) -> Value {
         json!({
@@ -1959,7 +2890,10 @@ mod gate_tests {
         });
         let gate = evaluate_report_gate(&understated);
         let item = gate_item(&gate, gate_name);
-        assert_eq!(item.status, "failed", "reported 0 against evidence 1: {item:?}");
+        assert_eq!(
+            item.status, "failed",
+            "reported 0 against evidence 1: {item:?}"
+        );
 
         // A larger reported number is not a defect. The headline counts the harness's own
         // captured calls; the evidence counts the durable event stream, which includes
@@ -2027,27 +2961,16 @@ mod gate_tests {
 
     #[test]
     fn deep_gate_accepts_a_complete_explicitly_selected_live_scenario() {
+        let mut scenario = terminal_sample("candidate", 0);
+        scenario["scenario_id"] = json!("live_group_theory_ai_research_simulation");
+        scenario["production_trace"] = json!({"session_id":scenario["session_id"],"terminal_id":scenario["terminal_id"],"execution_id":scenario["execution_id"]});
+        scenario["observation_integrity"] = json!({"status":"passed","cursor_monotonic":true,"timeline_drained":true,"message_pages_drained":true,"omitted_changes":0,"stall_detected":false});
         let report = json!({
             "level": "deep",
             "live_gateway_scenarios": {
                 "status": "passed",
                 "selected_scenario_ids": ["live_group_theory_ai_research_simulation"],
-                "scenarios": [{
-                    "status": "passed",
-                    "production_trace": {
-                        "session_id": "session-1",
-                        "terminal_id": "terminal-1",
-                        "execution_id": "execution-1"
-                    },
-                    "observation_integrity": {
-                        "status": "passed",
-                        "cursor_monotonic": true,
-                        "timeline_drained": true,
-                        "message_pages_drained": true,
-                        "omitted_changes": 0,
-                        "stall_detected": false
-                    }
-                }]
+                "scenarios": [scenario]
             }
         });
 
@@ -2058,8 +2981,15 @@ mod gate_tests {
             .find(|item| item.name == "deep_live_gateway_scenarios")
             .expect("gate item");
         assert_eq!(item.status, "passed");
-        assert!(item.evidence.contains("required_scenarios=1"));
-        assert!(item.evidence.contains("complete_observations=true"));
+        for name in [
+            "deep_selected_scenarios_exact",
+            "deep_execution_physically_settled",
+            "deep_business_outcome",
+            "deep_current_public_ack",
+            "deep_actor_cleanup",
+        ] {
+            assert_eq!(gate_item(&gate, name).status, "passed", "{name}");
+        }
     }
 
     #[test]
@@ -2325,6 +3255,36 @@ impl ExecutionTrace {
     }
 
     pub fn add_provider_round(&mut self, summary: ProviderRoundSummary) {
+        let overflow = [
+            self.total_usage
+                .input_tokens
+                .checked_add(summary.usage.input_tokens),
+            self.total_usage
+                .output_tokens
+                .checked_add(summary.usage.output_tokens),
+            self.total_usage
+                .cache_creation_input_tokens
+                .checked_add(summary.usage.cache_creation_input_tokens),
+            self.total_usage
+                .cache_read_input_tokens
+                .checked_add(summary.usage.cache_read_input_tokens),
+            self.total_usage
+                .total_tokens
+                .checked_add(summary.usage.total_tokens),
+        ]
+        .iter()
+        .any(Option::is_none);
+        self.total_usage.usage_source = if self.provider_rounds == 0 {
+            summary.usage.usage_source.clone()
+        } else {
+            format!(
+                "{}+{}",
+                self.total_usage.usage_source, summary.usage.usage_source
+            )
+        };
+        if overflow {
+            self.total_usage.usage_source.push_str("+overflow");
+        }
         self.total_usage.input_tokens = self
             .total_usage
             .input_tokens
@@ -2345,9 +3305,6 @@ impl ExecutionTrace {
             .total_usage
             .total_tokens
             .saturating_add(summary.usage.total_tokens);
-        if summary.usage.usage_source == "provider_event" {
-            self.total_usage.usage_source = "provider_event".to_string();
-        }
         self.rounds.push(summary);
         self.provider_rounds = self.rounds.len();
     }
@@ -2399,7 +3356,6 @@ impl HarnessEvalReportSummary {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let total_usage = trace.get("total_usage").unwrap_or(&Value::Null);
         Self {
             id,
             level: report
@@ -2447,10 +3403,7 @@ impl HarnessEvalReportSummary {
                 .get("tool_calls")
                 .and_then(Value::as_u64)
                 .unwrap_or_default() as usize,
-            total_tokens: total_usage
-                .get("total_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or_default() as u32,
+            total_tokens: canonical_total_tokens(report),
             scenario_count: scenarios.len(),
             failed_capabilities: scenarios
                 .iter()

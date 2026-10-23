@@ -21,7 +21,7 @@ use crate::{
         HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, HarnessEvalUsageSummary,
         ToolCallDetail, ToolCallSummary,
     },
-    report_store::{empty_usage, now_ms, HarnessEvalReportStore},
+    report_store::{empty_usage, merge_usage, now_ms, HarnessEvalReportStore},
     run_live_gateway_scenarios, stable_ai_scenario_matrix, E2eScenarioKind,
     NextGenHarnessEvalInput, RealToolScenarioReport, RealToolScenarioResult, ScenarioCheck,
     ScenarioObservation, ScenarioSpec, ScenarioSuite, StableAiHealthReport,
@@ -111,7 +111,7 @@ fn running_record(
         total_elapsed_ms: None,
         provider_rounds: 0,
         tool_calls: 0,
-        total_tokens: 0,
+        total_tokens: None,
         scenario_count: 0,
         message: "harness eval started; no report written yet".to_string(),
     }
@@ -147,7 +147,7 @@ pub fn run_eval_controlled(
             total_elapsed_ms: None,
             provider_rounds: 0,
             tool_calls: 0,
-            total_tokens: 0,
+            total_tokens: None,
             scenario_count: 0,
             message: "deep/real harness eval requires explicit allow_real_model authorization"
                 .to_string(),
@@ -443,7 +443,7 @@ pub fn run_eval_controlled(
             execution_rounds.extend(rounds.iter().cloned());
         }
         execution_provider_rounds = execution_provider_rounds.saturating_add(provider_round_count);
-        if provider_review.usage.total_tokens == 0 {
+        if provider_round_count > 0 {
             execution_usage_unknown_attempts =
                 execution_usage_unknown_attempts.saturating_add(provider_round_count as u64);
         }
@@ -453,6 +453,9 @@ pub fn run_eval_controlled(
         execution_cache_dimensions_unknown_attempts =
             execution_cache_dimensions_unknown_attempts.saturating_add(provider_round_count as u64);
         execution_usage = merge_usage(&execution_usage, &provider_review.usage);
+        if provider_round_count > 0 {
+            execution_usage.usage_source.push_str("+partial");
+        }
         report["execution_trace"]["rounds"] = Value::Array(execution_rounds);
         report["execution_trace"]["provider_rounds"] = json!(execution_provider_rounds);
         report["execution_trace"]["total_usage"] =
@@ -460,9 +463,7 @@ pub fn run_eval_controlled(
         report["execution_trace"]["provider_cache"] = provider_cache_evidence(
             &execution_usage,
             execution_provider_rounds,
-            live_provider_evidence
-                .physical_attempts
-                .saturating_add(provider_round_count as u64),
+            live_provider_evidence.physical_attempts,
             execution_usage_unknown_attempts,
             execution_cache_dimensions_unknown_attempts,
             &execution_cache_structure,
@@ -568,7 +569,7 @@ fn cancelled_record(
         total_elapsed_ms,
         provider_rounds: 0,
         tool_calls: 0,
-        total_tokens: 0,
+        total_tokens: None,
         scenario_count: 0,
         message: message.into(),
     }
@@ -633,7 +634,10 @@ fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProvide
         .and_then(|value| value.get("scenarios"))
         .and_then(Value::as_array)
     else {
-        return LiveGatewayProviderEvidence::default();
+        return LiveGatewayProviderEvidence {
+            usage: empty_usage("deterministic_smoke"),
+            ..LiveGatewayProviderEvidence::default()
+        };
     };
 
     let mut evidence = LiveGatewayProviderEvidence {
@@ -652,22 +656,19 @@ fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProvide
         let input_tokens = json_u32(metrics.get("input_tokens"));
         let output_tokens = json_u32(metrics.get("output_tokens"));
         let cache_creation_tokens = json_u32(metrics.get("cache_creation_input_tokens"));
-        let explicit_cache_read = metrics.get("cache_read_input_tokens");
-        let cache_read_tokens = explicit_cache_read
-            .map(|value| json_u32(Some(value)))
-            .unwrap_or_else(|| json_u32(metrics.get("cache_tokens")));
+        let cache_read_tokens = json_u32(metrics.get("cache_read_input_tokens"));
         let total_tokens = json_u32(metrics.get("total_tokens"));
         let model_rounds = json_u32(metrics.get("model_rounds"));
         let physical_attempts = metrics
             .get("provider_attempt_count")
             .and_then(Value::as_u64)
-            .unwrap_or(u64::from(model_rounds));
+            .unwrap_or_default();
         evidence.physical_attempts = evidence.physical_attempts.saturating_add(physical_attempts);
         evidence.usage_unknown_attempts = evidence.usage_unknown_attempts.saturating_add(
             metrics
                 .get("usage_unknown_attempts")
                 .and_then(Value::as_u64)
-                .unwrap_or_default(),
+                .unwrap_or(physical_attempts.max(u64::from(model_rounds)).max(1)),
         );
         evidence.cache_dimensions_unknown_attempts =
             evidence.cache_dimensions_unknown_attempts.saturating_add(
@@ -708,18 +709,16 @@ fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProvide
             .usage
             .cache_read_input_tokens
             .saturating_add(cache_read_tokens);
-        evidence.usage.total_tokens =
-            evidence
+        if crate::report::complete_metric_tokens(metrics).is_none()
+            || evidence
                 .usage
                 .total_tokens
-                .saturating_add(if total_tokens > 0 {
-                    total_tokens
-                } else {
-                    input_tokens
-                        .saturating_add(output_tokens)
-                        .saturating_add(cache_creation_tokens)
-                        .saturating_add(cache_read_tokens)
-                });
+                .checked_add(total_tokens)
+                .is_none()
+        {
+            evidence.usage.usage_source = "live_gateway_canonical_usage+partial".to_string();
+        }
+        evidence.usage.total_tokens = evidence.usage.total_tokens.saturating_add(total_tokens);
         evidence.provider_rounds = evidence
             .provider_rounds
             .saturating_add(model_rounds as usize);
@@ -738,30 +737,6 @@ fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProvide
     evidence
 }
 
-fn merge_usage(
-    left: &HarnessEvalUsageSummary,
-    right: &HarnessEvalUsageSummary,
-) -> HarnessEvalUsageSummary {
-    if right.total_tokens == 0 {
-        return left.clone();
-    }
-    if left.total_tokens == 0 {
-        return right.clone();
-    }
-    HarnessEvalUsageSummary {
-        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
-        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
-        cache_creation_input_tokens: left
-            .cache_creation_input_tokens
-            .saturating_add(right.cache_creation_input_tokens),
-        cache_read_input_tokens: left
-            .cache_read_input_tokens
-            .saturating_add(right.cache_read_input_tokens),
-        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
-        usage_source: format!("{}+{}", left.usage_source, right.usage_source),
-    }
-}
-
 fn provider_cache_evidence(
     usage: &HarnessEvalUsageSummary,
     provider_rounds: usize,
@@ -774,11 +749,13 @@ fn provider_cache_evidence(
     let creation = u64::from(usage.cache_creation_input_tokens);
     let read = u64::from(usage.cache_read_input_tokens);
     let prompt = miss.saturating_add(creation).saturating_add(read);
-    let ratio = if prompt == 0 {
-        0
-    } else {
-        (read.saturating_mul(10_000) / prompt).min(10_000)
-    };
+    let usage_known = crate::report::observed_usage_source(&usage.usage_source)
+        && usage_unknown_attempts == 0
+        && physical_attempts >= provider_rounds as u64;
+    let cache_dimensions_known =
+        cache_dimensions_unknown_attempts == 0 && physical_attempts >= provider_rounds as u64;
+    let ratio = (usage_known && cache_dimensions_known && prompt > 0)
+        .then(|| (read.saturating_mul(10_000) / prompt).min(10_000));
     let structural_ratio = ratio_u64_bp(structure.reusable_prefix_bytes, structure.prompt_bytes);
     let warm_structural_ratio = ratio_u64_bp(
         structure.warm_reusable_prefix_bytes,
@@ -788,7 +765,8 @@ fn provider_cache_evidence(
         .warm_input_miss_tokens
         .saturating_add(structure.warm_cache_creation_input_tokens)
         .saturating_add(structure.warm_cache_read_input_tokens);
-    let warm_cache_ratio = ratio_u64_bp(structure.warm_cache_read_input_tokens, warm_prompt_tokens);
+    let warm_cache_ratio = (usage_known && cache_dimensions_known && warm_prompt_tokens > 0)
+        .then(|| ratio_u64_bp(structure.warm_cache_read_input_tokens, warm_prompt_tokens));
     json!({
         "schema_version": 1,
         "input_miss_tokens": miss,
@@ -798,9 +776,8 @@ fn provider_cache_evidence(
         "cache_hit_ratio_bp": ratio,
         "provider_rounds": provider_rounds,
         "physical_provider_attempts": physical_attempts,
-        "usage_known": (provider_rounds == 0 || prompt > 0) && usage_unknown_attempts == 0,
-        "cache_dimensions_known": cache_dimensions_unknown_attempts == 0
-            && physical_attempts >= provider_rounds as u64,
+        "usage_known": usage_known,
+        "cache_dimensions_known": cache_dimensions_known,
         "usage_unknown_attempts": usage_unknown_attempts,
         "cache_dimensions_unknown_attempts": cache_dimensions_unknown_attempts,
         "structural_reuse_ratio_bp": structural_ratio,
@@ -843,7 +820,7 @@ struct FullRealToolEval {
     usage: crate::HarnessEvalUsageSummary,
 }
 
-fn build_evidence_manifest(
+pub(crate) fn build_evidence_manifest(
     options: &HarnessEvalRunnerOptions,
     requested_at_ms: u128,
     tool_calls: usize,
@@ -875,12 +852,21 @@ fn build_evidence_manifest(
     let execution_key = std::env::var("COWD_EVAL_EVIDENCE_KEY")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let launcher_observed = nonempty_env("COWD_EVAL_CANDIDATE_SHA").is_some()
+        && candidate_source_sha256.is_some()
+        && execution_key.is_some()
+        && target_repo_dirty_state == "clean";
     json!({
         "kind": "harness_eval.evidence_manifest",
         "report_id": null,
         "repo": repo,
         "commit": commit,
         "candidate_source_sha256": candidate_source_sha256,
+        "identity_source": if launcher_observed { "frozen_launcher" } else { "unattested_library" },
+        "expected_candidate": {
+            "commit": nonempty_env("COWD_EVAL_EXPECTED_CANDIDATE_SHA"),
+            "candidate_source_sha256": nonempty_env("COWD_EVAL_EXPECTED_CANDIDATE_SOURCE_SHA256"),
+        },
         "version": env!("CARGO_PKG_VERSION"),
         "command": format!(
             "harness-eval {}{}",
@@ -1198,9 +1184,13 @@ mod tests {
                         "input_tokens": 100,
                         "output_tokens": 20,
                         "cache_tokens": 3,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 3,
                         "total_tokens": 123,
                         "model_rounds": 1,
                         "provider_attempt_count": 1,
+                        "provider_usage_records": 1,
+                        "usage_unknown_attempts": 0,
                         "provider_attempt_cache_dimensions_unknown_count": 0
                     }
                 },
@@ -1211,9 +1201,13 @@ mod tests {
                         "input_tokens": 200,
                         "output_tokens": 40,
                         "cache_tokens": 7,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 7,
                         "total_tokens": 247,
                         "model_rounds": 4,
                         "provider_attempt_count": 4,
+                        "provider_usage_records": 4,
+                        "usage_unknown_attempts": 0,
                         "provider_attempt_cache_dimensions_unknown_count": 0
                     }
                 }
@@ -1229,12 +1223,50 @@ mod tests {
         assert_eq!(evidence.usage.output_tokens, 60);
         assert_eq!(evidence.usage.cache_read_input_tokens, 10);
         assert_eq!(evidence.usage.total_tokens, 370);
+        assert_eq!(evidence.usage_unknown_attempts, 0);
+        assert!(crate::report::observed_usage_source(
+            &evidence.usage.usage_source
+        ));
         assert_eq!(evidence.rounds.len(), 2);
         assert_eq!(evidence.rounds[1]["round_kind"], "live_gateway_scenario");
         assert_eq!(
             evidence.rounds[1]["trace_artifact"],
             "live-scenarios/team.json"
         );
+        for value in [Value::Null, json!(1)] {
+            let mut partial = details.clone();
+            partial["scenarios"][0]["metrics"]["usage_unknown_attempts"] = value;
+            let evidence = live_gateway_provider_evidence(Some(&partial));
+            assert_eq!(evidence.usage.total_tokens, 370);
+            assert!(evidence.usage_unknown_attempts > 0);
+            assert!(!crate::report::observed_usage_source(
+                &evidence.usage.usage_source
+            ));
+        }
+        let mut zero = details.clone();
+        for scenario in zero["scenarios"].as_array_mut().expect("scenarios") {
+            for field in [
+                "input_tokens",
+                "output_tokens",
+                "cache_tokens",
+                "total_tokens",
+            ] {
+                scenario["metrics"][field] = json!(0);
+            }
+        }
+        let evidence = live_gateway_provider_evidence(Some(&zero));
+        assert_eq!(evidence.usage.total_tokens, 0);
+        assert!(!crate::report::observed_usage_source(
+            &evidence.usage.usage_source
+        ));
+        for scenario in zero["scenarios"].as_array_mut().expect("scenarios") {
+            scenario["metrics"]["cache_creation_input_tokens"] = json!(0);
+            scenario["metrics"]["cache_read_input_tokens"] = json!(0);
+        }
+        let evidence = live_gateway_provider_evidence(Some(&zero));
+        assert!(crate::report::observed_usage_source(
+            &evidence.usage.usage_source
+        ));
     }
 
     #[test]
@@ -1251,6 +1283,8 @@ mod tests {
         assert_eq!(cache["physical_provider_attempts"], 1);
         assert_eq!(cache["cache_dimensions_unknown_attempts"], 1);
         assert_eq!(cache["cache_dimensions_known"], false);
+        assert_eq!(cache["usage_known"], false);
+        assert!(cache["cache_hit_ratio_bp"].is_null());
     }
 
     #[test]
@@ -1269,7 +1303,7 @@ mod tests {
         )
         .expect("run eval");
         assert_eq!(record.status, "gated");
-        assert_eq!(record.total_tokens, 0);
+        assert_eq!(record.total_tokens, None);
         assert!(store.list_reports().expect("reports").is_empty());
         assert_eq!(store.list_runs().expect("runs").len(), 1);
         let _ = std::fs::remove_dir_all(root);
@@ -1293,13 +1327,23 @@ mod tests {
 
         assert_eq!(record.status, "completed");
         assert!(record.tool_calls >= 3);
-        assert!(record.total_tokens > 0);
+        assert_eq!(record.total_tokens, None);
         let report_id = record.report_id.as_deref().expect("report id");
         let detail = store
             .get_report(report_id)
             .expect("detail")
             .expect("report exists");
         assert_eq!(detail.summary.status, "passed");
+        assert!(detail
+            .report
+            .pointer("/execution_trace/total_usage/total_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > 0));
+        assert!(detail
+            .report
+            .pointer("/execution_trace/total_usage/usage_source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source.contains("estimate")));
         assert_eq!(detail.report["report_gate"]["status"], "passed");
         assert_eq!(
             detail.report["next_gen_harness_closure"]["status"],
