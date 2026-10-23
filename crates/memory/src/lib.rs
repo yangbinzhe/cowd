@@ -192,7 +192,7 @@ pub use knowledge::{
     InMemoryKnowledgeStore, IngestionResult, KnowledgeChunk, KnowledgeConsolidationReport,
     KnowledgeFabric, KnowledgeFabricHealth, KnowledgeIngestionReceipt, KnowledgeIngestionService,
     KnowledgeNamespaceSearchResult, KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError,
-    UsageFeedbackLoop,
+    KnowledgeTurnProjection, UsageFeedbackLoop,
 };
 pub use maintenance::{
     scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateAction,

@@ -248,6 +248,11 @@ struct KnowledgeFabricState {
     usage: Vec<KnowledgeUsageSignal>,
 }
 
+#[derive(Debug, Clone)]
+pub struct KnowledgeTurnProjection {
+    receipt: KnowledgeIngestionReceipt,
+}
+
 #[derive(Clone, Default)]
 pub struct KnowledgeFabric {
     state: Arc<RwLock<KnowledgeFabricState>>,
@@ -318,104 +323,34 @@ impl KnowledgeFabric {
         governance_level: KnowledgeGovernanceLevel,
         content: DocumentContent,
     ) -> KnowledgeIngestionReceipt {
-        let classification = KnowledgeIngestionService::new().classify(&content);
-        let now = Utc::now();
-        let corpus_id = format!(
-            "corpus-{}",
-            stable_hash(&format!(
-                "{}:{}",
-                content.source.clone().unwrap_or_default(),
-                content.body
-            ))
-        );
-        let source_ref = KernelRef::new(
-            "knowledge_source",
-            content
-                .source
-                .clone()
-                .unwrap_or_else(|| format!("inline:{}", content.title)),
-        )
-        .with_label(content.title.clone());
-        let chunks = chunk_document(&corpus_id, &content);
-        let corpus = KnowledgeCorpus {
-            corpus_id: corpus_id.clone(),
-            name: content.title.clone(),
-            namespace: namespace.clone(),
-            source_ref: source_ref.clone(),
-            source_hash: format!("hash-{}", stable_hash(&content.body)),
-            state: KnowledgeObjectState::Indexed,
-            chunk_count: chunks.len(),
-            created_at: now,
-            updated_at: now,
-        };
-        let pack_id = format!(
-            "pack-{}",
-            stable_hash(&format!("{}:{}", namespace.key(), content.title))
-        );
-        let canon = CanonExtractor::new().extract(
-            &pack_id,
-            &classification,
-            &content,
-            &chunks,
-            governance_level,
-        );
-        let conflicts = ConflictGovernor::new().detect(&pack_id, &canon);
-        let state = if conflicts.is_empty() {
-            KnowledgeObjectState::Active
-        } else {
-            KnowledgeObjectState::Conflicted
-        };
-        let pack = KnowledgePack {
-            pack_id: pack_id.clone(),
-            name: classification.metadata.title.clone(),
-            kind: classification.metadata.category.pack_kind(),
+        let mut receipt = KnowledgeIngestionService::new().prepare_document(
             namespace,
             activation_policy,
             governance_level,
-            source_corpus_refs: vec![corpus_id.clone()],
-            canon_pack_ref: Some(canon.canon_id.clone()),
-            graph_ref: Some(format!("knowledge-graph:{pack_id}")),
-            // Knowledge 保持为受治理的记忆域；结构化业务事实仅通过显式
-            // source/growth 投影进入 Matrix，避免激活知识时发生隐式重复写。
-            matrix_refs: Vec::new(),
-            memory_refs: vec![KernelRef::new(
-                "memory",
-                format!("knowledge-pack:{pack_id}"),
-            )],
-            evidence_refs: chunks
-                .iter()
-                .map(|chunk| chunk.evidence_ref.clone())
-                .collect(),
-            version: "1".to_string(),
-            state,
-            health_score_bp: if conflicts.is_empty() { 9_000 } else { 6_000 },
-            owner: "memory.knowledge_fabric".to_string(),
-            created_at: now,
-            updated_at: now,
-        };
+            content,
+            false,
+        );
         let mut state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.corpus.insert(corpus_id, corpus.clone());
-        state.packs.insert(pack_id, pack.clone());
-        state.canon.insert(canon.canon_id.clone(), canon.clone());
-        for chunk in &chunks {
+        state
+            .corpus
+            .insert(receipt.corpus.corpus_id.clone(), receipt.corpus.clone());
+        state
+            .packs
+            .insert(receipt.pack.pack_id.clone(), receipt.pack.clone());
+        state
+            .canon
+            .insert(receipt.canon.canon_id.clone(), receipt.canon.clone());
+        for chunk in &receipt.chunks {
             state.chunks.insert(chunk.chunk_id.clone(), chunk.clone());
         }
-        for conflict in &conflicts {
+        for conflict in &receipt.conflicts {
             state
                 .conflicts
                 .insert(conflict.conflict_id.clone(), conflict.clone());
         }
-        let mut receipt = KnowledgeIngestionReceipt {
-            corpus,
-            pack,
-            canon,
-            conflicts,
-            chunks,
-            warnings: classification.reasoning,
-        };
         if let Some(store) = self.store.as_ref() {
             if let Err(err) = store.save_receipt(&receipt) {
                 receipt
@@ -519,10 +454,47 @@ impl KnowledgeFabric {
         Vec<KnowledgeCanonPack>,
         Vec<KnowledgeComplianceWarning>,
     ) {
+        self.activate_with_turn_projection(session_id, intent, profile, project_id, &[])
+    }
+
+    /// Evaluate persisted knowledge and ephemeral turn views through the same
+    /// original activation policy. This never adopts or writes a turn view.
+    #[must_use]
+    pub fn activate_with_turn_projection(
+        &self,
+        session_id: &str,
+        intent: &str,
+        profile: &str,
+        project_id: Option<&str>,
+        projected: &[KnowledgeTurnProjection],
+    ) -> (
+        KnowledgeActivationPlan,
+        Vec<KnowledgeCanonPack>,
+        Vec<KnowledgeComplianceWarning>,
+    ) {
         let state = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let turn = projected
+            .iter()
+            .map(|view| {
+                let item = &view.receipt;
+                (item.pack.pack_id.as_str(), (&item.pack, Some(&item.canon)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let candidates = state
+            .packs
+            .values()
+            .map(|pack| {
+                (
+                    pack,
+                    pack.canon_pack_ref
+                        .as_ref()
+                        .and_then(|id| state.canon.get(id)),
+                )
+            })
+            .chain(turn.values().copied());
         let intent_lc = intent.to_ascii_lowercase();
         let mut selected_namespaces = Vec::new();
         let mut blocked_namespaces = Vec::new();
@@ -533,7 +505,7 @@ impl KnowledgeFabric {
         let mut canon_packs = Vec::new();
         let mut warnings = Vec::new();
 
-        for pack in state.packs.values() {
+        for (pack, canon) in candidates {
             if !matches!(
                 pack.state,
                 KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
@@ -559,7 +531,7 @@ impl KnowledgeFabric {
             ));
             if let Some(canon_id) = pack.canon_pack_ref.as_ref() {
                 canon_refs.push(canon_id.clone());
-                if let Some(canon) = state.canon.get(canon_id) {
+                if let Some(canon) = canon {
                     for rule in &canon.rules {
                         if matches!(
                             rule.governance_level,
@@ -893,6 +865,132 @@ impl KnowledgeIngestionService {
     #[must_use]
     pub fn classify(&self, content: &DocumentContent) -> ClassificationResult {
         self.classifier.classify(content)
+    }
+
+    /// Pure conversion of an already selected Memory item into this turn's
+    /// view. The returned carrier is not a durable adoption receipt.
+    #[must_use]
+    pub fn project_for_turn(
+        &self,
+        namespace: KnowledgeNamespace,
+        activation_policy: KnowledgeActivationPolicy,
+        governance_level: KnowledgeGovernanceLevel,
+        content: DocumentContent,
+    ) -> KnowledgeTurnProjection {
+        KnowledgeTurnProjection {
+            receipt: self.prepare_document(
+                namespace,
+                activation_policy,
+                governance_level,
+                content,
+                true,
+            ),
+        }
+    }
+
+    fn prepare_document(
+        &self,
+        namespace: KnowledgeNamespace,
+        activation_policy: KnowledgeActivationPolicy,
+        governance_level: KnowledgeGovernanceLevel,
+        content: DocumentContent,
+        for_turn: bool,
+    ) -> KnowledgeIngestionReceipt {
+        let classification = self.classify(&content);
+        let now = Utc::now();
+        let corpus_id = format!(
+            "corpus-{}",
+            stable_hash(&format!(
+                "{}:{}",
+                content.source.clone().unwrap_or_default(),
+                content.body
+            ))
+        );
+        let source_ref = KernelRef::new(
+            "knowledge_source",
+            content
+                .source
+                .clone()
+                .unwrap_or_else(|| format!("inline:{}", content.title)),
+        )
+        .with_label(content.title.clone());
+        let chunks = chunk_document(&corpus_id, &content);
+        let corpus = KnowledgeCorpus {
+            corpus_id: corpus_id.clone(),
+            name: content.title.clone(),
+            namespace: namespace.clone(),
+            source_ref: source_ref.clone(),
+            source_hash: format!("hash-{}", stable_hash(&content.body)),
+            state: KnowledgeObjectState::Indexed,
+            chunk_count: chunks.len(),
+            created_at: now,
+            updated_at: now,
+        };
+        let pack_id = if for_turn {
+            // A turn view cannot replace a persisted pack with the same title.
+            format!(
+                "turn-pack-{}",
+                stable_hash(&format!(
+                    "{}:{}:{corpus_id}",
+                    namespace.key(),
+                    content.title
+                ))
+            )
+        } else {
+            format!(
+                "pack-{}",
+                stable_hash(&format!("{}:{}", namespace.key(), content.title))
+            )
+        };
+        let canon = CanonExtractor::new().extract(
+            &pack_id,
+            &classification,
+            &content,
+            &chunks,
+            governance_level,
+        );
+        let conflicts = ConflictGovernor::new().detect(&pack_id, &canon);
+        let state = if conflicts.is_empty() {
+            KnowledgeObjectState::Active
+        } else {
+            KnowledgeObjectState::Conflicted
+        };
+        let pack = KnowledgePack {
+            pack_id: pack_id.clone(),
+            name: classification.metadata.title.clone(),
+            kind: classification.metadata.category.pack_kind(),
+            namespace,
+            activation_policy,
+            governance_level,
+            source_corpus_refs: vec![corpus_id.clone()],
+            canon_pack_ref: Some(canon.canon_id.clone()),
+            graph_ref: Some(format!("knowledge-graph:{pack_id}")),
+            // Knowledge 保持为受治理的记忆域；结构化业务事实仅通过显式
+            // source/growth 投影进入 Matrix，避免激活知识时发生隐式重复写。
+            matrix_refs: Vec::new(),
+            memory_refs: vec![KernelRef::new(
+                "memory",
+                format!("knowledge-pack:{pack_id}"),
+            )],
+            evidence_refs: chunks
+                .iter()
+                .map(|chunk| chunk.evidence_ref.clone())
+                .collect(),
+            version: "1".to_string(),
+            state,
+            health_score_bp: if conflicts.is_empty() { 9_000 } else { 6_000 },
+            owner: "memory.knowledge_fabric".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        KnowledgeIngestionReceipt {
+            corpus,
+            pack,
+            canon,
+            conflicts,
+            chunks,
+            warnings: classification.reasoning,
+        }
     }
 
     #[must_use]
@@ -1510,10 +1608,18 @@ fn character_pairs(value: &str) -> BTreeSet<(char, char)> {
 }
 
 fn activation_fits(pack: &KnowledgePack, intent_lc: &str, project_id: Option<&str>) -> bool {
+    // Activation preference never grants access to another project's rules.
+    if let KnowledgeNamespace::Project(project) = &pack.namespace {
+        if project_id != Some(project.as_str()) {
+            return false;
+        }
+    }
     match &pack.activation_policy {
         KnowledgeActivationPolicy::ExplicitOnly => false,
         KnowledgeActivationPolicy::DefaultForProjectGroup => {
-            project_id.is_some_and(|project| pack.namespace.key().contains(project))
+            matches!(&pack.namespace,
+                KnowledgeNamespace::Project(id) | KnowledgeNamespace::ProjectGroup(id)
+                if project_id == Some(id.as_str()))
         }
         KnowledgeActivationPolicy::DefaultForDomain
         | KnowledgeActivationPolicy::DefaultForIntent
@@ -1959,6 +2065,88 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_projection_preserves_durable_rules_and_does_not_survive_the_turn() {
+        let fabric = KnowledgeFabric::new();
+        let durable = fabric.ingest_document(
+            KnowledgeNamespace::Project("project-a".into()),
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeGovernanceLevel::Required,
+            DocumentContent::new(
+                "Safety policy",
+                "The operator must retain the original audit evidence.",
+            ),
+        );
+        let before = serde_json::to_value(fabric.snapshot()).unwrap();
+        let turn = KnowledgeIngestionService::new().project_for_turn(
+            KnowledgeNamespace::Project("project-a".into()),
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeGovernanceLevel::Advisory,
+            DocumentContent::new("Safety policy", "A temporary suggestion for this turn."),
+        );
+        assert_ne!(durable.pack.pack_id, turn.receipt.pack.pack_id);
+        let (plan, canons, warnings) = fabric.activate_with_turn_projection(
+            "session",
+            "safety policy",
+            "profile",
+            Some("project-a"),
+            &[turn.clone()],
+        );
+        assert_eq!(plan.active_pack_ids.len(), 2);
+        assert!(plan.active_pack_ids.contains(&durable.pack.pack_id));
+        assert!(canons.iter().any(|canon| canon
+            .rules
+            .iter()
+            .any(|rule| rule.summary.contains("original audit evidence"))));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.level == KnowledgeGovernanceLevel::Required));
+        assert_eq!(serde_json::to_value(fabric.snapshot()).unwrap(), before);
+        let (next, _, _) = fabric.activate("next", "safety policy", "profile", Some("project-a"));
+        assert_eq!(next.active_pack_ids, vec![durable.pack.pack_id]);
+        let (foreign, _, _) = fabric.activate_with_turn_projection(
+            "foreign",
+            "safety policy",
+            "profile",
+            Some("project-b"),
+            &[turn],
+        );
+        assert!(foreign.active_pack_ids.is_empty());
+    }
+
+    #[test]
+    fn project_namespace_fences_every_activation_policy_before_relevance() {
+        for policy in [
+            KnowledgeActivationPolicy::ExplicitOnly,
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeActivationPolicy::DefaultForIntent,
+            KnowledgeActivationPolicy::DefaultForRole,
+            KnowledgeActivationPolicy::DefaultForUser,
+            KnowledgeActivationPolicy::BlockingPolicy,
+            KnowledgeActivationPolicy::OnDemand,
+        ] {
+            let fabric = KnowledgeFabric::new();
+            fabric.ingest_document(
+                KnowledgeNamespace::Project("cowd".into()),
+                policy,
+                KnowledgeGovernanceLevel::Required,
+                DocumentContent::new("Safety policy", "The operator must retain audit evidence."),
+            );
+            for project in [None, Some("cow"), Some("cowd-other")] {
+                let (plan, _, _) =
+                    fabric.activate("foreign", "safety policy cowd", "profile", project);
+                assert!(plan.active_pack_ids.is_empty(), "{policy:?} {project:?}");
+            }
+            let (own, _, _) = fabric.activate("own", "safety policy", "profile", Some("cowd"));
+            assert_eq!(
+                own.active_pack_ids.is_empty(),
+                policy == KnowledgeActivationPolicy::ExplicitOnly,
+                "{policy:?}"
+            );
+        }
+    }
 
     #[test]
     fn ingestion_creates_corpus_pack_canon_without_global_memory() {

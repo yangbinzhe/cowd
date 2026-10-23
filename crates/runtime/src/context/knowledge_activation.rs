@@ -4,7 +4,8 @@ use harness_contract::knowledge::{
 #[cfg(test)]
 use memory::RecallReport;
 use memory::{
-    DocumentContent, KnowledgeFabric, MemoryContextPacket, MemoryPacketRole, OmittedMemory,
+    DocumentContent, KnowledgeFabric, KnowledgeIngestionService, MemoryContextPacket,
+    MemoryPacketRole, OmittedMemory,
 };
 
 use crate::context_runtime::{
@@ -46,6 +47,7 @@ impl KnowledgeActivationRuntime {
         packet: &MemoryContextPacket,
     ) -> Option<RuntimeKnowledgeActivation> {
         let packet = filter_packet_for_turn_intent(packet, intent);
+        let mut projected = Vec::new();
         for item in &packet.selected {
             if is_runtime_memory_noise_item(item) {
                 continue;
@@ -56,13 +58,15 @@ impl KnowledgeActivationRuntime {
             let governance = governance_from_memory_item(item);
             let policy = activation_policy_from_memory_item(item);
             let namespace = namespace_from_memory_item(item, project_id);
-            self.fabric
-                .ingest_document(namespace, policy, governance, document);
+            projected.push(
+                KnowledgeIngestionService::new()
+                    .project_for_turn(namespace, policy, governance, document),
+            );
         }
 
         let (plan, canon_packs, warnings) = self
             .fabric
-            .activate(session_id, intent, profile, project_id);
+            .activate_with_turn_projection(session_id, intent, profile, project_id, &projected);
         if plan.active_pack_ids.is_empty() {
             return None;
         }
@@ -711,6 +715,97 @@ mod tests {
             reason: "must be applied to this task".to_string(),
             content_preview: format!("{title} full policy body"),
         }
+    }
+
+    #[derive(Default)]
+    struct ReadOnlyKnowledgeStore {
+        writes: std::sync::atomic::AtomicU64,
+        inner: memory::InMemoryKnowledgeStore,
+    }
+
+    impl ReadOnlyKnowledgeStore {
+        fn reject_write(&self) -> Result<(), memory::KnowledgeStoreError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(memory::KnowledgeStoreError::Backend(
+                "activation attempted a write".into(),
+            ))
+        }
+    }
+
+    impl memory::KnowledgeStore for ReadOnlyKnowledgeStore {
+        fn save_receipt(
+            &self,
+            _: &memory::KnowledgeIngestionReceipt,
+        ) -> Result<(), memory::KnowledgeStoreError> {
+            self.reject_write()
+        }
+        fn save_pack(
+            &self,
+            _: &harness_contract::knowledge::KnowledgePack,
+        ) -> Result<(), memory::KnowledgeStoreError> {
+            self.reject_write()
+        }
+        fn save_conflict(
+            &self,
+            _: &harness_contract::knowledge::KnowledgeConflictRecord,
+        ) -> Result<(), memory::KnowledgeStoreError> {
+            self.reject_write()
+        }
+        fn record_usage(
+            &self,
+            _: &harness_contract::knowledge::KnowledgeUsageSignal,
+        ) -> Result<(), memory::KnowledgeStoreError> {
+            self.reject_write()
+        }
+        fn snapshot(&self) -> Result<memory::KnowledgeSnapshot, memory::KnowledgeStoreError> {
+            memory::KnowledgeStore::snapshot(&self.inner)
+        }
+    }
+
+    #[test]
+    fn runtime_packet_activation_never_writes_or_contaminates_the_next_turn() {
+        let store = std::sync::Arc::new(ReadOnlyKnowledgeStore::default());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let runtime = KnowledgeActivationRuntime::with_fabric(fabric.clone());
+        let mut packet = MemoryContextPacket {
+            selected: vec![packet_item(
+                "Safety policy must stop without approval",
+                MemoryLayer::L3,
+                MemoryPacketRole::Conflict,
+            )],
+            omitted: Vec::new(),
+            token_estimate: 128,
+            truncated: false,
+            recall_report: RecallReport::default(),
+        };
+        let active = runtime
+            .activate_from_packet_for_project(
+                "one",
+                "safety policy approval",
+                "profile",
+                Some("project-a"),
+                &packet,
+            )
+            .expect("a read-only store must still produce the current blocking context");
+        assert!(!active.items.is_empty());
+        assert!(!active.compliance_decision.allows_execution());
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(fabric.snapshot().packs.is_empty());
+        packet.selected.clear();
+        assert!(runtime
+            .activate_from_packet_for_project(
+                "two",
+                "safety policy approval",
+                "profile",
+                Some("project-a"),
+                &packet,
+            )
+            .is_none());
+        assert!(memory::KnowledgeStore::snapshot(store.as_ref())
+            .unwrap()
+            .packs
+            .is_empty());
     }
 
     #[test]
