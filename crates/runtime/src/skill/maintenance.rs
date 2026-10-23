@@ -10,9 +10,8 @@ use std::{
 use harness_contract::{
     outcome::ExecutionOutcome,
     skill::{
-        SKILL_MAINTENANCE_DRAFT_SCHEMA_VERSION, SKILL_USAGE_RECEIPT_SCHEMA_VERSION,
         SkillMaintenanceDraft, SkillMaintenanceRecommendation, SkillMaintenanceValidation,
-        SkillUsageCounts, SkillUsageReceipt,
+        SkillUsageCounts, SkillUsageReceipt, SKILL_MAINTENANCE_DRAFT_SCHEMA_VERSION,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -27,7 +26,9 @@ use crate::{
 
 use super::usage::SKILL_USAGE_RECEIPT_EVENT_KIND;
 
-pub(crate) const PROJECTOR_ID: &str = "projector:skill-maintenance:v1";
+// v1 checkpoints accepted kind/payload without canonical producer provenance.
+// Rebuild from the original event journal instead of promoting those snapshots.
+pub(crate) const PROJECTOR_ID: &str = "projector:skill-maintenance:v2";
 const PROJECTOR_WORKER_BATCH: usize = 8;
 const MAX_RECEIPTS_PER_SCOPE: usize = 512;
 const MAX_MAINTENANCE_SCOPES: usize = 256;
@@ -188,18 +189,12 @@ impl SkillMaintenanceProjector {
             for event in &batch.events {
                 match event.kind.as_str() {
                     SKILL_USAGE_RECEIPT_EVENT_KIND => {
-                        let receipt = event.payload.get("receipt").cloned().and_then(|value| {
-                            serde_json::from_value::<SkillUsageReceipt>(value).ok()
-                        });
-                        match receipt {
-                            Some(receipt)
-                                if receipt.schema_version == SKILL_USAGE_RECEIPT_SCHEMA_VERSION
-                                    && receipt_fields_complete(&receipt) =>
-                            {
+                        match super::usage::canonical_receipt_event(event) {
+                            Ok(receipt) => {
                                 reduce_receipt(&mut next, receipt);
                                 changed = true;
                             }
-                            _ => {
+                            Err(_) => {
                                 next.rejected_receipts = next.rejected_receipts.saturating_add(1);
                                 changed = true;
                             }
@@ -299,36 +294,6 @@ fn projection_interest() -> RuntimeProjectionInterest {
         .map(|scope| RuntimeProjectionEventInterest::new(scope, OUTCOME_EVENT_KIND)),
     );
     RuntimeProjectionInterest::new(interests)
-}
-
-fn receipt_fields_complete(receipt: &SkillUsageReceipt) -> bool {
-    [
-        receipt.receipt_id.as_str(),
-        receipt.skill_id.as_str(),
-        receipt.skill_revision.as_str(),
-        receipt.workspace_identity.as_str(),
-        receipt.workload_fingerprint.as_str(),
-        receipt.config_revision.as_str(),
-        receipt.evaluation_environment.as_str(),
-        receipt.execution_id.as_str(),
-        receipt.session_id.as_str(),
-        receipt.turn_id.as_str(),
-    ]
-    .iter()
-    .all(|value| !value.trim().is_empty())
-        && receipt.receipt_id
-            == SkillUsageReceipt::stable_id(
-                &receipt.skill_id,
-                &receipt.skill_revision,
-                receipt.usage,
-                &receipt.workspace_identity,
-                &receipt.workload_fingerprint,
-                &receipt.config_revision,
-                &receipt.evaluation_environment,
-                &receipt.execution_id,
-                &receipt.session_id,
-                &receipt.turn_id,
-            )
 }
 
 fn reduce_receipt(snapshot: &mut SkillMaintenanceSnapshot, receipt: SkillUsageReceipt) {
@@ -620,8 +585,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeTransactionEventInput,
-        SkillInvocation,
+        RuntimeEventInput, RuntimeEventScope, RuntimeTransactionEventInput, SkillInvocation,
     };
     use harness_contract::{
         outcome::{
@@ -630,7 +594,7 @@ mod tests {
             RuntimeIdentity, StrategyIdentity,
         },
         reality::EvidenceCompleteness,
-        skill::{SkillAdapterKind, SkillUsageKind},
+        skill::{SkillAdapterKind, SkillUsageKind, SKILL_USAGE_RECEIPT_SCHEMA_VERSION},
         strategy::ExecutionCandidateKind,
     };
 
@@ -726,20 +690,8 @@ mod tests {
     }
 
     fn append_receipt(store: &RuntimeEventStore, receipt: &SkillUsageReceipt) {
-        store
-            .append(RuntimeEventInput {
-                stream_id: format!("test:{}", receipt.receipt_id),
-                scope: RuntimeEventScope::Skill,
-                kind: SKILL_USAGE_RECEIPT_EVENT_KIND.to_string(),
-                status: Some("observed".to_string()),
-                actor: Some("test".to_string()),
-                refs: vec![RuntimeEventRef {
-                    kind: "skill".to_string(),
-                    id: receipt.skill_id.clone(),
-                }],
-                payload: serde_json::json!({"receipt": receipt}),
-            })
-            .expect("receipt");
+        super::super::usage::persist_receipt_for_test(store, receipt)
+            .expect("original receipt writer");
     }
 
     #[test]
@@ -789,6 +741,27 @@ mod tests {
         let replay = SkillMaintenanceProjector::new(Arc::clone(&store));
         replay.project_available(128).expect("replay");
         assert_eq!(draft.digest(), replay.drafts(1).remove(0).digest());
+    }
+
+    #[test]
+    fn an_accepted_or_foreign_receipt_cannot_become_canonical_maintenance_evidence() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let receipt = receipt(1, SkillUsageKind::Load);
+        store
+            .append(RuntimeEventInput {
+                stream_id: format!("test:{}", receipt.receipt_id),
+                scope: RuntimeEventScope::Skill,
+                kind: SKILL_USAGE_RECEIPT_EVENT_KIND.into(),
+                status: Some("observed".into()),
+                actor: Some("foreign".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"receipt":receipt}),
+            })
+            .unwrap();
+        let projector = SkillMaintenanceProjector::new(store);
+        projector.project_available(128).unwrap();
+        assert_eq!(projector.snapshot().rejected_receipts, 1);
+        assert!(projector.drafts(128).is_empty());
     }
 
     #[test]

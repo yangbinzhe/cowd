@@ -1868,12 +1868,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
             );
-    let skill_usage_sink: Arc<dyn runtime::RuntimeSkillUsageSink> =
-        Arc::new(runtime::RuntimeSkillUsageRecorder::with_pointer_cache(
-            Arc::clone(&selected_storage.runtime_event_store),
-            skill_revision_pointer_cache,
-        ));
-    crate::services::attach_workspace_skill_usage_sink(&workspace_root, skill_usage_sink);
     let skill_catalog_started_at = Instant::now();
     let startup_skill_assets = crate::services::runtime_skill_assets_for_workspace(&workspace_root);
     tracing::info!(
@@ -1931,6 +1925,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         "Runtime services composition completed"
     );
     startup_registry.runtime_services = Some(Arc::clone(&runtime_services));
+    let skill_usage_sink: Arc<dyn runtime::RuntimeSkillUsageSink> =
+        match runtime_services.skill_usage_recorder() {
+            Ok(recorder) => recorder,
+            Err(error) => return Err(startup_registry.rollback(error).await),
+        };
+    crate::services::attach_workspace_skill_usage_sink(&workspace_root, skill_usage_sink);
     if evolution_runtime
         .set(Arc::downgrade(&runtime_services))
         .is_err()

@@ -656,6 +656,8 @@ impl RuntimeSkillUsageRelay {
         let Some(sink) = sink else {
             return;
         };
+        // Admission is best-effort observation, not proof of durable usage.
+        // Maintenance consumes only original committed EventStore receipts.
         let _ = sink.observe(invocation, revision, context, usage);
     }
 
@@ -1115,12 +1117,15 @@ mod tests {
         )
         .expect("skill");
         let store = Arc::new(runtime::RuntimeEventStore::for_test());
-        let usage_sink: Arc<dyn runtime::RuntimeSkillUsageSink> =
-            Arc::new(runtime::RuntimeSkillUsageRecorder::new(Arc::clone(&store)));
-        attach_workspace_skill_usage_sink(&temp.root, usage_sink);
+        let recorder = Arc::new(
+            runtime::RuntimeSkillUsageRecorder::new(Arc::clone(&store)).expect("usage worker"),
+        );
+        let usage_sink: Arc<dyn runtime::RuntimeSkillUsageSink> = recorder.clone();
         let source = runtime_skill_assets_for_workspace(&temp.root)
             .instruction_source
             .expect("instruction source");
+        attach_workspace_skill_usage_sink(&temp.root, usage_sink);
+
         let invocation = runtime::SkillInvocation {
             skill_id: "research".to_string(),
             skill_version: None,
@@ -1138,17 +1143,11 @@ mod tests {
             .expect("cache hit")
             .expect("prompt");
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let events = loop {
-            let events = store
-                .list_scope(runtime::RuntimeEventScope::Skill, 10)
-                .expect("Skill usage events");
-            let health = workspace_skill_cache_health(&temp.root);
-            if (!events.is_empty() && health.usage_persisted > 0) || Instant::now() >= deadline {
-                break events;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        let drained = recorder.shutdown_and_drain(Duration::from_secs(2)).await;
+        assert!(drained.clean, "{drained:?}");
+        let events = store
+            .list_scope(runtime::RuntimeEventScope::Skill, 10)
+            .expect("original Skill receipts");
         assert!(
             events
                 .iter()

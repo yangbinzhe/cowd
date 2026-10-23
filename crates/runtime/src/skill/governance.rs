@@ -484,6 +484,10 @@ impl SkillRevisionGovernanceService {
         Ok(review)
     }
 
+    pub(crate) fn pointer_cache(&self) -> Arc<SkillRevisionPointerCache> {
+        Arc::clone(&self.pointer_cache)
+    }
+
     pub fn pointer(
         &self,
         skill_id: &str,

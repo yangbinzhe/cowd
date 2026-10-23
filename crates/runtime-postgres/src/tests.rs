@@ -121,6 +121,32 @@ impl RuntimeEventStoreBackend for PreparedCommitResponseLoss {
         Ok(receipt)
     }
 
+    fn append_batch_if_revision(
+        &self,
+        stream_id: String,
+        expected_revision: u64,
+        transaction_id: String,
+        events: Vec<RuntimeTransactionEventInput>,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        let receipt = self.inner.append_batch_if_revision(
+            stream_id,
+            expected_revision,
+            transaction_id,
+            events,
+        )?;
+        if self
+            .lose_response
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.injected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(RuntimeEventStoreError::Corrupt(
+                "injected committed batch response loss".into(),
+            ));
+        }
+        Ok(receipt)
+    }
+
     fn source_mutation_fence(&self) -> RuntimeEventStoreResult<runtime::RuntimeSourceMutationFence> {
         self.inner.source_mutation_fence()
     }
@@ -161,7 +187,7 @@ impl RuntimeEventStoreBackend for PreparedCommitResponseLoss {
             fn append_transaction_with_terminal(&self, request: AppendTransactionRequest, terminal: SessionTerminalInput) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
             fn consume_verified_decision_lease(&self, lease_id: &str, principal_id: &str, review_id: &str, action: &str, scope: &str, evidence_digest: &str, credential_epoch: u64, consumed_at_ms: u64) -> RuntimeEventStoreResult<()>;
             fn append_transaction_with_verified_decision_lease(&self, request: AppendTransactionRequest, lease: &runtime::VerifiedDecisionLease) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
-            fn append_batch_if_revision(&self, stream_id: String, expected_revision: u64, transaction_id: String, events: Vec<RuntimeTransactionEventInput>) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+
             fn events_after_cursor(&self, cursor: u64, max_commits: usize) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>>;
             fn projection_scan_page(&self, cursor: u64, interest: &RuntimeProjectionInterest, max_commits: usize, max_events: usize, max_bytes: usize) -> RuntimeEventStoreResult<RuntimeProjectionScanPage>;
             fn projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<Option<RuntimeProjectionCheckpoint>>;
@@ -3898,4 +3924,81 @@ fn structured_task_pending_registration_is_atomic_indexed_and_survives_reconnect
         .structured_recovery_candidates("task-structured-pg", 1)
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; failed schema retained"]
+async fn skill_usage_original_worker_confirms_lost_commit_and_reopens_without_duplicate() {
+    use harness_contract::skill::{SkillAdapterKind, SkillUsageKind};
+    use runtime::RuntimeSkillUsageSink;
+    // Success drops only this new schema. Panic retains it for bounded direct
+    // inspection instead of destroying the original failed PG facts.
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let invocation = runtime::SkillInvocation {
+        skill_id: "usage-pg".into(),
+        skill_version: None,
+        adapter: SkillAdapterKind::PromptOnly,
+        entrypoint: None,
+    };
+    let mut prior_id = None;
+    for reopened in [false, true] {
+        let backend = PreparedCommitResponseLoss {
+            inner: PostgresRuntimeEventStore::new(fixture.reconnect()).unwrap(),
+            lose_response: std::sync::atomic::AtomicBool::new(!reopened),
+            injected: injected.clone(),
+            checkpoint_fault: None,
+            checkpoint_injected: std::sync::atomic::AtomicBool::new(false),
+        };
+        let store = Arc::new(RuntimeEventStore::from_backend(Arc::new(backend)));
+        let recorder = runtime::RuntimeSkillUsageRecorder::new(store.clone()).unwrap();
+        let context = runtime::RuntimeSkillUsageContext {
+            workspace_identity: "usage-workspace".into(),
+            workload_fingerprint: "workload".into(),
+            config_revision: "config".into(),
+            evaluation_environment: "test".into(),
+            execution_id: "usage-execution".into(),
+            session_id: "usage-session".into(),
+            turn_id: "usage-turn".into(),
+            observed_at_ms: if reopened { 2 } else { 1 },
+        };
+        let id = recorder
+            .observe(
+                &invocation,
+                "exact-immutable-revision",
+                &context,
+                SkillUsageKind::Load,
+            )
+            .unwrap();
+        if let Some(prior) = prior_id.as_ref() {
+            assert_eq!(&id, prior);
+        }
+        let report = recorder
+            .shutdown_and_drain(std::time::Duration::from_secs(5))
+            .await;
+        assert!(report.clean, "{report:?}");
+        assert_eq!(
+            (report.accepted, report.persisted, report.unsettled_unknown),
+            (1, 1, 0)
+        );
+        let receipt = recorder.durable_receipt("usage-pg", &id).unwrap().unwrap();
+        assert_eq!(receipt.workspace_identity, "usage-workspace");
+        assert_eq!(receipt.skill_revision, "exact-immutable-revision");
+        assert_eq!(receipt.observed_at_ms, 1);
+        assert!(
+            injected.load(std::sync::atomic::Ordering::SeqCst),
+            "committed response-loss fault must hit"
+        );
+        assert_eq!(
+            store
+                .list_scope(RuntimeEventScope::Skill, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        prior_id = Some(id);
+        drop(recorder);
+        drop(store); // destroy the old EventStore adapter and its IO ownership
+    }
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
 }

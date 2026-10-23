@@ -755,7 +755,9 @@ pub use skill::governance::{
 pub use skill::maintenance::{
     SkillMaintenanceProjectionHealth, SkillMaintenanceProjector, SkillMaintenanceSnapshot,
 };
-pub use skill::usage::{RuntimeSkillUsageRecorder, SKILL_USAGE_RECEIPT_EVENT_KIND};
+pub use skill::usage::{
+    RuntimeSkillUsageRecorder, SkillUsageShutdownReport, SKILL_USAGE_RECEIPT_EVENT_KIND,
+};
 pub use skill::{
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
     RuntimeSkillCandidate, RuntimeSkillCatalog, RuntimeSkillInstructionSource,

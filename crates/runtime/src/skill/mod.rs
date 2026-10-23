@@ -113,6 +113,16 @@ pub trait RuntimeSkillUsageSink: Send + Sync {
 
     fn health(&self) -> RuntimeSkillUsageSinkHealth;
 
+    /// `observe` returns only an accepted ID. Strong consumers must read the
+    /// original durable fact; missing/unsupported/error is never durable success.
+    fn durable_receipt(
+        &self,
+        _skill_id: &str,
+        _receipt_id: &str,
+    ) -> Result<Option<harness_contract::skill::SkillUsageReceipt>, String> {
+        Ok(None)
+    }
+
     fn active_pointer(
         &self,
         _skill_id: &str,

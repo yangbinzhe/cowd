@@ -800,6 +800,8 @@ pub struct RuntimeServices {
     skill_maintenance_projector: Arc<crate::SkillMaintenanceProjector>,
     event_reactor: Arc<crate::RuntimeEventReactor>,
     skill_revision_governance: Arc<crate::SkillRevisionGovernanceService>,
+    // One lazy Runtime-owned worker, never one worker per in-memory Runtime.
+    skill_usage_recorder: std::sync::Mutex<(bool, Option<Arc<crate::RuntimeSkillUsageRecorder>>)>,
     mission_evidence: Arc<MissionEvidenceBus>,
     conflict_resolver: Arc<ConflictArbiter>,
     resource_manager: Arc<ExecutionResourceManager>,
@@ -1498,6 +1500,7 @@ impl RuntimeServices {
             skill_maintenance_projector,
             event_reactor,
             skill_revision_governance,
+            skill_usage_recorder: std::sync::Mutex::new((false, None)),
             mission_evidence,
             conflict_resolver,
             resource_manager,
@@ -1826,6 +1829,11 @@ impl RuntimeServices {
 
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
+        if let Some(report) = self.shutdown_skill_usage(Duration::from_secs(5)).await {
+            if !report.clean {
+                tracing::warn!(?report, "Runtime Skill usage shutdown incomplete");
+            }
+        }
         self.approval_queue.shutdown_deadline_scheduler().await;
         let report = self.event_reactor.shutdown().await;
         if !report.timed_out_lanes.is_empty() || !report.join_errors.is_empty() {
@@ -1838,6 +1846,46 @@ impl RuntimeServices {
         self.resource_evidence_writer.shutdown_and_drain();
     }
 
+    /// The process composition root receives an observe port to this same
+    /// retained worker. Startup rollback and normal shutdown share its owner.
+    pub fn skill_usage_recorder(&self) -> Result<Arc<crate::RuntimeSkillUsageRecorder>, String> {
+        let mut slot = self
+            .skill_usage_recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.0 {
+            return Err("Runtime Skill usage intake is closed".into());
+        }
+        if slot.1.is_none() {
+            slot.1 = Some(Arc::new(
+                crate::RuntimeSkillUsageRecorder::with_pointer_cache(
+                    Arc::clone(&self.event_store),
+                    self.skill_revision_governance.pointer_cache(),
+                )
+                .map_err(|e| format!("Skill usage worker failed to start: {e}"))?,
+            ));
+        }
+        Ok(Arc::clone(slot.1.as_ref().unwrap()))
+    }
+
+    pub async fn shutdown_skill_usage(
+        &self,
+        timeout: Duration,
+    ) -> Option<crate::SkillUsageShutdownReport> {
+        let recorder = {
+            let mut slot = self
+                .skill_usage_recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.0 = true;
+            slot.1.clone()
+        };
+        match recorder {
+            Some(recorder) => Some(recorder.shutdown_and_drain(timeout).await),
+            None => None,
+        }
+    }
+
     /// Stop the one Runtime execution owner and return auditable per-owner
     /// queue/abort/error evidence to the process host.
     pub async fn shutdown_execution(&self) -> crate::RuntimeExecutionShutdownReport {
@@ -1845,6 +1893,15 @@ impl RuntimeServices {
         let mut report = self.execution_supervisor.shutdown().await;
         if let Err(error) = self.agent_runtime.drain_retained_runs().await {
             report.errors.push(error);
+        }
+        // Original Graph and retained Agent producers must physically drain
+        // before the observation intake is fenced and its writer is joined.
+        if let Some(usage) = self.shutdown_skill_usage(Duration::from_secs(5)).await {
+            if !usage.clean {
+                report
+                    .errors
+                    .push(format!("Skill usage shutdown incomplete: {usage:?}"));
+            }
         }
         report
     }
