@@ -30,6 +30,53 @@ const REVIEW_REQUESTED_KIND: &str = "skill.revision.review.requested.v1";
 const REVIEW_DECIDED_KIND: &str = "skill.revision.review.decided.v1";
 const POINTER_CHANGED_KIND: &str = "skill.revision.pointer.changed.v1";
 
+/// Original caller intent is stored with its registration. It does not carry
+/// authority; the same request ID cannot be rebound after the pointer advances.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum SkillRevisionInput {
+    Activate {
+        skill_id: String,
+        draft_id: String,
+        draft_digest: String,
+        target_revision: String,
+        validation_digest: String,
+    },
+    Rollback {
+        skill_id: String,
+        target_revision: String,
+        reason_evidence_digest: String,
+    },
+}
+
+impl SkillRevisionInput {
+    fn matches_review(&self, review: &SkillRevisionReview) -> bool {
+        match self {
+            Self::Activate {
+                skill_id,
+                draft_id,
+                target_revision,
+                ..
+            } => {
+                review.action == SkillRevisionReviewAction::Activate
+                    && review.skill_id == *skill_id
+                    && review.draft_id.as_deref() == Some(draft_id.as_str())
+                    && review.target_revision == *target_revision
+            }
+            Self::Rollback {
+                skill_id,
+                target_revision,
+                ..
+            } => {
+                review.action == SkillRevisionReviewAction::Rollback
+                    && review.skill_id == *skill_id
+                    && review.draft_id.is_none()
+                    && review.target_revision == *target_revision
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SkillRevisionGovernanceError {
     #[error("interactive human capability skill.revision.manage is required")]
@@ -53,6 +100,8 @@ pub enum SkillRevisionGovernanceError {
 pub struct SkillRevisionGovernanceService {
     event_store: Arc<RuntimeEventStore>,
     approvals: Arc<ApprovalQueue>,
+    #[cfg(test)]
+    decision_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SkillRevisionGovernanceService {
@@ -61,6 +110,8 @@ impl SkillRevisionGovernanceService {
         Self {
             event_store,
             approvals,
+            #[cfg(test)]
+            decision_read_hook: None,
         }
     }
 
@@ -92,6 +143,16 @@ impl SkillRevisionGovernanceService {
                     .to_string(),
             ));
         }
+        let input = SkillRevisionInput::Activate {
+            skill_id: draft.skill_id.clone(),
+            draft_id: draft.draft_id.clone(),
+            draft_digest: draft.digest(),
+            target_revision: target_revision.into(),
+            validation_digest: validation_digest.into(),
+        };
+        if let Some(existing) = self.existing_request(request_id, &input)? {
+            return Ok(existing);
+        }
         self.request_review(
             request_id,
             SkillRevisionReviewAction::Activate,
@@ -104,6 +165,8 @@ impl SkillRevisionGovernanceService {
                 "validation_digest": validation_digest,
                 "target_revision": target_revision,
             })),
+            self.pointer_snapshot(&draft.skill_id)?,
+            input,
         )
     }
 
@@ -116,7 +179,24 @@ impl SkillRevisionGovernanceService {
         reason_evidence_digest: &str,
     ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
         require_human(principal)?;
-        let pointer = self.pointer(skill_id)?.ok_or_else(|| {
+        if request_id.trim().is_empty()
+            || target_revision.trim().is_empty()
+            || reason_evidence_digest.trim().is_empty()
+        {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "rollback input is required".into(),
+            ));
+        }
+        let input = SkillRevisionInput::Rollback {
+            skill_id: skill_id.into(),
+            target_revision: target_revision.into(),
+            reason_evidence_digest: reason_evidence_digest.into(),
+        };
+        if let Some(existing) = self.existing_request(request_id, &input)? {
+            return Ok(existing);
+        }
+        let pointer_cut = self.pointer_snapshot(skill_id)?;
+        let pointer = pointer_cut.0.as_ref().ok_or_else(|| {
             SkillRevisionGovernanceError::InvalidRequest("no active pointer".into())
         })?;
         if request_id.trim().is_empty()
@@ -140,6 +220,8 @@ impl SkillRevisionGovernanceService {
                 "active_pointer": pointer,
                 "reason_evidence_digest": reason_evidence_digest,
             })),
+            pointer_cut,
+            input,
         )
     }
 
@@ -152,11 +234,10 @@ impl SkillRevisionGovernanceService {
         target_revision: &str,
         previous_revision: Option<String>,
         evidence_digest: &str,
+        pointer_cut: (Option<SkillActivePointer>, u64),
+        input: SkillRevisionInput,
     ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
         let review_id = format!("skill-revision-review:{}", request_id.trim());
-        if let Ok(existing) = self.review(&review_id) {
-            return Ok(existing);
-        }
         let review = SkillRevisionReview {
             review_id: review_id.clone(),
             approval_id: format!("approval:{review_id}"),
@@ -166,13 +247,16 @@ impl SkillRevisionGovernanceService {
             target_revision: target_revision.to_string(),
             previous_revision,
             evidence_digest: evidence_digest.to_string(),
-            expected_generation: self
-                .pointer(skill_id)?
-                .map(|pointer| pointer.generation)
-                .unwrap_or_default(),
+            expected_generation: pointer_cut
+                .0
+                .as_ref()
+                .map_or(0, |pointer| pointer.generation),
             status: SkillRevisionReviewStatus::Pending,
             created_at_ms: now_ms(),
         };
+        if let Some(existing) = self.existing_request(request_id, &input)? {
+            return Ok(existing);
+        }
         let approval = GlobalApprovalRequest {
             approval_id: review.approval_id.clone(),
             context: harness_contract::policy::ApprovalContext::owned(
@@ -219,17 +303,22 @@ impl SkillRevisionGovernanceService {
         };
         let approval_stream = format!("approval:{}", review.approval_id);
         let review_stream = review_stream(&review.review_id);
-        self.event_store
+        let appended = self
+            .event_store
             .append_transaction(AppendTransactionRequest {
                 transaction_id: format!("skill-revision-request:{}", review.review_id),
                 expected_streams: vec![
                     ExpectedStreamRevision {
                         stream_id: approval_stream.clone(),
-                        expected_revision: self.revision(&approval_stream)?,
+                        expected_revision: 0,
                     },
                     ExpectedStreamRevision {
                         stream_id: review_stream.clone(),
-                        expected_revision: self.revision(&review_stream)?,
+                        expected_revision: 0,
+                    },
+                    ExpectedStreamRevision {
+                        stream_id: pointer_stream(skill_id),
+                        expected_revision: pointer_cut.1,
                     },
                 ],
                 events: vec![
@@ -250,12 +339,20 @@ impl SkillRevisionGovernanceService {
                         status: Some("pending".to_string()),
                         actor: Some("runtime.skill_revision_governance".to_string()),
                         refs: vec![skill_ref(&review.skill_id)],
-                        payload: json!({"review": review}),
+                        payload: json!({"review": review, "input": input}),
                     }
                     .into(),
                 ],
-            })
-            .map_err(|error| SkillRevisionGovernanceError::Store(error.to_string()))?;
+            });
+        if let Err(error) = appended {
+            // Another identical request (or a lost response) may already have
+            // committed. Reuse only its exact original intent, never a new head.
+            return match self.existing_request(request_id, &input) {
+                Ok(Some(existing)) => Ok(existing),
+                Ok(None) => Err(SkillRevisionGovernanceError::Store(error.to_string())),
+                Err(error) => Err(error),
+            };
+        }
         self.approvals.refresh();
         Ok(review)
     }
@@ -269,7 +366,12 @@ impl SkillRevisionGovernanceService {
         reason: &str,
     ) -> Result<Option<SkillActivePointer>, SkillRevisionGovernanceError> {
         require_human(principal)?;
-        let review = self.review(review_id)?;
+        let (review, review_revision, input) = self.review_snapshot(review_id)?;
+        if decision == SkillRevisionReviewDecision::Approve && input.is_none() {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "original Skill caller input is unavailable".into(),
+            ));
+        }
         if review.status != SkillRevisionReviewStatus::Pending {
             return Err(SkillRevisionGovernanceError::ReviewNotPending);
         }
@@ -280,7 +382,7 @@ impl SkillRevisionGovernanceService {
         {
             return Err(SkillRevisionGovernanceError::HumanCapabilityRequired);
         }
-        let current = self.pointer(&review.skill_id)?;
+        let (current, pointer_revision) = self.pointer_snapshot(&review.skill_id)?;
         let current_generation = current
             .as_ref()
             .map(|pointer| pointer.generation)
@@ -288,11 +390,41 @@ impl SkillRevisionGovernanceService {
         if current_generation != review.expected_generation {
             return Err(SkillRevisionGovernanceError::GenerationChanged);
         }
-        let approval = self
-            .approvals
-            .get(&review.approval_id)
+        #[cfg(test)]
+        if let Some(hook) = &self.decision_read_hook {
+            hook();
+        }
+        // The original pending submission, not a cached queue projection or a
+        // freshly rebound stream head, is the decision's approval read cut.
+        let approval_stream = format!("approval:{}", review.approval_id);
+        let approval_event = self
+            .event_store
+            .list_stream_page_desc(&approval_stream, 1, 0)
+            .map_err(SkillRevisionGovernanceError::Store)?
+            .into_iter()
+            .next()
             .ok_or(SkillRevisionGovernanceError::ReviewNotFound)?;
-        if approval.status != GlobalApprovalStatus::Pending {
+        if approval_event.kind != "approval.submitted"
+            || approval_event.scope != RuntimeEventScope::Approval
+            || approval_event.sequence != 1
+            || approval_event.status.as_deref() != Some("pending")
+            || approval_event.stream_id != approval_stream
+            || approval_event.actor.as_deref() != Some("runtime.skill_revision_governance")
+        {
+            return Err(SkillRevisionGovernanceError::ReviewNotPending);
+        }
+        let approval: GlobalApprovalRequest =
+            serde_json::from_value(approval_event.payload.get("request").cloned().ok_or_else(
+                || SkillRevisionGovernanceError::Store("Skill approval source is missing".into()),
+            )?)
+            .map_err(|error| SkillRevisionGovernanceError::Store(error.to_string()))?;
+        if approval.status != GlobalApprovalStatus::Pending
+            || approval.approval_id != review.approval_id
+            || approval.action != review.action.action_key()
+            || approval.source.review_ref.as_deref() != Some(review.review_id.as_str())
+            || approval.source.resource_ref.as_deref() != Some(review.scope_ref().as_str())
+            || approval.evidence_refs != vec![review.evidence_digest.clone()]
+        {
             return Err(SkillRevisionGovernanceError::ReviewNotPending);
         }
         let approved = decision == SkillRevisionReviewDecision::Approve;
@@ -312,11 +444,11 @@ impl SkillRevisionGovernanceService {
         let mut expected_streams = vec![
             ExpectedStreamRevision {
                 stream_id: approval_stream.clone(),
-                expected_revision: self.revision(&approval_stream)?,
+                expected_revision: approval_event.sequence,
             },
             ExpectedStreamRevision {
                 stream_id: review_stream.clone(),
-                expected_revision: self.revision(&review_stream)?,
+                expected_revision: review_revision,
             },
         ];
         let mut events = vec![
@@ -349,7 +481,7 @@ impl SkillRevisionGovernanceService {
         if let Some(pointer) = pointer.as_ref() {
             expected_streams.push(ExpectedStreamRevision {
                 stream_id: pointer_stream.clone(),
-                expected_revision: self.revision(&pointer_stream)?,
+                expected_revision: pointer_revision,
             });
             events.push(
                 RuntimeEventInput {
@@ -385,38 +517,148 @@ impl SkillRevisionGovernanceService {
         &self,
         review_id: &str,
     ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
-        let events = self
-            .event_store
-            .list_stream(&review_stream(review_id))
-            .map_err(SkillRevisionGovernanceError::Store)?;
-        let mut review: SkillRevisionReview = events
-            .iter()
-            .find(|event| event.kind == REVIEW_REQUESTED_KIND)
-            .and_then(|event| event.payload.get("review"))
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .ok_or(SkillRevisionGovernanceError::ReviewNotFound)?;
-        if let Some(decision) = events
-            .iter()
-            .rev()
-            .find(|event| event.kind == REVIEW_DECIDED_KIND)
-            .and_then(|event| event.payload.get("decision"))
-            .cloned()
-            .and_then(|value| serde_json::from_value::<SkillRevisionReviewDecision>(value).ok())
-        {
-            review.status = match decision {
-                SkillRevisionReviewDecision::Approve => SkillRevisionReviewStatus::Approved,
-                SkillRevisionReviewDecision::Deny => SkillRevisionReviewStatus::Denied,
-            };
-        } else if self
-            .pointer(&review.skill_id)?
-            .map(|pointer| pointer.generation)
-            .unwrap_or_default()
-            != review.expected_generation
+        let (mut review, _, _) = self.review_snapshot(review_id)?;
+        if review.status == SkillRevisionReviewStatus::Pending
+            && self
+                .pointer(&review.skill_id)?
+                .map_or(0, |pointer| pointer.generation)
+                != review.expected_generation
         {
             review.status = SkillRevisionReviewStatus::Superseded;
         }
         Ok(review)
+    }
+
+    fn review_snapshot(
+        &self,
+        review_id: &str,
+    ) -> Result<(SkillRevisionReview, u64, Option<SkillRevisionInput>), SkillRevisionGovernanceError>
+    {
+        let stream = review_stream(review_id);
+        // This protocol writes one request and at most one terminal decision.
+        // Fetching a third detects an invalid source instead of ignoring it.
+        let mut events = self
+            .event_store
+            .list_stream_page_desc(&stream, 3, 0)
+            .map_err(SkillRevisionGovernanceError::Store)?;
+        if events.is_empty() {
+            return Err(SkillRevisionGovernanceError::ReviewNotFound);
+        }
+        if events.len() > 2 {
+            return Err(SkillRevisionGovernanceError::Store(
+                "invalid Skill review journal".into(),
+            ));
+        }
+        let revision = events[0].sequence;
+        events.reverse();
+        let requested = &events[0];
+        if requested.kind != REVIEW_REQUESTED_KIND
+            || requested.stream_id != stream
+            || requested.scope != RuntimeEventScope::Skill
+            || requested.sequence != 1
+            || requested.status.as_deref() != Some("pending")
+            || requested.actor.as_deref() != Some("runtime.skill_revision_governance")
+        {
+            return Err(SkillRevisionGovernanceError::Store(
+                "invalid Skill review source".into(),
+            ));
+        }
+        let mut review: SkillRevisionReview =
+            serde_json::from_value(requested.payload.get("review").cloned().ok_or_else(|| {
+                SkillRevisionGovernanceError::Store("Skill review payload is missing".into())
+            })?)
+            .map_err(|error| SkillRevisionGovernanceError::Store(error.to_string()))?;
+        if review.review_id != stream
+            || review.approval_id != format!("approval:{stream}")
+            || review.status != SkillRevisionReviewStatus::Pending
+        {
+            return Err(SkillRevisionGovernanceError::Store(
+                "Skill review identity mismatch".into(),
+            ));
+        }
+        if let Some(event) = events.get(1) {
+            if event.kind != REVIEW_DECIDED_KIND
+                || event.stream_id != stream
+                || event.scope != RuntimeEventScope::Skill
+                || event.sequence != 2
+            {
+                return Err(SkillRevisionGovernanceError::Store(
+                    "unknown Skill review tail".into(),
+                ));
+            }
+            let decision: SkillRevisionReviewDecision = serde_json::from_value(
+                event.payload.get("decision").cloned().ok_or_else(|| {
+                    SkillRevisionGovernanceError::Store("Skill decision payload is missing".into())
+                })?,
+            )
+            .map_err(|error| SkillRevisionGovernanceError::Store(error.to_string()))?;
+            let expected_status = match decision {
+                SkillRevisionReviewDecision::Approve => "approved",
+                SkillRevisionReviewDecision::Deny => "denied",
+            };
+            if event.status.as_deref() != Some(expected_status)
+                || event.actor.as_deref().is_none_or(|actor| actor.is_empty())
+            {
+                return Err(SkillRevisionGovernanceError::Store(
+                    "Skill decision identity/status mismatch".into(),
+                ));
+            }
+            review.status = match decision {
+                SkillRevisionReviewDecision::Approve => SkillRevisionReviewStatus::Approved,
+                SkillRevisionReviewDecision::Deny => SkillRevisionReviewStatus::Denied,
+            };
+        }
+        let input: Option<SkillRevisionInput> = requested
+            .payload
+            .get("input")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| SkillRevisionGovernanceError::Store(error.to_string()))?;
+        if input
+            .as_ref()
+            .is_some_and(|input| !input.matches_review(&review))
+        {
+            return Err(SkillRevisionGovernanceError::Store(
+                "Skill input/review identity mismatch".into(),
+            ));
+        }
+        Ok((review, revision, input))
+    }
+
+    fn existing_request(
+        &self,
+        request_id: &str,
+        input: &SkillRevisionInput,
+    ) -> Result<Option<SkillRevisionReview>, SkillRevisionGovernanceError> {
+        let (mut review, _, original) =
+            match self.review_snapshot(&format!("{REVIEW_STREAM_PREFIX}{}", request_id.trim())) {
+                Ok(snapshot) => snapshot,
+                Err(SkillRevisionGovernanceError::ReviewNotFound) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        if original.as_ref() != Some(input) {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "Skill request ID has different or unavailable original input".into(),
+            ));
+        }
+        if review.status == SkillRevisionReviewStatus::Pending
+            && self
+                .pointer(&review.skill_id)?
+                .map_or(0, |pointer| pointer.generation)
+                != review.expected_generation
+        {
+            review.status = SkillRevisionReviewStatus::Superseded;
+        }
+        Ok(Some(review))
+    }
+
+    fn pointer_snapshot(
+        &self,
+        skill_id: &str,
+    ) -> Result<(Option<SkillActivePointer>, u64), SkillRevisionGovernanceError> {
+        pointer_snapshot_from_store(&self.event_store, skill_id)
+            .map_err(SkillRevisionGovernanceError::Store)
     }
 
     pub fn pointer(
@@ -426,32 +668,47 @@ impl SkillRevisionGovernanceService {
         active_pointer_from_store(&self.event_store, skill_id)
             .map_err(SkillRevisionGovernanceError::Store)
     }
-
-    fn revision(&self, stream: &str) -> Result<u64, SkillRevisionGovernanceError> {
-        self.event_store
-            .stream_revision(stream)
-            .map_err(|error| SkillRevisionGovernanceError::Store(error.to_string()))
-    }
 }
 
 pub(crate) fn active_pointer_from_store(
     event_store: &RuntimeEventStore,
     skill_id: &str,
 ) -> Result<Option<SkillActivePointer>, String> {
-    event_store
-        .list_stream_page_desc(&pointer_stream(skill_id), 1, 0)
-        .map_err(|error| error.to_string())?
+    pointer_snapshot_from_store(event_store, skill_id).map(|(pointer, _)| pointer)
+}
+
+fn pointer_snapshot_from_store(
+    event_store: &RuntimeEventStore,
+    skill_id: &str,
+) -> Result<(Option<SkillActivePointer>, u64), String> {
+    let stream = pointer_stream(skill_id);
+    let Some(event) = event_store
+        .list_stream_page_desc(&stream, 1, 0)?
         .into_iter()
-        .find(|event| event.kind == POINTER_CHANGED_KIND)
-        .map(|event| {
-            event
-                .payload
-                .get("pointer")
-                .cloned()
-                .ok_or_else(|| "Skill active pointer payload is missing".to_string())
-                .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
-        })
-        .transpose()
+        .next()
+    else {
+        return Ok((None, 0));
+    };
+    if event.kind != POINTER_CHANGED_KIND
+        || event.stream_id != stream
+        || event.scope != RuntimeEventScope::Skill
+        || event.status.as_deref() != Some("active")
+        || event.actor.as_deref() != Some("runtime.skill_revision_governance")
+    {
+        return Err("unknown Skill pointer source".into());
+    }
+    let pointer: SkillActivePointer = serde_json::from_value(
+        event
+            .payload
+            .get("pointer")
+            .cloned()
+            .ok_or("Skill pointer payload is missing")?,
+    )
+    .map_err(|error| error.to_string())?;
+    if pointer.skill_id != skill_id || pointer.generation != event.sequence {
+        return Err("Skill pointer source identity/generation mismatch".into());
+    }
+    Ok((Some(pointer), event.sequence))
 }
 
 fn require_human(principal: &VerifiedPrincipal) -> Result<(), SkillRevisionGovernanceError> {
@@ -611,6 +868,146 @@ mod tests {
     }
 
     #[test]
+    fn competing_review_between_pointer_read_and_commit_cannot_rebind_the_cut() {
+        let mut loser = service();
+        let winner = Arc::new(SkillRevisionGovernanceService::new(
+            Arc::clone(&loser.event_store),
+            Arc::clone(&loser.approvals),
+        ));
+        let principal = crate::security::test_human_interactive_principal();
+        let first = winner
+            .request_activation(&principal, "winner", &draft(), "1.2.0", "sha256:first")
+            .unwrap();
+        let second = loser
+            .request_activation(&principal, "loser", &draft(), "1.1.0", "sha256:second")
+            .unwrap();
+        loser.decision_read_hook = Some(Arc::new(move || {
+            winner
+                .decide_review(
+                    &crate::security::test_human_interactive_principal(),
+                    &lease(&first),
+                    &first.review_id,
+                    SkillRevisionReviewDecision::Approve,
+                    "first wins",
+                )
+                .unwrap();
+        }));
+        assert!(loser
+            .decide_review(
+                &principal,
+                &lease(&second),
+                &second.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "must not replace winner"
+            )
+            .is_err());
+        let pointer = loser.pointer("review").unwrap().unwrap();
+        assert_eq!(pointer.active_revision, "1.2.0");
+        assert_eq!(pointer.generation, 1);
+        assert_eq!(
+            loser
+                .event_store
+                .stream_event_count(&pointer_stream("review"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            loser.review(&second.review_id).unwrap().status,
+            SkillRevisionReviewStatus::Superseded
+        );
+    }
+
+    #[test]
+    fn same_request_replays_but_changed_scope_package_or_evidence_cannot_borrow_it() {
+        let service = service();
+        let principal = crate::security::test_human_interactive_principal();
+        let original = service
+            .request_activation(&principal, "same", &draft(), "1.1.0", "sha256:inspection")
+            .unwrap();
+        assert_eq!(
+            service
+                .request_activation(&principal, "same", &draft(), "1.1.0", "sha256:inspection")
+                .unwrap(),
+            original
+        );
+        let mut foreign = draft();
+        foreign.skill_id = "foreign".into();
+        let mut other_draft = draft();
+        other_draft.draft_id = "other-draft".into();
+        for (input, target, evidence) in [
+            (foreign, "1.1.0", "sha256:inspection"),
+            (other_draft, "1.1.0", "sha256:inspection"),
+            (draft(), "1.2.0", "sha256:inspection"),
+            (draft(), "1.1.0", "sha256:other"),
+        ] {
+            assert!(matches!(
+                service.request_activation(&principal, "same", &input, target, evidence),
+                Err(SkillRevisionGovernanceError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(
+            service
+                .event_store
+                .stream_event_count(&review_stream(&original.review_id))
+                .unwrap(),
+            1
+        );
+        assert!(service.pointer("review").unwrap().is_none());
+    }
+
+    #[test]
+    fn unknown_pointer_and_terminal_approval_cannot_become_absent_or_pending() {
+        let service = service();
+        let principal = crate::security::test_human_interactive_principal();
+        let review = service
+            .request_activation(&principal, "denied", &draft(), "1.1.0", "sha256:inspection")
+            .unwrap();
+        // Retain the old queue cache while the original journal advances.
+        assert_eq!(
+            service.approvals.get(&review.approval_id).unwrap().status,
+            GlobalApprovalStatus::Pending
+        );
+        service
+            .event_store
+            .append(RuntimeEventInput {
+                stream_id: format!("approval:{}", review.approval_id),
+                scope: RuntimeEventScope::Approval,
+                kind: "approval.decided".into(),
+                status: Some("denied".into()),
+                actor: Some("other-human".into()),
+                refs: vec![],
+                payload: json!({"approved":false}),
+            })
+            .unwrap();
+        assert!(service
+            .decide_review(
+                &principal,
+                &lease(&review),
+                &review.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "cached pending is not authority"
+            )
+            .is_err());
+        assert!(service.pointer("review").unwrap().is_none());
+        service
+            .event_store
+            .append(RuntimeEventInput {
+                stream_id: pointer_stream("review"),
+                scope: RuntimeEventScope::Skill,
+                kind: "foreign.pointer.event".into(),
+                status: None,
+                actor: None,
+                refs: vec![],
+                payload: json!({}),
+            })
+            .unwrap();
+        assert!(service.pointer("review").is_err());
+        assert!(service
+            .request_activation(&principal, "fresh", &draft(), "1.1.0", "sha256:inspection")
+            .is_err());
+    }
+
+    #[test]
     fn activation_and_rollback_require_human_lease_and_advance_generation() {
         let service = service();
         let principal = crate::security::test_human_interactive_principal();
@@ -660,6 +1057,28 @@ mod tests {
         assert_eq!(rolled_back.active_revision, "1.0.0");
         assert_eq!(rolled_back.previous_revision.as_deref(), Some("1.1.0"));
         assert_eq!(rolled_back.generation, 2);
+        let replay = service
+            .request_rollback(
+                &principal,
+                "rollback",
+                "review",
+                "1.0.0",
+                "sha256:regression",
+            )
+            .expect("lost rollback response replays original request before reading new pointer");
+        assert_eq!(replay.review_id, rollback.review_id);
+        assert_eq!(replay.status, SkillRevisionReviewStatus::Approved);
+        for (skill, target, reason) in [
+            ("review", "1.2.0", "sha256:regression"),
+            ("review", "1.0.0", "sha256:changed"),
+            ("foreign", "1.0.0", "sha256:regression"),
+        ] {
+            assert!(matches!(
+                service.request_rollback(&principal, "rollback", skill, target, reason),
+                Err(SkillRevisionGovernanceError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(service.pointer("review").unwrap().unwrap(), rolled_back);
     }
 
     #[test]
@@ -689,7 +1108,7 @@ mod tests {
                 SkillRevisionReviewDecision::Approve,
                 "stale",
             ),
-            Err(SkillRevisionGovernanceError::ReviewNotPending)
+            Err(SkillRevisionGovernanceError::GenerationChanged)
         ));
         assert_eq!(
             service
