@@ -95,7 +95,7 @@ pub enum SessionMessageReceiptUnavailableReason {
     TerminalInputMismatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(tag = "source", rename = "session_snapshot", deny_unknown_fields)]
 pub struct SessionReceiptSessionObservation {
     pub request_id: String,
@@ -104,6 +104,42 @@ pub struct SessionReceiptSessionObservation {
     pub input_sequence: String,
     pub presence_revision: String,
     pub observed_at_ms: u64,
+}
+
+// An internally tagged struct's derived deserializer rejects its own tag
+// together with deny_unknown_fields. Keep the public wire/schema unchanged and
+// decode through a closed tagged variant so source remains mandatory and exact.
+impl<'de> Deserialize<'de> for SessionReceiptSessionObservation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            SessionSnapshot {
+                request_id: String,
+                turn_id: String,
+                session_generation: String,
+                input_sequence: String,
+                presence_revision: String,
+                observed_at_ms: u64,
+            },
+        }
+        let Wire::SessionSnapshot {
+            request_id,
+            turn_id,
+            session_generation,
+            input_sequence,
+            presence_revision,
+            observed_at_ms,
+        } = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            request_id,
+            turn_id,
+            session_generation,
+            input_sequence,
+            presence_revision,
+            observed_at_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -163,6 +199,60 @@ pub enum SessionMessageReceiptContext {
 #[cfg(test)]
 mod receipt_wire_tests {
     use super::*;
+
+    fn snapshot_wire() -> serde_json::Value {
+        serde_json::json!({
+            "source":"session_snapshot", "request_id":"request", "turn_id":"turn",
+            "session_generation":"9007199254740993", "input_sequence":"7",
+            "presence_revision":"11", "observed_at_ms":13
+        })
+    }
+
+    #[test]
+    fn receipt_snapshot_round_trips_the_exact_public_source_tag() {
+        let snapshot = SessionReceiptSessionObservation {
+            request_id: "request".into(),
+            turn_id: "turn".into(),
+            session_generation: "9007199254740993".into(),
+            input_sequence: "7".into(),
+            presence_revision: "11".into(),
+            observed_at_ms: 13,
+        };
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), snapshot_wire());
+        assert_eq!(
+            serde_json::from_value::<SessionReceiptSessionObservation>(snapshot_wire()).unwrap(),
+            snapshot
+        );
+        let context_wire = serde_json::json!({
+            "status":"available", "payload_kind":"session-public-v1", "payload_json":"{}",
+            "session_id":"session", "message_id":"message", "client_id":"client",
+            "message_sequence":"17", "runtime_commit_cursor":"9007199254740993",
+            "content_digest":"session-public-v1:sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "receipt":null, "session_source":snapshot_wire(),
+            "outbox_observation":{"source":"runtime_outbox_unknown"}
+        });
+        let decoded: SessionMessageReceiptContext =
+            serde_json::from_value(context_wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), context_wire);
+    }
+
+    #[test]
+    fn receipt_snapshot_rejects_missing_foreign_and_unknown_source_fields() {
+        for (field, value) in [
+            ("source", serde_json::json!("runtime_outbox")),
+            ("unexpected", serde_json::json!(true)),
+            ("observed_at_ms", serde_json::json!("13")),
+        ] {
+            let mut wire = snapshot_wire();
+            wire[field] = value;
+            assert!(serde_json::from_value::<SessionReceiptSessionObservation>(wire).is_err());
+        }
+        for field in ["source", "request_id", "session_generation"] {
+            let mut wire = snapshot_wire();
+            wire.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<SessionReceiptSessionObservation>(wire).is_err());
+        }
+    }
 
     #[test]
     fn r1_message_ack_wire_is_closed_and_cursor_is_lossless() {
