@@ -14,7 +14,7 @@ case "$LANE" in
 Usage: scripts/validate.sh [quick|changed-crates|full-regression|contract|serial-global|scenario|surface|release|all|manual <name>]
 
 Lanes:
-	  quick      current default edit gate: fmt, workspace check, static architecture/governance, small boundary crates
+	  quick      current edit gate: fmt, static architecture/governance, discovered small boundary targets
   changed-crates  precise touched-crate gate; base defaults to HEAD or COWD_CHANGED_BASE
   full-regression final Rust regression: parallel workspace tests plus isolated global-state tests
   contract   package/API/CLI contracts without browser or tmux scenarios
