@@ -11,7 +11,7 @@ fn plan736_context() -> AgenticDispatchContext {
 }
 
 #[tokio::test]
-async fn plan736_dispatch_future_boundary_is_pointer_sized_without_polling() {
+async fn plan736_unpolled_dispatch_is_small_and_missing_program_never_admits() {
     let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
     let envelope = super::reviewed_goal_fixture::root(
         "plan736-unpolled",
@@ -34,28 +34,20 @@ async fn plan736_dispatch_future_boundary_is_pointer_sized_without_polling() {
             .unwrap()
             .is_none()
     );
-}
-
-#[tokio::test]
-async fn plan736_missing_program_is_an_error_not_an_implicit_provider_dispatch() {
-    let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
-    let envelope = super::reviewed_goal_fixture::root(
-        "plan736-negative",
-        AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
-            query: None,
-            wait_for_workers: false,
-            scope_ref: None,
-            after_revision: None,
-            page_cursor: None,
-            entry_ref: None,
-        }),
-    );
     assert!(
         services
             .dispatch_agentic_followups(&envelope, plan736_context())
             .await
             .is_err()
     );
+    assert!(
+        services
+            .agent_action_service()
+            .project_if_exists(&envelope.actor.program_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(services.agent_runtime().list().is_empty());
 }
 
 #[test]
