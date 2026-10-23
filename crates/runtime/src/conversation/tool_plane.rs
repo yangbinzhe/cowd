@@ -3,6 +3,18 @@
 use super::*;
 use std::sync::Mutex;
 
+/// Construct each responsibility future outside its caller's poll frame. The
+/// factory only allocates; polling stays in the original task and cancel scope.
+#[inline(never)]
+fn boxed_tool_future<'future, F>(
+    build: impl FnOnce() -> F,
+) -> GovernedToolFuture<'future, F::Output>
+where
+    F: std::future::Future + Send + 'future,
+{
+    Box::pin(build())
+}
+
 pub(crate) struct RootNodeActivityRuntime<'runtime, C, T> {
     runtime: &'runtime mut ConversationRuntime<C, T>,
     original_bus: Option<Arc<crate::CowdEventBus>>,
@@ -466,7 +478,7 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
         task: &'future crate::GovernedToolPlanTask,
         admission: &'future mut Self::Admission,
     ) -> GovernedToolFuture<'future, Result<Self::Output, String>> {
-        Box::pin(async move {
+        boxed_tool_future(|| async move {
             let input = self
                 .inner
                 .pending_tool_uses
@@ -1841,77 +1853,102 @@ where
         .await
     }
 
-    async fn execute_single_tool_at(
-        &self,
-        task: &crate::governed_tool_plan::GovernedToolPlanTask,
-        plan_id: &str,
+    #[inline(never)]
+    fn execute_single_tool_at<'tool>(
+        &'tool self,
+        task: &'tool crate::governed_tool_plan::GovernedToolPlanTask,
+        plan_id: &'tool str,
         plan_revision: u64,
-        input: &str,
-        prompter: &crate::permissions::SharedPrompter,
+        input: &'tool str,
+        prompter: &'tool crate::permissions::SharedPrompter,
         iterations: usize,
-        retained_admission: &mut Option<crate::ToolExecutionAdmission>,
-        caller_owner: Option<&(harness_contract::projection::RuntimeActivityBinding, u32)>,
-        preflight_refusals: Option<&Mutex<Vec<(String, String)>>>,
-    ) -> Result<ConversationMessage, RuntimeError>
+        retained_admission: &'tool mut Option<crate::ToolExecutionAdmission>,
+        caller_owner: Option<&'tool (harness_contract::projection::RuntimeActivityBinding, u32)>,
+        preflight_refusals: Option<&'tool Mutex<Vec<(String, String)>>>,
+    ) -> GovernedToolFuture<'tool, Result<ConversationMessage, RuntimeError>>
     where
         C: Sync,
     {
-        let tool_use_id = task.tool_call_id.as_str();
-        let tool_name = task.tool_name.as_str();
-        let refusal = self.blocked_repeated_call(tool_name, tool_use_id, input, iterations);
-        if let Some(refusal) = refusal {
-            self.note_refusal_ignored(tool_name, input);
-            return Ok(refusal);
-        }
-        let (pre_hook_result, effective_input, model_delivery_requirement, mut permission_context) =
-            self.prepare_tool_call(tool_name, input);
-        let effective_value = harness_contract::step::parse_strict_json(&effective_input)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-        if effective_value != task.invocation.intent.normalized_input {
-            return Err(RuntimeError::new("effective_input_requires_replan"));
-        }
-        if pre_hook_result.is_cancelled() {
-            permission_context = PermissionContext::new(
-                Some(crate::permissions::PermissionOverride::Deny),
-                Some(format!("PreToolUse hook cancelled tool `{tool_name}`")),
-            );
-        } else if pre_hook_result.is_failed() {
-            let hook_msgs = pre_hook_result.messages().join("; ");
-            permission_context = PermissionContext::new(
-                Some(crate::permissions::PermissionOverride::Deny),
-                Some(if hook_msgs.is_empty() {
-                    format!("PreToolUse hook failed for tool `{tool_name}`")
-                } else {
-                    format!("PreToolUse hook failed for tool `{tool_name}`: {hook_msgs}")
-                }),
-            );
-        } else if pre_hook_result.is_denied() {
-            permission_context = PermissionContext::new(
-                Some(crate::permissions::PermissionOverride::Deny),
-                Some(format!("PreToolUse hook denied tool `{tool_name}`")),
-            );
-        }
-        let profile_timeout = Duration::from_secs(task.safety_category.default_timeout_secs());
-        let tool_timeout = self
-            .tool_timeout
-            .map_or(profile_timeout, |timeout| timeout.min(profile_timeout));
-        let authorization_id = format!(
-            "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
-            self.session_id()
-        );
-        let authorization_decision = self
-            .negotiate_tool_authorization(
-                &task.effect,
-                &effective_input,
-                authorization_id,
-                permission_context,
-                tool_timeout.as_secs(),
-                prompter,
-            )
+        boxed_tool_future(|| async move {
+            let tool_use_id = task.tool_call_id.as_str();
+            let tool_name = task.tool_name.as_str();
+            let refusal = self.blocked_repeated_call(tool_name, tool_use_id, input, iterations);
+            if let Some(refusal) = refusal {
+                self.note_refusal_ignored(tool_name, input);
+                return Ok(refusal);
+            }
+            let (
+                pre_hook_result,
+                effective_input,
+                model_delivery_requirement,
+                tool_timeout,
+                authorization_decision,
+            ) = boxed_tool_future(|| async {
+                let (
+                    pre_hook_result,
+                    effective_input,
+                    model_delivery_requirement,
+                    mut permission_context,
+                ) = self.prepare_tool_call(tool_name, input);
+                let effective_value = harness_contract::step::parse_strict_json(&effective_input)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                if effective_value != task.invocation.intent.normalized_input {
+                    return Err(RuntimeError::new("effective_input_requires_replan"));
+                }
+                if pre_hook_result.is_cancelled() {
+                    permission_context = PermissionContext::new(
+                        Some(crate::permissions::PermissionOverride::Deny),
+                        Some(format!("PreToolUse hook cancelled tool `{tool_name}`")),
+                    );
+                } else if pre_hook_result.is_failed() {
+                    let hook_msgs = pre_hook_result.messages().join("; ");
+                    permission_context = PermissionContext::new(
+                        Some(crate::permissions::PermissionOverride::Deny),
+                        Some(if hook_msgs.is_empty() {
+                            format!("PreToolUse hook failed for tool `{tool_name}`")
+                        } else {
+                            format!("PreToolUse hook failed for tool `{tool_name}`: {hook_msgs}")
+                        }),
+                    );
+                } else if pre_hook_result.is_denied() {
+                    permission_context = PermissionContext::new(
+                        Some(crate::permissions::PermissionOverride::Deny),
+                        Some(format!("PreToolUse hook denied tool `{tool_name}`")),
+                    );
+                }
+                let profile_timeout =
+                    Duration::from_secs(task.safety_category.default_timeout_secs());
+                let tool_timeout = self
+                    .tool_timeout
+                    .map_or(profile_timeout, |timeout| timeout.min(profile_timeout));
+                let authorization_id = format!(
+                    "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
+                    self.session_id()
+                );
+                let authorization_decision = self
+                    .negotiate_tool_authorization(
+                        &task.effect,
+                        &effective_input,
+                        authorization_id,
+                        permission_context,
+                        tool_timeout.as_secs(),
+                        prompter,
+                    )
+                    .await?;
+
+                Ok::<_, RuntimeError>((
+                    pre_hook_result,
+                    effective_input,
+                    model_delivery_requirement,
+                    tool_timeout,
+                    authorization_decision,
+                ))
+            })
             .await?;
 
-        match authorization_decision {
-            ToolAuthorizationDecision::Authorized(authorization) => {
+            match authorization_decision {
+                ToolAuthorizationDecision::Authorized(authorization) => {
+                    let (execution, invocation_record, start, tname_for_err) = boxed_tool_future(|| async {
                 let execution_policy = self.permission_policy.execution_policy_control().snapshot();
                 if execution_policy.revision != authorization.authorization.policy_revision {
                     return Err(RuntimeError::new(format!(
@@ -2094,8 +2131,8 @@ where
                         let effect_request = &effect_request;
                         let root = root.as_ref();
                         let root_owner = root_owner.as_ref();
-                        let operation = async move {
-                            let execute = || async move {
+                        let operation = boxed_tool_future(|| async move {
+                            let execute = || boxed_tool_future(|| async move {
                                 if is_evidence_retrieve {
                                     if let Ok(output) = retrieve_tool_evidence_from_sandbox(
                                         evidence_sandbox.as_ref(),
@@ -2134,24 +2171,25 @@ where
                                         )
                                         .await
                                 }
-                            };
+                            });
                             if executor_owns_durable_effect {
                                 execute().await
                             } else {
-                                self.execute_scoped_root_effect(
-                                    effect_commit.ok_or_else(|| {
-                                        ToolError::new("tool execution lost its durable ledger")
-                                    })?,
+                                let effect_commit = effect_commit.ok_or_else(|| {
+                                    ToolError::new("tool execution lost its durable ledger")
+                                })?;
+                                boxed_tool_future(|| self.execute_scoped_root_effect(
+                                    effect_commit,
                                     effect_request,
                                     &task.effect,
                                     root,
                                     root_owner,
                                     executor_owns_admission,
                                     execute,
-                                )
+                                ))
                                 .await
                             }
-                        };
+                        });
                         let (execution, admission) = if executor_owns_admission {
                             (Ok(operation.await), None)
                         } else {
@@ -2170,6 +2208,10 @@ where
                         execution
                     }
                 };
+
+                    Ok::<_, RuntimeError>((execution, invocation_record, start, tname_for_err))
+                }).await?;
+                    boxed_tool_future(|| async {
                 let (output_draft, mut is_error, mut failure_kind) = match execution {
                     Ok(Ok(output)) => model_tool_output_feedback(tool_name, output),
                     Ok(Err(error)) => {
@@ -2417,28 +2459,29 @@ where
                 );
                 self.record_tool_finished(iterations, &result);
                 Ok(result)
-            }
-            ToolAuthorizationDecision::Gap { assessment, .. } => {
-                let gap = assessment.gap.as_ref();
-                let reason = gap.map_or_else(
-                    || "capability authorization was not granted".to_string(),
-                    |gap| gap.reason.clone(),
-                );
-                let failure_kind = if reason.starts_with("PreToolUse hook") {
-                    ToolFailureKind::HookDenied
-                } else {
-                    ToolFailureKind::PermissionDenied
-                };
-                self.record_tool_invocation_denied(
-                    tool_use_id,
-                    tool_name,
-                    &effective_input,
-                    iterations,
-                    failure_kind,
-                    &reason,
-                );
-                let first_recovery = gap.is_some_and(|gap| gap.recoverable);
-                let payload = serde_json::json!({
+                }).await
+                }
+                ToolAuthorizationDecision::Gap { assessment, .. } => {
+                    let gap = assessment.gap.as_ref();
+                    let reason = gap.map_or_else(
+                        || "capability authorization was not granted".to_string(),
+                        |gap| gap.reason.clone(),
+                    );
+                    let failure_kind = if reason.starts_with("PreToolUse hook") {
+                        ToolFailureKind::HookDenied
+                    } else {
+                        ToolFailureKind::PermissionDenied
+                    };
+                    self.record_tool_invocation_denied(
+                        tool_use_id,
+                        tool_name,
+                        &effective_input,
+                        iterations,
+                        failure_kind,
+                        &reason,
+                    );
+                    let first_recovery = gap.is_some_and(|gap| gap.recoverable);
+                    let payload = serde_json::json!({
                     "kind": "capability_gap",
                     "assessment_id": assessment.assessment_id,
                     "path": assessment.path,
@@ -2451,22 +2494,23 @@ where
                     },
                 })
                 .to_string();
-                let denied = ConversationMessage::tool_result(
-                    tool_use_id.to_string(),
-                    tool_name.to_string(),
-                    payload,
-                    !first_recovery,
-                );
-                self.session
-                    .write()
-                    .await
-                    .push_message(denied.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                let sequence = self.session_head().await.message_count.wrapping_sub(1);
-                self.record_message_event(&denied, sequence);
-                Ok(denied)
+                    let denied = ConversationMessage::tool_result(
+                        tool_use_id.to_string(),
+                        tool_name.to_string(),
+                        payload,
+                        !first_recovery,
+                    );
+                    self.session
+                        .write()
+                        .await
+                        .push_message(denied.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                    self.record_message_event(&denied, sequence);
+                    Ok(denied)
+                }
             }
-        }
+        })
     }
 
     pub(super) fn collect_tool_result_message(
