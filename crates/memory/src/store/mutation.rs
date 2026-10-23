@@ -252,8 +252,18 @@ impl MemorySourceAccess {
     }
 }
 
+/// Ephemeral eligibility of an original source frame, never a writable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySourceEligibility {
+    Current,
+    Obsolete,
+    LegacyUnknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemorySourceRevisionRead {
+    /// Specifically old automatic bodies without their original input binding.
+    pub legacy_provenance_unknown: bool,
     pub origin_retired: bool,
     /// Facts read from the original body in the same cut as its revision.
     pub access: Option<MemorySourceAccess>,
@@ -332,6 +342,7 @@ pub fn live_source_revision(
         }
     }
     Ok(MemorySourceRevisionRead {
+        legacy_provenance_unknown: false,
         origin_retired: false,
         packet_atom: Some(atom),
         access: (!source.retired).then(|| MemorySourceAccess::of(entry)),
@@ -364,53 +375,100 @@ pub struct MemoryExtractionOrigin {
     turn_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     source_readset: Vec<MemoryEntryRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_memory_id: Option<MemoryId>,
 }
 impl MemoryExtractionOrigin {
+    /// Runtime mutation targets are stable producer identities. For example,
+    /// private_note derives its ID from the authenticated Session/Agent/action
+    /// and journals that exact ID before this original native transaction.
+    pub fn for_turn_entry(
+        turn: &crate::MemoryTurnContext,
+        entry: &mut MemoryEntry,
+    ) -> Result<Self> {
+        reserved_source_bytes(
+            &(turn, entry.id),
+            crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+        )?;
+        let seed = Sha256::digest(serde_json::to_vec(&(
+            "cowd.memory.turn-write.v1",
+            turn,
+            entry.id,
+        ))?);
+        let id = uuid::Uuid::from_slice(&seed[..16]).map_err(|_| MemoryError::StaleSource)?;
+        let tag = format!("memory-turn:{id}");
+        if !entry.tags.contains(&tag) {
+            entry.tags.push(tag.clone());
+        }
+        Self::capture(turn, entry, &tag, Some(entry.id))
+    }
+
     pub fn for_entry(
         turn: &crate::MemoryTurnContext,
         entry: &MemoryEntry,
         batch_tag: &str,
     ) -> Result<Self> {
+        Self::capture(turn, entry, batch_tag, None)
+    }
+
+    fn capture(
+        turn: &crate::MemoryTurnContext,
+        entry: &MemoryEntry,
+        batch_tag: &str,
+        target_memory_id: Option<MemoryId>,
+    ) -> Result<Self> {
+        reserved_source_bytes(
+            &turn.source_readset,
+            crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+        )?;
+        let mut cuts = turn
+            .source_readset
+            .clone()
+            .ok_or(MemoryError::StaleSource)?;
+        cuts.sort_by(|a, b| {
+            (&a.memory_id, &a.scope_key, &a.body_digest).cmp(&(
+                &b.memory_id,
+                &b.scope_key,
+                &b.body_digest,
+            ))
+        });
+        cuts.dedup();
         let origin = Self {
             scope_key: entry.scope.scope_key(),
             session_id: turn.session_id.clone(),
             agent_id: turn.agent_id.clone(),
             batch_tag: batch_tag.into(),
             turn_ref: turn.turn_ref.clone(),
-            source_readset: {
-                reserved_source_bytes(
-                    &turn.source_readset,
-                    crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
-                )?;
-                let mut cuts = turn
-                    .source_readset
-                    .clone()
-                    .ok_or(MemoryError::StaleSource)?;
-                cuts.sort_by(|a, b| {
-                    (&a.memory_id, &a.scope_key, &a.body_digest).cmp(&(
-                        &b.memory_id,
-                        &b.scope_key,
-                        &b.body_digest,
-                    ))
-                });
-                cuts.dedup();
-                cuts
-            },
+            source_readset: cuts,
+            target_memory_id,
         };
         origin.validate_entry(entry)?;
         Ok(origin)
     }
     pub fn validate_entry(&self, entry: &MemoryEntry) -> Result<()> {
+        let automatic = self.batch_tag.starts_with("extraction-batch:");
+        let prefix = if automatic {
+            "extraction-batch:"
+        } else {
+            "memory-turn:"
+        };
         let batch = self
             .batch_tag
-            .strip_prefix("extraction-batch:")
+            .strip_prefix(prefix)
             .and_then(|id| uuid::Uuid::parse_str(id).ok());
-        if batch.is_none_or(|id| self.batch_tag != format!("extraction-batch:{id}"))
-            || entry.source != crate::MemorySource::AutoExtracted
+        if batch.is_none_or(|id| self.batch_tag != format!("{prefix}{id}"))
+            || (automatic
+                && (entry.source != crate::MemorySource::AutoExtracted
+                    || self.target_memory_id.is_some()))
+            || (!automatic && self.target_memory_id != Some(entry.id))
             || self.scope_key != entry.scope.scope_key()
             || entry.session_id.as_deref() != Some(self.session_id.as_str())
             || entry.source_agent.as_deref() != Some(self.agent_id.as_str())
             || !entry.tags.contains(&self.batch_tag)
+            || entry.tags.iter().any(|tag| {
+                (tag.starts_with("extraction-batch:") || tag.starts_with("memory-turn:"))
+                    && tag != &self.batch_tag
+            })
         {
             return Err(MemoryError::StaleSource);
         }
@@ -477,6 +535,7 @@ impl MemoryEntryRevision {
         if self != &Self::of(current)?
             || next.id != self.memory_id
             || next.scope.scope_key() != self.scope_key
+            || next.source != current.source
         {
             return Err(MemoryError::Store(
                 "stale or foreign Memory target revision".into(),
@@ -492,19 +551,39 @@ impl MemoryEntryRevision {
 /// Legacy/imported lifecycle bytes are still source evidence. Missing new
 /// receipt tables cannot turn an archived old snapshot into an active source.
 pub fn lifecycle_retired(memory_id: MemoryId, raw: Option<&str>) -> Result<bool> {
+    let events = read_lifecycle_history(memory_id, raw)?;
+    Ok(events
+        .last()
+        .is_some_and(|event| matches!(event.to, MemoryState::Archived | MemoryState::Superseded)))
+}
+
+/// Original lifecycle bytes have one interpretation for migration, recall and
+/// source CAS. A retired history cannot become live through a malformed tail.
+pub fn read_lifecycle_history(
+    memory_id: MemoryId,
+    raw: Option<&str>,
+) -> Result<Vec<MemoryLifecycleEvent>> {
     let events: Vec<MemoryLifecycleEvent> = raw
         .map(serde_json::from_str)
         .transpose()
         .map_err(MemoryError::Serialisation)?
         .unwrap_or_default();
-    if events.iter().any(|event| event.memory_id != memory_id) {
-        return Err(MemoryError::Store(
-            "foreign Memory lifecycle history".into(),
-        ));
+    let mut previous = None;
+    for event in &events {
+        if event.memory_id != memory_id
+            || event.from != previous
+            || event.session_id.is_empty()
+            || event.agent_id.is_empty()
+            || previous.is_some_and(|state| {
+                matches!(state, MemoryState::Archived | MemoryState::Superseded)
+                    && !matches!(event.to, MemoryState::Archived | MemoryState::Superseded)
+            })
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        previous = Some(event.to);
     }
-    Ok(events
-        .last()
-        .is_some_and(|event| matches!(event.to, MemoryState::Archived | MemoryState::Superseded)))
+    Ok(events)
 }
 
 fn typed_digest(domain: &str, value: &impl Serialize) -> Result<String> {
@@ -641,7 +720,7 @@ pub fn filter_auxiliary_source_frame(
         {
             return Err(MemoryError::StaleSource);
         }
-        if read.fence.retired || read.origin_retired {
+        if read.fence.retired || read.origin_retired || read.legacy_provenance_unknown {
             continue;
         }
         let actual = read.revision.as_ref().ok_or(MemoryError::StaleSource)?;
@@ -679,6 +758,63 @@ pub fn filter_auxiliary_source_frame(
         }
     }
     Ok((kept_entities, kept_triples))
+}
+
+/// Preserve original held rows omitted by the active projection. This does
+/// not admit them as readable/new inputs. Only original retirement cleanup can
+/// remove their unresolved source support; a filtered snapshot is not Erase.
+pub fn retain_held_auxiliary(
+    old_entities: &[crate::entity::Entity],
+    old_triples: &[crate::entity::Triple],
+    active_old_entities: &[crate::entity::Entity],
+    entities: &[crate::entity::Entity],
+    triples: &[crate::entity::Triple],
+    held_sources: &std::collections::BTreeSet<MemoryId>,
+) -> Result<(Vec<crate::entity::Entity>, Vec<crate::entity::Triple>)> {
+    let held_entities = old_entities
+        .iter()
+        .filter(|old| {
+            old.memory_source_revisions
+                .iter()
+                .any(|cut| held_sources.contains(&cut.memory_id))
+        })
+        .collect::<Vec<_>>();
+    let held_triples = old_triples
+        .iter()
+        .filter(|old| {
+            !triples.iter().any(|new| new.id == old.id)
+                && old
+                    .memory_source_revision
+                    .as_ref()
+                    .is_some_and(|cut| held_sources.contains(&cut.memory_id))
+        })
+        .collect::<Vec<_>>();
+    reserved_source_bytes(
+        &(entities, triples, &held_entities, &held_triples),
+        crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+    )?;
+    let mut entities = entities.to_vec();
+    for old in held_entities {
+        if let Some(next) = entities.iter_mut().find(|next| next.id == old.id) {
+            if active_old_entities
+                .iter()
+                .find(|active| active.id == old.id)
+                .map(serde_json::to_value)
+                .transpose()?
+                .as_ref()
+                == Some(&serde_json::to_value(&*next)?)
+            {
+                // Exact read/maintenance roundtrip preserves the original
+                // unresolved support. This accepts no changed metadata/cut.
+                *next = old.clone();
+            }
+        } else {
+            entities.push(old.clone());
+        }
+    }
+    let mut triples = triples.to_vec();
+    triples.extend(held_triples.into_iter().cloned());
+    Ok((entities, triples))
 }
 
 /// Compile the existing maintenance/recall snapshot before native commit/use.
@@ -830,23 +966,7 @@ impl MemoryLifecycleMutation {
         if matches!(entry.scope, crate::MemoryScope::LegacyUnresolvedAgent(_)) {
             return Ok(None);
         }
-        let events: Vec<MemoryLifecycleEvent> =
-            serde_json::from_str(history).map_err(MemoryError::Serialisation)?;
-        let mut previous = None;
-        for event in &events {
-            if event.memory_id != entry.id
-                || event.from != previous
-                || event.session_id.is_empty()
-                || event.agent_id.is_empty()
-                || previous.is_some_and(|state| {
-                    matches!(state, MemoryState::Archived | MemoryState::Superseded)
-                        && !matches!(event.to, MemoryState::Archived | MemoryState::Superseded)
-                })
-            {
-                return Err(MemoryError::StaleSource);
-            }
-            previous = Some(event.to);
-        }
+        let events = read_lifecycle_history(entry.id, Some(history))?;
         let Some(last) = events
             .last()
             .filter(|event| matches!(event.to, MemoryState::Archived | MemoryState::Superseded))
@@ -1052,11 +1172,7 @@ impl MemoryLifecycleMutation {
                 "stale or foreign Memory lifecycle read set".into(),
             ));
         }
-        let mut events: Vec<MemoryLifecycleEvent> = history
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(MemoryError::Serialisation)?
-            .unwrap_or_default();
+        let mut events = read_lifecycle_history(entry.id, history)?;
         if events.last().map(|e| e.to) != self.event.from
             || events.iter().any(|e| e.memory_id != entry.id)
         {
@@ -1117,12 +1233,13 @@ impl MemoryLifecycleMutation {
 /// Classify one root against the same complete native source frame. Known
 /// superseded/retired support is ineligible; missing, foreign or cyclic input
 /// remains unknown and cannot be filtered into success.
-pub fn source_root_is_current(
+pub fn source_root_eligibility(
     root: MemoryId,
     origins: &std::collections::BTreeMap<MemoryId, Option<MemoryExtractionOrigin>>,
     frame: &std::collections::BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
-) -> Result<bool> {
+) -> Result<MemorySourceEligibility> {
     let mut current = true;
+    let mut legacy_unknown = false;
     let mut done = std::collections::BTreeSet::new();
     let mut active = std::collections::BTreeSet::new();
     let mut todo = vec![(root, false)];
@@ -1147,6 +1264,11 @@ pub fn source_root_is_current(
         }
         if read.fence.retired || read.origin_retired {
             current = false;
+            done.insert(id);
+            continue;
+        }
+        if read.legacy_provenance_unknown {
+            legacy_unknown = true;
             done.insert(id);
             continue;
         }
@@ -1175,6 +1297,10 @@ pub fn source_root_is_current(
                     current = false;
                     continue;
                 }
+                if ancestor.legacy_provenance_unknown {
+                    legacy_unknown = true;
+                    continue;
+                }
                 let actual = ancestor.revision.as_ref().ok_or(MemoryError::StaleSource)?;
                 if actual != expected {
                     current = false;
@@ -1184,16 +1310,25 @@ pub fn source_root_is_current(
             }
         }
     }
-    Ok(current)
+    Ok(if legacy_unknown {
+        MemorySourceEligibility::LegacyUnknown
+    } else if current {
+        MemorySourceEligibility::Current
+    } else {
+        MemorySourceEligibility::Obsolete
+    })
 }
 
 pub fn source_frame_matches_original_lineage(
     origins: &std::collections::BTreeMap<MemoryId, Option<MemoryExtractionOrigin>>,
     frame: &std::collections::BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
 ) -> bool {
-    origins
-        .keys()
-        .all(|root| source_root_is_current(*root, origins, frame).unwrap_or(false))
+    origins.keys().all(|root| {
+        matches!(
+            source_root_eligibility(*root, origins, frame),
+            Ok(MemorySourceEligibility::Current)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1209,6 +1344,7 @@ mod original_lineage_frame_tests {
     }
     fn read(cut: MemoryEntryRevision) -> MemorySourceRevisionRead {
         MemorySourceRevisionRead {
+            legacy_provenance_unknown: false,
             origin_retired: false,
             access: None,
             packet_content_digest: None,
@@ -1233,6 +1369,7 @@ mod original_lineage_frame_tests {
             session_id: "s".into(),
             agent_id: "a".into(),
             batch_tag: "batch".into(),
+            target_memory_id: None,
             turn_ref: None,
             source_readset: vec![a.clone()],
         };

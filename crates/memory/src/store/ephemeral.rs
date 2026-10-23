@@ -242,6 +242,7 @@ fn read_single_memory_source(
             return Err(MemoryError::StaleSource);
         }
         let read = MemorySourceRevisionRead {
+            legacy_provenance_unknown: false,
             origin_retired: false,
             access: None,
             packet_content_digest: None,
@@ -259,6 +260,10 @@ fn read_single_memory_source(
         return Ok(None);
     };
     let origin_bytes = 0;
+    match origin {
+        Some(origin) => origin.validate_entry(entry)?,
+        None => {}
+    }
     let origin_retired = origin
         .map(MemoryExtractionOrigin::retirement_ref)
         .transpose()?
@@ -276,6 +281,8 @@ fn read_single_memory_source(
             .ok_or(MemoryError::SourceReadLimit)?,
     )?;
     read.materialized_bytes += origin_bytes;
+    read.legacy_provenance_unknown =
+        origin.is_none() && entry.source == crate::MemorySource::AutoExtracted;
     read.origin_retired = origin_retired;
     if origin_retired {
         read.revision = None;
@@ -343,16 +350,18 @@ fn read_memory_source_frame(
         .iter()
         .filter(|id| frame.get(id).and_then(Option::as_ref).is_some())
         .map(|id| {
-            super::source_root_is_current(*id, &origins, &frame).map(|current| (*id, current))
+            super::source_root_eligibility(*id, &origins, &frame).map(|current| (*id, current))
         })
         .collect::<Result<Vec<_>>>()?;
-    for (id, current) in classifications {
-        if !current {
+    for (id, eligibility) in classifications {
+        if eligibility != super::MemorySourceEligibility::Current {
             let read = frame
                 .get_mut(&id)
                 .and_then(Option::as_mut)
                 .ok_or(MemoryError::StaleSource)?;
-            read.origin_retired = true;
+            read.origin_retired = eligibility == super::MemorySourceEligibility::Obsolete;
+            read.legacy_provenance_unknown =
+                eligibility == super::MemorySourceEligibility::LegacyUnknown;
             read.revision = None;
             read.access = None;
         }
@@ -400,16 +409,71 @@ fn validate_extraction_origin(
         && entry
             .tags
             .iter()
-            .any(|tag| tag.starts_with("extraction-batch:"))
+            .any(|tag| tag.starts_with("extraction-batch:") || tag.starts_with("memory-turn:"))
     {
         return Err(MemoryError::StaleSource);
     }
     if let Some(bound) = binding {
+        bound.validate_entry(entry)?;
         if state.source_fences.contains_key(&bound.retirement_ref()?) {
             return Err(MemoryError::StaleSource);
         }
     }
     Ok(())
+}
+
+fn prepare_auxiliary_replacement(
+    state: &State,
+    scope: &str,
+    old_entities: &[Entity],
+    old_triples: &[Triple],
+    entities: &[Entity],
+    triples: &[Triple],
+) -> Result<(Vec<Entity>, Vec<Triple>)> {
+    let bytes = super::reserved_source_bytes(
+        &(old_entities, old_triples, entities, triples),
+        crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+    )?;
+    let old = super::auxiliary_source_cuts(old_entities, old_triples)?;
+    let new = super::auxiliary_source_cuts(entities, triples)?;
+    let roots = old
+        .keys()
+        .chain(new.keys())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let (frame, _, _) = read_memory_source_frame(
+        state,
+        &roots.into_iter().collect::<Vec<_>>(),
+        crate::knowledge::KNOWLEDGE_READ_MAX_BYTES - bytes,
+    )?;
+    let kept = super::filter_auxiliary_source_frame(scope, entities, triples, &frame)?;
+    if super::auxiliary_source_cuts(&kept.0, &kept.1)? != new {
+        return Err(MemoryError::StaleSource);
+    }
+    // Validate old scope/identity too. Only the specifically classified legacy
+    // unknown may be held; foreign, absent and malformed sources remain errors.
+    let active_old =
+        super::filter_auxiliary_source_frame(scope, old_entities, old_triples, &frame)?;
+    let held = old
+        .keys()
+        .filter(|id| {
+            frame
+                .get(id)
+                .and_then(Option::as_ref)
+                .is_some_and(|read| read.legacy_provenance_unknown)
+        })
+        .copied()
+        .collect();
+    let retained = super::retain_held_auxiliary(
+        old_entities,
+        old_triples,
+        &active_old.0,
+        entities,
+        triples,
+        &held,
+    )?;
+    super::validate_auxiliary_replacement(old_entities, old_triples, &retained.0, &retained.1)?;
+    Ok(retained)
 }
 
 fn auxiliary_at_state(
@@ -1083,30 +1147,20 @@ impl MemoryStore for EphemeralMemoryStore {
 
     async fn save_entities(&self, scope_key: &str, values: &[Entity]) -> Result<()> {
         let mut state = self.write()?;
-        let (entities, triples) = auxiliary_at_state(&state, scope_key, values, &[])?;
-        if super::auxiliary_source_cuts(&entities, &triples)?
-            != super::auxiliary_source_cuts(values, &[])?
-        {
-            return Err(MemoryError::StaleSource);
-        }
         let old = state
             .entities
             .iter()
             .filter(|((scope, _), _)| scope == scope_key)
-            .map(|(_, value)| value)
+            .map(|(_, v)| v)
             .collect::<Vec<_>>();
         super::reserved_source_bytes(&old, crate::knowledge::KNOWLEDGE_READ_MAX_BYTES)?;
-        super::validate_auxiliary_replacement(
-            &old.into_iter().cloned().collect::<Vec<_>>(),
-            &[],
-            values,
-            &[],
-        )?;
+        let old = old.into_iter().cloned().collect::<Vec<_>>();
+        let (values, _) = prepare_auxiliary_replacement(&state, scope_key, &old, &[], values, &[])?;
         state.entities.retain(|(scope, _), _| scope != scope_key);
         for value in values {
             state
                 .entities
-                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
+                .insert((scope_key.to_owned(), value.id.clone()), value);
         }
         Ok(())
     }
@@ -1128,30 +1182,20 @@ impl MemoryStore for EphemeralMemoryStore {
     }
     async fn save_triples(&self, scope_key: &str, values: &[Triple]) -> Result<()> {
         let mut state = self.write()?;
-        let (entities, triples) = auxiliary_at_state(&state, scope_key, &[], values)?;
-        if super::auxiliary_source_cuts(&entities, &triples)?
-            != super::auxiliary_source_cuts(&[], values)?
-        {
-            return Err(MemoryError::StaleSource);
-        }
         let old = state
             .triples
             .iter()
             .filter(|((scope, _), _)| scope == scope_key)
-            .map(|(_, value)| value)
+            .map(|(_, v)| v)
             .collect::<Vec<_>>();
         super::reserved_source_bytes(&old, crate::knowledge::KNOWLEDGE_READ_MAX_BYTES)?;
-        super::validate_auxiliary_replacement(
-            &[],
-            &old.into_iter().cloned().collect::<Vec<_>>(),
-            &[],
-            values,
-        )?;
+        let old = old.into_iter().cloned().collect::<Vec<_>>();
+        let (_, values) = prepare_auxiliary_replacement(&state, scope_key, &[], &old, &[], values)?;
         state.triples.retain(|(scope, _), _| scope != scope_key);
         for value in values {
             state
                 .triples
-                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
+                .insert((scope_key.to_owned(), value.id.clone()), value);
         }
         Ok(())
     }
@@ -1165,32 +1209,29 @@ impl MemoryStore for EphemeralMemoryStore {
             return Err(MemoryError::StaleSource);
         }
         let mut state = self.write()?;
-        let (kept_entities, kept_triples) =
-            auxiliary_at_state(&state, scope_key, entities, triples)?;
-        if super::auxiliary_source_cuts(&kept_entities, &kept_triples)?
-            != super::auxiliary_source_cuts(entities, triples)?
-        {
-            return Err(MemoryError::StaleSource);
-        }
         let old_entities = state
             .entities
             .iter()
             .filter(|((scope, _), _)| scope == scope_key)
-            .map(|(_, value)| value)
+            .map(|(_, v)| v)
             .collect::<Vec<_>>();
         let old_triples = state
             .triples
             .iter()
             .filter(|((scope, _), _)| scope == scope_key)
-            .map(|(_, value)| value)
+            .map(|(_, v)| v)
             .collect::<Vec<_>>();
         super::reserved_source_bytes(
             &(&old_entities, &old_triples),
             crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
         )?;
-        super::validate_auxiliary_replacement(
-            &old_entities.into_iter().cloned().collect::<Vec<_>>(),
-            &old_triples.into_iter().cloned().collect::<Vec<_>>(),
+        let old_entities = old_entities.into_iter().cloned().collect::<Vec<_>>();
+        let old_triples = old_triples.into_iter().cloned().collect::<Vec<_>>();
+        let (entities, triples) = prepare_auxiliary_replacement(
+            &state,
+            scope_key,
+            &old_entities,
+            &old_triples,
             entities,
             triples,
         )?;
@@ -1199,12 +1240,12 @@ impl MemoryStore for EphemeralMemoryStore {
         for value in entities {
             state
                 .entities
-                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
+                .insert((scope_key.to_owned(), value.id.clone()), value);
         }
         for value in triples {
             state
                 .triples
-                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
+                .insert((scope_key.to_owned(), value.id.clone()), value);
         }
         Ok(())
     }
@@ -1521,9 +1562,16 @@ impl MemorySourceFenceReader for EphemeralMemoryStore {
         source_ref: &str,
         budget_bytes: usize,
     ) -> Result<Option<MemorySourceRevisionRead>> {
-        Ok(self
+        let read = self
             .source_revision_guard(source_ref, budget_bytes)?
-            .map(|guard| guard.read.clone()))
+            .map(|guard| guard.read.clone());
+        if read
+            .as_ref()
+            .is_some_and(|read| read.legacy_provenance_unknown)
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        Ok(read)
     }
 
     fn read_source_fence(&self, source_ref: &str) -> Result<Option<MemorySourceFence>> {
@@ -1642,5 +1690,186 @@ mod corruption_tests {
         );
         assert!(store.read_source_fence(&source).is_err());
         assert!(store.read_source_revision(&source, 4096).is_err());
+    }
+}
+
+#[cfg(test)]
+mod legacy_auxiliary_hold_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_unknown_support_is_held_without_blocking_or_erasing_independent_graph_rows() {
+        let store = std::sync::Arc::new(EphemeralMemoryStore::new());
+        let now = chrono::Utc::now();
+        let legacy = MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::Reference,
+            priority: crate::Priority::Normal,
+            source: crate::MemorySource::AutoExtracted,
+            title: "old unbound automatic input".into(),
+            content: "held original bytes".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: None,
+            scope: MemoryScope::Global,
+            session_id: None,
+            source_agent: None,
+            visibility: crate::AgentVisibility::Shared,
+        };
+        let mut independent = legacy.clone();
+        independent.id = uuid::Uuid::new_v4();
+        independent.source = crate::MemorySource::Import;
+        independent.title = "independent original input".into();
+        store.insert(&legacy).await.unwrap();
+        store.insert(&independent).await.unwrap();
+        let node = |id: &str, source: Option<&MemoryEntry>| Entity {
+            id: id.into(),
+            name: id.into(),
+            entity_type: crate::entity::EntityType::Concept,
+            confidence: 1.0,
+            frequency: 1,
+            first_seen: now,
+            last_seen: now,
+            source_type: if source.is_some() { "memory" } else { "file" }.into(),
+            source_ids: source.map(|s| vec![s.id.to_string()]).unwrap_or_default(),
+            memory_source_revisions: source
+                .map(|s| vec![MemoryEntryRevision::of(s).unwrap()])
+                .unwrap_or_default(),
+        };
+        let mut child = legacy.clone();
+        child.id = uuid::Uuid::new_v4();
+        child.title = "old bound descendant of unknown input".into();
+        child.session_id = Some("legacy-session".into());
+        child.source_agent = Some("legacy-agent".into());
+        let batch = "extraction-batch:00000000-0000-0000-0000-000000000001";
+        child.tags = vec![batch.into()];
+        let ctx = crate::MemoryTurnContext::new("legacy-session", "legacy-agent")
+            .with_source_readset(Some(vec![MemoryEntryRevision::of(&legacy).unwrap()]));
+        let origin = MemoryExtractionOrigin::for_entry(&ctx, &child, batch).unwrap();
+        {
+            let mut state = store.write().unwrap();
+            state.entries.insert(child.id.to_string(), child.clone());
+            state.kv.insert(
+                MemoryExtractionOrigin::binding_key(child.id),
+                serde_json::to_string(&origin).unwrap(),
+            );
+        }
+        let held_child = node("old-held-child", Some(&child));
+        let mut multi = node("multi-node", Some(&legacy));
+        multi.source_ids.push(independent.id.to_string());
+        multi
+            .memory_source_revisions
+            .push(MemoryEntryRevision::of(&independent).unwrap());
+        let held = node("old-held-node", Some(&legacy));
+        let good = node("independent-node", Some(&independent));
+        let external = node("external-node", None);
+        // Import the exact old native snapshot; do not add a production bypass
+        // for creating a newly unbound automatic projection.
+        {
+            let mut state = store.write().unwrap();
+            for e in [&held, &held_child, &good, &external, &multi] {
+                state
+                    .entities
+                    .insert(("global".into(), e.id.clone()), e.clone());
+            }
+        }
+        let visible = store.load_entities("global").await.unwrap();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["independent-node", "external-node", "multi-node"])
+        );
+        assert!(store
+            .read_source_revision(
+                &format!("memory:{}", legacy.id),
+                crate::knowledge::KNOWLEDGE_READ_MAX_BYTES
+            )
+            .is_err());
+        let (frame, _) = store
+            .read_source_revisions(
+                &[legacy.id, independent.id],
+                crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+            )
+            .unwrap();
+        let unknown = frame[&legacy.id].as_ref().unwrap();
+        assert!(unknown.legacy_provenance_unknown);
+        assert!(!unknown.fence.retired);
+        assert!(!unknown.origin_retired);
+        assert!(unknown.revision.is_none());
+        assert!(frame[&independent.id].as_ref().unwrap().revision.is_some());
+        assert!(store
+            .save_entities("global", std::slice::from_ref(&held))
+            .await
+            .is_err());
+        store.save_entities("global", &visible).await.unwrap();
+        let mut changed = visible.clone();
+        changed
+            .iter_mut()
+            .find(|e| e.id == "multi-node")
+            .unwrap()
+            .name = "unproven metadata change".into();
+        assert!(store.save_entities("global", &changed).await.is_err());
+        store
+            .save_knowledge_graph("global", &visible, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(
+                &store.read().unwrap().entities[&("global".into(), held.id.clone())]
+            )
+            .unwrap(),
+            serde_json::to_value(&held).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                &store.read().unwrap().entities[&("global".into(), held_child.id.clone())]
+            )
+            .unwrap(),
+            serde_json::to_value(&held_child).unwrap()
+        );
+        assert!(store
+            .read_source_revision(
+                &format!("memory:{}", child.id),
+                crate::knowledge::KNOWLEDGE_READ_MAX_BYTES
+            )
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(
+                &store.read().unwrap().entities[&("global".into(), multi.id.clone())]
+            )
+            .unwrap(),
+            serde_json::to_value(&multi).unwrap()
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::MemoryConfig::default();
+        config.store.blob_dir = root.path().join("blobs");
+        config.store.enable_vector_index = false;
+        let manager = crate::CognitiveContextManager::new_with_selected_store(
+            config,
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manager.list_entities().await.unwrap().len(), 3);
+        assert_eq!(
+            store
+                .read_source_fence(&format!("memory:{}", legacy.id))
+                .unwrap()
+                .unwrap()
+                .delete_epoch,
+            0
+        );
     }
 }

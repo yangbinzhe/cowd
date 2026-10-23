@@ -2128,10 +2128,13 @@ async fn knowledge_required_source_read_failure_is_not_empty_success_or_foreign_
     let store = Arc::new(EphemeralMemoryStore::new());
     let mut own = entry(MemoryLayer::L3, MemorySource::Import, "required rule");
     own.scope = MemoryScope::Project("A".into());
+    own.visibility = memory::AgentVisibility::Shared;
     let mut independent = entry(MemoryLayer::L3, MemorySource::Import, "independent rule");
     independent.scope = own.scope.clone();
+    independent.visibility = memory::AgentVisibility::Shared;
     let mut foreign = entry(MemoryLayer::L3, MemorySource::Import, "foreign rule");
     foreign.scope = MemoryScope::Project("B".into());
+    foreign.visibility = memory::AgentVisibility::Shared;
     let reader = Arc::new(Reader {
         store: store.clone(),
         fail: AtomicBool::new(false),
@@ -3848,4 +3851,197 @@ async fn legacy_lifecycle_page_reserves_bytes_and_advances_past_an_unreadable_so
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn original_runtime_turn_write_cannot_drop_its_consumed_source_cut() {
+    use memory::store::{EphemeralMemoryStore, MemoryEntryRevision, MemoryStore};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("memory")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager.clone());
+    let mut source = entry(
+        MemoryLayer::L3,
+        MemorySource::Import,
+        "original independent source",
+    );
+    source.scope = MemoryScope::Global;
+    source.visibility = AgentVisibility::Shared;
+    store.insert(&source).await.unwrap();
+    let original_cut = MemoryEntryRevision::of(&source).unwrap();
+    let context = MemoryTurnContext::new("original-provider-session", "original-agent")
+        .with_turn_ref(Some("original-provider-turn".into()))
+        .with_source_readset(Some(vec![original_cut.clone()]));
+    source.content = "actual original correction".into();
+    store.update(&source, &original_cut).await.unwrap();
+    let stale = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "stale tool-authored note",
+    );
+    assert!(
+        kernel.remember(&context, stale.clone()).await.is_err(),
+        "Runtime write must commit against the consumed cut, not just its own new ID"
+    );
+    assert!(store.get(&stale.id).await.unwrap().is_none());
+    let current = context
+        .clone()
+        .with_source_readset(Some(vec![MemoryEntryRevision::of(&source).unwrap()]));
+    let note = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "legitimate current tool note",
+    );
+    kernel.remember(&current, note.clone()).await.unwrap();
+    assert!(store.get(&note.id).await.unwrap().is_some());
+    let sibling = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "same-turn independent note action",
+    );
+    kernel.remember(&current, sibling.clone()).await.unwrap();
+    kernel
+        .erase(&current, note.id, "erase just one original note action")
+        .await
+        .unwrap();
+    assert!(
+        kernel
+            .retrieve_visible_entry(&current, sibling.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "same-turn sibling action must not share this note's retirement origin"
+    );
+    let mut persisted = store.get(&sibling.id).await.unwrap().unwrap();
+    let original_origin =
+        memory::store::MemoryExtractionOrigin::for_turn_entry(&current, &mut persisted).unwrap();
+    let mut wrong_target = persisted.clone();
+    wrong_target.id = uuid::Uuid::new_v4();
+    assert!(store
+        .write_extraction(&wrong_target, &original_origin, None)
+        .await
+        .is_err());
+    assert!(store.get(&wrong_target.id).await.unwrap().is_none());
+    let mut unknown = current.clone();
+    unknown.source_readset = None;
+    let missing = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "metadata cannot grant independence",
+    );
+    assert!(kernel.remember(&unknown, missing.clone()).await.is_err());
+    assert!(store.get(&missing.id).await.unwrap().is_none());
+    kernel
+        .archive(&current, source.id, "original source retirement")
+        .await
+        .unwrap();
+    let late = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "new ID paraphrase after retirement",
+    );
+    assert!(kernel.remember(&current, late.clone()).await.is_err());
+    assert!(store.get(&late.id).await.unwrap().is_none());
+    let independent = manager
+        .create_entry(
+            MemoryLayer::L2,
+            MemoryCategory::Reference,
+            "explicit independent human input",
+            "A new independent user assertion.",
+            Priority::Normal,
+            vec![],
+            MemoryScope::Global,
+        )
+        .await
+        .unwrap();
+    assert!(store.get(&independent).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn unknown_legacy_extraction_and_broken_lifecycle_are_not_independent_live_sources() {
+    use memory::store::{EphemeralMemoryStore, MemorySourceFenceReader, MemoryStore};
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let old = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "legacy unknown ancestry",
+    );
+    store.insert(&old).await.unwrap();
+    assert!(
+        store
+            .read_source_revision(
+                &format!("memory:{}", old.id),
+                memory::knowledge::KNOWLEDGE_READ_MAX_BYTES
+            )
+            .is_err(),
+        "missing extraction origin must remain unknown, not an independent root"
+    );
+    let mut independent = entry(
+        MemoryLayer::L3,
+        MemorySource::Import,
+        "provable independent source",
+    );
+    independent.scope = MemoryScope::Global;
+    independent.visibility = AgentVisibility::Shared;
+    store.insert(&independent).await.unwrap();
+    assert!(store
+        .read_source_revision(
+            &format!("memory:{}", independent.id),
+            memory::knowledge::KNOWLEDGE_READ_MAX_BYTES
+        )
+        .unwrap()
+        .unwrap()
+        .revision
+        .is_some());
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: independent.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "historical retirement".into(),
+        session_id: "original-session".into(),
+        agent_id: "original-agent".into(),
+        occurred_at: Utc::now(),
+    };
+    let mut revival = event.clone();
+    revival.from = Some(MemoryState::Archived);
+    revival.to = MemoryState::Observed;
+    store
+        .kv_put(
+            &format!("memory_lifecycle:{}", independent.id),
+            &serde_json::to_string(&vec![event, revival]).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .read_source_revision(
+            &format!("memory:{}", independent.id),
+            memory::knowledge::KNOWLEDGE_READ_MAX_BYTES
+        )
+        .is_err());
+    let root = tempfile::tempdir().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("memory")),
+            None,
+            None,
+            store,
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager);
+    let ctx = MemoryTurnContext::new("reader", "reader");
+    assert!(kernel
+        .retrieve_visible_entry(&ctx, independent.id)
+        .await
+        .is_err());
 }

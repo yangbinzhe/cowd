@@ -94,6 +94,9 @@ pub fn same_memory_key(entry: &MemoryEntry) -> String {
     let mut tags = entry
         .tags
         .iter()
+        // Runtime input provenance is per call, not part of the business key.
+        // Native origin validation, not this lookup, authenticates the marker.
+        .filter(|tag| !tag.starts_with("memory-turn:"))
         .map(|tag| normalize(tag))
         .filter(|tag| !tag.is_empty())
         .collect::<Vec<_>>();
@@ -153,6 +156,19 @@ mod tests {
             source_agent: None,
             visibility: AgentVisibility::Shared,
         }
+    }
+
+    #[test]
+    fn runtime_input_marker_does_not_change_the_business_key() {
+        let mut note = entry(MemorySource::UserExplicit, "Rule", "body");
+        note.tags
+            .push("memory-turn:00000000-0000-0000-0000-000000000001".into());
+        assert_eq!(same_memory_key(&note), "L3:Reference:rule:runtime");
+        note.tags.push("important business topic".into());
+        assert_eq!(
+            same_memory_key(&note),
+            "L3:Reference:rule:important business topic,runtime"
+        );
     }
 
     #[test]

@@ -544,7 +544,7 @@ impl MemoryOrchestrator {
     /// Store an entry supplied outside Runtime execution. Even this lower
     /// level API never persists the historical empty-session scope sentinel:
     /// omitted ownership is deterministically attributed to `memory-api`.
-    pub async fn remember(&self, entry: MemoryEntry) -> Result<MemoryId> {
+    pub async fn remember(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
         let fallback_turn = MemoryTurnContext::new(
             entry.session_id.as_deref().unwrap_or("memory-api"),
             entry.source_agent.as_deref().unwrap_or("memory-api"),
@@ -553,7 +553,14 @@ impl MemoryOrchestrator {
             MemoryScope::Project(project) if !project.trim().is_empty() => Some(project.clone()),
             _ => None,
         });
-        self.remember_for_turn(&fallback_turn, entry).await
+        entry
+            .session_id
+            .get_or_insert_with(|| fallback_turn.session_id.clone());
+        entry
+            .source_agent
+            .get_or_insert_with(|| fallback_turn.agent_id.clone());
+        entry.scope = scoped_entry_scope(&fallback_turn, &entry);
+        self.remember_resolved(entry).await
     }
 
     /// Store one already-resolved entry, routing it to the correct layer.
@@ -663,7 +670,15 @@ impl MemoryOrchestrator {
             .source_agent
             .get_or_insert_with(|| turn.agent_id.clone());
         entry.scope = scoped_entry_scope(turn, &entry);
-        self.remember_resolved(entry).await
+        self.validate_ordinary_write(&entry)?;
+        // L1-L3 inserts only normalize the selected layer. Preserve L0's
+        // additional policy before the original native input/body transaction.
+        if entry.layer == MemoryLayer::L0 {
+            entry.priority = Priority::Critical;
+            entry.staleness = 0.0;
+        }
+        let origin = crate::store::MemoryExtractionOrigin::for_turn_entry(turn, &mut entry)?;
+        self.store.write_extraction(&entry, &origin, None).await
     }
 
     /// Write multiple memory entries in a batch, returning their IDs.

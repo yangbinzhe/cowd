@@ -700,23 +700,8 @@ impl PostgresMemoryStore {
         let mut remaining = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES
             .checked_sub(bytes)
             .ok_or(MemoryError::SourceReadLimit)?;
-        let (kept_entities, kept_triples) = auxiliary_in_transaction(
-            &mut tx,
-            scope_key,
-            entity_values,
-            triple_values,
-            &mut remaining,
-        )?;
-        if memory::store::auxiliary_source_cuts(&kept_entities, &kept_triples)? != original {
-            return Err(MemoryError::StaleSource);
-        }
-        // Source body set (including ancestors), origin and original rows were
-        // validated before the KG lock. No KG -> body callback is allowed.
-        tx.query_one(
-            "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
-            &[],
-        )
-        .map_err(postgres_memory_error)?;
+        // Capture the original target snapshot before source locks. One union
+        // source frame then serves both new-input admission and legacy hold.
         let old_entities = if entities.is_some() {
             auxiliary_rows(&mut tx, scope_key, "memory_entities", &mut remaining)?
         } else {
@@ -727,13 +712,75 @@ impl PostgresMemoryStore {
         } else {
             Vec::new()
         };
+        let old = memory::store::auxiliary_source_cuts(&old_entities, &old_triples)?;
+        let roots = old
+            .keys()
+            .chain(original.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let (frame, _, _) = read_memory_source_frame(
+            &mut tx,
+            &roots.into_iter().collect::<Vec<_>>(),
+            remaining,
+            true,
+            None,
+        )?;
+        let kept = memory::store::filter_auxiliary_source_frame(
+            scope_key,
+            entity_values,
+            triple_values,
+            &frame,
+        )?;
+        if memory::store::auxiliary_source_cuts(&kept.0, &kept.1)? != original {
+            return Err(MemoryError::StaleSource);
+        }
+        let active_old = memory::store::filter_auxiliary_source_frame(
+            scope_key,
+            &old_entities,
+            &old_triples,
+            &frame,
+        )?;
+        // Source -> KG is the sole lock order. Compare the original target
+        // rows after locking; a concurrent snapshot is a CAS refusal, not a
+        // reason to rebind to its latest rows or hydrate another full page.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
+            &[],
+        )
+        .map_err(postgres_memory_error)?;
+        if entities.is_some()
+            && !auxiliary_rows_equal(&mut tx, scope_key, "memory_entities", &old_entities)?
+            || triples.is_some()
+                && !auxiliary_rows_equal(&mut tx, scope_key, "memory_triples", &old_triples)?
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        let held = old
+            .keys()
+            .filter(|id| {
+                frame
+                    .get(id)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|read| read.legacy_provenance_unknown)
+            })
+            .copied()
+            .collect();
+        let (retained_entities, retained_triples) = memory::store::retain_held_auxiliary(
+            &old_entities,
+            &old_triples,
+            &active_old.0,
+            entity_values,
+            triple_values,
+            &held,
+        )?;
         memory::store::validate_auxiliary_replacement(
             &old_entities,
             &old_triples,
-            entity_values,
-            triple_values,
+            &retained_entities,
+            &retained_triples,
         )?;
-        if let Some(values) = entities {
+        if entities.is_some() {
+            let values = retained_entities.as_slice();
             tx.execute(
                 "DELETE FROM memory_entities WHERE scope_key=$1",
                 &[&scope_key],
@@ -752,7 +799,8 @@ impl PostgresMemoryStore {
                 }
             }
         }
-        if let Some(values) = triples {
+        if triples.is_some() {
+            let values = retained_triples.as_slice();
             tx.execute(
                 "DELETE FROM memory_triples WHERE scope_key=$1",
                 &[&scope_key],
@@ -767,9 +815,9 @@ impl PostgresMemoryStore {
             }
         }
         if entities.is_some()
-            && !auxiliary_rows_equal(&mut tx, scope_key, "memory_entities", entity_values)?
+            && !auxiliary_rows_equal(&mut tx, scope_key, "memory_entities", &retained_entities)?
             || triples.is_some()
-                && !auxiliary_rows_equal(&mut tx, scope_key, "memory_triples", triple_values)?
+                && !auxiliary_rows_equal(&mut tx, scope_key, "memory_triples", &retained_triples)?
         {
             return Err(MemoryError::StaleSource);
         }
@@ -2486,12 +2534,13 @@ fn write_entry(
         && entry
             .tags
             .iter()
-            .any(|tag| tag.starts_with("extraction-batch:"))
+            .any(|tag| tag.starts_with("extraction-batch:") || tag.starts_with("memory-turn:"))
     {
         return Err(MemoryError::StaleSource);
     }
     let active_origin = requested.as_ref().or(binding.as_ref());
-    if let Some((key, _)) = active_origin {
+    if let Some((key, original)) = active_origin {
+        original.validate_entry(entry)?;
         lock_extraction_origin(client, key)?;
         if client
             .query_opt(
@@ -3193,22 +3242,30 @@ fn read_memory_source_frame(
         }
         frame.insert(*id, read);
     }
+    // A fence-only observation reports the original deletion epoch, not an
+    // authorization to consume a body. Its frame intentionally has no body
+    // revisions or ancestor closure, so it cannot pass the live-input check.
+    if !include_body {
+        return Ok((frame, false, budget_bytes - remaining));
+    }
     let valid = memory::store::source_frame_matches_original_lineage(&origins, &frame);
     let classifications = roots
         .iter()
         .filter(|id| frame.get(id).and_then(Option::as_ref).is_some())
         .map(|id| {
-            memory::store::source_root_is_current(*id, &origins, &frame)
+            memory::store::source_root_eligibility(*id, &origins, &frame)
                 .map(|current| (*id, current))
         })
         .collect::<MemoryResult<Vec<_>>>()?;
-    for (id, current) in classifications {
-        if !current {
+    for (id, eligibility) in classifications {
+        if eligibility != memory::store::MemorySourceEligibility::Current {
             let read = frame
                 .get_mut(&id)
                 .and_then(Option::as_mut)
                 .ok_or(MemoryError::StaleSource)?;
-            read.origin_retired = true;
+            read.origin_retired = eligibility == memory::store::MemorySourceEligibility::Obsolete;
+            read.legacy_provenance_unknown =
+                eligibility == memory::store::MemorySourceEligibility::LegacyUnknown;
             read.revision = None;
             read.access = None;
         }
@@ -3338,6 +3395,7 @@ fn read_single_memory_source(
     if body_scope.is_none() {
         return match stored_fence {
             Some(fence) if fence.retired => Ok(Some(memory::store::MemorySourceRevisionRead {
+                legacy_provenance_unknown: false,
                 origin_retired,
                 access: None,
                 packet_content_digest: None,
@@ -3388,6 +3446,7 @@ fn read_single_memory_source(
     };
     if fence.retired || !include_body {
         return Ok(Some(memory::store::MemorySourceRevisionRead {
+            legacy_provenance_unknown: false,
             origin_retired,
             access: None,
             packet_content_digest: None,
@@ -3418,6 +3477,10 @@ fn read_single_memory_source(
             "Memory source/body scope mismatch".into(),
         ));
     }
+    match origin {
+        Some(origin) => origin.validate_entry(&entry)?,
+        None => {}
+    }
     let mut read = memory::store::live_source_revision(
         source_ref,
         &entry,
@@ -3432,6 +3495,8 @@ fn read_single_memory_source(
         .checked_add(origin_bytes)
         .ok_or(MemoryError::SourceReadLimit)?
         .max(used);
+    read.legacy_provenance_unknown =
+        origin.is_none() && entry.source == memory::MemorySource::AutoExtracted;
     read.origin_retired = origin_retired;
     if origin_retired {
         read.revision = None;
@@ -3477,7 +3542,14 @@ impl MemorySourceFenceReader for PostgresMemoryStore {
             .checkout_online_read()
             .map_err(storage_memory_error)?;
         let mut tx = connection.transaction().map_err(postgres_memory_error)?;
-        read_live_memory_source(&mut tx, source_ref, budget_bytes, true)
+        let read = read_live_memory_source(&mut tx, source_ref, budget_bytes, true)?;
+        if read
+            .as_ref()
+            .is_some_and(|read| read.legacy_provenance_unknown)
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        Ok(read)
     }
 
     fn read_source_fence(&self, source_ref: &str) -> MemoryResult<Option<MemorySourceFence>> {

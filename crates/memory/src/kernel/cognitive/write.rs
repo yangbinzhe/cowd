@@ -226,6 +226,7 @@ impl CognitiveContextManager {
         mut entry: MemoryEntry,
         turn: Option<&MemoryTurnContext>,
     ) -> Result<()> {
+        let runtime_owned_turn = turn.is_some();
         // CognitiveContextManager is the ordinary Runtime/API memory path;
         // it must never be a second L4 promotion route.  Runtime's
         // L4PromotionService owns the governed candidate lifecycle and calls
@@ -291,7 +292,11 @@ impl CognitiveContextManager {
             }
         }
 
-        self.orchestrator.remember_for_turn(turn, entry).await?;
+        if runtime_owned_turn {
+            self.orchestrator.remember_for_turn(turn, entry).await?;
+        } else {
+            self.orchestrator.remember(entry).await?;
+        }
         self.invalidate_prepare_context_cache();
         Ok(())
     }

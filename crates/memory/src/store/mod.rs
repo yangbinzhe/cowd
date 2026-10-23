@@ -24,11 +24,12 @@ mod mutation;
 pub(crate) use mutation::reserved_source_bytes;
 pub use mutation::{
     auxiliary_source_cuts, filter_auxiliary_snapshot, filter_auxiliary_source_frame,
-    lifecycle_retired, live_source_revision, retire_auxiliary_support,
-    source_frame_matches_original_lineage, source_root_is_current, validate_auxiliary_replacement,
-    MemoryCleanupPending, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLegacyLifecyclePage,
-    MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryRetirementVerificationError,
-    MemorySourceAccess, MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead,
+    lifecycle_retired, live_source_revision, read_lifecycle_history, retain_held_auxiliary,
+    retire_auxiliary_support, source_frame_matches_original_lineage, source_root_eligibility,
+    validate_auxiliary_replacement, MemoryCleanupPending, MemoryEntryRevision,
+    MemoryExtractionOrigin, MemoryLegacyLifecyclePage, MemoryLifecycleMutation,
+    MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceAccess,
+    MemorySourceEligibility, MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead,
     VerifiedMemoryRetirement,
 };
 mod ephemeral;

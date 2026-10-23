@@ -4002,6 +4002,7 @@ mod tests {
                     .0
                     .clone()
                     .map(|fence| crate::store::MemorySourceRevisionRead {
+                        legacy_provenance_unknown: false,
                         origin_retired: false,
                         access: None,
                         packet_content_digest: None,

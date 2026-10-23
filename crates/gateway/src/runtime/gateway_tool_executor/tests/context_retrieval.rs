@@ -477,6 +477,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
     let orchestrator = manager.orchestrator();
     let store = orchestrator.store();
     let mut sample = store.get(&exact_memory_id).await.unwrap().unwrap();
+    sample.tags = vec!["independent-pagination-fixture".into()];
     let mut expected = std::collections::BTreeSet::new();
     for index in 0..35 {
         sample.id = uuid::Uuid::new_v4();
@@ -512,6 +513,20 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
         request = page["next_request"].clone();
     }
     assert_eq!(actual, expected);
+    // This real tool invocation has already consumed the original Memory cut.
+    // A new action/new ID cannot drop it at the Kernel/orchestrator boundary.
+    let stale_context = context
+        .clone()
+        .with_source_readset(Some(vec![revision.clone()]));
+    let before_notes = store.aggregate(0.5).await.unwrap().total_entries;
+    assert!(executor.execute_runtime_tool_with_binding(
+        "private_note", json!({"kind":"hypothesis","title":"late old-cut note","content":"Do not re-author a corrected original source."}),
+        RuntimeToolExecutionBinding { action_id:Some("private-note-stale-cut"), memory_context:Some(&stale_context), ..binding },
+    ).await.is_err());
+    assert_eq!(
+        store.aggregate(0.5).await.unwrap().total_entries,
+        before_notes
+    );
     let revision = memory::store::MemoryEntryRevision::of(&sample).unwrap();
     sample.content.push_str(" changed");
     store.update(&sample, &revision).await.unwrap();

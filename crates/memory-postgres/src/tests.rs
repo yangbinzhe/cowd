@@ -3103,3 +3103,223 @@ async fn real_postgres_legacy_retirement_adopts_original_cut_after_reopen_withou
     drop(store);
     drop(executor);
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_runtime_turn_writes_keep_original_cuts_and_legacy_unknown_after_reopen() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    let mut source = memory_entry(uuid::Uuid::new_v4(), "runtime-consumed-original");
+    source.visibility = AgentVisibility::Shared;
+    store.insert(&source).await.unwrap();
+    let cut = MemoryEntryRevision::of(&source).unwrap();
+    let root =
+        std::env::temp_dir().join(format!("cowd-runtime-memory-cuts-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut config = memory::MemoryConfig::default();
+    config.store.blob_dir = root.join("blobs");
+    config.store.enable_vector_index = false;
+    let manager = Arc::new(
+        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+            .await
+            .unwrap(),
+    );
+    let kernel = memory::MemoryKernel::new(manager.clone());
+    let ctx = memory::MemoryTurnContext::new("provider-session", "provider-agent")
+        .with_project_id(Some("snapshot-test".into()))
+        .with_turn_ref(Some("original-provider-turn".into()))
+        .with_source_readset(Some(vec![cut.clone()]));
+    let mut note = memory_entry(uuid::Uuid::new_v4(), "original-note-action");
+    note.source = MemorySource::AutoExtracted;
+    note.session_id = None;
+    note.source_agent = None;
+    kernel.remember(&ctx, note.clone()).await.unwrap();
+    let mut sibling = note.clone();
+    sibling.id = uuid::Uuid::new_v4();
+    sibling.title = "independent-sibling-action".into();
+    sibling.content = "A separate original action.".into();
+    kernel.remember(&ctx, sibling.clone()).await.unwrap();
+    kernel
+        .erase(&ctx, note.id, "only the original note")
+        .await
+        .unwrap();
+    assert!(kernel
+        .retrieve_visible_entry(&ctx, sibling.id)
+        .await
+        .unwrap()
+        .is_some());
+    source.content = "actual corrected independent source".into();
+    store.update(&source, &cut).await.unwrap();
+    let mut stale = note.clone();
+    stale.id = uuid::Uuid::new_v4();
+    stale.title = "late-stale-cut".into();
+    assert!(kernel.remember(&ctx, stale.clone()).await.is_err());
+    assert!(store.get(&stale.id).await.unwrap().is_none());
+    let mut unknown = ctx.clone();
+    unknown.source_readset = None;
+    assert!(kernel.remember(&unknown, stale.clone()).await.is_err());
+    let current = ctx
+        .clone()
+        .with_source_readset(Some(vec![MemoryEntryRevision::of(&source).unwrap()]));
+    kernel
+        .archive(&current, source.id, "source erased from active input")
+        .await
+        .unwrap();
+    let mut late = note;
+    late.id = uuid::Uuid::new_v4();
+    late.title = "new-id-after-original-retirement".into();
+    assert!(kernel.remember(&current, late.clone()).await.is_err());
+    assert!(store.get(&late.id).await.unwrap().is_none());
+    let mut legacy = memory_entry(uuid::Uuid::new_v4(), "legacy-unbound-extraction");
+    legacy.source = MemorySource::AutoExtracted;
+    legacy.scope = MemoryScope::Global;
+    legacy.visibility = AgentVisibility::Shared;
+    store.insert(&legacy).await.unwrap();
+    let mut wash = legacy.clone();
+    wash.source = MemorySource::Import;
+    assert!(store
+        .update(&wash, &MemoryEntryRevision::of(&legacy).unwrap())
+        .await
+        .is_err());
+    drop(kernel);
+    drop(manager);
+    drop(store);
+    drop(executor);
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    assert!(store
+        .read_source_revision(
+            &format!("memory:{}", legacy.id),
+            memory::knowledge::KNOWLEDGE_READ_MAX_BYTES
+        )
+        .is_err());
+    let old_note = store
+        .read_source_revision(
+            &format!("memory:{}", sibling.id),
+            memory::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(old_note.origin_retired);
+    assert!(old_note.revision.is_none());
+    // The body's own deletion fence is distinct from its inherited eligibility.
+    let note_fence = store
+        .read_source_fence(&format!("memory:{}", sibling.id))
+        .unwrap()
+        .unwrap();
+    assert!(!note_fence.retired);
+    assert_eq!(note_fence.delete_epoch, 0);
+    let mut independent = memory_entry(uuid::Uuid::new_v4(), "explicit-independent-user-root");
+    independent.scope = MemoryScope::Global;
+    independent.visibility = AgentVisibility::Shared;
+    store.insert(&independent).await.unwrap();
+    assert!(store
+        .read_source_revision(
+            &format!("memory:{}", independent.id),
+            memory::knowledge::KNOWLEDGE_READ_MAX_BYTES
+        )
+        .unwrap()
+        .unwrap()
+        .revision
+        .is_some());
+    let now = chrono::Utc::now();
+    let node = |id: &str, source: Option<&MemoryEntry>| memory::entity::Entity {
+        id: id.into(),
+        name: id.into(),
+        entity_type: memory::entity::EntityType::Concept,
+        confidence: 1.0,
+        frequency: 1,
+        first_seen: now,
+        last_seen: now,
+        source_type: if source.is_some() { "memory" } else { "file" }.into(),
+        source_ids: source.map(|s| vec![s.id.to_string()]).unwrap_or_default(),
+        memory_source_revisions: source
+            .map(|s| vec![MemoryEntryRevision::of(s).unwrap()])
+            .unwrap_or_default(),
+    };
+    let mut multi = node("multi-node", Some(&legacy));
+    multi.source_ids.push(independent.id.to_string());
+    multi
+        .memory_source_revisions
+        .push(MemoryEntryRevision::of(&independent).unwrap());
+    let held = node("old-held-node", Some(&legacy));
+    let good = node("independent-node", Some(&independent));
+    let external = node("external-node", None);
+    {
+        let mut c = executor.checkout_critical().unwrap();
+        for e in [&held, &good, &external, &multi] {
+            c.execute(
+                "INSERT INTO memory_entities(scope_key,id,payload) VALUES('global',$1,$2)",
+                &[&e.id, &serde_json::to_value(e).unwrap()],
+            )
+            .unwrap();
+        }
+    }
+    let visible = store.load_entities("global").await.unwrap();
+    assert_eq!(
+        visible
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["independent-node", "external-node", "multi-node"])
+    );
+    assert!(store
+        .save_entities("global", std::slice::from_ref(&held))
+        .await
+        .is_err());
+    store.save_entities("global", &visible).await.unwrap();
+    let mut changed = visible.clone();
+    changed
+        .iter_mut()
+        .find(|e| e.id == "multi-node")
+        .unwrap()
+        .name = "unproven metadata change".into();
+    assert!(store.save_entities("global", &changed).await.is_err());
+    store
+        .save_knowledge_graph("global", &visible, &[])
+        .await
+        .unwrap();
+
+    {
+        let mut c = executor.checkout_online_read().unwrap();
+        let raw: serde_json::Value = c
+            .query_one(
+                "SELECT payload FROM memory_entities WHERE scope_key='global' AND id=$1",
+                &[&held.id],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(raw, serde_json::to_value(&held).unwrap());
+    }
+    {
+        let mut c = executor.checkout_online_read().unwrap();
+        let raw: serde_json::Value = c
+            .query_one(
+                "SELECT payload FROM memory_entities WHERE scope_key='global' AND id=$1",
+                &[&multi.id],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(raw, serde_json::to_value(&multi).unwrap());
+    }
+    let mut config = memory::MemoryConfig::default();
+    config.store.blob_dir = root.join("reopened-blobs");
+    config.store.enable_vector_index = false;
+    let manager =
+        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+            .await
+            .unwrap();
+    assert_eq!(manager.list_entities().await.unwrap().len(), 3);
+    for id in [legacy.id, independent.id] {
+        let fence = store
+            .read_source_fence(&format!("memory:{id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fence.delete_epoch, 0);
+        assert!(!fence.retired);
+    }
+    drop(manager);
+    drop(store);
+    drop(executor);
+}

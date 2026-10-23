@@ -895,13 +895,7 @@ impl MemoryKernel {
             let Some(memory_id) = keyed.get(&value.key).copied() else {
                 continue;
             };
-            let events = serde_json::from_str::<Vec<MemoryLifecycleEvent>>(&value.value).map_err(
-                |error| {
-                    MemoryKernelError::Backend(MemoryError::Store(format!(
-                        "decode lifecycle events for {memory_id}: {error}"
-                    )))
-                },
-            )?;
+            let events = crate::store::read_lifecycle_history(memory_id, Some(&value.value))?;
             states.insert(memory_id, events.last().map(|event| event.to));
         }
         Ok(states)
@@ -1061,10 +1055,29 @@ impl MemoryKernel {
         let Some(entry) = self.manager.get_entry(&memory_id.to_string()).await? else {
             return Ok(None);
         };
+        if !memory_entry_visible_to_ctx(&entry, ctx) {
+            return Ok(None);
+        }
         let mut active = self.filter_active_entries(vec![entry]).await?;
-        Ok(active
-            .pop()
-            .filter(|entry| memory_entry_visible_to_ctx(entry, ctx)))
+        let Some(entry) = active.pop() else {
+            return Ok(None);
+        };
+        let read = self
+            .manager
+            .orchestrator()
+            .store()
+            .read_source_revision(
+                &format!("memory:{memory_id}"),
+                crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+            )?
+            .ok_or(MemoryError::StaleSource)?;
+        if read.fence.retired || read.origin_retired {
+            return Ok(None);
+        }
+        if read.revision.as_ref() != Some(&crate::store::MemoryEntryRevision::of(&entry)?) {
+            return Err(MemoryError::StaleSource.into());
+        }
+        Ok(Some(entry))
     }
 
     async fn context_packet_with_mode(
@@ -1647,11 +1660,7 @@ impl MemoryKernel {
             return Ok(Vec::new());
         };
 
-        serde_json::from_str(&raw).map_err(|error| {
-            MemoryKernelError::Backend(MemoryError::Store(format!(
-                "decode lifecycle events for {memory_id}: {error}"
-            )))
-        })
+        crate::store::read_lifecycle_history(memory_id, Some(&raw)).map_err(Into::into)
     }
 
     async fn authority_match(
