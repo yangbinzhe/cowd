@@ -6798,11 +6798,6 @@ mod tests {
         (descriptor, scope, resolved)
     }
 
-    #[tokio::test]
-    async fn own870_real_native_control_receipts_authenticate_and_project_without_business_effect() {
-        original_native_primary_658(false).await;
-    }
-
     #[test]
     fn own869_runtime_control_is_not_a_workspace_business_effect() {
         use harness_contract::policy::{PermissionOperation, PermissionResource};

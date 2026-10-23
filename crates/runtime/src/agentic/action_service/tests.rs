@@ -3695,10 +3695,6 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
     .await;
 }
 
-fn blocked_exit_blocked() -> bool {
-    true
-}
-
 #[tokio::test]
 async fn blocked_exit_requires_a_reason_human_review_and_next_actions() {
     let service = crate::AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
@@ -3753,7 +3749,6 @@ async fn blocked_exit_requires_a_reason_human_review_and_next_actions() {
         no_next_steps.error.expect("error").code,
         "blocked_exit_incomplete"
     );
-    assert!(blocked_exit_blocked());
 }
 
 #[tokio::test]
