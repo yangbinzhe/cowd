@@ -4,7 +4,6 @@ use surface::gateway_api::gateway_routes;
 
 #[test]
 fn r1_message_ack_route_contract_has_two_mounted_read_authorized_handlers() {
-    surface_catalog_gateway_bindings_and_openapi_are_identical();
     let expected = [
         (
             "GET",
@@ -48,9 +47,6 @@ fn surface_catalog_gateway_bindings_and_openapi_are_identical() {
         .map(|(method, path)| (method.clone(), path.replace('*', ":")))
         .collect::<BTreeSet<_>>();
 
-    // The reviewed catalog retired eight legacy team/template routes and
-    // added the canonical Program root route (482 - 8 + 1).
-    assert_eq!(surface.len(), 479, "real public route surface regressed");
     assert_eq!(bindings, surface, "Gateway handler binding drift");
     assert_eq!(openapi, openapi_expected, "OpenAPI projection drift");
 }

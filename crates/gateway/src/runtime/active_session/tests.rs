@@ -54,9 +54,7 @@ fn replacement_advances_generation_even_at_capacity() {
 }
 
 #[test]
-fn directory_contract_performance_smoke() {
-    directory_preserves_sorted_lookup_and_removal_contract();
-    replacement_advances_generation_even_at_capacity();
+fn missing_session_lookup_and_removal_are_empty() {
     let sessions = ActiveSessionDirectory::new();
     assert!(sessions.get("missing").is_none());
     assert!(sessions.remove("missing").is_none());
