@@ -68,7 +68,7 @@ pub(crate) use session_service::{
 };
 pub(crate) use skill_service::profile_provider::{
     attach_workspace_skill_usage_sink, invalidate_workspace_skill_snapshot,
-    runtime_skill_assets_for_workspace, validate_workspace_skill_revision,
+    runtime_skill_assets_for_workspace,
 };
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,

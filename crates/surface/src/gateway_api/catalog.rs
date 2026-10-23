@@ -1041,6 +1041,10 @@ pub mod paths {
         GatewayPathKey::new("api_skills_by_id_files", "/api/skills/:id/files");
     pub const API_SKILLS_BY_ID_FILES_RAW: GatewayPathKey =
         GatewayPathKey::new("api_skills_by_id_files_raw", "/api/skills/:id/files/raw");
+    pub const API_SKILLS_BY_ID_FIRST_INSTALL_REVIEWS: GatewayPathKey = GatewayPathKey::new(
+        "api_skills_by_id_first_install_reviews",
+        "/api/skills/:id/first-install-reviews",
+    );
     pub const API_SKILLS_BY_ID_ROLLBACK_REVIEWS: GatewayPathKey = GatewayPathKey::new(
         "api_skills_by_id_rollback_reviews",
         "/api/skills/:id/rollback-reviews",
@@ -3424,6 +3428,11 @@ pub mod routes {
         GatewayHttpMethod::Post,
         paths::API_SKILLS_BY_ID_ACTIONS_VALIDATE,
     );
+    pub const POST_API_SKILLS_BY_ID_FIRST_INSTALL_REVIEWS: GatewayRouteSpec = GatewayRouteSpec::new(
+        "post_api_skills_by_id_first_install_reviews",
+        GatewayHttpMethod::Post,
+        paths::API_SKILLS_BY_ID_FIRST_INSTALL_REVIEWS,
+    );
     pub const POST_API_SKILLS_BY_ID_ROLLBACK_REVIEWS: GatewayRouteSpec = GatewayRouteSpec::new(
         "post_api_skills_by_id_rollback_reviews",
         GatewayHttpMethod::Post,
@@ -4049,6 +4058,7 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_SKILLS_BY_ID_ACTIVE_POINTER,
     paths::API_SKILLS_BY_ID_FILES,
     paths::API_SKILLS_BY_ID_FILES_RAW,
+    paths::API_SKILLS_BY_ID_FIRST_INSTALL_REVIEWS,
     paths::API_SKILLS_BY_ID_ROLLBACK_REVIEWS,
     paths::API_SKILLS_BY_ID_TRANSLATE,
     paths::API_SKILLS_CATALOG,
@@ -4569,6 +4579,7 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::POST_API_SKILLS_BY_ID_ACTIONS_PLAN,
     routes::POST_API_SKILLS_BY_ID_ACTIONS_RUN,
     routes::POST_API_SKILLS_BY_ID_ACTIONS_VALIDATE,
+    routes::POST_API_SKILLS_BY_ID_FIRST_INSTALL_REVIEWS,
     routes::POST_API_SKILLS_BY_ID_ROLLBACK_REVIEWS,
     routes::POST_API_SKILLS_BY_ID_TRANSLATE,
     routes::POST_API_SKILLS_INSTALL_COMMIT,

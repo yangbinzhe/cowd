@@ -1201,9 +1201,11 @@ impl RuntimeServices {
         let skill_maintenance_projector = Arc::new(crate::SkillMaintenanceProjector::new(
             Arc::clone(&event_store),
         ));
+        let skill_catalog = Arc::new(RwLock::new(skill_catalog));
         let skill_revision_governance = Arc::new(crate::SkillRevisionGovernanceService::new(
             Arc::clone(&event_store),
             Arc::clone(&approval_queue),
+            Arc::clone(&skill_catalog),
         ));
         let approval_policy_controls = Arc::clone(&session_execution_policy_controls);
         install_builtin_executors(
@@ -1528,7 +1530,7 @@ impl RuntimeServices {
             evolution_evaluation_flights: Arc::new(Mutex::new(BTreeSet::new())),
             agentic_dispatch_flights: Arc::new(Mutex::new(BTreeSet::new())),
             agentic_read_model,
-            skill_catalog: Arc::new(RwLock::new(skill_catalog)),
+            skill_catalog,
             reality_recall_port,
             knowledge_activation: knowledge_activation
                 .unwrap_or_else(crate::knowledge_activation::KnowledgeActivationRuntime::new),
@@ -4150,19 +4152,26 @@ impl RuntimeServices {
         request_id: &str,
         draft_id: &str,
         target_revision: &str,
-        validation_digest: &str,
+        receipt_id: &str,
     ) -> Result<harness_contract::skill::SkillRevisionReview, RuntimeServicesError> {
         let draft = self
             .skill_maintenance_draft(draft_id)?
             .ok_or_else(|| RuntimeServicesError::Invariant("skill Draft not found".to_string()))?;
         self.skill_revision_governance
-            .request_activation(
-                principal,
-                request_id,
-                &draft,
-                target_revision,
-                validation_digest,
-            )
+            .request_activation(principal, request_id, &draft, target_revision, receipt_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn request_skill_first_install(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        request_id: &str,
+        skill_id: &str,
+        target_revision: &str,
+        receipt_id: &str,
+    ) -> Result<harness_contract::skill::SkillRevisionReview, RuntimeServicesError> {
+        self.skill_revision_governance
+            .request_first_install(principal, request_id, skill_id, target_revision, receipt_id)
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 
@@ -4173,6 +4182,7 @@ impl RuntimeServices {
         skill_id: &str,
         target_revision: &str,
         evidence_digest: &str,
+        receipt_id: &str,
     ) -> Result<harness_contract::skill::SkillRevisionReview, RuntimeServicesError> {
         self.skill_revision_governance
             .request_rollback(
@@ -4181,6 +4191,7 @@ impl RuntimeServices {
                 skill_id,
                 target_revision,
                 evidence_digest,
+                receipt_id,
             )
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }

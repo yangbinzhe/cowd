@@ -70,6 +70,17 @@ pub struct RuntimeSkillPromptAsset {
 /// asks for the exact immutable instruction selected for the current turn.
 #[async_trait]
 pub trait RuntimeSkillInstructionSource: Send + Sync {
+    /// Synchronous bounded package verification at the original governance
+    /// boundary. Caller JSON/digests do not substitute for this trusted port.
+    fn inspect_revision(
+        &self,
+        _skill_id: &str,
+        _revision: &str,
+        _receipt_id: &str,
+    ) -> Result<harness_contract::skill::SkillInstallationEvidence, String> {
+        Err("installed Skill verification is unavailable".into())
+    }
+
     async fn load_instruction(
         &self,
         invocation: &SkillInvocation,

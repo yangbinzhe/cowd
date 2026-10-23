@@ -2135,6 +2135,11 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         handler: "skill_action_validate_handler",
     },
     GatewayRouteBinding {
+        route: routes::POST_API_SKILLS_BY_ID_FIRST_INSTALL_REVIEWS,
+        source: "skill_routes.rs",
+        handler: "skill_first_install_review_handler",
+    },
+    GatewayRouteBinding {
         route: routes::POST_API_SKILLS_BY_ID_ROLLBACK_REVIEWS,
         source: "skill_routes.rs",
         handler: "skill_revision_rollback_review_handler",

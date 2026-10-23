@@ -96,6 +96,7 @@ pub(crate) fn workspace_skill_snapshot(workspace_root: &Path) -> Arc<WorkspaceSk
         Vec::new()
     });
     let assets = runtime_skill_assets_from_snapshot(
+        workspace_root,
         &skills,
         Arc::clone(&cell.usage),
         Arc::clone(&cell.metrics),
@@ -164,50 +165,6 @@ pub(crate) fn runtime_skill_profiles_for_workspace(
     runtime_skill_assets_for_workspace(workspace_root).profiles
 }
 
-pub(crate) fn validate_workspace_skill_revision(
-    workspace_root: &Path,
-    skill_id: &str,
-    target_revision: &str,
-) -> Result<String, String> {
-    let registry = SkillRegistry::discover(workspace_root);
-    let skills = registry
-        .list()
-        .map_err(|error| format!("Skill candidate discovery failed: {error}"))?;
-    for candidate in skills {
-        let root = if candidate.path.is_file() {
-            candidate
-                .path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        } else {
-            candidate.path.clone()
-        };
-        let profile = match profile_skill_catalog_entry(
-            &candidate.path,
-            &candidate.name,
-            candidate.description.as_deref(),
-            candidate.version.clone(),
-        ) {
-            Ok(profile) if profile.skill_id == skill_id => profile,
-            Ok(_) | Err(_) => continue,
-        };
-        let inspected = profile_skill_package(&root, &profile.name, profile.version.clone())
-            .map_err(|error| format!("Skill revision inspection failed: {error}"))?;
-        if inspected.package_fingerprint != target_revision {
-            continue;
-        }
-        if inspected.lifecycle_status == SkillLifecycleStatus::Blocked {
-            return Err("Skill revision is blocked by full package inspection".to_string());
-        }
-        let bytes = serde_json::to_vec(&inspected).map_err(|error| error.to_string())?;
-        return Ok(format!("sha256:{:x}", Sha256::digest(bytes)));
-    }
-    Err(format!(
-        "no discovered Skill candidate matches {skill_id} revision {target_revision}"
-    ))
-}
-
 /// Gateway owns package discovery and inspection. Runtime receives only the
 /// lightweight capability catalog and a lazy instruction source; selected
 /// PromptOnly Markdown is loaded and cached without coupling Runtime to the
@@ -217,6 +174,7 @@ pub(crate) fn runtime_skill_assets_for_workspace(workspace_root: &Path) -> Runti
 }
 
 fn runtime_skill_assets_from_snapshot(
+    workspace_root: &Path,
     skills: &[SkillInfo],
     usage: Arc<RuntimeSkillUsageRelay>,
     metrics: Arc<SkillInstructionCacheMetrics>,
@@ -255,13 +213,12 @@ fn runtime_skill_assets_from_snapshot(
         };
         assets.profiles.push(profile);
     }
-    if !assets.profiles.is_empty() {
-        assets.instruction_source = Some(Arc::new(WorkspaceSkillInstructionSource::new(
-            &assets.profiles,
-            usage,
-            metrics,
-        )));
-    }
+    assets.instruction_source = Some(Arc::new(WorkspaceSkillInstructionSource::new(
+        workspace_root,
+        &assets.profiles,
+        usage,
+        metrics,
+    )));
     assets
 }
 
@@ -291,6 +248,8 @@ struct SkillInstructionCache {
 
 #[derive(Debug)]
 struct WorkspaceSkillInstructionSource {
+    workspace_root: PathBuf,
+    managed_store: Result<skill::ManagedSkillStore, String>,
     descriptors: Arc<HashMap<String, SkillInstructionDescriptor>>,
     cache: Mutex<SkillInstructionCache>,
     flights: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -300,6 +259,7 @@ struct WorkspaceSkillInstructionSource {
 
 impl WorkspaceSkillInstructionSource {
     fn new(
+        workspace_root: &Path,
         profiles: &[SkillCapabilityProfile],
         usage: Arc<RuntimeSkillUsageRelay>,
         metrics: Arc<SkillInstructionCacheMetrics>,
@@ -320,6 +280,9 @@ impl WorkspaceSkillInstructionSource {
             })
             .collect();
         Self {
+            workspace_root: workspace_root.to_path_buf(),
+            managed_store: skill::ManagedSkillStore::default_for_user()
+                .map_err(|error| error.to_string()),
             descriptors: Arc::new(descriptors),
             cache: Mutex::new(SkillInstructionCache::default()),
             flights: Mutex::new(HashMap::new()),
@@ -449,6 +412,38 @@ impl WorkspaceSkillInstructionSource {
 
 #[async_trait]
 impl runtime::RuntimeSkillInstructionSource for WorkspaceSkillInstructionSource {
+    fn inspect_revision(
+        &self,
+        skill_id: &str,
+        revision: &str,
+        receipt_id: &str,
+    ) -> Result<harness_contract::skill::SkillInstallationEvidence, String> {
+        let store = self.managed_store.as_ref().map_err(Clone::clone)?;
+        let installed = store
+            .resolve_installed(skill_id, revision, receipt_id)
+            .map_err(|error| error.to_string())?;
+        let workspace = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let store_root = store
+            .root()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let scope =
+            serde_json::to_vec(&("cowd.skill.installation.scope.v1", workspace, store_root))
+                .map_err(|error| error.to_string())?;
+        let receipt = serde_json::to_vec(&installed.receipt).map_err(|error| error.to_string())?;
+        Ok(harness_contract::skill::SkillInstallationEvidence {
+            scope_ref: format!("sha256:{:x}", Sha256::digest(scope)),
+            skill_id: installed.receipt.skill_id,
+            revision: installed.receipt.revision,
+            receipt_id: installed.receipt.install_id,
+            receipt_digest: format!("sha256:{:x}", Sha256::digest(receipt)),
+            inspection_fingerprint: installed.inspection_fingerprint,
+        })
+    }
+
     async fn load_instruction(
         &self,
         invocation: &runtime::SkillInvocation,
@@ -982,6 +977,7 @@ mod tests {
                 source_draft_id: Some("draft".to_string()),
                 approval_ref: "approval".to_string(),
                 activated_at_ms: 2,
+                installation: None,
             },
         });
         attach_workspace_skill_usage_sink(&temp.root, sink);
@@ -1023,6 +1019,7 @@ mod tests {
                 source_draft_id: Some("draft".to_string()),
                 approval_ref: "approval".to_string(),
                 activated_at_ms: 2,
+                installation: None,
             },
         });
         attach_workspace_skill_usage_sink(&temp.root, sink);
@@ -1045,34 +1042,71 @@ mod tests {
     }
 
     #[test]
-    fn shadowed_candidate_can_be_validated_without_becoming_active() {
-        let temp = TempWorkspace::new("shadowed-candidate");
-        let active_root = temp.root.join(".cowd").join("skills").join("review");
-        let candidate_root = temp.root.join(".agents").join("skills").join("review");
-        std::fs::create_dir_all(&active_root).expect("active root");
-        std::fs::create_dir_all(&candidate_root).expect("candidate root");
+    fn installed_revision_reader_binds_original_receipt_scope_and_full_bytes() {
+        use runtime::RuntimeSkillInstructionSource;
+        let temp = TempWorkspace::new("installed-reader");
+        let package_root = temp.root.join("package");
+        std::fs::create_dir_all(&package_root).unwrap();
+        std::fs::write(package_root.join("SKILL.md"), "---\nname: Review\nversion: 1.0.0\ndescription: Original receipt.\n---\nOriginal full bytes.\n").unwrap();
+        // A higher-precedence catalog entry cannot substitute its bytes or
+        // prevent exact inspection of the installed candidate being reviewed.
+        let shadow = temp.root.join(".cowd/skills/review");
+        std::fs::create_dir_all(&shadow).unwrap();
         std::fs::write(
-            active_root.join("SKILL.md"),
-            "---\nname: Review\nversion: 1.0.0\ndescription: Active.\n---\n\nActive content.",
+            shadow.join("SKILL.md"),
+            "---\nname: Review\ndescription: Foreign catalog candidate.\n---\nDifferent bytes.\n",
         )
-        .expect("active skill");
-        std::fs::write(
-            candidate_root.join("SKILL.md"),
-            "---\nname: Review\nversion: 2.0.0\ndescription: Candidate.\n---\n\nCandidate content.",
-        )
-        .expect("candidate skill");
-        let candidate = profile_skill_package(&candidate_root, "Review", Some("2.0.0".to_string()))
-            .expect("candidate inspection");
-        let digest =
-            validate_workspace_skill_revision(&temp.root, "review", &candidate.package_fingerprint)
-                .expect("shadowed candidate validation");
-        assert!(digest.starts_with("sha256:"));
-        let active = runtime_skill_assets_for_workspace(&temp.root)
-            .profiles
-            .into_iter()
-            .find(|profile| profile.skill_id == "review")
-            .expect("active profile");
-        assert_eq!(active.version.as_deref(), Some("1.0.0"));
+        .unwrap();
+        let store = skill::ManagedSkillStore::new(temp.root.join("installed"));
+        let lifecycle = skill::SkillLifecycle::new(store.clone()).unwrap();
+        let plan = lifecycle
+            .plan(package_root.to_str().unwrap(), &temp.root)
+            .unwrap();
+        let receipt = lifecycle
+            .commit(
+                package_root.to_str().unwrap(),
+                &temp.root,
+                &plan.package_digest,
+                false,
+                "human:test",
+            )
+            .unwrap();
+        let mut source = WorkspaceSkillInstructionSource::new(
+            &temp.root,
+            &[],
+            Arc::new(RuntimeSkillUsageRelay::default()),
+            Arc::new(SkillInstructionCacheMetrics::default()),
+        );
+        source.managed_store = Ok(store.clone());
+        let evidence = source
+            .inspect_revision("review", &receipt.revision, &receipt.install_id)
+            .unwrap();
+        assert_eq!(evidence.receipt_id, receipt.install_id);
+        assert_eq!(evidence.revision, plan.package_digest);
+        assert_eq!(evidence.inspection_fingerprint, receipt.plan_digest);
+        assert!(source
+            .inspect_revision("foreign", &receipt.revision, &receipt.install_id)
+            .is_err());
+        assert!(source
+            .inspect_revision("review", &receipt.revision, "../foreign")
+            .is_err());
+        let other_workspace = temp.root.join("other-workspace");
+        std::fs::create_dir_all(&other_workspace).unwrap();
+        source.workspace_root = other_workspace;
+        let other_scope = source
+            .inspect_revision("review", &receipt.revision, &receipt.install_id)
+            .unwrap();
+        assert_ne!(other_scope.scope_ref, evidence.scope_ref);
+        let receipt_path = store
+            .root()
+            .join("review/receipts")
+            .join(format!("{}.json", receipt.install_id));
+        let mut altered = serde_json::to_value(&receipt).unwrap();
+        altered["plan_digest"] = serde_json::json!("fabricated inspection");
+        std::fs::write(receipt_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(source
+            .inspect_revision("review", &receipt.revision, &receipt.install_id)
+            .is_err());
     }
 
     #[tokio::test]

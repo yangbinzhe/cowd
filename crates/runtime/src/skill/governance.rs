@@ -3,7 +3,7 @@
 //! Maintenance Drafts are inert evidence. A pointer can move only through a
 //! pending approval and a one-time verified human decision lease.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use harness_contract::{
     core::TaskRisk,
@@ -35,43 +35,73 @@ const POINTER_CHANGED_KIND: &str = "skill.revision.pointer.changed.v1";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum SkillRevisionInput {
+    FirstInstall {
+        skill_id: String,
+        target_revision: String,
+        receipt_id: String,
+    },
     Activate {
         skill_id: String,
         draft_id: String,
         draft_digest: String,
         target_revision: String,
-        validation_digest: String,
+        receipt_id: String,
     },
     Rollback {
         skill_id: String,
         target_revision: String,
         reason_evidence_digest: String,
+        receipt_id: String,
     },
 }
 
 impl SkillRevisionInput {
     fn matches_review(&self, review: &SkillRevisionReview) -> bool {
         match self {
+            Self::FirstInstall {
+                skill_id,
+                target_revision,
+                receipt_id,
+            } => {
+                review.action == SkillRevisionReviewAction::FirstInstall
+                    && review.skill_id == *skill_id
+                    && review.target_revision == *target_revision
+                    && review.draft_id.is_none()
+                    && review
+                        .installation
+                        .as_ref()
+                        .is_some_and(|installed| installed.receipt_id == *receipt_id)
+            }
             Self::Activate {
                 skill_id,
                 draft_id,
                 target_revision,
+                receipt_id,
                 ..
             } => {
                 review.action == SkillRevisionReviewAction::Activate
                     && review.skill_id == *skill_id
                     && review.draft_id.as_deref() == Some(draft_id.as_str())
                     && review.target_revision == *target_revision
+                    && review
+                        .installation
+                        .as_ref()
+                        .is_some_and(|installed| installed.receipt_id == *receipt_id)
             }
             Self::Rollback {
                 skill_id,
                 target_revision,
+                receipt_id,
                 ..
             } => {
                 review.action == SkillRevisionReviewAction::Rollback
                     && review.skill_id == *skill_id
                     && review.draft_id.is_none()
                     && review.target_revision == *target_revision
+                    && review
+                        .installation
+                        .as_ref()
+                        .is_some_and(|installed| installed.receipt_id == *receipt_id)
             }
         }
     }
@@ -100,19 +130,107 @@ pub enum SkillRevisionGovernanceError {
 pub struct SkillRevisionGovernanceService {
     event_store: Arc<RuntimeEventStore>,
     approvals: Arc<ApprovalQueue>,
+    catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
     #[cfg(test)]
     decision_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SkillRevisionGovernanceService {
     #[must_use]
-    pub fn new(event_store: Arc<RuntimeEventStore>, approvals: Arc<ApprovalQueue>) -> Self {
+    pub fn new(
+        event_store: Arc<RuntimeEventStore>,
+        approvals: Arc<ApprovalQueue>,
+        catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
+    ) -> Self {
         Self {
             event_store,
             approvals,
+            catalog,
             #[cfg(test)]
             decision_read_hook: None,
         }
+    }
+
+    fn installed(
+        &self,
+        skill_id: &str,
+        revision: &str,
+        receipt_id: &str,
+    ) -> Result<harness_contract::skill::SkillInstallationEvidence, SkillRevisionGovernanceError>
+    {
+        let source = self
+            .catalog
+            .read()
+            .map_err(|_| SkillRevisionGovernanceError::Store("Skill catalog lock failed".into()))?
+            .instruction_source()
+            .ok_or_else(|| {
+                SkillRevisionGovernanceError::InvalidRequest(
+                    "installed Skill reader is unavailable".into(),
+                )
+            })?;
+        // No catalog lock crosses package I/O or the original transaction.
+        let installed = source
+            .inspect_revision(skill_id, revision, receipt_id)
+            .map_err(SkillRevisionGovernanceError::InvalidRequest)?;
+        if installed.skill_id != skill_id
+            || installed.revision != revision
+            || installed.scope_ref.trim().is_empty()
+            || installed.receipt_id.trim().is_empty()
+            || installed.receipt_digest.trim().is_empty()
+            || installed.inspection_fingerprint.trim().is_empty()
+            || receipt_id != installed.receipt_id
+        {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "installed Skill reader identity mismatch".into(),
+            ));
+        }
+        Ok(installed)
+    }
+
+    pub fn request_first_install(
+        &self,
+        principal: &VerifiedPrincipal,
+        request_id: &str,
+        skill_id: &str,
+        target_revision: &str,
+        receipt_id: &str,
+    ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
+        require_human(principal)?;
+        if [request_id, skill_id, target_revision, receipt_id]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "first-install input is required".into(),
+            ));
+        }
+        let input = SkillRevisionInput::FirstInstall {
+            skill_id: skill_id.into(),
+            target_revision: target_revision.into(),
+            receipt_id: receipt_id.into(),
+        };
+        if let Some(existing) = self.existing_request(request_id, &input)? {
+            return Ok(existing);
+        }
+        let pointer_cut = self.pointer_snapshot(skill_id)?;
+        if pointer_cut.0.is_some() || pointer_cut.1 != 0 {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "first install requires an absent approved pointer".into(),
+            ));
+        }
+        let installation = self.installed(skill_id, target_revision, receipt_id)?;
+        self.request_review(
+            request_id,
+            SkillRevisionReviewAction::FirstInstall,
+            None,
+            skill_id,
+            target_revision,
+            None,
+            &digest_json(&json!({"first_install": installation})),
+            pointer_cut,
+            input,
+            installation,
+        )
     }
 
     pub fn request_activation(
@@ -121,15 +239,15 @@ impl SkillRevisionGovernanceService {
         request_id: &str,
         draft: &SkillMaintenanceDraft,
         target_revision: &str,
-        validation_digest: &str,
+        receipt_id: &str,
     ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
         require_human(principal)?;
         if request_id.trim().is_empty()
             || target_revision.trim().is_empty()
-            || validation_digest.trim().is_empty()
+            || receipt_id.trim().is_empty()
         {
             return Err(SkillRevisionGovernanceError::InvalidRequest(
-                "request_id, target_revision and validation_digest are required".to_string(),
+                "request_id and target_revision are required".to_string(),
             ));
         }
         if draft.recommendation == SkillMaintenanceRecommendation::Keep
@@ -148,10 +266,27 @@ impl SkillRevisionGovernanceService {
             draft_id: draft.draft_id.clone(),
             draft_digest: draft.digest(),
             target_revision: target_revision.into(),
-            validation_digest: validation_digest.into(),
+            receipt_id: receipt_id.into(),
         };
         if let Some(existing) = self.existing_request(request_id, &input)? {
             return Ok(existing);
+        }
+        let installation = self.installed(&draft.skill_id, target_revision, receipt_id)?;
+        let pointer_cut = self.pointer_snapshot(&draft.skill_id)?;
+        let current = pointer_cut.0.as_ref().ok_or_else(|| {
+            SkillRevisionGovernanceError::InvalidRequest(
+                "maintenance requires an existing approved pointer; use first install".into(),
+            )
+        })?;
+        if current.active_revision != draft.base_revision
+            || current
+                .installation
+                .as_ref()
+                .is_none_or(|installed| installed.scope_ref != installation.scope_ref)
+        {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "Skill installation scope changed or is unknown".into(),
+            ));
         }
         self.request_review(
             request_id,
@@ -162,11 +297,12 @@ impl SkillRevisionGovernanceService {
             Some(draft.base_revision.clone()),
             &digest_json(&json!({
                 "draft_digest": draft.digest(),
-                "validation_digest": validation_digest,
+                "installation": installation,
                 "target_revision": target_revision,
             })),
-            self.pointer_snapshot(&draft.skill_id)?,
+            pointer_cut,
             input,
+            installation,
         )
     }
 
@@ -177,11 +313,13 @@ impl SkillRevisionGovernanceService {
         skill_id: &str,
         target_revision: &str,
         reason_evidence_digest: &str,
+        receipt_id: &str,
     ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
         require_human(principal)?;
         if request_id.trim().is_empty()
             || target_revision.trim().is_empty()
             || reason_evidence_digest.trim().is_empty()
+            || receipt_id.trim().is_empty()
         {
             return Err(SkillRevisionGovernanceError::InvalidRequest(
                 "rollback input is required".into(),
@@ -191,6 +329,7 @@ impl SkillRevisionGovernanceService {
             skill_id: skill_id.into(),
             target_revision: target_revision.into(),
             reason_evidence_digest: reason_evidence_digest.into(),
+            receipt_id: receipt_id.into(),
         };
         if let Some(existing) = self.existing_request(request_id, &input)? {
             return Ok(existing);
@@ -199,6 +338,16 @@ impl SkillRevisionGovernanceService {
         let pointer = pointer_cut.0.as_ref().ok_or_else(|| {
             SkillRevisionGovernanceError::InvalidRequest("no active pointer".into())
         })?;
+        let installation = self.installed(skill_id, target_revision, receipt_id)?;
+        if pointer
+            .installation
+            .as_ref()
+            .is_none_or(|installed| installed.scope_ref != installation.scope_ref)
+        {
+            return Err(SkillRevisionGovernanceError::InvalidRequest(
+                "rollback installation scope changed or is unknown".into(),
+            ));
+        }
         if request_id.trim().is_empty()
             || target_revision.trim().is_empty()
             || reason_evidence_digest.trim().is_empty()
@@ -219,9 +368,11 @@ impl SkillRevisionGovernanceService {
             &digest_json(&json!({
                 "active_pointer": pointer,
                 "reason_evidence_digest": reason_evidence_digest,
+                "installation": installation,
             })),
             pointer_cut,
             input,
+            installation,
         )
     }
 
@@ -236,6 +387,7 @@ impl SkillRevisionGovernanceService {
         evidence_digest: &str,
         pointer_cut: (Option<SkillActivePointer>, u64),
         input: SkillRevisionInput,
+        installation: harness_contract::skill::SkillInstallationEvidence,
     ) -> Result<SkillRevisionReview, SkillRevisionGovernanceError> {
         let review_id = format!("skill-revision-review:{}", request_id.trim());
         let review = SkillRevisionReview {
@@ -253,6 +405,7 @@ impl SkillRevisionGovernanceService {
                 .map_or(0, |pointer| pointer.generation),
             status: SkillRevisionReviewStatus::Pending,
             created_at_ms: now_ms(),
+            installation: Some(installation),
         };
         if let Some(existing) = self.existing_request(request_id, &input)? {
             return Ok(existing);
@@ -428,6 +581,26 @@ impl SkillRevisionGovernanceService {
             return Err(SkillRevisionGovernanceError::ReviewNotPending);
         }
         let approved = decision == SkillRevisionReviewDecision::Approve;
+        if approved {
+            let installation = review.installation.as_ref().ok_or_else(|| {
+                SkillRevisionGovernanceError::InvalidRequest(
+                    "original installed Skill evidence is unavailable".into(),
+                )
+            })?;
+            let actual = self.installed(
+                &review.skill_id,
+                &review.target_revision,
+                &installation.receipt_id,
+            )?;
+            if &actual != installation {
+                return Err(SkillRevisionGovernanceError::InvalidRequest(
+                    "installed Skill bytes, inspection or scope changed after review".into(),
+                ));
+            }
+            if review.action == SkillRevisionReviewAction::FirstInstall && current.is_some() {
+                return Err(SkillRevisionGovernanceError::GenerationChanged);
+            }
+        }
         let pointer = approved.then(|| SkillActivePointer {
             skill_id: review.skill_id.clone(),
             active_revision: review.target_revision.clone(),
@@ -436,6 +609,7 @@ impl SkillRevisionGovernanceService {
             source_draft_id: review.draft_id.clone(),
             approval_ref: review.approval_id.clone(),
             activated_at_ms: now_ms(),
+            installation: review.installation.clone(),
         });
         let approval_stream = format!("approval:{}", review.approval_id);
         let review_stream = review_stream(&review.review_id);
@@ -611,6 +785,10 @@ impl SkillRevisionGovernanceService {
         let input: Option<SkillRevisionInput> = requested
             .payload
             .get("input")
+            // Before installed evidence was bound, caller input could not
+            // authorize these packages. Keep history visible without guessing
+            // the missing original receipt or a new approval grant.
+            .filter(|_| review.installation.is_some())
             .cloned()
             .map(serde_json::from_value)
             .transpose()
@@ -761,10 +939,72 @@ mod tests {
         SKILL_MAINTENANCE_DRAFT_SCHEMA_VERSION, SkillMaintenanceValidation, SkillUsageCounts,
     };
 
+    struct InstalledSource {
+        inspection: &'static str,
+        scope: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeSkillInstructionSource for InstalledSource {
+        fn inspect_revision(
+            &self,
+            skill_id: &str,
+            revision: &str,
+            receipt_id: &str,
+        ) -> Result<harness_contract::skill::SkillInstallationEvidence, String> {
+            if skill_id != "review" || !["1.0.0", "1.1.0", "1.2.0"].contains(&revision) {
+                return Err("installation is unavailable".into());
+            }
+            Ok(harness_contract::skill::SkillInstallationEvidence {
+                scope_ref: self.scope.into(),
+                skill_id: skill_id.into(),
+                revision: revision.into(),
+                receipt_id: receipt_id.into(),
+                receipt_digest: "original-receipt".into(),
+                inspection_fingerprint: self.inspection.into(),
+            })
+        }
+
+        async fn load_instruction(
+            &self,
+            _: &crate::SkillInvocation,
+            _: &crate::RuntimeSkillUsageContext,
+        ) -> Result<Option<crate::RuntimeSkillPromptAsset>, String> {
+            Err("not a page-in fixture".into())
+        }
+    }
+
     fn service() -> SkillRevisionGovernanceService {
         let store = Arc::new(RuntimeEventStore::for_test());
         let approvals = Arc::new(ApprovalQueue::new(Arc::clone(&store)));
-        SkillRevisionGovernanceService::new(store, approvals)
+        SkillRevisionGovernanceService::new(
+            store,
+            approvals,
+            Arc::new(RwLock::new(
+                crate::RuntimeSkillCatalog::default().with_instruction_source(Arc::new(
+                    InstalledSource {
+                        inspection: "original-inspection",
+                        scope: "workspace-test",
+                    },
+                )),
+            )),
+        )
+    }
+
+    fn approve_first(service: &SkillRevisionGovernanceService) {
+        let principal = crate::security::test_human_interactive_principal();
+        let review = service
+            .request_first_install(&principal, "bootstrap", "review", "1.0.0", "receipt-1.0")
+            .unwrap();
+        service
+            .decide_review(
+                &principal,
+                &lease(&review),
+                &review.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "first human approval",
+            )
+            .unwrap();
     }
 
     fn draft() -> SkillMaintenanceDraft {
@@ -810,6 +1050,149 @@ mod tests {
         )
     }
 
+    #[test]
+    fn original_1064_review_inputs_remain_status_readable_without_guessing_installation_authority()
+    {
+        let service = service();
+        let principal = crate::security::test_human_interactive_principal();
+        for action in ["activate", "rollback"] {
+            let request = format!("legacy-{action}");
+            let stream = format!("skill-revision-review:{request}");
+            let draft_id = (action == "activate").then_some("draft-1");
+            let input = if action == "activate" {
+                json!({"action":"activate", "skill_id":"review", "draft_id":"draft-1", "draft_digest":"old-draft", "target_revision":"1.1.0", "validation_digest":"old-inspection"})
+            } else {
+                json!({"action":"rollback", "skill_id":"review", "target_revision":"1.1.0", "reason_evidence_digest":"old-reason"})
+            };
+            service.event_store.append(RuntimeEventInput {
+                stream_id: stream.clone(), scope: RuntimeEventScope::Skill,
+                kind: "skill.revision.review.requested.v1".into(), status: Some("pending".into()), actor: Some("runtime.skill_revision_governance".into()), refs: vec![],
+                payload: json!({"review": {"review_id":stream, "approval_id":format!("approval:{stream}"), "action":action, "draft_id":draft_id, "skill_id":"review", "target_revision":"1.1.0", "previous_revision":"1.0.0", "evidence_digest":"original-evidence", "expected_generation":0, "status":"pending", "created_at_ms":1}, "input":input}),
+            }).unwrap();
+            let review = service
+                .review(&stream)
+                .expect("original literal journal remains readable");
+            assert_eq!(review.status, SkillRevisionReviewStatus::Pending);
+            assert!(review.installation.is_none());
+            assert_eq!(review.scope_ref(), "skill:review");
+            assert!(matches!(
+                service.decide_review(
+                    &principal,
+                    &lease(&review),
+                    &stream,
+                    SkillRevisionReviewDecision::Approve,
+                    "cannot invent receipt"
+                ),
+                Err(SkillRevisionGovernanceError::InvalidRequest(_))
+            ));
+            let replay = if action == "activate" {
+                service.request_activation(&principal, &request, &draft(), "1.1.0", "new-receipt")
+            } else {
+                service.request_rollback(
+                    &principal,
+                    &request,
+                    "review",
+                    "1.1.0",
+                    "old-reason",
+                    "new-receipt",
+                )
+            };
+            assert!(matches!(
+                replay,
+                Err(SkillRevisionGovernanceError::InvalidRequest(_))
+            ));
+        }
+        assert!(service.pointer("review").unwrap().is_none());
+    }
+
+    #[test]
+    fn first_install_rechecks_installed_evidence_and_replays_original_commit_after_reopen() {
+        let service = service();
+        let principal = crate::security::test_human_interactive_principal();
+        let review = service
+            .request_first_install(&principal, "first", "review", "1.0.0", "receipt-original")
+            .unwrap();
+        assert!(service.pointer("review").unwrap().is_none());
+        for (inspection, scope) in [
+            ("changed-inspection", "workspace-test"),
+            ("original-inspection", "foreign-workspace"),
+        ] {
+            *service.catalog.write().unwrap() = crate::RuntimeSkillCatalog::default()
+                .with_instruction_source(Arc::new(InstalledSource { inspection, scope }));
+            assert!(service
+                .decide_review(
+                    &principal,
+                    &lease(&review),
+                    &review.review_id,
+                    SkillRevisionReviewDecision::Approve,
+                    "must recheck"
+                )
+                .is_err());
+            assert!(service.pointer("review").unwrap().is_none());
+        }
+        *service.catalog.write().unwrap() = crate::RuntimeSkillCatalog::default()
+            .with_instruction_source(Arc::new(InstalledSource {
+                inspection: "original-inspection",
+                scope: "workspace-test",
+            }));
+        service
+            .decide_review(
+                &principal,
+                &lease(&review),
+                &review.review_id,
+                SkillRevisionReviewDecision::Approve,
+                "checked original installation",
+            )
+            .unwrap();
+        let reopened = SkillRevisionGovernanceService::new(
+            Arc::clone(&service.event_store),
+            Arc::clone(&service.approvals),
+            Arc::clone(&service.catalog),
+        );
+        let replay = reopened
+            .request_first_install(&principal, "first", "review", "1.0.0", "receipt-original")
+            .unwrap();
+        assert_eq!(replay.status, SkillRevisionReviewStatus::Approved);
+        assert_eq!(replay.review_id, "skill-revision-review:first");
+        assert!(reopened
+            .request_first_install(&principal, "first", "review", "1.0.0", "other-receipt")
+            .is_err());
+        assert!(reopened
+            .request_first_install(&principal, "new-first", "review", "1.1.0", "other-receipt")
+            .is_err());
+        let pointer = reopened.pointer("review").unwrap().unwrap();
+        assert_eq!(pointer.generation, 1);
+        assert_eq!(pointer.active_revision, "1.0.0");
+        assert_eq!(pointer.installation.unwrap().scope_ref, "workspace-test");
+    }
+
+    #[test]
+    fn maintenance_usage_gate_and_missing_installed_reader_do_not_become_bootstrap() {
+        let service = service();
+        let principal = crate::security::test_human_interactive_principal();
+        assert!(service
+            .request_activation(&principal, "no-first", &draft(), "1.1.0", "receipt")
+            .is_err());
+        approve_first(&service);
+        let mut no_outcome = draft();
+        no_outcome.validation.outcome_association_count = 0;
+        let mut open_evidence = draft();
+        open_evidence.validation.evidence_closed = false;
+        let mut keep = draft();
+        keep.recommendation = SkillMaintenanceRecommendation::Keep;
+        for bad in [no_outcome, open_evidence, keep] {
+            assert!(matches!(
+                service.request_activation(&principal, "ineligible", &bad, "1.1.0", "receipt"),
+                Err(SkillRevisionGovernanceError::DraftNotEligible(_))
+            ));
+        }
+        *service.catalog.write().unwrap() = crate::RuntimeSkillCatalog::default();
+        assert!(service
+            .request_activation(&principal, "unavailable", &draft(), "1.1.0", "receipt")
+            .is_err());
+        assert_eq!(service.pointer("review").unwrap().unwrap().generation, 1);
+    }
+
     #[tokio::test]
     async fn original_pointer_readers_observe_later_commits_without_cached_absence_or_generation() {
         use crate::RuntimeSkillUsageSink;
@@ -817,11 +1200,13 @@ mod tests {
         let writer = SkillRevisionGovernanceService::new(
             Arc::clone(&reader.event_store),
             Arc::clone(&reader.approvals),
+            Arc::clone(&reader.catalog),
         );
         let observer =
             crate::RuntimeSkillUsageRecorder::new(Arc::clone(&reader.event_store)).unwrap();
         assert!(reader.pointer("review").unwrap().is_none());
         assert!(observer.active_pointer("review").unwrap().is_none());
+        approve_first(&writer);
         let principal = crate::security::test_human_interactive_principal();
         let review = writer
             .request_activation(&principal, "new", &draft(), "1.1.0", "sha256:inspection")
@@ -835,12 +1220,19 @@ mod tests {
                 "validated",
             )
             .unwrap();
-        assert_eq!(reader.pointer("review").unwrap().unwrap().generation, 1);
+        assert_eq!(reader.pointer("review").unwrap().unwrap().generation, 2);
         let current = observer.active_pointer("review").unwrap().unwrap();
         assert_eq!(current.active_revision, "1.1.0");
-        assert_eq!(current.generation, 1);
+        assert_eq!(current.generation, 2);
         let rollback = writer
-            .request_rollback(&principal, "back", "review", "1.0.0", "sha256:regression")
+            .request_rollback(
+                &principal,
+                "back",
+                "review",
+                "1.0.0",
+                "sha256:regression",
+                "receipt-1.0",
+            )
             .unwrap();
         writer
             .decide_review(
@@ -853,8 +1245,8 @@ mod tests {
             .unwrap();
         let current = observer.active_pointer("review").unwrap().unwrap();
         assert_eq!(current.active_revision, "1.0.0");
-        assert_eq!(current.generation, 2);
-        assert_eq!(reader.pointer("review").unwrap().unwrap().generation, 2);
+        assert_eq!(current.generation, 3);
+        assert_eq!(reader.pointer("review").unwrap().unwrap().generation, 3);
         assert!(
             service().pointer("review").unwrap().is_none(),
             "another original store cannot borrow this pointer"
@@ -873,13 +1265,14 @@ mod tests {
         let winner = Arc::new(SkillRevisionGovernanceService::new(
             Arc::clone(&loser.event_store),
             Arc::clone(&loser.approvals),
+            Arc::clone(&loser.catalog),
         ));
         let principal = crate::security::test_human_interactive_principal();
         let first = winner
-            .request_activation(&principal, "winner", &draft(), "1.2.0", "sha256:first")
+            .request_first_install(&principal, "winner", "review", "1.2.0", "receipt-first")
             .unwrap();
         let second = loser
-            .request_activation(&principal, "loser", &draft(), "1.1.0", "sha256:second")
+            .request_first_install(&principal, "loser", "review", "1.1.0", "receipt-second")
             .unwrap();
         loser.decision_read_hook = Some(Arc::new(move || {
             winner
@@ -920,6 +1313,7 @@ mod tests {
     #[test]
     fn same_request_replays_but_changed_scope_package_or_evidence_cannot_borrow_it() {
         let service = service();
+        approve_first(&service);
         let principal = crate::security::test_human_interactive_principal();
         let original = service
             .request_activation(&principal, "same", &draft(), "1.1.0", "sha256:inspection")
@@ -952,7 +1346,10 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert!(service.pointer("review").unwrap().is_none());
+        assert_eq!(
+            service.pointer("review").unwrap().unwrap().active_revision,
+            "1.0.0"
+        );
     }
 
     #[test]
@@ -960,7 +1357,7 @@ mod tests {
         let service = service();
         let principal = crate::security::test_human_interactive_principal();
         let review = service
-            .request_activation(&principal, "denied", &draft(), "1.1.0", "sha256:inspection")
+            .request_first_install(&principal, "denied", "review", "1.1.0", "receipt-denied")
             .unwrap();
         // Retain the old queue cache while the original journal advances.
         assert_eq!(
@@ -1003,13 +1400,14 @@ mod tests {
             .unwrap();
         assert!(service.pointer("review").is_err());
         assert!(service
-            .request_activation(&principal, "fresh", &draft(), "1.1.0", "sha256:inspection")
+            .request_first_install(&principal, "fresh", "review", "1.1.0", "receipt-fresh")
             .is_err());
     }
 
     #[test]
     fn activation_and_rollback_require_human_lease_and_advance_generation() {
         let service = service();
+        approve_first(&service);
         let principal = crate::security::test_human_interactive_principal();
         let review = service
             .request_activation(
@@ -1020,7 +1418,10 @@ mod tests {
                 "sha256:inspection",
             )
             .expect("activation review");
-        assert!(service.pointer("review").expect("pointer").is_none());
+        assert_eq!(
+            service.pointer("review").unwrap().unwrap().active_revision,
+            "1.0.0"
+        );
         let pointer = service
             .decide_review(
                 &principal,
@@ -1033,7 +1434,7 @@ mod tests {
             .expect("pointer");
         assert_eq!(pointer.active_revision, "1.1.0");
         assert_eq!(pointer.previous_revision.as_deref(), Some("1.0.0"));
-        assert_eq!(pointer.generation, 1);
+        assert_eq!(pointer.generation, 2);
 
         let rollback = service
             .request_rollback(
@@ -1042,6 +1443,7 @@ mod tests {
                 "review",
                 "1.0.0",
                 "sha256:regression",
+                "receipt-1.0",
             )
             .expect("rollback review");
         let rolled_back = service
@@ -1056,7 +1458,7 @@ mod tests {
             .expect("pointer");
         assert_eq!(rolled_back.active_revision, "1.0.0");
         assert_eq!(rolled_back.previous_revision.as_deref(), Some("1.1.0"));
-        assert_eq!(rolled_back.generation, 2);
+        assert_eq!(rolled_back.generation, 3);
         let replay = service
             .request_rollback(
                 &principal,
@@ -1064,6 +1466,7 @@ mod tests {
                 "review",
                 "1.0.0",
                 "sha256:regression",
+                "receipt-1.0",
             )
             .expect("lost rollback response replays original request before reading new pointer");
         assert_eq!(replay.review_id, rollback.review_id);
@@ -1074,7 +1477,14 @@ mod tests {
             ("foreign", "1.0.0", "sha256:regression"),
         ] {
             assert!(matches!(
-                service.request_rollback(&principal, "rollback", skill, target, reason),
+                service.request_rollback(
+                    &principal,
+                    "rollback",
+                    skill,
+                    target,
+                    reason,
+                    "receipt-1.0"
+                ),
                 Err(SkillRevisionGovernanceError::InvalidRequest(_))
             ));
         }
@@ -1084,6 +1494,7 @@ mod tests {
     #[test]
     fn concurrent_review_is_fenced_by_pointer_generation() {
         let service = service();
+        approve_first(&service);
         let principal = crate::security::test_human_interactive_principal();
         let first = service
             .request_activation(&principal, "first", &draft(), "1.1.0", "sha256:inspection")

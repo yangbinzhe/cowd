@@ -72,6 +72,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(skill_revision_activation_review_handler),
         )
         .route(
+            surface::gateway_api::paths::API_SKILLS_BY_ID_FIRST_INSTALL_REVIEWS.template(),
+            post(skill_first_install_review_handler),
+        )
+        .route(
             surface::gateway_api::paths::API_SKILLS_BY_ID_ROLLBACK_REVIEWS.template(),
             post(skill_revision_rollback_review_handler),
         )
@@ -528,6 +532,28 @@ fn issue_skill_revision_decision_lease(
 struct SkillRevisionActivationReviewRequest {
     request_id: String,
     target_revision: String,
+    receipt_id: String,
+}
+
+async fn skill_first_install_review_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(skill_id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<SkillRevisionActivationReviewRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_revision_principal(&principal)?;
+    let review = runtime_skill_services(&state)?
+        .request_skill_first_install(
+            &principal.0,
+            &request.request_id,
+            &skill_id,
+            &request.target_revision,
+            &request.receipt_id,
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(
+        serde_json::json!({"kind":"skills.revision_review", "owner":"runtime", "review":review}),
+    ))
 }
 
 async fn skill_revision_activation_review_handler(
@@ -538,23 +564,13 @@ async fn skill_revision_activation_review_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     require_skill_revision_principal(&principal)?;
     let runtime = runtime_skill_services(&state)?;
-    let draft = runtime
-        .skill_maintenance_draft(&draft_id)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "skill_maintenance_draft_not_found"))?;
-    let validation_digest = crate::services::validate_workspace_skill_revision(
-        &state.workspace_root,
-        &draft.skill_id,
-        &request.target_revision,
-    )
-    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     let review = runtime
         .request_skill_revision_activation(
             &principal.0,
             &request.request_id,
             &draft_id,
             &request.target_revision,
-            &validation_digest,
+            &request.receipt_id,
         )
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(Json(serde_json::json!({
@@ -570,6 +586,7 @@ struct SkillRevisionRollbackReviewRequest {
     request_id: String,
     target_revision: String,
     evidence_digest: String,
+    receipt_id: String,
 }
 
 async fn skill_revision_rollback_review_handler(
@@ -580,23 +597,14 @@ async fn skill_revision_rollback_review_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     require_skill_revision_principal(&principal)?;
     let runtime = runtime_skill_services(&state)?;
-    let validation_digest = crate::services::validate_workspace_skill_revision(
-        &state.workspace_root,
-        &skill_id,
-        &request.target_revision,
-    )
-    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    let evidence_digest = format!(
-        "reason={};validated={validation_digest}",
-        request.evidence_digest
-    );
     let review = runtime
         .request_skill_revision_rollback(
             &principal.0,
             &request.request_id,
             &skill_id,
             &request.target_revision,
-            &evidence_digest,
+            &request.evidence_digest,
+            &request.receipt_id,
         )
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(Json(serde_json::json!({

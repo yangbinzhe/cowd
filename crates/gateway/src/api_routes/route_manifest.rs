@@ -209,6 +209,7 @@ mod tests {
             "POST",
             "/api/skills/maintenance/:id/activation-reviews"
         ));
+        assert!(has("POST", "/api/skills/:id/first-install-reviews"));
         assert!(has("POST", "/api/skills/:id/rollback-reviews"));
         assert!(has("GET", "/api/skills/revision-reviews/:id"));
         assert!(has("POST", "/api/skills/revision-reviews/:id/decision"));

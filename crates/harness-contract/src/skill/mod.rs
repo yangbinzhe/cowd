@@ -283,6 +283,7 @@ impl SkillMaintenanceDraft {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillRevisionReviewAction {
+    FirstInstall,
     Activate,
     Rollback,
 }
@@ -291,6 +292,7 @@ impl SkillRevisionReviewAction {
     #[must_use]
     pub const fn action_key(self) -> &'static str {
         match self {
+            Self::FirstInstall => "skill.revision.first_install",
             Self::Activate => "skill.revision.activate",
             Self::Rollback => "skill.revision.rollback",
         }
@@ -327,13 +329,30 @@ pub struct SkillRevisionReview {
     pub expected_generation: u64,
     pub status: SkillRevisionReviewStatus,
     pub created_at_ms: u64,
+    /// Missing historical installation evidence stays readable, never grants a
+    /// new approval. Only the configured original package reader produces it.
+    pub installation: Option<SkillInstallationEvidence>,
 }
 
 impl SkillRevisionReview {
     #[must_use]
     pub fn scope_ref(&self) -> String {
-        format!("skill:{}", self.skill_id)
+        match self.installation.as_ref() {
+            Some(installation) => format!("skill:{}:{}", self.skill_id, installation.scope_ref),
+            None => format!("skill:{}", self.skill_id),
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillInstallationEvidence {
+    pub scope_ref: String,
+    pub skill_id: String,
+    pub revision: String,
+    pub receipt_id: String,
+    pub receipt_digest: String,
+    pub inspection_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +365,7 @@ pub struct SkillActivePointer {
     pub source_draft_id: Option<String>,
     pub approval_ref: String,
     pub activated_at_ms: u64,
+    pub installation: Option<SkillInstallationEvidence>,
 }
 
 #[cfg(test)]
