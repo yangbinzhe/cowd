@@ -47,8 +47,6 @@ run_check "mission-harness-quick-eval" "cargo run -p harness-eval -- quick"
 if [[ "${COWD_AI_HARNESS_FULL_WORKSPACE:-0}" == "1" ]]; then
   run_check "workspace-all-targets" "scripts/test/full-regression.sh"
 else
-  run_check "runtime-lib-tests" "cargo test -p runtime --lib"
-  run_check "tool-closure" "cargo test -p tools --test ai_harness_tool_closure"
   run_check "provider-failure-classification" "cargo test -p provider --test provider_failure_classification"
 fi
 
