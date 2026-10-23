@@ -341,6 +341,7 @@ async fn persist_semantic_extraction_batch(
         .collect::<HashSet<_>>();
 
     for (heuristic, mut semantic) in refinements {
+        let revision = crate::store::MemoryEntryRevision::of(&heuristic)?;
         let semantic_id = semantic.id;
         if let Some(embedding) = semantic_embeddings.get(&semantic_id) {
             if let Some((existing, similarity)) = find_cross_turn_semantic_duplicate(
@@ -374,7 +375,7 @@ async fn persist_semantic_extraction_batch(
         semantic.tags.extend(heuristic.tags);
         semantic.tags.sort();
         semantic.tags.dedup();
-        orchestrator.update(&semantic).await?;
+        orchestrator.update(&semantic, &revision).await?;
         if let Some(embedding) = semantic_embeddings.get(&semantic_id) {
             result
                 .prepared_embeddings

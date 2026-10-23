@@ -56,9 +56,10 @@ impl IdentityLayer {
         // Check for an existing entry with this title by loading all L0 entries.
         let existing = self.store.search_by_layer(MemoryLayer::L0).await?;
         if let Some(mut entry) = existing.into_iter().find(|e| e.title == title) {
+            let revision = crate::store::MemoryEntryRevision::of(&entry)?;
             entry.content = content.to_string();
             entry.updated_at = Utc::now();
-            self.store.update(&entry).await?;
+            self.store.update(&entry, &revision).await?;
             return Ok(entry.id);
         }
 

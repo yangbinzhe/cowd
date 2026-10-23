@@ -252,10 +252,11 @@ impl LayerManager for DeepLayer {
         let decay = self.drift.staleness_decay_per_day;
 
         for mut entry in entries {
+            let revision = crate::store::MemoryEntryRevision::of(&entry)?;
             let next_staleness = wall_clock_staleness(&entry, decay);
             if (entry.staleness - next_staleness).abs() > f32::EPSILON {
                 entry.staleness = next_staleness;
-                self.store.update(&entry).await?;
+                self.store.update(&entry, &revision).await?;
             }
         }
         Ok(())

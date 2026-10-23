@@ -440,9 +440,10 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
         .is_err());
     let original_store = manager.orchestrator().store().clone();
     let mut changed = original_store.get(&exact_memory_id).await.unwrap().unwrap();
+    let revision = memory::store::MemoryEntryRevision::of(&changed).unwrap();
     changed.content.push_str(" revised original source");
     changed.updated_at += chrono::Duration::milliseconds(1);
-    original_store.update(&changed).await.unwrap();
+    original_store.update(&changed, &revision).await.unwrap();
     let stale = executor
         .execute_runtime_tool_with_binding("working_context", json!({"operation":"list"}), binding)
         .await
@@ -508,8 +509,9 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
         request = page["next_request"].clone();
     }
     assert_eq!(actual, expected);
+    let revision = memory::store::MemoryEntryRevision::of(&sample).unwrap();
     sample.content.push_str(" changed");
-    store.update(&sample).await.unwrap();
+    store.update(&sample, &revision).await.unwrap();
     assert!(executor
         .execute("context_retrieve", &first_next.unwrap().to_string())
         .await

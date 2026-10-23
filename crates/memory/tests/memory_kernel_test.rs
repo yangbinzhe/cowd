@@ -1403,9 +1403,10 @@ async fn memory_discovery_pages_all_matches_without_leaking_hidden_cursor_ids() 
     assert_eq!(actual, expected);
     let id = *expected.first().unwrap();
     let mut saved = store.get(&id).await.unwrap().unwrap();
+    let revision = memory::store::MemoryEntryRevision::of(&saved).unwrap();
     saved.access_count += 1;
     saved.last_accessed_at = Some(Utc::now());
-    store.update(&saved).await.unwrap();
+    store.update(&saved, &revision).await.unwrap();
     kernel
         .discover_page(&ctx, "needle", Some(&first_cursor), 7)
         .await
@@ -1421,7 +1422,7 @@ async fn memory_discovery_pages_all_matches_without_leaking_hidden_cursor_ids() 
     saved
         .content
         .push_str(" changed without changing timestamp");
-    store.update(&saved).await.unwrap();
+    store.update(&saved, &revision).await.unwrap();
     assert!(kernel
         .discover_page(&ctx, "needle", Some(&first_cursor), 7)
         .await
@@ -1777,7 +1778,13 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
             wrong_scope
         )
         .is_err());
-    assert!(store.update(&retired).await.is_err());
+    assert!(store
+        .update(
+            &retired,
+            &memory::store::MemoryEntryRevision::of(&retired).unwrap()
+        )
+        .await
+        .is_err());
     assert!(store.insert(&retired).await.is_err());
     let mut forged = pending[0].clone();
     forged.source.delete_epoch += 1;
@@ -1939,7 +1946,13 @@ async fn lifecycle_transaction_rejects_a_changed_body_and_foreign_receipt_identi
     let stale = MemoryLifecycleMutation::new(&original, None, event.clone()).unwrap();
     let mut changed = original.clone();
     changed.content = "actual concurrent body change".into();
-    store.update(&changed).await.unwrap();
+    store
+        .update(
+            &changed,
+            &memory::store::MemoryEntryRevision::of(&original).unwrap(),
+        )
+        .await
+        .unwrap();
     assert!(store.commit_lifecycle(stale).await.is_err());
     assert!(store
         .pending_memory_cleanup(None, 16)
@@ -1994,7 +2007,13 @@ async fn legacy_archived_snapshot_cannot_be_reactivated_without_a_new_fence_row(
             .unwrap()
             .retired
     );
-    assert!(store.update(&original).await.is_err());
+    assert!(store
+        .update(
+            &original,
+            &memory::store::MemoryEntryRevision::of(&original).unwrap()
+        )
+        .await
+        .is_err());
     assert!(store.insert(&original).await.is_err());
     let mut observed = archive;
     observed.from = Some(MemoryState::Archived);

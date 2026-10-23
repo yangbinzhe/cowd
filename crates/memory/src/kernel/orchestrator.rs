@@ -698,14 +698,18 @@ impl MemoryOrchestrator {
     }
 
     /// Update an existing memory entry in-place.
-    pub async fn update(&self, entry: &crate::types::MemoryEntry) -> Result<()> {
+    pub async fn update(
+        &self,
+        entry: &crate::types::MemoryEntry,
+        expected: &crate::store::MemoryEntryRevision,
+    ) -> Result<()> {
         if entry.layer == MemoryLayer::L4 {
             return Err(MemoryError::WriteDenied {
                 layer: "L4".to_string(),
                 write_source: "ordinary_memory_update_requires_l4_promotion_service".to_string(),
             });
         }
-        self.store.update(entry).await
+        self.store.update(entry, expected).await
     }
 
     /// List metadata for all entries in a given layer.
@@ -1267,6 +1271,87 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn original_memory_body_cas_rejects_overwrite_and_preserves_observations() {
+        use crate::store::MemoryEntryRevision;
+        let store = in_memory_store();
+        let first = test_entry(MemoryLayer::L3, "CAS body", "first body");
+        store.insert(&first).await.unwrap();
+        assert_eq!(store.insert(&first).await.unwrap(), first.id);
+        let original_revision = MemoryEntryRevision::of(&first).unwrap();
+        let mut competing = first.clone();
+        competing.content = "competing body".into();
+        assert!(store.insert(&competing).await.is_err());
+        assert_eq!(
+            store.get(&first.id).await.unwrap().unwrap().content,
+            "first body"
+        );
+        store.update(&competing, &original_revision).await.unwrap();
+        let mut stale = first.clone();
+        stale.content = "must never overwrite competing body".into();
+        assert!(store.update(&stale, &original_revision).await.is_err());
+        assert_eq!(
+            store.get(&first.id).await.unwrap().unwrap().content,
+            "competing body"
+        );
+        let revision = MemoryEntryRevision::of(&competing).unwrap();
+        let mut foreign = competing.clone();
+        foreign.scope = MemoryScope::Project("foreign".into());
+        assert!(store.update(&foreign, &revision).await.is_err());
+        foreign = competing.clone();
+        foreign.id = uuid::Uuid::new_v4();
+        assert!(store.update(&foreign, &revision).await.is_err());
+        let mut observed = competing.clone();
+        observed.access_count = 3;
+        observed.last_accessed_at = Some(Utc::now());
+        store.update(&observed, &revision).await.unwrap();
+        let mut corrected = competing;
+        corrected.content = "legitimate correction after observation".into();
+        store.update(&corrected, &revision).await.unwrap();
+        let stored = store.get(&first.id).await.unwrap().unwrap();
+        assert_eq!(stored.content, "legitimate correction after observation");
+        assert_eq!(stored.access_count, 3);
+        assert_eq!(stored.last_accessed_at, observed.last_accessed_at);
+        assert_eq!(
+            store
+                .load_verbatim_by_id(&first.id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "legitimate correction after observation"
+        );
+        let archive = crate::store::MemoryLifecycleMutation::new(
+            &stored,
+            None,
+            crate::MemoryLifecycleEvent {
+                memory_id: stored.id,
+                from: None,
+                to: crate::MemoryState::Archived,
+                reason: "archive with original semantic target".into(),
+                session_id: "cas-session".into(),
+                agent_id: "cas-agent".into(),
+                occurred_at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let mut observation = stored.clone();
+        observation.access_count = 4;
+        store
+            .update(&observation, &MemoryEntryRevision::of(&stored).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .commit_lifecycle(archive)
+                .await
+                .unwrap()
+                .source
+                .retired,
+            "an access observation must not invalidate the original semantic archive cut"
+        );
+    }
+
+    #[tokio::test]
     async fn original_memory_store_keeps_body_and_verbatim_one_mutation() {
         let store = in_memory_store();
         for layer in [
@@ -1289,9 +1374,10 @@ mod tests {
                 assert_eq!(verbatim.source, "AutoExtracted");
                 assert_eq!(verbatim.timestamp, entry.updated_at.to_rfc3339());
             }
+            let revision = crate::store::MemoryEntryRevision::of(&entry).unwrap();
             entry.content = "corrected retained body".into();
             entry.updated_at = Utc::now();
-            store.update(&entry).await.unwrap();
+            store.update(&entry, &revision).await.unwrap();
             assert_eq!(
                 store.get(&entry.id).await.unwrap().unwrap().content,
                 "corrected retained body"
@@ -1313,7 +1399,7 @@ mod tests {
                 .unwrap()
                 .is_none());
             assert!(matches!(
-                store.update(&entry).await,
+                store.update(&entry, &revision).await,
                 Err(MemoryError::NotFound(_))
             ));
             assert!(store

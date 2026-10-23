@@ -22,7 +22,7 @@ use crate::{
 pub mod blob;
 mod mutation;
 pub use mutation::{
-    lifecycle_retired, memory_entry_digest, MemoryCleanupPending, MemoryLifecycleMutation,
+    lifecycle_retired, MemoryCleanupPending, MemoryEntryRevision, MemoryLifecycleMutation,
     MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceFence,
     MemorySourceFenceReader, VerifiedMemoryRetirement,
 };
@@ -215,14 +215,16 @@ pub struct MemoryStoreAggregate {
 pub trait MemoryStore: Send + Sync {
     /// Return the selected store's durable/rebuildable capability verdict.
     fn capabilities(&self) -> MemoryStoreCapabilities;
-    /// Persist a memory entry and its L2/L3/L4 verbatim in one transaction.
+    /// Create an absent body and its L2/L3/L4 verbatim atomically. Exact existing
+    /// body replay is read-only; a different existing body is a conflict.
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId>;
 
     /// Retrieve a memory entry by its ID.
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>>;
 
-    /// Update an existing body and matching verbatim atomically; absent is an error.
-    async fn update(&self, entry: &MemoryEntry) -> Result<()>;
+    /// Replace an existing body and matching verbatim with the caller's original
+    /// target witness. Scope changes and stale bodies are refused atomically.
+    async fn update(&self, entry: &MemoryEntry, expected: &MemoryEntryRevision) -> Result<()>;
 
     /// Remove a body and matching verbatim atomically. Source/derived erasure
     /// obligations remain a separate governed domain contract.

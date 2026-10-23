@@ -36,7 +36,8 @@ pub trait LayerManager: Send + Sync {
     /// Which logical layer this manager handles.
     fn layer(&self) -> MemoryLayer;
 
-    /// Add or refresh an entry in this layer.
+    /// Create an entry in this layer; exact replay is read-only. Corrections
+    /// require an original target revision through the store update contract.
     async fn insert(&self, entry: MemoryEntry) -> Result<MemoryId>;
 
     /// Remove an entry from this layer.

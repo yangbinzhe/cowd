@@ -172,7 +172,11 @@ impl MemoryStore for EphemeralMemoryStore {
         if state
             .source_fences
             .get(&format!("memory:{}", entry.id))
-            .is_some_and(|f| f.retired || f.scope_key != entry.scope.scope_key())
+            .is_some_and(|f| {
+                f.source_ref != format!("memory:{}", entry.id)
+                    || f.retired
+                    || f.scope_key != entry.scope.scope_key()
+            })
         {
             return Err(MemoryError::Store(
                 "retired or foreign Memory source write".into(),
@@ -189,18 +193,30 @@ impl MemoryStore for EphemeralMemoryStore {
                 "legacy retired Memory source write".into(),
             ));
         }
+        if let Some(current) = state.entries.get(&entry.id.to_string()) {
+            if MemoryEntryRevision::of(current)? == MemoryEntryRevision::of(entry)? {
+                return Ok(entry.id);
+            }
+            return Err(MemoryError::Store(
+                "Memory create target already exists".into(),
+            ));
+        }
         put_discovery_entry(&mut state, entry);
         Ok(entry.id)
     }
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>> {
         Ok(self.read()?.entries.get(&id.to_string()).cloned())
     }
-    async fn update(&self, entry: &MemoryEntry) -> Result<()> {
+    async fn update(&self, entry: &MemoryEntry, expected: &MemoryEntryRevision) -> Result<()> {
         let mut state = self.write()?;
         if state
             .source_fences
             .get(&format!("memory:{}", entry.id))
-            .is_some_and(|f| f.retired || f.scope_key != entry.scope.scope_key())
+            .is_some_and(|f| {
+                f.source_ref != format!("memory:{}", entry.id)
+                    || f.retired
+                    || f.scope_key != entry.scope.scope_key()
+            })
         {
             return Err(MemoryError::Store(
                 "retired or foreign Memory source write".into(),
@@ -220,7 +236,12 @@ impl MemoryStore for EphemeralMemoryStore {
                 "legacy retired Memory source write".into(),
             ));
         }
-        put_discovery_entry(&mut state, entry);
+        let current = state
+            .entries
+            .get(&entry.id.to_string())
+            .ok_or_else(|| MemoryError::NotFound(entry.id.to_string()))?;
+        let entry = expected.validate_replace(current, entry)?;
+        put_discovery_entry(&mut state, &entry);
         Ok(())
     }
     async fn delete(&self, id: &MemoryId) -> Result<()> {

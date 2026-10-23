@@ -15,11 +15,11 @@ use memory::{
     same_memory_key,
     store::{
         AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryCleanupPending,
-        MemoryDiscoveryPage, MemoryDiscoveryQuery, MemoryKeyValue, MemoryLayerAggregate,
-        MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryScanCursor, MemoryScanPage,
-        MemorySourceFence, MemorySourceFenceReader, MemoryStore, MemoryStoreAggregate,
-        MemoryStoreCapabilities, Result as MemoryResult, SymbolMemoryReference, TaggedLookup,
-        VerbatimEntry,
+        MemoryDiscoveryPage, MemoryDiscoveryQuery, MemoryEntryRevision, MemoryKeyValue,
+        MemoryLayerAggregate, MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryScanCursor,
+        MemoryScanPage, MemorySourceFence, MemorySourceFenceReader, MemoryStore,
+        MemoryStoreAggregate, MemoryStoreCapabilities, Result as MemoryResult,
+        SymbolMemoryReference, TaggedLookup, VerbatimEntry,
     },
     MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
     MaintenanceQueueBackend, MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer,
@@ -586,23 +586,27 @@ impl PostgresMemoryStore {
             .collect()
     }
 
-    fn upsert_entry(&self, entry: &MemoryEntry) -> MemoryResult<()> {
+    fn create_entry(&self, entry: &MemoryEntry) -> MemoryResult<()> {
         let mut connection = self
             .executor
             .checkout_critical()
             .map_err(storage_memory_error)?;
         let mut tx = connection.transaction().map_err(postgres_memory_error)?;
-        write_entry(&mut tx, entry, true)?;
+        write_entry(&mut tx, entry, None)?;
         tx.commit().map_err(postgres_memory_error)
     }
 
-    fn update_entry(&self, entry: &MemoryEntry) -> MemoryResult<()> {
+    fn update_entry(
+        &self,
+        entry: &MemoryEntry,
+        expected: &MemoryEntryRevision,
+    ) -> MemoryResult<()> {
         let mut connection = self
             .executor
             .checkout_critical()
             .map_err(storage_memory_error)?;
         let mut tx = connection.transaction().map_err(postgres_memory_error)?;
-        write_entry(&mut tx, entry, false)?;
+        write_entry(&mut tx, entry, Some(expected))?;
         tx.commit().map_err(postgres_memory_error)
     }
 
@@ -875,7 +879,7 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let entry = entry.clone();
         run_memory_blocking(move || {
-            store.upsert_entry(&entry)?;
+            store.create_entry(&entry)?;
             Ok(entry.id)
         })
         .await
@@ -903,10 +907,15 @@ impl MemoryStore for PostgresMemoryStore {
         .await
     }
 
-    async fn update(&self, entry: &MemoryEntry) -> MemoryResult<()> {
+    async fn update(
+        &self,
+        entry: &MemoryEntry,
+        expected: &MemoryEntryRevision,
+    ) -> MemoryResult<()> {
         let store = self.clone();
         let entry = entry.clone();
-        run_memory_blocking(move || store.update_entry(&entry)).await
+        let expected = expected.clone();
+        run_memory_blocking(move || store.update_entry(&entry, &expected)).await
     }
     async fn delete(&self, id: &MemoryId) -> MemoryResult<()> {
         let store = self.clone();
@@ -2130,17 +2139,30 @@ fn guard_legacy_lifecycle_kv(client: &mut impl PostgresClient, key: &str) -> Mem
 fn write_entry(
     client: &mut impl PostgresClient,
     entry: &MemoryEntry,
-    upsert: bool,
+    expected: Option<&MemoryEntryRevision>,
 ) -> MemoryResult<()> {
     let id = entry.id.to_string();
-    // Same-target row lock orders lifecycle retirement against existing-body
-    // writers. The source tombstone remains even when a body is later erased.
+    // A missing row cannot be locked FOR UPDATE. Serialize exact same-ID
+    // creations in the original transaction, without a global/scope lock.
     client
-        .query_opt(
-            "SELECT id FROM memory_entries WHERE id=$1 FOR UPDATE",
-            &[&id],
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&format!("cowd-memory:body:{id}")],
         )
         .map_err(postgres_memory_error)?;
+    // Same-target row lock orders lifecycle retirement against existing-body
+    // writers. The source tombstone remains even when a body is later erased.
+    let current = client
+        .query_opt(
+            "SELECT payload FROM memory_entries WHERE id=$1 FOR UPDATE",
+            &[&id],
+        )
+        .map_err(postgres_memory_error)?
+        .map(|row| row.try_get(0))
+        .transpose()
+        .map_err(postgres_memory_error)?
+        .map(entry_from_json)
+        .transpose()?;
     if let Some(row) = client
         .query_opt(
             "SELECT payload FROM memory_source_fences WHERE source_ref=$1",
@@ -2151,7 +2173,10 @@ fn write_entry(
         let fence: MemorySourceFence =
             serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?)
                 .map_err(json_memory_error)?;
-        if fence.retired || fence.scope_key != entry.scope.scope_key() {
+        if fence.source_ref != format!("memory:{id}")
+            || fence.retired
+            || fence.scope_key != entry.scope.scope_key()
+        {
             return Err(MemoryError::Store(
                 "retired or foreign Memory source write".into(),
             ));
@@ -2171,6 +2196,26 @@ fn write_entry(
             "legacy retired Memory source write".into(),
         ));
     }
+    let next = match expected {
+        Some(expected) => expected.validate_replace(
+            current
+                .as_ref()
+                .ok_or_else(|| MemoryError::NotFound(id.clone()))?,
+            entry,
+        )?,
+        None => {
+            if let Some(current) = current {
+                if MemoryEntryRevision::of(&current)? == MemoryEntryRevision::of(entry)? {
+                    return Ok(());
+                }
+                return Err(MemoryError::Store(
+                    "Memory create target already exists".into(),
+                ));
+            }
+            entry.clone()
+        }
+    };
+    let entry = &next;
     let layer = enum_label(&entry.layer)?;
     let category = enum_label(&entry.category)?;
     let priority = enum_label(&entry.priority)?;
@@ -2180,17 +2225,12 @@ fn write_entry(
     let updated_at = entry.updated_at.to_rfc3339();
     let authority_fingerprint = same_memory_key(entry);
     let payload = serde_json::to_value(entry).map_err(json_memory_error)?;
-    let sql = if upsert {
+    let sql = if expected.is_none() {
         "INSERT INTO memory_entries(
             id,layer,category,priority,source,title,content,scope_key,session_id,
             source_agent,created_at,updated_at,payload,authority_fingerprint
          ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-         ON CONFLICT(id) DO UPDATE SET layer=EXCLUDED.layer,category=EXCLUDED.category,
-            priority=EXCLUDED.priority,source=EXCLUDED.source,title=EXCLUDED.title,
-            content=EXCLUDED.content,scope_key=EXCLUDED.scope_key,
-            session_id=EXCLUDED.session_id,source_agent=EXCLUDED.source_agent,
-            created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at,payload=EXCLUDED.payload,
-            authority_fingerprint=EXCLUDED.authority_fingerprint"
+         ON CONFLICT(id) DO NOTHING"
     } else {
         "UPDATE memory_entries SET layer=$2,category=$3,priority=$4,source=$5,title=$6,
             content=$7,scope_key=$8,session_id=$9,source_agent=$10,created_at=$11,

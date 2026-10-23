@@ -1087,10 +1087,11 @@ mod tests {
             .find(|entry| entry.source_agent.as_deref() == Some("growth-service"))
             .expect("growth memory entry")
             .clone();
+        let revision = memory::store::MemoryEntryRevision::of(&entry).unwrap();
         entry.staleness = 0.90;
         manager
             .orchestrator()
-            .update(&entry)
+            .update(&entry, &revision)
             .await
             .expect("stale entry update");
         let initial_growth_entries = growth_memory_entry_count(&memory).await;

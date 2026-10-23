@@ -177,8 +177,9 @@ impl SharedLayer {
         // Apply a small staleness reduction on sync (freshness signal).
         let entries = self.store.search_by_layer(MemoryLayer::L4).await?;
         for mut entry in entries {
+            let revision = crate::store::MemoryEntryRevision::of(&entry)?;
             entry.staleness = (entry.staleness - 0.01_f32).max(0.0);
-            self.store.update(&entry).await?;
+            self.store.update(&entry, &revision).await?;
         }
         Ok(())
     }
@@ -290,10 +291,11 @@ impl LayerManager for SharedLayer {
         let decay = self.drift.staleness_decay_per_day;
 
         for mut entry in entries {
+            let revision = crate::store::MemoryEntryRevision::of(&entry)?;
             let next_staleness = wall_clock_staleness(&entry, decay);
             if (entry.staleness - next_staleness).abs() > f32::EPSILON {
                 entry.staleness = next_staleness;
-                self.store.update(&entry).await?;
+                self.store.update(&entry, &revision).await?;
             }
         }
         Ok(())
@@ -364,7 +366,11 @@ impl crate::store::MemoryStore for NoopStore {
     async fn get(&self, _id: &MemoryId) -> crate::store::Result<Option<MemoryEntry>> {
         Ok(None)
     }
-    async fn update(&self, _entry: &MemoryEntry) -> crate::store::Result<()> {
+    async fn update(
+        &self,
+        _entry: &MemoryEntry,
+        _expected: &crate::store::MemoryEntryRevision,
+    ) -> crate::store::Result<()> {
         Ok(())
     }
     async fn delete(&self, _id: &MemoryId) -> crate::store::Result<()> {

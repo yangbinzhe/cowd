@@ -115,13 +115,16 @@ impl EssentialLayer {
 
     /// Update the content of an existing L1 entry.
     pub async fn update(&self, id: &MemoryId, content: &str) -> Result<()> {
-        if let Some(mut entry) = self.store.get(id).await? {
-            entry.content = content.to_string();
-            entry.updated_at = Utc::now();
-            entry.staleness = 0.0; // reset staleness on update
-            self.store.update(&entry).await?;
-        }
-        Ok(())
+        let mut entry = self
+            .store
+            .get(id)
+            .await?
+            .ok_or_else(|| crate::MemoryError::NotFound(id.to_string()))?;
+        let revision = crate::store::MemoryEntryRevision::of(&entry)?;
+        entry.content = content.to_string();
+        entry.updated_at = Utc::now();
+        entry.staleness = 0.0; // reset staleness on update
+        self.store.update(&entry, &revision).await
     }
 
     /// Promote a code symbol to the hot-symbol cache.
@@ -216,10 +219,11 @@ impl LayerManager for EssentialLayer {
         let decay = self.drift.staleness_decay_per_day;
 
         for mut entry in entries {
+            let revision = crate::store::MemoryEntryRevision::of(&entry)?;
             let next_staleness = wall_clock_staleness(&entry, decay);
             if (entry.staleness - next_staleness).abs() > f32::EPSILON {
                 entry.staleness = next_staleness;
-                self.store.update(&entry).await?;
+                self.store.update(&entry, &revision).await?;
             }
         }
 
@@ -337,6 +341,12 @@ mod tests {
             .await
             .unwrap();
         layer.update(&id, "new content here").await.unwrap();
+        assert!(matches!(
+            layer
+                .update(&uuid::Uuid::new_v4(), "absent correction")
+                .await,
+            Err(crate::MemoryError::NotFound(_))
+        ));
         let entries = layer.load().await.unwrap();
         assert_eq!(entries[0].content, "new content here");
         assert_eq!(entries[0].staleness, 0.0);

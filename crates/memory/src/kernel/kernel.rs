@@ -665,7 +665,7 @@ impl MemoryKernel {
         if let Some(task_id) = &ctx.task_id {
             tags.push(format!("task:{task_id}"));
         }
-        let entry = MemoryEntry {
+        let mut entry = MemoryEntry {
             // A checkpoint event is durable before this projection. Use a
             // deterministic ID so replay after a crash either creates the
             // missing memory once or reuses the existing fact without
@@ -691,6 +691,22 @@ impl MemoryKernel {
             source_agent: Some(ctx.agent_id.clone()),
             visibility: AgentVisibility::default(),
         };
+        // The checkpoint ID/index names immutable input. Its wall-clock
+        // projection timestamps belong to the first materialization, not a retry.
+        // Reuse only those timestamps, then compare the entire actual body and
+        // ownership before entering any duplicate/conflict policy side effects.
+        if let Some(original) = self.manager.orchestrator().recall(&entry.id).await? {
+            entry.created_at = original.created_at;
+            entry.updated_at = original.updated_at;
+            if crate::store::MemoryEntryRevision::of(&entry)?
+                != crate::store::MemoryEntryRevision::of(&original)?
+            {
+                return Err(crate::MemoryError::Store(
+                    "checkpoint fact identity reused with different input".into(),
+                )
+                .into());
+            }
+        }
         let id = entry.id;
         self.remember(ctx, entry).await?;
         Ok(id)
@@ -2841,6 +2857,34 @@ mod tests {
             .await
             .expect("replayed projection");
         let entries_after_replay = manager.list_all_entries().await.expect("entries");
+        let original = entries_after_first
+            .iter()
+            .find(|entry| entry.id == checkpoint_memory_id(&checkpoint.checkpoint_id, 0))
+            .unwrap();
+        let replayed = entries_after_replay
+            .iter()
+            .find(|entry| entry.id == original.id)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(replayed).unwrap()
+        );
+        let mut changed = checkpoint.facts[0].clone();
+        changed.content = "foreign changed checkpoint payload".into();
+        assert!(kernel
+            .remember_checkpoint_fact(&context, &checkpoint.checkpoint_id, 0, changed)
+            .await
+            .is_err());
+        assert_eq!(
+            manager
+                .orchestrator()
+                .recall(&original.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            original.content
+        );
 
         assert_eq!(entries_after_replay.len(), entries_after_first.len());
         assert!(first

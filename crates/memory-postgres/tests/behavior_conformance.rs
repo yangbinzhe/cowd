@@ -70,7 +70,7 @@ async fn insert_and_get_roundtrip() {
 
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-async fn insert_or_replace() {
+async fn create_refuses_replacement_and_revision_update_corrects() {
     let (_fixture, store) = open_store();
     let id = uid("replace");
     let e1 = entry("replace", "V1", "C1", MemoryLayer::L1);
@@ -78,7 +78,14 @@ async fn insert_or_replace() {
 
     let mut e2 = entry("replace", "V2", "C2", MemoryLayer::L1);
     e2.id = id;
-    store.insert(&e2).await.unwrap();
+    assert!(store.insert(&e2).await.is_err());
+    let unchanged = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(unchanged.title, "V1");
+    assert_eq!(unchanged.content, "C1");
+    store
+        .update(&e2, &memory::store::MemoryEntryRevision::of(&e1).unwrap())
+        .await
+        .unwrap();
 
     let got = store.get(&id).await.unwrap().unwrap();
     assert_eq!(got.title, "V2");
@@ -104,7 +111,13 @@ async fn update_modifies_existing() {
     let mut updated = e.clone();
     updated.content = "New content".into();
     updated.staleness = 0.5;
-    store.update(&updated).await.unwrap();
+    store
+        .update(
+            &updated,
+            &memory::store::MemoryEntryRevision::of(&e).unwrap(),
+        )
+        .await
+        .unwrap();
 
     let got = store.get(&id).await.unwrap().unwrap();
     assert_eq!(got.content, "New content");

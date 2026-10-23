@@ -427,6 +427,7 @@ impl CognitiveContextManager {
             });
         }
 
+        let revision = crate::store::MemoryEntryRevision::of(&entry)?;
         if let Some(c) = content {
             entry.content = c;
         }
@@ -439,7 +440,7 @@ impl CognitiveContextManager {
         entry.updated_at = chrono::Utc::now();
         entry.staleness = 0.0;
 
-        self.orchestrator.update(&entry).await?;
+        self.orchestrator.update(&entry, &revision).await?;
         self.log_memory_audit(
             AuditOperation::Update,
             entry.id.to_string(),

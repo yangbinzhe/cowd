@@ -162,8 +162,47 @@ impl VerifiedMemoryRetirement {
     }
 }
 
-pub fn memory_entry_digest(entry: &MemoryEntry) -> Result<String> {
-    typed_digest("cowd.memory.entry.v1", entry)
+/// A compare-and-swap witness for the original body, not an authorization grant.
+/// Accepted-use observations do not change the body's semantic revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEntryRevision {
+    pub memory_id: MemoryId,
+    pub scope_key: String,
+    pub body_digest: String,
+}
+
+impl MemoryEntryRevision {
+    pub fn of(entry: &MemoryEntry) -> Result<Self> {
+        let mut body = serde_json::to_value(entry).map_err(MemoryError::Serialisation)?;
+        if let Some(body) = body.as_object_mut() {
+            body.remove("access_count");
+            body.remove("last_accessed_at");
+        }
+        Ok(Self {
+            memory_id: entry.id,
+            scope_key: entry.scope.scope_key(),
+            body_digest: typed_digest("cowd.memory.body-revision.v1", &body)?,
+        })
+    }
+
+    pub fn validate_replace(
+        &self,
+        current: &MemoryEntry,
+        next: &MemoryEntry,
+    ) -> Result<MemoryEntry> {
+        if self != &Self::of(current)?
+            || next.id != self.memory_id
+            || next.scope.scope_key() != self.scope_key
+        {
+            return Err(MemoryError::Store(
+                "stale or foreign Memory target revision".into(),
+            ));
+        }
+        let mut next = next.clone();
+        next.access_count = next.access_count.max(current.access_count);
+        next.last_accessed_at = next.last_accessed_at.max(current.last_accessed_at);
+        Ok(next)
+    }
 }
 
 /// Legacy/imported lifecycle bytes are still source evidence. Missing new
@@ -216,7 +255,7 @@ impl MemoryLifecycleMutation {
         Ok(Self {
             mutation_id,
             scope_key,
-            expected_entry_digest: memory_entry_digest(entry)?,
+            expected_entry_digest: MemoryEntryRevision::of(entry)?.body_digest,
             expected_history,
             event,
         })
@@ -263,7 +302,7 @@ impl MemoryLifecycleMutation {
             || self.event.agent_id.is_empty()
             || entry.id != self.event.memory_id
             || entry.scope.scope_key() != self.scope_key
-            || memory_entry_digest(entry)? != self.expected_entry_digest
+            || MemoryEntryRevision::of(entry)?.body_digest != self.expected_entry_digest
             || history != self.expected_history.as_deref()
         {
             return Err(MemoryError::Store(

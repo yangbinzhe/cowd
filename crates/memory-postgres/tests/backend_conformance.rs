@@ -113,15 +113,16 @@ async fn postgres_memory_discovery_versions_content_and_lifecycle_atomically() {
         current.expected_revisions = Some(page.revisions);
     }
     assert_eq!(ids.len(), 140);
-    // get increments persisted usage metadata; it must not invalidate discovery.
+    // Read-only get must not invalidate discovery.
     let mut saved = store.get(&sample.id).await.unwrap().unwrap();
     store.discover_page(resume.clone()).await.unwrap();
     sample.id = uuid::Uuid::new_v4();
     sample.scope = MemoryScope::Project("unrelated".into());
     store.insert(&sample).await.unwrap();
     store.discover_page(resume.clone()).await.unwrap();
+    let revision = memory::store::MemoryEntryRevision::of(&saved).unwrap();
     saved.content.push_str(" changed");
-    store.update(&saved).await.unwrap();
+    store.update(&saved, &revision).await.unwrap();
     assert!(store
         .discover_page(resume)
         .await

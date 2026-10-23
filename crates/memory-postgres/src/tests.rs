@@ -45,6 +45,104 @@ fn memory_entry(id: uuid::Uuid, marker: &str) -> MemoryEntry {
 
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_memory_body_cas_create_conflict_and_observation_survive_reopen() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    let original = memory_entry(uuid::Uuid::new_v4(), "target-cas");
+    store.insert(&original).await.unwrap();
+    let concurrent = memory_entry(uuid::Uuid::new_v4(), "same-concurrent-create");
+    let (left, right) = tokio::join!(store.insert(&concurrent), store.insert(&concurrent));
+    assert_eq!(left.unwrap(), concurrent.id);
+    assert_eq!(right.unwrap(), concurrent.id);
+    let revision = MemoryEntryRevision::of(&original).unwrap();
+    {
+        let mut c = executor.checkout_critical().unwrap();
+        c.batch_execute("CREATE FUNCTION refuse_replay_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'exact create must not rewrite'; END $$; CREATE TRIGGER refuse_replay_write BEFORE INSERT OR UPDATE ON memory_entries FOR EACH ROW EXECUTE FUNCTION refuse_replay_write()").unwrap();
+    }
+    assert_eq!(store.insert(&original).await.unwrap(), original.id);
+    {
+        let mut c = executor.checkout_critical().unwrap();
+        c.batch_execute("DROP TRIGGER refuse_replay_write ON memory_entries; DROP FUNCTION refuse_replay_write()").unwrap();
+    }
+    let mut first = original.clone();
+    first.content = "first contender".into();
+    let mut second = original.clone();
+    second.content = "second contender".into();
+    assert!(store.insert(&first).await.is_err());
+    let (a, b) = tokio::join!(
+        store.update(&first, &revision),
+        store.update(&second, &revision)
+    );
+    assert_ne!(
+        a.is_ok(),
+        b.is_ok(),
+        "exactly one original revision may commit"
+    );
+    let winner = if a.is_ok() { first } else { second };
+    let winner_revision = MemoryEntryRevision::of(&winner).unwrap();
+    let mut wrong_scope = winner.clone();
+    wrong_scope.scope = MemoryScope::Project("foreign".into());
+    assert!(store.update(&wrong_scope, &winner_revision).await.is_err());
+    let mut wrong_id = winner.clone();
+    wrong_id.id = uuid::Uuid::new_v4();
+    assert!(store.update(&wrong_id, &winner_revision).await.is_err());
+    let mut observed = winner.clone();
+    observed.access_count = 7;
+    observed.last_accessed_at = Some(chrono::Utc::now());
+    store.update(&observed, &winner_revision).await.unwrap();
+    let mut correction = winner;
+    correction.content = "correction after observation".into();
+    store.update(&correction, &winner_revision).await.unwrap();
+    drop(store);
+    let reopened = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
+    let got = reopened.get(&original.id).await.unwrap().unwrap();
+    assert_eq!(got.content, "correction after observation");
+    assert_eq!(got.scope, original.scope);
+    assert_eq!(got.access_count, 7);
+    assert_eq!(got.last_accessed_at, observed.last_accessed_at);
+    assert_eq!(
+        reopened
+            .load_verbatim_by_id(&original.id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "correction after observation"
+    );
+    let archive = MemoryLifecycleMutation::new(
+        &got,
+        None,
+        memory::MemoryLifecycleEvent {
+            memory_id: got.id,
+            from: None,
+            to: memory::MemoryState::Archived,
+            reason: "original semantic cut after observation".into(),
+            session_id: "cas-session".into(),
+            agent_id: "cas-agent".into(),
+            occurred_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+    let mut later_observation = got.clone();
+    later_observation.access_count = 8;
+    reopened
+        .update(&later_observation, &MemoryEntryRevision::of(&got).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .commit_lifecycle(archive)
+            .await
+            .unwrap()
+            .source
+            .retired,
+        "native lifecycle uses the same semantic body cut as correction"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 async fn real_postgres_embedding_partial_progress_survives_store_and_client_reopen() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -860,7 +958,10 @@ async fn real_postgres_memory_body_and_verbatim_rollback_and_reopen_together() {
     connection.batch_execute("CREATE TRIGGER refuse_verbatim_write BEFORE UPDATE OR DELETE ON memory_verbatim FOR EACH ROW EXECUTE FUNCTION refuse_verbatim_write()").unwrap();
     entry.content = "corrected durable body".into();
     entry.updated_at = chrono::Utc::now();
-    assert!(store.update(&entry).await.is_err());
+    assert!(store
+        .update(&entry, &MemoryEntryRevision::of(&original).unwrap())
+        .await
+        .is_err());
     assert_eq!(
         store.get(&entry.id).await.unwrap().unwrap().content,
         original.content,
@@ -894,7 +995,10 @@ async fn real_postgres_memory_body_and_verbatim_rollback_and_reopen_together() {
         serde_json::to_value(&first).unwrap()
     );
     connection.batch_execute("DROP TRIGGER refuse_verbatim_write ON memory_verbatim; DROP FUNCTION refuse_verbatim_write()").unwrap();
-    store.update(&entry).await.unwrap();
+    store
+        .update(&entry, &MemoryEntryRevision::of(&original).unwrap())
+        .await
+        .unwrap();
     drop(store);
     let reopened = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
     assert_eq!(
@@ -916,7 +1020,9 @@ async fn real_postgres_memory_body_and_verbatim_rollback_and_reopen_together() {
         .unwrap()
         .is_none());
     assert!(matches!(
-        reopened.update(&entry).await,
+        reopened
+            .update(&entry, &MemoryEntryRevision::of(&entry).unwrap())
+            .await,
         Err(MemoryError::NotFound(_))
     ));
     assert!(reopened
@@ -1358,7 +1464,10 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .packs
         .iter()
         .any(|p| p.pack_id == other.pack.pack_id));
-    assert!(store.update(&entry).await.is_err());
+    assert!(store
+        .update(&entry, &MemoryEntryRevision::of(&entry).unwrap())
+        .await
+        .is_err());
     assert!(store.insert(&entry).await.is_err());
     assert!(store.pending_memory_cleanup(None, 16).await.unwrap()[0]
         .knowledge_receipt_digest
