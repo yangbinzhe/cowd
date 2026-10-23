@@ -2545,24 +2545,6 @@ fn context_turn_report_includes_active_knowledge_activation_report() {
     assert_eq!(knowledge.evidence_refs[0].ref_type, "knowledge_chunk");
 }
 
-#[test]
-fn m2_layer_priority_l0_before_l3() {
-    use memory::types::MemoryLayer;
-    let rank = |l: MemoryLayer| match l {
-        MemoryLayer::L0 => 5,
-        MemoryLayer::L1 => 4,
-        MemoryLayer::L2 => 3,
-        MemoryLayer::L3 => 2,
-        MemoryLayer::L4 => 1,
-    };
-    assert!(
-        rank(MemoryLayer::L0) > rank(MemoryLayer::L3),
-        "L0 must rank higher than L3"
-    );
-    assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L1));
-    assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn m2_empty_session_no_memory_crash() {
     let session = Session::new();
@@ -2990,21 +2972,6 @@ async fn prepare_reality_context_suppresses_memory_conflicting_with_current_turn
     assert!(!prompt.contains("<knowledge_compliance>"));
 }
 
-#[test]
-fn m2_layer_ranking_verification() {
-    use memory::types::MemoryLayer;
-    let rank = |l: MemoryLayer| match l {
-        MemoryLayer::L0 => 5,
-        MemoryLayer::L1 => 4,
-        MemoryLayer::L2 => 3,
-        MemoryLayer::L3 => 2,
-        MemoryLayer::L4 => 1,
-    };
-    assert_eq!(rank(MemoryLayer::L0), 5);
-    assert_eq!(rank(MemoryLayer::L4), 1);
-    assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L3));
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn m2_budget_cap_applied_on_prepare() {
     let session = Session::new();
@@ -3057,24 +3024,6 @@ async fn m2_l2_budget_enforcement_limits_system_prompt() {
         prompt.trusted_system[0].len() < 10000,
         "system prompt should not be oversized"
     );
-}
-
-#[test]
-fn m2_l2_layer_priority_preserves_l0_l1() {
-    // M2-L2-3: L0/L1 should be ranked before L3 in sorted entries
-    use memory::types::MemoryLayer;
-    let rank = |l: MemoryLayer| match l {
-        MemoryLayer::L0 => 5,
-        MemoryLayer::L1 => 4,
-        MemoryLayer::L2 => 3,
-        MemoryLayer::L3 => 2,
-        MemoryLayer::L4 => 1,
-    };
-    // L0 > L1 > L2 > L3 > L4
-    assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L1));
-    assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
-    assert!(rank(MemoryLayer::L2) > rank(MemoryLayer::L3));
-    assert!(rank(MemoryLayer::L3) > rank(MemoryLayer::L4));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -6702,12 +6702,44 @@ async fn assert_whole_frame_refusal_is_answered_and_recorded<C, T>(
             )),
         "{branch}: the model's own refused frame must stay visible: {transcript:?}"
     );
+    let matches_refused_call = |block: &ContentBlock| {
+        matches!(
+            block,
+            ContentBlock::ToolResult {
+                tool_use_id: actual_tool_use_id,
+                is_error: true,
+                ..
+            } if actual_tool_use_id == tool_use_id
+        )
+    };
+    let matching_result = transcript
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .find(|block| matches_refused_call(block));
     assert!(
-        transcript.iter().any(|message| message.blocks.iter().any(
-            |block| matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
-                    if tool_use_id == tool_use_id)
-        )),
+        matching_result.is_some(),
         "{branch}: the refused frame must carry an error tool result: {transcript:?}"
+    );
+    let original_result = matching_result.expect("the original refused call has an error result");
+    let mut wrong_id = original_result.clone();
+    if let ContentBlock::ToolResult {
+        tool_use_id: actual_tool_use_id,
+        ..
+    } = &mut wrong_id
+    {
+        *actual_tool_use_id = format!("foreign-call:{tool_use_id}");
+    }
+    assert!(
+        !matches_refused_call(&wrong_id),
+        "{branch}: another call's error is not this refusal"
+    );
+    let mut non_error = original_result.clone();
+    if let ContentBlock::ToolResult { is_error, .. } = &mut non_error {
+        *is_error = false;
+    }
+    assert!(
+        !matches_refused_call(&non_error),
+        "{branch}: success is not an error refusal"
     );
     let recorded = store
         .all_events(512)
