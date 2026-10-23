@@ -2596,6 +2596,7 @@ impl ReviewedTurn {
         let transcript = payload.transcript.unwrap();
         assert!(!transcript.is_empty());
         let mut seen_sequences = std::collections::BTreeSet::new();
+        let mut tool_blocks = Vec::new();
         for (index, expected) in transcript.iter().enumerate() {
             let stable_id = if index + 1 == transcript.len() {
                 terminal.message_id.clone()
@@ -2616,9 +2617,7 @@ impl ReviewedTurn {
                 assert_eq!(block["cowd_turn_ingress_message_id"], self.input.message_id);
                 assert_eq!(block["cowd_execution_id"], self.graph_id);
                 if matches!(block["type"].as_str(), Some("tool_use" | "tool_result")) {
-                    assert!(block["cowd_tool_instance_id"]
-                        .as_str()
-                        .is_some_and(|value| value.contains("#cowd-")));
+                    tool_blocks.push(block.clone());
                 }
             }
             for body in [&mut actual_body, &mut expected_body] {
@@ -2637,6 +2636,7 @@ impl ReviewedTurn {
             assert_eq!(actual_body, expected_body);
             assert_eq!(actual[0].token_usage_json, expected.token_usage_json);
         }
+        terminal_tool_associations(&tool_blocks).unwrap();
         let input = services
             .session
             .runtime_input(&self.request_id)
@@ -2671,6 +2671,86 @@ impl ReviewedTurn {
             session.output_tokens,
             usage["output_tokens"].as_i64().unwrap()
         );
+    }
+}
+
+fn terminal_tool_associations(blocks: &[Value]) -> Result<(), String> {
+    let mut instances = std::collections::BTreeMap::new();
+    for block in blocks {
+        let (is_use, provider_field, name_field) = match block["type"].as_str() {
+            Some("tool_use") => (true, "id", "name"),
+            Some("tool_result") => (false, "tool_use_id", "tool_name"),
+            _ => return Err("expected a terminal tool block".into()),
+        };
+        let instance = block["cowd_tool_instance_id"]
+            .as_str()
+            .filter(|identity| !identity.is_empty())
+            .ok_or("missing terminal tool instance identity")?;
+        let provider = block[provider_field]
+            .as_str()
+            .ok_or("missing provider tool identity")?;
+        let name = block[name_field].as_str().ok_or("missing tool name")?;
+        let entry = instances
+            .entry(instance)
+            .or_insert((provider, name, false, false));
+        if entry.0 != provider || entry.1 != name {
+            return Err(format!(
+                "terminal tool instance {instance} crosses tool identities"
+            ));
+        }
+        let seen = if is_use { &mut entry.2 } else { &mut entry.3 };
+        if *seen {
+            return Err(format!(
+                "duplicate terminal tool block for instance {instance}"
+            ));
+        }
+        *seen = true;
+    }
+    Ok(())
+}
+
+#[test]
+fn recovery_terminal_tool_association_contract() {
+    let blocks = vec![
+        json!({"type":"tool_use", "id":"reused", "name":"read_file",
+            "cowd_tool_instance_id":"opaque:first"}),
+        json!({"type":"tool_result", "tool_use_id":"reused", "tool_name":"read_file",
+            "cowd_tool_instance_id":"opaque:first"}),
+        json!({"type":"tool_use", "id":"reused", "name":"read_file",
+            "cowd_tool_instance_id":"opaque:second"}),
+        json!({"type":"tool_result", "tool_use_id":"reused", "tool_name":"read_file",
+            "cowd_tool_instance_id":"opaque:second"}),
+        json!({"type":"tool_result", "tool_use_id":"historical", "tool_name":"read_file",
+            "cowd_tool_instance_id":"opaque:historical"}),
+    ];
+    terminal_tool_associations(&blocks).unwrap();
+    let mut reordered = blocks.clone();
+    reordered.reverse();
+    terminal_tool_associations(&reordered).unwrap();
+    for defect in [
+        "provider",
+        "tool",
+        "duplicate_use",
+        "duplicate_result",
+        "missing",
+        "empty",
+    ] {
+        let mut changed = blocks.clone();
+        match defect {
+            "provider" => changed[1]["tool_use_id"] = json!("foreign"),
+            "tool" => changed[1]["tool_name"] = json!("write_file"),
+            "duplicate_use" => changed.push(blocks[0].clone()),
+            "duplicate_result" => changed.push(blocks[1].clone()),
+            "missing" => {
+                changed[1]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cowd_tool_instance_id");
+            }
+            "empty" => changed[1]["cowd_tool_instance_id"] = json!(""),
+            _ => unreachable!(),
+        }
+        assert!(terminal_tool_associations(&changed).is_err(), "{defect}");
     }
 }
 
@@ -3144,12 +3224,19 @@ impl TerminalCheckWitness {
     }
 }
 
-async fn terminal_transaction_rollback_case(source_race: bool) {
+async fn recovery_delivery_services() -> (
+    tempfile::TempDir,
+    LoopbackProvider,
+    LoopbackProvider,
+    LoopbackProvider,
+    Arc<runtime::ProviderRegistry>,
+    RecoveryServices,
+) {
     let root = fixture_root();
     std::fs::create_dir_all(root.path().join("workspace")).unwrap();
-    let mut provider = LoopbackProvider::start("root").await;
-    let mut producer = LoopbackProvider::start("producer").await;
-    let mut reviewer = LoopbackProvider::start("reviewer").await;
+    let provider = LoopbackProvider::start("root").await;
+    let producer = LoopbackProvider::start("producer").await;
+    let reviewer = LoopbackProvider::start("reviewer").await;
     let providers = provider_registry(&[&provider, &producer, &reviewer]);
     let topology = SelectedStorageTopology::compose_for_test(
         &root.path().join("home"),
@@ -3157,6 +3244,12 @@ async fn terminal_transaction_rollback_case(source_race: bool) {
     )
     .unwrap();
     let services = RecoveryServices::start(root.path(), topology, providers.clone()).await;
+    (root, provider, producer, reviewer, providers, services)
+}
+
+async fn terminal_transaction_rollback_case(source_race: bool) {
+    let (root, mut provider, mut producer, mut reviewer, providers, services) =
+        recovery_delivery_services().await;
     let mut turn = ReviewedTurn::produce(
         &services,
         &mut provider,
@@ -3352,18 +3445,8 @@ async fn terminal_transaction_rollback_case(source_race: bool) {
 }
 
 async fn delivery_restart_case(point: Point, commit_response_loss: bool) {
-    let root = fixture_root();
-    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
-    let mut provider = LoopbackProvider::start("root").await;
-    let mut producer = LoopbackProvider::start("producer").await;
-    let mut reviewer = LoopbackProvider::start("reviewer").await;
-    let providers = provider_registry(&[&provider, &producer, &reviewer]);
-    let topology = SelectedStorageTopology::compose_for_test(
-        &root.path().join("home"),
-        &root.path().join("workspace"),
-    )
-    .unwrap();
-    let services = RecoveryServices::start(root.path(), topology, providers.clone()).await;
+    let (root, mut provider, mut producer, mut reviewer, providers, services) =
+        recovery_delivery_services().await;
     let mut turn = ReviewedTurn::produce(
         &services,
         &mut provider,
