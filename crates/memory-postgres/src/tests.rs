@@ -2249,3 +2249,77 @@ async fn real_postgres_extraction_origin_retirement_fences_new_ids_after_reopen(
     assert!(!read.origin_retired);
     assert!(read.revision.is_some());
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_actual_source_readset_rejects_late_new_origin_without_target_writes() {
+    use memory::store::{MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation};
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = PostgresMemoryStore::new(executor.clone()).unwrap();
+    let mut parent = memory_entry(uuid::Uuid::new_v4(), "actual Provider source");
+    store.insert(&parent).await.unwrap();
+    let cut = MemoryEntryRevision::of(&parent).unwrap();
+    let turn = memory::MemoryTurnContext::new("session-snapshot", "test-agent")
+        .with_project_id(Some("snapshot-test".into()))
+        .with_turn_ref(Some("original-turn".into()))
+        .with_source_readset(Some(vec![cut.clone()]));
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000003";
+    let mut output = memory_entry(uuid::Uuid::new_v4(), "late new output");
+    output.source = MemorySource::AutoExtracted;
+    output.tags = vec![batch.into()];
+    let origin = MemoryExtractionOrigin::for_entry(&turn, &output, batch).unwrap();
+    parent.access_count += 1;
+    store.update(&parent, &cut).await.unwrap();
+    store
+        .write_extraction(&output, &origin, None)
+        .await
+        .unwrap();
+    parent.content = "source changed while the semantic request was outstanding".into();
+    store.update(&parent, &cut).await.unwrap();
+    output.id = uuid::Uuid::new_v4();
+    assert!(store
+        .write_extraction(&output, &origin, None)
+        .await
+        .is_err());
+    assert!(store.get(&output.id).await.unwrap().is_none());
+    {
+        let mut connection = executor.checkout_online_read().unwrap();
+        let count: i64 = connection
+            .query_one(
+                "SELECT count(*) FROM memory_kv WHERE key=$1",
+                &[&MemoryExtractionOrigin::binding_key(output.id)],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            count, 0,
+            "failed source-CAS cannot publish even the origin binding"
+        );
+    }
+    let fresh_turn =
+        turn.with_source_readset(Some(vec![MemoryEntryRevision::of(&parent).unwrap()]));
+    let fresh = MemoryExtractionOrigin::for_entry(&fresh_turn, &output, batch).unwrap();
+    store.write_extraction(&output, &fresh, None).await.unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: parent.id,
+        from: None,
+        to: memory::MemoryState::Archived,
+        reason: "retired source after use".into(),
+        session_id: "session-snapshot".into(),
+        agent_id: "test-agent".into(),
+        occurred_at: chrono::Utc::now(),
+    };
+    store
+        .commit_lifecycle(MemoryLifecycleMutation::new(&parent, None, event).unwrap())
+        .await
+        .unwrap();
+    drop(store);
+    let reopened = PostgresMemoryStore::new(executor).unwrap();
+    output.id = uuid::Uuid::new_v4();
+    assert!(reopened
+        .write_extraction(&output, &fresh, None)
+        .await
+        .is_err());
+    assert!(reopened.get(&output.id).await.unwrap().is_none());
+}

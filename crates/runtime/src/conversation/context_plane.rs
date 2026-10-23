@@ -2460,6 +2460,13 @@ where
     }
 
     pub(crate) fn memory_turn_context(&self) -> MemoryTurnContext {
+        let turn = self.active_turn_strategy();
+        let source_readset = turn.as_ref().and_then(|turn| {
+            self.memory_source_uses
+                .lock()
+                .ok()
+                .and_then(|uses| (uses.0 == turn.turn_ref).then(|| uses.1.clone()).flatten())
+        });
         let project_id = self.with_session_read_blocking(memory_project_id_for_session);
         let task_id = Some(format!("session-task-{}", self.session_id()));
         MemoryTurnContext::new(self.session_id().to_string(), self.memory_agent_id.clone())
@@ -2468,6 +2475,8 @@ where
             .with_task_id(task_id)
             .with_team_id(self.memory_team_id.clone())
             .with_cognitive_read_scopes(self.memory_read_scopes.clone())
+            .with_turn_ref(turn.map(|turn| turn.turn_ref))
+            .with_source_readset(source_readset)
     }
 
     pub(super) fn build_context_turn_report(
@@ -2880,11 +2889,13 @@ where
             let mut dynamic_items = runtime_reality_context_items;
             dynamic_items.extend(session_context_items);
             dynamic_items.extend(next_model_context_items);
+            let mut source_readsets = BTreeMap::new();
             let knowledge_report = self.append_knowledge_context(
                 user_input,
                 &empty_packet,
                 &mut dynamic_items,
                 memory::MemoryPacketUse::new(self.memory_turn_context(), 8 * 1024 * 1024),
+                &mut source_readsets,
             )?;
             let envelope = self.build_context_envelope(
                 user_input,
@@ -2896,7 +2907,8 @@ where
             );
             return Ok(self
                 .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
-                .await);
+                .await
+                .with_memory_source_readsets(&source_readsets));
         };
 
         let mem_messages = self.memory_context_messages().await;
@@ -3012,11 +3024,17 @@ where
                 dynamic_items.extend(runtime_reality_context_items);
                 dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
+                let mut source_readsets = packet
+                    .selected
+                    .iter()
+                    .map(|item| (item.atom.id.to_string(), vec![item.source_revision.clone()]))
+                    .collect::<BTreeMap<_, _>>();
                 let knowledge_report = self.append_knowledge_context(
                     user_input,
                     &packet,
                     &mut dynamic_items,
                     memory_use,
+                    &mut source_readsets,
                 )?;
                 let envelope = self.build_context_envelope(
                     user_input,
@@ -3028,7 +3046,8 @@ where
                 );
                 Ok(self
                     .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
-                    .await)
+                    .await
+                    .with_memory_source_readsets(&source_readsets))
             }
             Err(err) => {
                 tracing::warn!(%err, "memory: prepare_context failed, using base system prompt");
@@ -3039,11 +3058,13 @@ where
                 let mut dynamic_items = runtime_reality_context_items;
                 dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
+                let mut source_readsets = BTreeMap::new();
                 let knowledge_report = self.append_knowledge_context(
                     user_input,
                     &empty_packet,
                     &mut dynamic_items,
                     memory::MemoryPacketUse::new(self.memory_turn_context(), 8 * 1024 * 1024),
+                    &mut source_readsets,
                 )?;
                 let envelope = self.build_context_envelope(
                     user_input,
@@ -3055,7 +3076,8 @@ where
                 );
                 Ok(self
                     .finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
-                    .await)
+                    .await
+                    .with_memory_source_readsets(&source_readsets))
             }
         }
     }
@@ -3066,6 +3088,7 @@ where
         packet: &memory::MemoryContextPacket,
         dynamic_items: &mut Vec<ContextItem>,
         memory_use: memory::MemoryPacketUse,
+        source_readsets: &mut BTreeMap<String, Vec<memory::store::MemoryEntryRevision>>,
     ) -> Result<Option<harness_contract::knowledge::KnowledgeTurnReport>, RuntimeError> {
         let memory_project = memory_use.context().and_then(|ctx| ctx.project_id.clone());
         let activation = self
@@ -3089,6 +3112,7 @@ where
         let Some(activation) = activation else {
             return Ok(None);
         };
+        source_readsets.extend(activation.source_readsets);
         dynamic_items.extend(activation.items);
         self.set_turn_knowledge_report(activation.report.clone());
         Ok(Some(activation.report))

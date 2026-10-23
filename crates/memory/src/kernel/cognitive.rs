@@ -247,6 +247,7 @@ fn extraction_batch_key(turn: &MemoryTurnContext, messages: &[Message]) -> Strin
     };
     field(Some(&turn.session_id));
     field(Some(&turn.agent_id));
+    field(turn.turn_ref.as_deref());
     field(turn.project_id.as_deref());
     field(turn.task_id.as_deref());
     field(turn.definition_lineage_id.as_deref());
@@ -254,6 +255,24 @@ fn extraction_batch_key(turn: &MemoryTurnContext, messages: &[Message]) -> Strin
     field(Some(&turn.cognitive_read_scopes.len().to_string()));
     for scope in &turn.cognitive_read_scopes {
         field(Some(&format!("{scope:?}")));
+    }
+    if let Some(cuts) = &turn.source_readset {
+        field(Some(&cuts.len().to_string()));
+        let mut cuts = cuts.iter().collect::<Vec<_>>();
+        cuts.sort_by(|a, b| {
+            (&a.memory_id, &a.scope_key, &a.body_digest).cmp(&(
+                &b.memory_id,
+                &b.scope_key,
+                &b.body_digest,
+            ))
+        });
+        for cut in cuts {
+            field(Some(&cut.memory_id.to_string()));
+            field(Some(&cut.scope_key));
+            field(Some(&cut.body_digest));
+        }
+    } else {
+        field(None);
     }
     field(Some(&messages.len().to_string()));
     for message in messages {

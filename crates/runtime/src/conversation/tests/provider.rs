@@ -1849,6 +1849,7 @@ fn candidate_packer_accounts_for_history_schema_and_omits_packet_tail() {
     let mut prompt = PromptAssembly::new(vec!["runtime control".repeat(60)]);
     for source_id in (0..64).map(|index| format!("packet-{index}")) {
         prompt.contextual_packets.push(crate::PromptContextPacket {
+            memory_source_readset: Vec::new(),
             authority: ContextAuthority::Project,
             source: ContextSourceKind::Workspace,
             role: ContextRole::Evidence,

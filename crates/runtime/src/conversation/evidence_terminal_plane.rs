@@ -1789,6 +1789,14 @@ where
         // decision before either one can run so both observe the same
         // turn-owned lease. The executor is a transport cache only: the
         // ConversationRuntime remains the sole decision owner.
+        match self.memory_source_uses.lock() {
+            Ok(mut uses) => *uses = (state.turn_ref.clone(), Some(Vec::new())),
+            Err(poisoned) => {
+                // Optional Memory provenance cannot fail an otherwise admitted
+                // business turn. A poisoned recorder remains explicitly unknown.
+                *poisoned.into_inner() = (state.turn_ref.clone(), None);
+            }
+        }
         self.tool_executor
             .bind_execution_decision(state.decision.clone());
         *guard = Some(state.clone());

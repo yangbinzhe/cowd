@@ -19,6 +19,8 @@ pub struct RuntimeKnowledgeActivation {
     pub debug_fragment: String,
     pub report: KnowledgeTurnReport,
     pub compliance_decision: KnowledgeComplianceDecision,
+    pub source_readsets:
+        std::collections::BTreeMap<String, Vec<memory::store::MemoryEntryRevision>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,9 +68,10 @@ impl KnowledgeActivationRuntime {
             );
         }
 
-        let (plan, canon_packs, warnings) = self.fabric.activate_with_turn_projection(
-            session_id, intent, profile, project_id, &projected, usage,
-        )?;
+        let (plan, canon_packs, warnings, source_readsets) =
+            self.fabric.activate_with_turn_projection(
+                session_id, intent, profile, project_id, &projected, usage,
+            )?;
         if plan.active_pack_ids.is_empty() {
             return Ok(None);
         }
@@ -172,6 +175,7 @@ impl KnowledgeActivationRuntime {
             debug_fragment: fragment,
             report,
             compliance_decision,
+            source_readsets,
         }))
     }
 

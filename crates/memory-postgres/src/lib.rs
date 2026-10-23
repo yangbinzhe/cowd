@@ -2292,14 +2292,53 @@ fn write_entry(
     origin: Option<&MemoryExtractionOrigin>,
 ) -> MemoryResult<()> {
     let id = entry.id.to_string();
-    // A missing row cannot be locked FOR UPDATE. Serialize exact same-ID
-    // creations in the original transaction, without a global/scope lock.
-    client
-        .query_one(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
-            &[&format!("cowd-memory:body:{id}")],
-        )
-        .map_err(postgres_memory_error)?;
+    // Lock the original target and all source bodies in one deterministic
+    // order, including absent IDs, before origin/row locks and any writes.
+    let mut body_ids = vec![id.clone()];
+    if let Some(origin) = origin {
+        body_ids.extend(
+            origin
+                .source_readset()
+                .iter()
+                .map(|cut| cut.memory_id.to_string()),
+        );
+    }
+    body_ids.sort();
+    body_ids.dedup();
+    for body_id in body_ids {
+        let sql = if body_id == id {
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))"
+        } else {
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))"
+        };
+        client
+            .query_one(sql, &[&format!("cowd-memory:body:{body_id}")])
+            .map_err(postgres_memory_error)?;
+    }
+    if let Some(origin) = origin {
+        let mut remaining = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES;
+        let mut frame = std::collections::BTreeMap::new();
+        for expected in origin.source_readset() {
+            if !frame.contains_key(&expected.memory_id) {
+                let read = read_live_memory_source(
+                    client,
+                    &format!("memory:{}", expected.memory_id),
+                    remaining,
+                    true,
+                )?
+                .ok_or(MemoryError::StaleSource)?;
+                remaining = remaining
+                    .checked_sub(read.materialized_bytes)
+                    .ok_or(MemoryError::SourceReadLimit)?;
+                frame.insert(expected.memory_id, read);
+            }
+            let read = &frame[&expected.memory_id];
+            if read.fence.retired || read.origin_retired || read.revision.as_ref() != Some(expected)
+            {
+                return Err(MemoryError::StaleSource);
+            }
+        }
+    }
     let binding = extraction_binding(client, &id)?;
     let requested = origin
         .map(|origin| -> MemoryResult<(String, MemoryExtractionOrigin)> {
@@ -2383,7 +2422,7 @@ fn write_entry(
             "legacy retired Memory source write".into(),
         ));
     }
-    if let Some((key, origin)) = requested {
+    if let Some((_key, origin)) = requested {
         if current.is_some() && binding.is_none() {
             return Err(MemoryError::StaleSource);
         }
@@ -2903,7 +2942,7 @@ mod tests;
 // history or its source fence. The dependent Knowledge commit holds the same
 // row shared until its own transaction commits; no copied writer authority.
 fn read_live_memory_source(
-    tx: &mut PostgresTransaction<'_>,
+    tx: &mut impl PostgresClient,
     source_ref: &str,
     budget_bytes: usize,
     include_body: bool,

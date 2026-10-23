@@ -2938,3 +2938,82 @@ async fn extraction_retirement_fences_late_different_id_but_not_an_independent_i
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn actual_consumed_source_cut_fences_a_new_extraction_origin_and_target() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation,
+        MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let mut parent = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "actual consumed source",
+    );
+    parent.scope = MemoryScope::Project("project-a".into());
+    store.insert(&parent).await.unwrap();
+    let original_cut = MemoryEntryRevision::of(&parent).unwrap();
+    let turn = MemoryTurnContext::new("session-a", "agent-a")
+        .with_project_id(Some("project-a".into()))
+        .with_turn_ref(Some("original-turn".into()))
+        .with_source_readset(Some(vec![original_cut.clone()]));
+    let mut output = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "derived output with a new ID",
+    );
+    output.scope = parent.scope.clone();
+    output.session_id = Some("session-a".into());
+    output.source_agent = Some("agent-a".into());
+    let first_batch = "extraction-batch:00000000-0000-0000-0000-000000000001";
+    output.tags = vec![first_batch.into()];
+    let origin = MemoryExtractionOrigin::for_entry(&turn, &output, first_batch).unwrap();
+    store
+        .write_extraction(&output, &origin, None)
+        .await
+        .unwrap();
+    parent.access_count += 1;
+    store.update(&parent, &original_cut).await.unwrap();
+    output.id = uuid::Uuid::new_v4();
+    store
+        .write_extraction(&output, &origin, None)
+        .await
+        .unwrap();
+    parent.content = "changed after the Provider consumed the old body".into();
+    store.update(&parent, &original_cut).await.unwrap();
+    let new_batch = "extraction-batch:00000000-0000-0000-0000-000000000002";
+    output.id = uuid::Uuid::new_v4();
+    output.tags = vec![new_batch.into()];
+    let late_origin = MemoryExtractionOrigin::for_entry(&turn, &output, new_batch).unwrap();
+    assert_ne!(late_origin.key().unwrap(), origin.key().unwrap());
+    assert!(store
+        .write_extraction(&output, &late_origin, None)
+        .await
+        .is_err());
+    assert!(store.get(&output.id).await.unwrap().is_none());
+    let current = MemoryEntryRevision::of(&parent).unwrap();
+    let fresh_turn = turn.clone().with_source_readset(Some(vec![current]));
+    let fresh = MemoryExtractionOrigin::for_entry(&fresh_turn, &output, new_batch).unwrap();
+    store.write_extraction(&output, &fresh, None).await.unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: parent.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "source revoked after actual use".into(),
+        session_id: "session-a".into(),
+        agent_id: "agent-a".into(),
+        occurred_at: Utc::now(),
+    };
+    store
+        .commit_lifecycle(MemoryLifecycleMutation::new(&parent, None, event).unwrap())
+        .await
+        .unwrap();
+    output.id = uuid::Uuid::new_v4();
+    assert!(store.write_extraction(&output, &fresh, None).await.is_err());
+    assert!(store.get(&output.id).await.unwrap().is_none());
+    assert!(
+        MemoryExtractionOrigin::for_entry(&turn.with_source_readset(None), &output, new_batch)
+            .is_err()
+    );
+}

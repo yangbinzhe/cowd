@@ -501,6 +501,20 @@ where
         };
     }
 
+    fn memory_source_observation_turn(
+        &self,
+        cuts: &[memory::store::MemoryEntryRevision],
+    ) -> Result<String, RuntimeError> {
+        if cuts.is_empty() {
+            return Ok(String::new());
+        }
+        self.active_turn_strategy()
+            .map(|turn| turn.turn_ref)
+            .ok_or_else(|| {
+                RuntimeError::new("Memory-bearing Provider request has no original admitted turn")
+            })
+    }
+
     fn pack_timed_provider_attempt(
         &self,
         prompt: &PromptAssembly,
@@ -1229,11 +1243,19 @@ where
                 {
                     reducer = reducer.with_terminal_presentation(presentation_id, attempt_id);
                 }
+                let source_readset = request.prompt.memory_source_readset();
+                let source_turn = self.memory_source_observation_turn(&source_readset)?;
                 token_reservations.mark_dispatched();
                 let ApiClientStream {
                     events,
                     transport_activity,
                 } = self.api_client.stream_with_transport_activity(request);
+                let events = observe_memory_source_stream(
+                    events,
+                    self.memory_source_uses.clone(),
+                    source_turn,
+                    source_readset,
+                );
                 let stream_run = consume_provider_stream_with_activity(
                     events,
                     cancellation,
@@ -2425,11 +2447,19 @@ where
                 self.session_id().to_string(),
             )
             .with_bound_step(bound_step);
+            let source_readset = request.prompt.memory_source_readset();
+            let source_turn = self.memory_source_observation_turn(&source_readset)?;
             token_reservations.mark_dispatched();
             let ApiClientStream {
                 events,
                 transport_activity,
             } = self.api_client.stream_with_transport_activity(request);
+            let events = observe_memory_source_stream(
+                events,
+                self.memory_source_uses.clone(),
+                source_turn,
+                source_readset,
+            );
             let stream_run = consume_provider_stream_with_activity(
                 events,
                 cancellation,
@@ -3538,5 +3568,163 @@ mod final_closure_tool_context_tests {
         let reads = names(&["read_ref"]);
         assert!(!bind_final_closure_tool_context(&mut items, Some(&reads), &reads,
             &names(&[]), ProviderContextInventory::default()));
+    }
+}
+
+/// Observes real protocol consumption before early tools can run. No protocol
+/// event means no accepted-use fact. Original failed/unknown streams stay such.
+fn observe_memory_source_stream<'a>(
+    events: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'a>,
+    >,
+    uses: std::sync::Arc<
+        std::sync::Mutex<(String, Option<Vec<memory::store::MemoryEntryRevision>>)>,
+    >,
+    turn_ref: String,
+    mut cuts: Vec<memory::store::MemoryEntryRevision>,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'a>>
+{
+    use futures::StreamExt;
+    if cuts.is_empty() {
+        return events;
+    }
+    let mut recorded = false;
+    events.map(move |event| {
+        if !recorded && event.is_ok() {
+            let mut observed = match uses.lock() {
+                Ok(observed) => observed,
+                Err(poisoned) => {
+                    poisoned.into_inner().1 = None;
+                    recorded = true;
+                    tracing::warn!("Memory input readset poisoned; automatic derived writes unavailable");
+                    return event;
+                }
+            };
+            if observed.0 != turn_ref {
+                observed.1 = None;
+                recorded = true;
+                tracing::warn!("Memory input belongs to a different original turn; automatic derived writes unavailable");
+                return event;
+            }
+            for cut in cuts.drain(..) {
+                let Some(prior) = observed.1.as_mut() else { break; };
+                // Preserve conflicting original cuts; never replace an earlier
+                // consumed revision with a fresh head to launder old input.
+                if !prior.contains(&cut) {
+                    if memory::store::MemoryEntryRevision::reserve_extension(prior, &cut, memory::knowledge::KNOWLEDGE_READ_MAX_BYTES).is_err() {
+                        // The business stream is still real. Optional automatic
+                        // extraction is unavailable rather than borrowing an
+                        // incomplete readset or retrying another Provider.
+                        observed.1 = None;
+                        tracing::warn!("Memory input readset exceeded its bound; automatic derived writes unavailable");
+                        break;
+                    }
+                    prior.push(cut);
+                }
+            }
+            recorded = true;
+        }
+        event
+    }).boxed()
+}
+
+#[cfg(test)]
+mod memory_input_use_tests {
+    use super::*;
+    use futures::StreamExt;
+    fn cut(digest: &str) -> memory::store::MemoryEntryRevision {
+        memory::store::MemoryEntryRevision {
+            memory_id: uuid::Uuid::from_u128(1),
+            scope_key: "project:source".into(),
+            body_digest: digest.into(),
+        }
+    }
+    #[tokio::test]
+    async fn observed_stream_preserves_original_conflicting_cuts_and_deduplicates_replay() {
+        let uses = Arc::new(std::sync::Mutex::new(("turn-a".into(), Some(Vec::new()))));
+        for digest in ["old", "old", "new"] {
+            let events =
+                futures::stream::iter([Ok(AssistantEvent::TextDelta("real response".into()))])
+                    .boxed();
+            let mut observed = observe_memory_source_stream(
+                events,
+                uses.clone(),
+                "turn-a".into(),
+                vec![cut(digest)],
+            );
+            let before = uses.lock().unwrap().1.clone();
+            assert_eq!(
+                uses.lock().unwrap().1,
+                before,
+                "constructing a stream is not source consumption"
+            );
+            assert!(observed.next().await.unwrap().is_ok());
+        }
+        assert_eq!(uses.lock().unwrap().1, Some(vec![cut("old"), cut("new")]));
+    }
+    #[tokio::test]
+    async fn unused_failed_and_foreign_turn_streams_never_publish_source_use() {
+        let uses = Arc::new(std::sync::Mutex::new(("turn-a".into(), Some(Vec::new()))));
+        let events =
+            futures::stream::iter([Ok(AssistantEvent::TextDelta("never polled".into()))]).boxed();
+        drop(observe_memory_source_stream(
+            events,
+            uses.clone(),
+            "turn-a".into(),
+            vec![cut("old")],
+        ));
+        assert!(uses.lock().unwrap().1.as_ref().unwrap().is_empty());
+        let events = futures::stream::iter([Err(RuntimeError::new(
+            "transport failed before any protocol event",
+        ))])
+        .boxed();
+        let mut failed =
+            observe_memory_source_stream(events, uses.clone(), "turn-a".into(), vec![cut("old")]);
+        assert!(failed.next().await.unwrap().is_err());
+        assert!(uses.lock().unwrap().1.as_ref().unwrap().is_empty());
+        let events = futures::stream::iter([Ok(AssistantEvent::TextDelta(
+            "late foreign response".into(),
+        ))])
+        .boxed();
+        let mut foreign =
+            observe_memory_source_stream(events, uses.clone(), "turn-b".into(), vec![cut("old")]);
+        assert!(
+            matches!(foreign.next().await.unwrap(), Ok(AssistantEvent::TextDelta(text)) if text == "late foreign response")
+        );
+        assert_eq!(uses.lock().unwrap().1, None);
+    }
+}
+
+#[cfg(test)]
+mod memory_input_observation_failure_tests {
+    use super::*;
+    use futures::StreamExt;
+    #[tokio::test]
+    async fn poisoned_metadata_never_changes_a_real_provider_event_or_retries_it() {
+        let uses = Arc::new(std::sync::Mutex::new(("turn-a".into(), Some(Vec::new()))));
+        let poison = uses.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("controlled provenance lock poison");
+        })
+        .join()
+        .is_err());
+        let events = futures::stream::iter([Ok(AssistantEvent::TextDelta(
+            "original protocol event".into(),
+        ))])
+        .boxed();
+        let cut = memory::store::MemoryEntryRevision {
+            memory_id: uuid::Uuid::from_u128(1),
+            scope_key: "project:source".into(),
+            body_digest: "old".into(),
+        };
+        let mut observed =
+            observe_memory_source_stream(events, uses.clone(), "turn-a".into(), vec![cut]);
+        assert!(
+            matches!(observed.next().await.unwrap(), Ok(AssistantEvent::TextDelta(text)) if text == "original protocol event")
+        );
+        assert!(observed.next().await.is_none());
+        assert!(uses.is_poisoned());
+        assert_eq!(uses.lock().unwrap_err().into_inner().1, None);
     }
 }

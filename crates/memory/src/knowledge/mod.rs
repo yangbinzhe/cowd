@@ -825,6 +825,7 @@ impl KnowledgeFabric {
             None,
             &mut { KNOWLEDGE_READ_MAX_BYTES },
             &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
         )?;
         let state = KnowledgeFabricState {
             packs: packs
@@ -884,6 +885,7 @@ impl KnowledgeFabric {
         ctx: Option<&crate::MemoryTurnContext>,
         remaining: &mut usize,
         source_frame: &mut BTreeMap<String, crate::store::MemorySourceRevisionRead>,
+        readsets_by_pack: &mut BTreeMap<String, Vec<crate::store::MemoryEntryRevision>>,
     ) -> Result<(Vec<KnowledgePack>, Vec<KnowledgeCanonPack>), KnowledgeStoreError> {
         let mut cursor = None;
         let mut packs = Vec::new();
@@ -952,6 +954,15 @@ impl KnowledgeFabric {
                         source_frame,
                     ) {
                         Ok(true) => {
+                            if let Some(cut) = source_frame
+                                .get(&source.source_ref)
+                                .and_then(|read| read.revision.as_ref())
+                            {
+                                readsets_by_pack
+                                    .entry(pack.pack_id.clone())
+                                    .or_default()
+                                    .push(cut.clone());
+                            }
                             if source.source_ref.starts_with("memory:")
                                 && !memory_source_access_allowed(
                                     &source_frame[&source.source_ref],
@@ -1027,6 +1038,7 @@ impl KnowledgeFabric {
             &[],
             crate::kernel::MemoryPacketUse::public_read(KNOWLEDGE_READ_MAX_BYTES),
         )
+        .map(|(plan, canon, warnings, _)| (plan, canon, warnings))
     }
 
     pub fn validate_packet_for_use(
@@ -1062,6 +1074,7 @@ impl KnowledgeFabric {
             KnowledgeActivationPlan,
             Vec<KnowledgeCanonPack>,
             Vec<KnowledgeComplianceWarning>,
+            BTreeMap<String, Vec<crate::store::MemoryEntryRevision>>,
         ),
         KnowledgeStoreError,
     > {
@@ -1073,6 +1086,7 @@ impl KnowledgeFabric {
         }
         let remaining = &mut usage.remaining;
         let source_frame = &mut usage.sources;
+        let mut readsets_by_pack = BTreeMap::new();
         let (packs, canon) = self.read_complete_candidates(
             KnowledgeCandidateScope::Activation {
                 project_id: project_id.map(str::to_owned),
@@ -1080,6 +1094,7 @@ impl KnowledgeFabric {
             ctx,
             remaining,
             source_frame,
+            &mut readsets_by_pack,
         )?;
         let mut eligible_turn = Vec::new();
         for view in projected {
@@ -1093,6 +1108,15 @@ impl KnowledgeFabric {
             )? && (!source.source_ref.id.starts_with("memory:")
                 || memory_source_access_allowed(&source_frame[&source.source_ref.id], ctx))
             {
+                if let Some(cut) = source_frame
+                    .get(&source.source_ref.id)
+                    .and_then(|read| read.revision.as_ref())
+                {
+                    readsets_by_pack
+                        .entry(view.receipt.pack.pack_id.clone())
+                        .or_default()
+                        .push(cut.clone());
+                }
                 eligible_turn.push(view);
             }
         }
@@ -1134,6 +1158,7 @@ impl KnowledgeFabric {
         let mut evidence_refs = Vec::new();
         let mut reasons = Vec::new();
         let mut canon_packs = Vec::new();
+        let mut source_readsets = BTreeMap::new();
         let mut warnings = Vec::new();
 
         for (pack, canon) in candidates {
@@ -1163,6 +1188,13 @@ impl KnowledgeFabric {
             if let Some(canon_id) = pack.canon_pack_ref.as_ref() {
                 canon_refs.push(canon_id.clone());
                 if let Some(canon) = canon {
+                    source_readsets.insert(
+                        canon.canon_id.clone(),
+                        readsets_by_pack
+                            .get(&pack.pack_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
                     for rule in &canon.rules {
                         if matches!(
                             rule.governance_level,
@@ -1207,7 +1239,7 @@ impl KnowledgeFabric {
             token_estimate,
             generated_at: Utc::now(),
         };
-        Ok((plan, canon_packs, warnings))
+        Ok((plan, canon_packs, warnings, source_readsets))
     }
 
     pub fn record_usage(&self, signal: KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
@@ -3162,7 +3194,7 @@ mod tests {
             DocumentContent::new("Safety policy", "A temporary suggestion for this turn."),
         );
         assert_ne!(durable.pack.pack_id, turn.receipt.pack.pack_id);
-        let (plan, canons, warnings) = fabric
+        let (plan, canons, warnings, _) = fabric
             .activate_with_turn_projection(
                 "session",
                 "safety policy",
@@ -3189,7 +3221,7 @@ mod tests {
             .activate("next", "safety policy", "profile", Some("project-a"))
             .unwrap();
         assert_eq!(next.active_pack_ids, vec![durable.pack.pack_id]);
-        let (foreign, _, _) = fabric
+        let (foreign, _, _, _) = fabric
             .activate_with_turn_projection(
                 "foreign",
                 "safety policy",

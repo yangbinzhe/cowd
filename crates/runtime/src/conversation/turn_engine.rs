@@ -232,6 +232,7 @@ where
             skill_task_objective: None,
             skill_prompt_assets: Vec::new(),
             skill_instruction_source: None,
+            memory_source_uses: Arc::new(std::sync::Mutex::new((String::new(), Some(Vec::new())))),
             memory_agent_id: "primary".to_string(),
             memory_definition_lineage_id: None,
             memory_team_id: None,

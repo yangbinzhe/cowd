@@ -4257,6 +4257,10 @@ pub struct ConversationRuntime<C, T> {
     session_tracer: Option<SessionTracer>,
     /// Optional cognitive memory manager – `None` when memory is disabled.
     memory_manager: Option<Arc<CognitiveContextManager>>,
+    /// Immutable input cuts observed in actual Provider streams of the original
+    /// admitted turn. This is a readset, never a source cache or writer authority.
+    memory_source_uses:
+        Arc<std::sync::Mutex<(String, Option<Vec<memory::store::MemoryEntryRevision>>)>>,
     checkpoint_workspace_id: String,
     execution_identity: Option<harness_contract::execution::ExecutionIdentity>,
     /// Runtime-owned owner for post-turn maintenance tasks.

@@ -200,6 +200,69 @@ fn extraction_binding(state: &State, id: MemoryId) -> Result<Option<MemoryExtrac
         .transpose()
 }
 
+// Reserve the borrowed durable bytes before parsing an origin carrying readsets.
+// Both source cuts and extraction validation share this native budget contract.
+fn bounded_extraction_binding(
+    state: &State,
+    id: MemoryId,
+    budget_bytes: usize,
+) -> Result<(Option<MemoryExtractionOrigin>, usize)> {
+    let Some(raw) = state.kv.get(&MemoryExtractionOrigin::binding_key(id)) else {
+        return Ok((None, 0));
+    };
+    if raw.len() > budget_bytes {
+        return Err(MemoryError::SourceReadLimit);
+    }
+    Ok((Some(serde_json::from_str(raw)?), raw.len()))
+}
+
+fn validate_extraction_sources(state: &State, origin: &MemoryExtractionOrigin) -> Result<()> {
+    let mut remaining = crate::knowledge::KNOWLEDGE_READ_MAX_BYTES;
+    let mut frame = BTreeMap::new();
+    for expected in origin.source_readset() {
+        if !frame.contains_key(&expected.memory_id) {
+            let entry = state
+                .entries
+                .get(&expected.memory_id.to_string())
+                .ok_or(MemoryError::StaleSource)?;
+            let (binding, origin_bytes) =
+                bounded_extraction_binding(state, expected.memory_id, remaining)?;
+            remaining = remaining
+                .checked_sub(origin_bytes)
+                .ok_or(MemoryError::SourceReadLimit)?;
+            if binding
+                .as_ref()
+                .map(MemoryExtractionOrigin::retirement_ref)
+                .transpose()?
+                .is_some_and(|key| state.source_fences.contains_key(&key))
+            {
+                return Err(MemoryError::StaleSource);
+            }
+            let read = live_source_revision(
+                &format!("memory:{}", expected.memory_id),
+                entry,
+                state
+                    .kv
+                    .get(&format!("memory_lifecycle:{}", expected.memory_id))
+                    .map(String::as_str),
+                state
+                    .source_fences
+                    .get(&format!("memory:{}", expected.memory_id)),
+                remaining,
+            )?;
+            remaining = remaining
+                .checked_sub(read.materialized_bytes)
+                .ok_or(MemoryError::SourceReadLimit)?;
+            frame.insert(expected.memory_id, read);
+        }
+        let read = &frame[&expected.memory_id];
+        if read.fence.retired || read.revision.as_ref() != Some(expected) {
+            return Err(MemoryError::StaleSource);
+        }
+    }
+    Ok(())
+}
+
 fn validate_extraction_origin(
     state: &State,
     entry: &MemoryEntry,
@@ -254,6 +317,7 @@ impl MemoryStore for EphemeralMemoryStore {
     ) -> Result<MemoryId> {
         let mut state = self.write()?;
         validate_extraction_origin(&state, entry, Some(origin))?;
+        validate_extraction_sources(&state, origin)?;
         if state.entries.contains_key(&entry.id.to_string())
             && extraction_binding(&state, entry.id)?.is_none()
         {
@@ -1141,8 +1205,7 @@ impl EphemeralMemoryStore {
             }
             return Ok(None);
         };
-        let origin = extraction_binding(&state, id)?;
-        let origin_bytes = reserved_source_bytes(&origin, budget_bytes)?;
+        let (origin, origin_bytes) = bounded_extraction_binding(&state, id, budget_bytes)?;
         let origin_retired = origin
             .as_ref()
             .map(MemoryExtractionOrigin::retirement_ref)
@@ -1247,5 +1310,36 @@ impl MemorySourceFenceReader for EphemeralMemoryStore {
             delete_epoch: 0,
             retired: lifecycle_retired(entry.id, history.map(String::as_str))?,
         }))
+    }
+}
+
+#[cfg(test)]
+mod extraction_source_budget_tests {
+    use super::*;
+    #[test]
+    fn origin_bytes_are_reserved_before_parse_and_share_the_source_budget() {
+        let mut state = State::default();
+        let id = uuid::Uuid::from_u128(1);
+        let key = MemoryExtractionOrigin::binding_key(id);
+        state.kv.insert(key.clone(), "not-json".repeat(128));
+        assert!(
+            matches!(
+                bounded_extraction_binding(&state, id, 64),
+                Err(MemoryError::SourceReadLimit)
+            ),
+            "oversize borrowed origin must be refused before deserialization"
+        );
+        let raw = r#"{"scope_key":"project:a","session_id":"s","agent_id":"a","batch_tag":"extraction-batch:00000000-0000-0000-0000-000000000001"}"#;
+        state.kv.insert(key, raw.into());
+        let (origin, used) = bounded_extraction_binding(&state, id, raw.len() + 8).unwrap();
+        assert!(origin.is_some());
+        assert_eq!(used, raw.len());
+        assert!(
+            matches!(
+                bounded_extraction_binding(&state, id, 8),
+                Err(MemoryError::SourceReadLimit)
+            ),
+            "another source must not parse an origin exceeding its remaining shared budget"
+        );
     }
 }

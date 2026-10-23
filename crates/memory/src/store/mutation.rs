@@ -312,6 +312,10 @@ pub struct MemoryExtractionOrigin {
     session_id: String,
     agent_id: String,
     batch_tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_readset: Vec<MemoryEntryRevision>,
 }
 impl MemoryExtractionOrigin {
     pub fn for_entry(
@@ -324,6 +328,26 @@ impl MemoryExtractionOrigin {
             session_id: turn.session_id.clone(),
             agent_id: turn.agent_id.clone(),
             batch_tag: batch_tag.into(),
+            turn_ref: turn.turn_ref.clone(),
+            source_readset: {
+                reserved_source_bytes(
+                    &turn.source_readset,
+                    crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+                )?;
+                let mut cuts = turn
+                    .source_readset
+                    .clone()
+                    .ok_or(MemoryError::StaleSource)?;
+                cuts.sort_by(|a, b| {
+                    (&a.memory_id, &a.scope_key, &a.body_digest).cmp(&(
+                        &b.memory_id,
+                        &b.scope_key,
+                        &b.body_digest,
+                    ))
+                });
+                cuts.dedup();
+                cuts
+            },
         };
         origin.validate_entry(entry)?;
         Ok(origin)
@@ -343,6 +367,9 @@ impl MemoryExtractionOrigin {
             return Err(MemoryError::StaleSource);
         }
         Ok(())
+    }
+    pub fn source_readset(&self) -> &[MemoryEntryRevision] {
+        &self.source_readset
     }
     pub fn binding_key(id: MemoryId) -> String {
         format!("memory_extraction_origin:{id}")
@@ -376,6 +403,11 @@ pub struct MemoryEntryRevision {
 }
 
 impl MemoryEntryRevision {
+    /// Reserve a borrowed accumulated readset before extending its carrier.
+    pub fn reserve_extension(cuts: &[Self], next: &Self, budget_bytes: usize) -> Result<()> {
+        reserved_source_bytes(&(cuts, next), budget_bytes).map(|_| ())
+    }
+
     pub fn of(entry: &MemoryEntry) -> Result<Self> {
         let mut body = serde_json::to_value(entry).map_err(MemoryError::Serialisation)?;
         if let Some(body) = body.as_object_mut() {

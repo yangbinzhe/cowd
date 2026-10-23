@@ -30,6 +30,9 @@ impl CognitiveContextManager {
         turn: &MemoryTurnContext,
         messages: &[Message],
     ) -> Result<()> {
+        if turn.source_readset.is_none() {
+            return Err(MemoryError::StaleSource);
+        }
         let _extract_start = Instant::now();
         // ── 0. Extract and persist memories ──────────────────────────────────
         let mut pending_embeddings: Vec<(MemoryId, String)> = Vec::new();

@@ -85,6 +85,9 @@ pub struct PromptContextPacket {
     pub(crate) source_id: String,
     pub(crate) content: String,
     pub(crate) evidence: Vec<String>,
+    /// Provenance only. Travels with exactly this packet through final packing;
+    /// it is never rendered as model instructions or reused as a read grant.
+    pub(crate) memory_source_readset: Vec<memory::store::MemoryEntryRevision>,
     /// A normalized, deterministic representation of ContextItem.score. The
     /// final provider packer uses it with source admission rules so a late
     /// packet is not preferred merely because it arrived first.
@@ -101,6 +104,7 @@ impl PromptContextPacket {
             source_id: item.source_id.clone().unwrap_or_else(|| item.id.clone()),
             content: item.content.clone(),
             evidence: item.evidence.clone(),
+            memory_source_readset: Vec::new(),
             utility_score_milli: (item.score.max(0.0) * 1_000.0).round() as i64,
         }
     }
@@ -327,6 +331,34 @@ impl PromptAssembly {
     #[must_use]
     pub(crate) fn immutable_user_prefix_messages(&self) -> Vec<String> {
         self.immutable_user_prefix.clone()
+    }
+
+    pub(crate) fn with_memory_source_readsets(
+        mut self,
+        readsets: &BTreeMap<String, Vec<memory::store::MemoryEntryRevision>>,
+    ) -> Self {
+        for packet in &mut self.contextual_packets {
+            packet.memory_source_readset =
+                readsets.get(&packet.source_id).cloned().unwrap_or_default();
+        }
+        self
+    }
+
+    pub(crate) fn memory_source_readset(&self) -> Vec<memory::store::MemoryEntryRevision> {
+        let mut cuts = self
+            .contextual_packets
+            .iter()
+            .flat_map(|packet| packet.memory_source_readset.iter().cloned())
+            .collect::<Vec<_>>();
+        cuts.sort_by(|a, b| {
+            (&a.memory_id, &a.scope_key, &a.body_digest).cmp(&(
+                &b.memory_id,
+                &b.scope_key,
+                &b.body_digest,
+            ))
+        });
+        cuts.dedup();
+        cuts
     }
 
     pub(crate) fn push_context_item(&mut self, item: &ContextItem) {
@@ -769,6 +801,7 @@ mod tests {
         let mut assembly = PromptAssembly::new(vec!["builtin".to_string()]);
         for source_id in ["first", "second"] {
             assembly.contextual_packets.push(PromptContextPacket {
+                memory_source_readset: Vec::new(),
                 authority: ContextAuthority::Project,
                 source: ContextSourceKind::Workspace,
                 role: ContextRole::Evidence,
@@ -799,6 +832,7 @@ mod tests {
             ("handoff", ContextSourceKind::Handoff),
         ] {
             assembly.contextual_packets.push(PromptContextPacket {
+                memory_source_readset: Vec::new(),
                 authority: ContextAuthority::Derived,
                 source,
                 role: ContextRole::Evidence,
@@ -831,6 +865,7 @@ mod tests {
             ("high-memory", ContextSourceKind::Memory, 900),
         ] {
             assembly.contextual_packets.push(PromptContextPacket {
+                memory_source_readset: Vec::new(),
                 authority: ContextAuthority::Derived,
                 source,
                 role: ContextRole::Evidence,
@@ -855,6 +890,7 @@ mod tests {
     fn packer_never_silently_drops_required_continuity() {
         let mut assembly = PromptAssembly::new(vec!["builtin".to_string()]);
         assembly.contextual_packets.push(PromptContextPacket {
+            memory_source_readset: Vec::new(),
             authority: ContextAuthority::Session,
             source: ContextSourceKind::Conversation,
             role: ContextRole::TaskState,
@@ -873,6 +909,7 @@ mod tests {
     fn required_packet_estimate_uses_hard_cap_classification() {
         let mut assembly = PromptAssembly::new(vec!["builtin".to_string()]);
         assembly.contextual_packets.push(PromptContextPacket {
+            memory_source_readset: Vec::new(),
             authority: ContextAuthority::Session,
             source: ContextSourceKind::Conversation,
             role: ContextRole::TaskState,
@@ -882,6 +919,7 @@ mod tests {
             utility_score_milli: 1,
         });
         assembly.contextual_packets.push(PromptContextPacket {
+            memory_source_readset: Vec::new(),
             authority: ContextAuthority::Derived,
             source: ContextSourceKind::Memory,
             role: ContextRole::Evidence,
@@ -1034,6 +1072,54 @@ mod composition_tests {
             composition.contextual_packet_bytes.contains_key("Memory"),
             "memory bytes must be attributable: {:?}",
             composition.contextual_packet_bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_readset_packing_tests {
+    use super::*;
+    #[test]
+    fn only_the_final_admitted_packet_carries_its_memory_dependency() {
+        let first = ContextItem::new(
+            "retained",
+            ContextSourceKind::Memory,
+            ContextRole::Evidence,
+            "small source",
+        );
+        let mut omitted = ContextItem::new(
+            "omitted",
+            ContextSourceKind::Memory,
+            ContextRole::Evidence,
+            "large ".repeat(2000),
+        );
+        omitted.score = 0.1;
+        let a = memory::store::MemoryEntryRevision {
+            memory_id: uuid::Uuid::from_u128(1),
+            scope_key: "project:a".into(),
+            body_digest: "original-a".into(),
+        };
+        let b = memory::store::MemoryEntryRevision {
+            memory_id: uuid::Uuid::from_u128(2),
+            scope_key: "project:a".into(),
+            body_digest: "original-b".into(),
+        };
+        let mut prompt = PromptAssembly::default();
+        prompt.push_context_item(&first);
+        prompt.push_context_item(&omitted);
+        let prompt = prompt.with_memory_source_readsets(&BTreeMap::from([
+            ("retained".into(), vec![a.clone()]),
+            ("omitted".into(), vec![b]),
+        ]));
+        let (packed, _, omitted, _) = prompt.pack_for_hard_cap(512).unwrap();
+        assert_eq!(omitted, vec!["omitted"]);
+        assert_eq!(packed.memory_source_readset(), vec![a]);
+        assert!(
+            !packed
+                .contextual_messages()
+                .join("\n")
+                .contains("original-a"),
+            "readset metadata is not model instruction text"
         );
     }
 }

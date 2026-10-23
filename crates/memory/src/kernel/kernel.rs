@@ -353,6 +353,8 @@ pub struct MemoryLifecycleEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryTurnContext {
     pub session_id: String,
+    #[serde(default)]
+    pub turn_ref: Option<String>,
     pub project_id: Option<String>,
     pub agent_id: String,
     /// Definition lineage is distinct from `agent_id`, which is always an
@@ -365,6 +367,10 @@ pub struct MemoryTurnContext {
     /// broad backend query cannot leak a memory into an Agent context.
     #[serde(default = "default_cognitive_read_scopes")]
     pub cognitive_read_scopes: Vec<harness_contract::agent::CognitiveReadScope>,
+    /// Original cuts actually consumed by this turn's Provider requests.
+    /// None is unknown and cannot authorize automatic derived persistence.
+    #[serde(default)]
+    pub source_readset: Option<Vec<crate::store::MemoryEntryRevision>>,
 }
 
 impl MemoryTurnContext {
@@ -372,12 +378,14 @@ impl MemoryTurnContext {
     pub fn new(session_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            turn_ref: None,
             project_id: None,
             agent_id: agent_id.into(),
             definition_lineage_id: None,
             team_id: None,
             task_id: None,
             cognitive_read_scopes: default_cognitive_read_scopes(),
+            source_readset: Some(Vec::new()),
         }
     }
 
@@ -402,6 +410,21 @@ impl MemoryTurnContext {
     #[must_use]
     pub fn with_team_id(mut self, team_id: Option<String>) -> Self {
         self.team_id = team_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_turn_ref(mut self, turn_ref: Option<String>) -> Self {
+        self.turn_ref = turn_ref;
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_readset(
+        mut self,
+        readset: Option<Vec<crate::store::MemoryEntryRevision>>,
+    ) -> Self {
+        self.source_readset = readset;
         self
     }
 
