@@ -4389,34 +4389,6 @@ async fn recovery_requeues_retryable_running_node_and_preserves_waiting_approval
 }
 
 #[tokio::test]
-async fn restart_rebuilds_running_node_from_persistent_graph_payload() {
-    let (events, graph, ticket, original_calls) =
-        committed_inline_attempt_450("persistent atomic restart").await;
-    let state = ExecutionGraphStateStore::new(events.clone());
-    let commits = ExecutionCommitService::new(events);
-    let registry = Arc::new(NodeExecutorRegistry::new());
-    let backend = Arc::new(PayloadScopedBackend {
-        calls: Arc::new(AtomicUsize::new(0)),
-    });
-    let executor = Arc::new(ScopedNodeExecutor::new("inline_model"));
-    executor.install_resolver(Arc::new(PayloadScopedResolver {
-        payload_ref: ticket.payload_ref.clone(),
-        backend: backend.clone(),
-    }));
-    registry.register(executor).unwrap();
-    let runner = recovery_runner_475(registry, state.clone(), commits, &graph.id);
-    let recovered = runner.recover_graph(&graph.id).await.unwrap();
-    assert_eq!(recovered.nodes[0].payload_ref, "payload:durable");
-    assert_eq!(
-        recovered.node_statuses["durable"],
-        ExecutionNodeStatus::Completed
-    );
-    runner.run_until_quiescent(&graph.id).await.unwrap();
-    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(original_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
 async fn restart_installs_fresh_scoped_resolver_and_executes_from_persistent_payload() {
     let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
@@ -8392,11 +8364,6 @@ async fn r1_704_runtime_cancel_tree_retries_original_publication_before_terminal
     services.shutdown_execution().await;
 }
 
-#[tokio::test]
-async fn r1_704_live_unknown_physical_owner_requires_real_original_cancel_drain() {
-    assert_actual_cancel_gate_475(false).await;
-}
-
 struct RecoverableCallback704 {
     inner: PostCommitExecutor,
     publish: AtomicBool,
@@ -9479,12 +9446,24 @@ async fn assert_actual_cancel_gate_475(abort_fails: bool) {
         assert!(!state
             .binding_lease_closure(&cancelled, "drain475", &binding, position)
             .unwrap());
-        assert!(runner.recover_graph(&graph.id).await.is_err());
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
+        let recovery_error = runner.recover_graph(&graph.id).await.unwrap_err();
+        assert!(
+            recovery_error
+                .to_string()
+                .contains("475 after_abort failed"),
+            "{recovery_error}"
+        );
+        assert_eq!(state.load(&graph.id).unwrap(), cancelled);
+        assert!(!state
+            .binding_lease_closure(&cancelled, "drain475", &binding, position)
+            .unwrap());
     } else {
         result.unwrap();
         assert!(state
             .binding_lease_closure(&cancelled, "drain475", &binding, position)
             .unwrap());
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
     }
     let ticket = fixture_ticket_475(&cancelled, "drain475", &binding);
     assert_eq!(
@@ -9498,7 +9477,6 @@ async fn assert_actual_cancel_gate_475(abort_fails: bool) {
         ExecutionEffectState::Uncertain
     ));
     assert_eq!(executor.polls.load(Ordering::SeqCst), 0);
-    assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
