@@ -41,6 +41,7 @@ mod turn_identity_tests {
 
 #[derive(Debug, Clone)]
 pub struct BoundStep {
+    provider_consumed: Arc<std::sync::atomic::AtomicBool>,
     snapshot: Arc<StepSnapshot>,
     lease: tools::ToolHostLease,
 }
@@ -254,6 +255,7 @@ impl BoundStep {
             request_digest: digest("runtime-request", request)?,
         };
         Ok(Self {
+            provider_consumed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             snapshot: Arc::new(StepSnapshot {
                 contract_version: STEP_CONTRACT_VERSION,
                 identity,
@@ -316,6 +318,23 @@ impl BoundStep {
     }
 
     #[must_use]
+    pub(crate) fn consume_provider_attempt(&self) -> Result<(), RuntimeError> {
+        self.provider_consumed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| {
+                RuntimeError::preparation(
+                    crate::ProviderPreparationFailure::Consumed,
+                    "bound Provider attempt already consumed; bind a fresh Step",
+                )
+            })
+    }
+
     pub fn provider_origin(&self, call_id: &str) -> CallOrigin {
         CallOrigin {
             origin_step_id: self.snapshot.identity.step_id.clone(),
@@ -427,6 +446,9 @@ impl BoundStep {
             }
         }
         Ok(Self {
+            // Recovery restores tool/read attribution, never permission to
+            // replay an uncertain physical Provider attempt.
+            provider_consumed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             snapshot: Arc::new(snapshot),
             lease,
         })

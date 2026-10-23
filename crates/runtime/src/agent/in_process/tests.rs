@@ -2440,6 +2440,7 @@ fn discovery_request() -> crate::conversation::ApiRequest {
             0,
             0,
         ),
+        preparation: Default::default(),
         provider_evidence_context: None,
     }
 }

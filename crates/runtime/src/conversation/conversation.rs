@@ -778,6 +778,7 @@ fn is_agent_collaboration_action(call: &ModelToolCall) -> bool {
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
+    pub preparation: crate::ProviderRequestPreparation,
     pub bound_step: Option<Arc<crate::step_snapshot::BoundStep>>,
     pub prompt: PromptAssembly,
     pub messages: HistoryView,
@@ -2388,8 +2389,11 @@ pub trait ApiClient {
         None
     }
 
-    fn prepare_request_budget(&self, _request: &mut ApiRequest) -> Result<(), RuntimeError> {
-        Ok(())
+    fn prepare_request_budget<'a>(
+        &'a self,
+        _request: &'a mut ApiRequest,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
     }
 
     fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
@@ -3124,6 +3128,7 @@ impl std::error::Error for ToolError {}
 pub struct RuntimeError {
     message: String,
     context_capacity_failure: Option<crate::context_ledger::ContextCapacityFailure>,
+    preparation_failure: Option<crate::ProviderPreparationFailure>,
     provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope,
     provider_account_key: Option<String>,
     provider_context_window_limit: Option<u32>,
@@ -3141,6 +3146,18 @@ pub struct RuntimeError {
 
 impl RuntimeError {
     #[must_use]
+    pub fn preparation(
+        failure: crate::ProviderPreparationFailure,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut error = Self::new(message);
+        error.preparation_failure = Some(failure);
+        error
+    }
+    pub const fn preparation_failure(&self) -> Option<crate::ProviderPreparationFailure> {
+        self.preparation_failure
+    }
+
     pub fn context_capacity(
         failure: crate::context_ledger::ContextCapacityFailure,
         message: impl Into<String>,
@@ -3162,6 +3179,7 @@ impl RuntimeError {
         Self {
             message: message.into(),
             context_capacity_failure: None,
+            preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
             provider_account_key: None,
             provider_context_window_limit: None,
@@ -3184,6 +3202,7 @@ impl RuntimeError {
         Self {
             message: message.into(),
             context_capacity_failure: None,
+            preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
             provider_account_key: None,
             provider_context_window_limit,
@@ -3248,6 +3267,7 @@ impl RuntimeError {
         Self {
             message: message.into(),
             context_capacity_failure: None,
+            preparation_failure: None,
             provider_failure_scope,
             provider_account_key: None,
             provider_context_window_limit,
@@ -3267,6 +3287,7 @@ impl RuntimeError {
         Self {
             message: message.into(),
             context_capacity_failure: None,
+            preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
             provider_account_key: None,
             provider_context_window_limit: None,

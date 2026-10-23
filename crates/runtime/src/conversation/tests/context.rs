@@ -697,6 +697,7 @@ fn synchronous_stream_collection_creates_the_stream_inside_tokio() {
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 128_000, 4_096, 128, 256, 0,
             ),
+            preparation: Default::default(),
             provider_evidence_context: None,
         })
         .expect("synchronous collection should succeed");
@@ -2021,6 +2022,7 @@ fn stable_prefix_metrics_track_wire_identity_and_provider_native_cache() {
         budget: crate::context_ledger::RequestBudgetReport::for_attempt(
             "test", 32_768, 4_096, 128, 256, 0,
         ),
+        preparation: Default::default(),
         provider_evidence_context: None,
     };
 

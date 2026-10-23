@@ -3470,6 +3470,7 @@ mod tests {
                 256,
                 0,
             ),
+            preparation: Default::default(),
             provider_evidence_context: None,
         };
         let events = client

@@ -908,6 +908,7 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
             256,
             0,
         ),
+        preparation: Default::default(),
         provider_evidence_context: None,
     };
     let candidates = runtime
@@ -1516,6 +1517,7 @@ fn provider_transport_policy_scales_with_actual_request_size() {
         budget: crate::context_ledger::RequestBudgetReport::for_attempt(
             "test", 32_768, 4_096, 128, 256, 0,
         ),
+        preparation: Default::default(),
         provider_evidence_context: None,
     };
     let large = ApiRequest {
@@ -1528,6 +1530,7 @@ fn provider_transport_policy_scales_with_actual_request_size() {
         budget: crate::context_ledger::RequestBudgetReport::for_attempt(
             "test", 1_000_000, 32_000, 128, 256, 0,
         ),
+        preparation: Default::default(),
         provider_evidence_context: None,
     };
 
@@ -1548,6 +1551,7 @@ fn token_reservation_request() -> ApiRequest {
         budget: crate::context_ledger::RequestBudgetReport::for_attempt(
             "test", 1_000, 100, 20, 5, 10,
         ),
+        preparation: Default::default(),
         provider_evidence_context: None,
     }
 }
@@ -2600,11 +2604,17 @@ impl ApiClient for ContextBudgetFixtureApi {
 async fn rendered_capacity_refusal_precedes_reservation_and_stream_dispatch() {
     struct RefusingBudgetApi(Arc<AtomicUsize>);
     impl ApiClient for RefusingBudgetApi {
-        fn prepare_request_budget(&self, _: &mut ApiRequest) -> Result<(), RuntimeError> {
-            Err(RuntimeError::context_capacity(
-                crate::context_ledger::ContextCapacityFailure::RenderOverflow,
-                "fixture full wire does not fit",
-            ))
+        fn prepare_request_budget<'a>(
+            &'a self,
+            _: &'a mut ApiRequest,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(RuntimeError::context_capacity(
+                    crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                    "fixture full wire does not fit",
+                ))
+            })
         }
         fn stream(
             &mut self,
@@ -2654,6 +2664,13 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
         requests: Arc<std::sync::Mutex<Vec<(bool, Option<String>)>>>,
     }
     impl ApiClient for ChoiceApi {
+        fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+            Some(vec![crate::ProviderToolDefinition {
+                name: "read_file".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            }])
+        }
         fn configure_tool_choice(&mut self, required: bool, name: Option<String>) {
             self.pending = (required, name);
         }
@@ -2683,6 +2700,33 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
             Box::pin(futures::stream::iter(events))
         }
     }
+    struct ChoiceTools(harness_contract::tool::ToolDiscoveryReceipt);
+    #[async_trait::async_trait]
+    impl ToolExecutor for ChoiceTools {
+        fn available_tool_names(&self) -> Vec<String> {
+            vec!["read_file".into()]
+        }
+        fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+            self.0.clone()
+        }
+        async fn execute_output(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+            panic!("calibration returns a call; it must not dispatch a tool")
+        }
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let host = tools::ToolHost::builtin("calibration-choice", workspace.path());
+    let mut discovery = host.pin_snapshot().catalog_receipt();
+    discovery
+        .descriptors
+        .retain(|definition| definition.canonical_id == "read_file");
+    discovery
+        .activation_candidates
+        .retain(|name| name == "read_file");
+    assert_eq!(discovery.descriptors.len(), 1);
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut runtime = ConversationRuntime::new(
         Session::new(),
@@ -2690,7 +2734,7 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
             pending: (false, None),
             requests: requests.clone(),
         },
-        StaticToolExecutor::new().register("read_file", |_| Ok("not dispatched".into())),
+        ChoiceTools(discovery),
         PermissionPolicy::new(PermissionMode::ReadOnly),
         vec!["system".into()],
     )
@@ -2700,14 +2744,17 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
     runtime
         .begin_turn_strategy("choice-turn", "read the source")
         .unwrap();
-    runtime.require_next_model_tool_call();
+    runtime.require_next_model_tool_action(["read_file".to_owned()]);
     runtime
         .execute_model_step("read the source", true)
         .await
         .unwrap();
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests.iter().all(|(required, _)| *required));
+    assert!(
+        requests.iter().all(|(required, _)| *required),
+        "{requests:?}"
+    );
 }
 
 #[test]

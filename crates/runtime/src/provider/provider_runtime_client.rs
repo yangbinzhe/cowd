@@ -62,6 +62,165 @@ fn request_reasoning_effort(
         .or(configured)
 }
 
+struct PreparationSourceCounter(usize);
+impl std::io::Write for PreparationSourceCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("prepared source byte overflow"))?;
+        if self.0 > provider::MAX_PREPARED_WIRE_BYTES {
+            return Err(std::io::Error::other("prepared source exceeds body limit"));
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreparationFailure {
+    SourceChanged,
+    ProfileChanged,
+    Consumed,
+    MissingResourceOwner,
+}
+
+/// One original request's frozen preparation and resource handoff. Cloning this
+/// handle does not allocate another body or admit another Provider slot.
+#[derive(Clone, Default)]
+pub struct ProviderRequestPreparation {
+    prepared: Option<Arc<PreparedRuntimeRequest>>,
+    dispatch_lease: Option<Arc<crate::execution_core::graph::ExecutionResourceLease>>,
+    policy_source: Option<(crate::permissions::SessionExecutionPolicyControl, u64)>,
+    preparation_scope: Option<(crate::execution_core::graph::ExecutionServiceClass, String)>,
+}
+impl std::fmt::Debug for ProviderRequestPreparation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRequestPreparation")
+            .field(
+                "prepared",
+                &self
+                    .prepared
+                    .as_ref()
+                    .map(|p| p.entry.request_context.request_id.as_str()),
+            )
+            .field(
+                "provider_lease",
+                &self.dispatch_lease.as_ref().map(|lease| lease.id()),
+            )
+            .finish()
+    }
+}
+impl PartialEq for ProviderRequestPreparation {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.prepared, &other.prepared) {
+            (Some(a), Some(b)) if !Arc::ptr_eq(a, b) => return false,
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => return false,
+        }
+        self.dispatch_lease.as_ref().map(|l| l.id())
+            == other.dispatch_lease.as_ref().map(|l| l.id())
+    }
+}
+impl Eq for ProviderRequestPreparation {}
+impl ProviderRequestPreparation {
+    pub fn invalidate(&mut self) {
+        self.prepared = None;
+    }
+    pub(crate) fn bind_preparation_scope(
+        &mut self,
+        class: crate::execution_core::graph::ExecutionServiceClass,
+        key: &str,
+    ) {
+        self.preparation_scope = Some((class, key.to_owned()));
+    }
+    pub(crate) fn bind_policy_source(
+        &mut self,
+        source: crate::permissions::SessionExecutionPolicyControl,
+        revision: u64,
+    ) {
+        self.policy_source = Some((source, revision));
+    }
+    pub(crate) fn retain_dispatch_lease(
+        &mut self,
+        lease: Option<Arc<crate::execution_core::graph::ExecutionResourceLease>>,
+    ) {
+        self.dispatch_lease = lease;
+    }
+}
+
+struct ProviderDispatchSourceFence {
+    registry: Arc<ProviderRegistry>,
+    revision: u64,
+    transport: Arc<crate::ProviderTransportPool>,
+    transport_fingerprint: crate::TransportProfileFingerprint,
+    policy: Option<(crate::permissions::SessionExecutionPolicyControl, u64)>,
+}
+impl ProviderDispatchSourceFence {
+    fn validate(&self) -> Result<(), RuntimeError> {
+        if self.registry.revision() != self.revision
+            || self
+                .transport
+                .checkout_default()
+                .map_err(|e| RuntimeError::new(e.to_string()))?
+                .0
+                != self.transport_fingerprint
+        {
+            return Err(RuntimeError::preparation(
+                ProviderPreparationFailure::ProfileChanged,
+                "provider profile/transport changed before HTTP; prepare again",
+            ));
+        }
+        if self
+            .policy
+            .as_ref()
+            .is_some_and(|(source, revision)| source.revision() != *revision)
+        {
+            return Err(RuntimeError::preparation(
+                ProviderPreparationFailure::SourceChanged,
+                "Session policy changed before HTTP; bind a fresh Step",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct PreparedRuntimeRequest {
+    source: PreparedRuntimeSource,
+    entry: ProviderEntry,
+    message: MessageRequest,
+    wire: provider::PreparedProviderWire,
+    consumed: std::sync::atomic::AtomicBool,
+    _resident: Option<crate::execution_core::graph::ExecutionResourceLease>,
+}
+struct PreparedRuntimeSource {
+    prompt: crate::PromptAssembly,
+    history: crate::HistoryView,
+    model: String,
+    reasoning: Option<String>,
+    budget: crate::context_ledger::RequestBudgetReport,
+    inventory: ProviderContextInventory,
+    required: bool,
+    required_name: Option<String>,
+    configured_reasoning: Option<String>,
+}
+impl PreparedRuntimeSource {
+    fn matches(&self, request: &ApiRequest, client: &ProviderRuntimeClient) -> bool {
+        self.prompt == request.prompt
+            && self.history == request.messages
+            && self.model == request.model
+            && self.reasoning == request.reasoning_effort_override
+            && self.budget == request.budget
+            && self.inventory == client.compiled_tool_schema().inventory
+            && self.required == client.tool_choice_required
+            && self.required_name == client.tool_choice_required_tool_name
+            && self.configured_reasoning == client.reasoning_effort
+    }
+}
+
 #[derive(Clone)]
 struct ProviderEntry {
     model: String,
@@ -299,6 +458,8 @@ pub trait ProviderWireEvidenceWriter: Send + Sync {
 
 #[derive(Clone)]
 pub struct ProviderRuntimeClient {
+    preparation_resources: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
+    wire_preparations: Arc<AtomicU64>,
     registry: Arc<ProviderRegistry>,
     transport_pool: Arc<crate::ProviderTransportPool>,
     template_cache: Arc<ProviderClientTemplateCache>,
@@ -319,7 +480,6 @@ pub struct ProviderRuntimeClient {
     tool_schema_cache_hits: Arc<AtomicU64>,
     execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
     provider_wire_evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
-    prompt_history: Arc<std::sync::Mutex<ProviderPromptHistory>>,
     /// PLAN D1b: how long a provider stream may go without semantic progress
     /// before a probe is warranted, and how many probes are allowed. The wall
     /// clock is deliberately absent: a long healthy generation is never
@@ -338,17 +498,6 @@ struct CompiledToolSchema {
     exposure_digest: u64,
     tools: Arc<[ToolDefinition]>,
     inventory: ProviderContextInventory,
-}
-
-#[derive(Debug, Default)]
-struct ProviderPromptHistory {
-    /// Frozen user-role prefix. Changing it invalidates this local append-only
-    /// journal even when the conversational transcript itself is unchanged.
-    immutable_prefix: Vec<InputMessage>,
-    session_history: Vec<InputMessage>,
-    /// Diagnostic generation for a changed immutable prefix or rewritten
-    /// transcript. Request-local Runtime context is deliberately not stored.
-    generation: u64,
 }
 
 #[cfg(test)]
@@ -492,6 +641,8 @@ impl ProviderRuntimeClient {
         let snapshot = registry.pin();
         template_cache.resolve(&snapshot, &transport_pool, &model)?;
         Ok(Self {
+            preparation_resources: None,
+            wire_preparations: Arc::new(AtomicU64::new(0)),
             registry,
             transport_pool,
             template_cache,
@@ -508,7 +659,6 @@ impl ProviderRuntimeClient {
             tool_schema_cache_hits: Arc::new(AtomicU64::new(0)),
             execution_supervisor: None,
             provider_wire_evidence_writer: None,
-            prompt_history: Arc::new(std::sync::Mutex::new(ProviderPromptHistory::default())),
             liveness_contract: crate::liveness::LivenessContract::default(),
             liveness_stalls: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
@@ -521,6 +671,19 @@ impl ProviderRuntimeClient {
     ) -> Self {
         self.execution_supervisor = Some(Arc::downgrade(supervisor));
         self
+    }
+
+    #[must_use]
+    pub fn with_preparation_resources(
+        mut self,
+        manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
+    ) -> Self {
+        self.preparation_resources = Some(manager);
+        self
+    }
+
+    pub fn wire_preparation_count(&self) -> u64 {
+        self.wire_preparations.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -876,34 +1039,14 @@ impl ApiClient for ProviderRuntimeClient {
         self.registry.pin().configured_context_window(model)
     }
 
-    fn prepare_request_budget(&self, request: &mut ApiRequest) -> Result<(), RuntimeError> {
-        if matches!(request.budget.context_window_source.as_str(), "unknown" | "assumed") {
-            return Err(RuntimeError::context_capacity(
-                crate::context_ledger::ContextCapacityFailure::UnknownProfile,
-                "context_capacity_unknown: configure a verified model window before dispatch",
-            ));
-        }
-        let snapshot = self.registry.pin();
-        let (entry, message_request) = self.prepare_message_request(request, &snapshot)?;
-        provider::preflight_message_request(&message_request).map_err(|error| {
-            request.budget.executable = false;
-            RuntimeError::context_capacity(crate::context_ledger::ContextCapacityFailure::RenderOverflow, error.to_string())
-        })?;
-        let wire = entry.client.wire_request(&message_request)
-            .map_err(|error| RuntimeError::new(format!("provider_render_failed: {error}")))?;
-        let bytes = serde_json::to_vec(&wire.body)
-            .map_err(|error| RuntimeError::new(error.to_string()))?.len();
-        request.budget.record_rendered_input(
-            (bytes as u64).saturating_add(3) / 4,
-            "provider_wire_utf8_bytes_div4_estimated_v1",
-        );
-        if !request.budget.executable {
-            return Err(RuntimeError::context_capacity(crate::context_ledger::ContextCapacityFailure::RenderOverflow, format!(
-                "context_capacity_exceeded: rendered estimate={} input_cap={} model={}",
-                request.budget.input_total_tokens(), request.budget.hard_input_cap_tokens, request.model,
-            )));
-        }
-        Ok(())
+    fn prepare_request_budget<'a>(
+        &'a self,
+        request: &'a mut ApiRequest,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.prepare_frozen_request(request, &self.registry.pin())
+                .await
+        })
     }
 
     fn step_tool_definitions(&self) -> Option<Vec<ProviderToolDefinition>> {
@@ -1018,63 +1161,145 @@ impl ProviderRuntimeClient {
 
     fn stream_with_activity_and_provider_snapshot(
         &mut self,
-        request: ApiRequest,
-        provider_snapshot: ProviderRegistrySnapshot,
+        mut request: ApiRequest,
+        snapshot: ProviderRegistrySnapshot,
     ) -> ApiClientStream<'_> {
-        if let Some(step) = request.bound_step.as_ref() {
-            if step.snapshot().related_revisions.get("provider_registry") != Some(&provider_snapshot.revision().to_string()) {
-                return ApiClientStream {
-                    events: Box::pin(futures::stream::once(async { Err(RuntimeError::new("provider_registry_changed_after_step_binding")) })),
-                    transport_activity: None,
-                };
-            }
-            if let Err(error) = step.validate_provider_request(&request, self.compiled_tool_schema().tools.as_ref()) {
-                return ApiClientStream {
-                    events: Box::pin(futures::stream::once(async move { Err(error) })),
-                    transport_activity: None,
-                };
-            }
-        }
-        let (entry, message_request) = match self.prepare_message_request(&request, &provider_snapshot) {
-            Ok(prepared) => prepared,
-            Err(error) => return ApiClientStream {
-                events: Box::pin(futures::stream::once(async move { Err(error) })),
-                transport_activity: None,
-            },
-        };
+        let owner = self.clone();
         self.tool_choice_required = false;
         self.tool_choice_required_tool_name = None;
-        let cache_cohort_system = request.prompt.cache_cohort_system_text();
-        let cache_cohort_user_prefix = request.prompt.cache_cohort_user_prefix_messages();
         let (sender, receiver) = tokio::sync::mpsc::channel(PROVIDER_EVENT_QUEUE_CAPACITY);
-        let transport_activity = provider::TransportActivity::default();
+        let activity = provider::TransportActivity::default();
+        let dispatch_activity = activity.clone();
         let producer = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => Some(
-                handle.spawn(forward_provider_attempt(
+            Ok(handle) => Some(handle.spawn(async move {
+                if let Err(error) = owner.prepare_frozen_request(&mut request, &snapshot).await {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+                if owner.registry.revision() != snapshot.revision() {
+                    let _ = sender
+                        .send(Err(RuntimeError::preparation(
+                            ProviderPreparationFailure::ProfileChanged,
+                            "provider registry changed after preparation",
+                        )))
+                        .await;
+                    return;
+                }
+                if let Some(step) = request.bound_step.as_ref() {
+                    if step.snapshot().related_revisions.get("provider_registry")
+                        != Some(&snapshot.revision().to_string())
+                    {
+                        let _ = sender
+                            .send(Err(RuntimeError::preparation(
+                                ProviderPreparationFailure::ProfileChanged,
+                                "provider registry changed after Step binding",
+                            )))
+                            .await;
+                        return;
+                    }
+                    if let Err(error) = step.validate_provider_request(
+                        &request,
+                        owner.compiled_tool_schema().tools.as_ref(),
+                    ) {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+                if let Some(step) = request.bound_step.as_ref() {
+                    if let Err(error) = step.consume_provider_attempt() {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+                let prepared = request
+                    .preparation
+                    .prepared
+                    .take()
+                    .expect("original preparation completed");
+                if prepared
+                    .consumed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    let _ = sender
+                        .send(Err(RuntimeError::preparation(
+                            ProviderPreparationFailure::Consumed,
+                            "prepared Provider attempt already consumed",
+                        )))
+                        .await;
+                    return;
+                }
+                let mut entry = prepared.entry.clone();
+                entry.request_context.attempt =
+                    provider_attempt(request.provider_evidence_context.as_ref());
+                if owner.transport_pool.provider_account_is_fenced(
+                    entry.request_context.profile.registry_revision,
+                    &entry.request_context.profile.provider_name,
+                ) {
+                    let _ = sender
+                        .send(Err(provider_account_fenced_error(
+                            &entry.request_context.profile.provider_name,
+                        )))
+                        .await;
+                    return;
+                }
+                let lease = request.preparation.dispatch_lease.take();
+                if owner.execution_supervisor.is_some() && lease.is_none() {
+                    let _ = sender
+                        .send(Err(RuntimeError::preparation(
+                            ProviderPreparationFailure::MissingResourceOwner,
+                            "governed Provider dispatch has no original admission lease",
+                        )))
+                        .await;
+                    return;
+                }
+                if let (Some(manager), Some(lease)) = (&owner.preparation_resources, lease.as_ref())
+                {
+                    if !matches!(
+                        manager.lease_is_active(&lease.projection_reference()),
+                        Ok(Some(true))
+                    ) {
+                        let _ = sender
+                            .send(Err(RuntimeError::new(
+                                "original Provider admission lease is not active",
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+                let fence = ProviderDispatchSourceFence {
+                    registry: owner.registry.clone(),
+                    revision: snapshot.revision(),
+                    transport: owner.transport_pool.clone(),
+                    transport_fingerprint: entry.request_context.transport_fingerprint,
+                    policy: request.preparation.policy_source.take(),
+                };
+                if let Err(error) = fence.validate() {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+                forward_provider_attempt(
                     entry,
                     Some(request.prompt.composition()),
-                    message_request,
-                    cache_cohort_system,
-                    cache_cohort_user_prefix,
-                    self.emit_output,
-                    self.stream_callback.clone(),
+                    prepared,
+                    fence,
+                    request.prompt.cache_cohort_system_text(),
+                    request.prompt.cache_cohort_user_prefix_messages(),
+                    owner.emit_output,
+                    owner.stream_callback.clone(),
                     request.provider_evidence_context,
-                    self.provider_wire_evidence_writer.clone(),
-                    request.bound_step.clone(),
-                    Arc::clone(&self.transport_pool),
-                    transport_activity.clone(),
+                    owner.provider_wire_evidence_writer.clone(),
+                    request.bound_step,
+                    owner.transport_pool.clone(),
+                    dispatch_activity,
                     sender,
-                )),
-            ),
+                )
+                .await;
+                // Retain the one original admission through the physical future,
+                // including cancellation while that future is still polling.
+                drop(lease);
+            })),
             Err(_) => {
-                // `ApiClient::stream` is consumed from async Runtime code, but
-                // callers may still construct it in synchronous diagnostics.
-                // Return a normal stream error instead of panicking while
-                // attempting to spawn a Tokio task without a reactor.
-                tracing::warn!(
-                    model = %entry.model,
-                    "provider stream was created outside an active Tokio runtime"
-                );
                 let _ = sender.try_send(Err(RuntimeError::new(
                     "provider stream requires an active Tokio runtime",
                 )));
@@ -1087,12 +1312,223 @@ impl ProviderRuntimeClient {
                 producer,
                 execution_supervisor: self.execution_supervisor.clone(),
             }),
-            transport_activity: Some(transport_activity),
+            transport_activity: Some(activity),
         }
     }
 }
 
 impl ProviderRuntimeClient {
+    async fn prepare_frozen_request(
+        &self,
+        request: &mut ApiRequest,
+        snapshot: &ProviderRegistrySnapshot,
+    ) -> Result<(), RuntimeError> {
+        if matches!(
+            request.budget.context_window_source.as_str(),
+            "unknown" | "assumed"
+        ) {
+            return Err(RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::UnknownProfile,
+                "context_capacity_unknown: configure a verified model window before dispatch",
+            ));
+        }
+        if request
+            .budget
+            .compiled_provider_registry_revision
+            .is_some_and(|revision| revision != snapshot.revision())
+        {
+            return Err(RuntimeError::preparation(
+                ProviderPreparationFailure::ProfileChanged,
+                "provider profile changed after compile",
+            ));
+        }
+        if let Some(prepared) = request.preparation.prepared.as_ref() {
+            if prepared.entry.request_context.profile.registry_revision != snapshot.revision() {
+                return Err(RuntimeError::preparation(
+                    ProviderPreparationFailure::ProfileChanged,
+                    "provider profile changed after preparation",
+                ));
+            }
+            if !prepared.source.matches(request, self)
+                || prepared.entry.request_context.profile.registry_revision != snapshot.revision()
+            {
+                return Err(RuntimeError::preparation(
+                    ProviderPreparationFailure::SourceChanged,
+                    "request/schema changed; prepare again",
+                ));
+            }
+            if prepared.consumed.load(Ordering::Acquire) {
+                return Err(RuntimeError::preparation(
+                    ProviderPreparationFailure::Consumed,
+                    "prepared Provider attempt already consumed",
+                ));
+            }
+            return Ok(());
+        }
+        // Count original resident sources without rendering prompt packets,
+        // converting history, or cloning the protocol message beforehand.
+        let mut counter = PreparationSourceCounter(0);
+        let structures = request
+            .messages
+            .iter()
+            .map(|m| m.blocks.len())
+            .sum::<usize>()
+            .saturating_add(request.prompt.contextual_packets.len());
+        counter.0 = structures.checked_mul(512).ok_or_else(|| {
+            RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::RequiredOverflow,
+                "prepared source structure budget overflow",
+            )
+        })?;
+
+        for message in request.messages.iter() {
+            serde_json::to_writer(&mut counter, &(message.role, &message.blocks)).map_err(|e| {
+                RuntimeError::context_capacity(
+                    crate::context_ledger::ContextCapacityFailure::RequiredOverflow,
+                    e.to_string(),
+                )
+            })?;
+        }
+        let prompt = &request.prompt;
+        serde_json::to_writer(
+            &mut counter,
+            &(
+                &prompt.trusted_system,
+                &prompt.cache_cohort_user_prefix,
+                &prompt.immutable_user_prefix,
+                &prompt.runtime_context,
+                &prompt.volatile_tail,
+            ),
+        )
+        .map_err(|e| {
+            RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::RequiredOverflow,
+                e.to_string(),
+            )
+        })?;
+        for packet in &prompt.contextual_packets {
+            serde_json::to_writer(
+                &mut counter,
+                &(&packet.content, &packet.source_id, &packet.evidence),
+            )
+            .map_err(|e| {
+                RuntimeError::context_capacity(
+                    crate::context_ledger::ContextCapacityFailure::RequiredOverflow,
+                    e.to_string(),
+                )
+            })?;
+        }
+        let schema = self.compiled_tool_schema();
+        serde_json::to_writer(&mut counter, &*schema.tools).map_err(|e| {
+            RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::RequiredOverflow,
+                e.to_string(),
+            )
+        })?;
+        let resident = counter
+            .0
+            .checked_add(65536)
+            .and_then(|n| n.checked_mul(32))
+            .ok_or_else(|| {
+                RuntimeError::context_capacity(
+                    crate::context_ledger::ContextCapacityFailure::RequiredOverflow,
+                    "prepared request resident budget overflow",
+                )
+            })?;
+        let reservation = if let Some(manager) = &self.preparation_resources {
+            use crate::execution_core::graph::*;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| RuntimeError::new(e.to_string()))?
+                .as_millis() as u64;
+            let (class, key) = request
+                .preparation
+                .preparation_scope
+                .as_ref()
+                .map(|(class, key)| (*class, key.as_str()))
+                .unwrap_or_else(|| {
+                    (
+                        ExecutionServiceClass::Foreground,
+                        request
+                            .provider_evidence_context
+                            .as_ref()
+                            .map_or("provider-prepare", |c| c.session_id.as_str()),
+                    )
+                });
+            let admission = ResourceAdmissionRequest::new(
+                class,
+                [(ExecutionResourceKind::ContextBytes, resident)],
+            )
+            .with_fairness_key(key)
+            .with_deadline_at_ms(now.saturating_add(5000));
+            match manager.admit(admission).await.map_err(|e| {
+                RuntimeError::context_capacity(
+                    crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                    e.to_string(),
+                )
+            })? {
+                ResourceAdmissionDecision::Granted { lease, .. } => Some(lease),
+                _ => {
+                    return Err(RuntimeError::context_capacity(
+                        crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                        "prepared content capacity unavailable",
+                    ))
+                }
+            }
+        } else {
+            if self.execution_supervisor.is_some() {
+                return Err(RuntimeError::preparation(
+                    ProviderPreparationFailure::MissingResourceOwner,
+                    "governed Provider preparation has no original resident resource owner",
+                ));
+            }
+            None
+        };
+        let (entry, message) = self.prepare_message_request(request, snapshot)?;
+        provider::preflight_message_request(&message).map_err(|e| {
+            RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                e.to_string(),
+            )
+        })?;
+        self.wire_preparations.fetch_add(1, Ordering::Relaxed);
+        crate::execution_core::performance::observe_count("provider_wire_preparations_total", 1);
+        let wire = entry
+            .client
+            .prepare_wire(&message)
+            .map_err(|e| RuntimeError::new(format!("provider_render_failed:{e}")))?;
+        request.budget.record_rendered_input(
+            (wire.body_len() as u64).saturating_add(3) / 4,
+            "provider_wire_utf8_bytes_div4_estimated_v1",
+        );
+        if !request.budget.executable {
+            return Err(RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                "rendered Provider body exceeds input capacity",
+            ));
+        }
+        let source = PreparedRuntimeSource {
+            prompt: request.prompt.clone(),
+            history: request.messages.clone(),
+            model: request.model.clone(),
+            reasoning: request.reasoning_effort_override.clone(),
+            budget: request.budget.clone(),
+            inventory: schema.inventory,
+            required: self.tool_choice_required,
+            required_name: self.tool_choice_required_tool_name.clone(),
+            configured_reasoning: self.reasoning_effort.clone(),
+        };
+        request.preparation.prepared = Some(Arc::new(PreparedRuntimeRequest {
+            source,
+            entry,
+            message,
+            wire,
+            consumed: std::sync::atomic::AtomicBool::new(false),
+            _resident: reservation,
+        }));
+        Ok(())
+    }
+
     fn prepare_message_request(
         &self,
         request: &ApiRequest,
@@ -1178,37 +1614,24 @@ impl ProviderRuntimeClient {
             .into_iter()
             .map(InputMessage::user_text)
             .collect::<Vec<_>>();
-        let mut state = self
-            .prompt_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        compile_provider_input_messages(&mut state, immutable_prefix, history, context)
+        compile_provider_input_messages(immutable_prefix, history, context)
     }
 }
 
 fn compile_provider_input_messages(
-    state: &mut ProviderPromptHistory,
     immutable_prefix: Vec<InputMessage>,
     history: Vec<InputMessage>,
     context: Vec<InputMessage>,
 ) -> Vec<InputMessage> {
-    if immutable_prefix != state.immutable_prefix {
-        state.generation = state.generation.saturating_add(1);
-    }
-    if !history.starts_with(&state.session_history) {
-        state.generation = state.generation.saturating_add(1);
-    }
     // Provider input is rebuilt from canonical sources on every request:
     // stable cohort material first, the actual append-only conversation next,
     // and exactly one current Runtime capsule at the tail. Dynamic clock,
     // policy, evidence, and checkpoint messages never become history, so old
     // capsules cannot accumulate or invalidate the reusable prefix.
     let mut wire = Vec::with_capacity(immutable_prefix.len() + history.len() + context.len());
-    wire.extend(immutable_prefix.iter().cloned());
-    wire.extend(history.iter().cloned());
+    wire.extend(immutable_prefix);
+    wire.extend(history);
     wire.extend(context);
-    state.session_history = history;
-    state.immutable_prefix = immutable_prefix;
     wire
 }
 
@@ -1216,7 +1639,8 @@ fn compile_provider_input_messages(
 async fn forward_provider_attempt(
     entry: ProviderEntry,
     prompt_composition: Option<crate::PromptComposition>,
-    message_request: MessageRequest,
+    prepared: Arc<PreparedRuntimeRequest>,
+    dispatch_fence: ProviderDispatchSourceFence,
     cache_cohort_system: Option<String>,
     cache_cohort_user_prefix: Vec<String>,
     emit_output: bool,
@@ -1238,17 +1662,8 @@ async fn forward_provider_attempt(
         attempt = request_context.attempt,
         "starting request-local provider attempt"
     );
-    let wire_request = match entry.client.wire_request(&message_request) {
-        Ok(wire_request) => wire_request,
-        Err(error) => {
-            let _ = sender
-                .send(Err(RuntimeError::new(format!(
-                    "provider wire evidence could not be generated: {error}"
-                ))))
-                .await;
-            return;
-        }
-    };
+    let message_request = &prepared.message;
+    let wire_request = prepared.wire.wire_request();
     // The tool schema array as it is serialized on this request. It is the region
     // covered by cache breakpoint 2 and sits ahead of every other segment in the
     // reusable prefix, so its size is what decides whether "append a contract
@@ -1256,9 +1671,26 @@ async fn forward_provider_attempt(
     // the definitions, so it is comparable with `model_visible_prompt_bytes`.
     let step_render = if let Some(step) = &bound_step {
         let snapshot = step.snapshot();
-        if evidence_context.as_ref().is_none_or(|context| context.session_id != snapshot.identity.session_id
-            || context.turn_id != snapshot.identity.turn_id) || evidence_writer.is_none() {
-            let _ = sender.send(Err(RuntimeError::new("bound provider step requires matching durable wire evidence"))).await;
+        if evidence_context.as_ref().is_none_or(|context| {
+            context.session_id != snapshot.identity.session_id
+                || context.turn_id != snapshot.identity.turn_id
+                || context.execution_id
+                    != snapshot
+                        .identity
+                        .execution_id
+                        .as_deref()
+                        .unwrap_or_default()
+                || snapshot
+                    .identity
+                    .attempt
+                    .is_some_and(|attempt| context.attempt != attempt)
+        }) || evidence_writer.is_none()
+        {
+            let _ = sender
+                .send(Err(RuntimeError::new(
+                    "bound provider step requires matching durable wire evidence",
+                )))
+                .await;
             return;
         }
         let value = match serde_json::to_value(&wire_request) {
@@ -1322,7 +1754,7 @@ async fn forward_provider_attempt(
                 ProviderWireEvidence {
                     step_render,
                     request_context: entry.request_context.clone(),
-                    wire_request,
+                    wire_request: wire_request.clone(),
                     prefix_observation,
                 },
             )
@@ -1332,12 +1764,30 @@ async fn forward_provider_attempt(
             return;
         }
     }
+    // Persistence/cohort waits never turn a formerly prepared request into
+    // fresh authorization. Read original live owners immediately before HTTP.
+    if let Err(error) = dispatch_fence.validate() {
+        let _ = sender.send(Err(error)).await;
+        return;
+    }
+    if transport_pool.provider_account_is_fenced(
+        entry.request_context.profile.registry_revision,
+        &entry.request_context.profile.provider_name,
+    ) {
+        let _ = sender
+            .send(Err(provider_account_fenced_error(
+                &entry.request_context.profile.provider_name,
+            )))
+            .await;
+        return;
+    }
     let request_guard = transport_pool.begin_request();
     let mut attempt_usage = None;
     let mut attempt_cache_dimensions_observed = false;
     let stream_result = forward_provider_stream(
         &entry.client,
         &message_request,
+        &prepared.wire,
         &entry.model,
         &entry.request_context.profile,
         emit_output,
@@ -1581,6 +2031,7 @@ impl std::fmt::Display for ProviderStreamError {
 async fn forward_provider_stream(
     client: &ProviderClient,
     message_request: &MessageRequest,
+    prepared_wire: &provider::PreparedProviderWire,
     effective_model: &str,
     resolved_profile: &ResolvedProviderProfile,
     emit_output: bool,
@@ -1591,7 +2042,7 @@ async fn forward_provider_stream(
     attempt_cache_dimensions_observed: &mut bool,
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let mut stream = client
-        .stream_message(message_request)
+        .stream_prepared_message(message_request, prepared_wire)
         .await
         .map_err(|error| ProviderStreamError { error })?;
     stream.set_transport_activity(transport_activity);
@@ -2216,12 +2667,12 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderPromptHistory, ProviderRequestContext, ResolvedProviderProfile,
         build_provider_entry, commit_provider_cache_before_terminal,
         compile_provider_input_messages, forward_text_delta, merge_provider_usage_max,
         provider_attempt, provider_cache_material, provider_tool_choice,
         provider_tool_choice_for_required_tool, push_provider_output_block,
         request_reasoning_effort, response_to_events, tool_definitions_for_exposure,
+        ProviderRequestContext, ResolvedProviderProfile,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{
@@ -2493,7 +2944,6 @@ mod tests {
         assert_eq!(reader, researcher);
     }
 
-    #[test]
     /// The precondition for moving turn-stable content into the cohort prefix.
     ///
     /// `provider_input_messages` builds `immutable_prefix` from the cohort prefix
@@ -2508,14 +2958,9 @@ mod tests {
         let history = vec![provider::InputMessage::user_text("history-entry")];
         let context = vec![provider::InputMessage::user_text("turn-local-tail")];
         let immutable = vec![provider::InputMessage::user_text("COHORT-MARKER")];
-        let mut state = ProviderPromptHistory::default();
 
-        let messages = compile_provider_input_messages(
-            &mut state,
-            immutable.clone(),
-            history.clone(),
-            context.clone(),
-        );
+        let messages =
+            compile_provider_input_messages(immutable.clone(), history.clone(), context.clone());
 
         assert_eq!(messages.len(), 3, "immutable + history + context");
         assert!(
@@ -2548,7 +2993,7 @@ mod tests {
                 text: "provider-output".to_string(),
             }],
         });
-        let regrown = compile_provider_input_messages(&mut state, immutable, grown, context);
+        let regrown = compile_provider_input_messages(immutable, grown, context);
         assert!(
             matches!(
                 regrown[0].content.as_slice(),
@@ -2558,6 +3003,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn request_local_context_is_appended_after_exact_history() {
         let prompt = PromptAssembly::new(vec![
             "stable-system".to_string(),
@@ -2570,13 +3016,8 @@ mod tests {
             .into_iter()
             .map(provider::InputMessage::user_text)
             .collect::<Vec<_>>();
-        let mut state = ProviderPromptHistory::default();
-        let messages = compile_provider_input_messages(
-            &mut state,
-            Vec::new(),
-            history.clone(),
-            context.clone(),
-        );
+        let messages =
+            compile_provider_input_messages(Vec::new(), history.clone(), context.clone());
         assert_eq!(messages.len(), 2);
         assert!(matches!(
             messages[0].content.as_slice(),
@@ -2588,12 +3029,7 @@ mod tests {
         ));
         assert_eq!(prompt.wire_system_text().as_deref(), Some("stable-system"));
 
-        let retry = compile_provider_input_messages(
-            &mut state,
-            Vec::new(),
-            history.clone(),
-            context.clone(),
-        );
+        let retry = compile_provider_input_messages(Vec::new(), history.clone(), context.clone());
         assert_eq!(
             retry, messages,
             "an identical retry must not duplicate context"
@@ -2607,7 +3043,6 @@ mod tests {
             }],
         });
         let continuation = compile_provider_input_messages(
-            &mut state,
             Vec::new(),
             extended_history,
             vec![provider::InputMessage::user_text("runtime-clock-b")],
@@ -2638,13 +3073,7 @@ mod tests {
             provider::InputMessage::user_text("private-role-brief"),
         ];
         let history = vec![provider::InputMessage::user_text("role-a objective")];
-        let mut state = ProviderPromptHistory::default();
-        let first = compile_provider_input_messages(
-            &mut state,
-            prefix.clone(),
-            history.clone(),
-            Vec::new(),
-        );
+        let first = compile_provider_input_messages(prefix.clone(), history.clone(), Vec::new());
         assert_eq!(first.len(), 3);
         assert!(matches!(
             first[0].content.as_slice(),
@@ -2659,16 +3088,10 @@ mod tests {
             [InputContentBlock::Text { text }] if text == "role-a objective"
         ));
 
-        let retry = compile_provider_input_messages(
-            &mut state,
-            prefix.clone(),
-            history.clone(),
-            Vec::new(),
-        );
+        let retry = compile_provider_input_messages(prefix.clone(), history.clone(), Vec::new());
         assert_eq!(retry, first, "exact retry keeps the frozen prefix");
 
         let changed = compile_provider_input_messages(
-            &mut state,
             vec![provider::InputMessage::user_text("other-team-context")],
             history,
             Vec::new(),
@@ -2686,9 +3109,7 @@ mod tests {
 
     #[test]
     fn role_private_prefix_precedes_history_after_shared_cohort() {
-        let mut state = ProviderPromptHistory::default();
         let first = compile_provider_input_messages(
-            &mut state,
             vec![
                 provider::InputMessage::user_text("shared-cohort"),
                 provider::InputMessage::user_text("private-role"),
@@ -2812,14 +3233,29 @@ mod tests {
     #[derive(Default)]
     struct StepWireRecorder {
         records: std::sync::Mutex<Vec<super::ProviderWireEvidence>>,
+        attempts: std::sync::atomic::AtomicUsize,
         refuse: std::sync::atomic::AtomicBool,
+        advance_policy: Option<crate::permissions::SessionExecutionPolicyControl>,
     }
 
     #[async_trait::async_trait]
     impl super::ProviderWireEvidenceWriter for StepWireRecorder {
-        async fn persist(&self, _: &super::ProviderRequestEvidenceContext, evidence: super::ProviderWireEvidence) -> Result<(), crate::RuntimeError> {
-            if self.refuse.load(Ordering::SeqCst) { return Err(crate::RuntimeError::new("fixture durable write refused")); }
+        async fn persist(
+            &self,
+            _: &super::ProviderRequestEvidenceContext,
+            evidence: super::ProviderWireEvidence,
+        ) -> Result<(), crate::RuntimeError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(crate::RuntimeError::new("fixture durable write refused"));
+            }
             self.records.lock().unwrap().push(evidence);
+            if let Some(source) = &self.advance_policy {
+                let mut policy = source.snapshot();
+                policy.revision += 1;
+                source.replace(policy).unwrap();
+            }
             Ok(())
         }
         async fn persist_outcome(&self, _: &super::ProviderRequestEvidenceContext, _: super::ProviderAttemptOutcomeEvidence) -> Result<(), crate::RuntimeError> { Ok(()) }
@@ -2841,11 +3277,22 @@ mod tests {
         client.configure_tool_exposure(exposure(&["read_file"], &[], 1));
         let budget = crate::context_ledger::RequestBudgetReport::for_attempt("fixture-model", 32_768, 4_096, 0, 0, 0);
         let mut request = ApiRequest {
-            bound_step: None, prompt: PromptAssembly::new(vec!["fixture system".into()]), messages: Vec::new().into(),
-            model: "fixture-model".into(), reasoning_effort_override: None, request_compiler_cache_hit: false,
-            budget: budget.clone(), provider_evidence_context: Some(super::ProviderRequestEvidenceContext {
-                session_id: "wire-session".into(), execution_id: "wire-execution".into(), turn_id: "wire-turn".into(),
-                request_sequence: 1, request_compiler_cache_hit: false, budget, attempt: 1,
+            bound_step: None,
+            prompt: PromptAssembly::new(vec!["fixture system".into()]),
+            messages: Vec::new().into(),
+            model: "fixture-model".into(),
+            reasoning_effort_override: None,
+            request_compiler_cache_hit: false,
+            budget: budget.clone(),
+            preparation: Default::default(),
+            provider_evidence_context: Some(super::ProviderRequestEvidenceContext {
+                session_id: "wire-session".into(),
+                execution_id: "wire-execution".into(),
+                turn_id: "wire-turn".into(),
+                request_sequence: 1,
+                request_compiler_cache_hit: false,
+                budget,
+                attempt: 1,
             }),
         };
         let step = crate::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
@@ -2858,45 +3305,75 @@ mod tests {
         (client, request)
     }
 
-    #[test]
-    fn wire_budget_preview_preserves_required_choice_and_counts_the_actual_adapter_body() {
+    #[tokio::test]
+    async fn wire_budget_preview_preserves_required_choice_and_counts_the_actual_adapter_body() {
         let workspace = tempfile::tempdir().unwrap();
         let (mut client, mut request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), workspace.path());
         request.budget.set_context_window_source("configured");
         request.budget.compiled_provider_registry_revision = Some(client.registry.revision());
         client.configure_tool_choice(true, Some("read_file".into()));
-        client.prepare_request_budget(&mut request).unwrap();
-        client.prepare_request_budget(&mut request).unwrap();
+        client.prepare_request_budget(&mut request).await.unwrap();
+        client.prepare_request_budget(&mut request).await.unwrap();
         assert!(client.tool_choice_required);
-        assert_eq!(client.tool_choice_required_tool_name.as_deref(), Some("read_file"));
-        let (entry, message) = client.prepare_message_request(&request, &client.registry.pin()).unwrap();
-        let wire = entry.client.wire_request(&message).unwrap();
-        let expected = (serde_json::to_vec(&wire.body).unwrap().len() as u64 + 3) / 4;
-        assert_eq!(request.budget.rendered_input_tokens, Some(expected));
-        assert!(expected > 0);
-        assert_eq!(request.budget.render_estimate_source.as_deref(), Some("provider_wire_utf8_bytes_div4_estimated_v1"));
-        assert!(message.tool_choice.is_some());
+        assert_eq!(
+            client.tool_choice_required_tool_name.as_deref(),
+            Some("read_file")
+        );
+        assert_eq!(client.wire_preparation_count(), 1);
+        let prepared = request.preparation.prepared.as_ref().unwrap();
+        assert_eq!(prepared.wire.wire_request().body["model"], "fixture-model");
+        assert!(prepared.message.tool_choice.is_some());
+        assert_eq!(
+            prepared.wire.wire_request().body["tool_choice"]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            request.budget.render_estimate_source.as_deref(),
+            Some("provider_wire_utf8_bytes_div4_estimated_v1")
+        );
         assert!(request.budget.executable);
     }
 
-    #[test]
-    fn wire_budget_refuses_unknown_profile_overflow_and_changed_profile_without_network() {
+    #[tokio::test]
+    async fn wire_budget_refuses_unknown_profile_overflow_and_changed_profile_without_network() {
         let workspace = tempfile::tempdir().unwrap();
-        let (client, mut request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), workspace.path());
-        let error = client.prepare_request_budget(&mut request).unwrap_err();
-        assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::UnknownProfile));
+        let (client, mut request) =
+            step_wire_fixture("http://127.0.0.1:1/v1".into(), workspace.path());
+        let error = client
+            .prepare_request_budget(&mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.context_capacity_failure(),
+            Some(crate::context_ledger::ContextCapacityFailure::UnknownProfile)
+        );
         request.budget.set_context_window_source("configured");
-        request.budget.compiled_provider_registry_revision = Some(client.registry.revision().saturating_add(1));
-        assert!(client.prepare_request_budget(&mut request).unwrap_err().to_string().contains("profile_changed"));
+        request.budget.compiled_provider_registry_revision =
+            Some(client.registry.revision().saturating_add(1));
+        assert_eq!(
+            client
+                .prepare_request_budget(&mut request)
+                .await
+                .unwrap_err()
+                .preparation_failure(),
+            Some(super::ProviderPreparationFailure::ProfileChanged)
+        );
         request.budget.compiled_provider_registry_revision = Some(client.registry.revision());
         request.budget.hard_input_cap_tokens = 1;
-        let error = client.prepare_request_budget(&mut request).unwrap_err();
-        assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::RenderOverflow));
+        let error = client
+            .prepare_request_budget(&mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.context_capacity_failure(),
+            Some(crate::context_ledger::ContextCapacityFailure::RenderOverflow)
+        );
         assert!(!request.budget.executable);
     }
 
     #[tokio::test]
     async fn bound_step_wire_digest_matches_sent_bytes_and_is_recorded_before_http() {
+        use sha2::Digest;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let recorder = Arc::new(StepWireRecorder::default());
@@ -2912,9 +3389,17 @@ mod tests {
                 request_bytes.extend_from_slice(&buffer[..count]);
                 if let Some(offset) = request_bytes.windows(4).position(|window| window == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&request_bytes[..offset]);
-                    let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:")
-                        .map(|value| value.trim().parse::<usize>().unwrap())).unwrap();
-                    if request_bytes.len() >= offset + 4 + length { break serde_json::from_slice::<serde_json::Value>(&request_bytes[offset + 4..offset + 4 + length]).unwrap(); }
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if request_bytes.len() >= offset + 4 + length {
+                        break request_bytes[offset + 4..offset + 4 + length].to_vec();
+                    }
                 }
             };
             let response = "data: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
@@ -2924,7 +3409,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let (mut client, mut request) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
         request.budget.set_context_window_source("configured");
-        client.prepare_request_budget(&mut request).unwrap();
+        client.prepare_request_budget(&mut request).await.unwrap();
+        let budget_input = request.budget.rendered_input_tokens;
         let snapshot = request.bound_step.as_ref().unwrap().snapshot().clone();
         client.configure_provider_wire_evidence(Some(recorder.clone()));
         let events = tokio::time::timeout(std::time::Duration::from_secs(5), client.stream(request).collect::<Vec<_>>()).await.unwrap();
@@ -2933,7 +3419,16 @@ mod tests {
         let sent_body = fixture.await.unwrap();
         let records = recorder.records.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].wire_request.body, sent_body);
+        assert_eq!(
+            records[0].wire_request.body,
+            serde_json::from_slice::<serde_json::Value>(&sent_body).unwrap()
+        );
+        assert_eq!(
+            records[0].wire_request.body_sha256,
+            format!("{:x}", sha2::Sha256::digest(&sent_body))
+        );
+        assert_eq!(budget_input, Some((sent_body.len() as u64 + 3) / 4));
+        assert_eq!(client.wire_preparation_count(), 1);
         let render = records[0].step_render.as_ref().unwrap();
         assert_eq!(render.step_id, snapshot.identity.step_id);
         assert_eq!(render.catalog_digest, snapshot.catalog_digest);
@@ -2950,6 +3445,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         for condition in ["missing_writer", "wrong_session", "persist_failed", "changed_request", "stale_registry"] {
             let (mut client, mut request) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+            request.budget.set_context_window_source("configured");
             let recorder = Arc::new(StepWireRecorder::default());
             if condition != "missing_writer" { client.configure_provider_wire_evidence(Some(recorder.clone())); }
             if condition == "wrong_session" { request.provider_evidence_context.as_mut().unwrap().session_id = "other-session".into(); }
@@ -2958,16 +3454,326 @@ mod tests {
             if condition == "stale_registry" {
                 let step = request.bound_step.as_ref().unwrap();
                 let mut snapshot = step.snapshot().clone();
-                snapshot.related_revisions.insert("provider_registry".into(), "999999".into());
-                request.bound_step = Some(Arc::new(crate::step_snapshot::BoundStep::restore(snapshot, step.lease().clone()).unwrap()));
+                snapshot
+                    .related_revisions
+                    .insert("provider_registry".into(), "999999".into());
+                request.bound_step = Some(Arc::new(
+                    crate::step_snapshot::BoundStep::bind(
+                        snapshot.identity,
+                        step.lease().clone(),
+                        &client.step_tool_definitions().unwrap(),
+                        &json!({}),
+                        &crate::step_snapshot::request_material(&request),
+                        snapshot.related_revisions,
+                        snapshot.expires_at_ms,
+                    )
+                    .unwrap(),
+                ));
             }
             let events = tokio::time::timeout(std::time::Duration::from_secs(2), client.stream(request).collect::<Vec<_>>()).await.unwrap();
             assert!(events.iter().any(Result::is_err), "{condition}: {events:?}");
             assert_eq!(recorder.records.lock().unwrap().len(), 0, "{condition}");
+            assert_eq!(
+                recorder.attempts.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(condition == "persist_failed"),
+                "intended evidence gate must be reached: {condition}"
+            );
             assert_eq!(client.transport_pool.stats().in_flight, 0);
         }
         assert!(tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await.is_err());
         assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_change_during_durable_wire_write_refuses_before_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, mut request) = step_wire_fixture(
+            format!("http://{}/v1", listener.local_addr().unwrap()),
+            root.path(),
+        );
+        request.budget.set_context_window_source("configured");
+        let source = crate::permissions::SessionExecutionPolicyControl::new(
+            crate::permissions::PermissionMode::ReadOnly,
+        );
+        request
+            .preparation
+            .bind_policy_source(source.clone(), source.revision());
+        let recorder = Arc::new(StepWireRecorder {
+            advance_policy: Some(source),
+            ..Default::default()
+        });
+        client.configure_provider_wire_evidence(Some(recorder.clone()));
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.stream(request).collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorder.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(recorder.records.lock().unwrap().len(), 1);
+        assert!(events.iter().any(|event|matches!(event,Err(error) if error.preparation_failure()==Some(super::ProviderPreparationFailure::SourceChanged))));
+        assert_eq!(client.transport_pool.stats().in_flight, 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_request_rejects_changed_inputs_and_allows_explicit_repreparation() {
+        let root = tempfile::tempdir().unwrap();
+        let (client, mut request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        request.bound_step = None;
+        request.budget.set_context_window_source("configured");
+        client.prepare_request_budget(&mut request).await.unwrap();
+        let first = request
+            .preparation
+            .prepared
+            .as_ref()
+            .unwrap()
+            .entry
+            .request_context
+            .request_id
+            .clone();
+        request.prompt.push_runtime_context("new required material");
+        let error = client
+            .prepare_request_budget(&mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.preparation_failure(),
+            Some(super::ProviderPreparationFailure::SourceChanged)
+        );
+        assert_eq!(client.wire_preparation_count(), 1);
+        request.preparation.invalidate();
+        client.prepare_request_budget(&mut request).await.unwrap();
+        assert_eq!(client.wire_preparation_count(), 2);
+        assert_ne!(
+            first,
+            request
+                .preparation
+                .prepared
+                .as_ref()
+                .unwrap()
+                .entry
+                .request_context
+                .request_id
+        );
+        assert!(serde_json::to_string(
+            &request
+                .preparation
+                .prepared
+                .as_ref()
+                .unwrap()
+                .wire
+                .wire_request()
+                .body
+        )
+        .unwrap()
+        .contains("new required material"));
+    }
+
+    #[tokio::test]
+    async fn prepared_capacity_is_reserved_before_render_and_released_with_the_body() {
+        use crate::execution_core::graph::*;
+        let root = tempfile::tempdir().unwrap();
+        for capacity in [1, 16 * 1024 * 1024] {
+            let manager = Arc::new(ExecutionResourceManager::new([(
+                ExecutionResourceKind::ContextBytes,
+                ResourceQuota::new(capacity, capacity, capacity).unwrap(),
+            )]));
+            let (client, mut request) =
+                step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+            let client = client.with_preparation_resources(manager.clone());
+            request.budget.set_context_window_source("configured");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.prepare_request_budget(&mut request),
+            )
+            .await
+            .unwrap();
+            if capacity == 1 {
+                assert!(result.is_err());
+                assert_eq!(client.wire_preparation_count(), 0);
+                assert_eq!(
+                    manager
+                        .snapshot(&ExecutionResourceKind::ContextBytes)
+                        .unwrap()
+                        .active_leases,
+                    0
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(client.wire_preparation_count(), 1);
+                assert!((1..=16 * 1024 * 1024).contains(
+                    &manager
+                        .snapshot(&ExecutionResourceKind::ContextBytes)
+                        .unwrap()
+                        .active_leases
+                ));
+                request.preparation.invalidate();
+                assert_eq!(
+                    manager
+                        .snapshot(&ExecutionResourceKind::ContextBytes)
+                        .unwrap()
+                        .active_leases,
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn original_provider_lease_survives_handoff_and_local_cancel_releases_capacity() {
+        use crate::execution_core::graph::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut block = [0; 4096];
+                let n = socket.read(&mut block).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+                if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..offset]);
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= offset + 4 + len {
+                        break;
+                    }
+                }
+                assert!(bytes.len() < 256 * 1024);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+        });
+        let manager = Arc::new(ExecutionResourceManager::new([
+            (
+                ExecutionResourceKind::Provider,
+                ResourceQuota::new(1, 1, 1).unwrap(),
+            ),
+            (
+                ExecutionResourceKind::ContextBytes,
+                ResourceQuota::new(16 * 1024 * 1024, 16 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+            ),
+        ]));
+        let admission = || {
+            ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Foreground,
+                [(ExecutionResourceKind::Provider, 1)],
+            )
+            .with_fairness_key("wire-session")
+        };
+        let ResourceAdmissionDecision::Granted { lease, .. } =
+            manager.admit(admission()).await.unwrap()
+        else {
+            panic!("fixture admission")
+        };
+        let root = tempfile::tempdir().unwrap();
+        let (client, mut request) = step_wire_fixture(format!("http://{address}/v1"), root.path());
+        let mut client = client.with_preparation_resources(manager.clone());
+        client.configure_provider_wire_evidence(Some(Arc::new(StepWireRecorder::default())));
+        request.budget.set_context_window_source("configured");
+        request
+            .preparation
+            .retain_dispatch_lease(Some(Arc::new(lease)));
+        let stream = client.stream(request);
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            1
+        );
+        assert!((1..=16 * 1024 * 1024).contains(
+            &manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases
+        ));
+        assert!(!server.is_finished(), "remote completion is still unknown");
+        drop(stream);
+        let ResourceAdmissionDecision::Granted { lease: next, .. } = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.admit(admission()),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("local producer failed to release the original slot")
+        };
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            1
+        );
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        assert!(
+            !server.is_finished(),
+            "local cancellation does not certify remote completion"
+        );
+        drop(next);
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn used_and_recovered_step_provider_authorizations_cannot_dispatch_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let step = request.bound_step.unwrap();
+        let clone = step.clone();
+        step.consume_provider_attempt().unwrap();
+        assert_eq!(
+            clone
+                .consume_provider_attempt()
+                .unwrap_err()
+                .preparation_failure(),
+            Some(super::ProviderPreparationFailure::Consumed)
+        );
+        let recovered =
+            crate::step_snapshot::BoundStep::restore(step.snapshot().clone(), step.lease().clone())
+                .unwrap();
+        assert_eq!(
+            recovered
+                .consume_provider_attempt()
+                .unwrap_err()
+                .preparation_failure(),
+            Some(super::ProviderPreparationFailure::Consumed)
+        );
     }
 
     fn exposure(bootstrap: &[&str], active: &[&str], revision: u64) -> ToolExposureProjection {
@@ -3187,7 +3993,7 @@ mod tests {
             .expect_err("control analysis must honor the shared fence");
         assert!(control_error.contains("temporarily fenced"));
 
-        let request = ApiRequest {
+        let mut request = ApiRequest {
             bound_step: None,
             prompt: PromptAssembly::new(vec!["system".to_string()]),
             messages: Vec::new().into(),
@@ -3202,8 +4008,10 @@ mod tests {
                 0,
                 0,
             ),
+            preparation: Default::default(),
             provider_evidence_context: None,
         };
+        request.budget.set_context_window_source("configured");
         let error = client
             .stream(request)
             .next()
@@ -3276,7 +4084,7 @@ mod tests {
         fixture.await.expect("fixture task");
         assert!(pool.provider_account_is_fenced(registry.revision(), "token-plan"));
 
-        let request = ApiRequest {
+        let mut request = ApiRequest {
             bound_step: None,
             prompt: PromptAssembly::new(vec!["system".to_string()]),
             messages: Vec::new().into(),
@@ -3291,8 +4099,10 @@ mod tests {
                 0,
                 0,
             ),
+            preparation: Default::default(),
             provider_evidence_context: None,
         };
+        request.budget.set_context_window_source("configured");
         let error = client
             .stream(request)
             .next()

@@ -516,9 +516,15 @@ where
         request
     }
 
-    fn prepare_timed_provider_budget(&self, request: &mut ApiRequest) -> Result<(), RuntimeError> {
+    async fn prepare_timed_provider_budget(
+        &self,
+        request: &mut ApiRequest,
+    ) -> Result<(), RuntimeError> {
         let started = Instant::now();
-        let result = self.api_client.prepare_request_budget(request);
+        request
+            .preparation
+            .bind_preparation_scope(self.execution_service_class, self.session_id());
+        let result = self.api_client.prepare_request_budget(request).await;
         crate::execution_core::performance::observe_duration(
             "request_wire_budget_ms",
             started.elapsed(),
@@ -891,6 +897,10 @@ where
                     "persist step binding before provider dispatch: {error}"
                 ))
             })?;
+        request.preparation.bind_policy_source(
+            self.permission_policy.execution_policy_control().clone(),
+            policy.revision,
+        );
         request.bound_step = Some(Arc::clone(&step));
         Ok(Some(step))
     }
@@ -1065,10 +1075,16 @@ where
                         }
                     };
                 request.reasoning_effort_override = one_shot_reasoning_effort.clone();
-                if let Err(error) = self.prepare_timed_provider_budget(&mut request) {
+                if let Err(error) = self.prepare_timed_provider_budget(&mut request).await {
                     last_error = Some(error);
                     break 'candidate_attempt;
                 }
+                let prepared_output = request.budget.requested_output_tokens;
+                let reserved_input = request
+                    .budget
+                    .input_total_tokens()
+                    .saturating_add(request.budget.protocol_overhead_tokens)
+                    .saturating_add(request.budget.safety_margin_tokens);
                 let mut token_reservations = match ProviderTokenReservationSet::acquire(
                     self.evaluation_provider_token_lease.as_ref(),
                     self.delegated_provider_budget.as_ref(),
@@ -1081,6 +1097,26 @@ where
                         break 'candidate_attempt;
                     }
                 };
+
+                if request.budget.requested_output_tokens != prepared_output {
+                    request.preparation.invalidate();
+                    if let Err(error) = self.prepare_timed_provider_budget(&mut request).await {
+                        last_error = Some(error);
+                        break 'candidate_attempt;
+                    }
+                    if request
+                        .budget
+                        .input_total_tokens()
+                        .saturating_add(request.budget.protocol_overhead_tokens)
+                        > reserved_input
+                    {
+                        last_error = Some(RuntimeError::context_capacity(
+                            crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                            "reprepared wire exceeds original token input reservation",
+                        ));
+                        break 'candidate_attempt;
+                    }
+                }
                 if !models_tried.contains(&model) {
                     models_tried.push(model.clone());
                 }
@@ -1139,6 +1175,10 @@ where
                 );
                 let (provider_lease, provider_queue_wait) =
                     self.acquire_provider_capacity(&model, &request).await?;
+                let provider_lease = provider_lease.map(Arc::new);
+                request
+                    .preparation
+                    .retain_dispatch_lease(provider_lease.clone());
                 tracing::info!(
                     target: "cowd::terminal_provider",
                     model = %model,
@@ -1214,7 +1254,7 @@ where
                     "terminal provider phase finished"
                 );
                 self.record_provider_resource_outcome(
-                    provider_lease.as_ref(),
+                    provider_lease.as_deref(),
                     provider_queue_wait,
                     stream_started.elapsed(),
                     stream_run.resource_result_class,
@@ -1614,6 +1654,8 @@ where
                     }
                 },
             };
+
+
             Some(lease)
         } else {
             None
@@ -2249,10 +2291,16 @@ where
                 }
             };
             request.reasoning_effort_override = one_shot_reasoning_effort.clone();
-            if let Err(error) = self.prepare_timed_provider_budget(&mut request) {
+            if let Err(error) = self.prepare_timed_provider_budget(&mut request).await {
                 last_error = Some(error);
                 continue;
             }
+            let prepared_output = request.budget.requested_output_tokens;
+            let reserved_input = request
+                .budget
+                .input_total_tokens()
+                .saturating_add(request.budget.protocol_overhead_tokens)
+                .saturating_add(request.budget.safety_margin_tokens);
             let mut token_reservations = match ProviderTokenReservationSet::acquire(
                 self.evaluation_provider_token_lease.as_ref(),
                 self.delegated_provider_budget.as_ref(),
@@ -2265,6 +2313,26 @@ where
                     continue;
                 }
             };
+            if request.budget.requested_output_tokens != prepared_output {
+                request.preparation.invalidate();
+                if let Err(error) = self.prepare_timed_provider_budget(&mut request).await {
+                    last_error = Some(error);
+                    continue;
+                }
+                if request
+                    .budget
+                    .input_total_tokens()
+                    .saturating_add(request.budget.protocol_overhead_tokens)
+                    > reserved_input
+                {
+                    last_error = Some(RuntimeError::context_capacity(
+                        crate::context_ledger::ContextCapacityFailure::RenderOverflow,
+                        "reprepared wire exceeds original token input reservation",
+                    ));
+                    continue;
+                }
+            }
+
             if !models_tried.contains(&model) {
                 models_tried.push(model.clone());
             }
@@ -2325,6 +2393,10 @@ where
             let cancellation = self.cancellation_token.clone();
             let (provider_lease, provider_queue_wait) =
                 self.acquire_provider_capacity(&model, &request).await?;
+            let provider_lease = provider_lease.map(Arc::new);
+            request
+                .preparation
+                .retain_dispatch_lease(provider_lease.clone());
             let provider_started = Instant::now();
             let stream_started = Instant::now();
             let bound_step = self.bind_provider_step(&mut request)?;
@@ -2424,7 +2496,7 @@ where
             );
             Self::observe_provider_downstream_overload(resource_result_class);
             self.record_provider_resource_outcome(
-                provider_lease.as_ref(),
+                provider_lease.as_deref(),
                 provider_queue_wait,
                 provider_started.elapsed(),
                 resource_result_class,

@@ -654,8 +654,9 @@ pub use provider_resources::{
 pub use provider_runtime_client::{
     push_provider_output_block, ProviderAttemptOutcomeEvidence, ProviderClientTemplateCache,
     ProviderClientTemplateCacheStats, ProviderControlCompletion, ProviderOutputContentBlock,
-    ProviderRequestEvidenceContext, ProviderRuntimeClient, ProviderToolDefinition,
-    ProviderWireEvidence, ProviderWireEvidenceWriter,
+    ProviderPreparationFailure, ProviderRequestEvidenceContext, ProviderRequestPreparation,
+    ProviderRuntimeClient, ProviderToolDefinition, ProviderWireEvidence,
+    ProviderWireEvidenceWriter,
 };
 pub use provider_runtime_client::{ProviderRequestContext, ResolvedProviderProfile};
 pub use provider_transport_policy::ProviderTransportPolicy;

@@ -2168,6 +2168,7 @@ dependencies = [
 name = "provider"
 version = "0.9.999"
 dependencies = [
+ "bytes",
  "harness-contract",
  "httpdate",
  "model-protocol",

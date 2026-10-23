@@ -13,7 +13,9 @@ use model_protocol::telemetry::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::client::build_provider_wire_request;
+use crate::client::{
+    build_provider_wire_request, preparation_transport_digest, PreparedProviderWire,
+};
 use crate::error::ApiError;
 use crate::{ProviderWireHeader, ProviderWireRequest};
 
@@ -123,6 +125,19 @@ impl AnthropicClient {
     }
 
     pub fn wire_request(&self, request: &MessageRequest) -> Result<ProviderWireRequest, ApiError> {
+        Ok(self.prepare_wire(request)?.wire_request().clone())
+    }
+
+    fn preparation_binding(&self) -> Result<String, ApiError> {
+        preparation_transport_digest(&(
+            &self.base_url,
+            self.auth.api_key(),
+            self.auth.bearer_token(),
+            format!("{:?}", self.request_profile),
+        ))
+    }
+
+    pub fn prepare_wire(&self, request: &MessageRequest) -> Result<PreparedProviderWire, ApiError> {
         let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut body);
@@ -162,7 +177,8 @@ impl AnthropicClient {
             "anthropic_messages",
             headers,
             body,
-            request.tools.as_deref(),
+            request,
+            &self.preparation_binding()?,
         )
     }
 
@@ -311,14 +327,32 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
+        self.send_message_inner(request, None).await
+    }
+    pub async fn send_prepared_message(
+        &self,
+        request: &MessageRequest,
+        prepared: &PreparedProviderWire,
+    ) -> Result<MessageResponse, ApiError> {
+        self.send_message_inner(request, Some(prepared)).await
+    }
+    async fn send_message_inner(
+        &self,
+        request: &MessageRequest,
+        prepared: Option<&PreparedProviderWire>,
+    ) -> Result<MessageResponse, ApiError> {
         let request = MessageRequest {
             stream: false,
             ..request.clone()
         };
 
-        self.preflight_message_request(&request).await?;
+        if prepared.is_none() {
+            self.preflight_message_request(&request).await?;
+        } else {
+            super::preflight_message_request(&request)?;
+        }
 
-        let http_response = self.send_with_retry(&request).await?;
+        let http_response = self.send_with_retry(&request, prepared).await?;
         let request_id = request_id_from_headers(http_response.headers());
         let body = http_response.text().await.map_err(ApiError::from)?;
         let mut response =
@@ -350,9 +384,27 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        self.preflight_message_request(request).await?;
+        self.stream_message_inner(request, None).await
+    }
+    pub async fn stream_prepared_message(
+        &self,
+        request: &MessageRequest,
+        prepared: &PreparedProviderWire,
+    ) -> Result<MessageStream, ApiError> {
+        self.stream_message_inner(request, Some(prepared)).await
+    }
+    async fn stream_message_inner(
+        &self,
+        request: &MessageRequest,
+        prepared: Option<&PreparedProviderWire>,
+    ) -> Result<MessageStream, ApiError> {
+        if prepared.is_none() {
+            self.preflight_message_request(request).await?;
+        } else {
+            super::preflight_message_request(request)?;
+        }
         let response = self
-            .send_with_retry(&request.clone().with_streaming())
+            .send_with_retry(&request.clone().with_streaming(), prepared)
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
@@ -407,7 +459,16 @@ impl AnthropicClient {
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
+        prepared: Option<&PreparedProviderWire>,
     ) -> Result<reqwest::Response, ApiError> {
+        let owned;
+        let prepared = match prepared {
+            Some(value) => value,
+            None => {
+                owned = self.prepare_wire(request)?;
+                &owned
+            }
+        };
         let mut attempts = 0;
         let last_error = loop {
             attempts += 1;
@@ -419,7 +480,7 @@ impl AnthropicClient {
                     Map::new(),
                 );
             }
-            let retry_error = match self.send_raw_request(request).await {
+            let retry_error = match self.send_raw_request(request, prepared).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
                         if let Some(session_tracer) = &self.session_tracer {
@@ -470,11 +531,16 @@ impl AnthropicClient {
     async fn send_raw_request(
         &self,
         request: &MessageRequest,
+        prepared: &PreparedProviderWire,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut request_body = self.request_profile.render_json_body(request)?;
-        strip_unsupported_beta_body_fields(&mut request_body);
-        let request_builder = self.build_request(&request_url).json(&request_body);
+        prepared.validate(
+            request,
+            &request_url,
+            "anthropic_messages",
+            &self.preparation_binding()?,
+        )?;
+        let request_builder = self.build_request(&request_url).body(prepared.body());
         request_builder.send().await.map_err(ApiError::from)
     }
 

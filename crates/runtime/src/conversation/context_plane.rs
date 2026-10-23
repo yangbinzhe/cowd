@@ -2809,6 +2809,7 @@ where
             reasoning_effort_override: None,
             request_compiler_cache_hit: prepared.cache_hit,
             budget,
+            preparation: Default::default(),
             provider_evidence_context: None,
         })
     }
