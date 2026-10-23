@@ -563,6 +563,29 @@ pub struct ProviderControlCompletion {
     pub stop_reason: Option<String>,
 }
 
+/// A single non-streaming request. The original Task may record this wire
+/// identity before dispatch; ownership prevents a second send of the carrier.
+/// Body and credentials are deliberately absent from Debug and public access.
+pub(crate) struct PreparedControlAnalysis {
+    entry: ProviderEntry,
+    message: MessageRequest,
+    wire: provider::PreparedProviderWire,
+    fence: ProviderDispatchSourceFence,
+    configured_reasoning: Option<String>,
+    _resident: Option<crate::execution_core::graph::ExecutionResourceLease>,
+}
+impl PreparedControlAnalysis {
+    pub(crate) fn wire(&self) -> &provider::ProviderWireRequest {
+        self.wire.wire_request()
+    }
+    pub(crate) fn context(&self) -> &ProviderRequestContext {
+        &self.entry.request_context
+    }
+    pub(crate) fn estimated_total_tokens(&self) -> u64 {
+        (self.wire.body_len() as u64).saturating_add(3) / 4 + u64::from(self.message.max_tokens)
+    }
+}
+
 /// Bridges one provider request into the runtime's lazy `ApiClient` stream.
 ///
 /// The provider SDK is asynchronous but does not itself implement
@@ -723,10 +746,123 @@ impl ProviderRuntimeClient {
         input: impl Into<String>,
         max_tokens: u32,
     ) -> Result<ProviderControlCompletion, String> {
+        let system = system.into();
+        let input = input.into();
+        let prepared = self
+            .prepare_control_analysis(model, &system, &input, max_tokens)
+            .await?;
+        self.send_control_analysis(prepared).await
+    }
+
+    pub(crate) async fn prepare_control_analysis(
+        &self,
+        model: &str,
+        system: &str,
+        input: &str,
+        max_tokens: u32,
+    ) -> Result<PreparedControlAnalysis, String> {
         let snapshot = self.registry.pin();
         let entry = self
             .template_cache
             .resolve(&snapshot, &self.transport_pool, model)?;
+        self.validate_control_account(&entry)?;
+        // Count the borrowed input before allocating the protocol message or
+        // rendering JSON. This uses the same original resident quota as streams.
+        let mut counter = PreparationSourceCounter(0);
+        serde_json::to_writer(&mut counter, &(system, input)).map_err(|e| e.to_string())?;
+        let resident_bytes = counter
+            .0
+            .checked_add(65536)
+            .and_then(|n| n.checked_mul(32))
+            .ok_or("control resident budget overflow")?;
+        let resident = if let Some(manager) = &self.preparation_resources {
+            use crate::execution_core::graph::*;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis() as u64;
+            let admission = ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Foreground,
+                [(ExecutionResourceKind::ContextBytes, resident_bytes)],
+            )
+            .with_fairness_key("provider-control-prepare")
+            .with_deadline_at_ms(now.saturating_add(5000));
+            match manager.admit(admission).await.map_err(|e| e.to_string())? {
+                ResourceAdmissionDecision::Granted { lease, .. } => Some(lease),
+                _ => return Err("control prepared content capacity unavailable".into()),
+            }
+        } else {
+            if self.execution_supervisor.is_some() {
+                return Err("governed control preparation has no original resource owner".into());
+            }
+            None
+        };
+        let message = MessageRequest {
+            model: entry.model.clone(),
+            max_tokens: max_tokens.max(1),
+            messages: vec![InputMessage::user_text(input)],
+            system: Some(system.to_owned()),
+            reasoning_effort: request_reasoning_effort(
+                &entry.model,
+                &entry.request_context.profile.model_capabilities,
+                None,
+                self.reasoning_effort.clone(),
+            ),
+            protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
+            ..MessageRequest::default()
+        };
+        provider::preflight_message_request(&message).map_err(|e| e.to_string())?;
+        let wire = entry
+            .client
+            .prepare_wire(&message)
+            .map_err(|e| e.to_string())?;
+        self.wire_preparations.fetch_add(1, Ordering::Relaxed);
+        let fence = ProviderDispatchSourceFence {
+            registry: Arc::clone(&self.registry),
+            revision: snapshot.revision(),
+            transport: Arc::clone(&self.transport_pool),
+            transport_fingerprint: entry.request_context.transport_fingerprint,
+            policy: None,
+        };
+        Ok(PreparedControlAnalysis {
+            entry,
+            message,
+            wire,
+            fence,
+            configured_reasoning: self.reasoning_effort.clone(),
+            _resident: resident,
+        })
+    }
+
+    /// Consume the existing leaf admission, never acquire a second Provider slot.
+    pub(crate) async fn complete_admitted_control_analysis(
+        &self,
+        prepared: PreparedControlAnalysis,
+        lease: &crate::execution_core::graph::ExecutionResourceLease,
+        config: &crate::ProviderResourceConfig,
+    ) -> Result<ProviderControlCompletion, String> {
+        let manager = self
+            .preparation_resources
+            .as_ref()
+            .ok_or("control dispatch has no original resource owner")?;
+        let expected = config.admission_demands(
+            &prepared.entry.request_context.profile.provider_name,
+            &prepared.entry.model,
+            prepared.estimated_total_tokens(),
+        );
+        if manager
+            .lease_is_active(&lease.projection_reference())
+            .map_err(|e| e.to_string())?
+            != Some(true)
+            || lease.demands().len() != expected.len()
+            || expected.iter().any(|d| !lease.demands().contains(d))
+        {
+            return Err("control dispatch lease does not match original Provider admission".into());
+        }
+        self.send_control_analysis(prepared).await
+    }
+
+    fn validate_control_account(&self, entry: &ProviderEntry) -> Result<(), String> {
         if self.transport_pool.provider_account_is_fenced(
             entry.request_context.profile.registry_revision,
             &entry.request_context.profile.provider_name,
@@ -735,30 +871,33 @@ impl ProviderRuntimeClient {
                 &entry.request_context.profile.provider_name,
             ));
         }
+        Ok(())
+    }
+
+    async fn send_control_analysis(
+        &self,
+        prepared: PreparedControlAnalysis,
+    ) -> Result<ProviderControlCompletion, String> {
+        if !Arc::ptr_eq(&self.registry, &prepared.fence.registry)
+            || !Arc::ptr_eq(&self.transport_pool, &prepared.fence.transport)
+            || self.reasoning_effort != prepared.configured_reasoning
+        {
+            return Err("control preparation belongs to a different source; prepare again".into());
+        }
+        prepared.fence.validate().map_err(|e| e.to_string())?;
+        self.validate_control_account(&prepared.entry)?;
         let _request_guard = self.transport_pool.begin_request();
-        let response = match entry
+        let response = match prepared
+            .entry
             .client
-            .send_message(&MessageRequest {
-                model: entry.model.clone(),
-                max_tokens: max_tokens.max(1),
-                messages: vec![InputMessage::user_text(input)],
-                system: Some(system.into()),
-                reasoning_effort: request_reasoning_effort(
-                    &entry.model,
-                    &entry.request_context.profile.model_capabilities,
-                    None,
-                    self.reasoning_effort.clone(),
-                ),
-                protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
-                ..MessageRequest::default()
-            })
+            .send_prepared_message(&prepared.message, &prepared.wire)
             .await
         {
             Ok(response) => response,
             Err(error) => {
                 self.transport_pool.record_provider_failure(
-                    entry.request_context.profile.registry_revision,
-                    &entry.request_context.profile.provider_name,
+                    prepared.entry.request_context.profile.registry_revision,
+                    &prepared.entry.request_context.profile.provider_name,
                     error.failure_scope(),
                 );
                 return Err(error.to_string());
@@ -3304,6 +3443,264 @@ mod tests {
             BTreeMap::from([("provider_registry".into(), client.context_inventory().provider_registry_revision.to_string())]), i64::MAX).unwrap();
         request.bound_step = Some(Arc::new(step));
         (client, request)
+    }
+
+    fn control_resource_fixture(
+        client: &ProviderRuntimeClient,
+    ) -> (
+        Arc<crate::execution_core::graph::ExecutionResourceManager>,
+        crate::ProviderResourceConfig,
+    ) {
+        use crate::execution_core::graph::*;
+        let one = crate::ProviderQuotaPolicy::new(1, 1, 1, 0);
+        let config = crate::ProviderResourceConfig {
+            global: one,
+            fallback: one,
+            ..Default::default()
+        };
+        let mut quotas = config.materialize(&client.registry.pin()).quotas;
+        quotas.push((
+            ExecutionResourceKind::ContextBytes,
+            ResourceQuota::new(4 * 1024 * 1024, 4 * 1024 * 1024, 4 * 1024 * 1024).unwrap(),
+        ));
+        (Arc::new(ExecutionResourceManager::new(quotas)), config)
+    }
+
+    #[tokio::test]
+    async fn control_prepared_body_uses_exact_wire_and_existing_capacity_one_lease() {
+        use crate::execution_core::graph::*;
+        use sha2::Digest;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let body = loop {
+                let mut buffer = [0; 1024];
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0 && bytes.len() < 65536);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..offset]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if bytes.len() >= offset + 4 + length {
+                        break bytes[offset + 4..offset + 4 + length].to_vec();
+                    }
+                }
+            };
+            let response = r#"{"id":"control-response","model":"fixture-model","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).as_bytes()).await.unwrap();
+            body
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let (client, _) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+        let (manager, config) = control_resource_fixture(&client);
+        let client = client.with_preparation_resources(Arc::clone(&manager));
+        let prepared = client
+            .prepare_control_analysis("fixture-model", "control system", "untrusted input", 32)
+            .await
+            .unwrap();
+        let digest = prepared.wire().body_sha256.clone();
+        let total = prepared.estimated_total_tokens();
+        assert!(
+            manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases
+                > 0
+        );
+        let demand = config.admission_demands("fixture", "fixture-model", total);
+        let ResourceAdmissionDecision::Granted { lease, .. } = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Foreground,
+                demand,
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("one slot must grant");
+        };
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.complete_admitted_control_analysis(prepared, &lease, &config),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let bytes = server.await.unwrap();
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&bytes)), digest);
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["model"], "fixture-model");
+        assert_eq!(body["messages"][0]["content"], "control system");
+        assert_eq!(body["messages"][1]["content"], "untrusted input");
+        assert_eq!(total, (bytes.len() as u64 + 3) / 4 + 32);
+        assert_eq!(completion.text, "ok");
+        assert_eq!((completion.input_tokens, completion.output_tokens), (7, 2));
+        assert_eq!(client.wire_preparation_count(), 1);
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::ContextBytes)
+                .unwrap()
+                .active_leases,
+            0
+        );
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            1
+        );
+        drop(lease);
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .active_leases,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn control_prepared_source_changes_refuse_before_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for mutation in ["registry", "reasoning", "account", "owner"] {
+            let (mut client, _) = step_wire_fixture(
+                format!("http://{}/v1", listener.local_addr().unwrap()),
+                workspace.path(),
+            );
+            let prepared = client
+                .prepare_control_analysis("fixture-model", "system", "input", 32)
+                .await
+                .unwrap();
+            match mutation {
+                "registry" => {
+                    let mut config = client.registry.pin().config().clone();
+                    config.providers.get_mut("fixture").unwrap().api_key =
+                        "different-account-secret".into();
+                    client.registry.replace(config).unwrap();
+                }
+                "reasoning" => client.set_reasoning_effort(Some("high".into())),
+                "account" => {
+                    client.transport_pool.record_provider_failure(
+                        client.registry.revision(),
+                        "fixture",
+                        model_protocol::provider_failure::ProviderFailureScope::Account,
+                    );
+                }
+                "owner" => {
+                    client.transport_pool = Arc::new(ProviderTransportPool::default());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                client.send_control_analysis(prepared).await.is_err(),
+                "{mutation}"
+            );
+            assert_eq!(client.transport_pool.stats().in_flight, 0);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn control_admitted_lease_rejects_foreign_owner_wrong_model_and_underweighted_tokens() {
+        use crate::execution_core::graph::*;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for mutation in ["foreign_owner", "model", "pressure"] {
+            let (client, _) = step_wire_fixture(
+                format!("http://{}/v1", listener.local_addr().unwrap()),
+                workspace.path(),
+            );
+            let (manager, config) = control_resource_fixture(&client);
+            let client = client.with_preparation_resources(Arc::clone(&manager));
+            let prepared = client
+                .prepare_control_analysis("fixture-model", "system", &"x".repeat(20000), 32)
+                .await
+                .unwrap();
+            let mut demands = config.admission_demands(
+                "fixture",
+                "fixture-model",
+                prepared.estimated_total_tokens(),
+            );
+            let mut lease_manager = Arc::clone(&manager);
+            if mutation == "foreign_owner" {
+                lease_manager = control_resource_fixture(&client).0;
+            }
+            if mutation == "model" {
+                demands.retain(|(k, _)| !matches!(k, ExecutionResourceKind::ProviderModel(_)));
+            }
+            if mutation == "pressure" {
+                for (kind, weight) in &mut demands {
+                    if matches!(kind, ExecutionResourceKind::ProviderTokenPool(_)) {
+                        assert!(*weight > 1);
+                        *weight = 1;
+                    }
+                }
+            }
+            let ResourceAdmissionDecision::Granted { lease, .. } = lease_manager
+                .admit(ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    demands,
+                ))
+                .await
+                .unwrap()
+            else {
+                panic!("fixture lease");
+            };
+            assert!(
+                client
+                    .complete_admitted_control_analysis(prepared, &lease, &config)
+                    .await
+                    .unwrap_err()
+                    .contains("does not match"),
+                "{mutation}"
+            );
+            assert_eq!(
+                manager
+                    .snapshot(&ExecutionResourceKind::ContextBytes)
+                    .unwrap()
+                    .active_leases,
+                0
+            );
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn control_preparation_capacity_failure_does_not_render_or_dispatch() {
+        use crate::execution_core::graph::*;
+        let workspace = tempfile::tempdir().unwrap();
+        let (client, _) = step_wire_fixture("http://127.0.0.1:9/v1".into(), workspace.path());
+        let manager = Arc::new(ExecutionResourceManager::new([(
+            ExecutionResourceKind::ContextBytes,
+            ResourceQuota::new(1, 1, 1).unwrap(),
+        )]));
+        let client = client.with_preparation_resources(manager);
+        assert!(client
+            .prepare_control_analysis("fixture-model", "system", "input", 32)
+            .await
+            .is_err());
+        assert_eq!(client.wire_preparation_count(), 0);
+        assert_eq!(client.transport_pool.stats().in_flight, 0);
     }
 
     #[tokio::test]
