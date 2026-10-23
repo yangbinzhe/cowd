@@ -138,6 +138,37 @@ pub trait MemorySourceFenceReader: Send + Sync {
         budget_bytes: usize,
     ) -> Result<Option<MemorySourceRevisionRead>>;
 
+    /// Read one bounded original frame. Native owners override this with one
+    /// guard/transaction and charge shared ancestry once. The fallback is
+    /// conservative for custom readers, without inventing reusable read credit.
+    fn read_source_revisions(
+        &self,
+        roots: &[MemoryId],
+        budget_bytes: usize,
+    ) -> Result<(
+        std::collections::BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
+        usize,
+    )> {
+        if roots.len() > crate::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        let mut remaining = budget_bytes;
+        let mut frame = std::collections::BTreeMap::new();
+        for id in roots {
+            if frame.contains_key(id) {
+                continue;
+            }
+            let read = self.read_source_revision(&format!("memory:{id}"), remaining)?;
+            if let Some(read) = &read {
+                remaining = remaining
+                    .checked_sub(read.materialized_bytes)
+                    .ok_or(MemoryError::SourceReadLimit)?;
+            }
+            frame.insert(*id, read);
+        }
+        Ok((frame, budget_bytes - remaining))
+    }
+
     /// Typed retirement is irreversible in the original owner. An older epoch
     /// remains retired after a later retirement; it must not strand its own
     /// durable cleanup obligation. Legacy epoch-zero observations are not proofs.
@@ -477,6 +508,263 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn auxiliary_memory_id(source: &str, declared_memory: bool) -> Result<Option<MemoryId>> {
+    let explicit = source.strip_prefix("memory:");
+    if !declared_memory && explicit.is_none() {
+        return Ok(None);
+    }
+    let raw = explicit.unwrap_or(source);
+    let id = raw
+        .parse::<MemoryId>()
+        .map_err(|_| MemoryError::StaleSource)?;
+    if raw != id.to_string() {
+        return Err(MemoryError::StaleSource);
+    }
+    Ok(Some(id))
+}
+
+/// Validate the original auxiliary provenance without guessing that file,
+/// conversation or orphan-placeholder UUIDs name Memory bodies.
+pub fn auxiliary_source_cuts(
+    entities: &[crate::entity::Entity],
+    triples: &[crate::entity::Triple],
+) -> Result<std::collections::BTreeMap<MemoryId, MemoryEntryRevision>> {
+    if entities.len().saturating_add(triples.len()) > crate::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+        return Err(MemoryError::SourceReadLimit);
+    }
+    reserved_source_bytes(
+        &(entities, triples),
+        crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+    )?;
+    if entities
+        .iter()
+        .map(|value| &value.id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != entities.len()
+        || triples
+            .iter()
+            .map(|value| &value.id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != triples.len()
+        || entities.iter().any(|value| value.id.is_empty())
+        || triples.iter().any(|value| value.id.is_empty())
+    {
+        return Err(MemoryError::StaleSource);
+    }
+    let mut cuts = std::collections::BTreeMap::new();
+    let mut add = |cut: &MemoryEntryRevision| -> Result<()> {
+        if cuts.get(&cut.memory_id).is_some_and(|old| old != cut) {
+            return Err(MemoryError::StaleSource);
+        }
+        cuts.insert(cut.memory_id, cut.clone());
+        Ok(())
+    };
+    for entity in entities {
+        let ids = entity
+            .source_ids
+            .iter()
+            .map(|source| auxiliary_memory_id(source, entity.source_type == "memory"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        let cut_ids = entity
+            .memory_source_revisions
+            .iter()
+            .map(|cut| cut.memory_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if (entity.source_type == "memory" && ids.is_empty())
+            || ids != cut_ids
+            || cut_ids.len() != entity.memory_source_revisions.len()
+        {
+            // Historical missing cuts are unknown. Never adopt a fresh head.
+            return Err(MemoryError::StaleSource);
+        }
+        for cut in &entity.memory_source_revisions {
+            add(cut)?;
+        }
+    }
+    for triple in triples {
+        let id = triple
+            .source
+            .as_deref()
+            .map(|source| auxiliary_memory_id(source, triple.memory_source_revision.is_some()))
+            .transpose()?
+            .flatten();
+        if id
+            != triple
+                .memory_source_revision
+                .as_ref()
+                .map(|cut| cut.memory_id)
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        if let Some(cut) = &triple.memory_source_revision {
+            add(cut)?;
+        }
+    }
+    Ok(cuts)
+}
+
+/// Filter only known obsolete support from one original captured snapshot.
+/// Unknown input remains an error; no new source cut is manufactured here.
+pub fn filter_auxiliary_source_frame(
+    scope_key: &str,
+    entities: &[crate::entity::Entity],
+    triples: &[crate::entity::Triple],
+    frame: &std::collections::BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
+) -> Result<(Vec<crate::entity::Entity>, Vec<crate::entity::Triple>)> {
+    let cuts = auxiliary_source_cuts(entities, triples)?;
+    let mut live = std::collections::BTreeSet::new();
+    for (id, cut) in cuts {
+        let read = frame
+            .get(&id)
+            .and_then(Option::as_ref)
+            .ok_or(MemoryError::StaleSource)?;
+        if read.fence.source_ref != format!("memory:{id}")
+            || read.fence.scope_key != cut.scope_key
+            || cut.scope_key != scope_key
+            || cut.scope_key.starts_with("legacy_agent_")
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        if read.fence.retired || read.origin_retired {
+            continue;
+        }
+        let actual = read.revision.as_ref().ok_or(MemoryError::StaleSource)?;
+        if actual == &cut {
+            live.insert(id);
+        }
+    }
+    let mut kept_entities = Vec::new();
+    for original in entities {
+        let mut entity = original.clone();
+        let mut kept_sources = Vec::new();
+        for source in &entity.source_ids {
+            let id = auxiliary_memory_id(source, entity.source_type == "memory")?;
+            if id.is_none_or(|id| live.contains(&id)) {
+                kept_sources.push(source.clone());
+            }
+        }
+        if !entity.source_ids.is_empty() && kept_sources.is_empty() {
+            continue;
+        }
+        entity.source_ids = kept_sources;
+        entity
+            .memory_source_revisions
+            .retain(|cut| live.contains(&cut.memory_id));
+        kept_entities.push(entity);
+    }
+    let mut kept_triples = Vec::new();
+    for triple in triples {
+        if triple
+            .memory_source_revision
+            .as_ref()
+            .is_none_or(|cut| live.contains(&cut.memory_id))
+        {
+            kept_triples.push(triple.clone());
+        }
+    }
+    Ok((kept_entities, kept_triples))
+}
+
+/// Compile the existing maintenance/recall snapshot before native commit/use.
+/// Native writers still revalidate these exact cuts under their original locks.
+pub fn filter_auxiliary_snapshot(
+    reader: &dyn MemorySourceFenceReader,
+    scope_key: &str,
+    entities: &[crate::entity::Entity],
+    triples: &[crate::entity::Triple],
+) -> Result<(Vec<crate::entity::Entity>, Vec<crate::entity::Triple>)> {
+    let cuts = auxiliary_source_cuts(entities, triples)?;
+    let bytes = reserved_source_bytes(
+        &(entities, triples),
+        crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+    )?;
+    let remaining = crate::knowledge::KNOWLEDGE_READ_MAX_BYTES - bytes;
+    let (frame, spent) =
+        reader.read_source_revisions(&cuts.keys().copied().collect::<Vec<_>>(), remaining)?;
+    if spent > remaining {
+        return Err(MemoryError::SourceReadLimit);
+    }
+    filter_auxiliary_source_frame(scope_key, entities, triples, &frame)
+}
+
+/// Remove only the exact retired Memory support. External UUIDs and other
+/// scopes are not reclassified as Memory by this cleanup operation.
+pub fn retire_auxiliary_support(
+    source: &MemorySourceFence,
+    entities: &[crate::entity::Entity],
+    triples: &[crate::entity::Triple],
+) -> Result<(Vec<crate::entity::Entity>, Vec<crate::entity::Triple>)> {
+    source.verifies_retirement(source)?;
+    let id = auxiliary_memory_id(&source.source_ref, true)?.ok_or(MemoryError::StaleSource)?;
+    let raw = id.to_string();
+    let mut kept = Vec::new();
+    for original in entities {
+        let mut entity = original.clone();
+        let typed = entity.source_type == "memory"
+            || entity
+                .memory_source_revisions
+                .iter()
+                .any(|cut| cut.memory_id == id);
+        entity
+            .source_ids
+            .retain(|value| value != &source.source_ref && (!typed || value != &raw));
+        entity
+            .memory_source_revisions
+            .retain(|cut| cut.memory_id != id);
+        if !original.source_ids.is_empty() && entity.source_ids.is_empty() {
+            continue;
+        }
+        kept.push(entity);
+    }
+    let triples = triples
+        .iter()
+        .filter(|triple| {
+            triple.source.as_deref() != Some(source.source_ref.as_str())
+                && !triple
+                    .memory_source_revision
+                    .as_ref()
+                    .is_some_and(|cut| cut.memory_id == id)
+        })
+        .cloned()
+        .collect();
+    Ok((kept, triples))
+}
+
+/// A snapshot replacement cannot turn an existing Memory-backed identity into
+/// an unrelated external entity by dropping or replacing its original cuts.
+/// Native retirement cleanup is the owner of removing that support.
+pub fn validate_auxiliary_replacement(
+    old_entities: &[crate::entity::Entity],
+    old_triples: &[crate::entity::Triple],
+    entities: &[crate::entity::Entity],
+    triples: &[crate::entity::Triple],
+) -> Result<()> {
+    for next in entities {
+        if let Some(old) = old_entities.iter().find(|old| old.id == next.id) {
+            let old = auxiliary_source_cuts(std::slice::from_ref(old), &[])?;
+            let new = auxiliary_source_cuts(std::slice::from_ref(next), &[])?;
+            if old.iter().any(|(id, cut)| new.get(id) != Some(cut)) {
+                return Err(MemoryError::StaleSource);
+            }
+        }
+    }
+    for next in triples {
+        if let Some(old) = old_triples.iter().find(|old| old.id == next.id) {
+            let old = auxiliary_source_cuts(&[], std::slice::from_ref(old))?;
+            let new = auxiliary_source_cuts(&[], std::slice::from_ref(next))?;
+            if old.iter().any(|(id, cut)| new.get(id) != Some(cut)) {
+                return Err(MemoryError::StaleSource);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn origin_revocation_default() -> bool {
     true
 }
@@ -760,50 +1048,86 @@ impl MemoryLifecycleMutation {
 
 /// Pure check over a native transaction's original bounded frame. Missing,
 /// conflicting, cyclic or retired ancestral cuts cannot authorize a derivative.
+/// Classify one root against the same complete native source frame. Known
+/// superseded/retired support is ineligible; missing, foreign or cyclic input
+/// remains unknown and cannot be filtered into success.
+pub fn source_root_is_current(
+    root: MemoryId,
+    origins: &std::collections::BTreeMap<MemoryId, Option<MemoryExtractionOrigin>>,
+    frame: &std::collections::BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
+) -> Result<bool> {
+    let mut current = true;
+    let mut done = std::collections::BTreeSet::new();
+    let mut active = std::collections::BTreeSet::new();
+    let mut todo = vec![(root, false)];
+    while let Some((id, leaving)) = todo.pop() {
+        if leaving {
+            active.remove(&id);
+            done.insert(id);
+            continue;
+        }
+        if active.contains(&id) {
+            return Err(MemoryError::StaleSource);
+        }
+        if done.contains(&id) {
+            continue;
+        }
+        let read = frame
+            .get(&id)
+            .and_then(Option::as_ref)
+            .ok_or(MemoryError::StaleSource)?;
+        if read.fence.source_ref != format!("memory:{id}") {
+            return Err(MemoryError::StaleSource);
+        }
+        if read.fence.retired || read.origin_retired {
+            current = false;
+            done.insert(id);
+            continue;
+        }
+        let actual = read.revision.as_ref().ok_or(MemoryError::StaleSource)?;
+        if actual.memory_id != id || actual.scope_key != read.fence.scope_key {
+            return Err(MemoryError::StaleSource);
+        }
+        let origin = origins.get(&id).ok_or(MemoryError::StaleSource)?;
+        active.insert(id);
+        todo.push((id, true));
+        if let Some(origin) = origin {
+            if origin.scope_key != actual.scope_key {
+                return Err(MemoryError::StaleSource);
+            }
+            for expected in origin.source_readset() {
+                let ancestor = frame
+                    .get(&expected.memory_id)
+                    .and_then(Option::as_ref)
+                    .ok_or(MemoryError::StaleSource)?;
+                if ancestor.fence.source_ref != format!("memory:{}", expected.memory_id)
+                    || ancestor.fence.scope_key != expected.scope_key
+                {
+                    return Err(MemoryError::StaleSource);
+                }
+                if ancestor.fence.retired || ancestor.origin_retired {
+                    current = false;
+                    continue;
+                }
+                let actual = ancestor.revision.as_ref().ok_or(MemoryError::StaleSource)?;
+                if actual != expected {
+                    current = false;
+                    continue;
+                }
+                todo.push((expected.memory_id, false));
+            }
+        }
+    }
+    Ok(current)
+}
+
 pub fn source_frame_matches_original_lineage(
     origins: &std::collections::BTreeMap<MemoryId, Option<MemoryExtractionOrigin>>,
     frame: &std::collections::BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>,
 ) -> bool {
-    let mut done = std::collections::BTreeSet::new();
-    let mut active = std::collections::BTreeSet::new();
-    for root in origins.keys() {
-        let mut todo = vec![(*root, false)];
-        while let Some((id, leaving)) = todo.pop() {
-            if leaving {
-                active.remove(&id);
-                done.insert(id);
-                continue;
-            }
-            if active.contains(&id) {
-                return false;
-            }
-            if done.contains(&id) {
-                continue;
-            }
-            let Some(origin) = origins.get(&id) else {
-                return false;
-            };
-            active.insert(id);
-            todo.push((id, true));
-            if let Some(origin) = origin {
-                for expected in origin.source_readset() {
-                    if !frame
-                        .get(&expected.memory_id)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|read| {
-                            !read.fence.retired
-                                && !read.origin_retired
-                                && read.revision.as_ref() == Some(expected)
-                        })
-                    {
-                        return false;
-                    }
-                    todo.push((expected.memory_id, false));
-                }
-            }
-        }
-    }
-    true
+    origins
+        .keys()
+        .all(|root| source_root_is_current(*root, origins, frame).unwrap_or(false))
 }
 
 #[cfg(test)]

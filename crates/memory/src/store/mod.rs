@@ -23,7 +23,9 @@ pub mod blob;
 mod mutation;
 pub(crate) use mutation::reserved_source_bytes;
 pub use mutation::{
-    lifecycle_retired, live_source_revision, source_frame_matches_original_lineage,
+    auxiliary_source_cuts, filter_auxiliary_snapshot, filter_auxiliary_source_frame,
+    lifecycle_retired, live_source_revision, retire_auxiliary_support,
+    source_frame_matches_original_lineage, source_root_is_current, validate_auxiliary_replacement,
     MemoryCleanupPending, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation,
     MemoryLifecycleReceipt, MemoryRetirementVerificationError, MemorySourceAccess,
     MemorySourceFence, MemorySourceFenceReader, MemorySourceRevisionRead, VerifiedMemoryRetirement,
@@ -352,17 +354,18 @@ pub trait MemoryStore: MemorySourceFenceReader + Send + Sync {
     async fn save_triples(&self, scope_key: &str, triples: &[Triple]) -> Result<()>;
 
     /// Persist the whole knowledge graph of one scope (entities + triples) as
-    /// one logical snapshot. The default performs two independent writes; a
-    /// backend that shares a database should override this so the pair is atomic
-    /// and serialized (see `PostgresMemoryStore::save_knowledge_graph`).
+    /// one atomic snapshot, validating the original captured source cuts.
+    /// A backend without that transaction must refuse rather than publish half.
     async fn save_knowledge_graph(
         &self,
         scope_key: &str,
         entities: &[Entity],
         triples: &[Triple],
     ) -> Result<()> {
-        self.save_entities(scope_key, entities).await?;
-        self.save_triples(scope_key, triples).await
+        let _ = (scope_key, entities, triples);
+        Err(MemoryError::Store(
+            "atomic auxiliary snapshot is unsupported".into(),
+        ))
     }
 
     /// Load all triples of one scope.

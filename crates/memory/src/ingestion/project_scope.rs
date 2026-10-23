@@ -1454,6 +1454,7 @@ fn add_entity(
         last_seen: *now,
         source_ids: vec![source_file.to_string()],
         source_type: source_type.to_string(),
+        memory_source_revisions: Vec::new(),
     };
     kg.add_entity(entity);
 }

@@ -35,7 +35,30 @@ impl CognitiveContextManager {
         let budget = self.compute_budget(&turn.agent_id);
         let cache_revision = self.memory_revision.load(Ordering::Relaxed);
         let cache_key = self.prepare_context_cache_key(query, messages, turn, &budget);
-        if entries.is_empty() {
+        let candidates = {
+            let kg = self.kg.lock();
+            let mut ids = HashSet::new();
+            query
+                .split_whitespace()
+                .filter_map(|token| {
+                    kg.get_entity_by_name(&token.to_lowercase())
+                        .filter(|entity| ids.insert(entity.id.clone()))
+                        .cloned()
+                })
+                .take(crate::knowledge::KNOWLEDGE_READ_MAX_ROWS + 1)
+                .collect::<Vec<_>>()
+        };
+        let store = self.orchestrator.store();
+        let original_kg_cuts = crate::store::auxiliary_source_cuts(&candidates, &[])?;
+        let (kg_candidates, _) = crate::store::filter_auxiliary_snapshot(
+            store.as_ref(),
+            crate::store::KG_DEFAULT_SCOPE,
+            &candidates,
+            &[],
+        )?;
+        let kg_support_current =
+            crate::store::auxiliary_source_cuts(&kg_candidates, &[])? == original_kg_cuts;
+        if entries.is_empty() && kg_support_current {
             if let Some(context) = self.cached_prepared_context(cache_key, cache_revision) {
                 let elapsed = _prepare_start.elapsed();
                 self.perf_monitor.record_cache_hit();
@@ -278,16 +301,24 @@ impl CognitiveContextManager {
 
         // ── Step 2b: P1 project knowledge graph query ───────────────────────
         {
-            let kg = self.kg.lock();
-            let query_tokens: Vec<String> =
-                query.split_whitespace().map(str::to_lowercase).collect();
-            let mut seen: HashSet<String> = HashSet::new();
-            for token in &query_tokens {
-                if seen.contains(token) {
-                    continue;
-                }
-                if let Some(entity) = kg.get_entity_by_name(token) {
-                    seen.insert(token.clone());
+            for entity in &kg_candidates {
+                if !entity.memory_source_revisions.is_empty() {
+                    // A Memory-backed graph hit selects original evidence; it
+                    // cannot fabricate a fresh Memory ID or replace captured
+                    // provenance with the body's latest revision.
+                    for cut in &entity.memory_source_revisions {
+                        let original = store
+                            .get(&cut.memory_id)
+                            .await?
+                            .ok_or(MemoryError::StaleSource)?;
+                        if crate::store::MemoryEntryRevision::of(&original)? != *cut {
+                            return Err(MemoryError::StaleSource);
+                        }
+                        if crate::kernel::memory_entry_visible_to_ctx(&original, turn) {
+                            entries.push(original);
+                        }
+                    }
+                } else {
                     use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
                     entries.push(MemoryEntry {
                         id: uuid::Uuid::new_v4(),

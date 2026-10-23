@@ -599,6 +599,7 @@ fn scenario_entity(scope: &str, index: usize) -> memory::entity::Entity {
         last_seen: now,
         source_ids: Vec::new(),
         source_type: "kg-concurrency-test".to_string(),
+        memory_source_revisions: Vec::new(),
     }
 }
 
@@ -614,6 +615,7 @@ fn scenario_triple(scope: &str, index: usize) -> memory::entity::Triple {
         confidence: 0.5,
         created_at: chrono::Utc::now(),
         source_agent: None,
+        memory_source_revision: None,
     }
 }
 
@@ -1409,6 +1411,11 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     independent.visibility = AgentVisibility::Shared;
     store.insert(&entry).await.unwrap();
     store.insert(&independent).await.unwrap();
+    let mut foreign_source = memory_entry(uuid::Uuid::new_v4(), "foreign original source");
+    foreign_source.scope = MemoryScope::Project("foreign-project".into());
+    foreign_source.visibility = AgentVisibility::Shared;
+    store.insert(&foreign_source).await.unwrap();
+    let foreign_scope = foreign_source.scope.scope_key();
     let mut document = DocumentContent::new("retiring pack", "Keep original evidence.");
     document.source = Some(format!("memory:{}", entry.id));
     document.memory_source_revision = Some(memory::store::MemoryEntryRevision::of(&entry).unwrap());
@@ -1440,8 +1447,23 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         frequency: 1,
         first_seen: chrono::Utc::now(),
         last_seen: chrono::Utc::now(),
-        source_ids: sources,
-        source_type: "memory".into(),
+        source_ids: sources.clone(),
+        source_type: if sources.is_empty() {
+            "independent"
+        } else {
+            "memory"
+        }
+        .into(),
+        memory_source_revisions: sources
+            .iter()
+            .map(|id| {
+                let source = [&entry, &independent, &foreign_source]
+                    .into_iter()
+                    .find(|source| source.id.to_string() == *id)
+                    .unwrap();
+                memory::store::MemoryEntryRevision::of(source).unwrap()
+            })
+            .collect(),
     };
     let only = entity("only-source", vec![entry.id.to_string()]);
     let multi = entity(
@@ -1454,8 +1476,16 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .save_entities(&scope, &[only.clone(), multi.clone(), empty.clone()])
         .await
         .unwrap();
+    assert!(store
+        .save_entities(&foreign_scope, &[only.clone()])
+        .await
+        .is_err());
+    let mut foreign_entity = only.clone();
+    foreign_entity.source_ids = vec![foreign_source.id.to_string()];
+    foreign_entity.memory_source_revisions =
+        vec![memory::store::MemoryEntryRevision::of(&foreign_source).unwrap()];
     store
-        .save_entities("foreign-scope", &[only.clone()])
+        .save_entities(&foreign_scope, &[foreign_entity])
         .await
         .unwrap();
     let triple = memory::entity::Triple {
@@ -1469,16 +1499,27 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         confidence: 1.0,
         created_at: chrono::Utc::now(),
         source_agent: None,
+        memory_source_revision: Some(memory::store::MemoryEntryRevision::of(&entry).unwrap()),
     };
     let mut independent_triple = triple.clone();
     independent_triple.id = "independent-triple".into();
     independent_triple.source = Some(format!("memory:{}", independent.id));
+    independent_triple.memory_source_revision =
+        Some(memory::store::MemoryEntryRevision::of(&independent).unwrap());
     store
         .save_triples(&scope, &[triple.clone(), independent_triple.clone()])
         .await
         .unwrap();
+    assert!(store
+        .save_triples(&foreign_scope, &[triple.clone()])
+        .await
+        .is_err());
+    let mut foreign_triple = triple.clone();
+    foreign_triple.source = Some(format!("memory:{}", foreign_source.id));
+    foreign_triple.memory_source_revision =
+        Some(memory::store::MemoryEntryRevision::of(&foreign_source).unwrap());
     store
-        .save_triples("foreign-scope", &[triple.clone()])
+        .save_triples(&foreign_scope, &[foreign_triple])
         .await
         .unwrap();
     // A persisted fence payload cannot borrow another source identity, even
@@ -1724,7 +1765,7 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     assert_eq!(triples.len(), 1);
     assert_eq!(triples[0].id, "independent-triple");
     assert_eq!(
-        reopened_store.load_triples("foreign-scope").await.unwrap()[0].id,
+        reopened_store.load_triples(&foreign_scope).await.unwrap()[0].id,
         "same-scoped-triple"
     );
     let entities = reopened_store.load_entities(&scope).await.unwrap();
@@ -1741,8 +1782,8 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         vec![independent.id.to_string()]
     );
     assert_eq!(
-        reopened_store.load_entities("foreign-scope").await.unwrap()[0].source_ids,
-        vec![entry.id.to_string()]
+        reopened_store.load_entities(&foreign_scope).await.unwrap()[0].source_ids,
+        vec![foreign_source.id.to_string()]
     );
     assert!(reopened_store.get(&entry.id).await.unwrap().is_some());
     assert!(reopened_store
@@ -2696,4 +2737,212 @@ async fn real_postgres_erasure_skipped_delete_cannot_publish_a_receipt() {
             .unwrap()
             .is_none());
     }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_auxiliary_original_cuts_and_cleanup_refusal_survive_reopen() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let store = PostgresMemoryStore::new(executor.clone()).unwrap();
+    let mut a = memory_entry(uuid::Uuid::new_v4(), "aux upstream original");
+    let d = memory_entry(uuid::Uuid::new_v4(), "aux independent support");
+    store.insert(&a).await.unwrap();
+    store.insert(&d).await.unwrap();
+    let a_cut = MemoryEntryRevision::of(&a).unwrap();
+    let d_cut = MemoryEntryRevision::of(&d).unwrap();
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000057";
+    let turn = memory::MemoryTurnContext::new("aux-session", "aux-agent")
+        .with_source_readset(Some(vec![a_cut.clone()]));
+    let mut b = memory_entry(uuid::Uuid::new_v4(), "aux derived original");
+    b.source = MemorySource::AutoExtracted;
+    b.session_id = Some(turn.session_id.clone());
+    b.source_agent = Some(turn.agent_id.clone());
+    b.tags = vec![batch.into()];
+    store
+        .write_extraction(
+            &b,
+            &MemoryExtractionOrigin::for_entry(&turn, &b, batch).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut backed = scenario_entity("auxiliary-cut", 1);
+    backed.source_type = "memory".into();
+    backed.source_ids = vec![b.id.to_string(), d.id.to_string()];
+    backed.memory_source_revisions = vec![MemoryEntryRevision::of(&b).unwrap(), d_cut.clone()];
+    let mut external = scenario_entity("external-uuid", 1);
+    external.source_type = "file".into();
+    external.source_ids = vec![a.id.to_string()];
+    let mut triple = scenario_triple("auxiliary-cut", 1);
+    triple.source = Some(format!("memory:{}", b.id));
+    triple.memory_source_revision = Some(MemoryEntryRevision::of(&b).unwrap());
+    let scope = a.scope.scope_key();
+    store
+        .save_knowledge_graph(
+            &scope,
+            &[backed.clone(), external.clone()],
+            &[triple.clone()],
+        )
+        .await
+        .unwrap();
+    a.content = "corrected after original snapshot capture".into();
+    store.update(&a, &a_cut).await.unwrap();
+    let visible = store.load_entities(&scope).await.unwrap();
+    let multi = visible
+        .iter()
+        .find(|entity| entity.id == backed.id)
+        .unwrap();
+    assert_eq!(multi.source_ids, vec![d.id.to_string()]);
+    assert_eq!(multi.memory_source_revisions, vec![d_cut]);
+    assert!(store.load_triples(&scope).await.unwrap().is_empty());
+    assert!(store
+        .save_knowledge_graph(&scope, &[backed], &[triple])
+        .await
+        .is_err());
+    let mut fresh = scenario_entity("fresh-original-cut", 1);
+    fresh.source_type = "memory".into();
+    fresh.source_ids = vec![a.id.to_string()];
+    fresh.memory_source_revisions = vec![MemoryEntryRevision::of(&a).unwrap()];
+    let mut fresh_triple = scenario_triple("fresh-original-cut", 1);
+    fresh_triple.source = Some(format!("memory:{}", a.id));
+    fresh_triple.memory_source_revision = Some(MemoryEntryRevision::of(&a).unwrap());
+    store
+        .save_knowledge_graph(
+            &scope,
+            &[fresh.clone(), external.clone()],
+            &[fresh_triple.clone()],
+        )
+        .await
+        .unwrap();
+    let mut washed = fresh.clone();
+    washed.source_type = "file".into();
+    washed.source_ids.clear();
+    washed.memory_source_revisions.clear();
+    assert!(store.save_entities(&scope, &[washed]).await.is_err());
+    let receipt = store
+        .commit_lifecycle(erase_command(&a, None))
+        .await
+        .unwrap();
+    let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].mutation_id, receipt.mutation_id);
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("CREATE FUNCTION skip_auxiliary_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER skip_auxiliary_cleanup BEFORE DELETE ON memory_entities FOR EACH ROW EXECUTE FUNCTION skip_auxiliary_cleanup()").unwrap();
+    assert!(store
+        .confirm_memory_cleanup(&pending[0], None, true)
+        .await
+        .is_err());
+    assert!(!store.pending_memory_cleanup(None, 16).await.unwrap()[0].auxiliary_confirmed);
+    for (table, id) in [
+        ("memory_entities", &fresh.id),
+        ("memory_triples", &fresh_triple.id),
+    ] {
+        let count: i64 = connection
+            .query_one(
+                &format!("SELECT count(*) FROM {table} WHERE scope_key=$1 AND id=$2"),
+                &[&scope, id],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            count, 1,
+            "a skipped deletion cannot publish partial cleanup"
+        );
+    }
+    let visible = store.load_entities(&scope).await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(
+        visible[0].id, external.id,
+        "read fence precedes physical cleanup"
+    );
+    connection
+        .batch_execute("DROP TRIGGER skip_auxiliary_cleanup ON memory_entities")
+        .unwrap();
+    drop(store);
+    let reopened = Arc::new(PostgresMemoryStore::new(fixture.reconnect()).unwrap());
+    let knowledge = KnowledgeFabric::with_store(Arc::new(
+        PostgresKnowledgeStore::new(executor.clone()).unwrap(),
+    ))
+    .with_memory_sources(reopened.clone());
+    let quarantine = knowledge
+        .quarantine_memory_source(&pending[0].source)
+        .unwrap();
+    reopened
+        .confirm_memory_cleanup(&pending[0], Some(&quarantine), true)
+        .await
+        .unwrap();
+    assert!(reopened
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(reopened.load_triples(&scope).await.unwrap().is_empty());
+    let visible = reopened.load_entities(&scope).await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(
+        visible[0].source_ids,
+        vec![a.id.to_string()],
+        "an external UUID must not be erased as a Memory reference"
+    );
+    fresh.id = "late-new-auxiliary-id".into();
+    assert!(reopened.save_entities(&scope, &[fresh]).await.is_err());
+    assert_eq!(
+        reopened.load_entities(&scope).await.unwrap()[0].id,
+        external.id
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_auxiliary_production_filter_shares_one_bounded_source_frame() {
+    let fixture = PostgresTestScope::new();
+    let store = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
+    let mut a = memory_entry(uuid::Uuid::new_v4(), "shared 5MiB source");
+    a.content = "z".repeat(5 * 1024 * 1024);
+    store.insert(&a).await.unwrap();
+    let turn = memory::MemoryTurnContext::new("frame-session", "frame-agent")
+        .with_source_readset(Some(vec![MemoryEntryRevision::of(&a).unwrap()]));
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000058";
+    let mut leaves = Vec::new();
+    for marker in ["first small leaf", "second small leaf"] {
+        let mut b = memory_entry(uuid::Uuid::new_v4(), marker);
+        b.source = MemorySource::AutoExtracted;
+        b.session_id = Some(turn.session_id.clone());
+        b.source_agent = Some(turn.agent_id.clone());
+        b.tags = vec![batch.into()];
+        store
+            .write_extraction(
+                &b,
+                &MemoryExtractionOrigin::for_entry(&turn, &b, batch).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        leaves.push(b);
+    }
+    let mut entity = scenario_entity("shared-frame", 1);
+    entity.source_type = "memory".into();
+    entity.source_ids = leaves.iter().map(|entry| entry.id.to_string()).collect();
+    entity.memory_source_revisions = leaves
+        .iter()
+        .map(|entry| MemoryEntryRevision::of(entry).unwrap())
+        .collect();
+    let scope = a.scope.scope_key();
+    let (kept, _) =
+        memory::store::filter_auxiliary_snapshot(&store, &scope, &[entity], &[]).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].source_ids.len(), 2);
+    let (frame, spent) = store
+        .read_source_revisions(
+            &leaves.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+    assert_eq!(frame.len(), 2);
+    assert!(spent > a.content.len() && spent < 6 * 1024 * 1024);
+    store
+        .save_knowledge_graph(&scope, &kept, &[])
+        .await
+        .unwrap();
 }

@@ -339,6 +339,24 @@ fn read_memory_source_frame(
         frame.insert(*id, read);
     }
     let valid = super::mutation::source_frame_matches_original_lineage(&origins, &frame);
+    let classifications = roots
+        .iter()
+        .filter(|id| frame.get(id).and_then(Option::as_ref).is_some())
+        .map(|id| {
+            super::source_root_is_current(*id, &origins, &frame).map(|current| (*id, current))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (id, current) in classifications {
+        if !current {
+            let read = frame
+                .get_mut(&id)
+                .and_then(Option::as_mut)
+                .ok_or(MemoryError::StaleSource)?;
+            read.origin_retired = true;
+            read.revision = None;
+            read.access = None;
+        }
+    }
     Ok((frame, valid, budget_bytes - remaining))
 }
 
@@ -392,6 +410,25 @@ fn validate_extraction_origin(
         }
     }
     Ok(())
+}
+
+fn auxiliary_at_state(
+    state: &State,
+    scope_key: &str,
+    entities: &[Entity],
+    triples: &[Triple],
+) -> Result<(Vec<Entity>, Vec<Triple>)> {
+    let cuts = super::auxiliary_source_cuts(entities, triples)?;
+    let bytes = super::reserved_source_bytes(
+        &(entities, triples),
+        crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+    )?;
+    let (frame, _valid, _) = read_memory_source_frame(
+        state,
+        &cuts.keys().copied().collect::<Vec<_>>(),
+        crate::knowledge::KNOWLEDGE_READ_MAX_BYTES - bytes,
+    )?;
+    super::filter_auxiliary_source_frame(scope_key, entities, triples, &frame)
 }
 
 #[async_trait]
@@ -584,39 +621,67 @@ impl MemoryStore for EphemeralMemoryStore {
         auxiliary: bool,
     ) -> Result<()> {
         let mut state = self.write()?;
-        let pending = state
+        let mut pending = state
             .cleanup_pending
-            .get_mut(&expected.mutation_id)
-            .ok_or_else(|| MemoryError::NotFound(expected.mutation_id.clone()))?;
+            .get(&expected.mutation_id)
+            .ok_or_else(|| MemoryError::NotFound(expected.mutation_id.clone()))?
+            .clone();
+        pending.validate()?;
         if pending.source != expected.source || pending.memory_id != expected.memory_id {
-            return Err(MemoryError::Store(
-                "foreign Memory cleanup confirmation".into(),
-            ));
+            return Err(MemoryError::StaleSource);
         }
+        state
+            .source_fences
+            .get(&expected.source.source_ref)
+            .ok_or(MemoryError::StaleSource)?
+            .verifies_retirement(&expected.source)?;
         pending.confirm_knowledge(knowledge)?;
         pending.auxiliary_confirmed |= auxiliary;
         if auxiliary {
-            let id = expected.memory_id.to_string();
-            let reference = expected.source.source_ref.as_str();
+            let entities = state
+                .entities
+                .iter()
+                .filter(|((scope, _), _)| scope == &expected.source.scope_key)
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>();
+            let triples = state
+                .triples
+                .iter()
+                .filter(|((scope, _), _)| scope == &expected.source.scope_key)
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>();
+            super::reserved_source_bytes(
+                &(&entities, &triples),
+                crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+            )?;
+            let (kept_entities, kept_triples) = super::retire_auxiliary_support(
+                &expected.source,
+                &entities.into_iter().cloned().collect::<Vec<_>>(),
+                &triples.into_iter().cloned().collect::<Vec<_>>(),
+            )?;
             state
                 .symbol_memory
-                .retain(|r| r.memory_id != expected.memory_id);
-            state.entities.retain(|(scope, _), entity| {
-                if scope != &expected.source.scope_key {
-                    return true;
-                }
-                let matched = entity.source_ids.iter().any(|s| s == &id || s == reference);
-                entity.source_ids.retain(|s| s != &id && s != reference);
-                !matched || !entity.source_ids.is_empty()
-            });
-            state.triples.retain(|(scope, _), triple| {
-                scope != &expected.source.scope_key
-                    || !triple
-                        .source
-                        .as_deref()
-                        .is_some_and(|s| s == id || s == reference)
-            });
+                .retain(|row| row.memory_id != expected.memory_id);
+            state
+                .entities
+                .retain(|(scope, _), _| scope != &expected.source.scope_key);
+            state
+                .triples
+                .retain(|(scope, _), _| scope != &expected.source.scope_key);
+            for value in kept_entities {
+                state
+                    .entities
+                    .insert((expected.source.scope_key.clone(), value.id.clone()), value);
+            }
+            for value in kept_triples {
+                state
+                    .triples
+                    .insert((expected.source.scope_key.clone(), value.id.clone()), value);
+            }
         }
+        state
+            .cleanup_pending
+            .insert(pending.mutation_id.clone(), pending);
         Ok(())
     }
 
@@ -975,42 +1040,147 @@ impl MemoryStore for EphemeralMemoryStore {
     }
 
     async fn save_entities(&self, scope_key: &str, values: &[Entity]) -> Result<()> {
-        let mut s = self.write()?;
-        // Scope-keyed REPLACE, matching the Postgres store: saving the graph for a
-        // scope replaces that scope's set rather than merging into every scope.
-        s.entities.retain(|(scope, _), _| scope != scope_key);
-        for v in values {
-            s.entities
-                .insert((scope_key.to_string(), v.id.clone()), v.clone());
+        let mut state = self.write()?;
+        let (entities, triples) = auxiliary_at_state(&state, scope_key, values, &[])?;
+        if super::auxiliary_source_cuts(&entities, &triples)?
+            != super::auxiliary_source_cuts(values, &[])?
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        let old = state
+            .entities
+            .iter()
+            .filter(|((scope, _), _)| scope == scope_key)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        super::reserved_source_bytes(&old, crate::knowledge::KNOWLEDGE_READ_MAX_BYTES)?;
+        super::validate_auxiliary_replacement(
+            &old.into_iter().cloned().collect::<Vec<_>>(),
+            &[],
+            values,
+            &[],
+        )?;
+        state.entities.retain(|(scope, _), _| scope != scope_key);
+        for value in values {
+            state
+                .entities
+                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
         }
         Ok(())
     }
     async fn load_entities(&self, scope_key: &str) -> Result<Vec<Entity>> {
-        Ok(self
-            .read()?
+        let state = self.read()?;
+        let refs = state
             .entities
             .iter()
             .filter(|((scope, _), _)| scope == scope_key)
-            .map(|(_, entity)| entity.clone())
-            .collect())
+            .map(|(_, value)| value)
+            .take(crate::knowledge::KNOWLEDGE_READ_MAX_ROWS + 1)
+            .collect::<Vec<_>>();
+        if refs.len() > crate::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        super::reserved_source_bytes(&refs, crate::knowledge::KNOWLEDGE_READ_MAX_BYTES)?;
+        let values = refs.into_iter().cloned().collect::<Vec<_>>();
+        auxiliary_at_state(&state, scope_key, &values, &[]).map(|(entities, _)| entities)
     }
     async fn save_triples(&self, scope_key: &str, values: &[Triple]) -> Result<()> {
-        let mut s = self.write()?;
-        s.triples.retain(|(scope, _), _| scope != scope_key);
-        for v in values {
-            s.triples
-                .insert((scope_key.to_string(), v.id.clone()), v.clone());
+        let mut state = self.write()?;
+        let (entities, triples) = auxiliary_at_state(&state, scope_key, &[], values)?;
+        if super::auxiliary_source_cuts(&entities, &triples)?
+            != super::auxiliary_source_cuts(&[], values)?
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        let old = state
+            .triples
+            .iter()
+            .filter(|((scope, _), _)| scope == scope_key)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        super::reserved_source_bytes(&old, crate::knowledge::KNOWLEDGE_READ_MAX_BYTES)?;
+        super::validate_auxiliary_replacement(
+            &[],
+            &old.into_iter().cloned().collect::<Vec<_>>(),
+            &[],
+            values,
+        )?;
+        state.triples.retain(|(scope, _), _| scope != scope_key);
+        for value in values {
+            state
+                .triples
+                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
+        }
+        Ok(())
+    }
+    async fn save_knowledge_graph(
+        &self,
+        scope_key: &str,
+        entities: &[Entity],
+        triples: &[Triple],
+    ) -> Result<()> {
+        if entities.is_empty() && triples.is_empty() {
+            return Err(MemoryError::StaleSource);
+        }
+        let mut state = self.write()?;
+        let (kept_entities, kept_triples) =
+            auxiliary_at_state(&state, scope_key, entities, triples)?;
+        if super::auxiliary_source_cuts(&kept_entities, &kept_triples)?
+            != super::auxiliary_source_cuts(entities, triples)?
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        let old_entities = state
+            .entities
+            .iter()
+            .filter(|((scope, _), _)| scope == scope_key)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        let old_triples = state
+            .triples
+            .iter()
+            .filter(|((scope, _), _)| scope == scope_key)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        super::reserved_source_bytes(
+            &(&old_entities, &old_triples),
+            crate::knowledge::KNOWLEDGE_READ_MAX_BYTES,
+        )?;
+        super::validate_auxiliary_replacement(
+            &old_entities.into_iter().cloned().collect::<Vec<_>>(),
+            &old_triples.into_iter().cloned().collect::<Vec<_>>(),
+            entities,
+            triples,
+        )?;
+        state.entities.retain(|(scope, _), _| scope != scope_key);
+        state.triples.retain(|(scope, _), _| scope != scope_key);
+        for value in entities {
+            state
+                .entities
+                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
+        }
+        for value in triples {
+            state
+                .triples
+                .insert((scope_key.to_owned(), value.id.clone()), value.clone());
         }
         Ok(())
     }
     async fn load_triples(&self, scope_key: &str) -> Result<Vec<Triple>> {
-        Ok(self
-            .read()?
+        let state = self.read()?;
+        let refs = state
             .triples
             .iter()
             .filter(|((scope, _), _)| scope == scope_key)
-            .map(|(_, triple)| triple.clone())
-            .collect())
+            .map(|(_, value)| value)
+            .take(crate::knowledge::KNOWLEDGE_READ_MAX_ROWS + 1)
+            .collect::<Vec<_>>();
+        if refs.len() > crate::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        super::reserved_source_bytes(&refs, crate::knowledge::KNOWLEDGE_READ_MAX_BYTES)?;
+        let values = refs.into_iter().cloned().collect::<Vec<_>>();
+        auxiliary_at_state(&state, scope_key, &[], &values).map(|(_, triples)| triples)
     }
     async fn load_verbatim_by_id(&self, id: &str) -> Result<Option<VerbatimEntry>> {
         Ok(self.read()?.verbatim.get(id).cloned())
@@ -1188,6 +1358,7 @@ mod scope_tests {
             last_seen: now,
             source_ids: Vec::new(),
             source_type: "test".to_string(),
+            memory_source_revisions: Vec::new(),
         }
     }
 
@@ -1285,6 +1456,24 @@ impl EphemeralMemoryStore {
 }
 
 impl MemorySourceFenceReader for EphemeralMemoryStore {
+    fn read_source_revisions(
+        &self,
+        roots: &[MemoryId],
+        budget_bytes: usize,
+    ) -> Result<(BTreeMap<MemoryId, Option<MemorySourceRevisionRead>>, usize)> {
+        if roots.len() > crate::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        let state = self.read()?;
+        let (mut frame, _valid, spent) = read_memory_source_frame(&state, roots, budget_bytes)?;
+        let requested = roots
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        frame.retain(|id, _| requested.contains(id));
+        Ok((frame, spent))
+    }
+
     fn read_source_revision(
         &self,
         source_ref: &str,

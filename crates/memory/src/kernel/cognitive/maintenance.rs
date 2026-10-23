@@ -232,6 +232,19 @@ impl CognitiveContextManager {
                 let triples: Vec<_> = kg.list_triples().into_iter().cloned().collect();
                 (entities, triples)
             };
+            let filtered = crate::store::filter_auxiliary_snapshot(
+                self.orchestrator.store().as_ref(),
+                crate::store::KG_DEFAULT_SCOPE,
+                &entities,
+                &triples,
+            );
+            let (entities, triples) = match filtered {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(%error, "knowledge graph source snapshot is unknown; not persisted");
+                    return Err(error);
+                }
+            };
             if !entities.is_empty() || !triples.is_empty() {
                 // Persist entities + triples as one atomic, serialized snapshot
                 // so concurrent turn-end writers cannot interleave and wipe one

@@ -1670,6 +1670,15 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     other.visibility = AgentVisibility::Shared;
     store.insert(&retired).await.unwrap();
     store.insert(&other).await.unwrap();
+    let mut foreign_source = entry(
+        MemoryLayer::L3,
+        MemorySource::Import,
+        "foreign original source",
+    );
+    foreign_source.scope = MemoryScope::Project("foreign-project".into());
+    foreign_source.visibility = AgentVisibility::Shared;
+    store.insert(&foreign_source).await.unwrap();
+    let foreign_scope = foreign_source.scope.scope_key();
     let ingest = |source: &memory::MemoryEntry, title: &str| {
         let mut document = memory::DocumentContent::new(title, "Retain the original evidence.");
         document.source = Some(format!("memory:{}", source.id));
@@ -1700,8 +1709,23 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
         frequency: 1,
         first_seen: Utc::now(),
         last_seen: Utc::now(),
-        source_ids: sources,
-        source_type: "memory".into(),
+        source_ids: sources.clone(),
+        source_type: if sources.is_empty() {
+            "independent"
+        } else {
+            "memory"
+        }
+        .into(),
+        memory_source_revisions: sources
+            .iter()
+            .map(|id| {
+                let source = [&retired, &other, &foreign_source]
+                    .into_iter()
+                    .find(|source| source.id.to_string() == *id)
+                    .unwrap();
+                memory::store::MemoryEntryRevision::of(source).unwrap()
+            })
+            .collect(),
     };
     let only = entity("same-scoped-entity", vec![retired.id.to_string()]);
     let multi = entity(
@@ -1714,7 +1738,18 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
         .save_entities(&scope, &[only.clone(), multi, empty])
         .await
         .unwrap();
-    store.save_entities("foreign-scope", &[only]).await.unwrap();
+    assert!(store
+        .save_entities(&foreign_scope, &[only.clone()])
+        .await
+        .is_err());
+    let mut foreign_entity = only.clone();
+    foreign_entity.source_ids = vec![foreign_source.id.to_string()];
+    foreign_entity.memory_source_revisions =
+        vec![memory::store::MemoryEntryRevision::of(&foreign_source).unwrap()];
+    store
+        .save_entities(&foreign_scope, &[foreign_entity])
+        .await
+        .unwrap();
     let triple = memory::entity::Triple {
         id: "same-scoped-triple".into(),
         subject_id: "same-scoped-entity".into(),
@@ -1726,10 +1761,19 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
         confidence: 1.0,
         created_at: Utc::now(),
         source_agent: None,
+        memory_source_revision: Some(memory::store::MemoryEntryRevision::of(&retired).unwrap()),
     };
     store.save_triples(&scope, &[triple.clone()]).await.unwrap();
+    assert!(store
+        .save_triples(&foreign_scope, &[triple.clone()])
+        .await
+        .is_err());
+    let mut foreign_triple = triple.clone();
+    foreign_triple.source = Some(format!("memory:{}", foreign_source.id));
+    foreign_triple.memory_source_revision =
+        Some(memory::store::MemoryEntryRevision::of(&foreign_source).unwrap());
     store
-        .save_triples("foreign-scope", &[triple])
+        .save_triples(&foreign_scope, &[foreign_triple])
         .await
         .unwrap();
     let manager = Arc::new(
@@ -1903,12 +1947,12 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     );
     assert!(entities.iter().any(|e| e.id == "independent-empty-entity"));
     assert_eq!(
-        store.load_entities("foreign-scope").await.unwrap()[0].id,
+        store.load_entities(&foreign_scope).await.unwrap()[0].id,
         "same-scoped-entity"
     );
     assert!(store.load_triples(&scope).await.unwrap().is_empty());
     assert_eq!(
-        store.load_triples("foreign-scope").await.unwrap()[0].id,
+        store.load_triples(&foreign_scope).await.unwrap()[0].id,
         "same-scoped-triple"
     );
     assert!(
@@ -3391,4 +3435,269 @@ async fn erasure_preserves_original_layer_scope_and_operation_kind_guards() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn auxiliary_original_cuts_keep_independent_support_and_fence_late_snapshots() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryEntryRevision, MemoryExtractionOrigin, MemoryLifecycleMutation,
+        MemoryStore,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let mut a = entry(MemoryLayer::L3, MemorySource::Import, "upstream original");
+    a.scope = MemoryScope::Global;
+    a.visibility = AgentVisibility::Shared;
+    let mut d = entry(MemoryLayer::L3, MemorySource::Import, "independent support");
+    d.scope = MemoryScope::Global;
+    d.visibility = AgentVisibility::Shared;
+    store.insert(&a).await.unwrap();
+    store.insert(&d).await.unwrap();
+    let a_cut = MemoryEntryRevision::of(&a).unwrap();
+    let d_cut = MemoryEntryRevision::of(&d).unwrap();
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000057";
+    let turn = MemoryTurnContext::new("original-session", "original-agent")
+        .with_source_readset(Some(vec![a_cut.clone()]));
+    let mut b = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "derived original",
+    );
+    b.scope = MemoryScope::Global;
+    b.visibility = AgentVisibility::Shared;
+    b.session_id = Some(turn.session_id.clone());
+    b.source_agent = Some(turn.agent_id.clone());
+    b.tags = vec![batch.into()];
+    store
+        .write_extraction(
+            &b,
+            &MemoryExtractionOrigin::for_entry(&turn, &b, batch).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    let backed = memory::entity::Entity {
+        id: "original-backed-entity".into(),
+        name: "signal".into(),
+        entity_type: memory::entity::EntityType::Concept,
+        confidence: 1.0,
+        frequency: 1,
+        first_seen: Utc::now(),
+        last_seen: Utc::now(),
+        source_ids: vec![b.id.to_string(), d.id.to_string()],
+        source_type: "memory".into(),
+        memory_source_revisions: vec![MemoryEntryRevision::of(&b).unwrap(), d_cut.clone()],
+    };
+    let mut external = backed.clone();
+    external.id = "external-uuid-source".into();
+    external.name = "external".into();
+    external.source_ids = vec![d.id.to_string()];
+    external.source_type = "file".into();
+    external.memory_source_revisions.clear();
+    let triple = memory::entity::Triple {
+        id: "original-backed-triple".into(),
+        subject_id: backed.id.clone(),
+        predicate: "supported_by".into(),
+        object_id: external.id.clone(),
+        valid_from: None,
+        valid_to: None,
+        source: Some(format!("memory:{}", b.id)),
+        confidence: 1.0,
+        created_at: Utc::now(),
+        source_agent: None,
+        memory_source_revision: Some(MemoryEntryRevision::of(&b).unwrap()),
+    };
+    store
+        .save_knowledge_graph(
+            "global",
+            &[backed.clone(), external.clone()],
+            &[triple.clone()],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .save_knowledge_graph("project_P", &[backed.clone()], &[triple.clone()])
+            .await
+            .is_err(),
+        "global use does not grant cross-scope physical duplication"
+    );
+    let mut washed = backed.clone();
+    washed.source_ids.clear();
+    washed.memory_source_revisions.clear();
+    assert!(store
+        .save_entities("global", &[washed.clone()])
+        .await
+        .is_err());
+    washed.source_type = "file".into();
+    assert!(
+        store.save_entities("global", &[washed]).await.is_err(),
+        "same identity cannot shed its original Memory provenance"
+    );
+    let mut unknown = triple.clone();
+    unknown.source = Some(format!("memory:{}", uuid::Uuid::new_v4()));
+    assert!(store
+        .save_knowledge_graph("global", &[external.clone()], &[unknown])
+        .await
+        .is_err());
+    assert_eq!(store.load_entities("global").await.unwrap().len(), 2);
+    assert_eq!(store.load_triples("global").await.unwrap().len(), 1);
+    a.content = "a true correction after the auxiliary snapshot".into();
+    store.update(&a, &a_cut).await.unwrap();
+    let visible = store.load_entities("global").await.unwrap();
+    let multi = visible
+        .iter()
+        .find(|entity| entity.id == backed.id)
+        .unwrap();
+    assert_eq!(multi.source_ids, vec![d.id.to_string()]);
+    assert_eq!(multi.memory_source_revisions, vec![d_cut.clone()]);
+    assert!(store.load_triples("global").await.unwrap().is_empty());
+    assert!(store
+        .save_knowledge_graph("global", &[backed.clone()], &[triple])
+        .await
+        .is_err());
+    // Startup and the actual project consumer use this original global graph.
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("manager")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut consumer = MemoryTurnContext::new("consumer-session", "consumer-agent");
+    consumer.project_id = Some("P".into());
+    let prepared = manager
+        .prepare_context_for_turn(&consumer, "signal", &[])
+        .await
+        .unwrap();
+    assert!(prepared.entries.iter().any(|entry| entry.id == d.id));
+    assert!(prepared
+        .entries
+        .iter()
+        .all(|entry| entry.id != b.id && entry.title != "KG entity: signal"));
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: d.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "source removed".into(),
+        session_id: "erase-owner".into(),
+        agent_id: "erase-owner".into(),
+        occurred_at: Utc::now(),
+    };
+    store
+        .commit_lifecycle(MemoryLifecycleMutation::erase(&d, None, event).unwrap())
+        .await
+        .unwrap();
+    let prepared = manager
+        .prepare_context_for_turn(&consumer, "signal", &[])
+        .await
+        .unwrap();
+    assert!(
+        prepared.entries.iter().all(|entry| entry.id != d.id),
+        "an accelerator hit cannot return the previously cached retired source"
+    );
+    let visible = store.load_entities("global").await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id, external.id);
+    let knowledge = memory::KnowledgeFabric::with_store(Arc::new(
+        memory::InMemoryKnowledgeStore::new().with_memory_owner(store.clone()),
+    ))
+    .with_memory_sources(store.clone());
+    assert!(manager
+        .recover_memory_cleanup(&knowledge, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    let visible = store.load_entities("global").await.unwrap();
+    assert_eq!(
+        visible[0].source_ids,
+        vec![d.id.to_string()],
+        "an external UUID is not a Memory dependency"
+    );
+    let mut late = backed;
+    late.id = "late-different-entity-id".into();
+    assert!(store.save_entities("global", &[late]).await.is_err());
+    assert_eq!(
+        store.load_entities("global").await.unwrap()[0].id,
+        external.id
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_production_filter_reads_shared_large_ancestry_once() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryEntryRevision, MemoryExtractionOrigin, MemorySourceFenceReader,
+        MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let mut a = entry(
+        MemoryLayer::L3,
+        MemorySource::Import,
+        "large shared original",
+    );
+    a.scope = MemoryScope::Global;
+    a.content = "z".repeat(5 * 1024 * 1024);
+    store.insert(&a).await.unwrap();
+    let turn = MemoryTurnContext::new("frame-session", "frame-agent")
+        .with_source_readset(Some(vec![MemoryEntryRevision::of(&a).unwrap()]));
+    let batch = "extraction-batch:00000000-0000-0000-0000-000000000058";
+    let mut leaves = Vec::new();
+    for title in ["first small leaf", "second small leaf"] {
+        let mut b = entry(MemoryLayer::L3, MemorySource::AutoExtracted, title);
+        b.scope = MemoryScope::Global;
+        b.session_id = Some(turn.session_id.clone());
+        b.source_agent = Some(turn.agent_id.clone());
+        b.tags = vec![batch.into()];
+        store
+            .write_extraction(
+                &b,
+                &MemoryExtractionOrigin::for_entry(&turn, &b, batch).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        leaves.push(b);
+    }
+    let entity = memory::entity::Entity {
+        id: "shared-large-ancestor".into(),
+        name: "shared ancestry".into(),
+        entity_type: memory::entity::EntityType::Concept,
+        confidence: 1.0,
+        frequency: 1,
+        first_seen: Utc::now(),
+        last_seen: Utc::now(),
+        source_type: "memory".into(),
+        source_ids: leaves.iter().map(|entry| entry.id.to_string()).collect(),
+        memory_source_revisions: leaves
+            .iter()
+            .map(|entry| MemoryEntryRevision::of(entry).unwrap())
+            .collect(),
+    };
+    let (kept, _) =
+        memory::store::filter_auxiliary_snapshot(&store, "global", &[entity], &[]).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].source_ids.len(), 2);
+    let (frame, spent) = store
+        .read_source_revisions(
+            &leaves.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+    assert_eq!(frame.len(), 2);
+    assert!(
+        spent > a.content.len() && spent < 6 * 1024 * 1024,
+        "the shared 5MiB source is charged once, with bounded original metadata"
+    );
+    store
+        .save_knowledge_graph("global", &kept, &[])
+        .await
+        .unwrap();
 }

@@ -671,176 +671,143 @@ impl PostgresMemoryStore {
             .map_err(|_| MemoryError::Store("memory search count overflow".to_string()))
     }
 
-    fn replace_json_rows<T: Serialize>(
+    // Every auxiliary writer uses the same original transaction and source
+    // lock order. None can bypass provenance through a partial snapshot API.
+    fn replace_knowledge_graph(
         &self,
         scope_key: &str,
-        table: &str,
-        values: &[T],
-        id: impl Fn(&serde_json::Value) -> Option<String>,
+        entities: Option<&[Entity]>,
+        triples: Option<&[Triple]>,
     ) -> MemoryResult<()> {
-        let (delete_sql, insert_sql) = match table {
-            "memory_entities" => (
-                "DELETE FROM memory_entities WHERE scope_key=$1",
-                "INSERT INTO memory_entities(scope_key,id,payload) VALUES($1,$2,$3)",
-            ),
-            _ => {
-                return Err(MemoryError::Store(format!(
-                    "unsupported memory JSON table `{table}`"
-                )))
-            }
-        };
-        let scope_key = scope_key.to_string();
-        let mut connection = self
-            .executor
-            .checkout_critical()
-            .map_err(storage_memory_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
-        transaction
-            .execute(
-                "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
-                &[],
-            )
-            .map_err(postgres_memory_error)?;
-        transaction
-            .execute(delete_sql, &[&scope_key])
-            .map_err(postgres_memory_error)?;
-        for value in values {
-            let payload = serde_json::to_value(value).map_err(json_memory_error)?;
-            let id = id(&payload)
-                .ok_or_else(|| MemoryError::Store("durable JSON row has no id".to_string()))?;
-            transaction
-                .execute(insert_sql, &[&scope_key, &id, &payload])
-                .map_err(postgres_memory_error)?;
+        let entity_values = entities.unwrap_or_default();
+        let triple_values = triples.unwrap_or_default();
+        if entities.is_some()
+            && triples.is_some()
+            && entity_values.is_empty()
+            && triple_values.is_empty()
+        {
+            return Err(MemoryError::StaleSource);
         }
-        transaction.commit().map_err(postgres_memory_error)?;
-        Ok(())
-    }
-
-    fn load_json_rows<T: DeserializeOwned>(
-        &self,
-        scope_key: &str,
-        table: &str,
-    ) -> MemoryResult<Vec<T>> {
-        let sql = match table {
-            "memory_entities" => {
-                "SELECT payload FROM memory_entities WHERE scope_key=$1 ORDER BY id"
-            }
-            "memory_triples" => "SELECT payload FROM memory_triples WHERE scope_key=$1 ORDER BY id",
-            _ => {
-                return Err(MemoryError::Store(format!(
-                    "unsupported memory JSON table `{table}`"
-                )))
-            }
-        };
-        let scope_key = scope_key.to_string();
-        let mut connection = self
-            .executor
-            .checkout_online_read()
-            .map_err(storage_memory_error)?;
-        connection
-            .query(sql, &[&scope_key])
-            .map_err(postgres_memory_error)?
-            .iter()
-            .map(|row| {
-                let payload: serde_json::Value = row.try_get(0).map_err(postgres_memory_error)?;
-                serde_json::from_value(payload).map_err(json_memory_error)
-            })
-            .collect()
-    }
-
-    fn replace_triples(&self, scope_key: &str, triples: &[Triple]) -> MemoryResult<()> {
-        let scope_key = scope_key.to_string();
+        let original = memory::store::auxiliary_source_cuts(entity_values, triple_values)?;
         let mut connection = self
             .executor
             .checkout_critical()
             .map_err(storage_memory_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
-        transaction
-            .execute(
-                "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
-                &[],
+        let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+        let bytes = serde_json::to_vec(&(entity_values, triple_values))
+            .map_err(json_memory_error)?
+            .len();
+        let mut remaining = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES
+            .checked_sub(bytes)
+            .ok_or(MemoryError::SourceReadLimit)?;
+        let (kept_entities, kept_triples) = auxiliary_in_transaction(
+            &mut tx,
+            scope_key,
+            entity_values,
+            triple_values,
+            &mut remaining,
+        )?;
+        if memory::store::auxiliary_source_cuts(&kept_entities, &kept_triples)? != original {
+            return Err(MemoryError::StaleSource);
+        }
+        // Source body set (including ancestors), origin and original rows were
+        // validated before the KG lock. No KG -> body callback is allowed.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
+            &[],
+        )
+        .map_err(postgres_memory_error)?;
+        let old_entities = if entities.is_some() {
+            auxiliary_rows(&mut tx, scope_key, "memory_entities", &mut remaining)?
+        } else {
+            Vec::new()
+        };
+        let old_triples = if triples.is_some() {
+            auxiliary_rows(&mut tx, scope_key, "memory_triples", &mut remaining)?
+        } else {
+            Vec::new()
+        };
+        memory::store::validate_auxiliary_replacement(
+            &old_entities,
+            &old_triples,
+            entity_values,
+            triple_values,
+        )?;
+        if let Some(values) = entities {
+            tx.execute(
+                "DELETE FROM memory_entities WHERE scope_key=$1",
+                &[&scope_key],
             )
             .map_err(postgres_memory_error)?;
-        transaction
-            .execute(
+            for entity in values {
+                let payload = serde_json::to_value(entity).map_err(json_memory_error)?;
+                let changed = tx
+                    .execute(
+                        "INSERT INTO memory_entities(scope_key,id,payload) VALUES($1,$2,$3)",
+                        &[&scope_key, &entity.id, &payload],
+                    )
+                    .map_err(postgres_memory_error)?;
+                if changed != 1 {
+                    return Err(MemoryError::StaleSource);
+                }
+            }
+        }
+        if let Some(values) = triples {
+            tx.execute(
                 "DELETE FROM memory_triples WHERE scope_key=$1",
                 &[&scope_key],
             )
             .map_err(postgres_memory_error)?;
-        for triple in triples {
-            let payload = serde_json::to_value(triple).map_err(json_memory_error)?;
-            transaction
-                .execute(
-                    "INSERT INTO memory_triples(scope_key,id,subject_key,object_key,payload) VALUES($1,$2,$3,$4,$5)",
-                    &[&scope_key, &triple.id, &triple.subject_id, &triple.object_id, &payload],
-                )
-                .map_err(postgres_memory_error)?;
+            for triple in values {
+                let payload = serde_json::to_value(triple).map_err(json_memory_error)?;
+                let changed = tx.execute("INSERT INTO memory_triples(scope_key,id,subject_key,object_key,payload) VALUES($1,$2,$3,$4,$5)", &[&scope_key,&triple.id,&triple.subject_id,&triple.object_id,&payload]).map_err(postgres_memory_error)?;
+                if changed != 1 {
+                    return Err(MemoryError::StaleSource);
+                }
+            }
         }
-        transaction.commit().map_err(postgres_memory_error)?;
-        Ok(())
+        if entities.is_some()
+            && !auxiliary_rows_equal(&mut tx, scope_key, "memory_entities", entity_values)?
+            || triples.is_some()
+                && !auxiliary_rows_equal(&mut tx, scope_key, "memory_triples", triple_values)?
+        {
+            return Err(MemoryError::StaleSource);
+        }
+        tx.commit().map_err(postgres_memory_error)
     }
 
-    /// Persist entities and triples as one atomic, serialized snapshot.
-    ///
-    /// `save_entities` + `save_triples` are two independent transactions; under
-    /// a multi-connection pool two turn-end writers could interleave and one
-    /// could wipe the other's rows. Take the knowledge-graph advisory lock and
-    /// perform both replacements in a single transaction, and refuse an empty
-    /// snapshot so a load failure cannot silently clear durable state
-    /// (PLAN M-02 / W5 Step2).
-    fn replace_knowledge_graph(
+    fn read_knowledge_graph(
         &self,
         scope_key: &str,
-        entities: &[Entity],
-        triples: &[Triple],
-    ) -> MemoryResult<()> {
-        if entities.is_empty() && triples.is_empty() {
-            return Err(MemoryError::Store(
-                "refusing to replace the knowledge graph with an empty snapshot".to_string(),
-            ));
-        }
+        entities: bool,
+    ) -> MemoryResult<(Vec<Entity>, Vec<Triple>)> {
         let mut connection = self
             .executor
             .checkout_critical()
             .map_err(storage_memory_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
-        transaction
-            .execute(
-                "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
-                &[],
-            )
-            .map_err(postgres_memory_error)?;
-        let scope = scope_key.to_string();
-        transaction
-            .execute("DELETE FROM memory_entities WHERE scope_key=$1", &[&scope])
-            .map_err(postgres_memory_error)?;
-        for entity in entities {
-            let payload = serde_json::to_value(entity).map_err(json_memory_error)?;
-            let id = payload
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| MemoryError::Store("durable entity has no id".to_string()))?;
-            transaction
-                .execute(
-                    "INSERT INTO memory_entities(scope_key,id,payload) VALUES($1,$2,$3)",
-                    &[&scope, &id, &payload],
-                )
-                .map_err(postgres_memory_error)?;
-        }
-        transaction
-            .execute("DELETE FROM memory_triples WHERE scope_key=$1", &[&scope])
-            .map_err(postgres_memory_error)?;
-        for triple in triples {
-            let payload = serde_json::to_value(triple).map_err(json_memory_error)?;
-            transaction
-                .execute(
-                    "INSERT INTO memory_triples(scope_key,id,subject_key,object_key,payload) VALUES($1,$2,$3,$4,$5)",
-                    &[&scope, &triple.id, &triple.subject_id, &triple.object_id, &payload],
-                )
-                .map_err(postgres_memory_error)?;
-        }
-        transaction.commit().map_err(postgres_memory_error)?;
-        Ok(())
+        let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+        let mut remaining = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES;
+        // These immutable input rows take no KG/row locks. The complete source
+        // frame below validates their captured cuts, never newer replacement cuts.
+        let entity_values = if entities {
+            auxiliary_rows(&mut tx, scope_key, "memory_entities", &mut remaining)?
+        } else {
+            Vec::new()
+        };
+        let triple_values = if entities {
+            Vec::new()
+        } else {
+            auxiliary_rows(&mut tx, scope_key, "memory_triples", &mut remaining)?
+        };
+        let kept = auxiliary_in_transaction(
+            &mut tx,
+            scope_key,
+            &entity_values,
+            &triple_values,
+            &mut remaining,
+        )?;
+        tx.commit().map_err(postgres_memory_error)?;
+        Ok(kept)
     }
 
     fn upsert_symbol(&self, symbol: &CodeSymbol) -> MemoryResult<()> {
@@ -1074,27 +1041,58 @@ impl MemoryStore for PostgresMemoryStore {
         knowledge: Option<&memory::knowledge::MemorySourceQuarantineReceipt>,
         auxiliary: bool,
     ) -> MemoryResult<()> {
+        expected.validate()?;
         let store = self.clone();
         let expected = expected.clone();
         let knowledge = knowledge.cloned();
         run_memory_blocking(move || {
-            let mut connection=store.executor.checkout_critical().map_err(storage_memory_error)?;
-            let mut tx=connection.transaction().map_err(postgres_memory_error)?;
-            let row=tx.query_opt("SELECT payload FROM memory_cleanup_pending WHERE mutation_id=$1 FOR UPDATE", &[&expected.mutation_id]).map_err(postgres_memory_error)?.ok_or_else(||MemoryError::NotFound(expected.mutation_id.clone()))?;
-            let mut pending:MemoryCleanupPending=serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
-            if pending.source!=expected.source || pending.memory_id!=expected.memory_id {return Err(MemoryError::Store("foreign Memory cleanup confirmation".into()));}
-            pending.confirm_knowledge(knowledge.as_ref())?; pending.auxiliary_confirmed |= auxiliary;
+            let mut connection = store.executor.checkout_critical().map_err(storage_memory_error)?;
+            let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+            let target = expected.memory_id.to_string();
+            // Same source -> original KG -> pending lock order as every writer.
+            tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", &[&format!("cowd-memory:body:{target}")]).map_err(postgres_memory_error)?;
+            let fence = tx.query_opt("SELECT payload FROM memory_source_fences WHERE source_ref=$1", &[&expected.source.source_ref]).map_err(postgres_memory_error)?.ok_or(MemoryError::StaleSource)?;
+            let fence: MemorySourceFence = serde_json::from_value(fence.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
+            fence.verifies_retirement(&expected.source)?;
+            tx.query_one("SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))", &[]).map_err(postgres_memory_error)?;
+            let row = tx.query_opt("SELECT payload FROM memory_cleanup_pending WHERE mutation_id=$1 FOR UPDATE", &[&expected.mutation_id]).map_err(postgres_memory_error)?.ok_or(MemoryError::StaleSource)?;
+            let mut pending: MemoryCleanupPending = serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
+            pending.validate()?;
+            if pending.source != expected.source || pending.memory_id != expected.memory_id { return Err(MemoryError::StaleSource); }
+            pending.confirm_knowledge(knowledge.as_ref())?;
+            pending.auxiliary_confirmed |= auxiliary;
             if auxiliary {
-                let id=expected.memory_id.to_string();let reference=expected.source.source_ref.clone();let scope=expected.source.scope_key.clone();
-                tx.execute("DELETE FROM memory_symbol_references WHERE memory_id=$1", &[&id]).map_err(postgres_memory_error)?;
-                tx.execute("DELETE FROM memory_entities WHERE scope_key=$1 AND jsonb_array_length(payload->'source_ids')>0 AND (payload->'source_ids') <@ to_jsonb($2::text[])", &[&scope,&vec![id.clone(),reference.clone()]]).map_err(postgres_memory_error)?;
-                tx.execute("UPDATE memory_entities SET payload=jsonb_set(payload,'{source_ids}',(payload->'source_ids')-$2::text-$3::text) WHERE scope_key=$1 AND ((payload->'source_ids') ? $2 OR (payload->'source_ids') ? $3)", &[&scope,&id,&reference]).map_err(postgres_memory_error)?;
-                tx.execute("DELETE FROM memory_triples WHERE scope_key=$1 AND payload->>'source'=ANY($2::text[])", &[&scope,&vec![id,reference]]).map_err(postgres_memory_error)?;
+                let scope = &expected.source.scope_key;
+                let mut remaining = memory::knowledge::KNOWLEDGE_READ_MAX_BYTES;
+                let entities: Vec<Entity> = auxiliary_rows(&mut tx, scope, "memory_entities", &mut remaining)?;
+                let triples: Vec<Triple> = auxiliary_rows(&mut tx, scope, "memory_triples", &mut remaining)?;
+                let (kept_entities, kept_triples) = memory::store::retire_auxiliary_support(&expected.source, &entities, &triples)?;
+                tx.execute("DELETE FROM memory_symbol_references WHERE memory_id=$1", &[&target]).map_err(postgres_memory_error)?;
+                for old in &entities {
+                    let changed = match kept_entities.iter().find(|new| new.id == old.id) {
+                        None => tx.execute("DELETE FROM memory_entities WHERE scope_key=$1 AND id=$2", &[scope,&old.id]).map_err(postgres_memory_error)?,
+                        Some(new) if serde_json::to_value(new).map_err(json_memory_error)? != serde_json::to_value(old).map_err(json_memory_error)? => {
+                            let payload = serde_json::to_value(new).map_err(json_memory_error)?;
+                            tx.execute("UPDATE memory_entities SET payload=$3 WHERE scope_key=$1 AND id=$2", &[scope,&old.id,&payload]).map_err(postgres_memory_error)?
+                        },
+                        Some(_) => continue,
+                    };
+                    if changed != 1 { return Err(MemoryError::StaleSource); }
+                }
+                for old in &triples {
+                    if !kept_triples.iter().any(|new| new.id == old.id) {
+                        if tx.execute("DELETE FROM memory_triples WHERE scope_key=$1 AND id=$2", &[scope,&old.id]).map_err(postgres_memory_error)? != 1 { return Err(MemoryError::StaleSource); }
+                    }
+                }
+                // A trigger may suppress or undo a mutation without SQL error.
+                // Confirmation reports the physical original result, not intent.
+                let symbols: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM memory_symbol_references WHERE memory_id=$1)", &[&target]).map_err(postgres_memory_error)?.try_get(0).map_err(postgres_memory_error)?;
+                if symbols || !auxiliary_rows_equal(&mut tx, scope, "memory_entities", &kept_entities)? || !auxiliary_rows_equal(&mut tx, scope, "memory_triples", &kept_triples)? { return Err(MemoryError::StaleSource); }
             }
-            let complete=pending.knowledge_receipt_digest.is_some() && pending.auxiliary_confirmed;
-            let payload=serde_json::to_value(&pending).map_err(json_memory_error)?;
-            tx.execute("UPDATE memory_cleanup_pending SET confirmed=$2,payload=$3 WHERE mutation_id=$1", &[&expected.mutation_id,&complete,&payload]).map_err(postgres_memory_error)?;
-            tx.commit().map_err(postgres_memory_error)?;Ok(())
+            let complete = pending.knowledge_receipt_digest.is_some() && pending.auxiliary_confirmed;
+            let payload = serde_json::to_value(&pending).map_err(json_memory_error)?;
+            if tx.execute("UPDATE memory_cleanup_pending SET confirmed=$2,payload=$3 WHERE mutation_id=$1", &[&expected.mutation_id,&complete,&payload]).map_err(postgres_memory_error)? != 1 { return Err(MemoryError::StaleSource); }
+            tx.commit().map_err(postgres_memory_error)
         }).await
     }
 
@@ -1448,29 +1446,32 @@ impl MemoryStore for PostgresMemoryStore {
         .await
     }
     async fn save_entities(&self, scope_key: &str, entities: &[Entity]) -> MemoryResult<()> {
+        memory::store::auxiliary_source_cuts(entities, &[])?;
         let store = self.clone();
         let scope_key = scope_key.to_string();
         let entities = entities.to_vec();
         run_memory_blocking(move || {
-            store.replace_json_rows(&scope_key, "memory_entities", &entities, |value| {
-                value
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
+            store.replace_knowledge_graph(&scope_key, Some(&entities), None)
         })
         .await
     }
     async fn load_entities(&self, scope_key: &str) -> MemoryResult<Vec<Entity>> {
         let store = self.clone();
         let scope_key = scope_key.to_string();
-        run_memory_blocking(move || store.load_json_rows(&scope_key, "memory_entities")).await
+        run_memory_blocking(move || {
+            store
+                .read_knowledge_graph(&scope_key, true)
+                .map(|(values, _)| values)
+        })
+        .await
     }
     async fn save_triples(&self, scope_key: &str, triples: &[Triple]) -> MemoryResult<()> {
+        memory::store::auxiliary_source_cuts(&[], triples)?;
         let store = self.clone();
         let scope_key = scope_key.to_string();
         let triples = triples.to_vec();
-        run_memory_blocking(move || store.replace_triples(&scope_key, &triples)).await
+        run_memory_blocking(move || store.replace_knowledge_graph(&scope_key, None, Some(&triples)))
+            .await
     }
     async fn save_knowledge_graph(
         &self,
@@ -1478,17 +1479,25 @@ impl MemoryStore for PostgresMemoryStore {
         entities: &[Entity],
         triples: &[Triple],
     ) -> MemoryResult<()> {
+        memory::store::auxiliary_source_cuts(entities, triples)?;
         let store = self.clone();
         let scope_key = scope_key.to_string();
         let entities = entities.to_vec();
         let triples = triples.to_vec();
-        run_memory_blocking(move || store.replace_knowledge_graph(&scope_key, &entities, &triples))
-            .await
+        run_memory_blocking(move || {
+            store.replace_knowledge_graph(&scope_key, Some(&entities), Some(&triples))
+        })
+        .await
     }
     async fn load_triples(&self, scope_key: &str) -> MemoryResult<Vec<Triple>> {
         let store = self.clone();
         let scope_key = scope_key.to_string();
-        run_memory_blocking(move || store.load_json_rows(&scope_key, "memory_triples")).await
+        run_memory_blocking(move || {
+            store
+                .read_knowledge_graph(&scope_key, false)
+                .map(|(_, values)| values)
+        })
+        .await
     }
     async fn load_verbatim_by_id(&self, id: &str) -> MemoryResult<Option<VerbatimEntry>> {
         let store = self.clone();
@@ -2268,6 +2277,95 @@ fn extraction_binding(
         })
         .transpose()
 }
+fn auxiliary_rows<T: DeserializeOwned>(
+    tx: &mut impl PostgresClient,
+    scope_key: &str,
+    table: &str,
+    remaining: &mut usize,
+) -> MemoryResult<Vec<T>> {
+    if !matches!(table, "memory_entities" | "memory_triples") {
+        return Err(MemoryError::StaleSource);
+    }
+    // Cap transferred bytes in SQL, before materializing JSON, including the
+    // row identity. An oversized scope cannot charge another scope's budget.
+    let sql = format!("SELECT CASE WHEN bytes <= $2 THEN id END, CASE WHEN bytes <= $2 THEN payload END, bytes FROM (SELECT id,payload,SUM(octet_length(id)+octet_length(payload::text)) OVER (ORDER BY id) AS bytes FROM {table} WHERE scope_key=$1) bounded ORDER BY id LIMIT $3");
+    let rows = tx
+        .query(
+            &sql,
+            &[
+                &scope_key,
+                &(*remaining as i64),
+                &((memory::knowledge::KNOWLEDGE_READ_MAX_ROWS + 1) as i64),
+            ],
+        )
+        .map_err(postgres_memory_error)?;
+    if rows.len() > memory::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+        return Err(MemoryError::SourceReadLimit);
+    }
+    let mut values = Vec::new();
+    let mut spent = 0usize;
+    for row in rows {
+        let id = row
+            .try_get::<_, Option<String>>(0)
+            .map_err(postgres_memory_error)?
+            .ok_or(MemoryError::SourceReadLimit)?;
+        let payload = row
+            .try_get::<_, Option<serde_json::Value>>(1)
+            .map_err(postgres_memory_error)?
+            .ok_or(MemoryError::SourceReadLimit)?;
+        spent = usize::try_from(row.try_get::<_, i64>(2).map_err(postgres_memory_error)?)
+            .map_err(|_| MemoryError::SourceReadLimit)?;
+        if payload.get("id").and_then(serde_json::Value::as_str) != Some(id.as_str()) {
+            return Err(MemoryError::StaleSource);
+        }
+        values.push(serde_json::from_value(payload).map_err(json_memory_error)?);
+    }
+    *remaining = remaining
+        .checked_sub(spent)
+        .ok_or(MemoryError::SourceReadLimit)?;
+    Ok(values)
+}
+
+fn auxiliary_rows_equal<T: Serialize>(
+    tx: &mut impl PostgresClient,
+    scope_key: &str,
+    table: &str,
+    expected: &[T],
+) -> MemoryResult<bool> {
+    if !matches!(table, "memory_entities" | "memory_triples") {
+        return Err(MemoryError::StaleSource);
+    }
+    let expected = serde_json::to_value(expected).map_err(json_memory_error)?;
+    // Return one boolean instead of hydrating all rows a second time. This
+    // verifies physical equality even when a trigger skipped/rewrote a row.
+    let sql = format!("WITH actual AS (SELECT id,payload FROM {table} WHERE scope_key=$1), expected AS (SELECT value->>'id' AS id,value AS payload FROM jsonb_array_elements($2::jsonb)) SELECT NOT EXISTS(SELECT 1 FROM actual FULL JOIN expected USING(id) WHERE actual.payload IS DISTINCT FROM expected.payload)");
+    tx.query_one(&sql, &[&scope_key, &expected])
+        .map_err(postgres_memory_error)?
+        .try_get(0)
+        .map_err(postgres_memory_error)
+}
+
+fn auxiliary_in_transaction(
+    tx: &mut impl PostgresClient,
+    scope_key: &str,
+    entities: &[Entity],
+    triples: &[Triple],
+    remaining: &mut usize,
+) -> MemoryResult<(Vec<Entity>, Vec<Triple>)> {
+    let cuts = memory::store::auxiliary_source_cuts(entities, triples)?;
+    let (frame, _valid, spent) = read_memory_source_frame(
+        tx,
+        &cuts.keys().copied().collect::<Vec<_>>(),
+        *remaining,
+        true,
+        None,
+    )?;
+    *remaining = remaining
+        .checked_sub(spent)
+        .ok_or(MemoryError::SourceReadLimit)?;
+    memory::store::filter_auxiliary_source_frame(scope_key, entities, triples, &frame)
+}
+
 fn lock_extraction_origin(client: &mut impl PostgresClient, key: &str) -> MemoryResult<()> {
     client
         .query_one(
@@ -3043,6 +3141,25 @@ fn read_memory_source_frame(
         frame.insert(*id, read);
     }
     let valid = memory::store::source_frame_matches_original_lineage(&origins, &frame);
+    let classifications = roots
+        .iter()
+        .filter(|id| frame.get(id).and_then(Option::as_ref).is_some())
+        .map(|id| {
+            memory::store::source_root_is_current(*id, &origins, &frame)
+                .map(|current| (*id, current))
+        })
+        .collect::<MemoryResult<Vec<_>>>()?;
+    for (id, current) in classifications {
+        if !current {
+            let read = frame
+                .get_mut(&id)
+                .and_then(Option::as_mut)
+                .ok_or(MemoryError::StaleSource)?;
+            read.origin_retired = true;
+            read.revision = None;
+            read.access = None;
+        }
+    }
     Ok((frame, valid, budget_bytes - remaining))
 }
 
@@ -3271,6 +3388,32 @@ fn read_single_memory_source(
 }
 
 impl MemorySourceFenceReader for PostgresMemoryStore {
+    fn read_source_revisions(
+        &self,
+        roots: &[MemoryId],
+        budget_bytes: usize,
+    ) -> MemoryResult<(
+        std::collections::BTreeMap<MemoryId, Option<memory::store::MemorySourceRevisionRead>>,
+        usize,
+    )> {
+        if roots.len() > memory::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+            return Err(MemoryError::SourceReadLimit);
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_memory_error)?;
+        let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+        let (mut frame, _valid, spent) =
+            read_memory_source_frame(&mut tx, roots, budget_bytes, true, None)?;
+        let requested = roots
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        frame.retain(|id, _| requested.contains(id));
+        Ok((frame, spent))
+    }
+
     fn read_source_revision(
         &self,
         source_ref: &str,

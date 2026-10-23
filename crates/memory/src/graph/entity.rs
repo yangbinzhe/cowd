@@ -59,6 +59,10 @@ pub struct Entity {
     pub last_seen: DateTime<Utc>,
     pub source_ids: Vec<String>,
     pub source_type: String,
+    /// Original captured Memory cuts, not fresh heads at snapshot persistence.
+    /// Non-Memory file and placeholder sources do not carry Memory cuts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_source_revisions: Vec<crate::store::MemoryEntryRevision>,
 }
 
 /// A triple in the knowledge graph (subject-predicate-object).
@@ -74,6 +78,8 @@ pub struct Triple {
     pub confidence: f64,
     pub created_at: DateTime<Utc>,
     pub source_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_source_revision: Option<crate::store::MemoryEntryRevision>,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +203,7 @@ impl EntityDetector {
                 last_seen: now,
                 source_ids: Vec::new(),
                 source_type: String::new(),
+                memory_source_revisions: Vec::new(),
             };
 
             seen.entry(key)
@@ -284,6 +291,7 @@ impl KnowledgeGraph {
             confidence,
             created_at: Utc::now(),
             source_agent: None,
+            memory_source_revision: None,
         };
         let id = triple.id.clone();
         self.triples.push(triple);
@@ -366,6 +374,7 @@ impl KnowledgeGraph {
                     last_seen: now,
                     source_ids: vec![t.id.clone()],
                     source_type: String::new(),
+                    memory_source_revisions: Vec::new(),
                 };
                 fixes.push(format!(
                     "orphan-subject: created placeholder {} for subject_id {} in triple {}",
@@ -384,6 +393,7 @@ impl KnowledgeGraph {
                     last_seen: now,
                     source_ids: vec![t.id.clone()],
                     source_type: String::new(),
+                    memory_source_revisions: Vec::new(),
                 };
                 fixes.push(format!(
                     "orphan-object: created placeholder {} for object_id {} in triple {}",
@@ -510,6 +520,7 @@ mod tests {
             last_seen: Utc::now(),
             source_ids: vec![],
             source_type: String::new(),
+            memory_source_revisions: Vec::new(),
         };
         kg.add_entity(person);
 
@@ -523,6 +534,7 @@ mod tests {
             last_seen: Utc::now(),
             source_ids: vec![],
             source_type: String::new(),
+            memory_source_revisions: Vec::new(),
         };
         kg.add_entity(project);
 
@@ -546,6 +558,7 @@ mod tests {
             last_seen: Utc::now(),
             source_ids: vec![],
             source_type: String::new(),
+            memory_source_revisions: Vec::new(),
         };
         kg.add_entity(e);
         let tid = kg.add_triple("e1", "relates_to", "e1", None, None, 0.5);
