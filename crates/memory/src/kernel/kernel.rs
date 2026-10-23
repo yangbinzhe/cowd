@@ -428,7 +428,7 @@ impl MemoryKernel {
             Ok(mut prepared) => {
                 prepared.entries = self
                     .filter_active_entries(prepared.entries)
-                    .await
+                    .await?
                     .into_iter()
                     .filter(|entry| memory_entry_visible_to_ctx(entry, ctx))
                     .collect();
@@ -508,7 +508,7 @@ impl MemoryKernel {
                 self.record_lifecycle_event(
                     ctx,
                     existing_id,
-                    self.latest_state(existing_id).await.unwrap_or(None),
+                    self.latest_state(existing_id).await?,
                     MemoryState::Observed,
                     format!("duplicate write skipped: {}", decision.reason),
                 )
@@ -601,7 +601,7 @@ impl MemoryKernel {
             }
         }
         let mut fact_service = FactKernelService::with_store(InMemoryFactStore::new());
-        for entry in self.filter_active_entries(existing_candidates).await {
+        for entry in self.filter_active_entries(existing_candidates).await? {
             fact_service.upsert_fact(entry.to_fact_record());
         }
         let fact_review = fact_service.review_candidates(checkpoint.to_fact_extraction_batch());
@@ -723,24 +723,23 @@ impl MemoryKernel {
         &self,
         memory_id: MemoryId,
     ) -> MemoryKernelResult<Vec<MemoryLifecycleEvent>> {
-        Ok(self
-            .load_lifecycle_events(memory_id)
-            .await
-            .unwrap_or_default())
+        self.load_lifecycle_events(memory_id).await
     }
 
-    pub async fn filter_active_entries(&self, entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+    pub async fn filter_active_entries(
+        &self,
+        entries: Vec<MemoryEntry>,
+    ) -> MemoryKernelResult<Vec<MemoryEntry>> {
         let states = self
             .latest_states(entries.iter().map(|entry| entry.id))
-            .await
-            .unwrap_or_default();
-        entries
+            .await?;
+        Ok(entries
             .into_iter()
             .filter(|entry| {
                 let state = states.get(&entry.id).copied().flatten();
                 !matches!(state, Some(MemoryState::Superseded | MemoryState::Archived))
             })
-            .collect()
+            .collect())
     }
 
     async fn latest_states(
@@ -847,7 +846,7 @@ impl MemoryKernel {
             vector_scores.insert(entry.id, score);
             candidates.push(entry);
         }
-        let candidates = self.filter_active_entries(candidates).await;
+        let candidates = self.filter_active_entries(candidates).await?;
         let (candidates, mut omitted) = deduplicate_memory_entries_for_recall(candidates);
         let mut selected_sources = HashMap::new();
         let mut relevance_omissions = Vec::new();
@@ -915,7 +914,7 @@ impl MemoryKernel {
         let Some(entry) = self.manager.get_entry(&memory_id.to_string()).await? else {
             return Ok(None);
         };
-        let mut active = self.filter_active_entries(vec![entry]).await;
+        let mut active = self.filter_active_entries(vec![entry]).await?;
         Ok(active
             .pop()
             .filter(|entry| memory_entry_visible_to_ctx(entry, ctx)))
@@ -985,7 +984,7 @@ impl MemoryKernel {
                     .filter_active_entries(
                         vector_entries.into_iter().map(|(entry, _)| entry).collect(),
                     )
-                    .await;
+                    .await?;
                 for entry in active_vector_entries {
                     let score = score_by_id.get(&entry.id).copied().unwrap_or_default();
                     if seen_for_vector.insert(entry.id) {
@@ -1149,7 +1148,7 @@ impl MemoryKernel {
         for entry in entries {
             let atom = self
                 .atom_with_lifecycle_state(&entry, MemoryInformationState::Orientation)
-                .await;
+                .await?;
             // This packet carries a preview and a durable locator, not the
             // full source. Charging the original bytes makes long memories
             // undiscoverable even when their preview fits comfortably.
@@ -1217,7 +1216,7 @@ impl MemoryKernel {
     pub async fn clusters(&self, limit: usize) -> MemoryKernelResult<Vec<MemoryCluster>> {
         let entries = self
             .filter_active_entries(self.manager.list_all_entries().await?)
-            .await;
+            .await?;
         let mut clusters = cluster_entries(&entries, 960);
         clusters.truncate(limit.max(1));
         Ok(clusters)
@@ -1229,7 +1228,7 @@ impl MemoryKernel {
 
     pub async fn runtime_snapshot(&self) -> MemoryKernelResult<MemoryRuntimeSnapshot> {
         let entries = self.manager.list_all_entries().await?;
-        let active_entries = self.filter_active_entries(entries.clone()).await;
+        let active_entries = self.filter_active_entries(entries.clone()).await?;
         let health = health_from_entries(&entries, None);
         let clusters = cluster_entries(&active_entries, 960);
         let usage = self.usage_summary().await.unwrap_or_default();
@@ -1268,7 +1267,7 @@ impl MemoryKernel {
             }
             if let Some(entry) = entry_by_id.get(&current) {
                 let mut atom = MemoryAtomView::from_entry(entry, MemoryInformationState::Trace);
-                if let Ok(Some(state)) = self.latest_state(entry.id).await {
+                if let Some(state) = self.latest_state(entry.id).await? {
                     atom.state = state;
                 }
                 path_entries.push(atom);
@@ -1360,7 +1359,7 @@ impl MemoryKernel {
                 entries.iter().filter(|entry| entry.layer == layer),
                 information_state,
             )
-            .await;
+            .await?;
         Ok(MemoryLayerView::new(layer, atoms))
     }
 
@@ -1384,7 +1383,7 @@ impl MemoryKernel {
                     entries.iter().filter(|entry| entry.layer == layer),
                     information_state,
                 )
-                .await;
+                .await?;
             views.push(MemoryLayerView::new(layer, atoms));
         }
         Ok(views)
@@ -1394,13 +1393,12 @@ impl MemoryKernel {
         &self,
         entries: impl Iterator<Item = &'a MemoryEntry>,
         information_state: MemoryInformationState,
-    ) -> Vec<MemoryAtomView> {
+    ) -> MemoryKernelResult<Vec<MemoryAtomView>> {
         let entries = entries.collect::<Vec<_>>();
         let states = self
             .latest_states(entries.iter().map(|entry| entry.id))
-            .await
-            .unwrap_or_default();
-        entries
+            .await?;
+        Ok(entries
             .into_iter()
             .map(|entry| {
                 let mut atom = MemoryAtomView::from_entry(entry, information_state);
@@ -1409,19 +1407,19 @@ impl MemoryKernel {
                 }
                 atom
             })
-            .collect()
+            .collect())
     }
 
     async fn atom_with_lifecycle_state(
         &self,
         entry: &MemoryEntry,
         information_state: MemoryInformationState,
-    ) -> MemoryAtomView {
+    ) -> MemoryKernelResult<MemoryAtomView> {
         let mut atom = MemoryAtomView::from_entry(entry, information_state);
-        if let Ok(Some(state)) = self.latest_state(entry.id).await {
+        if let Some(state) = self.latest_state(entry.id).await? {
             atom.state = state;
         }
-        atom
+        Ok(atom)
     }
 
     fn empty_degraded_context() -> PreparedContext {
@@ -1512,8 +1510,7 @@ impl MemoryKernel {
             .await?;
         let states = self
             .latest_states(entries.iter().map(|entry| entry.id))
-            .await
-            .unwrap_or_default();
+            .await?;
         let mut best: Option<(MemoryId, MemoryAuthorityDecision)> = None;
         for existing in entries {
             if existing.id == incoming.id || same_memory_key(&existing) != incoming_key {

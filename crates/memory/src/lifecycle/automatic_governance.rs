@@ -238,7 +238,12 @@ pub async fn run_automatic_governance_with_resolver(
                 break;
             }
             report.scanned_entries = report.scanned_entries.saturating_add(page.entries.len());
-            active_entries.extend(kernel.filter_active_entries(page.entries).await);
+            active_entries.extend(
+                kernel
+                    .filter_active_entries(page.entries)
+                    .await
+                    .map_err(|error| MemoryError::Store(error.to_string()))?,
+            );
             manager.update_automatic_governance_progress(
                 &report.run_id,
                 "scanning",

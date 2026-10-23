@@ -513,7 +513,10 @@ async fn superseded_atom_is_hidden_from_active_kernel_entries() {
         .await
         .unwrap();
 
-    let active_entries = kernel.filter_active_entries(vec![active, superseded]).await;
+    let active_entries = kernel
+        .filter_active_entries(vec![active, superseded])
+        .await
+        .unwrap();
 
     assert!(active_entries
         .iter()
@@ -931,6 +934,7 @@ async fn archive_hides_memory_without_deleting_evidence() {
     assert!(kernel
         .filter_active_entries(vec![candidate])
         .await
+        .unwrap()
         .is_empty());
     assert_eq!(
         kernel
@@ -1543,5 +1547,100 @@ async fn private_writes_never_deduplicate_or_conflict_across_agents_in_one_proje
             .unwrap()
             .confidence,
         0.73
+    );
+}
+
+#[tokio::test]
+async fn malformed_lifecycle_cannot_become_active_or_an_observed_projection() {
+    use memory::store::{EphemeralMemoryStore, MemoryStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&tmp.path().join("lifecycle-read.db")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager.clone());
+    let ctx = MemoryTurnContext::new("lifecycle-session", "lifecycle-agent");
+    let candidate = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "retained evidence",
+    );
+    store.insert(&candidate).await.unwrap();
+    // Actual absence is valid; a failed decode must not be treated as absence.
+    assert_eq!(
+        kernel
+            .filter_active_entries(vec![candidate.clone()])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(kernel
+        .lifecycle_events(candidate.id)
+        .await
+        .unwrap()
+        .is_empty());
+    let key = format!("memory_lifecycle:{}", candidate.id);
+    store.kv_put(&key, "{broken lifecycle").await.unwrap();
+    assert!(kernel
+        .filter_active_entries(vec![candidate.clone()])
+        .await
+        .is_err());
+    assert!(kernel.lifecycle_events(candidate.id).await.is_err());
+    assert!(kernel
+        .layer_view(MemoryLayer::L3, MemoryInformationState::Trace)
+        .await
+        .is_err());
+    assert!(kernel
+        .layer_views(MemoryInformationState::Trace)
+        .await
+        .is_err());
+    assert!(kernel.runtime_snapshot().await.is_err());
+    assert!(kernel.clusters(10).await.is_err());
+    assert!(kernel.path_recall(candidate.id, 1, 10).await.is_err());
+    assert!(kernel
+        .context_packet_from_entries(vec![candidate.clone()], 10, 1000)
+        .await
+        .is_err());
+    assert!(kernel
+        .archive(&ctx, candidate.id, "must not overwrite unread history")
+        .await
+        .is_err());
+    assert_eq!(
+        store.kv_get(&key).await.unwrap().unwrap(),
+        "{broken lifecycle"
+    );
+    assert!(manager
+        .get_entry(&candidate.id.to_string())
+        .await
+        .unwrap()
+        .is_some());
+    // Restore an actual empty history, then exercise the real archive writer.
+    store.kv_put(&key, "[]").await.unwrap();
+    kernel
+        .archive(&ctx, candidate.id, "user archive")
+        .await
+        .unwrap();
+    assert!(kernel
+        .filter_active_entries(vec![candidate.clone()])
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        kernel
+            .lifecycle_events(candidate.id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Archived
     );
 }

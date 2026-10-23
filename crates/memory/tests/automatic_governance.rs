@@ -146,6 +146,7 @@ async fn exact_duplicates_are_archived_once_and_the_decision_stays_applied() {
         MemoryKernel::new(Arc::clone(&manager))
             .filter_active_entries(manager.list_all_entries().await.unwrap())
             .await
+            .unwrap()
             .len(),
         1
     );
@@ -320,6 +321,7 @@ async fn semantic_governance_resolves_only_low_risk_derived_conflicts() {
         MemoryKernel::new(Arc::clone(&manager))
             .filter_active_entries(manager.list_all_entries().await.unwrap())
             .await
+            .unwrap()
             .len(),
         1
     );
@@ -372,6 +374,7 @@ async fn semantic_governance_never_receives_authoritative_user_memory() {
         MemoryKernel::new(Arc::clone(&manager))
             .filter_active_entries(manager.list_all_entries().await.unwrap())
             .await
+            .unwrap()
             .len(),
         2
     );
@@ -534,4 +537,52 @@ async fn paged_full_scan_detects_duplicates_across_storage_page_boundaries() {
         report.duration_ms
     );
     assert_eq!(report.discovered_by_kind.get("duplicate").copied(), Some(1));
+}
+
+#[tokio::test]
+async fn unreadable_lifecycle_fails_governance_without_archiving_or_resolving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_ephemeral(test_config(
+            &tmp.path().join("unreadable-lifecycle.db"),
+        ))
+        .await
+        .unwrap(),
+    );
+    let first = entry(
+        MemorySource::AutoExtracted,
+        "first",
+        "identical retained fact",
+    );
+    let mut second = first.clone();
+    second.id = uuid::Uuid::new_v4();
+    let orchestrator = manager.orchestrator();
+    let store = orchestrator.store();
+    store.insert(&first).await.unwrap();
+    store.insert(&second).await.unwrap();
+    let key = format!("memory_lifecycle:{}", first.id);
+    store.kv_put(&key, "not a lifecycle array").await.unwrap();
+    let resolver = CountingResolver::default();
+    let result = memory::run_automatic_governance_with_resolver(
+        manager.clone(),
+        None,
+        &GovernanceConfig::default(),
+        AutomaticGovernanceMode::Manual,
+        Some(&resolver),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        store.kv_get(&key).await.unwrap().as_deref(),
+        Some("not a lifecycle array")
+    );
+    assert!(store.get(&first.id).await.unwrap().is_some());
+    assert!(store.get(&second.id).await.unwrap().is_some());
+    let report = last_automatic_governance_report(&manager)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(report.outcome, "succeeded");
+    assert!(report.fatal_error.is_some());
 }

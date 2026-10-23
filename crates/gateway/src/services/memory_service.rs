@@ -560,9 +560,24 @@ impl MemoryService {
                 });
             }
         };
-        let entries = MemoryKernel::new(Arc::clone(&mgr))
+        let entries = match MemoryKernel::new(Arc::clone(&mgr))
             .filter_active_entries(entries)
-            .await;
+            .await
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                return serde_json::json!({
+                    "enabled": true,
+                    "kind": "memory.knowledge_fabric",
+                    "capability_status": RealityCapabilityStatus::Degraded.as_str(),
+                    "projection_mode": "memory_lifecycle_read_failed",
+                    "durable": false,
+                    "degraded": true,
+                    "degraded_reason": error.to_string(),
+                    "projection": null,
+                })
+            }
+        };
         let import_candidate_count = entries
             .iter()
             .filter(|entry| is_knowledge_memory_entry(entry))
@@ -926,6 +941,48 @@ mod tests {
             source_agent: Some("gateway-test".to_string()),
             visibility: AgentVisibility::Shared,
         }
+    }
+
+    #[tokio::test]
+    async fn knowledge_projection_reports_unreadable_memory_lifecycle_as_degraded() {
+        use memory::store::{EphemeralMemoryStore, MemoryStore};
+        let root = tempfile::tempdir().unwrap();
+        let mut config = memory::MemoryConfig::default();
+        config.store.blob_dir = root.path().join("blobs");
+        config.store.enable_vector_index = false;
+        let store = Arc::new(EphemeralMemoryStore::new());
+        let manager = Arc::new(
+            GatewayMemoryManager::new_with_selected_store(config, None, None, store.clone())
+                .await
+                .unwrap(),
+        );
+        let entry = memory_entry(
+            MemoryLayer::L3,
+            vec!["knowledge".into()],
+            memory::MemoryScope::default(),
+            "retained source",
+        );
+        store.insert(&entry).await.unwrap();
+        let service = MemoryService::with_manager(Some(manager));
+        let valid = service.knowledge_projection(root.path()).await;
+        assert_ne!(valid["projection_mode"], "memory_lifecycle_read_failed");
+        store
+            .kv_put(&format!("memory_lifecycle:{}", entry.id), "broken history")
+            .await
+            .unwrap();
+        let failed = service.knowledge_projection(root.path()).await;
+        assert_eq!(
+            failed["capability_status"],
+            RealityCapabilityStatus::Degraded.as_str()
+        );
+        assert_eq!(failed["projection_mode"], "memory_lifecycle_read_failed");
+        assert_eq!(failed["durable"], false);
+        assert_eq!(failed["degraded"], true);
+        assert!(failed["projection"].is_null());
+        assert!(failed["degraded_reason"]
+            .as_str()
+            .unwrap()
+            .contains("decode lifecycle"));
     }
 
     #[test]
