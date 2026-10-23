@@ -1290,10 +1290,20 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     malformed.source_ref = format!("memory:{}", entry.id);
     let mut c = executor.checkout_critical().unwrap();
     c.execute("INSERT INTO memory_source_fences(source_ref,scope_key,delete_epoch,payload) VALUES($1,$2,0,$3)",&[&source,&scope,&serde_json::to_value(malformed).unwrap()]).unwrap();
+    assert!(matches!(
+        fabric.search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), ""),
+        Err(memory::KnowledgeStoreError::MemorySourceRead(_))
+    ));
+    c.execute(
+        "UPDATE memory_source_fences SET payload=$2 WHERE source_ref=$1",
+        &[&source, &serde_json::to_value(valid).unwrap()],
+    )
+    .unwrap();
+    drop(c);
     let visible = fabric
         .search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), "")
         .unwrap();
-    assert!(!visible
+    assert!(visible
         .packs
         .iter()
         .any(|p| p.pack_id == other.pack.pack_id));
@@ -1301,12 +1311,6 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .packs
         .iter()
         .any(|p| p.pack_id == retired.pack.pack_id));
-    c.execute(
-        "UPDATE memory_source_fences SET payload=$2 WHERE source_ref=$1",
-        &[&source, &serde_json::to_value(valid).unwrap()],
-    )
-    .unwrap();
-    drop(c);
     let config = || {
         let mut config = memory::MemoryConfig::default();
         config.store.blob_dir = root.join("blobs");
@@ -1595,12 +1599,10 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     assert!(reopened_store
         .read_source_fence(&format!("memory:{}", independent.id))
         .is_err());
-    assert!(reopened_fabric
-        .search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), "")
-        .unwrap()
-        .packs
-        .iter()
-        .all(|p| p.pack_id != other.pack.pack_id));
+    assert!(matches!(
+        reopened_fabric.search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), ""),
+        Err(memory::KnowledgeStoreError::MemorySourceRead(_))
+    ));
     drop(reopened_fabric);
     drop(reopened_store);
     drop(std::mem::ManuallyDrop::into_inner(fixture));

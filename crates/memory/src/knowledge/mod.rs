@@ -538,21 +538,30 @@ impl KnowledgeFabric {
         self
     }
 
-    fn source_allowed(&self, source_ref: &str, namespace: &KnowledgeNamespace) -> bool {
+    fn source_allowed(
+        &self,
+        source_ref: &str,
+        namespace: &KnowledgeNamespace,
+    ) -> Result<bool, KnowledgeStoreError> {
         if !source_ref.starts_with("memory:") {
-            return true;
+            return Ok(true);
         }
-        let Some(reader) = self.memory_sources.as_ref() else {
-            return false;
-        };
-        let Ok(Some(fence)) = reader.read_source_fence(source_ref) else {
-            return false;
-        };
-        if fence.retired || fence.source_ref != source_ref {
-            return false;
+        let reader = self
+            .memory_sources
+            .as_ref()
+            .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+        let fence = reader
+            .read_source_fence(source_ref)
+            .map_err(KnowledgeStoreError::MemorySourceRead)?
+            .ok_or(KnowledgeStoreError::MemorySourceUnknown)?;
+        if fence.source_ref != source_ref {
+            return Err(KnowledgeStoreError::StaleRead);
+        }
+        if fence.retired {
+            return Ok(false);
         }
         use crate::MemoryScope;
-        match namespace {
+        Ok(match namespace {
             KnowledgeNamespace::Project(id) => {
                 fence.scope_key == MemoryScope::Project(id.clone()).scope_key()
             }
@@ -569,7 +578,7 @@ impl KnowledgeFabric {
             .iter()
             .any(|scope| scope.scope_key() == fence.scope_key),
             _ => false,
-        }
+        })
     }
 
     pub fn ingest_document(
@@ -587,14 +596,12 @@ impl KnowledgeFabric {
         if input_bytes > KNOWLEDGE_READ_MAX_BYTES {
             return Err(KnowledgeStoreError::ReadLimit);
         }
-        if content
-            .source
-            .as_ref()
-            .is_some_and(|source| !self.source_allowed(source, &namespace))
-        {
-            return Err(KnowledgeStoreError::Backend(
-                "unverified or retired Memory ingestion source".into(),
-            ));
+        if let Some(source) = &content.source {
+            if !self.source_allowed(source, &namespace)? {
+                return Err(KnowledgeStoreError::Backend(
+                    "unverified or retired Memory ingestion source".into(),
+                ));
+            }
         }
         let receipt = KnowledgeIngestionService::new().prepare_document(
             namespace,
@@ -603,7 +610,7 @@ impl KnowledgeFabric {
             content,
             false,
         );
-        if !self.source_allowed(&receipt.corpus.source_ref.id, &receipt.corpus.namespace) {
+        if !self.source_allowed(&receipt.corpus.source_ref.id, &receipt.corpus.namespace)? {
             return Err(KnowledgeStoreError::StaleRead);
         }
         self.store.save_receipt(&receipt)
@@ -733,18 +740,44 @@ impl KnowledgeFabric {
                     }
                 }
             }
-            page.packs.retain(|pack| {
-                pack.source_corpus_refs.iter().all(|id| {
-                    page.sources
-                        .iter()
-                        .find(|source| {
-                            &source.corpus_id == id && source.namespace == pack.namespace
-                        })
-                        .is_some_and(|source| {
-                            self.source_allowed(&source.source_ref, &pack.namespace)
-                        })
-                })
-            });
+            let mut visible = Vec::with_capacity(page.packs.len());
+            for pack in page.packs {
+                let mut denied = false;
+                let mut read_error = None;
+                for id in &pack.source_corpus_refs {
+                    let Some(source) = page.sources.iter().find(|source| &source.corpus_id == id)
+                    else {
+                        if read_error.is_none() {
+                            read_error = Some(KnowledgeStoreError::Backend(
+                                "Knowledge candidate source identity missing".into(),
+                            ));
+                        }
+                        continue;
+                    };
+                    if source.namespace != pack.namespace {
+                        denied = true;
+                        continue;
+                    }
+                    match self.source_allowed(&source.source_ref, &pack.namespace) {
+                        Ok(true) => {}
+                        Ok(false) => denied = true,
+                        Err(error) => {
+                            if read_error.is_none() {
+                                read_error = Some(error);
+                            }
+                        }
+                    }
+                }
+                // Known ineligibility excludes this pack regardless of source order.
+                // Otherwise unknown policy input must not become an empty success.
+                if !denied {
+                    if let Some(error) = read_error {
+                        return Err(error);
+                    }
+                    visible.push(pack);
+                }
+            }
+            page.packs = visible;
             page.canon
                 .retain(|item| page.packs.iter().any(|pack| pack.pack_id == item.pack_id));
             for item in page.canon {
@@ -3575,6 +3608,79 @@ mod tests {
             Err(KnowledgeStoreError::ReadLimit)
         ));
     }
+    #[test]
+    fn knowledge_missing_candidate_source_is_not_an_empty_success() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let receipt = ingest_fault_test(&fabric).unwrap();
+        let mut pack = receipt.pack;
+        pack.source_corpus_refs = vec!["absent-original-corpus".into()];
+        store
+            .commit_maintenance(&store.maintenance_inputs().unwrap(), &[pack], &[])
+            .unwrap();
+        assert!(matches!(
+            fabric.search_namespace(&KnowledgeNamespace::Project("cowd".into()), ""),
+            Err(KnowledgeStoreError::Backend(_))
+        ));
+        assert!(matches!(
+            fabric.activate("s", "approval", "main", Some("cowd")),
+            Err(KnowledgeStoreError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn knowledge_live_source_requires_original_identity_and_known_read() {
+        struct Reader(Option<crate::store::MemorySourceFence>);
+        impl crate::store::MemorySourceFenceReader for Reader {
+            fn read_source_fence(
+                &self,
+                _: &str,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceFence>> {
+                Ok(self.0.clone())
+            }
+        }
+        let source = "memory:00000000-0000-0000-0000-000000000001";
+        let namespace = KnowledgeNamespace::Project("A".into());
+        assert!(matches!(
+            KnowledgeFabric::with_store(Arc::new(InMemoryKnowledgeStore::new()))
+                .source_allowed(source, &namespace),
+            Err(KnowledgeStoreError::MemorySourceUnknown)
+        ));
+        let make = |value| {
+            KnowledgeFabric::with_store(Arc::new(InMemoryKnowledgeStore::new()))
+                .with_memory_sources(Arc::new(Reader(value)))
+        };
+        assert!(matches!(
+            make(None).source_allowed(source, &namespace),
+            Err(KnowledgeStoreError::MemorySourceUnknown)
+        ));
+        let mut fence = crate::store::MemorySourceFence {
+            source_ref: source.into(),
+            scope_key: crate::MemoryScope::Project("A".into()).scope_key(),
+            delete_epoch: 0,
+            retired: false,
+        };
+        assert!(make(Some(fence.clone()))
+            .source_allowed(source, &namespace)
+            .unwrap());
+        fence.source_ref = "memory:00000000-0000-0000-0000-000000000002".into();
+        assert!(matches!(
+            make(Some(fence.clone())).source_allowed(source, &namespace),
+            Err(KnowledgeStoreError::StaleRead)
+        ));
+        fence.source_ref = source.into();
+        fence.scope_key = crate::MemoryScope::Project("B".into()).scope_key();
+        assert!(!make(Some(fence.clone()))
+            .source_allowed(source, &namespace)
+            .unwrap());
+        fence.scope_key = crate::MemoryScope::Project("A".into()).scope_key();
+        fence.retired = true;
+        fence.delete_epoch = 1;
+        assert!(!make(Some(fence))
+            .source_allowed(source, &namespace)
+            .unwrap());
+    }
+
     #[test]
     fn knowledge_retirement_distinguishes_source_read_failure_from_unknown_and_stale() {
         struct FailedReader(bool);

@@ -2012,6 +2012,136 @@ async fn legacy_archived_snapshot_cannot_be_reactivated_without_a_new_fence_row(
 }
 
 #[tokio::test]
+async fn knowledge_required_source_read_failure_is_not_empty_success_or_foreign_failure() {
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    use memory::store::{
+        EphemeralMemoryStore, MemorySourceFence, MemorySourceFenceReader, MemoryStore,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Reader {
+        store: Arc<EphemeralMemoryStore>,
+        fail: AtomicBool,
+        source: String,
+    }
+    impl MemorySourceFenceReader for Reader {
+        fn read_source_fence(
+            &self,
+            source: &str,
+        ) -> memory::store::Result<Option<MemorySourceFence>> {
+            if source == self.source && self.fail.load(Ordering::SeqCst) {
+                return Err(memory::MemoryError::Store(
+                    "injected source read failure".into(),
+                ));
+            }
+            self.store.read_source_fence(source)
+        }
+    }
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let mut own = entry(MemoryLayer::L3, MemorySource::Import, "required rule");
+    own.scope = MemoryScope::Project("A".into());
+    let mut independent = entry(MemoryLayer::L3, MemorySource::Import, "independent rule");
+    independent.scope = own.scope.clone();
+    let mut foreign = entry(MemoryLayer::L3, MemorySource::Import, "foreign rule");
+    foreign.scope = MemoryScope::Project("B".into());
+    let reader = Arc::new(Reader {
+        store: store.clone(),
+        fail: AtomicBool::new(false),
+        source: format!("memory:{}", own.id),
+    });
+    let fabric =
+        memory::KnowledgeFabric::with_store(Arc::new(memory::InMemoryKnowledgeStore::new()))
+            .with_memory_sources(reader.clone());
+    let mut ids = Vec::new();
+    for (item, project, governance) in [
+        (&own, "A", KnowledgeGovernanceLevel::Blocking),
+        (&independent, "A", KnowledgeGovernanceLevel::Required),
+        (&foreign, "B", KnowledgeGovernanceLevel::Required),
+    ] {
+        store.insert(item).await.unwrap();
+        let mut document = memory::DocumentContent::new(&item.title, "must retain evidence");
+        document.source = Some(format!("memory:{}", item.id));
+        ids.push(
+            fabric
+                .ingest_document(
+                    KnowledgeNamespace::Project(project.into()),
+                    KnowledgeActivationPolicy::DefaultForProjectGroup,
+                    governance,
+                    document,
+                )
+                .unwrap()
+                .pack
+                .pack_id,
+        );
+    }
+    let before = fabric.snapshot().unwrap().packs.len();
+    reader.fail.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        fabric.search_namespace(&KnowledgeNamespace::Project("A".into()), ""),
+        Err(memory::KnowledgeStoreError::MemorySourceRead(_))
+    ));
+    assert!(matches!(
+        fabric.activate("s", "rule", "main", Some("A")),
+        Err(memory::KnowledgeStoreError::MemorySourceRead(_))
+    ));
+    assert_eq!(
+        fabric
+            .search_namespace(&KnowledgeNamespace::Project("B".into()), "")
+            .unwrap()
+            .packs[0]
+            .pack_id,
+        ids[2]
+    );
+    assert!(fabric
+        .activate("s", "rule", "main", Some("B"))
+        .unwrap()
+        .0
+        .active_pack_ids
+        .contains(&ids[2]));
+    let mut rejected = memory::DocumentContent::new("must not persist", "must retain evidence");
+    rejected.source = Some(reader.source.clone());
+    assert!(matches!(
+        fabric.ingest_document(
+            KnowledgeNamespace::Project("A".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            rejected,
+        ),
+        Err(memory::KnowledgeStoreError::MemorySourceRead(_))
+    ));
+    assert_eq!(fabric.snapshot().unwrap().packs.len(), before);
+    reader.fail.store(false, Ordering::SeqCst);
+    assert_eq!(
+        fabric
+            .search_namespace(&KnowledgeNamespace::Project("A".into()), "")
+            .unwrap()
+            .packs
+            .len(),
+        2
+    );
+    // Persist a live source observation before simulating the legacy physical delete.
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: own.id,
+        from: None,
+        to: MemoryState::Observed,
+        reason: "original observation".into(),
+        session_id: "s".into(),
+        agent_id: "a".into(),
+        occurred_at: Utc::now(),
+    };
+    store
+        .commit_lifecycle(memory::store::MemoryLifecycleMutation::new(&own, None, event).unwrap())
+        .await
+        .unwrap();
+    store.delete(&own.id).await.unwrap();
+    assert!(matches!(
+        fabric.search_namespace(&KnowledgeNamespace::Project("A".into()), ""),
+        Err(memory::KnowledgeStoreError::MemorySourceRead(_))
+    ));
+}
+
+#[tokio::test]
 async fn live_source_fence_without_its_original_body_is_unknown() {
     use memory::store::{
         EphemeralMemoryStore, MemoryLifecycleMutation, MemorySourceFenceReader, MemoryStore,
