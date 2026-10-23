@@ -20,6 +20,11 @@ use crate::{
 };
 
 pub mod blob;
+mod mutation;
+pub use mutation::{
+    lifecycle_retired, memory_entry_digest, MemoryCleanupPending, MemoryLifecycleMutation,
+    MemoryLifecycleReceipt, MemorySourceFence, MemorySourceFenceReader,
+};
 mod ephemeral;
 pub mod vector;
 pub use ephemeral::EphemeralMemoryStore;
@@ -221,6 +226,25 @@ pub trait MemoryStore: Send + Sync {
     /// Remove a body and matching verbatim atomically. Source/derived erasure
     /// obligations remain a separate governed domain contract.
     async fn delete(&self, id: &MemoryId) -> Result<()>;
+
+    /// Atomically compare the original body/history and publish lifecycle,
+    /// source epoch, receipt and derived cleanup obligation in this owner.
+    async fn commit_lifecycle(
+        &self,
+        command: MemoryLifecycleMutation,
+    ) -> Result<MemoryLifecycleReceipt>;
+    /// Bounded original pending obligations. Confirmations require exact identity/epoch.
+    async fn pending_memory_cleanup(
+        &self,
+        after_mutation: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryCleanupPending>>;
+    async fn confirm_memory_cleanup(
+        &self,
+        expected: &MemoryCleanupPending,
+        knowledge: bool,
+        auxiliary: bool,
+    ) -> Result<()>;
 
     /// Full-text search across `title` and `content` fields.
     async fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>>;

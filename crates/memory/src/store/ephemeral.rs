@@ -20,6 +20,9 @@ use crate::{
 #[derive(Debug, Default)]
 struct State {
     entries: BTreeMap<String, MemoryEntry>,
+    source_fences: BTreeMap<String, MemorySourceFence>,
+    lifecycle_receipts: BTreeMap<String, MemoryLifecycleReceipt>,
+    cleanup_pending: BTreeMap<String, MemoryCleanupPending>,
     discovery_revisions: BTreeMap<String, i64>,
     /// PLAN B-8: keyed by `(scope_key, id)`, matching the Postgres store's
     /// scope-partitioned tables. A flat id-keyed map made the in-memory store
@@ -165,7 +168,28 @@ impl MemoryStore for EphemeralMemoryStore {
     }
 
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId> {
-        put_discovery_entry(&mut *self.write()?, entry);
+        let mut state = self.write()?;
+        if state
+            .source_fences
+            .get(&format!("memory:{}", entry.id))
+            .is_some_and(|f| f.retired || f.scope_key != entry.scope.scope_key())
+        {
+            return Err(MemoryError::Store(
+                "retired or foreign Memory source write".into(),
+            ));
+        }
+        if lifecycle_retired(
+            entry.id,
+            state
+                .kv
+                .get(&format!("memory_lifecycle:{}", entry.id))
+                .map(String::as_str),
+        )? {
+            return Err(MemoryError::Store(
+                "legacy retired Memory source write".into(),
+            ));
+        }
+        put_discovery_entry(&mut state, entry);
         Ok(entry.id)
     }
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>> {
@@ -173,8 +197,28 @@ impl MemoryStore for EphemeralMemoryStore {
     }
     async fn update(&self, entry: &MemoryEntry) -> Result<()> {
         let mut state = self.write()?;
+        if state
+            .source_fences
+            .get(&format!("memory:{}", entry.id))
+            .is_some_and(|f| f.retired || f.scope_key != entry.scope.scope_key())
+        {
+            return Err(MemoryError::Store(
+                "retired or foreign Memory source write".into(),
+            ));
+        }
         if !state.entries.contains_key(&entry.id.to_string()) {
             return Err(MemoryError::NotFound(entry.id.to_string()));
+        }
+        if lifecycle_retired(
+            entry.id,
+            state
+                .kv
+                .get(&format!("memory_lifecycle:{}", entry.id))
+                .map(String::as_str),
+        )? {
+            return Err(MemoryError::Store(
+                "legacy retired Memory source write".into(),
+            ));
         }
         put_discovery_entry(&mut state, entry);
         Ok(())
@@ -185,6 +229,109 @@ impl MemoryStore for EphemeralMemoryStore {
             bump_discovery(&mut state, &entry.scope);
         }
         state.verbatim.remove(&id.to_string());
+        Ok(())
+    }
+
+    async fn commit_lifecycle(
+        &self,
+        command: MemoryLifecycleMutation,
+    ) -> Result<MemoryLifecycleReceipt> {
+        let mut state = self.write()?;
+        if let Some(receipt) = state.lifecycle_receipts.get(&command.mutation_id) {
+            command.validate_replay(receipt)?;
+            return Ok(receipt.clone());
+        }
+        let entry = state
+            .entries
+            .get(&command.event.memory_id.to_string())
+            .ok_or_else(|| MemoryError::NotFound(command.event.memory_id.to_string()))?
+            .clone();
+        let key = format!("memory_lifecycle:{}", entry.id);
+        let source_ref = format!("memory:{}", entry.id);
+        let (raw, receipt, pending) = command.validate_cut(
+            &entry,
+            state.kv.get(&key).map(String::as_str),
+            state.source_fences.get(&source_ref),
+        )?;
+        state.kv.insert(key, raw);
+        bump_discovery(&mut state, &entry.scope);
+        state
+            .source_fences
+            .insert(source_ref, receipt.source.clone());
+        if let Some(pending) = pending {
+            state
+                .cleanup_pending
+                .insert(command.mutation_id.clone(), pending);
+        }
+        state
+            .lifecycle_receipts
+            .insert(command.mutation_id, receipt.clone());
+        Ok(receipt)
+    }
+
+    async fn pending_memory_cleanup(
+        &self,
+        after_mutation: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryCleanupPending>> {
+        if limit == 0 || limit > 256 {
+            return Err(MemoryError::Store(
+                "invalid Memory cleanup page size".into(),
+            ));
+        }
+        Ok(self
+            .read()?
+            .cleanup_pending
+            .values()
+            .filter(|p| {
+                !(p.knowledge_confirmed && p.auxiliary_confirmed)
+                    && after_mutation.is_none_or(|after| p.mutation_id.as_str() > after)
+            })
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn confirm_memory_cleanup(
+        &self,
+        expected: &MemoryCleanupPending,
+        knowledge: bool,
+        auxiliary: bool,
+    ) -> Result<()> {
+        let mut state = self.write()?;
+        let pending = state
+            .cleanup_pending
+            .get_mut(&expected.mutation_id)
+            .ok_or_else(|| MemoryError::NotFound(expected.mutation_id.clone()))?;
+        if pending.source != expected.source || pending.memory_id != expected.memory_id {
+            return Err(MemoryError::Store(
+                "foreign Memory cleanup confirmation".into(),
+            ));
+        }
+        pending.knowledge_confirmed |= knowledge;
+        pending.auxiliary_confirmed |= auxiliary;
+        if auxiliary {
+            let id = expected.memory_id.to_string();
+            let reference = expected.source.source_ref.as_str();
+            state
+                .symbol_memory
+                .retain(|r| r.memory_id != expected.memory_id);
+            state.entities.retain(|(scope, _), entity| {
+                if scope != &expected.source.scope_key {
+                    return true;
+                }
+                let matched = entity.source_ids.iter().any(|s| s == &id || s == reference);
+                entity.source_ids.retain(|s| s != &id && s != reference);
+                !matched || !entity.source_ids.is_empty()
+            });
+            state.triples.retain(|(scope, _), triple| {
+                scope != &expected.source.scope_key
+                    || !triple
+                        .source
+                        .as_deref()
+                        .is_some_and(|s| s == id || s == reference)
+            });
+        }
         Ok(())
     }
 
@@ -678,6 +825,13 @@ impl MemoryStore for EphemeralMemoryStore {
     }
     async fn kv_put(&self, k: &str, v: &str) -> Result<()> {
         let mut state = self.write()?;
+        if k.strip_prefix("memory_lifecycle:")
+            .is_some_and(|id| state.source_fences.contains_key(&format!("memory:{id}")))
+        {
+            return Err(MemoryError::Store(
+                "owned Memory lifecycle requires typed transaction".into(),
+            ));
+        }
         let previous = state.kv.insert(k.into(), v.into());
         if previous.as_deref() != Some(v) {
             if let Some(scope) = k
@@ -695,6 +849,14 @@ impl MemoryStore for EphemeralMemoryStore {
     }
     async fn kv_delete(&self, key: &str) -> Result<()> {
         let mut state = self.write()?;
+        if key
+            .strip_prefix("memory_lifecycle:")
+            .is_some_and(|id| state.source_fences.contains_key(&format!("memory:{id}")))
+        {
+            return Err(MemoryError::Store(
+                "owned Memory lifecycle requires typed transaction".into(),
+            ));
+        }
         if state.kv.remove(key).is_some() {
             if let Some(scope) = key
                 .strip_prefix("memory_lifecycle:")
@@ -791,5 +953,53 @@ mod scope_tests {
             "saving a scope replaces that scope's set"
         );
         assert_eq!(store.load_entities("scope-b").await.expect("load b").len(), 1);
+    }
+}
+
+impl MemorySourceFenceReader for EphemeralMemoryStore {
+    fn read_source_fence(&self, source_ref: &str) -> Result<Option<MemorySourceFence>> {
+        let parsed = source_ref
+            .strip_prefix("memory:")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .ok_or_else(|| MemoryError::Store("invalid Memory source identity".into()))?;
+        if format!("memory:{parsed}") != source_ref {
+            return Err(MemoryError::Store(
+                "noncanonical Memory source identity".into(),
+            ));
+        }
+        let state = self.read()?;
+        if let Some(fence) = state.source_fences.get(source_ref) {
+            if fence.source_ref != source_ref
+                || source_ref
+                    .strip_prefix("memory:")
+                    .and_then(|id| state.entries.get(id))
+                    .is_some_and(|entry| entry.scope.scope_key() != fence.scope_key)
+            {
+                return Err(MemoryError::Store(
+                    "Memory source fence identity mismatch".into(),
+                ));
+            }
+            if !fence.retired
+                && source_ref
+                    .strip_prefix("memory:")
+                    .is_none_or(|id| !state.entries.contains_key(id))
+            {
+                return Err(MemoryError::Store("live Memory source body missing".into()));
+            }
+            return Ok(Some(fence.clone()));
+        }
+        let Some(id) = source_ref.strip_prefix("memory:") else {
+            return Err(MemoryError::Store("not a Memory source reference".into()));
+        };
+        let Some(entry) = state.entries.get(id) else {
+            return Ok(None);
+        };
+        let history = state.kv.get(&format!("memory_lifecycle:{id}"));
+        Ok(Some(MemorySourceFence {
+            source_ref: source_ref.into(),
+            scope_key: entry.scope.scope_key(),
+            delete_epoch: 0,
+            retired: lifecycle_retired(entry.id, history.map(String::as_str))?,
+        }))
     }
 }

@@ -1644,3 +1644,335 @@ async fn malformed_lifecycle_cannot_become_active_or_an_observed_projection() {
         MemoryState::Archived
     );
 }
+
+#[tokio::test]
+async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen() {
+    use harness_contract::knowledge::{
+        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
+    };
+    use memory::store::{EphemeralMemoryStore, MemorySourceFenceReader, MemoryStore};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(EphemeralMemoryStore::new());
+    let knowledge_store = Arc::new(memory::InMemoryKnowledgeStore::new());
+    let fabric = memory::KnowledgeFabric::with_store(knowledge_store.clone())
+        .with_memory_sources(store.clone());
+    let mut retired = entry(MemoryLayer::L3, MemorySource::Import, "retire rule");
+    retired.scope = MemoryScope::Project("A".into());
+    let mut other = entry(MemoryLayer::L3, MemorySource::Import, "independent rule");
+    other.scope = MemoryScope::Project("A".into());
+    store.insert(&retired).await.unwrap();
+    store.insert(&other).await.unwrap();
+    let ingest = |source: &memory::MemoryEntry, title: &str| {
+        let mut document = memory::DocumentContent::new(title, "Retain the original evidence.");
+        document.source = Some(format!("memory:{}", source.id));
+        fabric.ingest_document(
+            KnowledgeNamespace::Project("A".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document,
+        )
+    };
+    let retired_receipt = ingest(&retired, "retired rule").unwrap();
+    let other_receipt = ingest(&other, "independent rule").unwrap();
+    assert_eq!(
+        fabric
+            .search_namespace(&KnowledgeNamespace::Project("A".into()), "")
+            .unwrap()
+            .packs
+            .len(),
+        2
+    );
+    let entity = |name: &str, sources: Vec<String>| memory::entity::Entity {
+        id: name.into(),
+        name: name.into(),
+        entity_type: memory::entity::EntityType::Concept,
+        confidence: 1.0,
+        frequency: 1,
+        first_seen: Utc::now(),
+        last_seen: Utc::now(),
+        source_ids: sources,
+        source_type: "memory".into(),
+    };
+    let only = entity("same-scoped-entity", vec![retired.id.to_string()]);
+    let multi = entity(
+        "multi-source-entity",
+        vec![retired.id.to_string(), other.id.to_string()],
+    );
+    let empty = entity("independent-empty-entity", vec![]);
+    let scope = retired.scope.scope_key();
+    store
+        .save_entities(&scope, &[only.clone(), multi, empty])
+        .await
+        .unwrap();
+    store.save_entities("foreign-scope", &[only]).await.unwrap();
+    let triple = memory::entity::Triple {
+        id: "same-scoped-triple".into(),
+        subject_id: "same-scoped-entity".into(),
+        predicate: "retain".into(),
+        object_id: "independent-empty-entity".into(),
+        valid_from: None,
+        valid_to: None,
+        source: Some(format!("memory:{}", retired.id)),
+        confidence: 1.0,
+        created_at: Utc::now(),
+        source_agent: None,
+    };
+    store.save_triples(&scope, &[triple.clone()]).await.unwrap();
+    store
+        .save_triples("foreign-scope", &[triple])
+        .await
+        .unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_with_selected_store(
+            test_config(&root.path().join("first")),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let weak = Arc::downgrade(&manager);
+    let kernel = MemoryKernel::new(manager.clone());
+    let ctx = MemoryTurnContext::new("archive-command", "operator");
+    kernel
+        .archive(&ctx, retired.id, "user archive")
+        .await
+        .unwrap();
+    let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].source.delete_epoch, 1);
+    assert!(!pending[0].knowledge_confirmed);
+    assert!(!pending[0].auxiliary_confirmed);
+    assert!(
+        store
+            .read_source_fence(&format!("memory:{}", retired.id))
+            .unwrap()
+            .unwrap()
+            .retired
+    );
+    // Before quarantine has run, original Knowledge rows still contain both
+    // packs, but its real read path must omit only the retired source.
+    assert_eq!(fabric.snapshot().unwrap().packs.len(), 2);
+    let visible = fabric
+        .search_namespace(&KnowledgeNamespace::Project("A".into()), "")
+        .unwrap();
+    assert!(visible
+        .packs
+        .iter()
+        .all(|p| p.pack_id != retired_receipt.pack.pack_id));
+    assert!(visible
+        .packs
+        .iter()
+        .any(|p| p.pack_id == other_receipt.pack.pack_id));
+    assert!(ingest(&retired, "different pack same retired source").is_err());
+    let mut wrong_scope = memory::DocumentContent::new("foreign", "must not import");
+    wrong_scope.source = Some(format!("memory:{}", other.id));
+    assert!(fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("B".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            wrong_scope
+        )
+        .is_err());
+    assert!(store.update(&retired).await.is_err());
+    assert!(store.insert(&retired).await.is_err());
+    let mut forged = pending[0].clone();
+    forged.source.delete_epoch += 1;
+    assert!(store
+        .confirm_memory_cleanup(&forged, true, true)
+        .await
+        .is_err());
+    drop(kernel);
+    drop(manager);
+    assert!(weak.upgrade().is_none());
+    let reopened = CognitiveContextManager::new_with_selected_store(
+        test_config(&root.path().join("second")),
+        None,
+        None,
+        store.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(reopened
+        .recover_memory_cleanup(&fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    let entities = store.load_entities(&scope).await.unwrap();
+    assert!(!entities.iter().any(|e| e.id == "same-scoped-entity"));
+    assert_eq!(
+        entities
+            .iter()
+            .find(|e| e.id == "multi-source-entity")
+            .unwrap()
+            .source_ids,
+        vec![other.id.to_string()]
+    );
+    assert!(entities.iter().any(|e| e.id == "independent-empty-entity"));
+    assert_eq!(
+        store.load_entities("foreign-scope").await.unwrap()[0].id,
+        "same-scoped-entity"
+    );
+    assert!(store.load_triples(&scope).await.unwrap().is_empty());
+    assert_eq!(
+        store.load_triples("foreign-scope").await.unwrap()[0].id,
+        "same-scoped-triple"
+    );
+    assert!(
+        store.get(&retired.id).await.unwrap().is_some(),
+        "archive retains evidence; it is not erase"
+    );
+    // Original command replay is a receipt lookup, not a new epoch or pending.
+    MemoryKernel::new(Arc::new(reopened))
+        .archive(&ctx, retired.id, "user archive")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_source_fence(&format!("memory:{}", retired.id))
+            .unwrap()
+            .unwrap()
+            .delete_epoch,
+        1
+    );
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn lifecycle_transaction_rejects_a_changed_body_and_foreign_receipt_identity() {
+    use memory::store::{EphemeralMemoryStore, MemoryLifecycleMutation, MemoryStore};
+    let store = EphemeralMemoryStore::new();
+    let original = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "original source",
+    );
+    store.insert(&original).await.unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: original.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "same command".into(),
+        session_id: "s".into(),
+        agent_id: "a".into(),
+        occurred_at: Utc::now(),
+    };
+    let stale = MemoryLifecycleMutation::new(&original, None, event.clone()).unwrap();
+    let mut changed = original.clone();
+    changed.content = "actual concurrent body change".into();
+    store.update(&changed).await.unwrap();
+    assert!(store.commit_lifecycle(stale).await.is_err());
+    assert!(store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    let command = MemoryLifecycleMutation::new(&changed, None, event).unwrap();
+    let first = store.commit_lifecycle(command.clone()).await.unwrap();
+    assert_eq!(
+        store.commit_lifecycle(command.clone()).await.unwrap(),
+        first
+    );
+    let mut forged = command;
+    forged.event.agent_id = "foreign".into();
+    assert!(store.commit_lifecycle(forged).await.is_err());
+    assert_eq!(
+        store.pending_memory_cleanup(None, 16).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn legacy_archived_snapshot_cannot_be_reactivated_without_a_new_fence_row() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryLifecycleMutation, MemorySourceFenceReader, MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let original = entry(
+        MemoryLayer::L3,
+        MemorySource::Import,
+        "retained legacy snapshot",
+    );
+    store.insert(&original).await.unwrap();
+    let archive = memory::MemoryLifecycleEvent {
+        memory_id: original.id,
+        from: None,
+        to: MemoryState::Archived,
+        reason: "historical archive".into(),
+        session_id: "original-session".into(),
+        agent_id: "original-agent".into(),
+        occurred_at: Utc::now(),
+    };
+    let raw = serde_json::to_string(&vec![archive.clone()]).unwrap();
+    store
+        .kv_put(&format!("memory_lifecycle:{}", original.id), &raw)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_source_fence(&format!("memory:{}", original.id))
+            .unwrap()
+            .unwrap()
+            .retired
+    );
+    assert!(store.update(&original).await.is_err());
+    assert!(store.insert(&original).await.is_err());
+    let mut observed = archive;
+    observed.from = Some(MemoryState::Archived);
+    observed.to = MemoryState::Observed;
+    let command = MemoryLifecycleMutation::new(&original, Some(raw.clone()), observed).unwrap();
+    assert!(store.commit_lifecycle(command).await.is_err());
+    assert_eq!(
+        store
+            .kv_get(&format!("memory_lifecycle:{}", original.id))
+            .await
+            .unwrap()
+            .unwrap(),
+        raw
+    );
+}
+
+#[tokio::test]
+async fn live_source_fence_without_its_original_body_is_unknown() {
+    use memory::store::{
+        EphemeralMemoryStore, MemoryLifecycleMutation, MemorySourceFenceReader, MemoryStore,
+    };
+    let store = EphemeralMemoryStore::new();
+    let original = entry(MemoryLayer::L3, MemorySource::UserExplicit, "original body");
+    store.insert(&original).await.unwrap();
+    let event = memory::MemoryLifecycleEvent {
+        memory_id: original.id,
+        from: None,
+        to: MemoryState::Observed,
+        reason: "original observation".into(),
+        session_id: "s".into(),
+        agent_id: "a".into(),
+        occurred_at: Utc::now(),
+    };
+    store
+        .commit_lifecycle(MemoryLifecycleMutation::new(&original, None, event).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .read_source_fence(&format!("memory:{}", original.id))
+            .unwrap()
+            .unwrap()
+            .retired
+    );
+    store.delete(&original.id).await.unwrap();
+    assert!(store
+        .read_source_fence(&format!("memory:{}", original.id))
+        .is_err());
+}

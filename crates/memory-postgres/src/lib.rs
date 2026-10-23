@@ -14,10 +14,12 @@ use memory::{
     project_scope::MemoryScope,
     same_memory_key,
     store::{
-        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryDiscoveryPage,
-        MemoryDiscoveryQuery, MemoryKeyValue, MemoryLayerAggregate, MemoryScanCursor,
-        MemoryScanPage, MemoryStore, MemoryStoreAggregate, MemoryStoreCapabilities,
-        Result as MemoryResult, SymbolMemoryReference, TaggedLookup, VerbatimEntry,
+        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryCleanupPending,
+        MemoryDiscoveryPage, MemoryDiscoveryQuery, MemoryKeyValue, MemoryLayerAggregate,
+        MemoryLifecycleMutation, MemoryLifecycleReceipt, MemoryScanCursor, MemoryScanPage,
+        MemorySourceFence, MemorySourceFenceReader, MemoryStore, MemoryStoreAggregate,
+        MemoryStoreCapabilities, Result as MemoryResult, SymbolMemoryReference, TaggedLookup,
+        VerbatimEntry,
     },
     MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
     MaintenanceQueueBackend, MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer,
@@ -219,6 +221,26 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_entities_scope_id ON memory_entities(scope_key, id)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_triples_scope_id ON memory_triples(scope_key, id)",
     ],
+}, PostgresMigrationSpec {
+    id: "memory.0008.source-fence-cleanup",
+    domain: MEMORY_DOMAIN,
+    version:8,
+    description:"original lifecycle source fences, idempotent receipts and durable cleanup obligations",
+    statements:&[
+        "CREATE TABLE memory_source_fences(source_ref TEXT PRIMARY KEY,scope_key TEXT NOT NULL,delete_epoch BIGINT NOT NULL CHECK(delete_epoch>=0),payload JSONB NOT NULL)",
+        "CREATE TABLE memory_lifecycle_receipts(mutation_id TEXT PRIMARY KEY,payload JSONB NOT NULL)",
+        "CREATE TABLE memory_cleanup_pending(mutation_id TEXT PRIMARY KEY,source_ref TEXT NOT NULL,delete_epoch BIGINT NOT NULL,confirmed BOOLEAN NOT NULL DEFAULT FALSE,payload JSONB NOT NULL)",
+        "CREATE INDEX memory_cleanup_pending_page ON memory_cleanup_pending(mutation_id) WHERE NOT confirmed",
+    ],
+}, PostgresMigrationSpec {
+    id:"memory.0009.scoped-graph-primary-identities",domain:MEMORY_DOMAIN,version:9,
+    description:"remove inherited global graph identity constraints in favor of the original scoped keys",
+    statements:&[
+        "ALTER TABLE memory_entities DROP CONSTRAINT memory_entities_pkey",
+        "ALTER TABLE memory_entities ADD CONSTRAINT memory_entities_pkey PRIMARY KEY USING INDEX uq_memory_entities_scope_id",
+        "ALTER TABLE memory_triples DROP CONSTRAINT memory_triples_pkey",
+        "ALTER TABLE memory_triples ADD CONSTRAINT memory_triples_pkey PRIMARY KEY USING INDEX uq_memory_triples_scope_id",
+    ],
 }];
 
 const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
@@ -300,6 +322,13 @@ const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
            RETURN NULL;
          END $$",
         "CREATE TRIGGER knowledge_canon_candidate_revision AFTER INSERT OR UPDATE OR DELETE ON knowledge_canon FOR EACH ROW EXECUTE FUNCTION knowledge_canon_candidates_changed()",
+    ],
+}, PostgresMigrationSpec {
+    id:"knowledge.0004.candidate-source-revisions",domain:KNOWLEDGE_DOMAIN,version:4,
+    description:"fence candidate continuation on original source identity changes",
+    statements:&[
+        "CREATE FUNCTION knowledge_corpus_candidates_changed() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE ns TEXT; BEGIN IF TG_OP='UPDATE' AND OLD.payload->'source_ref'=NEW.payload->'source_ref' AND OLD.namespace_key=NEW.namespace_key THEN RETURN NULL; END IF; FOR ns IN SELECT DISTINCT namespace_key FROM knowledge_corpus WHERE corpus_id=CASE WHEN TG_OP='DELETE' THEN OLD.corpus_id ELSE NEW.corpus_id END LOOP PERFORM knowledge_bump_candidate_namespace(ns); END LOOP; IF TG_OP='DELETE' THEN PERFORM knowledge_bump_candidate_namespace(OLD.namespace_key); ELSIF TG_OP='UPDATE' AND OLD.namespace_key<>NEW.namespace_key THEN PERFORM knowledge_bump_candidate_namespace(OLD.namespace_key); END IF; RETURN NULL; END $$",
+        "CREATE TRIGGER knowledge_corpus_candidate_revision AFTER INSERT OR UPDATE OR DELETE ON knowledge_corpus FOR EACH ROW EXECUTE FUNCTION knowledge_corpus_candidates_changed()",
     ],
 }];
 
@@ -885,6 +914,91 @@ impl MemoryStore for PostgresMemoryStore {
         .await
     }
 
+    async fn commit_lifecycle(
+        &self,
+        command: MemoryLifecycleMutation,
+    ) -> MemoryResult<MemoryLifecycleReceipt> {
+        let store = self.clone();
+        run_memory_blocking(move || {
+            let mut connection=store.executor.checkout_critical().map_err(storage_memory_error)?;
+            let mut tx=connection.transaction().map_err(postgres_memory_error)?;
+            // One per-target transaction lock also serializes the absent-history
+            // case, where a SELECT FOR UPDATE of a missing KV row is insufficient.
+            let target=command.event.memory_id.to_string();
+            let row=tx.query_opt("SELECT payload FROM memory_entries WHERE id=$1 FOR UPDATE", &[&target]).map_err(postgres_memory_error)?;
+            if let Some(row)=tx.query_opt("SELECT payload FROM memory_lifecycle_receipts WHERE mutation_id=$1", &[&command.mutation_id]).map_err(postgres_memory_error)? {
+                let receipt:MemoryLifecycleReceipt=serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
+                command.validate_replay(&receipt)?;
+                return Ok(receipt);
+            }
+            let entry=entry_from_json(row.ok_or_else(||MemoryError::NotFound(target.clone()))?.try_get(0).map_err(postgres_memory_error)?)?;
+            let key=format!("memory_lifecycle:{target}");
+            let source_ref=format!("memory:{target}");
+            let history:Option<String>=tx.query_opt("SELECT value FROM memory_kv WHERE key=$1 FOR UPDATE", &[&key]).map_err(postgres_memory_error)?.map(|r|r.try_get(0)).transpose().map_err(postgres_memory_error)?;
+            let source:Option<MemorySourceFence>=tx.query_opt("SELECT payload FROM memory_source_fences WHERE source_ref=$1 FOR UPDATE", &[&source_ref]).map_err(postgres_memory_error)?.map(|r|r.try_get::<_,serde_json::Value>(0)).transpose().map_err(postgres_memory_error)?.map(serde_json::from_value).transpose().map_err(json_memory_error)?;
+            let (raw,receipt,pending)=command.validate_cut(&entry,history.as_deref(),source.as_ref())?;
+            let payload=serde_json::to_value(&receipt.source).map_err(json_memory_error)?;
+            let epoch=i64::try_from(receipt.source.delete_epoch).map_err(|_|MemoryError::Store("Memory delete epoch overflow".into()))?;
+            tx.execute("INSERT INTO memory_kv(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", &[&key,&raw]).map_err(postgres_memory_error)?;
+            tx.execute("INSERT INTO memory_source_fences(source_ref,scope_key,delete_epoch,payload) VALUES($1,$2,$3,$4) ON CONFLICT(source_ref) DO UPDATE SET delete_epoch=EXCLUDED.delete_epoch,payload=EXCLUDED.payload", &[&source_ref,&receipt.source.scope_key,&epoch,&payload]).map_err(postgres_memory_error)?;
+            if let Some(pending)=pending {
+                let payload=serde_json::to_value(&pending).map_err(json_memory_error)?;
+                tx.execute("INSERT INTO memory_cleanup_pending(mutation_id,source_ref,delete_epoch,payload) VALUES($1,$2,$3,$4)", &[&command.mutation_id,&source_ref,&epoch,&payload]).map_err(postgres_memory_error)?;
+            }
+            let payload=serde_json::to_value(&receipt).map_err(json_memory_error)?;
+            tx.execute("INSERT INTO memory_lifecycle_receipts(mutation_id,payload) VALUES($1,$2)", &[&command.mutation_id,&payload]).map_err(postgres_memory_error)?;
+            tx.commit().map_err(postgres_memory_error)?;
+            Ok(receipt)
+        }).await
+    }
+
+    async fn pending_memory_cleanup(
+        &self,
+        after_mutation: Option<&str>,
+        limit: usize,
+    ) -> MemoryResult<Vec<MemoryCleanupPending>> {
+        if limit == 0 || limit > 256 {
+            return Err(MemoryError::Store(
+                "invalid Memory cleanup page size".into(),
+            ));
+        }
+        let store = self.clone();
+        let after = after_mutation.map(str::to_owned);
+        run_memory_blocking(move || {
+            let mut connection=store.executor.checkout_online_read().map_err(storage_memory_error)?;
+            connection.query("SELECT payload FROM memory_cleanup_pending WHERE NOT confirmed AND ($1::TEXT IS NULL OR mutation_id>$1) ORDER BY mutation_id LIMIT $2", &[&after,&(limit as i64)]).map_err(postgres_memory_error)?.into_iter().map(|r| serde_json::from_value(r.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)).collect()
+        }).await
+    }
+
+    async fn confirm_memory_cleanup(
+        &self,
+        expected: &MemoryCleanupPending,
+        knowledge: bool,
+        auxiliary: bool,
+    ) -> MemoryResult<()> {
+        let store = self.clone();
+        let expected = expected.clone();
+        run_memory_blocking(move || {
+            let mut connection=store.executor.checkout_critical().map_err(storage_memory_error)?;
+            let mut tx=connection.transaction().map_err(postgres_memory_error)?;
+            let row=tx.query_opt("SELECT payload FROM memory_cleanup_pending WHERE mutation_id=$1 FOR UPDATE", &[&expected.mutation_id]).map_err(postgres_memory_error)?.ok_or_else(||MemoryError::NotFound(expected.mutation_id.clone()))?;
+            let mut pending:MemoryCleanupPending=serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?).map_err(json_memory_error)?;
+            if pending.source!=expected.source || pending.memory_id!=expected.memory_id {return Err(MemoryError::Store("foreign Memory cleanup confirmation".into()));}
+            pending.knowledge_confirmed |= knowledge; pending.auxiliary_confirmed |= auxiliary;
+            if auxiliary {
+                let id=expected.memory_id.to_string();let reference=expected.source.source_ref.clone();let scope=expected.source.scope_key.clone();
+                tx.execute("DELETE FROM memory_symbol_references WHERE memory_id=$1", &[&id]).map_err(postgres_memory_error)?;
+                tx.execute("DELETE FROM memory_entities WHERE scope_key=$1 AND jsonb_array_length(payload->'source_ids')>0 AND (payload->'source_ids') <@ to_jsonb($2::text[])", &[&scope,&vec![id.clone(),reference.clone()]]).map_err(postgres_memory_error)?;
+                tx.execute("UPDATE memory_entities SET payload=jsonb_set(payload,'{source_ids}',(payload->'source_ids')-$2::text-$3::text) WHERE scope_key=$1 AND ((payload->'source_ids') ? $2 OR (payload->'source_ids') ? $3)", &[&scope,&id,&reference]).map_err(postgres_memory_error)?;
+                tx.execute("DELETE FROM memory_triples WHERE scope_key=$1 AND payload->>'source'=ANY($2::text[])", &[&scope,&vec![id,reference]]).map_err(postgres_memory_error)?;
+            }
+            let complete=pending.knowledge_confirmed && pending.auxiliary_confirmed;
+            let payload=serde_json::to_value(&pending).map_err(json_memory_error)?;
+            tx.execute("UPDATE memory_cleanup_pending SET confirmed=$2,payload=$3 WHERE mutation_id=$1", &[&expected.mutation_id,&complete,&payload]).map_err(postgres_memory_error)?;
+            tx.commit().map_err(postgres_memory_error)?;Ok(())
+        }).await
+    }
+
     async fn search_fts(&self, query: &str, limit: usize) -> MemoryResult<Vec<MemoryEntry>> {
         let store = self.clone();
         let query = query.to_string();
@@ -1397,7 +1511,10 @@ impl MemoryStore for PostgresMemoryStore {
         let value = value.to_string();
         run_memory_blocking(move || {
             let mut connection = store.executor.checkout_critical().map_err(storage_memory_error)?;
-            connection.execute("INSERT INTO memory_kv(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", &[&key,&value]).map_err(postgres_memory_error)?;
+            let mut tx=connection.transaction().map_err(postgres_memory_error)?;
+            guard_legacy_lifecycle_kv(&mut tx,&key)?;
+            tx.execute("INSERT INTO memory_kv(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", &[&key,&value]).map_err(postgres_memory_error)?;
+            tx.commit().map_err(postgres_memory_error)?;
             Ok(())
         }).await
     }
@@ -1409,9 +1526,11 @@ impl MemoryStore for PostgresMemoryStore {
                 .executor
                 .checkout_critical()
                 .map_err(storage_memory_error)?;
-            connection
-                .execute("DELETE FROM memory_kv WHERE key=$1", &[&key])
+            let mut tx = connection.transaction().map_err(postgres_memory_error)?;
+            guard_legacy_lifecycle_kv(&mut tx, &key)?;
+            tx.execute("DELETE FROM memory_kv WHERE key=$1", &[&key])
                 .map_err(postgres_memory_error)?;
+            tx.commit().map_err(postgres_memory_error)?;
             Ok(())
         })
         .await
@@ -1719,6 +1838,33 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                 let value: serde_json::Value = row.try_get(0).map_err(postgres_knowledge_error)?;
                 serde_json::from_value(value).map_err(json_knowledge_error)
             }).collect::<Result<Vec<KnowledgePack>,_>>()?;
+                let source_ids = packs
+                    .iter()
+                    .flat_map(|p| p.source_corpus_refs.iter().cloned())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if source_ids.len() > memory::knowledge::KNOWLEDGE_READ_MAX_ROWS {
+                    return Err(KnowledgeStoreError::ReadLimit);
+                }
+                let namespaces = packs.iter().map(|p| p.namespace.key()).collect::<Vec<_>>();
+                // Only selected namespace metadata participates; reserve its exact
+                // serialized source strings before transferring them from PG.
+                let lengths=tx.query("SELECT corpus_id,COALESCE(octet_length((payload->'namespace')::text),0)::bigint+COALESCE(octet_length(payload->'source_ref'->>'id'),0)::bigint+octet_length(corpus_id)::bigint FROM knowledge_corpus WHERE corpus_id=ANY($1::text[]) AND namespace_key=ANY($2::text[]) ORDER BY corpus_id", &[&source_ids,&namespaces]).map_err(postgres_knowledge_error)?;
+                for row in lengths {
+                    let length: i64 = row.try_get(1).map_err(postgres_knowledge_error)?;
+                    bytes = bytes
+                        .checked_add(
+                            usize::try_from(length).map_err(|_| KnowledgeStoreError::ReadLimit)?,
+                        )
+                        .ok_or(KnowledgeStoreError::ReadLimit)?;
+                    if bytes > budget_bytes {
+                        return Err(KnowledgeStoreError::ReadLimit);
+                    }
+                }
+                let sources=tx.query("SELECT corpus_id,payload->'namespace',payload->'source_ref'->>'id' FROM knowledge_corpus WHERE corpus_id=ANY($1::text[]) AND namespace_key=ANY($2::text[]) ORDER BY corpus_id", &[&source_ids,&namespaces]).map_err(postgres_knowledge_error)?.into_iter().map(|row| {
+                    Ok(memory::knowledge::KnowledgeCandidateSource {corpus_id:row.try_get(0).map_err(postgres_knowledge_error)?,namespace:serde_json::from_value(row.try_get(1).map_err(postgres_knowledge_error)?).map_err(json_knowledge_error)?,source_ref:row.try_get(2).map_err(postgres_knowledge_error)?})
+                }).collect::<Result<Vec<_>,KnowledgeStoreError>>()?;
                 let canon = tx.query("SELECT payload FROM knowledge_canon WHERE canon_id=ANY($1::text[]) ORDER BY canon_id", &[&canon_ids]).map_err(postgres_knowledge_error)?.iter().map(|row| {
                 let value: serde_json::Value = row.try_get(0).map_err(postgres_knowledge_error)?;
                 serde_json::from_value(value).map_err(json_knowledge_error)
@@ -1734,6 +1880,7 @@ impl KnowledgeStore for PostgresKnowledgeStore {
                 };
                 tx.commit().map_err(postgres_knowledge_error)?;
                 Ok(KnowledgeCandidatePage {
+                    sources,
                     packs,
                     canon,
                     revision,
@@ -1873,12 +2020,74 @@ impl KnowledgeStore for PostgresKnowledgeStore {
     }
 }
 
+fn guard_legacy_lifecycle_kv(client: &mut impl PostgresClient, key: &str) -> MemoryResult<()> {
+    if let Some(id) = key.strip_prefix("memory_lifecycle:") {
+        client
+            .query_opt(
+                "SELECT id FROM memory_entries WHERE id=$1 FOR UPDATE",
+                &[&id],
+            )
+            .map_err(postgres_memory_error)?;
+        if client
+            .query_opt(
+                "SELECT source_ref FROM memory_source_fences WHERE source_ref=$1",
+                &[&format!("memory:{id}")],
+            )
+            .map_err(postgres_memory_error)?
+            .is_some()
+        {
+            return Err(MemoryError::Store(
+                "owned Memory lifecycle requires typed transaction".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_entry(
     client: &mut impl PostgresClient,
     entry: &MemoryEntry,
     upsert: bool,
 ) -> MemoryResult<()> {
     let id = entry.id.to_string();
+    // Same-target row lock orders lifecycle retirement against existing-body
+    // writers. The source tombstone remains even when a body is later erased.
+    client
+        .query_opt(
+            "SELECT id FROM memory_entries WHERE id=$1 FOR UPDATE",
+            &[&id],
+        )
+        .map_err(postgres_memory_error)?;
+    if let Some(row) = client
+        .query_opt(
+            "SELECT payload FROM memory_source_fences WHERE source_ref=$1",
+            &[&format!("memory:{id}")],
+        )
+        .map_err(postgres_memory_error)?
+    {
+        let fence: MemorySourceFence =
+            serde_json::from_value(row.try_get(0).map_err(postgres_memory_error)?)
+                .map_err(json_memory_error)?;
+        if fence.retired || fence.scope_key != entry.scope.scope_key() {
+            return Err(MemoryError::Store(
+                "retired or foreign Memory source write".into(),
+            ));
+        }
+    }
+    let history: Option<String> = client
+        .query_opt(
+            "SELECT value FROM memory_kv WHERE key=$1",
+            &[&format!("memory_lifecycle:{id}")],
+        )
+        .map_err(postgres_memory_error)?
+        .map(|row| row.try_get(0))
+        .transpose()
+        .map_err(postgres_memory_error)?;
+    if memory::store::lifecycle_retired(entry.id, history.as_deref())? {
+        return Err(MemoryError::Store(
+            "legacy retired Memory source write".into(),
+        ));
+    }
     let layer = enum_label(&entry.layer)?;
     let category = enum_label(&entry.category)?;
     let priority = enum_label(&entry.priority)?;
@@ -2139,7 +2348,22 @@ where
 }
 
 fn postgres_memory_error(error: postgres::Error) -> MemoryError {
-    MemoryError::Store(error.to_string())
+    // Preserve safe structural rejection evidence, without echoing SQL values,
+    // payloads or driver detail that can contain user content.
+    if let Some(database) = error.as_db_error() {
+        let constraint = database
+            .constraint()
+            .filter(|name| {
+                name.len() <= 128 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+            .unwrap_or("none");
+        MemoryError::Store(format!(
+            "PostgreSQL Memory refusal sqlstate={} constraint={constraint}",
+            database.code().code()
+        ))
+    } else {
+        MemoryError::Store(error.to_string())
+    }
 }
 
 fn json_memory_error(error: serde_json::Error) -> MemoryError {
@@ -2279,3 +2503,75 @@ fn knowledge_rows<T: DeserializeOwned>(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+impl MemorySourceFenceReader for PostgresMemoryStore {
+    fn read_source_fence(&self, source_ref: &str) -> MemoryResult<Option<MemorySourceFence>> {
+        let id = source_ref
+            .strip_prefix("memory:")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .ok_or_else(|| MemoryError::Store("invalid Memory source identity".into()))?;
+        if format!("memory:{id}") != source_ref {
+            return Err(MemoryError::Store(
+                "noncanonical Memory source identity".into(),
+            ));
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_memory_error)?;
+        // Single snapshot for the persisted fence, original body and legacy history.
+        let row=connection.query_opt("SELECT f.payload,e.scope_key,k.value,f.scope_key,f.delete_epoch FROM (SELECT $1::TEXT AS source_ref) s LEFT JOIN memory_source_fences f ON f.source_ref=s.source_ref LEFT JOIN memory_entries e ON e.id=$2 LEFT JOIN memory_kv k ON k.key='memory_lifecycle:'||e.id", &[&source_ref,&id.to_string()]).map_err(postgres_memory_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if let Some(payload) = row
+            .try_get::<_, Option<serde_json::Value>>(0)
+            .map_err(postgres_memory_error)?
+        {
+            let fence: MemorySourceFence =
+                serde_json::from_value(payload).map_err(json_memory_error)?;
+            let scope: String = row.try_get(3).map_err(postgres_memory_error)?;
+            let epoch: i64 = row.try_get(4).map_err(postgres_memory_error)?;
+            if fence.source_ref != source_ref
+                || fence.scope_key != scope
+                || i64::try_from(fence.delete_epoch).ok() != Some(epoch)
+            {
+                return Err(MemoryError::Store(
+                    "Memory source fence identity mismatch".into(),
+                ));
+            }
+            if let Some(body_scope) = row
+                .try_get::<_, Option<String>>(1)
+                .map_err(postgres_memory_error)?
+            {
+                if body_scope != scope {
+                    return Err(MemoryError::Store(
+                        "Memory source/body scope mismatch".into(),
+                    ));
+                }
+            }
+            if !fence.retired
+                && row
+                    .try_get::<_, Option<String>>(1)
+                    .map_err(postgres_memory_error)?
+                    .is_none()
+            {
+                return Err(MemoryError::Store("live Memory source body missing".into()));
+            }
+            return Ok(Some(fence));
+        }
+        let Some(scope_key) = row
+            .try_get::<_, Option<String>>(1)
+            .map_err(postgres_memory_error)?
+        else {
+            return Ok(None);
+        };
+        let history: Option<String> = row.try_get(2).map_err(postgres_memory_error)?;
+        Ok(Some(MemorySourceFence {
+            source_ref: source_ref.into(),
+            scope_key,
+            delete_epoch: 0,
+            retired: memory::store::lifecycle_retired(id, history.as_deref())?,
+        }))
+    }
+}

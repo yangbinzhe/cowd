@@ -1035,6 +1035,7 @@ pub struct CognitiveContextManager {
     /// Shared close signal for every Tokio task owned by this manager.
     background_shutdown: watch::Sender<bool>,
     background_extraction_state: Arc<BackgroundExtractionState>,
+    memory_cleanup_notify: tokio::sync::Notify,
     /// Freshness-priority context manager for session budget management.
     fresh_ctx: FreshContextManager,
     /// Context rotation monitor for GSD-style health warnings.
@@ -1866,6 +1867,7 @@ impl CognitiveContextManager {
             kg_rebuild_handle: OwnedBackgroundTask::new(kg_rebuild_handle),
             background_shutdown,
             background_extraction_state,
+            memory_cleanup_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -1916,6 +1918,86 @@ impl CognitiveContextManager {
     pub fn with_entity_registry(self, registry: crate::entity_registry::EntityRegistry) -> Self {
         *self.entity_registry.lock() = Some(registry);
         self
+    }
+
+    pub fn notify_memory_cleanup(&self) {
+        self.memory_cleanup_notify.notify_one();
+    }
+
+    pub async fn memory_cleanup_notified(&self) {
+        self.memory_cleanup_notify.notified().await;
+    }
+
+    /// One fair bounded page from the original durable obligations. Failed
+    /// sources stay pending; the persisted cursor lets unrelated sources advance.
+    pub async fn recover_memory_cleanup(
+        &self,
+        knowledge: &crate::KnowledgeFabric,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        const CURSOR: &str = "memory_cleanup:recovery_cursor";
+        let store = self.orchestrator.store();
+        let after = store.kv_get(CURSOR).await?.filter(|v| !v.is_empty());
+        let mut page = store
+            .pending_memory_cleanup(after.as_deref(), limit)
+            .await?;
+        if page.is_empty() && after.is_some() {
+            store.kv_put(CURSOR, "").await?;
+            page = store.pending_memory_cleanup(None, limit).await?;
+        }
+        if page.is_empty() {
+            store.kv_put(CURSOR, "").await?;
+            return Ok(Vec::new());
+        }
+        let mut errors = Vec::new();
+        for pending in &page {
+            let knowledge_done = if pending.knowledge_confirmed {
+                true
+            } else {
+                match knowledge.quarantine_source(&pending.source.source_ref) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        errors.push(format!(
+                            "Knowledge cleanup {}: {error}",
+                            pending.mutation_id
+                        ));
+                        false
+                    }
+                }
+            };
+            let auxiliary_done = if pending.auxiliary_confirmed {
+                true
+            } else {
+                match self.evict_vector_entry(&pending.memory_id) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        errors.push(format!(
+                            "Memory auxiliary cleanup {}: {error}",
+                            pending.mutation_id
+                        ));
+                        false
+                    }
+                }
+            };
+            // The original store applies associated durable auxiliary removals
+            // atomically with its confirmation; vector eviction is idempotent.
+            if let Err(error) = store
+                .confirm_memory_cleanup(pending, knowledge_done, auxiliary_done)
+                .await
+            {
+                errors.push(format!(
+                    "Memory cleanup confirmation {}: {error}",
+                    pending.mutation_id
+                ));
+            }
+        }
+        store
+            .kv_put(
+                CURSOR,
+                &page.last().expect("nonempty cleanup page").mutation_id,
+            )
+            .await?;
+        Ok(errors)
     }
 
     pub(crate) async fn kernel_kv_put(&self, key: &str, value: &str) -> Result<()> {

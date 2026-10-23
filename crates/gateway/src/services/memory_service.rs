@@ -380,22 +380,10 @@ impl MemoryService {
             .archive(&memory_ctx, memory_id, "archived by API delete request")
             .await
             .map_err(|error| error.to_string())?;
-        if let Err(error) = mgr.evict_vector_entry(&memory_id) {
-            tracing::warn!(
-                %error,
-                %memory_id,
-                "archived memory vector eviction degraded; lifecycle filtering remains authoritative"
-            );
-        }
-        if let Some(knowledge) = self.knowledge.as_ref() {
-            knowledge
-                .quarantine_source(&format!("memory:{memory_id}"))
-                .map_err(|error| {
-                    format!(
-                        "memory archived but derived knowledge quarantine failed for {memory_id}: {error}"
-                    )
-                })?;
-        }
+        // Archive visibility and cleanup registration already committed together.
+        // The original Memory owner consumes the durable obligations, including
+        // after restart; a Gateway response is not their completion authority.
+        mgr.notify_memory_cleanup();
         Ok(())
     }
 

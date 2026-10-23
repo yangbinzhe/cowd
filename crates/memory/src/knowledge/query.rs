@@ -74,7 +74,15 @@ impl KnowledgeCandidateCursor {
 }
 
 #[derive(Debug, Clone)]
+pub struct KnowledgeCandidateSource {
+    pub corpus_id: String,
+    pub namespace: KnowledgeNamespace,
+    pub source_ref: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct KnowledgeCandidatePage {
+    pub sources: Vec<KnowledgeCandidateSource>,
     pub packs: Vec<KnowledgePack>,
     pub canon: Vec<KnowledgeCanonPack>,
     pub revision: KnowledgeSourceRevision,

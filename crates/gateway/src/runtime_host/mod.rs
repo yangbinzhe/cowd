@@ -76,9 +76,6 @@ fn start_memory_governance_task(
     policy: memory::GovernanceConfig,
     semantic_resolver: Arc<dyn memory::SemanticGovernanceResolver>,
 ) -> Result<(), String> {
-    if !policy.enabled {
-        return Ok(());
-    }
     gateway_tasks
         .spawn(
             GatewayTaskKind::MemoryGovernance,
@@ -87,66 +84,60 @@ fn start_memory_governance_task(
                 let manager = Arc::clone(&manager);
                 let semantic_resolver = Arc::clone(&semantic_resolver);
                 async move {
-                    let initial_delay = Duration::from_secs(policy.startup_delay_secs);
-                    tokio::select! {
-                        _ = cancellation.cancelled() => return,
-                        () = tokio::time::sleep(initial_delay) => {}
-                    }
-                    match memory::run_automatic_governance(
-                        Arc::clone(&manager),
-                        Some(&knowledge),
-                        &policy,
-                        memory::AutomaticGovernanceMode::Startup,
-                    )
-                    .await
-                    {
-                        Ok(report) => tracing::info!(
-                            scanned_entries = report.scanned_entries,
-                            scanned_candidates = report.scanned_candidates,
-                            auto_applied = report.auto_applied_duplicates
-                                + report.auto_resolved_conflicts
-                                + report.auto_archived_stale
-                                + report.auto_validated_authority
-                                + report.auto_refreshed_relationships
-                                + report.auto_dismissed_obsolete
-                                + report.auto_retired_knowledge_conflicts,
-                            pending_review = report.pending_human_review,
-                            errors = report.errors.len(),
-                            "startup memory governance completed"
-                        ),
-                        Err(memory::MemoryError::GovernanceAlreadyRunning) => tracing::info!(
-                            "startup memory governance skipped because another run is active"
-                        ),
-                        Err(error) => tracing::warn!(%error, "startup memory governance degraded"),
-                    }
+                    let mut startup = true;
+                    let mut next_governance =
+                        tokio::time::Instant::now() + Duration::from_secs(policy.startup_delay_secs);
                     loop {
-                        let delay = delay_until_local_hour(policy.deep_scan_hour_local);
-                        tokio::select! {
-                            _ = cancellation.cancelled() => break,
-                            () = tokio::time::sleep(delay) => {}
-                        }
-                        match memory::run_automatic_governance_with_resolver(
-                            Arc::clone(&manager),
-                            Some(&knowledge),
-                            &policy,
-                            memory::AutomaticGovernanceMode::Nightly,
-                            Some(semantic_resolver.as_ref()),
-                        )
-                        .await
-                        {
-                            Ok(report) => tracing::info!(
-                                scanned_entries = report.scanned_entries,
-                                scanned_candidates = report.scanned_candidates,
-                                pending_review = report.pending_human_review,
-                                errors = report.errors.len(),
-                                "nightly memory governance completed"
-                            ),
-                            Err(memory::MemoryError::GovernanceAlreadyRunning) => tracing::info!(
-                                "nightly memory governance skipped because another run is active"
-                            ),
-                            Err(error) => {
-                                tracing::warn!(%error, "nightly memory governance degraded")
+                        match manager.recover_memory_cleanup(&knowledge, 64).await {
+                            Ok(errors) if !errors.is_empty() => {
+                                tracing::warn!(errors=?errors,"required Memory cleanup remains pending")
                             }
+                            Err(error) => tracing::warn!(%error,"required Memory cleanup replay failed"),
+                            _ => {}
+                        }
+                        if policy.enabled && tokio::time::Instant::now() >= next_governance {
+                            let mode = if startup {
+                                memory::AutomaticGovernanceMode::Startup
+                            } else {
+                                memory::AutomaticGovernanceMode::Nightly
+                            };
+                            let resolver = if startup {
+                                None
+                            } else {
+                                Some(semantic_resolver.as_ref())
+                            };
+                            match memory::run_automatic_governance_with_resolver(
+                                Arc::clone(&manager),
+                                Some(&knowledge),
+                                &policy,
+                                mode,
+                                resolver,
+                            )
+                            .await
+                            {
+                                Ok(report) => tracing::info!(
+                                    scanned_entries = report.scanned_entries,
+                                    errors = report.errors.len(),
+                                    "optional Memory governance completed"
+                                ),
+                                Err(error) => tracing::warn!(%error,"optional Memory governance failed"),
+                            }
+                            startup = false;
+                            next_governance =
+                                tokio::time::Instant::now() + delay_until_local_hour(policy.deep_scan_hour_local);
+                        }
+                        // Required recovery shares the existing joined owner and
+                        // remains live independently of optional governance policy.
+                        let retry = tokio::time::Instant::now() + Duration::from_secs(30);
+                        let wake = if policy.enabled {
+                            retry.min(next_governance)
+                        } else {
+                            retry
+                        };
+                        tokio::select! {
+                            _=cancellation.cancelled()=>break,
+                            _=manager.memory_cleanup_notified()=>{},
+                            ()=tokio::time::sleep_until(wake)=>{},
                         }
                     }
                 }
@@ -1609,6 +1600,25 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             return Err(startup_registry.rollback(error).await);
         }
     };
+    // The original durable source fence is already injected by selected storage.
+    // Replay one bounded cleanup page before any Memory consumer is exposed;
+    // downstream outage stays durable pending and never reopens its source.
+    if let Some(manager) = cognitive.as_ref() {
+        match manager
+            .recover_memory_cleanup(&selected_storage.knowledge_fabric, 64)
+            .await
+        {
+            Ok(errors) if !errors.is_empty() => {
+                tracing::warn!(errors=?errors,"startup Memory cleanup remains pending")
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(startup_registry
+                    .rollback(format!("restore Memory cleanup source fence: {error}"))
+                    .await)
+            }
+        }
+    }
     let memory_governance_task =
         cognitive
             .as_ref()
@@ -2548,6 +2558,112 @@ mod tests {
     use memory::MemoryConfig;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn required_memory_cleanup_runs_and_joins_with_optional_governance_disabled() {
+        use memory::store::{EphemeralMemoryStore, MemoryStore};
+        struct NoSemanticCalls;
+        #[async_trait::async_trait]
+        impl memory::SemanticGovernanceResolver for NoSemanticCalls {
+            async fn resolve(
+                &self,
+                _: memory::SemanticGovernanceRequest,
+            ) -> Result<memory::SemanticGovernanceResponse, String> {
+                panic!("disabled optional governance must not call its resolver")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(EphemeralMemoryStore::new());
+        let fabric =
+            memory::KnowledgeFabric::with_store(Arc::new(memory::InMemoryKnowledgeStore::new()))
+                .with_memory_sources(store.clone());
+        let mut config = MemoryConfig::default();
+        config.store.blob_dir = root.path().join("blobs");
+        config.store.enable_vector_index = false;
+        config.governance.enabled = false;
+        config.governance.startup_delay_secs = 86400;
+        let manager = Arc::new(
+            CognitiveContextManager::new_with_selected_store(
+                config.clone(),
+                None,
+                None,
+                store.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let id = manager
+            .orchestrator()
+            .write(
+                memory::MemoryLayer::L3,
+                memory::MemoryCategory::Reference,
+                "original source",
+                "retained text",
+                memory::Priority::Normal,
+                memory::MemorySource::Import,
+                vec![],
+                memory::MemoryScope::Global,
+            )
+            .await
+            .unwrap();
+        let mut document = memory::DocumentContent::new("derived pack", "Retain evidence.");
+        document.source = Some(format!("memory:{id}"));
+        let receipt = fabric
+            .ingest_document(
+                harness_contract::knowledge::KnowledgeNamespace::SharedLibrary("global".into()),
+                harness_contract::knowledge::KnowledgeActivationPolicy::BlockingPolicy,
+                harness_contract::knowledge::KnowledgeGovernanceLevel::Required,
+                document,
+            )
+            .unwrap();
+        memory::MemoryKernel::new(manager.clone())
+            .archive(
+                &memory::MemoryTurnContext::new("archive", "operator"),
+                id,
+                "user archive",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.pending_memory_cleanup(None, 16).await.unwrap().len(),
+            1
+        );
+        let tasks = GatewayRuntimeTaskSet::new(Duration::from_secs(2));
+        start_memory_governance_task(
+            &tasks,
+            manager.clone(),
+            fabric.clone(),
+            config.governance,
+            Arc::new(NoSemanticCalls),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store
+                .pending_memory_cleanup(None, 16)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("required cleanup cannot wait for optional startup delay");
+        let report = tasks.shutdown().await;
+        assert_eq!(report.forced_aborts, 0);
+        assert!(store.get(&id).await.unwrap().is_some());
+        let pack = fabric
+            .snapshot()
+            .unwrap()
+            .packs
+            .into_iter()
+            .find(|p| p.pack_id == receipt.pack.pack_id)
+            .unwrap();
+        assert_eq!(
+            pack.state,
+            harness_contract::knowledge::KnowledgeObjectState::Quarantined
+        );
+    }
 
     #[test]
     fn ordered_recovery_quarantines_local_sessions_but_fences_global_failures() {

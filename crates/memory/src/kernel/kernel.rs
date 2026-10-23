@@ -1448,8 +1448,14 @@ impl MemoryKernel {
         to: MemoryState,
         reason: impl Into<String>,
     ) -> MemoryKernelResult<()> {
-        let mut events = self.load_lifecycle_events(memory_id).await?;
-        events.push(MemoryLifecycleEvent {
+        let store = self.manager.orchestrator();
+        let store = store.store();
+        let entry = store
+            .get(&memory_id)
+            .await?
+            .ok_or_else(|| crate::MemoryError::NotFound(memory_id.to_string()))?;
+        let history = store.kv_get(&lifecycle_key(memory_id)).await?;
+        let event = MemoryLifecycleEvent {
             memory_id,
             from,
             to,
@@ -1457,12 +1463,10 @@ impl MemoryKernel {
             session_id: ctx.session_id.clone(),
             agent_id: ctx.agent_id.clone(),
             occurred_at: Utc::now(),
-        });
-
-        let raw = serde_json::to_string(&events).map_err(crate::MemoryError::Serialisation)?;
-        self.manager
-            .kernel_kv_put(&lifecycle_key(memory_id), &raw)
-            .await?;
+        };
+        let command = crate::store::MemoryLifecycleMutation::new(&entry, history, event)?;
+        store.commit_lifecycle(command).await?;
+        self.manager.notify_memory_cleanup();
         Ok(())
     }
 

@@ -670,7 +670,7 @@ fn real_postgres_knowledge_maintenance_is_atomic_and_rejects_stale_read_sets() {
         "conflicted rule",
         "must retain approval evidence\nmust not retain approval evidence",
     );
-    document.source = Some("memory:conflicted".into());
+    document.source = Some("import-fixture:conflicted".into());
     let receipt = fabric
         .ingest_document(
             KnowledgeNamespace::Project("cowd".into()),
@@ -686,7 +686,9 @@ fn real_postgres_knowledge_maintenance_is_atomic_and_rejects_stale_read_sets() {
     let original = store.snapshot().unwrap();
     let mut connection = executor.checkout_critical().unwrap();
     connection.batch_execute("CREATE FUNCTION refuse_conflict_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused conflict update'; END $$; CREATE TRIGGER refuse_conflict_update BEFORE UPDATE ON knowledge_conflict FOR EACH ROW EXECUTE FUNCTION refuse_conflict_update()").unwrap();
-    assert!(fabric.quarantine_source("memory:conflicted").is_err());
+    assert!(fabric
+        .quarantine_source("import-fixture:conflicted")
+        .is_err());
     assert_eq!(
         serde_json::to_value(store.snapshot().unwrap()).unwrap(),
         serde_json::to_value(&original).unwrap(),
@@ -709,7 +711,9 @@ fn real_postgres_knowledge_maintenance_is_atomic_and_rejects_stale_read_sets() {
         Err(KnowledgeStoreError::StaleRead)
     ));
     assert_eq!(store.snapshot().unwrap().packs[0], changed);
-    fabric.quarantine_source("memory:conflicted").unwrap();
+    fabric
+        .quarantine_source("import-fixture:conflicted")
+        .unwrap();
     // Rebuilt owner observes the same original transaction, not an in-process mirror.
     drop(fabric);
     drop(store);
@@ -1188,4 +1192,269 @@ fn real_postgres_knowledge_continuation_cannot_borrow_another_store_with_equal_c
     drop(second);
     drop(std::mem::ManuallyDrop::into_inner(left));
     drop(std::mem::ManuallyDrop::into_inner(right));
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_and_reopen() {
+    let fixture = std::mem::ManuallyDrop::new(PostgresTestScope::new());
+    let root = std::env::temp_dir().join(format!("cowd-memory-cleanup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let executor = fixture.reconnect();
+    let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
+    let knowledge = Arc::new(PostgresKnowledgeStore::new(executor.clone()).unwrap());
+    let fabric = KnowledgeFabric::with_store(knowledge.clone()).with_memory_sources(store.clone());
+    let entry = memory_entry(uuid::Uuid::new_v4(), "archive-cleanup");
+    let independent = memory_entry(uuid::Uuid::new_v4(), "independent-cleanup");
+    store.insert(&entry).await.unwrap();
+    store.insert(&independent).await.unwrap();
+    let mut document = DocumentContent::new("retiring pack", "Keep original evidence.");
+    document.source = Some(format!("memory:{}", entry.id));
+    let retired = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("snapshot-test".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            document,
+        )
+        .unwrap();
+    let mut other = DocumentContent::new("independent pack", "Independent valid source.");
+    other.source = Some(format!("memory:{}", independent.id));
+    let other = fabric
+        .ingest_document(
+            KnowledgeNamespace::Project("snapshot-test".into()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            other,
+        )
+        .unwrap();
+    let entity = |name: &str, sources: Vec<String>| memory::entity::Entity {
+        id: name.into(),
+        name: name.into(),
+        entity_type: memory::entity::EntityType::Concept,
+        confidence: 1.0,
+        frequency: 1,
+        first_seen: chrono::Utc::now(),
+        last_seen: chrono::Utc::now(),
+        source_ids: sources,
+        source_type: "memory".into(),
+    };
+    let only = entity("only-source", vec![entry.id.to_string()]);
+    let multi = entity(
+        "multi-source",
+        vec![entry.id.to_string(), independent.id.to_string()],
+    );
+    let empty = entity("independent-empty", vec![]);
+    let scope = entry.scope.scope_key();
+    store
+        .save_entities(&scope, &[only.clone(), multi.clone(), empty.clone()])
+        .await
+        .unwrap();
+    store
+        .save_entities("foreign-scope", &[only.clone()])
+        .await
+        .unwrap();
+    let triple = memory::entity::Triple {
+        id: "same-scoped-triple".into(),
+        subject_id: "only-source".into(),
+        predicate: "must retain".into(),
+        object_id: "independent-empty".into(),
+        valid_from: None,
+        valid_to: None,
+        source: Some(format!("memory:{}", entry.id)),
+        confidence: 1.0,
+        created_at: chrono::Utc::now(),
+        source_agent: None,
+    };
+    let mut independent_triple = triple.clone();
+    independent_triple.id = "independent-triple".into();
+    independent_triple.source = Some(format!("memory:{}", independent.id));
+    store
+        .save_triples(&scope, &[triple.clone(), independent_triple.clone()])
+        .await
+        .unwrap();
+    store
+        .save_triples("foreign-scope", &[triple.clone()])
+        .await
+        .unwrap();
+    // A persisted fence payload cannot borrow another source identity, even
+    // when its namespace happens to match this pack's namespace.
+    let source = format!("memory:{}", independent.id);
+    let valid = MemorySourceFence {
+        source_ref: source.clone(),
+        scope_key: scope.clone(),
+        delete_epoch: 0,
+        retired: false,
+    };
+    let mut malformed = valid.clone();
+    malformed.source_ref = format!("memory:{}", entry.id);
+    let mut c = executor.checkout_critical().unwrap();
+    c.execute("INSERT INTO memory_source_fences(source_ref,scope_key,delete_epoch,payload) VALUES($1,$2,0,$3)",&[&source,&scope,&serde_json::to_value(malformed).unwrap()]).unwrap();
+    let visible = fabric
+        .search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), "")
+        .unwrap();
+    assert!(!visible
+        .packs
+        .iter()
+        .any(|p| p.pack_id == other.pack.pack_id));
+    assert!(visible
+        .packs
+        .iter()
+        .any(|p| p.pack_id == retired.pack.pack_id));
+    c.execute(
+        "UPDATE memory_source_fences SET payload=$2 WHERE source_ref=$1",
+        &[&source, &serde_json::to_value(valid).unwrap()],
+    )
+    .unwrap();
+    drop(c);
+    let config = || {
+        let mut config = memory::MemoryConfig::default();
+        config.store.blob_dir = root.join("blobs");
+        config.store.enable_vector_index = false;
+        config.governance.enabled = false;
+        config
+    };
+    let manager = Arc::new(
+        memory::CognitiveContextManager::new_with_selected_store(
+            config(),
+            None,
+            None,
+            store.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let weak = Arc::downgrade(&manager);
+    let kernel = memory::MemoryKernel::new(manager.clone());
+    let ctx = memory::MemoryTurnContext::new("durable-archive", "operator");
+    let mut connection = executor.checkout_critical().unwrap();
+    // This really refuses the original Knowledge transaction, after the Memory
+    // transaction has already committed the source fence and pending fact.
+    connection.batch_execute("CREATE FUNCTION refuse_cleanup_pack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'quarantine unavailable'; END $$; CREATE TRIGGER refuse_cleanup_pack BEFORE UPDATE ON knowledge_pack FOR EACH ROW EXECUTE FUNCTION refuse_cleanup_pack()").unwrap();
+    kernel
+        .archive(&ctx, entry.id, "archive exactly once")
+        .await
+        .unwrap();
+    let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].source.delete_epoch, 1);
+    assert!(!manager
+        .recover_memory_cleanup(&fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    let visible = fabric
+        .search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), "")
+        .unwrap();
+    assert!(visible
+        .packs
+        .iter()
+        .all(|p| p.pack_id != retired.pack.pack_id));
+    assert!(visible
+        .packs
+        .iter()
+        .any(|p| p.pack_id == other.pack.pack_id));
+    assert!(store.update(&entry).await.is_err());
+    assert!(store.insert(&entry).await.is_err());
+    assert!(!store.pending_memory_cleanup(None, 16).await.unwrap()[0].knowledge_confirmed);
+    connection
+        .batch_execute("DROP TRIGGER refuse_cleanup_pack ON knowledge_pack")
+        .unwrap();
+    drop(connection);
+    drop(kernel);
+    drop(manager);
+    assert!(weak.upgrade().is_none());
+    drop(fabric);
+    drop(knowledge);
+    drop(store);
+    drop(executor);
+    let reopened_executor = fixture.reconnect();
+    let reopened_store = Arc::new(PostgresMemoryStore::new(reopened_executor.clone()).unwrap());
+    let reopened_fabric = KnowledgeFabric::with_store(Arc::new(
+        PostgresKnowledgeStore::new(reopened_executor).unwrap(),
+    ))
+    .with_memory_sources(reopened_store.clone());
+    let reopened = memory::CognitiveContextManager::new_with_selected_store(
+        config(),
+        None,
+        None,
+        reopened_store.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(!config().governance.enabled);
+    // No client archive or explicit Graph registration is replayed.
+    assert!(reopened
+        .recover_memory_cleanup(&reopened_fabric, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(reopened_store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    let triples = reopened_store.load_triples(&scope).await.unwrap();
+    assert_eq!(triples.len(), 1);
+    assert_eq!(triples[0].id, "independent-triple");
+    assert_eq!(
+        reopened_store.load_triples("foreign-scope").await.unwrap()[0].id,
+        "same-scoped-triple"
+    );
+    let entities = reopened_store.load_entities(&scope).await.unwrap();
+    assert!(!entities.iter().any(|e| e.id == "only-source"));
+    assert!(entities
+        .iter()
+        .any(|e| e.id == "independent-empty" && e.source_ids.is_empty()));
+    assert_eq!(
+        entities
+            .iter()
+            .find(|e| e.id == "multi-source")
+            .unwrap()
+            .source_ids,
+        vec![independent.id.to_string()]
+    );
+    assert_eq!(
+        reopened_store.load_entities("foreign-scope").await.unwrap()[0].source_ids,
+        vec![entry.id.to_string()]
+    );
+    assert!(reopened_store.get(&entry.id).await.unwrap().is_some());
+    assert!(reopened_store
+        .load_verbatim_by_id(&entry.id.to_string())
+        .await
+        .unwrap()
+        .is_some());
+    memory::MemoryKernel::new(Arc::new(reopened))
+        .archive(&ctx, entry.id, "archive exactly once")
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened_store
+            .read_source_fence(&format!("memory:{}", entry.id))
+            .unwrap()
+            .unwrap()
+            .delete_epoch,
+        1
+    );
+    assert!(reopened_store
+        .pending_memory_cleanup(None, 16)
+        .await
+        .unwrap()
+        .is_empty());
+    // A live epoch-zero record cannot authorize a source whose body was
+    // physically removed by the still-unmigrated legacy erase caller.
+    reopened_store.delete(&independent.id).await.unwrap();
+    assert!(reopened_store
+        .read_source_fence(&format!("memory:{}", independent.id))
+        .is_err());
+    assert!(reopened_fabric
+        .search_namespace(&KnowledgeNamespace::Project("snapshot-test".into()), "")
+        .unwrap()
+        .packs
+        .iter()
+        .all(|p| p.pack_id != other.pack.pack_id));
+    drop(reopened_fabric);
+    drop(reopened_store);
+    drop(std::mem::ManuallyDrop::into_inner(fixture));
+    std::fs::remove_dir_all(root).unwrap();
 }

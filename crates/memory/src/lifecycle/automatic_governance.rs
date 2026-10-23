@@ -1134,11 +1134,12 @@ async fn archive_derived_memory(
         .transition_state(ctx, memory_id, state, reason)
         .await
         .map_err(|error| MemoryError::Store(error.to_string()))?;
-    manager.evict_vector_entry(&memory_id)?;
+    manager.notify_memory_cleanup();
     if let Some(fabric) = knowledge {
-        fabric
-            .quarantine_source(&format!("memory:{memory_id}"))
-            .map_err(|error| crate::MemoryError::Store(error.to_string()))?;
+        let errors = manager.recover_memory_cleanup(fabric, 64).await?;
+        if !errors.is_empty() {
+            return Err(crate::MemoryError::Store(errors.join("; ")));
+        }
     }
     Ok(())
 }

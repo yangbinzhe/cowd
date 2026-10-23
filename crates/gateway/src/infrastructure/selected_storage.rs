@@ -354,16 +354,18 @@ impl SelectedStorageTopology {
             )
             .map_err(stringify)?,
         );
-        let memory_store: Arc<dyn MemoryStore> = Arc::new(
+        let memory_owner = Arc::new(
             memory_postgres::PostgresMemoryStore::new(executor.clone()).map_err(stringify)?,
         );
+        let memory_store: Arc<dyn MemoryStore> = memory_owner.clone();
         let memory_maintenance_queue = memory::MaintenanceQueue::from_backend(Arc::new(
             memory_postgres::PostgresMaintenanceQueue::new(executor.clone()).map_err(stringify)?,
         ));
         let knowledge_store: Arc<dyn KnowledgeStore> = Arc::new(
             memory_postgres::PostgresKnowledgeStore::new(executor.clone()).map_err(stringify)?,
         );
-        let knowledge_fabric = KnowledgeFabric::with_store(Arc::clone(&knowledge_store));
+        let knowledge_fabric = KnowledgeFabric::with_store(Arc::clone(&knowledge_store))
+            .with_memory_sources(memory_owner);
         let runtime_event_store = Arc::new(
             runtime_postgres::PostgresRuntimeEventStore::new(executor.clone())
                 .map_err(stringify)?

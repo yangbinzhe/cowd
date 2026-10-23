@@ -7,7 +7,7 @@
 mod query;
 pub use query::{
     KnowledgeCandidateCursor, KnowledgeCandidatePage, KnowledgeCandidateScope,
-    KnowledgeSourceRevision, KNOWLEDGE_CANDIDATE_PAGE_SIZE,
+    KnowledgeCandidateSource, KnowledgeSourceRevision, KNOWLEDGE_CANDIDATE_PAGE_SIZE,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -439,6 +439,7 @@ pub struct KnowledgeTurnProjection {
 #[derive(Clone)]
 pub struct KnowledgeFabric {
     store: Arc<dyn KnowledgeStore>,
+    memory_sources: Option<Arc<dyn crate::store::MemorySourceFenceReader>>,
 }
 
 impl Default for KnowledgeFabric {
@@ -457,7 +458,53 @@ impl KnowledgeFabric {
     /// mirror nor turns a failed read into an empty, apparently healthy fabric.
     #[must_use]
     pub fn with_store(store: Arc<dyn KnowledgeStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            memory_sources: None,
+        }
+    }
+
+    /// Inject the original read-only Memory fence before exposing the fabric.
+    pub fn with_memory_sources(
+        mut self,
+        sources: Arc<dyn crate::store::MemorySourceFenceReader>,
+    ) -> Self {
+        self.memory_sources = Some(sources);
+        self
+    }
+
+    fn source_allowed(&self, source_ref: &str, namespace: &KnowledgeNamespace) -> bool {
+        if !source_ref.starts_with("memory:") {
+            return true;
+        }
+        let Some(reader) = self.memory_sources.as_ref() else {
+            return false;
+        };
+        let Ok(Some(fence)) = reader.read_source_fence(source_ref) else {
+            return false;
+        };
+        if fence.retired || fence.source_ref != source_ref {
+            return false;
+        }
+        use crate::MemoryScope;
+        match namespace {
+            KnowledgeNamespace::Project(id) => {
+                fence.scope_key == MemoryScope::Project(id.clone()).scope_key()
+            }
+            KnowledgeNamespace::SharedLibrary(id) => {
+                id == "global" && fence.scope_key == MemoryScope::Global.scope_key()
+            }
+            KnowledgeNamespace::Corpus(id) => [
+                MemoryScope::Session(id.clone()),
+                MemoryScope::Task(id.clone()),
+                MemoryScope::AgentDefinitionLineage(id.clone()),
+                MemoryScope::AgentInstance(id.clone()),
+                MemoryScope::TeamRun(id.clone()),
+            ]
+            .iter()
+            .any(|scope| scope.scope_key() == fence.scope_key),
+            _ => false,
+        }
     }
 
     pub fn ingest_document(
@@ -475,6 +522,15 @@ impl KnowledgeFabric {
         if input_bytes > KNOWLEDGE_READ_MAX_BYTES {
             return Err(KnowledgeStoreError::ReadLimit);
         }
+        if content
+            .source
+            .as_ref()
+            .is_some_and(|source| !self.source_allowed(source, &namespace))
+        {
+            return Err(KnowledgeStoreError::Backend(
+                "unverified or retired Memory ingestion source".into(),
+            ));
+        }
         let receipt = KnowledgeIngestionService::new().prepare_document(
             namespace,
             activation_policy,
@@ -482,6 +538,9 @@ impl KnowledgeFabric {
             content,
             false,
         );
+        if !self.source_allowed(&receipt.corpus.source_ref.id, &receipt.corpus.namespace) {
+            return Err(KnowledgeStoreError::StaleRead);
+        }
         self.store.save_receipt(&receipt)
     }
 
@@ -573,7 +632,7 @@ impl KnowledgeFabric {
         let mut remaining = KNOWLEDGE_READ_MAX_BYTES;
         let mut rows = 0usize;
         loop {
-            let page = self.store.read_candidate_page(
+            let mut page = self.store.read_candidate_page(
                 &scope,
                 cursor.as_ref(),
                 KNOWLEDGE_CANDIDATE_PAGE_SIZE,
@@ -583,7 +642,7 @@ impl KnowledgeFabric {
                 previous.validate(&scope, &page.revision)?;
             }
             rows = rows
-                .checked_add(page.packs.len() + page.canon.len())
+                .checked_add(page.packs.len() + page.canon.len() + page.sources.len())
                 .ok_or(KnowledgeStoreError::ReadLimit)?;
             if rows > KNOWLEDGE_READ_MAX_ROWS {
                 return Err(KnowledgeStoreError::ReadLimit);
@@ -609,6 +668,20 @@ impl KnowledgeFabric {
                     }
                 }
             }
+            page.packs.retain(|pack| {
+                pack.source_corpus_refs.iter().all(|id| {
+                    page.sources
+                        .iter()
+                        .find(|source| {
+                            &source.corpus_id == id && source.namespace == pack.namespace
+                        })
+                        .is_some_and(|source| {
+                            self.source_allowed(&source.source_ref, &pack.namespace)
+                        })
+                })
+            });
+            page.canon
+                .retain(|item| page.packs.iter().any(|pack| pack.pack_id == item.pack_id));
             for item in page.canon {
                 canon.insert(item.canon_id.clone(), item);
             }
@@ -1475,6 +1548,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         let mut budget = Budget(0);
         let mut packs = Vec::new();
         let mut canon = Vec::new();
+        let mut sources = Vec::new();
         for pack in selected.into_iter().take(limit) {
             serde_json::to_writer(&mut budget, pack).map_err(|_| KnowledgeStoreError::ReadLimit)?;
             if budget.0 > budget_bytes {
@@ -1497,6 +1571,28 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 }
                 canon.push(item);
             }
+            for id in &pack.source_corpus_refs {
+                if let Some(corpus) = state
+                    .corpus
+                    .get(id)
+                    .filter(|c| c.namespace == pack.namespace)
+                {
+                    // Reserve borrowed metadata before cloning either string.
+                    serde_json::to_writer(
+                        &mut budget,
+                        &(&corpus.corpus_id, &corpus.namespace, &corpus.source_ref.id),
+                    )
+                    .map_err(|_| KnowledgeStoreError::ReadLimit)?;
+                    if budget.0 > budget_bytes {
+                        return Err(KnowledgeStoreError::ReadLimit);
+                    }
+                    sources.push(KnowledgeCandidateSource {
+                        corpus_id: id.clone(),
+                        namespace: corpus.namespace.clone(),
+                        source_ref: corpus.source_ref.id.clone(),
+                    });
+                }
+            }
             packs.push(pack);
         }
         let next = if has_more {
@@ -1513,6 +1609,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             None
         };
         Ok(KnowledgeCandidatePage {
+            sources,
             packs: packs.into_iter().cloned().collect(),
             canon: canon.into_iter().cloned().collect(),
             revision,
@@ -2591,7 +2688,7 @@ mod tests {
             "Derived project decision",
             "The project must use the governed runtime path.",
         );
-        document.source = Some("memory:archived-source".to_string());
+        document.source = Some("import-fixture:archived-source".to_string());
         let receipt = fabric
             .ingest_document(
                 KnowledgeNamespace::Project("cowd".to_string()),
@@ -2600,7 +2697,9 @@ mod tests {
                 document,
             )
             .unwrap();
-        let quarantined = fabric.quarantine_source("memory:archived-source").unwrap();
+        let quarantined = fabric
+            .quarantine_source("import-fixture:archived-source")
+            .unwrap();
         assert_eq!(quarantined, vec![receipt.pack.pack_id.clone()]);
         let (activation, _, _) = fabric
             .activate("session", "governed runtime", "main_turn", Some("cowd"))
@@ -2752,7 +2851,7 @@ mod tests {
             "Retired conflict",
             "must retain speculative output\nmust not retain speculative output",
         );
-        document.source = Some("memory:retired-conflict".to_string());
+        document.source = Some("import-fixture:retired-conflict".to_string());
         let receipt = fabric
             .ingest_document(
                 KnowledgeNamespace::Project("cowd".to_string()),
@@ -2763,7 +2862,9 @@ mod tests {
             .unwrap();
         assert!(!receipt.conflicts.is_empty());
 
-        fabric.quarantine_source("memory:retired-conflict").unwrap();
+        fabric
+            .quarantine_source("import-fixture:retired-conflict")
+            .unwrap();
         let projection = fabric.projection().unwrap();
         assert_eq!(projection["health"]["unresolved_conflict_count"], 0);
         assert!(projection["maintenance_candidates"]
@@ -2993,7 +3094,7 @@ mod tests {
         fabric: &KnowledgeFabric,
     ) -> Result<KnowledgeIngestionReceipt, KnowledgeStoreError> {
         let mut document = DocumentContent::new("durable rule", "must retain approval evidence");
-        document.source = Some("memory:durable-rule".into());
+        document.source = Some("import-fixture:durable-rule".into());
         fabric.ingest_document(
             KnowledgeNamespace::Project("cowd".into()),
             KnowledgeActivationPolicy::DefaultForProjectGroup,
@@ -3035,7 +3136,9 @@ mod tests {
             receipt.pack, original.packs[0],
             "retry returns original committed timestamps and identity"
         );
-        reopened.quarantine_source("memory:durable-rule").unwrap();
+        reopened
+            .quarantine_source("import-fixture:durable-rule")
+            .unwrap();
         let repeated = ingest_fault_test(&reopened).unwrap();
         assert_eq!(
             repeated.pack, receipt.pack,
@@ -3062,7 +3165,9 @@ mod tests {
             .search_namespace(&KnowledgeNamespace::Project("cowd".into()), "")
             .is_err());
         assert!(fabric.projection().is_err());
-        assert!(fabric.quarantine_source("memory:durable-rule").is_err());
+        assert!(fabric
+            .quarantine_source("import-fixture:durable-rule")
+            .is_err());
         assert!(fabric.consolidate_exact_duplicates().is_err());
         assert_eq!(
             store.inner.snapshot().unwrap().packs[0].state,
@@ -3198,7 +3303,9 @@ mod tests {
             KNOWLEDGE_READ_MAX_ROWS + 1
         );
         assert_eq!(
-            fabric.quarantine_source("memory:durable-rule").unwrap(),
+            fabric
+                .quarantine_source("import-fixture:durable-rule")
+                .unwrap(),
             vec![receipt.pack.pack_id]
         );
     }

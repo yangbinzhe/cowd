@@ -370,6 +370,27 @@ impl crate::store::MemoryStore for NoopStore {
     async fn delete(&self, _id: &MemoryId) -> crate::store::Result<()> {
         Ok(())
     }
+    async fn commit_lifecycle(
+        &self,
+        _: crate::store::MemoryLifecycleMutation,
+    ) -> crate::store::Result<crate::store::MemoryLifecycleReceipt> {
+        Self::unavailable()
+    }
+    async fn pending_memory_cleanup(
+        &self,
+        _: Option<&str>,
+        _: usize,
+    ) -> crate::store::Result<Vec<crate::store::MemoryCleanupPending>> {
+        Self::unavailable()
+    }
+    async fn confirm_memory_cleanup(
+        &self,
+        _: &crate::store::MemoryCleanupPending,
+        _: bool,
+        _: bool,
+    ) -> crate::store::Result<()> {
+        Self::unavailable()
+    }
     async fn search_fts(
         &self,
         _query: &str,
