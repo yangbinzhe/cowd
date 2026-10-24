@@ -1908,37 +1908,22 @@ async fn terminal_receipt_operation(
         state.services.runtime.as_ref(),
     ) {
         let port = runtime.runtime_services().session_terminal_delivery();
-        let terminal_id = format!("turn-terminal:{}", input.request_id);
-        let lookup = terminal_id.clone();
+        let lookup = format!("turn-terminal:{}", input.request_id);
         let record = tokio::task::spawn_blocking(move || port.get(&lookup))
             .await
             .ok()
             .and_then(Result::ok)
             .flatten();
-        if let Some(record) = record.filter(|record| {
-            record.terminal_id == terminal_id
-                && record.session_id == source.session_id
-                && record.message_id == format!("assistant:{}", input.message_id)
-                && record.execution_id.as_deref() == Some(source.execution_id.as_str())
-                && record.turn_id.as_deref() == Some(source.turn_id.as_str())
-                && record.request_id.as_deref() == Some(input.request_id.as_str())
-                && Some(record.commit_cursor) == input.runtime_commit_cursor
-                && record.session_generation == Some(input.session_generation)
-                && record.input_sequence == u64::try_from(input.sequence).ok()
-        }) {
-            *outbox_observation =
-                harness_contract::live::SessionReceiptOutboxObservation::RuntimeOutbox {
-                    terminal_id: record.terminal_id,
-                    revision: record.revision.to_string(),
-                    status: record.status,
-                    materialized_at_ms: record.materialized_at_ms,
-                    runtime_commit_cursor: harness_contract::live::ReceiptCursor::parse(
-                        &record.commit_cursor.to_string(),
-                    )?,
-                    execution_id: record.execution_id,
-                    turn_id: input.turn_id.clone(),
-                    request_id: input.request_id.clone(),
-                };
+        if let Some(record) = record {
+            if let Some(observation) =
+                super::session_service::SessionService::receipt_runtime_outbox_observation(
+                    input,
+                    record,
+                    Some(&source),
+                )?
+            {
+                *outbox_observation = observation;
+            }
         }
     }
     if operation_id == SESSION_TERMINAL_RECEIPT_READ_OPERATION_ID {

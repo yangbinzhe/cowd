@@ -259,41 +259,18 @@ async fn get_terminal_message_receipt_context(
             state.services.runtime.as_ref(),
         ) {
             let port = runtime.runtime_services().session_terminal_delivery();
-            let terminal_id = format!("turn-terminal:{}", input.request_id);
-            let lookup = terminal_id.clone();
+            let lookup = format!("turn-terminal:{}", input.request_id);
             let record = tokio::task::spawn_blocking(move || port.get(&lookup))
                 .await
                 .ok()
                 .and_then(Result::ok)
                 .flatten();
-            if let Some(record) = record.filter(|record| {
-                record.terminal_id == terminal_id
-                    && record.session_id == input.session_id
-                    && record.message_id == format!("assistant:{}", input.message_id)
-                    && Some(record.commit_cursor) == input.runtime_commit_cursor
-                    && record.request_id.as_deref() == Some(input.request_id.as_str())
-                    && record.turn_id.as_deref() == Some(input.turn_id.as_str())
-                    && record.session_generation == Some(input.session_generation)
-                    && record.input_sequence == u64::try_from(input.sequence).ok()
-            }) {
-                *outbox_observation =
-                    harness_contract::live::SessionReceiptOutboxObservation::RuntimeOutbox {
-                        terminal_id: record.terminal_id,
-                        revision: record.revision.to_string(),
-                        status: record.status,
-                        materialized_at_ms: record.materialized_at_ms,
-                        runtime_commit_cursor: harness_contract::live::ReceiptCursor::parse(
-                            &record.commit_cursor.to_string(),
-                        )
-                        .map_err(|_| {
-                            receipt_store_error(session::SessionError::Store(
-                                "outbox cursor unavailable".into(),
-                            ))
-                        })?,
-                        execution_id: record.execution_id,
-                        turn_id: input.turn_id.clone(),
-                        request_id: input.request_id.clone(),
-                    };
+            if let Some(record) = record {
+                if let Some(observation) = crate::services::session_service::SessionService::receipt_runtime_outbox_observation(input, record, None)
+                    .map_err(|_| receipt_store_error(session::SessionError::Store("outbox cursor unavailable".into())))?
+                {
+                    *outbox_observation = observation;
+                }
             }
         }
         serde_json::to_value(result.context).map_err(|_| {

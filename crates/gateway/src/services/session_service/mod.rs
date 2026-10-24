@@ -1938,6 +1938,48 @@ impl SessionService {
             .await
     }
 
+    /// Observe an original Runtime outbox record after the caller has authorized
+    /// the Session input. APP callers also supply their current authenticated
+    /// frame; its execution/turn identity remains mandatory.
+    pub(crate) fn receipt_runtime_outbox_observation(
+        input: &SessionRuntimeOutboxRecord,
+        record: runtime::RuntimeSessionOutboxRecord,
+        frame_source: Option<&session::SessionReceiptSource>,
+    ) -> Result<Option<harness_contract::live::SessionReceiptOutboxObservation>, &'static str> {
+        let session_id = frame_source.map_or(input.session_id.as_str(), |source| {
+            source.session_id.as_str()
+        });
+        let turn_id = frame_source.map_or(input.turn_id.as_str(), |source| source.turn_id.as_str());
+        if record.terminal_id != format!("turn-terminal:{}", input.request_id)
+            || record.session_id != session_id
+            || record.message_id != format!("assistant:{}", input.message_id)
+            || Some(record.commit_cursor) != input.runtime_commit_cursor
+            || record.request_id.as_deref() != Some(input.request_id.as_str())
+            || record.turn_id.as_deref() != Some(turn_id)
+            || record.session_generation != Some(input.session_generation)
+            || record.input_sequence != u64::try_from(input.sequence).ok()
+            || frame_source.is_some_and(|source| {
+                record.execution_id.as_deref() != Some(source.execution_id.as_str())
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            harness_contract::live::SessionReceiptOutboxObservation::RuntimeOutbox {
+                terminal_id: record.terminal_id,
+                revision: record.revision.to_string(),
+                status: record.status,
+                materialized_at_ms: record.materialized_at_ms,
+                runtime_commit_cursor: harness_contract::live::ReceiptCursor::parse(
+                    &record.commit_cursor.to_string(),
+                )?,
+                execution_id: record.execution_id,
+                turn_id: input.turn_id.clone(),
+                request_id: input.request_id.clone(),
+            },
+        ))
+    }
+
     pub(crate) async fn get_terminal_message_receipt_context(
         &self,
         query: session::SessionTerminalReceiptQuery,
@@ -3421,6 +3463,109 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             status: "active".to_string(),
+        }
+    }
+
+    #[test]
+    fn receipt_outbox_observation_preserves_exact_input_and_app_frame_identity() {
+        let input: SessionRuntimeOutboxRecord = serde_json::from_value(serde_json::json!({
+            "input_id":"input-1", "request_id":"request-1", "turn_id":"turn-1",
+            "message_id":"user-1", "session_id":"session-1", "sequence":7,
+            "session_generation":3, "decision":"start_new_turn", "status":"completed",
+            "runtime_commit_cursor":9007199254740993_u64, "attempts":1,
+            "next_attempt_at_ms":0, "revision":2, "created_at_ms":1, "updated_at_ms":2
+        }))
+        .unwrap();
+        let record_json = serde_json::json!({
+            "terminal_id":"turn-terminal:request-1", "message_id":"assistant:user-1",
+            "session_id":"session-1", "commit_cursor":9007199254740993_u64,
+            "payload_ref":"artifact://original", "execution_id":"execution-1",
+            "turn_id":"turn-1", "request_id":"request-1", "session_generation":3,
+            "input_sequence":7, "status":"materialized", "attempts":1,
+            "materialized_at_ms":42, "revision":23
+        });
+        let source: session::SessionReceiptSource = serde_json::from_value(serde_json::json!({
+            "principal_id":"principal", "tenant_id":"tenant", "workspace_id":"workspace",
+            "app_id":"app", "app_generation":"1", "profile_revision":"1",
+            "credential_epoch":"1", "frame_nonce":"nonce", "transport_id":"transport",
+            "attachment_revision":"1", "expires_at_ms":100, "session_id":"session-1",
+            "turn_id":"turn-1", "execution_id":"execution-1", "root_task_id":"task-1",
+            "lineage_generation":"1", "purpose":"receipt"
+        }))
+        .unwrap();
+        let expected = serde_json::json!({
+            "source":"runtime_outbox", "terminal_id":"turn-terminal:request-1",
+            "revision":"23", "status":"materialized", "materialized_at_ms":42,
+            "runtime_commit_cursor":"9007199254740993", "execution_id":"execution-1",
+            "turn_id":"turn-1", "request_id":"request-1"
+        });
+        for frame in [None, Some(&source)] {
+            let observation = SessionService::receipt_runtime_outbox_observation(
+                &input,
+                serde_json::from_value(record_json.clone()).unwrap(),
+                frame,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(serde_json::to_value(observation).unwrap(), expected);
+            for (field, value) in [
+                ("terminal_id", serde_json::json!("turn-terminal:foreign")),
+                ("message_id", serde_json::json!("assistant:foreign")),
+                ("session_id", serde_json::json!("foreign")),
+                ("commit_cursor", serde_json::json!(9007199254740994_u64)),
+                ("request_id", serde_json::json!("foreign")),
+                ("turn_id", serde_json::json!("foreign")),
+                ("session_generation", serde_json::json!(4)),
+                ("input_sequence", serde_json::json!(8)),
+            ] {
+                let mut changed = record_json.clone();
+                changed[field] = value;
+                assert!(
+                    SessionService::receipt_runtime_outbox_observation(
+                        &input,
+                        serde_json::from_value(changed).unwrap(),
+                        frame,
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "foreign {field}"
+                );
+            }
+        }
+        // REST has Session authority; only APP additionally requires the exact
+        // authenticated frame execution. Neither observation records an ACK.
+        for execution in [serde_json::Value::Null, serde_json::json!("foreign")] {
+            let mut changed = record_json.clone();
+            changed["execution_id"] = execution;
+            let record: runtime::RuntimeSessionOutboxRecord =
+                serde_json::from_value(changed).unwrap();
+            assert!(SessionService::receipt_runtime_outbox_observation(
+                &input,
+                record.clone(),
+                None
+            )
+            .unwrap()
+            .is_some());
+            assert!(SessionService::receipt_runtime_outbox_observation(
+                &input,
+                record,
+                Some(&source)
+            )
+            .unwrap()
+            .is_none());
+        }
+        for invalid_cursor in [0, i64::MAX as u64 + 1] {
+            let mut invalid_input = input.clone();
+            invalid_input.runtime_commit_cursor = Some(invalid_cursor);
+            let mut record: runtime::RuntimeSessionOutboxRecord =
+                serde_json::from_value(record_json.clone()).unwrap();
+            record.commit_cursor = invalid_cursor;
+            assert!(SessionService::receipt_runtime_outbox_observation(
+                &invalid_input,
+                record,
+                None
+            )
+            .is_err());
         }
     }
 
