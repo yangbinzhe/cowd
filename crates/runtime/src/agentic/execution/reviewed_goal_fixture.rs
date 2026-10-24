@@ -3185,7 +3185,7 @@ impl R1ScopedReviewer {
         #[cfg(test)]
         let retire =
             diagnostic_1120::Boundary::enter("aggregate.reviewer.retire_control", identity.clone());
-        self.reader.retire_control(&withdrawn, &task_ref).await;
+        let transport = self.reader.retire_control(&withdrawn, &task_ref).await;
         #[cfg(test)]
         retire.end();
         #[cfg(test)]
@@ -3220,6 +3220,8 @@ impl R1ScopedReviewer {
             crate::AgenticTaskStatus::Withdrawn
         );
         assert!(program.tasks[&task_ref].active_attempts.is_empty());
+        self.reader
+            .assert_retired_control(&withdrawn, &task_ref, &transport);
     }
 }
 
@@ -6904,7 +6906,7 @@ impl PhysicalWorker {
             expected_revision: None,
             action,
         };
-        self.process.retire_control(&withdrawal, &self.task_ref).await;
+        let transport = self.process.retire_control(&withdrawal, &self.task_ref).await;
         assert!(claim_sequence < self.assert_original_control_action(&withdrawal));
         let retiring = services
             .agent_action_service()
@@ -6952,6 +6954,8 @@ impl PhysicalWorker {
             "original withdrawal owner must settle after authenticated physical exit: {error:?}; reactor_health={:?}",
             services.event_reactor_health(),
         ));
+        self.process
+            .assert_retired_control(&withdrawal, &self.task_ref, &transport);
         assert_eq!(services.goal_store().get(&goal_id).unwrap(), goal_before);
     }
     pub(super) async fn finish_only(&self) {
@@ -9209,48 +9213,259 @@ impl RealProcessSession {
         }).await.map_err(|_| "Process exit snapshot authentication did not stabilize".to_string())?
     }
 
-    async fn retire_control(&self, envelope: &AgentActionEnvelope, task_ref: &str) {
-        assert_eq!(envelope.actor.execution_id.as_deref(), Some(self.packet.graph_id()));
+    async fn retire_control(
+        &self,
+        envelope: &AgentActionEnvelope,
+        task_ref: &str,
+    ) -> Result<(), String> {
+        assert_eq!(
+            envelope.actor.execution_id.as_deref(),
+            Some(self.packet.graph_id())
+        );
         assert!(match &envelope.action {
             AgentAction::TaskWithdraw(input) => input.task_ref == task_ref,
             AgentAction::TaskSupersede(input) => input.task_ref == task_ref,
             _ => false,
         });
         let worker = PhysicalWorker {
-            process: RealProcessSession { services: self.services.clone(), packet: self.packet.clone() },
+            process: RealProcessSession {
+                services: self.services.clone(),
+                packet: self.packet.clone(),
+            },
             root_actor: envelope.actor.clone(),
             packet: self.packet.clone(),
             task_ref: task_ref.into(),
         };
         let request_id = format!("{}:invocation:retirement", envelope.action_id);
+        #[cfg(test)]
+        let response = if CANCEL_FIRST_1147.try_with(|_| ()).is_ok() {
+            use crate::execution_core::services::RetirementOwnerTestGate;
+            use std::sync::atomic::Ordering;
+            // The scoped test controls only real transport ordering. Both
+            // orders use the same authentication and caller final assertions.
+            struct Release(Arc<RetirementOwnerTestGate>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.release_cancel();
+                    self.0.release_response();
+                }
+            }
+            let gate =
+                RetirementOwnerTestGate::new(self.packet.clone(), envelope.action_id.clone());
+            gate.release_response(); // ToolHost/ToolPlane may finish; only original worker receive is held.
+            self.services
+                .install_retirement_owner_test_gate(gate.clone());
+            let _release = Release(gate.clone());
+            let exit_gate = self
+                .services
+                .agent_runtime()
+                .process_fixture_exit_gate(false);
+            let _release_exit = native_retirement_479::ReleaseProcessGate(exit_gate.clone());
+            self.prepare_action_metadata_239(envelope, &request_id)
+                .unwrap();
+            diagnostic_1120::record(
+                "1147.packet",
+                serde_json::json!({
+                    "packet":self.packet,"envelope":envelope,"request_id":request_id,
+                    "fault":"existing Process defer_receive; no receive-release until cancellation",
+                }),
+            );
+            let encoded = serde_json::to_value(&envelope.action).unwrap();
+            // This is the existing raw fixture command port. The real worker
+            // still begins its authenticated Step and calls original ToolHost;
+            // no action is applied by the test or by an alternate dispatcher.
+            let request = self.command(serde_json::json!({
+                "request_id":request_id,"tool_name":encoded["kind"],
+                "input":encoded["input"],"defer_receive":true,
+            }));
+            tokio::pin!(request);
+            let directory = process_control_directory(&self.services, &self.packet);
+            let entered = async {
+                gate.until(|| gate.semantic_committed.load(Ordering::Acquire))
+                    .await;
+                gate.until(|| gate.postcommit_returned.load(Ordering::Acquire))
+                    .await;
+                gate.until(|| gate.cancel_hits.load(Ordering::Acquire) > 0)
+                    .await;
+                loop {
+                    if let Ok(bytes) = std::fs::read(directory.join("receive-held.json")) {
+                        let marker: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(marker["request_id"], request_id);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::select! {
+                response = &mut request => panic!("cancel-first fault not hit; original request returned before receive/cancel handshake: {response:?}"),
+                () = entered => {}
+            }
+            assert!(!directory.join("receive-release.json").exists());
+            diagnostic_1120::record(
+                "1147.receive_held",
+                serde_json::json!({
+                    "action_id":envelope.action_id,"request_id":request_id,
+                    "semantic":gate.semantic_committed.load(Ordering::Acquire),
+                    "postcommit":gate.postcommit_returned.load(Ordering::Acquire),
+                    "cancel_hits":gate.cancel_hits.load(Ordering::Acquire),
+                }),
+            );
+            gate.release_cancel();
+            while !exit_gate.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            diagnostic_1120::record(
+                "1147.cancel_first_hit",
+                serde_json::json!({
+                    "request_id":request_id,"process_driver_exit_gate_entered":true,
+                    "worker_receive_still_held":!directory.join("receive-release.json").exists(),
+                }),
+            );
+            exit_gate.release();
+            let response = request.await;
+            assert!(
+                response.is_err(),
+                "real cancel-first must prevent the original response file; got {response:?}"
+            );
+            response.and_then(|value| {
+                if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+                    return Err(error.to_string());
+                }
+                let output = value["output"]
+                    .as_str()
+                    .ok_or("Process response lacks output")?;
+                serde_json::from_str::<harness_contract::agent_action::AgentActionObservation>(
+                    output,
+                )
+                .map_err(|error| error.to_string())
+            })
+        } else {
+            self.action_with_request_id(envelope, &request_id).await
+        };
+        #[cfg(not(test))]
         let response = self.action_with_request_id(envelope, &request_id).await;
         match &response {
             Ok(observation) => {
-                assert_eq!(observation.status, harness_contract::agent_action::AgentActionStatus::Applied,
-                    "{observation:?}");
+                assert_eq!(
+                    observation.status,
+                    harness_contract::agent_action::AgentActionStatus::Applied,
+                    "{observation:?}"
+                );
                 assert_eq!(observation.action_id, envelope.action_id);
                 assert_eq!(observation.program_id, envelope.actor.program_id);
                 assert_eq!(observation.action, envelope.action.kind());
                 assert!(!observation.duplicate);
-                assert_eq!(observation.revision, worker.assert_original_control_transport(envelope));
+                assert_eq!(
+                    observation.revision,
+                    worker.assert_original_control_transport(envelope)
+                );
                 assert_eq!(observation.changed_refs, vec![task_ref.to_string()]);
             }
             Err(error) => {
+                let bounded_error = error.chars().take(4096).collect::<String>();
+                let identity = serde_json::json!({
+                    "packet":self.packet,"envelope":envelope,"request_id":request_id,
+                    "snapshot":self.services.agent_runtime().get(self.packet.agent_id()),
+                    "graph":self.services.graph_state_store().load(self.packet.graph_id())
+                        .map(|graph| serde_json::json!({
+                            "id":graph.id,"revision":graph.revision,"status":graph.node_statuses,
+                        })).map_err(|error| error.to_string()),
+                    "error":bounded_error,
+                    "error_sha256":crate::context_evidence::read_sha256(error.as_bytes()),
+                    "response_delivered":false,"transport_completion_proven":false,
+                });
+                #[cfg(test)]
+                diagnostic_1120::record("1148.transport_unconfirmed", identity.clone());
+                eprintln!("R1_772_CONTROL_RESPONSE_UNCONFIRMED {identity}");
                 worker.assert_original_control_action(envelope);
-                assert!(confirmed_run_exit_with_retry(self.services.event_store(), &self.packet).is_some(), "retirement requires authenticated original physical exit");
-                let run = self.services.agent_runtime().get(self.packet.agent_id()).unwrap();
-                assert_eq!(run.status, harness_contract::agent::AgentStatus::Cancelled);
-                assert_eq!(run.failure.as_deref(), Some("agent cancelled by command"));
-                assert_eq!(self.services.graph_state_store().load(self.packet.graph_id()).unwrap()
-                    .node_statuses[self.packet.node_id()], ExecutionNodeStatus::Cancelled);
-                assert!(worker.lifecycle().no_direct_effects());
-                eprintln!("R1_772_CONTROL_RESPONSE_UNCONFIRMED {}", serde_json::json!({
-                    "action_id": envelope.action_id, "request_id": request_id, "error": error,
-                    "response_delivered": false, "transport_completion_proven": false,
-                    "semantic_receipt": "original_agentic.action_applied",
-                }));
+                assert!(
+                    confirmed_run_exit_with_retry(self.services.event_store(), &self.packet)
+                        .is_some(),
+                    "retirement requires authenticated original physical exit"
+                );
             }
         }
+        response.map(|_| ())
+    }
+
+    // Read-only postconditions at each caller's existing terminal boundary.
+    // A lost transport response remains Err even after authentic retirement.
+    fn assert_retired_control(
+        &self,
+        envelope: &AgentActionEnvelope,
+        task_ref: &str,
+        transport: &Result<(), String>,
+    ) {
+        assert_eq!(
+            envelope.actor.execution_id.as_deref(),
+            Some(self.packet.graph_id())
+        );
+        let program = self
+            .services
+            .agent_action_service()
+            .project(&envelope.actor.program_id)
+            .unwrap();
+        let task = program
+            .tasks
+            .get(task_ref)
+            .expect("retirement must retain the original Task");
+        assert_eq!(task.status, crate::AgenticTaskStatus::Withdrawn);
+        assert!(task.active_attempts.is_empty());
+        assert!(confirmed_run_exit_with_retry(self.services.event_store(), &self.packet).is_some());
+        assert!(original_binding_closures_ready(
+            &self.services,
+            self.packet.graph_id(),
+            Some(&self.packet),
+        )
+        .expect("original retirement closure must authenticate")
+        .is_some());
+        let run = self
+            .services
+            .agent_runtime()
+            .get(self.packet.agent_id())
+            .unwrap();
+        assert_eq!(run.agent_id, self.packet.agent_id());
+        assert_eq!(run.run_id, self.packet.run_id());
+        assert_eq!(run.graph_id, self.packet.graph_id());
+        assert_eq!(run.node_id, self.packet.node_id());
+        assert_eq!(run.attempt, self.packet.attempt);
+        assert!(
+            run.status.is_terminal(),
+            "original Agent must retire: {run:?}"
+        );
+        match transport {
+            Ok(()) => {}
+            Err(_) => {
+                assert_eq!(run.status, harness_contract::agent::AgentStatus::Cancelled);
+                assert_eq!(run.failure.as_deref(), Some("agent cancelled by command"));
+                assert_eq!(
+                    self.services
+                        .graph_state_store()
+                        .load(self.packet.graph_id())
+                        .unwrap()
+                        .node_statuses[self.packet.node_id()],
+                    ExecutionNodeStatus::Cancelled
+                );
+                let worker = PhysicalWorker {
+                    process: self.clone(),
+                    root_actor: envelope.actor.clone(),
+                    packet: self.packet.clone(),
+                    task_ref: task_ref.into(),
+                };
+                assert!(worker.lifecycle().no_direct_effects());
+            }
+        }
+        #[cfg(test)]
+        diagnostic_1120::record(
+            "1148.final_postconditions",
+            serde_json::json!({
+                "packet":self.packet,"action_id":envelope.action_id,"task_ref":task_ref,
+                "snapshot":run,"actual_response_delivered":transport.is_ok(),
+                "transport_error_sha256":transport.as_ref().err()
+                    .map(|error| crate::context_evidence::read_sha256(error.as_bytes())),
+                "same_packet_task_exit_closure":true,"final_conditions_checked":true,
+            }),
+        );
     }
 
     async fn action(
@@ -15086,18 +15301,28 @@ fn assert_native_sources_b_case(
 }
 
 #[cfg(test)]
+tokio::task_local! { static CANCEL_FIRST_1147: (); }
+
+#[cfg(test)]
 #[tokio::test]
 async fn r1_772_original_self_withdrawal_761_retires_without_control_graph() {
-    let fixture = PhysicalProcessFixture::new(
-        crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
-        "772-semantic-retirement-discriminator",
-    ).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(50);
+    let fixture = tokio::time::timeout_at(
+        deadline,
+        PhysicalProcessFixture::new(
+            crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+            "772-semantic-retirement-discriminator",
+        ),
+    )
+    .await
+    .expect("cancel-first absolute setup deadline");
     let services = &fixture.services;
     let _cleanup = RealFixtureCleanup {
         services: services.clone(),
         host: fixture.host.clone(),
     };
     _cleanup.protect(async {
+    tokio::time::timeout_at(deadline, CANCEL_FIRST_1147.scope((), async {
 
     let worker = fixture.dispatch("772-self-withdraw", vec!["read:.".into()], false, false, true).await;
     let goal_id = format!("goal:{}", worker.root_actor.root_execution_id.as_ref().unwrap());
@@ -15145,6 +15370,8 @@ async fn r1_772_original_self_withdrawal_761_retires_without_control_graph() {
         "goal_present": goal_present,
         "goal_unchanged": services.goal_store().get(&goal_id).unwrap() == goal_before,
     }));
+    _cleanup.close_completed_consumer().await;
+    })).await.expect("single absolute cancel-first deadline; no stacked waiting budget");
     }, || {}).await;
 }
 
