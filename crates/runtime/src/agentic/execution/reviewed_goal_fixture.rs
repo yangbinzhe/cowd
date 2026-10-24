@@ -3251,6 +3251,192 @@ async fn start_r1_scoped_goal_worker(
     read_target: bool,
     can_write: bool,
 ) -> R1ScopedReviewer {
+    #[cfg(test)]
+    fn observe_dispatch_1150(
+        services: &ReviewedFixtureServices,
+        stage: &str,
+        publication: &AgentActionEnvelope,
+        published: Option<&harness_contract::agent_action::AgentActionObservation>,
+        returned: Option<&Result<Vec<AgenticDispatchReceipt>, String>>,
+    ) {
+        let stamp = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos().to_string())
+                .unwrap_or_else(|error| format!("clock_error:{error}"))
+        };
+        let started = stamp();
+        let task_ref = published.and_then(|value| value.changed_refs.first());
+        let team_ref = match &publication.action {
+            AgentAction::TaskPublish(input) => Some(input.team_ref.as_str()),
+            _ => None,
+        };
+        diagnostic_1120::record(
+            "1150.dispatch_call",
+            serde_json::json!({
+                "stage":stage,"started_ns":started,"publication":publication,
+                "published":published,"task_ref":task_ref,"returned":returned,
+                "cross_source_atomic":false,
+            }),
+        );
+        let store = services.event_store();
+        let stream = format!("agentic-program:{}", publication.actor.program_id);
+        let before = store
+            .stream_revision(&stream)
+            .map_err(|error| error.to_string());
+        let program = services
+            .agent_action_service()
+            .project(&publication.actor.program_id);
+        let mut graphs = std::collections::BTreeSet::new();
+        if let Some(root) = publication.actor.root_execution_id.as_ref() {
+            graphs.insert(root.clone());
+        }
+        match program {
+            Ok(program) => {
+                let members = program
+                    .memberships
+                    .values()
+                    .filter(|member| Some(member.team_id.as_str()) == team_ref)
+                    .take(17)
+                    .collect::<Vec<_>>();
+                let member_ids = members
+                    .iter()
+                    .take(16)
+                    .map(|member| member.agent_id.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let agents = member_ids
+                    .iter()
+                    .filter_map(|id| program.agents.get(*id))
+                    .collect::<Vec<_>>();
+                let task = task_ref.and_then(|reference| program.tasks.get(reference));
+                if let Some(task) = task {
+                    graphs.extend(task.claim_execution_id.iter().cloned());
+                    graphs.extend(
+                        task.active_attempts
+                            .values()
+                            .map(|attempt| attempt.execution_id.clone()),
+                    );
+                }
+                let occupied = program.tasks.iter().filter(|(_, task)| {
+                    task.active_attempts.values().any(|attempt| member_ids.contains(attempt.agent_id.as_str()))
+                }).take(17).map(|(id, task)| serde_json::json!({
+                    "task_ref":id,"status":task.status,"active_attempts":task.active_attempts,
+                })).collect::<Vec<_>>();
+                let after = store
+                    .stream_revision(&stream)
+                    .map_err(|error| error.to_string());
+                diagnostic_1120::record(
+                    "1150.program",
+                    serde_json::json!({
+                        "stage":stage,"started_ns":started,"ended_ns":stamp(),
+                        "stream":stream,"before":before,"after":after,
+                        "program_id":program.program_id,"revision":program.revision,"status":program.status,
+                        "root_execution_id":program.root_execution_id,"session_id":program.session_id,"turn_id":program.turn_id,
+                        "task_ref":task_ref,"task":task,"team_ref":team_ref,
+                        "team":team_ref.and_then(|id| program.teams.get(id)),"members":members,
+                        "agents":agents,"member_occupied_tasks":occupied,
+                        "incomplete_members":members.len()>16,"incomplete_occupied":occupied.len()>16,
+                        "missing_task":task_ref.is_some() && task.is_none(),"cross_source_atomic":false,
+                    }),
+                );
+            }
+            Err(error) => diagnostic_1120::record(
+                "1150.program",
+                serde_json::json!({
+                    "stage":stage,"started_ns":started,"ended_ns":stamp(),"stream":stream,
+                    "before":before,"missing":error.to_string(),"cross_source_atomic":false,
+                }),
+            ),
+        }
+        if let Some(Ok(receipts)) = returned {
+            graphs.extend(
+                receipts
+                    .iter()
+                    .take(16)
+                    .map(|receipt| receipt.graph_id.clone()),
+            );
+        }
+        for id in graphs.iter().take(16) {
+            let began = stamp();
+            let graph = services
+                .graph_state_store()
+                .load(id)
+                .map_err(|error| error.to_string());
+            diagnostic_1120::record(
+                "1150.graph",
+                serde_json::json!({
+                    "stage":stage,"started_ns":began,"ended_ns":stamp(),"graph_id":id,
+                    "original_graph":graph,"incomplete_candidates":graphs.len()>16,"cross_source_atomic":false,
+                }),
+            );
+        }
+        let stream = format!("agentic-dispatch:{}", publication.actor.program_id);
+        let began = stamp();
+        match store.stream_revision(&stream) {
+            Ok(head) => {
+                let from = head.saturating_sub(128);
+                let mut cursor = from;
+                let mut matched = 0;
+                let mut missing = None;
+                for _ in 0..4 {
+                    if cursor >= head {
+                        break;
+                    }
+                    match store.list_stream_after(&stream, cursor, head, 64, 256 * 1024) {
+                        Ok(page) if !page.is_empty() => {
+                            for event in page {
+                                if event.sequence <= cursor || event.sequence > head {
+                                    missing = Some("invalid bounded dispatch cursor".to_string());
+                                    break;
+                                }
+                                cursor = event.sequence;
+                                if task_ref.is_some_and(|reference| {
+                                    event.payload["task_ref"] == *reference
+                                }) {
+                                    matched += 1;
+                                    diagnostic_1120::record(
+                                        "1150.dispatch_event",
+                                        serde_json::json!({
+                                            "stage":stage,"read_started_ns":began,"event":event,
+                                            "includes_preexisting_deduplicated_records":true,
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            missing = Some("bounded dispatch page empty before head".into());
+                            break;
+                        }
+                        Err(error) => {
+                            missing = Some(error.to_string());
+                            break;
+                        }
+                    }
+                    if missing.is_some() {
+                        break;
+                    }
+                }
+                diagnostic_1120::record(
+                    "1150.dispatch_cut",
+                    serde_json::json!({
+                        "stage":stage,"started_ns":began,"ended_ns":stamp(),"stream":stream,
+                        "from_exclusive":from,"head":head,"next_sequence":cursor,"matched":matched,
+                        "after_head":store.stream_revision(&stream).map_err(|error| error.to_string()),
+                        "incomplete":from>0 || cursor<head || missing.is_some(),"missing":missing,
+                        "new_events_only":false,"cross_source_atomic":false,
+                    }),
+                );
+            }
+            Err(error) => diagnostic_1120::record(
+                "1150.dispatch_cut",
+                serde_json::json!({
+                    "stage":stage,"started_ns":began,"ended_ns":stamp(),"stream":stream,
+                    "missing":error.to_string(),"incomplete":true,"cross_source_atomic":false,
+                }),
+            ),
+        }
+    }
     let envelope = |id: &str, action: AgentAction| AgentActionEnvelope {
         action_id: format!("{namespace}:{id}"),
         actor: root_actor.clone(),
@@ -3320,7 +3506,17 @@ async fn start_r1_scoped_goal_worker(
             expertise_hints: Vec::new(),
         }),
     );
+    #[cfg(test)]
+    observe_dispatch_1150(services, "before_publication", &publication, None, None);
     let published = services.submit_agent_action(&publication).await.unwrap();
+    #[cfg(test)]
+    observe_dispatch_1150(
+        services,
+        "published_before_dispatch",
+        &publication,
+        Some(&published),
+        None,
+    );
     assert_eq!(
         published.status,
         harness_contract::agent_action::AgentActionStatus::Applied,
@@ -3342,8 +3538,16 @@ async fn start_r1_scoped_goal_worker(
                 resource_scopes: vec!["workspace:.".into()],
             },
         )
-        .await
-        .unwrap();
+        .await;
+    #[cfg(test)]
+    observe_dispatch_1150(
+        services,
+        "dispatch_returned_before_assert",
+        &publication,
+        Some(&published),
+        Some(&receipts),
+    );
+    let receipts = receipts.unwrap();
     assert_eq!(receipts.len(), 1);
     wait_real_process(services, &receipts[0].graph_id).await;
     let graph = services

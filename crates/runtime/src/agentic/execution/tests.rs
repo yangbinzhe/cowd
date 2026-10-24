@@ -172,8 +172,7 @@ fn assert_unsupported_review_inputs(
     }
 }
 
-#[tokio::test]
-async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
+async fn r1_proof_current_apply_first_objective_helper() {
     with_native_review_async(|services, original, donor| {
         Box::pin(async move {
             assert_unsupported_review_inputs(&services, &original, &donor, "objective");
@@ -210,6 +209,17 @@ async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
         })
     })
     .await;
+}
+
+#[tokio::test]
+#[ignore = "round102 one-shot first-helper causal capture; explicit admission required"]
+async fn r1_1150_first_objective_helper_causal_capture() {
+    r1_proof_current_apply_first_objective_helper().await;
+}
+
+#[tokio::test]
+async fn r1_proof_current_apply_rejects_legacy_and_unknown_inputs() {
+    r1_proof_current_apply_first_objective_helper().await;
     for action_kind in ["task-accept", "task-rework", "task-challenge"] {
         with_native_task_review_async(
             NativeTaskReviewCase::default(),
