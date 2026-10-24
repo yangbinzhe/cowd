@@ -635,6 +635,10 @@ pub(crate) async fn with_native_task_review_setup(
         + Send
         + 'static,
 ) {
+    let helper = diagnostic_1120::Boundary::enter(
+        "aggregate.task_review_setup",
+        serde_json::json!({"helper":"with_native_task_review_setup"}),
+    );
     let host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
     let complete_goal = case.complete_goal;
@@ -698,7 +702,17 @@ pub(crate) async fn with_native_task_review_setup(
             || {},
         )
         .await;
+    diagnostic_1120::record(
+        "aggregate.helper_body_returned",
+        serde_json::json!({"helper":"with_native_task_review_setup"}),
+    );
+    let normal_close = diagnostic_1120::Boundary::enter(
+        "aggregate.task_review_setup.normal_close",
+        serde_json::json!({"helper":"with_native_task_review_setup"}),
+    );
     cleanup.close_completed_consumer().await;
+    normal_close.end();
+    helper.end();
 }
 
 #[cfg(test)]
@@ -711,6 +725,10 @@ pub(crate) async fn with_native_review_async(
         + Send
         + 'static,
 ) {
+    let helper = diagnostic_1120::Boundary::enter(
+        "aggregate.review_async",
+        serde_json::json!({"helper":"with_native_review_async"}),
+    );
     let host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
     let cleanup = RealFixtureCleanup {
@@ -741,7 +759,17 @@ pub(crate) async fn with_native_review_async(
             || {},
         )
         .await;
+    diagnostic_1120::record(
+        "aggregate.helper_body_returned",
+        serde_json::json!({"helper":"with_native_review_async"}),
+    );
+    let normal_close = diagnostic_1120::Boundary::enter(
+        "aggregate.review_async.normal_close",
+        serde_json::json!({"helper":"with_native_review_async"}),
+    );
     cleanup.close_completed_consumer().await;
+    normal_close.end();
+    helper.end();
 }
 
 #[cfg(test)]
@@ -2009,6 +2037,23 @@ async fn exercise_reviewed_goal_proof_body(
         return;
     };
     let drain_workers = || async {
+        #[cfg(test)]
+        let reviewer_identity = serde_json::json!({
+            "run":reviewer_session.packet.run_id(),
+            "graph":reviewer_session.packet.graph_id(),
+            "node":reviewer_session.packet.node_id(),
+            "attempt":reviewer_session.packet.attempt,
+            "binding":reviewer_session.packet.binding.as_ref().map(|binding| &binding.binding_id),
+        });
+        #[cfg(test)]
+        let producer_identity = serde_json::json!({
+            "run":packet.run_id(), "graph":packet.graph_id(), "node":packet.node_id(),
+            "attempt":packet.attempt,
+            "binding":packet.binding.as_ref().map(|binding| &binding.binding_id),
+        });
+        #[cfg(test)]
+        let cancel_reviewer =
+            diagnostic_1120::Boundary::enter("drain.cancel_reviewer", reviewer_identity.clone());
         services
             .cancel_execution_tree(
                 &review_graph.id,
@@ -2016,6 +2061,11 @@ async fn exercise_reviewed_goal_proof_body(
             )
             .await
             .unwrap();
+        #[cfg(test)]
+        cancel_reviewer.end();
+        #[cfg(test)]
+        let cancel_producer =
+            diagnostic_1120::Boundary::enter("drain.cancel_producer", producer_identity.clone());
         services
             .cancel_execution_tree(
                 packet.graph_id(),
@@ -2023,8 +2073,20 @@ async fn exercise_reviewed_goal_proof_body(
             )
             .await
             .unwrap();
+        #[cfg(test)]
+        cancel_producer.end();
+        #[cfg(test)]
+        let producer_terminal =
+            diagnostic_1120::Boundary::enter("drain.wait_producer_terminal", producer_identity);
         wait_process_graph_terminal(&services, &producer_session).await;
+        #[cfg(test)]
+        producer_terminal.end();
+        #[cfg(test)]
+        let reviewer_terminal =
+            diagnostic_1120::Boundary::enter("drain.wait_reviewer_terminal", reviewer_identity);
         wait_process_graph_terminal(&services, &reviewer_session).await;
+        #[cfg(test)]
+        reviewer_terminal.end();
         for (execution_id, node_id) in [
             (packet.graph_id(), packet.node_id()),
             (review_graph.id.as_str(), review_graph.nodes[0].id.as_str()),
@@ -3113,7 +3175,22 @@ impl R1ScopedReviewer {
                 evidence_refs: vec![self.reason_ref],
             }),
         };
+        #[cfg(test)]
+        let identity = serde_json::json!({
+            "run":self.packet.run_id(), "graph":self.packet.graph_id(),
+            "node":self.packet.node_id(), "attempt":self.packet.attempt,
+            "binding":self.packet.binding.as_ref().map(|binding| &binding.binding_id),
+            "task_ref":task_ref,
+        });
+        #[cfg(test)]
+        let retire =
+            diagnostic_1120::Boundary::enter("aggregate.reviewer.retire_control", identity.clone());
         self.reader.retire_control(&withdrawn, &task_ref).await;
+        #[cfg(test)]
+        retire.end();
+        #[cfg(test)]
+        let followups =
+            diagnostic_1120::Boundary::enter("aggregate.reviewer.followups", identity.clone());
         services
             .dispatch_agentic_followups(
                 &withdrawn,
@@ -3127,7 +3204,13 @@ impl R1ScopedReviewer {
             )
             .await
             .unwrap();
+        #[cfg(test)]
+        followups.end();
+        #[cfg(test)]
+        let retired = diagnostic_1120::Boundary::enter("aggregate.reviewer.wait_retired", identity);
         wait_retired_process(services, &self.packet, &task_ref).await;
+        #[cfg(test)]
+        retired.end();
         let program = services
             .agent_action_service()
             .project(&self.actor.program_id)
@@ -12075,8 +12158,22 @@ impl RealFixtureCleanup {
     /// original normal close order, after every callback and postcondition.
     /// Maintenance returning unit is not evidence that all its lanes succeeded.
     async fn close_completed_consumer(&self) {
+        #[cfg(test)]
+        let maintenance = diagnostic_1120::Boundary::enter(
+            "aggregate.normal.maintenance",
+            serde_json::json!({"owner":"completed_consumer"}),
+        );
         self.services.shutdown_maintenance().await;
+        #[cfg(test)]
+        maintenance.end();
+        #[cfg(test)]
+        let execution = diagnostic_1120::Boundary::enter(
+            "aggregate.normal.execution",
+            serde_json::json!({"owner":"completed_consumer"}),
+        );
         let report = self.services.shutdown_execution().await;
+        #[cfg(test)]
+        execution.end();
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.remaining_keys, 0, "{report:?}");
         assert_eq!(report.forced_aborts, 0, "{report:?}");
@@ -14255,6 +14352,10 @@ where
     cleanup
         .protect(
             async {
+                let scenario = diagnostic_1120::Boundary::enter(
+                    "raw.proof_scenario",
+                    serde_json::json!({"owner":"native_raw_fixture"}),
+                );
                 Box::pin(exercise_reviewed_goal_proof_body(
                     services.clone(),
                     host.clone(),
@@ -14266,6 +14367,7 @@ where
                     R1ProofScenario::ReadDelivery(RealProcessProofCase::NativeSources),
                 ))
                 .await;
+                scenario.end();
                 let owner = services
                     .event_store()
                     .list_stream("session:session-dispatch")
@@ -14276,7 +14378,13 @@ where
                             && event.payload["tool_call_id"] == "native-publication-small"
                     })
                     .unwrap();
+                let callback = diagnostic_1120::Boundary::enter(
+                    "raw.consumer_callback",
+                    serde_json::json!({"stream":&owner.stream_id,
+                        "event":&owner.event_id,"cursor":owner.commit_cursor}),
+                );
                 consume(services.clone(), owner).await;
+                callback.end();
             },
             || {},
         )
