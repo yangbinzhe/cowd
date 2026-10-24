@@ -469,13 +469,21 @@ impl SurfaceHost {
             surface: surface.id.clone(),
             config,
         };
+        let (request_id, handshake) =
+            super::invocation::operation_reply_identity(&surface.id, &frame)?;
         let response = process.client.invoke(&frame).await?;
-        if matches!(response, SurfaceFrame::Ok { .. }) {
+        let result = super::invocation::operation_result_from_frame(
+            &surface.id,
+            &request_id,
+            handshake,
+            response,
+        );
+        if result.error.is_none() {
             return Ok(());
         }
         Err(SurfaceError::Invocation {
             surface: surface.id,
-            reason: format!("surface configure failed: {response:?}"),
+            reason: format!("surface configure failed: {result:?}"),
         })
     }
 

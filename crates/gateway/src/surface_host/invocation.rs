@@ -211,6 +211,7 @@ impl SurfaceHost {
             let _ = tx.send(result).await;
             return Ok(rx);
         }
+        let (request_id, handshake) = operation_reply_identity(&surface.id, &frame)?;
         let process = self.managed_process(surface.clone()).await?;
         let mut frames = tokio::time::timeout(
             Duration::from_secs(30),
@@ -236,8 +237,9 @@ impl SurfaceHost {
                         let Some(frame) = frame else {
                             break;
                         };
-                        let result =
-                            frame.map(|frame| operation_result_from_frame(&surface.id, frame));
+                        let result = frame.map(|frame| {
+                            operation_result_from_frame(&surface.id, &request_id, handshake, frame)
+                        });
                         if tx.send(result).await.is_err() {
                             break;
                         }
@@ -380,6 +382,7 @@ impl SurfaceHost {
     ) -> Result<SurfaceOperationResult, SurfaceError> {
         if surface.lifecycle == SurfaceLifecycle::Managed {
             let surface_id = surface.id.clone();
+            let (request_id, handshake) = operation_reply_identity(&surface_id, &frame)?;
             let response = match self.invoke_h2(surface.clone(), frame).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -392,7 +395,12 @@ impl SurfaceHost {
                     return Err(error);
                 }
             };
-            return Ok(operation_result_from_frame(&surface_id, response));
+            return Ok(operation_result_from_frame(
+                &surface_id,
+                &request_id,
+                handshake,
+                response,
+            ));
         }
         invoke_sidecar(surface, frame).await
     }
@@ -424,6 +432,7 @@ async fn invoke_sidecar(
     frame: SurfaceFrame,
 ) -> Result<SurfaceOperationResult, SurfaceError> {
     let surface_id = surface.id.clone();
+    let (request_id, handshake) = operation_reply_identity(&surface_id, &frame)?;
     let entry = surface
         .entry
         .clone()
@@ -557,7 +566,12 @@ async fn invoke_sidecar(
     }
 
     let response = SurfaceFrame::decode_jsonl(&line)?;
-    Ok(operation_result_from_frame(&surface_id, response))
+    Ok(operation_result_from_frame(
+        &surface_id,
+        &request_id,
+        handshake,
+        response,
+    ))
 }
 
 async fn drain_limited<R: AsyncRead + Unpin>(
@@ -583,23 +597,52 @@ async fn drain_limited<R: AsyncRead + Unpin>(
     Ok((kept, truncated))
 }
 
-fn operation_result_from_frame(surface: &str, frame: SurfaceFrame) -> SurfaceOperationResult {
+pub(super) fn operation_reply_identity(
+    surface: &str,
+    request: &SurfaceFrame,
+) -> Result<(String, bool), SurfaceError> {
+    match request {
+        SurfaceFrame::Handshake { id, .. } => Ok((id.clone(), true)),
+        SurfaceFrame::Configure { id, .. }
+        | SurfaceFrame::Connect { id, .. }
+        | SurfaceFrame::Disconnect { id, .. }
+        | SurfaceFrame::Send { id, .. }
+        | SurfaceFrame::Action { id, .. }
+        | SurfaceFrame::Health { id, .. } => Ok((id.clone(), false)),
+        _ => Err(SurfaceError::Invocation {
+            surface: surface.to_owned(),
+            reason: "surface operation requires a request frame".into(),
+        }),
+    }
+}
+
+pub(super) fn operation_result_from_frame(
+    surface: &str,
+    request_id: &str,
+    handshake: bool,
+    frame: SurfaceFrame,
+) -> SurfaceOperationResult {
     match frame {
-        SurfaceFrame::Ok { payload, .. } => SurfaceOperationResult::ok(surface, payload),
-        SurfaceFrame::Error { code, message, .. } => {
+        SurfaceFrame::Ok { id, payload } if !handshake && id == request_id => {
+            SurfaceOperationResult::ok(surface, payload)
+        }
+        SurfaceFrame::Error { id, code, message }
+            if id.as_deref().is_none_or(|id| id == request_id) =>
+        {
             SurfaceOperationResult::error(surface, code, message)
         }
-        SurfaceFrame::HandshakeOk { capabilities, .. } => SurfaceOperationResult::ok(
+        SurfaceFrame::HandshakeOk {
+            id, capabilities, ..
+        } if handshake && id == request_id => SurfaceOperationResult::ok(
             surface,
             serde_json::json!({
-                "status": "ok",
-                "capabilities": capabilities,
+                "status": "ok", "capabilities": capabilities,
             }),
         ),
         other => SurfaceOperationResult::error(
             surface,
             "surface_unexpected_frame",
-            format!("unexpected surface response frame: {other:?}"),
+            format!("unexpected surface response for request {request_id}: {other:?}"),
         ),
     }
 }
@@ -612,9 +655,342 @@ fn route_matches(route: &SurfaceRoute, path: &str, method: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use surface::SurfaceSendRequest;
+    use super::*;
 
-    use super::SurfaceHost;
+    #[test]
+    fn operation_replies_require_the_original_kind_and_identity() {
+        let request = SurfaceFrame::Send {
+            id: "request-1".into(),
+            surface: "fixture".into(),
+            recipient: "target".into(),
+            thread: None,
+            text: "payload".into(),
+            metadata: serde_json::Value::Null,
+        };
+        assert_eq!(
+            operation_reply_identity("fixture", &request).unwrap(),
+            ("request-1".into(), false)
+        );
+        for (frame, handshake, error) in [
+            (
+                SurfaceFrame::Ok {
+                    id: "request-1".into(),
+                    payload: serde_json::json!({"status":"sent"}),
+                },
+                false,
+                None,
+            ),
+            (
+                SurfaceFrame::Ok {
+                    id: "foreign".into(),
+                    payload: serde_json::json!({"status":"sent"}),
+                },
+                false,
+                Some("surface_unexpected_frame"),
+            ),
+            (
+                SurfaceFrame::HandshakeOk {
+                    id: "request-1".into(),
+                    surface_id: "fixture".into(),
+                    capabilities: vec![],
+                },
+                false,
+                Some("surface_unexpected_frame"),
+            ),
+            (
+                SurfaceFrame::HandshakeOk {
+                    id: "request-1".into(),
+                    surface_id: "fixture".into(),
+                    capabilities: vec![],
+                },
+                true,
+                None,
+            ),
+            (
+                SurfaceFrame::Ok {
+                    id: "request-1".into(),
+                    payload: serde_json::json!({}),
+                },
+                true,
+                Some("surface_unexpected_frame"),
+            ),
+            (
+                SurfaceFrame::Error {
+                    id: None,
+                    code: "busy".into(),
+                    message: "failed".into(),
+                },
+                false,
+                Some("busy"),
+            ),
+            (
+                SurfaceFrame::Error {
+                    id: Some("foreign".into()),
+                    code: "busy".into(),
+                    message: "failed".into(),
+                },
+                false,
+                Some("surface_unexpected_frame"),
+            ),
+        ] {
+            let result = operation_result_from_frame("fixture", "request-1", handshake, frame);
+            assert_eq!(
+                result.error.as_ref().map(|error| error.code.as_str()),
+                error
+            );
+        }
+        // A streamed action can have several correlated chunks.
+        for index in 0..2 {
+            let result = operation_result_from_frame(
+                "fixture",
+                "request-1",
+                false,
+                SurfaceFrame::Ok {
+                    id: "request-1".into(),
+                    payload: serde_json::json!({"chunk":index}),
+                },
+            );
+            assert!(result.error.is_none());
+            assert_eq!(result.payload.unwrap()["chunk"], index);
+        }
+    }
+
+    fn send_request(mode: &str) -> SurfaceSendRequest {
+        SurfaceSendRequest {
+            surface: "reply-fixture".into(),
+            recipient: "target".into(),
+            thread: Some("thread".into()),
+            text: "payload".into(),
+            idempotency_key: Some(mode.into()),
+            metadata: serde_json::json!({"reply_mode":mode}),
+        }
+    }
+
+    fn assert_delivery(host: &SurfaceHost, mode: &str, result: SurfaceOperationResult) {
+        let expected_error = match mode {
+            "ok" => None,
+            "unbound_error" => Some("busy"),
+            _ => Some("surface_unexpected_frame"),
+        };
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            expected_error,
+            "{mode}"
+        );
+        let records = host.outbox("reply-fixture").unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.request_json["metadata"]["reply_mode"] == mode)
+            .unwrap();
+        assert_eq!(record.status == "sent", mode == "ok", "{mode}");
+        if mode == "ok" {
+            assert_eq!(result.message_id.as_deref(), Some("original-message"));
+        } else {
+            assert!(record.last_error.is_some(), "{mode}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_send_outbox_rejects_handshake_and_foreign_replies() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("fixture");
+        std::fs::create_dir(&directory).unwrap();
+        let script = directory.join("reply-fixture");
+        std::fs::write(&script, r#"#!/usr/bin/env python3
+import json,sys
+from pathlib import Path
+r=json.loads(sys.stdin.readline())
+assert r['type']=='send' and r['recipient']=='target' and r['text']=='payload'
+Path(__file__).with_name('received.json').write_text(json.dumps(r))
+mode=r['metadata']['reply_mode']
+if mode=='handshake':
+    reply={'type':'handshake-ok','id':r['id'],'surface_id':'reply-fixture','capabilities':[]}
+elif mode=='unbound_error':
+    reply={'type':'error','id':None,'code':'busy','message':'failed'}
+else:
+    reply={'type':'ok','id':r['id'] if mode=='ok' else 'foreign','payload':{'status':'sent','message_id':'original-message'}}
+print(json.dumps(reply))
+"#).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(directory.join(surface::SURFACE_MANIFEST_FILE), serde_json::to_vec(&serde_json::json!({
+            "schema":"cowd.surface.v1", "id":"reply-fixture", "name":"Reply Fixture", "version":"1.0.0",
+            "kind":"external-integration", "runtime":{"kind":"one-shot","entry":"reply-fixture","transport":"stdio-jsonl"},
+            "capabilities":["send_text"], "default_enabled":true
+        })).unwrap()).unwrap();
+        let host = SurfaceHost::new(vec![root.path().into()]);
+        assert_eq!(host.discover().discovered, 1);
+        for mode in ["ok", "handshake", "foreign", "unbound_error"] {
+            let result = host.send(send_request(mode)).await.unwrap();
+            assert_delivery(&host, mode, result);
+            let received: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("received.json")).unwrap())
+                    .unwrap();
+            assert_eq!(received["metadata"]["reply_mode"], mode);
+            assert_eq!(received["thread"], "thread");
+        }
+        assert_eq!(host.outbox("reply-fixture").unwrap().len(), 4);
+        let report = host.gateway_tasks().shutdown().await;
+        assert_eq!(report.forced_aborts, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_send_outbox_rejects_handshake_and_foreign_replies() {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    let captured = captured.clone();
+                    async move {
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        let frame: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        captured.lock().unwrap().push(frame.clone());
+                        if frame["type"] == "action" {
+                            assert_eq!(frame["action"], "fixture.stream");
+                            let id = if frame["payload"]["foreign"] == true {
+                                serde_json::json!("foreign")
+                            } else {
+                                frame["id"].clone()
+                            };
+                            let mut body = Vec::new();
+                            for index in 0..2 {
+                                body.extend(
+                                    serde_json::to_vec(&serde_json::json!({
+                                        "type":"ok", "id":id, "payload":{"chunk":index}
+                                    }))
+                                    .unwrap(),
+                                );
+                                body.push(b'\n');
+                            }
+                            return Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(body),
+                            )));
+                        }
+                        assert_eq!(frame["type"], "send");
+                        assert_eq!(frame["recipient"], "target");
+                        assert_eq!(frame["text"], "payload");
+                        let reply = match frame["metadata"]["reply_mode"].as_str().unwrap() {
+                            "handshake" => {
+                                serde_json::json!({"type":"handshake-ok","id":frame["id"],"surface_id":"reply-fixture","capabilities":[]})
+                            }
+                            "unbound_error" => {
+                                serde_json::json!({"type":"error","id":null,"code":"busy","message":"failed"})
+                            }
+                            mode => {
+                                serde_json::json!({"type":"ok","id":if mode=="ok" {frame["id"].clone()} else {serde_json::json!("foreign")},"payload":{"status":"sent","message_id":"original-message"}})
+                            }
+                        };
+                        Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from(
+                            serde_json::to_vec(&reply).unwrap(),
+                        ))))
+                    }
+                },
+            );
+            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        let host = SurfaceHost::new(Vec::new());
+        let manifest: surface::SurfaceManifest = serde_json::from_value(serde_json::json!({
+            "schema":"cowd.surface.v1", "id":"reply-fixture", "name":"Reply Fixture", "version":"1.0.0",
+            "kind":"external-integration", "runtime":{"kind":"managed","artifact":"cowd-edge-fixture","driver_profile":"fixture","transport":"uds-http2"},
+            "capabilities":["send_text"], "default_enabled":true
+        })).unwrap();
+        manifest.validate().unwrap();
+        let descriptor = SurfaceDescriptor::from_manifest(&manifest, "local-contract-fixture");
+        host.registry
+            .write()
+            .unwrap()
+            .insert(descriptor.id.clone(), descriptor);
+        let client = super::super::edge_h2::EdgeH2Client::connect(
+            &socket,
+            "reply-fixture",
+            "fixture-token",
+            host.gateway_tasks(),
+        )
+        .await
+        .unwrap();
+        // This tests an already-cached managed transport, not worker bootstrap.
+        // The original cache carries an owned live child and the real H2 client.
+        let mut command = tokio::process::Command::new("/usr/bin/cat");
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let process = Arc::new(super::super::types::ManagedSurfaceProcess {
+            pid: child.id(),
+            started_at: Utc::now(),
+            client,
+            child: Arc::new(tokio::sync::Mutex::new(child)),
+            events: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            runtime_dir: root.path().into(),
+        });
+        assert!(process.child.lock().await.try_wait().unwrap().is_none());
+        host.managed
+            .lock()
+            .await
+            .insert("reply-fixture".into(), process.clone());
+        for mode in ["ok", "handshake", "foreign", "unbound_error"] {
+            assert_delivery(&host, mode, host.send(send_request(mode)).await.unwrap());
+        }
+        assert_eq!(received.lock().unwrap().len(), 4);
+        for foreign in [false, true] {
+            let mut chunks = host
+                .action_stream(SurfaceActionRequest {
+                    surface: "reply-fixture".into(),
+                    action: "fixture.stream".into(),
+                    payload: serde_json::json!({"foreign":foreign}),
+                })
+                .await
+                .unwrap();
+            for index in 0..2 {
+                let result = tokio::time::timeout(Duration::from_secs(2), chunks.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if foreign {
+                    assert_eq!(result.error.unwrap().code, "surface_unexpected_frame");
+                } else {
+                    assert!(result.error.is_none());
+                    assert_eq!(result.payload.unwrap()["chunk"], index);
+                }
+            }
+            assert!(tokio::time::timeout(Duration::from_secs(2), chunks.recv())
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(received.lock().unwrap().len(), 6);
+        let mut child = process.child.lock().await;
+        child.kill().await.unwrap();
+        assert!(child.wait().await.unwrap().code().is_none());
+        drop(child);
+        host.managed.lock().await.remove("reply-fixture");
+        drop(process);
+        let report = host.gateway_tasks().shutdown().await;
+        assert_eq!(report.forced_aborts, 0);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn send_uses_local_reply_to_for_gateway_ledger_when_present() {

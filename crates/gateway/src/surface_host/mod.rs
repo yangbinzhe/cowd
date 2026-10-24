@@ -373,7 +373,7 @@ mod tests {
         let sidecar = surface_dir.join("cowd-edge-echo");
         fs::write(
             &sidecar,
-            "#!/usr/bin/env sh\nread _line\nprintf '%s\\n' '{\"type\":\"ok\",\"id\":\"reply\",\"payload\":{\"status\":\"sent\",\"message_id\":\"m-1\"}}'\n",
+            "#!/usr/bin/env python3\nimport json,sys\nrequest=json.loads(sys.stdin.readline())\nprint(json.dumps({'type':'ok','id':request['id'],'payload':{'status': 'sent', 'message_id': 'm-1'}}))\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
@@ -438,7 +438,7 @@ mod tests {
         let sidecar = surface_dir.join("cowd-edge-panel");
         fs::write(
             &sidecar,
-            "#!/usr/bin/env sh\nread _line\nprintf '%s\\n' '{\"type\":\"ok\",\"id\":\"reply\",\"payload\":{\"status\":\"ok\"}}'\n",
+            "#!/usr/bin/env python3\nimport json,sys\nrequest=json.loads(sys.stdin.readline())\nprint(json.dumps({'type':'ok','id':request['id'],'payload':{'status': 'ok'}}))\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
@@ -517,7 +517,7 @@ mod tests {
         let sidecar = surface_dir.join("cowd-edge-hook");
         fs::write(
             &sidecar,
-            "#!/usr/bin/env sh\nread _line\nprintf '%s\\n' '{\"type\":\"ok\",\"id\":\"reply\",\"payload\":{\"status\":\"ok\",\"message_id\":\"cb-1\"}}'\n",
+            "#!/usr/bin/env python3\nimport json,sys\nrequest=json.loads(sys.stdin.readline())\nprint(json.dumps({'type':'ok','id':request['id'],'payload':{'status': 'ok', 'message_id': 'cb-1'}}))\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&sidecar).unwrap().permissions();

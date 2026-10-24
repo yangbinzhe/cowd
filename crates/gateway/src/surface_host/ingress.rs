@@ -1737,24 +1737,6 @@ fn payload_fingerprint_id(surface: &str, payload: &serde_json::Value) -> String 
     format!("generated:{:x}", hasher.finalize())
 }
 
-fn final_text(summary: &runtime::TurnSummary) -> String {
-    summary
-        .assistant_messages
-        .last()
-        .map(|message| {
-            message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    runtime::ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
