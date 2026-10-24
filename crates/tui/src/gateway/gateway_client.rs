@@ -4158,6 +4158,114 @@ async fn hydrate_session_history_once(
     Ok(from_sequence)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static GATEWAY_PAYLOAD_DECODE_COUNTS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+struct GatewayTextDeltaFields<'a> {
+    text: &'a str,
+    start_bytes: u64,
+    end_bytes: u64,
+    stream_revision: u64,
+}
+
+fn decode_gateway_text_delta<'a>(
+    value: &'a serde_json::Value,
+    event_type: &str,
+) -> Result<GatewayTextDeltaFields<'a>, String> {
+    #[cfg(test)]
+    GATEWAY_PAYLOAD_DECODE_COUNTS.with(|counts| {
+        let (terminal, text) = counts.get();
+        counts.set((terminal, text + 1));
+    });
+    let text = value
+        .get("text")
+        .or_else(|| value.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("`{event_type}` requires string `text`"))?;
+    let integer = |field| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("`{event_type}` requires integer `{field}`"))
+    };
+    Ok(GatewayTextDeltaFields {
+        text,
+        start_bytes: integer("start_bytes")?,
+        end_bytes: integer("end_bytes")?,
+        stream_revision: integer("stream_revision")?,
+    })
+}
+
+fn gateway_text_delta_range_matches(text: &str, start: usize, end: usize) -> bool {
+    end >= start && end.saturating_sub(start) == text.len()
+}
+
+fn gateway_text_delta_event(
+    value: &serde_json::Value,
+    session_id: Option<&str>,
+    fields: GatewayTextDeltaFields<'_>,
+) -> CowdEvent {
+    CowdEvent::GatewaySession {
+        event: GatewaySessionEvent::TextDelta {
+            correlation: gateway_event_correlation(value, session_id, None),
+            text: fields.text.to_string(),
+            start_bytes: fields.start_bytes as usize,
+            end_bytes: fields.end_bytes as usize,
+            stream_revision: fields.stream_revision,
+        },
+    }
+}
+
+fn decode_gateway_terminal_delivery(
+    value: &serde_json::Value,
+    event_type: &str,
+) -> Result<harness_contract::live::TerminalDeliveryEvent, String> {
+    let delivery = value
+        .get("delivery")
+        .cloned()
+        .ok_or_else(|| format!("`{event_type}` requires `delivery`"))?;
+    #[cfg(test)]
+    GATEWAY_PAYLOAD_DECODE_COUNTS.with(|counts| {
+        let (terminal, text) = counts.get();
+        counts.set((terminal + 1, text));
+    });
+    serde_json::from_value::<harness_contract::live::TerminalDeliveryEvent>(delivery)
+        .map_err(|error| format!("`{event_type}` has invalid delivery: {error}"))
+}
+
+fn gateway_terminal_delivery_event(
+    value: &serde_json::Value,
+    session_id: Option<&str>,
+    delivery: harness_contract::live::TerminalDeliveryEvent,
+) -> CowdEvent {
+    let correlation = match &delivery {
+        harness_contract::live::TerminalDeliveryEvent::CancellationCommitted { receipt } => {
+            let mut correlation = gateway_event_correlation(
+                value,
+                session_id.or(Some(receipt.session_id.as_str())),
+                None,
+            );
+            if correlation.execution_id.is_none() && !receipt.execution_id.is_empty() {
+                correlation.execution_id = Some(receipt.execution_id.clone());
+            }
+            if correlation.turn_id.is_none() && !receipt.turn_id.is_empty() {
+                correlation.turn_id = Some(receipt.turn_id.clone());
+            }
+            correlation
+        }
+        _ => gateway_event_correlation(value, session_id, None),
+    };
+    CowdEvent::GatewaySession {
+        event: GatewaySessionEvent::TerminalDelivery {
+            correlation,
+            delivery,
+        },
+    }
+}
+
 pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
     value: &serde_json::Value,
     session_id: Option<&str>,
@@ -4195,58 +4303,19 @@ fn gateway_sse_json_to_conversation_event(
             })
         }
         "TextDelta" | "text_delta" | "assistant_delta" => {
-            let text = value
-                .get("text")
-                .or_else(|| value.get("content"))
-                .and_then(serde_json::Value::as_str)?
-                .to_string();
-            let correlation = gateway_event_correlation(value, session_id, None);
-            let start_bytes = value.get("start_bytes")?.as_u64()? as usize;
-            let end_bytes = value.get("end_bytes")?.as_u64()? as usize;
-            let stream_revision = value.get("stream_revision")?.as_u64()?;
-            if end_bytes < start_bytes || end_bytes.saturating_sub(start_bytes) != text.len() {
+            let fields = decode_gateway_text_delta(value, event_type).ok()?;
+            if !gateway_text_delta_range_matches(
+                fields.text,
+                fields.start_bytes as usize,
+                fields.end_bytes as usize,
+            ) {
                 return None;
             }
-            Some(CowdEvent::GatewaySession {
-                event: GatewaySessionEvent::TextDelta {
-                    correlation,
-                    text,
-                    start_bytes,
-                    end_bytes,
-                    stream_revision,
-                },
-            })
+            Some(gateway_text_delta_event(value, session_id, fields))
         }
         "TerminalDelivery" | "terminal_delivery" => {
-            let delivery = serde_json::from_value::<harness_contract::live::TerminalDeliveryEvent>(
-                value.get("delivery")?.clone(),
-            )
-            .ok()?;
-            let correlation = match &delivery {
-                harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
-                    receipt,
-                } => {
-                    let mut correlation = gateway_event_correlation(
-                        value,
-                        session_id.or(Some(receipt.session_id.as_str())),
-                        None,
-                    );
-                    if correlation.execution_id.is_none() && !receipt.execution_id.is_empty() {
-                        correlation.execution_id = Some(receipt.execution_id.clone());
-                    }
-                    if correlation.turn_id.is_none() && !receipt.turn_id.is_empty() {
-                        correlation.turn_id = Some(receipt.turn_id.clone());
-                    }
-                    correlation
-                }
-                _ => gateway_event_correlation(value, session_id, None),
-            };
-            Some(CowdEvent::GatewaySession {
-                event: GatewaySessionEvent::TerminalDelivery {
-                    correlation,
-                    delivery,
-                },
-            })
+            let delivery = decode_gateway_terminal_delivery(value, event_type).ok()?;
+            Some(gateway_terminal_delivery_event(value, session_id, delivery))
         }
         "ReasoningSummaryDelta" | "reasoning_summary_delta" => {
             let summary = value
@@ -4638,8 +4707,29 @@ fn strict_gateway_sse_frame_to_cowd_event_for_session(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "session event has no typed identity".to_string())?;
     let frame_cursor = gateway_sse_frame_commit_cursor(frame);
-    validate_gateway_session_event_contract(&value, event_type, session_id, frame_cursor)?;
-    if let Some(mut event) = gateway_sse_json_to_cowd_event_for_session(&value, Some(session_id)) {
+    let prepared =
+        prepare_gateway_session_event_contract(&value, event_type, session_id, frame_cursor)?;
+    // Contract validation keeps its original u64 domain. Projection retains the
+    // converter's usize range guard, including its behavior on 32-bit targets.
+    if let Some(CowdEvent::GatewaySession {
+        event:
+            GatewaySessionEvent::TextDelta {
+                text,
+                start_bytes,
+                end_bytes,
+                ..
+            },
+    }) = &prepared
+    {
+        if !gateway_text_delta_range_matches(text, *start_bytes, *end_bytes) {
+            return Err(format!(
+                "recognized session event `{event_type}` is missing or has invalid required fields"
+            ));
+        }
+    }
+    if let Some(mut event) =
+        prepared.or_else(|| gateway_sse_json_to_cowd_event_for_session(&value, Some(session_id)))
+    {
         if let CowdEvent::GatewaySession {
             event: GatewaySessionEvent::TerminalCommitted { correlation, .. },
         } = &mut event
@@ -4734,6 +4824,16 @@ fn validate_gateway_session_event_contract(
     subscribed_session_id: &str,
     frame_cursor: Option<u64>,
 ) -> Result<(), String> {
+    prepare_gateway_session_event_contract(value, event_type, subscribed_session_id, frame_cursor)
+        .map(|_| ())
+}
+
+fn prepare_gateway_session_event_contract(
+    value: &serde_json::Value,
+    event_type: &str,
+    subscribed_session_id: &str,
+    frame_cursor: Option<u64>,
+) -> Result<Option<CowdEvent>, String> {
     if value.get("session_id").is_some() {
         let explicit_session = string_field(value, "session_id").ok_or_else(|| {
             format!("`{event_type}` contains an empty or non-string `session_id`")
@@ -4796,40 +4896,23 @@ fn validate_gateway_session_event_contract(
         "TextDelta" | "text_delta" | "assistant_delta" => {
             require_causal_item()?;
             require_text("part_id")?;
-            let text = value
-                .get("text")
-                .or_else(|| value.get("content"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("`{event_type}` requires string `text`"))?;
-            let start = value
-                .get("start_bytes")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("`{event_type}` requires integer `start_bytes`"))?;
-            let end = value
-                .get("end_bytes")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("`{event_type}` requires integer `end_bytes`"))?;
-            value
-                .get("stream_revision")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("`{event_type}` requires integer `stream_revision`"))?;
-            if end < start || end.saturating_sub(start) != text.len() as u64 {
+            let fields = decode_gateway_text_delta(value, event_type)?;
+            if fields.end_bytes < fields.start_bytes
+                || fields.end_bytes.saturating_sub(fields.start_bytes) != fields.text.len() as u64
+            {
                 return Err(format!(
                     "`{event_type}` byte range does not match UTF-8 text length"
                 ));
             }
-            Ok(())
+            return Ok(Some(gateway_text_delta_event(
+                value,
+                Some(subscribed_session_id),
+                fields,
+            )));
         }
         "TerminalDelivery" | "terminal_delivery" => {
-            let delivery_value = value
-                .get("delivery")
-                .cloned()
-                .ok_or_else(|| format!("`{event_type}` requires `delivery`"))?;
-            let delivery = serde_json::from_value::<harness_contract::live::TerminalDeliveryEvent>(
-                delivery_value,
-            )
-            .map_err(|error| format!("`{event_type}` has invalid delivery: {error}"))?;
-            match delivery {
+            let delivery = decode_gateway_terminal_delivery(value, event_type)?;
+            let validation: Result<(), String> = match &delivery {
                 harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
                     receipt,
                 } => {
@@ -4854,7 +4937,7 @@ fn validate_gateway_session_event_contract(
                     if presentation_id.trim().is_empty()
                         || attempt_id.trim().is_empty()
                         || byte_end < byte_start
-                        || byte_end.saturating_sub(byte_start) != delta.len() as u64
+                        || byte_end.saturating_sub(*byte_start) != delta.len() as u64
                     {
                         return Err(format!("`{event_type}` has an invalid presentation delta"));
                     }
@@ -4898,7 +4981,13 @@ fn validate_gateway_session_event_contract(
                     }
                     Ok(())
                 }
-            }
+            };
+            validation?;
+            return Ok(Some(gateway_terminal_delivery_event(
+                value,
+                Some(subscribed_session_id),
+                delivery,
+            )));
         }
         "ReasoningSummaryDelta" | "reasoning_summary_delta" => {
             require_causal_item()?;
@@ -4973,7 +5062,8 @@ fn validate_gateway_session_event_contract(
         | "RunModelTelemetry"
         | "run_model_telemetry" => require_execution(),
         _ => Ok(()),
-    }
+    }?;
+    Ok(None)
 }
 
 fn validate_permission_revision_event(

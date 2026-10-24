@@ -945,6 +945,376 @@ fn session_text_delta_preserves_runtime_causal_and_projection_identities() {
     );
 }
 
+
+fn v3_decode_counts<T>(parse: impl FnOnce() -> T) -> (T, (usize, usize)) {
+    GATEWAY_PAYLOAD_DECODE_COUNTS.with(|counts| {
+        let previous = counts.replace((0, 0));
+        let value = parse();
+        let measured = counts.replace(previous);
+        (value, measured)
+    })
+}
+
+fn v3_delivery_value(delivery: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "TerminalDelivery", "session_id": "session-v3",
+        "execution_id": "execution-v3", "turn_id": "turn-v3", "delivery": delivery
+    })
+}
+
+fn v3_cancellation_delivery() -> serde_json::Value {
+    serde_json::json!({"event": "cancellation_committed", "receipt": {
+        "cancellation_id": "cancel-v3", "session_id": "session-v3",
+        "execution_id": "execution-v3", "turn_id": "turn-v3", "actor_id": "principal:user",
+        "cause": "user_requested", "requested_at_ms": 100, "effective_at_ms": 110,
+        "status": "cancelled", "journal_sequence": 8, "projection_revision": 1
+    }})
+}
+
+#[test]
+fn strict_terminal_delivery_decodes_each_variant_once_without_tightening_loose_input() {
+    let deliveries = [
+        serde_json::json!({"event":"terminal_presentation_started", "presentation_id":"p-v3",
+            "attempt_id":"a-v3", "envelope_id":"env-v3", "envelope_revision":3, "objective_scope":"root"}),
+        serde_json::json!({"event":"text_delta", "presentation_id":"p-v3", "attempt_id":"a-v3",
+            "byte_start":10, "byte_end":17, "delta":"你🙂"}),
+        serde_json::json!({"event":"terminal_presentation_superseded", "presentation_id":"p-v3",
+            "attempt_id":"a-v3", "reason":"new attempt"}),
+        serde_json::json!({"event":"terminal_presentation_aborted", "presentation_id":"p-v3",
+            "attempt_id":"a-v3", "reason":"stopped"}),
+        serde_json::json!({"event":"terminal_presentation_committed", "presentation_id":"p-v3",
+            "attempt_id":"a-v3", "answer_origin":"model_direct", "terminal_id":"terminal-v3"}),
+        v3_cancellation_delivery(),
+    ];
+    for delivery in deliveries {
+        let value = v3_delivery_value(delivery.clone());
+        let frame = format!("data: {value}\n\n");
+        let (result, counts) = v3_decode_counts(|| {
+            strict_gateway_sse_frame_to_cowd_event_for_session(&frame, "session-v3")
+        });
+        assert_eq!(counts, (1, 0), "{delivery}");
+        let Some(CowdEvent::GatewaySession {
+            event:
+                GatewaySessionEvent::TerminalDelivery {
+                    correlation,
+                    delivery: parsed,
+                },
+        }) = result.expect("valid strict delivery")
+        else {
+            panic!("expected typed delivery")
+        };
+        assert_eq!(serde_json::to_value(parsed).unwrap(), delivery);
+        assert_eq!(correlation.session_id, "session-v3");
+        assert_eq!(correlation.execution_id.as_deref(), Some("execution-v3"));
+        assert_eq!(correlation.turn_id.as_deref(), Some("turn-v3"));
+    }
+
+    // Typed cancellation supplies missing correlation; unlike presentations it
+    // never required outer execution/turn metadata in the strict contract.
+    let mut cancellation = v3_delivery_value(v3_cancellation_delivery());
+    cancellation.as_object_mut().unwrap().remove("execution_id");
+    cancellation.as_object_mut().unwrap().remove("turn_id");
+    let Some(CowdEvent::GatewaySession {
+        event: GatewaySessionEvent::TerminalDelivery { correlation, .. },
+    }) = strict_gateway_sse_frame_to_cowd_event_for_session(
+        &format!("data: {cancellation}"),
+        "session-v3",
+    )
+    .unwrap()
+    else {
+        panic!("strict cancellation correlation")
+    };
+    assert_eq!(correlation.session_id, "session-v3");
+    assert_eq!(correlation.execution_id.as_deref(), Some("execution-v3"));
+    assert_eq!(correlation.turn_id.as_deref(), Some("turn-v3"));
+    let Some(CowdEvent::GatewaySession {
+        event: GatewaySessionEvent::TerminalDelivery { correlation, .. },
+    }) = gateway_sse_json_to_cowd_event_for_session(&cancellation, None)
+    else {
+        panic!("loose cancellation correlation")
+    };
+    assert_eq!(correlation.execution_id.as_deref(), Some("execution-v3"));
+    assert_eq!(correlation.turn_id.as_deref(), Some("turn-v3"));
+
+    let loose = serde_json::json!({"type":"TerminalDelivery", "delivery":{
+        "event":"text_delta", "presentation_id":"p", "attempt_id":"a",
+        "byte_start":4, "byte_end":1, "delta":"你🙂"
+    }});
+    assert!(
+        gateway_sse_json_to_cowd_event(&loose).is_some(),
+        "loose typed decode does not validate presentation ranges"
+    );
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(&format!("data: {loose}"), "session-v3")
+            .is_err()
+    );
+}
+
+#[test]
+fn strict_terminal_delivery_keeps_identity_and_range_refusals() {
+    let started = v3_delivery_value(serde_json::json!({
+        "event":"terminal_presentation_started", "presentation_id":"p-v3", "attempt_id":"a-v3",
+        "envelope_id":"env-v3", "envelope_revision":3, "objective_scope":"root"
+    }));
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(
+            &format!("data: {started}"),
+            "session-v3"
+        )
+        .unwrap()
+        .is_some()
+    );
+    for field in ["presentation_id", "attempt_id", "envelope_id"] {
+        let mut invalid = started.clone();
+        invalid["delivery"][field] = serde_json::json!(" ");
+        assert!(
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("data: {invalid}"),
+                "session-v3"
+            )
+            .is_err(),
+            "empty {field}"
+        );
+        assert!(
+            gateway_sse_json_to_cowd_event(&invalid).is_some(),
+            "loose {field}"
+        );
+    }
+    for field in ["execution_id", "turn_id"] {
+        let mut invalid = started.clone();
+        invalid.as_object_mut().unwrap().remove(field);
+        assert!(
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("data: {invalid}"),
+                "session-v3"
+            )
+            .is_err(),
+            "missing {field}"
+        );
+        assert!(gateway_sse_json_to_cowd_event(&invalid).is_some());
+    }
+    let mut foreign = started.clone();
+    foreign["session_id"] = serde_json::json!("foreign");
+    let (result, counts) = v3_decode_counts(|| {
+        strict_gateway_sse_frame_to_cowd_event_for_session(
+            &format!("data: {foreign}"),
+            "session-v3",
+        )
+    });
+    assert!(result.is_err());
+    assert_eq!(counts, (0, 0), "identity must fail before payload decode");
+    for invalid_delivery in [
+        serde_json::Value::Null,
+        serde_json::json!({"event":"unknown_delivery"}),
+    ] {
+        let invalid = v3_delivery_value(invalid_delivery);
+        let (result, counts) = v3_decode_counts(|| {
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("data: {invalid}"),
+                "session-v3",
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(counts, (1, 0));
+        assert!(gateway_sse_json_to_cowd_event(&invalid).is_none());
+    }
+    let mut missing = started.clone();
+    missing.as_object_mut().unwrap().remove("delivery");
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(
+            &format!("data: {missing}"),
+            "session-v3"
+        )
+        .is_err()
+    );
+    for (field, bad) in [
+        ("session_id", serde_json::json!("foreign")),
+        ("cancellation_id", serde_json::json!("")),
+        ("requested_at_ms", serde_json::json!(0)),
+    ] {
+        let mut invalid = v3_delivery_value(v3_cancellation_delivery());
+        invalid["delivery"]["receipt"][field] = bad;
+        assert!(
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("data: {invalid}"),
+                "session-v3"
+            )
+            .is_err(),
+            "invalid receipt {field}"
+        );
+    }
+    for end in [9, 16] {
+        let invalid = v3_delivery_value(serde_json::json!({"event":"text_delta",
+            "presentation_id":"p", "attempt_id":"a", "byte_start":10, "byte_end":end, "delta":"你🙂"}));
+        assert!(
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("data: {invalid}"),
+                "session-v3"
+            )
+            .is_err(),
+            "presentation UTF-8/range {end}"
+        );
+    }
+}
+
+#[test]
+fn strict_text_delta_extracts_once_and_preserves_both_entry_contracts() {
+    let base = serde_json::json!({"type":"TextDelta", "session_id":"session-v3",
+        "execution_id":"execution-v3", "turn_id":"turn-v3", "model_step_id":"step-v3",
+        "item_id":"item-v3", "segment_id":"segment-v3", "part_id":"part-v3",
+        "causal_sequence":3, "delta_sequence":1, "text":"你🙂",
+        "start_bytes":10, "end_bytes":17, "stream_revision":2});
+    for kind in ["TextDelta", "text_delta", "assistant_delta"] {
+        let mut value = base.clone();
+        value["type"] = serde_json::json!(kind);
+        let (result, counts) = v3_decode_counts(|| {
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("data: {value}"),
+                "session-v3",
+            )
+        });
+        assert_eq!(counts, (0, 1));
+        assert!(matches!(result.unwrap(), Some(CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::TextDelta { text, start_bytes:10, end_bytes:17,
+                stream_revision:2, correlation },
+        }) if text == "你🙂" && correlation.part_id.as_deref() == Some("part-v3")
+            && correlation.causal_sequence == Some(3)));
+    }
+    let mut content = base.clone();
+    content.as_object_mut().unwrap().remove("text");
+    content["content"] = serde_json::json!("你🙂");
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(
+            &format!("data: {content}"),
+            "session-v3"
+        )
+        .unwrap()
+        .is_some()
+    );
+    content["text"] = serde_json::Value::Null;
+    assert!(
+        gateway_sse_json_to_cowd_event(&content).is_none(),
+        "present text:null does not fall through to content"
+    );
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(
+            &format!("data: {content}"),
+            "session-v3"
+        )
+        .is_err()
+    );
+    let bare = serde_json::json!({"type":"TextDelta", "text":"你🙂", "start_bytes":10,
+        "end_bytes":17, "stream_revision":2});
+    assert!(gateway_sse_json_to_cowd_event(&bare).is_some());
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(&format!("data: {bare}"), "session-v3")
+            .is_err()
+    );
+    for (field, bad) in [
+        ("start_bytes", serde_json::json!(18)),
+        ("end_bytes", serde_json::json!(16)),
+        ("stream_revision", serde_json::json!("2")),
+    ] {
+        let mut invalid = base.clone();
+        invalid[field] = bad;
+        assert!(
+            gateway_sse_json_to_cowd_event(&invalid).is_none(),
+            "{field}"
+        );
+        assert!(
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("data: {invalid}"),
+                "session-v3"
+            )
+            .is_err()
+        );
+    }
+    let mut empty = base.clone();
+    empty["text"] = serde_json::json!("");
+    empty["end_bytes"] = serde_json::json!(10);
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(&format!("data: {empty}"), "session-v3")
+            .unwrap()
+            .is_some()
+    );
+    for (start, end) in [
+        (4_294_967_295_u64, 4_294_967_296_u64),
+        (4_294_967_296, 4_294_967_297),
+    ] {
+        let mut wide = base.clone();
+        wide["text"] = serde_json::json!("a");
+        wide["start_bytes"] = serde_json::json!(start);
+        wide["end_bytes"] = serde_json::json!(end);
+        assert!(
+            validate_gateway_session_event_contract(&wide, "TextDelta", "session-v3", None).is_ok()
+        );
+        let result = strict_gateway_sse_frame_to_cowd_event_for_session(
+            &format!("data: {wide}"),
+            "session-v3",
+        );
+        assert_eq!(result.is_ok(), usize::BITS != 32 || start != 4_294_967_295);
+    }
+}
+
+#[test]
+fn prepared_payloads_leave_cursor_and_unrelated_event_contracts_unchanged() {
+    let terminal = serde_json::json!({"type":"TerminalCommitted", "session_id":"session-v3",
+        "execution_id":"execution-v3", "turn_id":"turn-v3", "part_id":"part-v3",
+        "message_id":"message-v3", "terminal_id":"terminal-v3", "assistant_text":"done"});
+    for (payload, frame_id, expected) in [(None, "73", 73), (Some(7), "73", 7), (Some(0), "bad", 0)]
+    {
+        let mut value = terminal.clone();
+        if let Some(cursor) = payload {
+            value["runtime_commit_cursor"] = serde_json::json!(cursor);
+        }
+        let (result, counts) = v3_decode_counts(|| {
+            strict_gateway_sse_frame_to_cowd_event_for_session(
+                &format!("id: {frame_id}\ndata: {value}"),
+                "session-v3",
+            )
+        });
+        assert_eq!(counts, (0, 0));
+        assert!(matches!(result.unwrap(), Some(CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::TerminalCommitted { correlation, .. },
+        }) if correlation.commit_cursor == Some(expected)));
+    }
+    assert!(
+        strict_gateway_sse_frame_to_cowd_event_for_session(
+            &format!("id: bad\ndata: {terminal}"),
+            "session-v3"
+        )
+        .is_err()
+    );
+    for frame in ["", "data: [DONE]", "data: "] {
+        assert!(
+            strict_gateway_sse_frame_to_cowd_event_for_session(frame, "session-v3")
+                .unwrap()
+                .is_none()
+        );
+    }
+    let warning =
+        r#"data: {"type":"future_unknown_event","session_id":"session-v3","schema_version":999}"#;
+    let (result, counts) = v3_decode_counts(|| {
+        strict_gateway_sse_frame_to_cowd_event_for_session(warning, "session-v3")
+    });
+    assert_eq!(counts, (0, 0));
+    assert!(matches!(result.unwrap(), Some(CowdEvent::Warning { .. })));
+    assert!(
+        validate_session_authorization_revoke_identity(
+            "data: {\"type\":\"SessionAuthorizationRevoked\",\"session_id\":\"session-v3\"}",
+            "session-v3"
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_session_authorization_revoke_identity(
+            "data: {\"type\":\"SessionAuthorizationRevoked\",\"session_id\":\"foreign\"}",
+            "session-v3"
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn tui_consumes_the_canonical_live_envelope_fixture() {
     let envelope: harness_contract::live::LiveEnvelope =
