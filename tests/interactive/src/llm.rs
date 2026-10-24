@@ -74,7 +74,7 @@ pub fn generate_prompt(skill: &str) -> String {
 
 /// Validate TUI output against expected criteria using LLM
 pub fn validate_output(output: &str, criteria: &str) -> Result<(), String> {
-    if let Some(response) = call_llm(&format!(
+    let response = call_llm(&format!(
         "You are a test judge. Determine if this terminal output meets the criteria.
 
 CRITERIA: {}
@@ -84,15 +84,49 @@ OUTPUT:
 
 Answer ONLY: PASS or FAIL. If FAIL, explain why briefly (1 sentence).",
         criteria, output
-    )) {
-        let trimmed = response.trim();
-        if trimmed.starts_with("PASS") {
-            return Ok(());
-        }
-        return Err(trimmed.to_string());
+    ));
+    parse_judge_verdict(response.as_deref())
+}
+
+fn parse_judge_verdict(response: Option<&str>) -> Result<(), String> {
+    let response = response.ok_or_else(|| "LLM judge unavailable: validation failed".to_string())?;
+    let verdict = response.trim();
+    if verdict == "PASS" {
+        Ok(())
+    } else if verdict == "FAIL"
+        || verdict.starts_with("FAIL:")
+        || verdict.starts_with("FAIL ")
+        || verdict.starts_with("FAIL\n")
+    {
+        Err(verdict.to_string())
+    } else {
+        Err(format!("Invalid LLM judge verdict: {verdict:?}"))
     }
-    // No LLM available: skip LLM-based validation
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_judge_verdict;
+
+    #[test]
+    fn judge_accepts_only_exact_pass() {
+        assert_eq!(parse_judge_verdict(Some("PASS")), Ok(()));
+        assert_eq!(parse_judge_verdict(Some(" \nPASS\t")), Ok(()));
+        for verdict in [
+            "", " ", "unknown", "pass", "PASSING", "PASS: yes", "PASS\nFAIL", "ＰＡＳＳ",
+            "PASS\u{200b}",
+        ] {
+            assert!(parse_judge_verdict(Some(verdict)).is_err(), "{verdict:?}");
+        }
+    }
+
+    #[test]
+    fn judge_missing_and_negative_responses_fail() {
+        assert!(parse_judge_verdict(None).unwrap_err().contains("unavailable"));
+        for verdict in ["FAIL", "FAIL: no response", "FAIL response empty"] {
+            assert_eq!(parse_judge_verdict(Some(verdict)), Err(verdict.to_string()));
+        }
+    }
 }
 
 /// Post-test analysis: generate summary from results

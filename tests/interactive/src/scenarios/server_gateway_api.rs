@@ -16,7 +16,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let _server = ServerProcess::start()?;
-    let api = ApiClient::new("http://127.0.0.1:8642");
+    let api = ApiClient::new(_server.base_url());
     println!("\n── Server Gateway API ──");
 
     runner.run("Gateway API: /api/memory returns layers", || {

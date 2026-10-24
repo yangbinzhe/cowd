@@ -12,7 +12,7 @@ pub fn has_scenario(name: &str) -> bool {
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     let mut srv = ServerProcess::start()?;
-    let api = ApiClient::new("http://127.0.0.1:8642");
+    let api = ApiClient::new(srv.base_url());
     println!("\n── Server Core ──");
 
     runner.run("Health check", || {

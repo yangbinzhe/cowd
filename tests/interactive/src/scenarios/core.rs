@@ -56,7 +56,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("Health endpoint", || {
         let mut srv = ServerProcess::start()?;
-        let api = ApiClient::new("http://127.0.0.1:8642");
+        let api = ApiClient::new(srv.base_url());
         let b = api.get("/health")?;
         let ok = b.contains("ok") || b.contains("healthy");
         if !ok {
@@ -68,7 +68,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("Session CRUD", || {
         let mut srv = ServerProcess::start()?;
-        let api = ApiClient::new("http://127.0.0.1:8642");
+        let api = ApiClient::new(srv.base_url());
         let sessions = api.get("/api/sessions")?;
         let parsed = serde_json::from_str::<serde_json::Value>(&sessions);
         if parsed.is_err() {
@@ -80,7 +80,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("Memory + Config", || {
         let mut srv = ServerProcess::start()?;
-        let api = ApiClient::new("http://127.0.0.1:8642");
+        let api = ApiClient::new(srv.base_url());
         let _ = api.get("/api/memory/search?q=test")?;
         let _ = api.get("/api/config")?;
         let _ = api.get("/api/approval/config")?;
@@ -90,7 +90,10 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     // === CROSS TEST ===
     println!("\n── Cross Test ──");
     runner.run("TUI→API session verify", || {
-        let t = TuiSession::new(TuiLaunchConfig::from_env("cross")?)?;
+        let mut srv = ServerProcess::start()?;
+        let mut config = TuiLaunchConfig::from_env("cross")?;
+        srv.configure_tui(&mut config);
+        let t = TuiSession::new(config)?;
         t.wait_until_ready(10)?;
         t.send("/status")?;
         t.enter()?;
@@ -109,8 +112,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         }
         t.close();
 
-        let mut srv = ServerProcess::start()?;
-        let api = ApiClient::new("http://127.0.0.1:8642");
+        let api = ApiClient::new(srv.base_url());
         let body = api.get("/api/sessions")?;
         if !body.contains("sessions") {
             Err(anyhow::anyhow!("No sessions in API"))
