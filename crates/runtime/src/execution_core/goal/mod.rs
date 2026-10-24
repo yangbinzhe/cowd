@@ -32,6 +32,18 @@ use crate::{
     RuntimeEventScope, RuntimeEventStore,
 };
 
+/// The original native Goal review identity, shared by its writer and reader.
+pub(crate) fn objective_review_record_id(
+    goal_id: &str,
+    action_id: &str,
+    criterion: &str,
+) -> String {
+    format!(
+        "objective_review:{:x}",
+        sha2::Sha256::digest(format!("{goal_id}|{action_id}|{criterion}").as_bytes())
+    )
+}
+
 #[derive(Clone)]
 pub struct GoalStore {
     event_store: Arc<RuntimeEventStore>,
@@ -544,13 +556,7 @@ impl GoalStore {
                         ObjectiveReviewDecision::Gap => "gap",
                         ObjectiveReviewDecision::Blocked => "blocked",
                     };
-                    let review_id = format!(
-                        "objective_review:{:x}",
-                        sha2::Sha256::digest(
-                            format!("{}|{}|{}", goal.id, envelope.action_id, input.criterion_ref)
-                                .as_bytes()
-                        )
-                    );
+                    let review_id = objective_review_record_id(&goal.id, &envelope.action_id, &input.criterion_ref);
                     if let Some(criterion) = goal.criteria.iter_mut().find(|item| item.id == input.criterion_ref) {
                         criterion.status = match input.decision {
                             ObjectiveReviewDecision::Satisfied => AcceptanceStatus::Satisfied,

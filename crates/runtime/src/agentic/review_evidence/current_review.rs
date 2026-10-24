@@ -88,6 +88,26 @@ pub(crate) fn program_cut_absorbs_own_review(
     current: u64,
     action_id: &str,
 ) -> bool {
+    program_cut_absorbs_review_records(
+        events,
+        program_source,
+        pinned,
+        current,
+        action_id,
+        &BTreeSet::new(),
+    )
+}
+
+/// Additional records are authenticated by the original proof policy reader.
+/// This admits their carrier advance only; it grants no effect/call exemption.
+pub(crate) fn program_cut_absorbs_review_records(
+    events: &[crate::DurableRuntimeEvent],
+    program_source: &str,
+    pinned: u64,
+    current: u64,
+    action_id: &str,
+    authenticated_review_events: &BTreeSet<String>,
+) -> bool {
     current.checked_sub(pinned) == Some(events.len() as u64)
         && events.iter().enumerate().all(|(offset, event)| {
             event.stream_id == program_source
@@ -95,7 +115,8 @@ pub(crate) fn program_cut_absorbs_own_review(
                 && event.scope == crate::RuntimeEventScope::Program
                 && event.schema_version == 1
                 && (is_current_review_application(event)
-                    && event.payload["envelope"]["action_id"].as_str() == Some(action_id)
+                    && (event.payload["envelope"]["action_id"].as_str() == Some(action_id)
+                        || authenticated_review_events.contains(&event.event_id))
                     || is_worker_lifecycle_event(event)
                     || is_completion_request_event(event)
                     || is_conclusion_process_event(event))

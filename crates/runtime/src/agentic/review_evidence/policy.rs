@@ -364,20 +364,30 @@ pub(crate) fn validate_proof_inputs_for_action(
     if current.session_id != program.session_id || current.objective_id != program.objective_id {
         return Err("proof Program identity changed".into());
     }
+    // Keep the Goal whose records authenticated the carrier tied to its exact
+    // read cut. A later source head cannot certify an earlier projection.
     let current_goal = goal
         .map(|goal| {
-            crate::execution_core::GoalStore::new(std::sync::Arc::clone(store)).get(&goal.id)
+            crate::execution_core::GoalStore::new(std::sync::Arc::clone(store)).projection(&goal.id)
         })
         .transpose()?
         .flatten();
     let snapshot = proof_input_snapshot_for_action(
         store,
         &current,
-        current_goal.as_ref(),
+        current_goal.as_ref().map(|projection| &projection.goal),
         proof,
         readers,
         current_review,
     )?;
+    if let Some(projection) = &current_goal {
+        if !snapshot.sources.iter().any(|source| {
+            source.stream_id == format!("goal:{}", projection.goal.id)
+                && source.expected_revision == projection.stream_revision
+        }) {
+            return Err("proof Goal source changed during review authentication".into());
+        }
+    }
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
     let changed = [
         (
@@ -3449,6 +3459,154 @@ fn is_review_own_admitted_call(
     current_review_effect_key == Some(identity) && reviewer_receipt_stream == Some(source)
 }
 
+/// A distinct required criterion may be reviewed after this proof was built.
+/// Authenticate its original native record before allowing the complete proof
+/// reader to proceed. The current review's own call identity is unchanged.
+fn applied_program_tail_preserves_inputs(
+    store: &RuntimeEventStore,
+    program: &AgenticProgramProjection,
+    goal: Option<&GoalContract>,
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+    context: &super::current_review::AppliedReviewContext<'_>,
+) -> Result<bool, String> {
+    if super::current_review::program_cut_absorbs_own_review(
+        context.program_events,
+        context.program_source,
+        context.pinned,
+        context.through,
+        context.action_id,
+    ) {
+        return Ok(true);
+    }
+    let mut authenticated = BTreeSet::new();
+    if let Some(goal) = goal {
+        for event in context.program_events {
+            if event.payload["envelope"]["action_id"].as_str() != Some(context.action_id)
+                && other_required_review_is_native(store, program, goal, proof, event)?
+            {
+                authenticated.insert(event.event_id.clone());
+            }
+        }
+    }
+    Ok(super::current_review::program_cut_absorbs_review_records(
+        context.program_events,
+        context.program_source,
+        context.pinned,
+        context.through,
+        context.action_id,
+        &authenticated,
+    ))
+}
+
+fn other_required_review_is_native(
+    store: &RuntimeEventStore,
+    program: &AgenticProgramProjection,
+    goal: &GoalContract,
+    original_proof: &harness_contract::goal::ObjectiveReviewVerification,
+    event: &crate::DurableRuntimeEvent,
+) -> Result<bool, String> {
+    use harness_contract::agent_action::{
+        AgentAction, AgentActionEnvelope, ObjectiveReviewDecision,
+    };
+    if event.stream_id != format!("agentic-program:{}", program.program_id)
+        || event.scope != crate::RuntimeEventScope::Program
+        || event.schema_version != 1
+        || event.kind != "agentic.action_applied"
+        || event.status.as_deref() != Some("applied")
+    {
+        return Ok(false);
+    }
+    let Ok(envelope) =
+        serde_json::from_value::<AgentActionEnvelope>(event.payload["envelope"].clone())
+    else {
+        return Ok(false);
+    };
+    let AgentAction::ObjectiveReview(input) = &envelope.action else {
+        return Ok(false);
+    };
+    let Some(original_condition) = original_proof
+        .input_set
+        .as_ref()
+        .and_then(|set| set.condition_ref.as_deref())
+    else {
+        return Ok(false);
+    };
+    let Some(binding) = &goal.execution_binding else {
+        return Ok(false);
+    };
+    if envelope.validate().is_err()
+        || envelope.actor.program_id != program.program_id
+        || envelope.actor.objective_id != program.objective_id
+        || envelope.actor.session_id != program.session_id
+        || envelope.actor.turn_id != program.turn_id
+        || envelope.actor.root_execution_id != program.root_execution_id
+        || event.actor.as_deref() != Some(envelope.actor.actor_id.as_str())
+        || binding.agentic_program_id != program.program_id
+        || binding.objective_id != program.objective_id
+        || binding.session_id != program.session_id
+        || goal.session_id != program.session_id
+        || goal.id != format!("goal:{}", binding.root_execution_id)
+        || binding.turn_id != program.turn_id
+        || Some(&binding.root_execution_id) != program.root_execution_id.as_ref()
+        || original_condition == input.criterion_ref
+        || !super::required_review_conditions(goal).contains(&input.criterion_ref)
+    {
+        return Ok(false);
+    }
+    let Ok(proof) = serde_json::from_value::<harness_contract::goal::ObjectiveReviewVerification>(
+        event.payload["review_verification"].clone(),
+    ) else {
+        return Ok(false);
+    };
+    let Some(inputs) = &proof.input_set else {
+        return Ok(false);
+    };
+    if inputs.version != 2
+        || inputs.condition_ref.as_deref() != Some(input.criterion_ref.as_str())
+        || proof.goal_spec_revision != Some(goal.spec_revision)
+        || proof.goal_spec_digest.as_deref() != Some(goal.spec_digest.as_str())
+    {
+        return Ok(false);
+    }
+    let review_id = crate::execution_core::goal::objective_review_record_id(
+        &goal.id,
+        &envelope.action_id,
+        &input.criterion_ref,
+    );
+    let decision = match input.decision {
+        ObjectiveReviewDecision::Satisfied => "satisfied",
+        ObjectiveReviewDecision::Gap => "gap",
+        ObjectiveReviewDecision::Blocked => "blocked",
+    };
+    if !goal.reviews.iter().any(|record| {
+        record.review_id == review_id
+            && record.criterion_ref == input.criterion_ref
+            && record.spec_revision == goal.spec_revision
+            && record.input_manifest_digest == goal.spec_digest
+            && record.reviewer_actor == envelope.actor.actor_id
+            && record.reviewer_execution_id == envelope.actor.execution_id
+            && record.result_refs == input.result_refs
+            && record.evidence_refs == input.evidence_refs
+            && record.decision == decision
+            && record.verification.as_ref() == Some(&proof)
+    }) {
+        return Ok(false);
+    }
+    let indexed = store
+        .event_by_idempotency_key(
+            &event.stream_id,
+            &crate::agentic::action_service::action_key(&envelope.action_id),
+        )
+        .map_err(|error| error.to_string())?;
+    let Some(primary) = indexed else {
+        return Ok(false);
+    };
+    Ok(
+        serde_json::to_value(primary).map_err(|error| error.to_string())?
+            == serde_json::to_value(event).map_err(|error| error.to_string())?,
+    )
+}
+
 /// The invocation id of the ORIGINAL applied action that produced a proof.
 ///
 /// The durable action record carries the envelope it applied and the proof it
@@ -4237,13 +4395,8 @@ fn proof_input_snapshot_for_phase(
             .get(&program_source)
             .copied()
             .ok_or("applied proof has no original Program cut")?;
-        if !super::current_review::program_cut_absorbs_own_review(
-            context.program_events,
-            &program_source,
-            pinned,
-            program_revision,
-            context.action_id,
-        ) || context.program_source != program_source
+        if !applied_program_tail_preserves_inputs(store, program, goal, proof, context)?
+            || context.program_source != program_source
             || context.pinned != pinned
             || context.through != program_revision
         {
@@ -8926,3 +9079,7 @@ mod own872_plan_owner_tests {
         assert!(delegated_plan_callback_owner(&plan, &[], &roots, &packets).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "policy_applied_carrier_tests.rs"]
+mod applied_carrier_tests;
