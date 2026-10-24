@@ -35,10 +35,6 @@
 
 #[path = "ingestion/aaak_compression.rs"]
 pub mod aaak_compression;
-#[path = "lifecycle/agent_directory.rs"]
-pub mod agent_directory;
-#[path = "lifecycle/agent_reputation.rs"]
-pub mod agent_reputation;
 #[path = "lifecycle/automatic_governance.rs"]
 pub mod automatic_governance;
 #[path = "lifecycle/background_watcher.rs"]
@@ -248,9 +244,6 @@ pub use impact_analyzer::{CallGraph, ImpactAnalyzer};
 // --- Performance monitor re-exports (P9.4) ---
 pub use performance_monitor::{AutoTuner, PerformanceMonitor, PerformanceReport};
 
-// --- Agent directory re-exports (P7.3) ---
-pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
-
 // --- Memory sync re-exports (P8.4) ---
 
 // --- Entity registry re-exports (P9.3) ---
@@ -259,9 +252,4 @@ pub use entity_registry::{DisambiguationKey, EntityRecord, EntityRegistry, Evolu
 // --- Transaction re-exports (F20) ---
 pub use transaction::{
     FileEditEffect, ReversibleEffect, TransactionError, TransactionGuard, TransactionManager,
-};
-
-// --- Agent reputation re-exports (P9.1) ---
-pub use agent_reputation::{
-    apply_decay, compute_reputation, AgentMetrics, DecayConfig, ReputationManager,
 };
