@@ -709,20 +709,33 @@ mod tests {
         let mut first = FactRecord::new("policy", "always verify output");
         first.id = FactId::from_string("fact-1");
         first.created_at = Utc::now();
-        let evidence = EvidencePacket::new(source(), serde_json::json!({"a": 1}));
+        let mut second = first.clone();
+        second.id = FactId::from_string("fact-2");
+        second.statement = "preserve independent evidence".to_string();
+        let mut evidence = EvidencePacket::new(source(), serde_json::json!({"a": 1}));
+        evidence.id = crate::FactEvidenceId::from_string("evidence-1");
+        let mut other_evidence = evidence.clone();
+        other_evidence.id = crate::FactEvidenceId::from_string("evidence-2");
+        other_evidence.payload = serde_json::json!({"b": 2});
         let ordered = FactLedgerSnapshot {
-            facts: vec![first.clone()],
-            evidence: vec![evidence.clone()],
+            facts: vec![first.clone(), second.clone()],
+            evidence: vec![evidence.clone(), other_evidence.clone()],
             ..FactLedgerSnapshot::default()
         };
         let reordered = FactLedgerSnapshot {
-            evidence: vec![evidence],
-            facts: vec![first.clone()],
+            facts: vec![second, first.clone()],
+            evidence: vec![other_evidence, evidence],
             ..FactLedgerSnapshot::default()
         };
         assert_eq!(
             ordered.canonical_digest().unwrap(),
             reordered.canonical_digest().unwrap()
+        );
+        let mut changed = ordered.clone();
+        changed.facts[0].statement = "changed content".to_string();
+        assert_ne!(
+            ordered.canonical_digest().unwrap(),
+            changed.canonical_digest().unwrap()
         );
         let duplicate = FactLedgerSnapshot {
             facts: vec![first.clone(), first],

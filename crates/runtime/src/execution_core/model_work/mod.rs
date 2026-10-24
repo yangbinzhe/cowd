@@ -293,6 +293,8 @@ mod tests {
         };
         started.notified().await;
         task.abort();
+        let cancelled = task.await.expect_err("original owner must be cancelled");
+        assert!(cancelled.is_cancelled());
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             coalescer.run("recoverable".to_string(), || async { Ok(9) }),

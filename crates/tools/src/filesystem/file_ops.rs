@@ -836,6 +836,8 @@ mod tests {
         )
         .expect("edit should succeed");
         assert!(output.replace_all);
+        let actual = std::fs::read_to_string(&path).expect("read edited file");
+        assert_eq!(actual, "omega beta omega");
     }
 
     #[test]
