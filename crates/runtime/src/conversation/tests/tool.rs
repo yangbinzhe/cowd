@@ -6984,6 +6984,8 @@ async fn a_one_shot_text_only_request_is_not_projected_as_a_signal() {
     .without_memory()
     .with_runtime_event_store(Arc::clone(&store));
 
+    runtime.require_next_model_final_response();
+
     let (_runtime, result) = submit_test_owned_conversation_turn(
         runtime,
         Arc::clone(&services),

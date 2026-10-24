@@ -4190,21 +4190,29 @@ fn a_second_distinct_defect_earns_its_own_repair_attempt() {
         first, second,
         "distinct defects must be distinct signatures"
     );
-    // Each signature starts from zero and therefore earns the full budget, while
-    // the second occurrence of the SAME defect is still refused - that is where
-    // the model has stopped learning.
-    for signature in [&first, &second] {
-        let mut attempts = std::collections::BTreeMap::new();
-        assert_eq!(
-            provider_frame_repair_attempt(true, false, true, false, false, 0),
-            Some(1)
+    // Both defects share the same live budget map. Spending one key must not
+    // spend the other, and neither key may regain a repair after exhaustion.
+    let mut attempts = std::collections::BTreeMap::new();
+    for (signature, expected) in [
+        (&first, Some(1)),
+        (&second, Some(1)),
+        (&first, None),
+        (&second, None),
+    ] {
+        let attempt = provider_frame_repair_attempt(
+            true,
+            false,
+            true,
+            false,
+            false,
+            attempts.get(signature).copied().unwrap_or(0),
         );
-        *attempts.entry(signature.clone()).or_insert(0) += 1;
-        assert_eq!(
-            provider_frame_repair_attempt(true, false, true, false, false, 1),
-            None
-        );
+        assert_eq!(attempt, expected, "repair budget for {signature}");
+        if attempt.is_some() {
+            *attempts.entry(signature.clone()).or_insert(0) += 1;
+        }
     }
+    assert_eq!(attempts.len(), 2);
 }
 
 /// Frames that differ only in length are the same mistake.
