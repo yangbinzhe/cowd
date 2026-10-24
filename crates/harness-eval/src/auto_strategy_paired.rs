@@ -1831,9 +1831,9 @@ fn zero_provider_usage_proven(sample: &Sample, consumed: u64) -> bool {
         && !nodes.is_empty()
         && nodes.iter().all(|node| {
             let usage = node.get("usage").unwrap_or(&Value::Null);
-            value_u64(usage, &["input_tokens"]) == 0
-                && value_u64(usage, &["output_tokens"]) == 0
-                && value_u64(usage, &["cached_tokens"]) == 0
+            usage.get("input_tokens").and_then(Value::as_u64) == Some(0)
+                && usage.get("output_tokens").and_then(Value::as_u64) == Some(0)
+                && usage.get("cached_tokens").and_then(Value::as_u64) == Some(0)
                 && usage.get("model").is_none_or(Value::is_null)
         })
 }
@@ -2983,6 +2983,67 @@ mod tests {
         });
 
         assert!(zero_provider_usage_proven(&sample, 0));
+        let baseline = sample.clone();
+        for node_index in 0..2 {
+            for field in ["input_tokens", "output_tokens", "cached_tokens"] {
+                for invalid in [
+                    None,
+                    Some(Value::Null),
+                    Some(json!("0")),
+                    Some(json!(-1)),
+                    Some(json!(1)),
+                ] {
+                    let mut changed = baseline.clone();
+                    let usage = changed.projection["graph"]["nodes"][node_index]["usage"]
+                        .as_object_mut()
+                        .unwrap();
+                    match &invalid {
+                        Some(value) => {
+                            usage.insert(field.into(), value.clone());
+                        }
+                        None => {
+                            usage.remove(field);
+                        }
+                    }
+                    assert!(
+                        !zero_provider_usage_proven(&changed, 0),
+                        "node {node_index} {field}={invalid:?} is not typed known zero"
+                    );
+                }
+            }
+            for invalid in [None, Some(Value::Null), Some(json!("0"))] {
+                let mut changed = baseline.clone();
+                let node = changed.projection["graph"]["nodes"][node_index]
+                    .as_object_mut()
+                    .unwrap();
+                match &invalid {
+                    Some(value) => {
+                        node.insert("usage".into(), value.clone());
+                    }
+                    None => {
+                        node.remove("usage");
+                    }
+                }
+                assert!(
+                    !zero_provider_usage_proven(&changed, 0),
+                    "node {node_index} usage={invalid:?} must stay unknown"
+                );
+            }
+        }
+        let mut mixed = baseline.clone();
+        mixed.projection["graph"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "kind": "judge_dispatch",
+                "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}
+            }));
+        assert!(zero_provider_usage_proven(&mixed, 0));
+        mixed.projection["graph"]["nodes"][2]["usage"]["cached_tokens"] = Value::Null;
+        assert!(
+            !zero_provider_usage_proven(&mixed, 0),
+            "complete earlier nodes cannot hide a later unknown dimension"
+        );
         sample.projection = Value::Null;
         assert!(!zero_provider_usage_proven(&sample, 0));
         sample.projection = json!({
