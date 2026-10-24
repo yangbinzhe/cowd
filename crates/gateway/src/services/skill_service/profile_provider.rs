@@ -1580,9 +1580,10 @@ mod tests {
             .root()
             .join("review/receipts")
             .join(format!("{}.json", receipt.install_id));
+        let original = std::fs::read(&path).unwrap();
         let mut altered = serde_json::to_value(&receipt).unwrap();
         altered["profile"]["name"] = serde_json::json!("foreign injected catalog metadata");
-        std::fs::write(path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
         assert!(fixture.source.approved_profiles().is_err());
         assert!(fixture
             .source
@@ -1592,6 +1593,23 @@ mod tests {
             )
             .await
             .is_err());
+        // Prove the first fault is gone before testing an independent native
+        // pointer fault, including a previously cached approved instruction.
+        std::fs::write(&path, &original).unwrap();
+        assert_eq!(
+            fixture.source.approved_profiles().unwrap().unwrap().len(),
+            1
+        );
+        let restored = fixture
+            .source
+            .load_instruction(
+                &Fixture::invocation(&receipt, "1.0.0"),
+                &usage_context("restored"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.content, "---\nname: Review\nversion: 1.0.0\ndescription: Review evidence.\n---\nAPPROVED_BODY\n");
         fixture
             .store
             .append(runtime::RuntimeEventInput {
@@ -1605,6 +1623,14 @@ mod tests {
             })
             .unwrap();
         assert!(fixture.source.approved_profiles().is_err());
+        assert!(fixture
+            .source
+            .load_instruction(
+                &Fixture::invocation(&receipt, "1.0.0"),
+                &usage_context("unknown-pointer"),
+            )
+            .await
+            .is_err());
         fixture.close().await;
     }
 

@@ -1097,14 +1097,19 @@ fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
         .unwrap()
         .count();
     for action in ["rollback", "deactivate"] {
-        let rejected = execute_in_workspace(
-            &root,
-            "skill",
-            &json!({"action":action,"skill_id":"reviewed-skill"}),
-        );
+        let mut request = json!({"action":action,"skill_id":"reviewed-skill"});
+        if action == "rollback" {
+            // A restored legacy handler must receive a complete, installed
+            // target, so missing revision cannot masquerade as denial.
+            request["revision"] = json!(digest);
+        }
+        let rejected = execute_in_workspace(&root, "skill", &request)
+            .expect_err("model must not mint a human approval");
         assert!(
-            rejected.is_err(),
-            "model must not mint a human approval: {action}"
+            rejected.contains("skill action")
+                && rejected.contains(action)
+                && !rejected.contains("missing field"),
+            "{action}: {rejected}"
         );
     }
     assert_eq!(
