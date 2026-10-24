@@ -2013,70 +2013,79 @@ mod tests {
             &["verify_after_write:cowd/dir".to_string()],
         );
         let wa = resolver
-            .observe_tool_scope("edit", "write:cowd/dir/a.rs", Some("a"), 1)
+            .observe_tool_scope("edit", "write:cowd/dir/a.rs", Some("a"), 10)
             .unwrap();
         let wb = resolver
-            .observe_tool_scope("edit", "write:cowd/dir/b.rs", Some("b"), 2)
+            .observe_tool_scope("edit", "write:cowd/dir/b.rs", Some("b"), 20)
             .unwrap();
         let wc = resolver
-            .observe_tool_scope("edit", "write:cowd/dir/c.rs", Some("c"), 3)
+            .observe_tool_scope("edit", "write:cowd/dir/c.rs", Some("c"), 30)
             .unwrap();
         let ra = resolver
-            .observe_tool_scope("read_file", "read:cowd/dir/a.rs", Some("a"), 4)
+            .observe_tool_scope("read_file", "read:cowd/dir/a.rs", Some("a"), 40)
             .unwrap();
         let rb = resolver
-            .observe_tool_scope("read_file", "read:cowd/dir/b.rs", Some("b"), 5)
+            .observe_tool_scope("read_file", "read:cowd/dir/b.rs", Some("b"), 50)
             .unwrap();
         let rc = resolver
-            .observe_tool_scope("read_file", "read:cowd/dir/c.rs", Some("c"), 6)
+            .observe_tool_scope("read_file", "read:cowd/dir/c.rs", Some("c"), 60)
             .unwrap();
 
-        let all = evaluate_observed_acceptance(
-            &required,
-            vec!["verified".to_string()],
-            vec![
-                wa.clone(),
-                wb.clone(),
-                wc.clone(),
-                ra.clone(),
-                rb.clone(),
-                rc.clone(),
-            ],
-        );
+        let baseline = vec![wa, wb, wc, ra, rb, rc];
+        let verified = vec!["verified".to_string()];
+        let evaluate = |receipts| evaluate_observed_acceptance(&required, verified.clone(), receipts);
+        let all = evaluate(baseline.clone());
+        assert_eq!(all.satisfied_criteria, verified);
         assert!(all.unresolved_obligation_ids.is_empty());
 
-        let missing_one = evaluate_observed_acceptance(
-            &required,
-            Vec::new(),
-            vec![wa.clone(), wb.clone(), wc.clone(), ra.clone(), rb.clone()],
-        );
-        assert_eq!(missing_one.unresolved_obligation_ids.len(), 1);
+        for read_index in 3..6 {
+            let mut missing_one = baseline.clone();
+            missing_one.remove(read_index);
+            assert_eq!(
+                evaluate(missing_one).unresolved_obligation_ids.len(),
+                1,
+                "missing read at index {read_index} must not pass"
+            );
 
-        let read_before_write = evaluate_observed_acceptance(
-            &required,
-            Vec::new(),
-            vec![ra.clone(), wa.clone(), wb.clone(), wc.clone(), rb.clone()],
-        );
-        assert_eq!(read_before_write.unresolved_obligation_ids.len(), 1);
+            // Vector order is unchanged: only the actual receipt timestamp
+            // moves before, or to, its own write. Both remain nonzero.
+            let write_sequence = baseline[read_index - 3].observed_at_sequence;
+            for read_sequence in [write_sequence - 1, write_sequence] {
+                let mut not_after_write = baseline.clone();
+                not_after_write[read_index].observed_at_sequence = read_sequence;
+                assert_eq!(
+                    evaluate(not_after_write).unresolved_obligation_ids.len(),
+                    1,
+                    "read {read_index} at {read_sequence} is not after its write"
+                );
+            }
 
-        let wrong_digest = evaluate_observed_acceptance(
-            &required,
-            Vec::new(),
-            vec![wa.clone(), wb.clone(), wc.clone(), rb.clone(), rc.clone()],
-        );
-        assert_eq!(wrong_digest.unresolved_obligation_ids.len(), 1);
+            let mut wrong_digest = baseline.clone();
+            let EvidenceTargetIdentity::Workspace { scope } = &mut wrong_digest[read_index].target
+            else {
+                panic!("baseline must contain workspace receipts");
+            };
+            scope.path.observed_revision_or_digest = Some("wrong-digest".to_string());
+            assert_eq!(
+                evaluate(wrong_digest).unresolved_obligation_ids.len(),
+                1,
+                "wrong digest for read {read_index} must not pass"
+            );
+        }
 
         // A directory listing read (windowed coverage) never satisfies an
         // exact post-write read obligation.
         let listing = resolver
-            .observe_tool_scope("list_directory", "read:cowd/dir", Some("listing"), 7)
+            .observe_tool_scope(
+                "list_directory",
+                "read:cowd/dir",
+                Some("listing"),
+                baseline[3].observed_at_sequence,
+            )
             .unwrap();
-        let windowed_read = evaluate_observed_acceptance(
-            &required,
-            Vec::new(),
-            vec![wa.clone(), wb.clone(), wc.clone(), listing],
-        );
-        assert_eq!(windowed_read.unresolved_obligation_ids.len(), 1);
+        let mut windowed_read = baseline.clone();
+        windowed_read[3] = listing;
+        assert_eq!(evaluate(windowed_read).unresolved_obligation_ids.len(), 1);
     }
 
     #[test]

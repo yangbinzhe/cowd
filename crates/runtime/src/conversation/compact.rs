@@ -894,10 +894,17 @@ mod tests {
         use crate::session::{ContentBlock, Session};
 
         let tool_id = "call_abc";
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            ..CompactionConfig::default()
+        };
         let mut session = Session::default();
-        // Turn 1: user prompt
+        // Exceed the real default budget through input, not a lower threshold.
         session
-            .push_message(ConversationMessage::user_text("Search for files"))
+            .push_message(ConversationMessage::user_text(format!(
+                "Search for files\n{}",
+                "old ".repeat(config.max_estimated_tokens)
+            )))
             .unwrap();
         // Turn 2: assistant calls a tool
         session
@@ -925,37 +932,53 @@ mod tests {
             }]))
             .unwrap();
 
-        // Compact preserving only 1 recent message — without the fix this
-        // would cut the boundary so that the tool result (turn 3) is first,
-        // without its preceding assistant tool_calls (turn 2).
-        let config = CompactionConfig {
-            preserve_recent_messages: 1,
-            ..CompactionConfig::default()
-        };
+        // Keeping the final two messages starts at this exact ToolResult;
+        // the compactor must move the boundary back to its matching ToolUse.
+        let raw_keep_from = session.message_count() - config.preserve_recent_messages;
+        assert!(matches!(
+            session.message(raw_keep_from).unwrap().blocks.first(),
+            Some(ContentBlock::ToolResult { tool_use_id, .. }) if tool_use_id == tool_id
+        ));
+        assert!(should_compact(&session, config));
         let result = compact_session(&session, config);
-        // After compaction, no two consecutive messages should have the pattern
-        // tool_result immediately following a non-assistant message (i.e. an
-        // orphaned tool result without a preceding assistant ToolUse).
+        assert!(result.removed_message_count > 0, "compaction must occur");
         let messages = result.compacted_session.materialize_messages();
-        for i in 1..messages.len() {
-            let curr_is_tool_result = messages[i]
-                .blocks
-                .first()
-                .is_some_and(|b| matches!(b, ContentBlock::ToolResult { .. }));
-            if curr_is_tool_result {
-                let prev_has_tool_use = messages[i - 1]
-                    .blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-                assert!(
-                    prev_has_tool_use,
-                    "message[{}] is a ToolResult but message[{}] has no ToolUse: {:?}",
-                    i,
-                    i - 1,
-                    &messages[i - 1].blocks
-                );
+        let mut use_positions = Vec::new();
+        let mut result_positions = Vec::new();
+        // Start at index zero and inspect every block: no orphan may evade
+        // the check, and an unrelated ToolUse cannot authorize this result.
+        for (index, message) in messages.iter().enumerate() {
+            for block in &message.blocks {
+                match block {
+                    ContentBlock::ToolUse { id, .. } if id == tool_id => {
+                        use_positions.push(index);
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        if tool_use_id == tool_id {
+                            result_positions.push(index);
+                        }
+                        let previous = index
+                            .checked_sub(1)
+                            .expect("a ToolResult at index zero is orphaned");
+                        assert_eq!(messages[previous].role, MessageRole::Assistant);
+                        assert!(
+                            messages[previous].blocks.iter().any(|block| {
+                                matches!(block, ContentBlock::ToolUse { id, .. } if id == tool_use_id)
+                            }),
+                            "ToolResult {tool_use_id} at {index} needs its own preceding ToolUse"
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
+        assert_eq!(use_positions.len(), 1, "original ToolUse must survive");
+        assert_eq!(
+            result_positions.len(),
+            1,
+            "original ToolResult must survive"
+        );
+        assert_eq!(result_positions[0], use_positions[0] + 1);
     }
 
     #[test]
