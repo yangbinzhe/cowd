@@ -7,6 +7,28 @@ use harness_contract::agent::{
     AgenticExecutionBinding, AgenticExecutionFocus, CohortPromptPackage, CohortPromptPacket,
 };
 
+const AGENTIC_RECOVERY_OWNER: &str = "runtime:agentic-program-recovery:v1";
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct AgenticRecoveryCursor {
+    after_program: Option<(u64, String)>,
+    program: Option<(u64, String)>,
+    after_work: Option<(String, String)>,
+}
+
+impl AgenticRecoveryCursor {
+    fn advance_program(&mut self) {
+        self.after_program = self.program.take();
+        self.after_work = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetirementProgress {
+    Complete,
+    Pending,
+}
+
 // Accounting prediction only. `ParentExecutionBudgetLedger::reserve_provider`
 // records overruns and borrowing but never rejects or shrinks an Agent model
 // request, so this estimate cannot become a business-execution budget gate.
@@ -956,18 +978,8 @@ impl RuntimeServices {
         // be reported as if the semantic retirement itself had failed.
         cancellation_tasks.sort();
         cancellation_tasks.dedup();
-        for task_ref in cancellation_tasks {
-            if let Err(error) = self
-                .reconcile_agentic_task_cancellation(&projection, &task_ref)
-                .await
-            {
-                tracing::warn!(
-                    program_id = projection.program_id,
-                    task_ref,
-                    %error,
-                    "durable Agent Task cancellation awaits recovery reconciliation"
-                );
-            }
+        if !cancellation_tasks.is_empty() {
+            self.notify_agentic_followups();
         }
 
         let mut receipts = Vec::new();
@@ -999,12 +1011,13 @@ impl RuntimeServices {
         self: &Arc<Self>,
         projection: &AgenticProgramProjection,
         task_ref: &str,
-    ) -> Result<(), String> {
+        attempt_filter: Option<&str>,
+    ) -> Result<RetirementProgress, String> {
         let Some(task) = projection.tasks.get(task_ref) else {
             return Err(format!("agentic_task_not_found:{task_ref}"));
         };
         if task.status != AgenticTaskStatus::CancelRequested {
-            return Ok(());
+            return Ok(RetirementProgress::Complete);
         }
         let mut attempts = task.active_attempts.values().cloned().collect::<Vec<_>>();
         // Old journals written before the effect outbox was introduced still
@@ -1024,13 +1037,18 @@ impl RuntimeServices {
                 });
             }
         }
+        attempts.retain(|attempt| {
+            attempt_filter.is_none_or(|selected| attempt.execution_id == selected)
+        });
         for attempt in &attempts {
             let terminal = match self
                 .graph_state_store()
                 .load_async(execution_graph_id(&attempt.execution_id))
                 .await
             {
-                Ok(_) => {
+                Ok(graph) => {
+                    #[cfg(test)]
+                    self.retirement_cancel_gate_for_test(&graph).await;
                     self.cancel_execution_tree(
                         &attempt.execution_id,
                         "Agentic Task was withdrawn or superseded",
@@ -1049,10 +1067,7 @@ impl RuntimeServices {
                 Err(error) => return Err(error.to_string()),
             };
             if !terminal {
-                return Err(format!(
-                    "agentic_task_cancellation_not_terminal:{}:{}",
-                    task_ref, attempt.execution_id
-                ));
+                return Ok(RetirementProgress::Pending);
             }
         }
         // All physical effects, including a legacy claim without an outbox
@@ -1069,13 +1084,24 @@ impl RuntimeServices {
                 continue;
             }
             if !self.retry_agentic_run_exit(&attempt.execution_id).await? {
-                return Err(format!(
-                    "agentic_task_cancellation_awaits_exact_exit_or_effects:{task_ref}:{}",
-                    attempt.execution_id
-                ));
+                return Ok(RetirementProgress::Pending);
             }
         }
-        Ok(())
+        let current = self
+            .agent_action_service()
+            .project_snapshot(&projection.program_id)
+            .map_err(|error| error.to_string())?;
+        Ok(
+            if current
+                .tasks
+                .get(task_ref)
+                .is_some_and(|task| task.status == AgenticTaskStatus::CancelRequested)
+            {
+                RetirementProgress::Pending
+            } else {
+                RetirementProgress::Complete
+            },
+        )
     }
 
     pub(crate) async fn retry_agentic_run_exit(
@@ -1230,43 +1256,114 @@ impl RuntimeServices {
         Ok(settled)
     }
 
-    pub(crate) async fn retry_pending_agentic_run_exits(self: &Arc<Self>) -> Result<(), String> {
-        let streams = self
-            .event_store()
-            .stream_ids_for_scope(crate::RuntimeEventScope::Program)
-            .map_err(|error| error.to_string())?;
-        let mut executions = BTreeSet::new();
-        let mut errors = Vec::new();
-        for stream in streams {
-            let Some(program_id) = stream.strip_prefix("agentic-program:") else {
-                continue;
+    /// One directory address and one retained domain operation per pass. The
+    /// cursor is only an address; the worker re-reads the original Task truth.
+    pub(crate) fn admit_agentic_recovery_page(
+        self: &Arc<Self>,
+        cursor: &mut AgenticRecoveryCursor,
+    ) -> Result<bool, String> {
+        if cursor.program.is_none() {
+            let page = self
+                .event_store()
+                .stream_ids_for_scope_kind_at_sequence_page(
+                    crate::RuntimeEventScope::Program,
+                    "agentic.program_opened",
+                    1,
+                    cursor.after_program.clone(),
+                    1,
+                )
+                .map_err(|error| error.to_string())?;
+            let Some((stream, sequence)) = page.into_iter().next() else {
+                cursor.after_program = None;
+                cursor.after_work = None;
+                return Ok(false);
             };
-            let projection = match self.agent_action_service().project_snapshot(program_id) {
-                Ok(projection) => projection,
-                Err(error) => {
-                    errors.push(format!("{program_id}:{error}"));
-                    continue;
+            cursor.program = Some((sequence, stream));
+        }
+        let (_, stream) = cursor.program.as_ref().expect("directory address selected");
+        let Some(program_id) = stream.strip_prefix("agentic-program:") else {
+            cursor.advance_program();
+            return Ok(true);
+        };
+        let program_id = program_id.to_string();
+        let projection = match self.agent_action_service().project_snapshot(&program_id) {
+            Ok(projection) => projection,
+            Err(error) => {
+                cursor.advance_program();
+                return Err(error.to_string());
+            }
+        };
+        if self
+            .agent_action_service()
+            .recovery_session_is_excluded(&projection.session_id)
+        {
+            cursor.advance_program();
+            return Ok(true);
+        }
+        let coordination = coordination_requests(&projection);
+        let candidate = projection
+            .tasks
+            .iter()
+            .flat_map(|(task_ref, task)| {
+                let mut attempts = task
+                    .active_attempts
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                attempts.extend(task.claim_execution_id.iter().cloned());
+                // A task with no attempt still owes ready/review/coordination admission.
+                if attempts.is_empty()
+                    && (task.status == AgenticTaskStatus::CancelRequested
+                        || (projection.status == super::super::program::AgenticProgramStatus::Open
+                            && (task_ready_for_execution(task, now_ms())
+                                || task.status == AgenticTaskStatus::Submitted
+                                || coordination
+                                    .iter()
+                                    .any(|(selected, _)| selected == task_ref))))
+                {
+                    attempts.insert(String::new());
                 }
-            };
-            for task in projection
-                .tasks
-                .values()
-                .filter(|task| task.status == AgenticTaskStatus::CancelRequested)
-            {
-                executions.extend(task.active_attempts.keys().cloned());
-                executions.extend(task.claim_execution_id.iter().cloned());
-            }
+                attempts
+                    .into_iter()
+                    .map(move |attempt| (task_ref.clone(), attempt))
+            })
+            .find(|work| cursor.after_work.as_ref().is_none_or(|after| work > after));
+        let Some((task_ref, attempt)) = candidate else {
+            cursor.advance_program();
+            return Ok(true);
+        };
+        // Busy and Full preserve this first unadmitted address. In particular,
+        // they do not move to the next Program and starve it on every rotation.
+        let Some(flight) = DispatchFlight::acquire(
+            self.agentic_dispatch_flights(),
+            AGENTIC_RECOVERY_OWNER.to_string(),
+        ) else {
+            return Ok(false);
+        };
+        let expected = projection.tasks[&task_ref].clone();
+        let weak = Arc::downgrade(self);
+        let worker_program = program_id.clone();
+        let worker_task = task_ref.clone();
+        let worker_attempt = attempt.clone();
+        let admitted = self.maintenance_supervisor().try_submit(
+            AGENTIC_RECOVERY_OWNER.to_string(), async move {
+                let _flight = flight;
+                let Some(services) = weak.upgrade() else { return; };
+                if let Err(error) = services.recover_agentic_program_task(
+                    &worker_program, &worker_task,
+                    (!worker_attempt.is_empty()).then_some(worker_attempt.as_str()),
+                    Some(&expected), &BTreeSet::new(),
+                ).await {
+                    tracing::warn!(program_id = %worker_program, task_ref = %worker_task,
+                        attempt = %worker_attempt, %error, "durable Agentic recovery remains pending");
+                }
+            },
+        );
+        if admitted.is_err() {
+            return Ok(false);
         }
-        for execution_id in executions {
-            if let Err(error) = self.retry_agentic_run_exit(&execution_id).await {
-                errors.push(format!("{execution_id}:{error}"));
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        cursor.after_work = Some((task_ref, attempt));
+        Ok(true)
     }
 
     async fn settle_agentic_task_attempt(
@@ -1372,6 +1469,9 @@ impl RuntimeServices {
         self: &Arc<Self>,
         excluded_sessions: &BTreeSet<String>,
     ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        // Startup retains the original full inventory validation: malformed
+        // openings must fail startup, while other Programs still recover.
+        // The hot lane alone uses the bounded canonical opening directory.
         let streams = self
             .event_store()
             .stream_ids_for_scope(crate::RuntimeEventScope::Program)
@@ -1382,184 +1482,209 @@ impl RuntimeServices {
             let Some(program_id) = stream.strip_prefix("agentic-program:") else {
                 continue;
             };
-            // A corrupt or unavailable Program is not authority to suppress
-            // independent Programs. Keep reconciliation ordered within one
-            // Program and report aggregate failure only after checking all.
-            let recovered: Result<(), String> = async {
-            let mut projection = self
+            let snapshot = match self.agent_action_service().project_snapshot(program_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    failures.push(format!("{program_id}:{error}"));
+                    continue;
+                }
+            };
+            for task_ref in snapshot.tasks.keys() {
+                match self
+                    .recover_agentic_program_task(
+                        program_id,
+                        task_ref,
+                        None,
+                        None,
+                        excluded_sessions,
+                    )
+                    .await
+                {
+                    Ok(dispatched) => receipts.extend(dispatched),
+                    Err(error) => failures.push(format!("{program_id}:{task_ref}:{error}")),
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "Agent-first startup dispatch reconciliation failed for {} followup(s) after {} idempotent dispatch receipt(s): {}",
+                failures.len(), receipts.len(), failures.join("; "),
+            ));
+        }
+        Ok(receipts)
+    }
+
+    pub(crate) async fn recover_agentic_program_task(
+        self: &Arc<Self>,
+        program_id: &str,
+        task_ref: &str,
+        attempt_filter: Option<&str>,
+        expected_task: Option<&AgenticTaskProjection>,
+        excluded_sessions: &BTreeSet<String>,
+    ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        let mut receipts = Vec::new();
+        let mut failures = Vec::new();
+        if let Some(expected) = expected_task {
+            let current = self
                 .agent_action_service()
                 .project_snapshot(program_id)
                 .map_err(|error| error.to_string())?;
-            if excluded_sessions.contains(&projection.session_id)
-                || self.agent_action_service().recovery_session_is_excluded(&projection.session_id) {
-                return Ok(());
+            let Some(task) = current.tasks.get(task_ref) else {
+                return Ok(receipts);
+            };
+            if task.active_attempts != expected.active_attempts
+                || task.claim_execution_id != expected.claim_execution_id
+                || task.claim_generation != expected.claim_generation
+                || task.review_generation != expected.review_generation
+            {
+                return Err(
+                    "queued Agentic recovery no longer names the registered attempt".into(),
+                );
             }
-            let cancellation_tasks = projection
-                .tasks
-                .values()
-                .filter(|task| task.status == AgenticTaskStatus::CancelRequested)
-                .map(|task| task.task_id.clone())
-                .collect::<Vec<_>>();
-            let mut cancellation_reconciled = false;
-            for task_ref in cancellation_tasks {
-                self.reconcile_agentic_task_cancellation(&projection, &task_ref)
+        }
+        let mut projection = self
+            .agent_action_service()
+            .project_snapshot(program_id)
+            .map_err(|error| error.to_string())?;
+        if excluded_sessions.contains(&projection.session_id)
+            || self
+                .agent_action_service()
+                .recovery_session_is_excluded(&projection.session_id)
+        {
+            return Ok(receipts);
+        }
+        let cancellation_tasks = projection
+            .tasks
+            .values()
+            .filter(|task| {
+                task.task_id == task_ref && task.status == AgenticTaskStatus::CancelRequested
+            })
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        let mut cancellation_reconciled = false;
+        for task_ref in cancellation_tasks {
+            let progress = self.reconcile_agentic_task_cancellation(&projection, &task_ref, attempt_filter)
                     .await
                     .map_err(|error| {
                         format!(
                             "startup cancellation reconciliation failed for Program {program_id}, Task {task_ref}: {error}"
                         )
                     })?;
-                cancellation_reconciled = true;
+            if progress == RetirementProgress::Pending {
+                return Ok(receipts);
             }
-            if cancellation_reconciled {
-                projection = self
-                    .agent_action_service()
-                    .project_snapshot(program_id)
-                    .map_err(|error| error.to_string())?;
-            }
-            if projection.status != super::super::program::AgenticProgramStatus::Open {
-                return Ok(());
-            }
-            // An admitted graph that is terminal (or was never persisted)
-            // cannot remain an invisible outbox entry.  Settle it through the
-            // same Supervisor action used by normal worker failure so later
-            // dispatch is based on durable Task truth, never stale memory.
-            let stranded_attempts = projection
+            cancellation_reconciled = true;
+        }
+        if cancellation_reconciled {
+            projection = self
+                .agent_action_service()
+                .project_snapshot(program_id)
+                .map_err(|error| error.to_string())?;
+        }
+        if projection
+            .tasks
+            .get(task_ref)
+            .is_some_and(|task| task.status == AgenticTaskStatus::CancelRequested)
+        {
+            return Ok(receipts);
+        }
+        if projection.status != super::super::program::AgenticProgramStatus::Open {
+            return Ok(receipts);
+        }
+        // An admitted graph that is terminal (or was never persisted)
+        // cannot remain an invisible outbox entry.  Settle it through the
+        // same Supervisor action used by normal worker failure so later
+        // dispatch is based on durable Task truth, never stale memory.
+        let stranded_attempts = projection
+            .tasks
+            .values()
+            .filter(|task| task.task_id == task_ref)
+            .flat_map(|task| {
+                task.active_attempts
+                    .values()
+                    .cloned()
+                    .map(move |attempt| (task.task_id.clone(), attempt))
+            })
+            .filter(|(_, attempt)| {
+                attempt_filter.is_none_or(|selected| attempt.execution_id == selected)
+            })
+            .collect::<Vec<_>>();
+        let mut settled_attempt = false;
+        for (task_ref, attempt) in stranded_attempts {
+            projection = self
+                .agent_action_service()
+                .project_snapshot(program_id)
+                .map_err(|error| error.to_string())?;
+            if projection
                 .tasks
-                .values()
-                .flat_map(|task| {
-                    task.active_attempts
-                        .values()
-                        .cloned()
-                        .map(move |attempt| (task.task_id.clone(), attempt))
-                })
-                .collect::<Vec<_>>();
-            let mut settled_attempt = false;
-            for (task_ref, attempt) in stranded_attempts {
-                projection = self.agent_action_service().project_snapshot(program_id)
-                    .map_err(|error| error.to_string())?;
-                if projection.tasks.get(&task_ref).is_some_and(|task|
-                    task.status == AgenticTaskStatus::CancelRequested)
-                {
-                    if attempt.mode == harness_contract::agent_action::AgentAttemptMode::Coordination
-                        || !self.retry_agentic_run_exit(execution_graph_id(&attempt.execution_id)).await?
-                    {
-                        return Err("startup retirement awaits original binding closure".into());
-                    }
-                    settled_attempt = true;
-                    continue;
-                }
-                let reason = match self
-                    .graph_state_store()
-                    .load_async(execution_graph_id(&attempt.execution_id))
-                    .await
-                {
-                    Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
-                    Ok(_) => {
-                        "startup recovered a terminal Agent graph with an unsettled Task attempt"
-                    }
-                    Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
-                        if attempt.mode == harness_contract::agent_action::AgentAttemptMode::Coordination
-                            && projection.coordination_wake(attempt.generation).is_some_and(|(_, wake)| projection.coordination_request_current(wake))
-                            && projection.coordination_team_id_for(&attempt.agent_id, attempt.generation)
-                                .and_then(|team| projection.membership_for(&attempt.agent_id, team))
-                                .is_some_and(|membership| membership.membership_id == attempt.membership_id) {
-                            // The durable registration is not consumption by a
-                            // model. Preserve it for the same graph factory.
-                            continue;
-                        }
-                        "startup recovered an Agent attempt whose graph was never admitted"
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
+                .get(&task_ref)
+                .is_some_and(|task| task.status == AgenticTaskStatus::CancelRequested)
+            {
                 if attempt.mode == harness_contract::agent_action::AgentAttemptMode::Coordination
-                    && projection.coordination_wake(attempt.generation).is_some_and(|(_, wake)|
-                        projection.coordination_replied(&wake.entry_id, &attempt.execution_id, &attempt.agent_id)) {
-                    let release = AgentActionEnvelope {
-                        action_id: format!("startup-coordination-reply:{}:{}", program_id, attempt.execution_id),
-                        actor: agentic_supervisor_actor(&projection, Some(attempt.execution_id.clone())),
-                        expected_revision: Some(projection.revision),
-                        action: AgentAction::TaskRelease(harness_contract::agent_action::TaskReleaseInput {
-                            task_ref: task_ref.clone(), reason: "recovered durable coordination reply".into(),
-                        }),
-                    };
-                    let observation = self.submit_agent_action(&release).await?;
-                    if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
-                        return Err(format!("coordination reply recovery rejected: {:?}", observation.error));
-                    }
-                    settled_attempt = true;
-                    continue;
-                }
-                self.settle_agentic_task_attempt(
-                    &projection,
-                    &task_ref,
-                    &attempt.execution_id,
-                    attempt.mode,
-                    reason,
-                    true,
-                )
-                .await?;
-                settled_attempt = true;
-            }
-            if settled_attempt {
-                projection = self
-                    .agent_action_service()
-                    .project_snapshot(program_id)
-                    .map_err(|error| error.to_string())?;
-            }
-            // An Agent claim is the durable reservation for its physical
-            // execution. If Runtime died after that model-authored claim was
-            // committed, release a missing/terminal graph immediately instead of making the
-            // Program wait for lease expiry. A non-terminal graph is left to
-            // the execution supervisor's recovery path; its actual Agent
-            // worker owns the rolling claim heartbeat for exactly its future.
-            let orphaned_claims = projection
-                .tasks
-                .values()
-                .filter(|task| task.status == AgenticTaskStatus::Claimed)
-                .filter(|task| task.active_attempts.is_empty())
-                .filter_map(|task| task.claim_execution_id.as_ref().map(|execution_id| {
-                    (task.task_id.clone(), execution_graph_id(&execution_id).to_string())
-                }))
-                .collect::<Vec<_>>();
-            let mut released_orphan = false;
-            for (task_ref, execution_id) in orphaned_claims {
-                // Same namespace translation as the heartbeat: this id is the one
-                // the Agent was admitted under, which is an agent-run id.
-                let recovery_reason = match self.graph_state_store().load_async(&execution_id).await
+                    || !self
+                        .retry_agentic_run_exit(execution_graph_id(&attempt.execution_id))
+                        .await?
                 {
-                    Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
-                    Ok(_) => "startup recovered a terminal graph with an unsettled claim",
-                    Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
-                        "startup recovered an orphaned graph reservation"
+                    return Ok(receipts); // Real retirement remains durable and pending.
+                }
+                settled_attempt = true;
+                continue;
+            }
+            let reason = match self
+                .graph_state_store()
+                .load_async(execution_graph_id(&attempt.execution_id))
+                .await
+            {
+                Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
+                Ok(_) => "startup recovered a terminal Agent graph with an unsettled Task attempt",
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
+                    ..
+                }) => {
+                    if attempt.mode
+                        == harness_contract::agent_action::AgentAttemptMode::Coordination
+                        && projection
+                            .coordination_wake(attempt.generation)
+                            .is_some_and(|(_, wake)| projection.coordination_request_current(wake))
+                        && projection
+                            .coordination_team_id_for(&attempt.agent_id, attempt.generation)
+                            .and_then(|team| projection.membership_for(&attempt.agent_id, team))
+                            .is_some_and(|membership| {
+                                membership.membership_id == attempt.membership_id
+                            })
+                    {
+                        // The durable registration is not consumption by a
+                        // model. Preserve it for the same graph factory.
+                        continue;
                     }
-                    Err(error) => return Err(error.to_string()),
-                };
+                    "startup recovered an Agent attempt whose graph was never admitted"
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if attempt.mode == harness_contract::agent_action::AgentAttemptMode::Coordination
+                && projection
+                    .coordination_wake(attempt.generation)
+                    .is_some_and(|(_, wake)| {
+                        projection.coordination_replied(
+                            &wake.entry_id,
+                            &attempt.execution_id,
+                            &attempt.agent_id,
+                        )
+                    })
+            {
                 let release = AgentActionEnvelope {
-                    action_id: format!("startup-release-orphan:{task_ref}:{execution_id}"),
-                    actor: harness_contract::agent_action::AgentActorBinding {
-                        objective_id: projection.objective_id.clone(),
-                        program_id: projection.program_id.clone(),
-                        session_id: projection.session_id.clone(),
-                        turn_id: projection.turn_id.clone(),
-                        root_execution_id: projection.root_execution_id.clone(),
-                        required_team_count: projection.required_team_count,
-                        exact_team_count: projection.exact_team_count,
-                        objective_summary: projection.objective_summary.clone(),
-                        model_lease: projection.model_lease.clone(),
-                        permission_ceiling: Some(projection.permission_ceiling),
-                        resource_scopes: projection.resource_scopes.clone(),
-                        actor_id: "runtime.program-supervisor".to_string(),
-                        kind: harness_contract::agent_action::AgentActorKind::Supervisor,
-                        execution_id: Some(execution_id),
-                        team_id: None,
-                        agent_id: None,
-                    },
-                    expected_revision: None,
+                    action_id: format!(
+                        "startup-coordination-reply:{}:{}",
+                        program_id, attempt.execution_id
+                    ),
+                    actor: agentic_supervisor_actor(
+                        &projection,
+                        Some(attempt.execution_id.clone()),
+                    ),
+                    expected_revision: Some(projection.revision),
                     action: AgentAction::TaskRelease(
                         harness_contract::agent_action::TaskReleaseInput {
-                            task_ref,
-                            reason: recovery_reason.to_string(),
+                            task_ref: task_ref.clone(),
+                            reason: "recovered durable coordination reply".into(),
                         },
                     ),
                 };
@@ -1567,27 +1692,64 @@ impl RuntimeServices {
                 if observation.status != harness_contract::agent_action::AgentActionStatus::Applied
                 {
                     return Err(format!(
-                        "orphaned claim recovery was rejected: {:?}",
+                        "coordination reply recovery rejected: {:?}",
                         observation.error
                     ));
                 }
-                released_orphan = true;
+                settled_attempt = true;
+                continue;
             }
-            if released_orphan {
-                projection = self
-                    .agent_action_service()
-                    .project_snapshot(program_id)
-                    .map_err(|error| error.to_string())?;
-            }
-            let context = AgenticDispatchContext {
-                session_id: projection.session_id.clone(),
-                turn_id: projection.turn_id.clone(),
-                model_lease: projection.model_lease.clone(),
-                permission_ceiling: projection.permission_ceiling,
-                resource_scopes: projection.resource_scopes.clone(),
+            self.settle_agentic_task_attempt(
+                &projection,
+                &task_ref,
+                &attempt.execution_id,
+                attempt.mode,
+                reason,
+                true,
+            )
+            .await?;
+            settled_attempt = true;
+        }
+        if settled_attempt {
+            projection = self
+                .agent_action_service()
+                .project_snapshot(program_id)
+                .map_err(|error| error.to_string())?;
+        }
+        // An Agent claim is the durable reservation for its physical
+        // execution. If Runtime died after that model-authored claim was
+        // committed, release a missing/terminal graph immediately instead of making the
+        // Program wait for lease expiry. A non-terminal graph is left to
+        // the execution supervisor's recovery path; its actual Agent
+        // worker owns the rolling claim heartbeat for exactly its future.
+        let orphaned_claims = projection
+            .tasks
+            .values()
+            .filter(|task| task.task_id == task_ref && task.status == AgenticTaskStatus::Claimed)
+            .filter(|task| task.active_attempts.is_empty())
+            .filter_map(|task| {
+                task.claim_execution_id.as_ref().map(|execution_id| {
+                    (
+                        task.task_id.clone(),
+                        execution_graph_id(&execution_id).to_string(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut released_orphan = false;
+        for (task_ref, execution_id) in orphaned_claims {
+            // Same namespace translation as the heartbeat: this id is the one
+            // the Agent was admitted under, which is an agent-run id.
+            let recovery_reason = match self.graph_state_store().load_async(&execution_id).await {
+                Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
+                Ok(_) => "startup recovered a terminal graph with an unsettled claim",
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
+                    ..
+                }) => "startup recovered an orphaned graph reservation",
+                Err(error) => return Err(error.to_string()),
             };
-            let trigger = AgentActionEnvelope {
-                action_id: format!("startup-reconcile:{}:{}", program_id, projection.revision),
+            let release = AgentActionEnvelope {
+                action_id: format!("startup-release-orphan:{task_ref}:{execution_id}"),
                 actor: harness_contract::agent_action::AgentActorBinding {
                     objective_id: projection.objective_id.clone(),
                     program_id: projection.program_id.clone(),
@@ -1602,76 +1764,120 @@ impl RuntimeServices {
                     resource_scopes: projection.resource_scopes.clone(),
                     actor_id: "runtime.program-supervisor".to_string(),
                     kind: harness_contract::agent_action::AgentActorKind::Supervisor,
-                    execution_id: None,
+                    execution_id: Some(execution_id),
                     team_id: None,
                     agent_id: None,
                 },
                 expected_revision: None,
-                action: AgentAction::StateInspect(
-                    harness_contract::agent_action::StateInspectInput {
-                        query: None,
-                        wait_for_workers: false,
-                        scope_ref: None,
-                        after_revision: None,
-                        page_cursor: None,
-                        entry_ref: None,
+                action: AgentAction::TaskRelease(
+                    harness_contract::agent_action::TaskReleaseInput {
+                        task_ref,
+                        reason: recovery_reason.to_string(),
                     },
                 ),
             };
-            let observed_at_ms = now_ms();
-            let mut requests = projection
-                .tasks
-                .values()
-                .filter(|task| {
-                    task_ready_for_execution(task, observed_at_ms)
-                        && dependencies_accepted(&projection, task)
-                })
-                .map(|task| (task.task_id.clone(), DispatchMode::Execute))
-                .chain(
-                    projection
-                        .tasks
-                        .values()
-                        .filter(|task| task.status == AgenticTaskStatus::Submitted)
-                        .map(|task| (task.task_id.clone(), DispatchMode::Review)),
-                )
-                .collect::<Vec<_>>();
-            requests.sort();
-            requests.extend(coordination_requests(&projection));
-            requests.dedup();
-            for (task_ref, mode) in requests {
-                match self
-                    .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger)
-                    .await
-                {
-                    Ok(dispatched) => receipts.extend(dispatched),
-                    Err(error) => {
-                        tracing::warn!(
-                            program_id,
-                            task_ref,
-                            mode = mode.as_str(),
-                            %error,
-                            "startup recovery failed one Agent-first followup"
-                        );
-                        failures.push(format!(
-                            "program={program_id},task={task_ref},mode={}: {error}",
-                            mode.as_str()
-                        ));
-                    }
-                }
+            let observation = self.submit_agent_action(&release).await?;
+            if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
+                return Err(format!(
+                    "orphaned claim recovery was rejected: {:?}",
+                    observation.error
+                ));
             }
-            Ok(())
-            }.await;
-            if let Err(error) = recovered {
-                failures.push(format!("program={program_id}: {error}"));
+            released_orphan = true;
+        }
+        if released_orphan {
+            projection = self
+                .agent_action_service()
+                .project_snapshot(program_id)
+                .map_err(|error| error.to_string())?;
+        }
+        let context = AgenticDispatchContext {
+            session_id: projection.session_id.clone(),
+            turn_id: projection.turn_id.clone(),
+            model_lease: projection.model_lease.clone(),
+            permission_ceiling: projection.permission_ceiling,
+            resource_scopes: projection.resource_scopes.clone(),
+        };
+        let trigger = AgentActionEnvelope {
+            action_id: format!("startup-reconcile:{}:{}", program_id, projection.revision),
+            actor: harness_contract::agent_action::AgentActorBinding {
+                objective_id: projection.objective_id.clone(),
+                program_id: projection.program_id.clone(),
+                session_id: projection.session_id.clone(),
+                turn_id: projection.turn_id.clone(),
+                root_execution_id: projection.root_execution_id.clone(),
+                required_team_count: projection.required_team_count,
+                exact_team_count: projection.exact_team_count,
+                objective_summary: projection.objective_summary.clone(),
+                model_lease: projection.model_lease.clone(),
+                permission_ceiling: Some(projection.permission_ceiling),
+                resource_scopes: projection.resource_scopes.clone(),
+                actor_id: "runtime.program-supervisor".to_string(),
+                kind: harness_contract::agent_action::AgentActorKind::Supervisor,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+            expected_revision: None,
+            action: AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
+                query: None,
+                wait_for_workers: false,
+                scope_ref: None,
+                after_revision: None,
+                page_cursor: None,
+                entry_ref: None,
+            }),
+        };
+        let observed_at_ms = now_ms();
+        let mut requests = projection
+            .tasks
+            .values()
+            .filter(|task| {
+                task.task_id == task_ref
+                    && task_ready_for_execution(task, observed_at_ms)
+                    && dependencies_accepted(&projection, task)
+            })
+            .map(|task| (task.task_id.clone(), DispatchMode::Execute))
+            .chain(
+                projection
+                    .tasks
+                    .values()
+                    .filter(|task| {
+                        task.task_id == task_ref && task.status == AgenticTaskStatus::Submitted
+                    })
+                    .map(|task| (task.task_id.clone(), DispatchMode::Review)),
+            )
+            .collect::<Vec<_>>();
+        requests.sort();
+        requests.extend(
+            coordination_requests(&projection)
+                .into_iter()
+                .filter(|(task, _)| task == task_ref),
+        );
+        requests.dedup();
+        for (task_ref, mode) in requests {
+            match self
+                .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger)
+                .await
+            {
+                Ok(dispatched) => receipts.extend(dispatched),
+                Err(error) => {
+                    tracing::warn!(
+                        program_id,
+                        task_ref,
+                        mode = mode.as_str(),
+                        %error,
+                        "startup recovery failed one Agent-first followup"
+                    );
+                    failures.push(format!(
+                        "program={program_id},task={task_ref},mode={}: {error}",
+                        mode.as_str()
+                    ));
+                }
             }
         }
         if !failures.is_empty() {
-            return Err(format!(
-                "Agent-first startup dispatch reconciliation failed for {} followup(s) after {} idempotent dispatch receipt(s): {}",
-                failures.len(),
-                receipts.len(),
-                failures.join("; ")
-            ));
+            return Err(failures.join("; "));
         }
         Ok(receipts)
     }

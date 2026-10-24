@@ -803,7 +803,13 @@ impl GatewayToolExecutor {
                     permission_ceiling: binding.permission_ceiling,
                     resource_scopes: envelope.actor.resource_scopes.clone(),
                 };
-                reconcile_program_barrier(&services, &envelope.actor.program_id).await;
+                if !matches!(
+                    &envelope.action,
+                    harness_contract::agent_action::AgentAction::TaskWithdraw(_)
+                        | harness_contract::agent_action::AgentAction::TaskSupersede(_)
+                ) {
+                    reconcile_program_barrier(&services, &envelope.actor.program_id).await;
+                }
                 match services
                     .dispatch_agentic_followups(&envelope, dispatch_context.clone())
                     .await
@@ -832,35 +838,6 @@ impl GatewayToolExecutor {
                         ));
                     }
                 }
-                // Bounded re-reconciliation (L2'/Y2): the semantic action is
-                // durable and dispatch is deterministic, so retry a few times in
-                // the background. This recovers a deferred physical dispatch
-                // (e.g. an invited member that had not started) and also admits
-                // an independent Review graph for a Task that was just
-                // Submitted, instead of waiting for a worker exit or a restart.
-                // `DispatchFlight` single-flights concurrent retries.
-                let retry_services = Arc::clone(&services);
-                let retry_envelope = envelope.clone();
-                let retry_context = dispatch_context.clone();
-                tokio::spawn(async move {
-                    for delay_ms in [5_000u64, 15_000, 45_000] {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        match retry_services
-                            .dispatch_agentic_followups(&retry_envelope, retry_context.clone())
-                            .await
-                        {
-                            Ok(dispatches) if !dispatches.is_empty() => {
-                                tracing::info!(
-                                    program_id = %retry_envelope.actor.program_id,
-                                    admitted = dispatches.len(),
-                                    "reconciled deferred Agent dispatch"
-                                );
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                });
             }
             // A refused action must reach the model as a failed tool call.
             //

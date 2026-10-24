@@ -1932,9 +1932,22 @@ async fn n1_native_retirement_recovers_automatically_after_cold_rebuild() {
 
 async fn automatic_retirement_after_fault(cold: bool) {
     let fixture = NativeRetirementFixture::new("n1-auto-retirement").await;
+    // Suppress commit notifications only for the original settled lane. Its
+    // original safety tick remains active across an already consumed action.
+    let (_commit_sender, commits) = tokio::sync::watch::channel(0u64);
+    let mut safety_hits = fixture
+        .physical
+        .services
+        .retirement_lane_notifications_for_test(commits);
     fixture
         .protect(async {
             fixture.worker.withdraw().await;
+            let requested_cursor = fixture
+                .physical
+                .services
+                .event_store()
+                .durable_commit_cursor()
+                .unwrap();
             fixture.worker.cancel().await;
             fixture.resume.notify_one();
             tokio::time::timeout(
@@ -1959,13 +1972,48 @@ async fn automatic_retirement_after_fault(cold: bool) {
             .await
             .expect("production lane must hit the held settlement fault");
             assert_pending(&fixture.physical.services, &fixture.worker);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let checkpoint = fixture
+                        .physical
+                        .services
+                        .event_store()
+                        .projection_checkpoint("runtime:agentic-settled-graph-resolver:v1")
+                        .unwrap();
+                    if checkpoint
+                        .is_some_and(|checkpoint| checkpoint.source_cursor >= requested_cursor)
+                        && !fixture
+                            .physical
+                            .services
+                            .agentic_dispatch_flights()
+                            .lock()
+                            .unwrap()
+                            .contains("runtime:agentic-program-recovery:v1")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("original lane checkpoint must pass the withdrawal while it remains pending");
         })
         .await;
     let fixture = if cold {
-        fixture.cold_rebuild().await
+        let rebuilt = fixture.cold_rebuild().await;
+        let (_new_commit_sender, new_commits) = tokio::sync::watch::channel(0u64);
+        // The sender need not publish. Keep its receiver open for this scope.
+        // A closed notification channel would terminate the original lane.
+        safety_hits = rebuilt
+            .physical
+            .services
+            .retirement_lane_notifications_for_test(new_commits);
+        (rebuilt, Some(_new_commit_sender))
     } else {
-        fixture
+        (fixture, None)
     };
+    let (fixture, _rebuilt_commit_sender) = fixture;
+    let safety_before_release = safety_hits.load(Ordering::SeqCst);
     fixture
         .protect(async {
             fixture.backend.allow();
@@ -1979,6 +2027,7 @@ async fn automatic_retirement_after_fault(cold: bool) {
                         .unwrap();
                     if program.tasks[&fixture.worker.task_ref].status
                         == crate::AgenticTaskStatus::Withdrawn
+                        && safety_hits.load(Ordering::SeqCst) > safety_before_release
                     {
                         break;
                     }
@@ -1987,6 +2036,7 @@ async fn automatic_retirement_after_fault(cold: bool) {
             })
             .await
             .expect("production lane must recover without test-driven retry");
+            eprintln!("1145_RETIREMENT_TICK cold={cold} ticks_before={safety_before_release} ticks_after={}", safety_hits.load(Ordering::SeqCst));
             assert_withdrawn_evidence(&fixture).await;
             assert_real_closures(&fixture.physical.services, fixture.worker.packet.graph_id());
             fixture.physical.services.shutdown_maintenance().await;
@@ -2498,4 +2548,90 @@ async fn r1_1112_retirement_exit_fences_concurrent_program_change() {
 #[tokio::test]
 async fn r1_1112_startup_settlement_fences_concurrent_program_change() {
     settlement_program_race_1112(2).await;
+}
+
+#[tokio::test]
+async fn self_withdraw_response_precedes_its_physical_exit() {
+    use crate::execution_core::services::RetirementOwnerTestGate;
+    let (physical, backend, worker, cleanup) = process_retirement_1100("1145-self-withdraw").await;
+    let services = &physical.services;
+    let actor = services
+        .resolve_agent_action_actor(
+            &ExecutionParentBinding {
+                execution_id: worker.packet.graph_id().into(),
+                node_id: worker.packet.node_id().into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let reason = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/plain".into(),
+                visibility_scope: "session:session-dispatch".into(),
+                expected_bytes: None,
+                original_name: Some("1145-self-withdraw.txt".into()),
+            },
+            b"The original controlled Process has completed its probe.",
+        )
+        .await
+        .unwrap();
+    let envelope = AgentActionEnvelope {
+        action_id: "1145-self-withdraw".into(),
+        actor,
+        expected_revision: None,
+        action: AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+            task_ref: worker.task_ref.clone(),
+            reason_ref: reason.selector.clone(),
+            evidence_refs: vec![reason.selector],
+        }),
+    };
+    let gate = RetirementOwnerTestGate::new(worker.packet.clone(), envelope.action_id.clone());
+    services.install_retirement_owner_test_gate(gate.clone());
+    cleanup.protect(async {
+        let request = worker.process.action_with_request_id(&envelope, "1145-self-withdraw:tool");
+        tokio::pin!(request);
+        let reached = async {
+            gate.until(|| gate.semantic_committed.load(Ordering::Acquire)).await;
+            gate.until(|| gate.cancel_hits.load(Ordering::Acquire) > 0).await;
+        };
+        tokio::select! {
+            response = &mut request => panic!("original ToolHost must reach the held semantic/cancel boundary first: {response:?}"),
+            reached = tokio::time::timeout(Duration::from_secs(30), reached) => reached.expect("original self-withdraw must hit semantic commit and exact cancel gate"),
+        }
+        let program = services.agent_action_service().project(&envelope.actor.program_id).unwrap();
+        assert_eq!(program.tasks[&worker.task_ref].status, crate::AgenticTaskStatus::CancelRequested);
+        assert!(program.tasks[&worker.task_ref].pending_retirement.is_some());
+        assert!(program.tasks[&worker.task_ref].active_attempts.contains_key(worker.packet.graph_id()));
+        assert!(confirmed_run_exit_with_retry(services.event_store(), &worker.packet).is_none());
+        let returned = tokio::select! {
+            response = &mut request => panic!("response escaped its explicit host gate: {response:?}"),
+            returned = tokio::time::timeout(Duration::from_secs(5), gate.until(|| gate.postcommit_returned.load(Ordering::Acquire))) => returned.is_ok(),
+        };
+        eprintln!("SELF_RETIREMENT_RESPONSE_ORACLE semantic={} cancel_hits={} postcommit_returned={returned}",
+            gate.semantic_committed.load(Ordering::Acquire), gate.cancel_hits.load(Ordering::Acquire));
+        gate.release_response();
+        assert!(returned, "SELF_RETIREMENT_RESPONSE_DEPENDS_ON_PHYSICAL_EXIT: exact original cancel gate was hit, but ToolHost postcommit did not return");
+        let observation = request.await.unwrap();
+        assert_eq!(observation.status, AgentActionStatus::Applied);
+        assert_eq!(observation.action_id, envelope.action_id);
+        gate.release_cancel();
+        backend.allow();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let current = services.agent_action_service().project(&envelope.actor.program_id).unwrap();
+                if current.tasks[&worker.task_ref].status == crate::AgenticTaskStatus::Withdrawn { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("original owner must settle self-retirement without test retry/recover");
+        assert_real_closures(services, worker.packet.graph_id());
+        assert!(confirmed_run_exit_with_retry(services.event_store(), &worker.packet).is_some());
+        services.shutdown_maintenance().await;
+        let report = services.shutdown_execution().await;
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.forced_aborts, 0, "{report:?}");
+        assert_eq!(report.remaining_keys, 0, "{report:?}");
+    }, || { gate.release_response(); gate.release_cancel(); backend.allow(); }).await;
 }

@@ -4762,68 +4762,75 @@ impl crate::RuntimeExecutionHost for ReviewReadHost {
                             .and_then(|path| std::fs::read(path).ok())
                             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                             .unwrap_or_default();
-                        let action = serde_json::from_value(serde_json::json!({
+                    let action = serde_json::from_value(serde_json::json!({
                         "kind":request.tool_name,
                         "input":serde_json::from_str::<serde_json::Value>(&request.input).unwrap(),
-                    })).unwrap();
-                        let envelope = AgentActionEnvelope {
-                            action_id: metadata["action_id"]
-                                .as_str()
-                                .unwrap_or(call_id)
-                                .to_string(),
-                            actor,
-                            expected_revision: metadata["expected_revision"].as_u64(),
-                            action,
-                        };
-                        let result = services.submit_agent_action(&envelope).await;
-                        if let Ok(observation) = &result {
-                            if observation.status
-                                == harness_contract::agent_action::AgentActionStatus::Applied
-                                && !matches!(&envelope.action, AgentAction::StateInspect(_))
-                            {
-                                let context = original_packet_followup_context(&packet, parent, &envelope.actor)
-                                    .expect("followup requires the same original packet/parent/actor identity");
-                                let barrier = services
+                    }))
+                    .unwrap();
+                    let envelope = AgentActionEnvelope {
+                        action_id: metadata["action_id"]
+                            .as_str()
+                            .unwrap_or(call_id)
+                            .to_string(),
+                        actor,
+                        expected_revision: metadata["expected_revision"].as_u64(),
+                        action,
+                    };
+                    let result = services.submit_agent_action(&envelope).await;
+                    #[cfg(test)]
+                    if result.as_ref().is_ok_and(|observation| {
+                        observation.status
+                            == harness_contract::agent_action::AgentActionStatus::Applied
+                    }) {
+                        services.retirement_semantic_for_test(&envelope);
+                    }
+                    if let Ok(observation) = &result {
+                        if observation.status
+                            == harness_contract::agent_action::AgentActionStatus::Applied
+                            && !matches!(&envelope.action, AgentAction::StateInspect(_))
+                        {
+                            let context = original_packet_followup_context(
+                                &packet,
+                                parent,
+                                &envelope.actor,
+                            )
+                            .expect(
+                                "followup requires the same original packet/parent/actor identity",
+                            );
+                            let barrier = if matches!(
+                                &envelope.action,
+                                AgentAction::TaskWithdraw(_) | AgentAction::TaskSupersede(_)
+                            ) {
+                                Ok(0)
+                            } else {
+                                services
                                     .resolve_agentic_program_barrier(&envelope.actor.program_id)
-                                    .await;
-                                let dispatch = services
-                                    .dispatch_agentic_followups(&envelope, context.clone())
-                                    .await;
-                                eprintln!("R1_752_POSTCOMMIT {}", serde_json::json!({
+                                    .await
+                            };
+                            let dispatch = services
+                                .dispatch_agentic_followups(&envelope, context.clone())
+                                .await;
+                            eprintln!(
+                                "R1_752_POSTCOMMIT {}",
+                                serde_json::json!({
                                     "envelope": &envelope,
                                     "observation": observation,
                                     "parent_execution": parent,
                                     "attempt": packet.attempt,
                                     "barrier": format!("{barrier:?}"),
                                     "dispatch": format!("{dispatch:?}"),
-                                }));
-                                let retry_services = services.clone();
-                                let retry_owner = format!("fixture-postcommit:{}", envelope.action_id);
-                                let retry_admitted = services.maintenance_supervisor().submit(retry_owner.clone(), async move {
-                                    for delay_ms in [5_000u64, 15_000, 45_000] {
-                                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
-                                            .await;
-                                        let dispatch = retry_services
-                                            .dispatch_agentic_followups(&envelope, context.clone())
-                                            .await;
-                                        eprintln!("R1_752_POSTCOMMIT_RETRY {}", serde_json::json!({
-                                            "action_id": &envelope.action_id,
-                                            "dispatch": format!("{dispatch:?}"),
-                                        }));
-                                        if matches!(dispatch, Ok(ref admitted) if !admitted.is_empty()) {
-                                            break;
-                                        }
-                                    }
-                                }).await;
-                                if !retry_admitted {
-                                    eprintln!("R1_752_POSTCOMMIT_NOT_ADMITTED owner={retry_owner}");
-                                }
-                            }
+                                })
+                            );
                         }
-                        result
                     }
-                    Err(error) => Err(error),
-                };
+                    #[cfg(test)]
+                    if result.is_ok() {
+                        services.retirement_response_for_test(&envelope).await;
+                    }
+                    result
+                }
+                Err(error) => Err(error),
+            };
             let (status, output, error) = match result {
                 Ok(observation) => (
                     crate::RuntimeToolExecutionStatus::Executed,

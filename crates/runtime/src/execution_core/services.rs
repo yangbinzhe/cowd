@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -232,6 +234,67 @@ pub(crate) struct RuntimeMaintenanceSupervisor {
     shutdown_timeout: Duration,
 }
 
+/// Per-Runtime scheduling control for the original self-retirement oracle.
+/// This never supplies an action, exit, receipt or binding closure.
+#[cfg(test)]
+pub(crate) struct RetirementOwnerTestGate {
+    pub(crate) packet: harness_contract::agent::AgentTaskPacket,
+    pub(crate) action_id: String,
+    pub(crate) semantic_committed: std::sync::atomic::AtomicBool,
+    pub(crate) postcommit_returned: std::sync::atomic::AtomicBool,
+    pub(crate) cancel_hits: std::sync::atomic::AtomicUsize,
+    cancel_released: std::sync::atomic::AtomicBool,
+    response_released: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl RetirementOwnerTestGate {
+    pub(crate) fn new(
+        packet: harness_contract::agent::AgentTaskPacket,
+        action_id: String,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            packet,
+            action_id,
+            semantic_committed: false.into(),
+            postcommit_returned: false.into(),
+            cancel_hits: 0.into(),
+            cancel_released: false.into(),
+            response_released: false.into(),
+            changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) async fn until(&self, predicate: impl Fn() -> bool) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if predicate() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn release_response(&self) {
+        self.response_released.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn release_cancel(&self) {
+        self.cancel_released.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaintenanceSubmitError {
+    Full,
+    Closing,
+}
+
 impl RuntimeMaintenanceSupervisor {
     fn new() -> Self {
         Self::with_shutdown_timeout(Duration::from_secs(10))
@@ -256,113 +319,130 @@ impl RuntimeMaintenanceSupervisor {
         }
     }
 
+    /// Non-waiting admission into the same retained worker/reaper as `submit`.
+    /// The future is returned internally on Full so the waiting API can retry;
+    /// callers of try_submit drop it (and its original in-flight token).
+    pub(crate) fn try_submit<F>(&self, owner: String, work: F) -> Result<(), MaintenanceSubmitError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.try_submit_work(owner, Box::pin(work))
+            .map_err(|(error, _work)| error)
+    }
+
     pub(crate) async fn submit<F>(&self, owner: String, work: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if !self.ensure_reaper() {
-            return false;
-        }
-        let mut pending_work: Option<MaintenanceWork> = Some(Box::pin(work));
+        let mut work: MaintenanceWork = Box::pin(work);
         loop {
             let changed = self.changed.notified();
-            let should_wait = {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.lifecycle != MaintenanceLifecycle::Open {
-                    return false;
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.try_submit_work(owner.clone(), work) {
+                Ok(()) => return true,
+                Err((MaintenanceSubmitError::Closing, _)) => return false,
+                Err((MaintenanceSubmitError::Full, returned)) => {
+                    work = returned;
+                    changed.await;
                 }
-
-                if let Some(existing) = state.owners.get_mut(&owner) {
-                    if existing.queued.len() < MAX_QUEUED_MAINTENANCE_PER_OWNER {
-                        let Some(work) = pending_work.take() else {
-                            return false;
-                        };
-                        existing.queued.push_back(work);
-                        return true;
-                    }
-                    true
-                } else if state.owners.len() >= MAX_MAINTENANCE_OWNERS {
-                    true
-                } else {
-                    state.next_generation = state.next_generation.saturating_add(1);
-                    let generation = state.next_generation;
-                    let worker_state = Arc::downgrade(&self.state);
-                    let worker_changed = Arc::clone(&self.changed);
-                    let completion_tx = self.completion_tx.clone();
-                    let worker_owner = owner.clone();
-                    let Some(initial_work) = pending_work.take() else {
-                        return false;
-                    };
-                    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-                    let handle = tokio::spawn(async move {
-                        if start_rx.await.is_err() {
-                            return;
-                        }
-                        let mut current = initial_work;
-                        loop {
-                            let _ = std::panic::AssertUnwindSafe(current).catch_unwind().await;
-                            let Some(state) = worker_state.upgrade() else {
-                                return;
-                            };
-                            let (next, completed) = {
-                                let mut state = state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let Some(entry) = state.owners.get_mut(&worker_owner) else {
-                                    return;
-                                };
-                                if entry.generation != generation {
-                                    return;
-                                }
-                                if let Some(next) = entry.queued.pop_front() {
-                                    (Some(next), None)
-                                } else {
-                                    let Some(completed) = state.owners.remove(&worker_owner) else {
-                                        return;
-                                    };
-                                    state.reaping = state.reaping.saturating_add(1);
-                                    (None, Some(completed))
-                                }
-                            };
-                            worker_changed.notify_waiters();
-                            if let Some(completed) = completed {
-                                if completion_tx
-                                    .send(MaintenanceCompletion { owner: completed })
-                                    .await
-                                    .is_err()
-                                {
-                                    tracing::debug!(
-                                        owner = %worker_owner,
-                                        "maintenance completion reaper is closed"
-                                    );
-                                }
-                                return;
-                            }
-                            match next {
-                                Some(next) => current = next,
-                                None => return,
-                            }
-                        }
-                    });
-                    state.owners.insert(
-                        owner.clone(),
-                        MaintenanceOwner {
-                            generation,
-                            queued: VecDeque::new(),
-                            handle,
-                        },
-                    );
-                    let _ = start_tx.send(());
-                    return true;
-                }
-            };
-            if should_wait {
-                changed.await;
             }
         }
+    }
+
+    fn try_submit_work(
+        &self,
+        owner: String,
+        work: MaintenanceWork,
+    ) -> Result<(), (MaintenanceSubmitError, MaintenanceWork)> {
+        if !self.ensure_reaper() {
+            return Err((MaintenanceSubmitError::Closing, work));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.lifecycle != MaintenanceLifecycle::Open {
+            return Err((MaintenanceSubmitError::Closing, work));
+        }
+        if let Some(existing) = state.owners.get_mut(&owner) {
+            if existing.queued.len() >= MAX_QUEUED_MAINTENANCE_PER_OWNER {
+                return Err((MaintenanceSubmitError::Full, work));
+            }
+            existing.queued.push_back(work);
+            return Ok(());
+        }
+        if state.owners.len() >= MAX_MAINTENANCE_OWNERS {
+            return Err((MaintenanceSubmitError::Full, work));
+        }
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        let worker_state = Arc::downgrade(&self.state);
+        let worker_changed = Arc::clone(&self.changed);
+        let completion_tx = self.completion_tx.clone();
+        let worker_owner = owner.clone();
+        let initial_work = work;
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            let mut current = initial_work;
+            loop {
+                let _ = std::panic::AssertUnwindSafe(current).catch_unwind().await;
+                let Some(state) = worker_state.upgrade() else {
+                    return;
+                };
+                let (next, completed) = {
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let Some(entry) = state.owners.get_mut(&worker_owner) else {
+                        return;
+                    };
+                    if entry.generation != generation {
+                        return;
+                    }
+                    if let Some(next) = entry.queued.pop_front() {
+                        (Some(next), None)
+                    } else {
+                        let Some(completed) = state.owners.remove(&worker_owner) else {
+                            return;
+                        };
+                        state.reaping = state.reaping.saturating_add(1);
+                        (None, Some(completed))
+                    }
+                };
+                worker_changed.notify_waiters();
+                if let Some(completed) = completed {
+                    if completion_tx
+                        .send(MaintenanceCompletion { owner: completed })
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            owner = %worker_owner,
+                            "maintenance completion reaper is closed"
+                        );
+                    }
+                    return;
+                }
+                match next {
+                    Some(next) => current = next,
+                    None => return,
+                }
+            }
+        });
+        state.owners.insert(
+            owner.clone(),
+            MaintenanceOwner {
+                generation,
+                queued: VecDeque::new(),
+                handle,
+            },
+        );
+        let _ = start_tx.send(());
+        Ok(())
     }
 
     fn ensure_reaper(&self) -> bool {
@@ -848,6 +928,8 @@ pub struct RuntimeServices {
         Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
     session_execution_policy_admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
+    #[cfg(test)]
+    retirement_owner_test_gate: Mutex<Option<Arc<RetirementOwnerTestGate>>>,
     resource_evidence_writer: Arc<super::evidence_writer::ResourceEvidenceWriter>,
     execution_projection_cache: Mutex<crate::execution_projection::ExecutionProjectionCache>,
     // Keep this field last so filesystem-backed components are dropped before
@@ -1544,6 +1626,8 @@ impl RuntimeServices {
             session_execution_policy_controls,
             session_execution_policy_admission_blocks,
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
+            #[cfg(test)]
+            retirement_owner_test_gate: Mutex::new(None),
             resource_evidence_writer,
             execution_projection_cache: Mutex::new(
                 crate::execution_projection::ExecutionProjectionCache::default(),
@@ -1566,6 +1650,11 @@ impl RuntimeServices {
                 }
             })
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub(crate) fn notify_agentic_followups(&self) {
+        self.event_reactor
+            .wake_lane(AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID);
     }
 
     /// Release every Runtime-owned autonomous writer only after the launcher
@@ -1821,6 +1910,80 @@ impl RuntimeServices {
 
     pub(crate) fn maintenance_supervisor(&self) -> Arc<RuntimeMaintenanceSupervisor> {
         Arc::clone(&self.maintenance_supervisor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retirement_lane_notifications_for_test(
+        &self,
+        source: tokio::sync::watch::Receiver<u64>,
+    ) -> Arc<std::sync::atomic::AtomicU64> {
+        self.event_reactor
+            .use_lane_notifications_for_test(AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID, source)
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_retirement_owner_test_gate(&self, gate: Arc<RetirementOwnerTestGate>) {
+        let mut slot = self.retirement_owner_test_gate.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some(gate);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retirement_cancel_gate_for_test(
+        &self,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+    ) {
+        let gate = self.retirement_owner_test_gate.lock().unwrap().clone();
+        let Some(gate) = gate.filter(|gate| gate.packet.graph_id() == graph.id) else {
+            return;
+        };
+        let original = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == gate.packet.node_id())
+            .and_then(|node| {
+                serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref)
+                    .ok()
+            });
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(Some(&gate.packet)).unwrap()
+        );
+        gate.cancel_hits.fetch_add(1, Ordering::SeqCst);
+        gate.changed.notify_waiters();
+        gate.until(|| gate.cancel_released.load(Ordering::Acquire))
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retirement_semantic_for_test(
+        &self,
+        envelope: &harness_contract::agent_action::AgentActionEnvelope,
+    ) {
+        let gate = self.retirement_owner_test_gate.lock().unwrap().clone();
+        if let Some(gate) = gate.filter(|gate| gate.action_id == envelope.action_id) {
+            assert_eq!(
+                envelope.actor.execution_id.as_deref(),
+                Some(gate.packet.graph_id())
+            );
+            gate.semantic_committed.store(true, Ordering::Release);
+            gate.changed.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retirement_response_for_test(
+        &self,
+        envelope: &harness_contract::agent_action::AgentActionEnvelope,
+    ) {
+        let gate = self.retirement_owner_test_gate.lock().unwrap().clone();
+        if let Some(gate) = gate.filter(|gate| gate.action_id == envelope.action_id) {
+            gate.postcommit_returned.store(true, Ordering::Release);
+            gate.changed.notify_waiters();
+            gate.until(|| gate.response_released.load(Ordering::Acquire))
+                .await;
+        }
     }
 
     /// Stop accepting detached maintenance and await every retained task.
@@ -4998,6 +5161,10 @@ fn agentic_program_wait_resolution_lane(
 fn agentic_settled_graph_resolution_interest() -> crate::RuntimeProjectionInterest {
     crate::RuntimeProjectionInterest::new([
         crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::Program,
+            "agentic.action_applied",
+        ),
+        crate::RuntimeProjectionEventInterest::new(
             RuntimeEventScope::ManagedAgent,
             "managed_agent.invocation.started.v1",
         ),
@@ -5056,7 +5223,6 @@ fn agentic_settled_graph_resolution_lane(
                     .services()
                     .ok_or("Agent exit reconciliation lane has no bound RuntimeServices")?;
                 let mut touched_graphs = BTreeSet::new();
-                let mut unscoped_effect_receipt = false;
                 for batch in &page.batches {
                     for event in &batch.events {
                         if let Some(graph_id) = event
@@ -5065,8 +5231,6 @@ fn agentic_settled_graph_resolution_lane(
                             .and_then(serde_json::Value::as_str)
                         {
                             touched_graphs.insert(graph_id.to_string());
-                        } else if event.kind == "execution.effect.receipt" {
-                            unscoped_effect_receipt = true;
                         }
                     }
                 }
@@ -5104,9 +5268,6 @@ fn agentic_settled_graph_resolution_lane(
                 // linked Agent children so either event order closes the barrier.
                 let mut exit_errors = managed_errors;
                 for graph_id in &touched_graphs {
-                    if let Err(error) = services.retry_agentic_run_exit(graph_id).await {
-                        exit_errors.push(format!("{graph_id}:{error}"));
-                    }
                     crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                     graph_id,
                     &actions,
@@ -5118,12 +5279,6 @@ fn agentic_settled_graph_resolution_lane(
                         .child_links(graph_id)
                         .map_err(|error| error.to_string())?
                     {
-                        if let Err(error) = services
-                            .retry_agentic_run_exit(&link.child_execution_id)
-                            .await
-                        {
-                            exit_errors.push(format!("{}:{error}", link.child_execution_id));
-                        }
                         crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                         &link.child_execution_id,
                         &actions,
@@ -5133,26 +5288,20 @@ fn agentic_settled_graph_resolution_lane(
                     .await?;
                     }
                 }
-                let mut last_exit_retry_ms = checkpoint
-                    .as_ref()
-                    .and_then(|checkpoint| {
-                        checkpoint
-                            .payload
-                            .get("last_exit_retry_ms")
-                            .and_then(serde_json::Value::as_u64)
-                    })
-                    .unwrap_or(0);
-                let retry_now_ms = now_ms();
-                if page.scanned_commits == 0
-                    || unscoped_effect_receipt
-                    || retry_now_ms < last_exit_retry_ms
-                    || retry_now_ms.saturating_sub(last_exit_retry_ms) >= 5_000
-                {
-                    if let Err(error) = services.retry_pending_agentic_run_exits().await {
-                        exit_errors.push(error);
-                    }
-                    last_exit_retry_ms = retry_now_ms;
-                }
+                let mut recovery_cursor: crate::agentic::execution::dispatch::AgenticRecoveryCursor =
+                    match checkpoint.as_ref().and_then(|checkpoint| checkpoint.payload.get("agentic_recovery")) {
+                        Some(value) => serde_json::from_value(value.clone()).map_err(|error| error.to_string())?,
+                        None => Default::default(),
+                    };
+                let recovery_backlog =
+                    match services.admit_agentic_recovery_page(&mut recovery_cursor) {
+                        Ok(backlog) => backlog,
+                        Err(error) => {
+                            exit_errors.push(error);
+                            false
+                        }
+                    };
+                let last_exit_retry_ms = now_ms();
                 let structured_after = checkpoint
                     .as_ref()
                     .and_then(|checkpoint| checkpoint.payload.get("structured_after"))
@@ -5161,37 +5310,60 @@ fn agentic_settled_graph_resolution_lane(
                 let next_structured_after = services
                     .recover_structured_task_page(structured_after, batch_size.max(1))
                     .await?;
-                if !exit_errors.is_empty() {
-                    return Err(exit_errors.join("; "));
+                // Preserve every existing position; an event cursor is independent
+                // of the durable pending-work directory. On read failure do not
+                // consume events, but persist the address rotation for fairness.
+                let committed_cursor = if exit_errors.is_empty() {
+                    page.scanned_through_cursor
+                } else {
+                    source_cursor
+                };
+                let mut payload = checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.payload.clone())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let fields = payload
+                    .as_object_mut()
+                    .ok_or("invalid settled lane checkpoint payload")?;
+                if exit_errors.is_empty() {
+                    fields.insert("source_cursor".into(), serde_json::json!(committed_cursor));
+                    fields.insert(
+                        "resolved_graphs".into(),
+                        serde_json::json!(touched_graphs.len()),
+                    );
+                    fields.insert(
+                        "managed_after".into(),
+                        serde_json::json!(next_managed_after),
+                    );
+                    fields.insert(
+                        "structured_after".into(),
+                        serde_json::json!(next_structured_after),
+                    );
+                    fields.insert(
+                        "last_exit_retry_ms".into(),
+                        serde_json::json!(last_exit_retry_ms),
+                    );
                 }
-                if page.scanned_commits == 0
-                    && managed_after.is_empty()
-                    && !managed_backlog
-                    && structured_after.is_empty()
-                    && next_structured_after.is_none()
-                {
-                    return Ok(crate::RuntimeProjectionPass::default());
-                }
-                // The checkpoint advances only after every matching join was
-                // either atomically resolved or proven inapplicable/terminal.
+                fields.insert(
+                    "agentic_recovery".into(),
+                    serde_json::to_value(recovery_cursor).map_err(|error| error.to_string())?,
+                );
                 event_store
                     .put_projection_checkpoint_retrying(
                         AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID,
-                        page.scanned_through_cursor,
-                        &serde_json::json!({
-                            "source_cursor": page.scanned_through_cursor,
-                            "resolved_graphs": touched_graphs.len(),
-                            "managed_after": next_managed_after,
-                            "structured_after": next_structured_after,
-                            "last_exit_retry_ms": last_exit_retry_ms,
-                        }),
+                        committed_cursor,
+                        &payload,
                         now_ms(),
                     )
                     .map_err(|error| error.to_string())?;
+                if !exit_errors.is_empty() {
+                    return Err(exit_errors.join("; "));
+                }
                 let mut pass =
                     crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
                         .with_matches(page.matched_events);
-                pass.backlog |= managed_backlog || next_structured_after.is_some();
+                pass.backlog |=
+                    managed_backlog || next_structured_after.is_some() || recovery_backlog;
                 Ok(pass)
             })
         },
@@ -5234,6 +5406,191 @@ mod exact_exit_lane_tests {
                 RuntimeEventScope::ExecutionNode,
                 "execution.effect.receipt"
             )));
+    }
+
+    #[tokio::test]
+    async fn retirement_maintenance_nonwaiting_full_closing_drops_rejected_work() {
+        struct Rejected(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Rejected {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let supervisor = RuntimeMaintenanceSupervisor::new();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (worker_release, worker_started) = (release.clone(), started.clone());
+        supervisor
+            .try_submit("capacity".into(), async move {
+                worker_started.notify_one();
+                worker_release.notified().await;
+            })
+            .unwrap();
+        started.notified().await;
+        for _ in 0..MAX_QUEUED_MAINTENANCE_PER_OWNER {
+            supervisor.try_submit("capacity".into(), async {}).unwrap();
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = Rejected(dropped.clone());
+        assert_eq!(
+            supervisor.try_submit("capacity".into(), async move {
+                let _probe = probe;
+                panic!("a rejected maintenance future must never be polled");
+            }),
+            Err(MaintenanceSubmitError::Full)
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        // The waiting API shares that admission step and must still wait.
+        let waiting = supervisor.submit("capacity".into(), async {});
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        release.notify_one();
+        assert!(waiting.await);
+        supervisor.shutdown_and_drain().await;
+        let probe = Rejected(dropped.clone());
+        assert_eq!(
+            supervisor.try_submit("closed".into(), async move {
+                let _probe = probe;
+                panic!("a closing owner cannot poll rejected work");
+            }),
+            Err(MaintenanceSubmitError::Closing)
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        let state = supervisor.state.lock().unwrap();
+        assert!(state.owners.is_empty());
+        assert_eq!(state.reaping, 0);
+    }
+
+    #[tokio::test]
+    async fn retirement_directory_busy_full_preserves_first_unadmitted_work() {
+        use crate::agentic::execution::dispatch::AgenticRecoveryCursor;
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionStatus, TaskPublishInput, TeamCreateInput,
+        };
+        let services = RuntimeServices::in_memory().unwrap();
+        // This is an admission/cursor contract, independent of reactor timing.
+        let reactor = services.event_reactor.shutdown().await;
+        assert!(reactor.timed_out_lanes.is_empty());
+        assert!(reactor.join_errors.is_empty());
+        let mut tasks = Vec::new();
+        for id in ["first", "second"] {
+            let envelope = |suffix: &str, action| {
+                let mut envelope = harness_contract::agent_action::AgentActionEnvelope {
+                    action_id: format!("1145:{id}:{suffix}"),
+                    action,
+                    actor: harness_contract::agent_action::AgentActorBinding {
+                        objective_id: String::new(),
+                        program_id: String::new(),
+                        session_id: "session-1145-directory".into(),
+                        turn_id: "turn-1145-directory".into(),
+                        root_execution_id: None,
+                        required_team_count: 0,
+                        exact_team_count: None,
+                        objective_summary: "bounded admission".into(),
+                        model_lease: "test".into(),
+                        permission_ceiling: Some(
+                            harness_contract::policy::PermissionMode::ReadOnly,
+                        ),
+                        resource_scopes: Vec::new(),
+                        actor_id: "root:session-1145-directory".into(),
+                        kind: harness_contract::agent_action::AgentActorKind::Root,
+                        execution_id: None,
+                        team_id: None,
+                        agent_id: None,
+                    },
+                    expected_revision: None,
+                };
+                envelope.actor.program_id = format!("1145-{id}");
+                envelope.actor.objective_id = format!("1145-objective-{id}");
+                envelope
+            };
+            let team = services
+                .agent_action_service()
+                .apply(&envelope(
+                    "team",
+                    AgentAction::TeamCreate(TeamCreateInput {
+                        name: id.into(),
+                        mission: "directory fairness".into(),
+                        objective: None,
+                    }),
+                ))
+                .unwrap();
+            assert_eq!(team.status, AgentActionStatus::Applied);
+            let task = services
+                .agent_action_service()
+                .apply(&envelope(
+                    "task",
+                    AgentAction::TaskPublish(TaskPublishInput {
+                        team_ref: team.changed_refs[0].clone(),
+                        title: id.into(),
+                        objective: "independent ready work".into(),
+                        acceptance: "actual admission remains pending without a member".into(),
+                        criterion_source: Default::default(),
+                        acceptance_checks: Vec::new(),
+                        required_capabilities: Vec::new(),
+                        depends_on: Vec::new(),
+                        obligation_refs: Vec::new(),
+                        purpose: harness_contract::agent_action::TaskPurpose::Exploration,
+                        execution_requirements: Vec::new(),
+                        expertise_hints: Vec::new(),
+                    }),
+                ))
+                .unwrap();
+            assert_eq!(task.status, AgentActionStatus::Applied);
+            tasks.push(task.changed_refs[0].clone());
+        }
+        let owner = "runtime:agentic-program-recovery:v1";
+        let flights = services.agentic_dispatch_flights();
+        assert!(flights.lock().unwrap().insert(owner.into()));
+        let mut cursor = AgenticRecoveryCursor::default();
+        assert!(!services.admit_agentic_recovery_page(&mut cursor).unwrap());
+        let blocked_first = serde_json::to_value(&cursor).unwrap();
+        assert_eq!(blocked_first["program"][1], "agentic-program:1145-first");
+        assert!(blocked_first["after_work"].is_null());
+        assert!(!services.admit_agentic_recovery_page(&mut cursor).unwrap());
+        assert_eq!(serde_json::to_value(&cursor).unwrap(), blocked_first);
+        flights.lock().unwrap().remove(owner);
+        assert!(services.admit_agentic_recovery_page(&mut cursor).unwrap());
+        assert_eq!(
+            serde_json::to_value(&cursor).unwrap()["after_work"],
+            serde_json::json!([tasks[0], ""])
+        );
+        // A still-pending first Task has already received its bounded turn.
+        assert!(services.admit_agentic_recovery_page(&mut cursor).unwrap());
+        assert!(flights.lock().unwrap().contains(owner));
+        assert!(!services.admit_agentic_recovery_page(&mut cursor).unwrap());
+        let blocked_second = serde_json::to_value(&cursor).unwrap();
+        assert_eq!(blocked_second["program"][1], "agentic-program:1145-second");
+        // Let the retained original worker return, then saturate the SAME
+        // supervisor queue. Rejection must also drop its DispatchFlight token.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while flights.lock().unwrap().contains(owner) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_release = release.clone();
+        let maintenance = services.maintenance_supervisor();
+        maintenance
+            .try_submit(owner.into(), async move {
+                worker_release.notified().await;
+            })
+            .unwrap();
+        for _ in 0..MAX_QUEUED_MAINTENANCE_PER_OWNER {
+            maintenance.try_submit(owner.into(), async {}).unwrap();
+        }
+        assert!(!services.admit_agentic_recovery_page(&mut cursor).unwrap());
+        assert_eq!(serde_json::to_value(&cursor).unwrap(), blocked_second);
+        assert!(!flights.lock().unwrap().contains(owner));
+        release.notify_one();
+        maintenance.shutdown_and_drain().await;
+        assert!(!services.admit_agentic_recovery_page(&mut cursor).unwrap());
+        assert_eq!(serde_json::to_value(&cursor).unwrap(), blocked_second);
+        assert!(!flights.lock().unwrap().contains(owner));
+        services.shutdown_maintenance().await;
+        assert!(services.shutdown_execution().await.errors.is_empty());
     }
 
     #[tokio::test]
