@@ -208,18 +208,20 @@ pub(crate) fn decode_terminal_payload(
                 format!("terminal payload has an invalid presentation: {error}"),
             )
         })?;
-    let goal_completion = payload
-        .get("goal_completion")
-        .cloned()
-        .map(serde_json::from_value::<harness_contract::goal::GoalCompletion>)
-        .transpose()
-        .map_err(|error| {
-            (
-                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                format!("terminal payload has an invalid goal_completion: {error}"),
-            )
-        })?
-        .unwrap_or(harness_contract::goal::GoalCompletion::Satisfied);
+    let completion = payload.get("goal_completion").ok_or_else(|| {
+        (
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            "current terminal artifact requires goal_completion".to_string(),
+        )
+    })?;
+    let goal_completion =
+        serde_json::from_value::<harness_contract::goal::GoalCompletion>(completion.clone())
+            .map_err(|error| {
+                (
+                    runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                    format!("terminal payload has an invalid goal_completion: {error}"),
+                )
+            })?;
     if !terminal_presentation.as_ref().is_some_and(|presentation| {
         presentation.state == harness_contract::outcome::TerminalPresentationState::Committed
     }) {
@@ -696,5 +698,55 @@ mod terminal_accounting_tests {
                 (26, 9, 3)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_completion_tests {
+    use super::*;
+
+    #[test]
+    fn current_terminal_requires_explicit_completion_without_inventing_a_goal() {
+        use harness_contract::goal::GoalCompletion;
+        let mut payload =
+            crate::current_terminal_fixture::current_payload("completion", "ingress", 0, "answer");
+        // Independent (non-Goal) terminals need no fabricated Goal identity.
+        assert!(payload.get("goal_id").is_none());
+        for (wire, expected) in [
+            ("satisfied", GoalCompletion::Satisfied),
+            ("cancelled", GoalCompletion::Cancelled),
+            ("partial", GoalCompletion::Partial),
+        ] {
+            payload["goal_completion"] = serde_json::json!(wire);
+            assert_eq!(
+                decode_terminal_payload(&serde_json::to_vec(&payload).unwrap())
+                    .unwrap()
+                    .goal_completion,
+                expected
+            );
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("complete"),
+            serde_json::json!(0),
+            serde_json::json!({}),
+        ] {
+            payload["goal_completion"] = invalid;
+            let (class, reason) =
+                decode_terminal_payload(&serde_json::to_vec(&payload).unwrap()).unwrap_err();
+            assert_eq!(
+                class,
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+            );
+            assert!(reason.contains("goal_completion"), "{reason}");
+        }
+        payload.as_object_mut().unwrap().remove("goal_completion");
+        let (class, reason) =
+            decode_terminal_payload(&serde_json::to_vec(&payload).unwrap()).unwrap_err();
+        assert_eq!(
+            class,
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+        );
+        assert!(reason.contains("goal_completion"), "{reason}");
     }
 }

@@ -548,15 +548,27 @@ fn terminal_payload_schema_three_round_trips_collaboration_terminal() {
             serde_json::from_str::<serde_json::Value>(usage).unwrap(),
             serde_json::json!({"input_tokens": 12, "output_tokens": 3})
         );
-        assert_eq!(
+        let row_usage: serde_json::Value = serde_json::from_str(
             decoded
                 .transcript
                 .as_ref()
                 .unwrap()
                 .last()
                 .unwrap()
-                .token_usage_json,
-            decoded.token_usage_json
+                .token_usage_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            row_usage,
+            serde_json::json!({
+                "input_tokens":12, "output_tokens":3, "accounting_scope":"terminal_remainder"
+            })
+        );
+        assert!(
+            row_usage.get("provider_call_usage").is_none(),
+            "this fixture has no per-call Provider usage to infer"
         );
     }
 }
@@ -1121,6 +1133,92 @@ async fn corrupt_terminal_is_poisoned_and_visible_to_operations() {
     assert_eq!(poison[0].terminal_id, "poison");
     assert_eq!(poison[0].failure_class.as_deref(), Some("corrupt_payload"));
     assert!(_store
+        .get_all_messages("s1")
+        .await
+        .unwrap()
+        .iter()
+        .all(|message| message.role != "assistant"));
+}
+
+#[tokio::test]
+async fn missing_completion_cannot_materialize_or_restore_a_successful_terminal() {
+    let (runtime_events, outbox, artifacts, sessions, store, bus, _services, topology, _rx) =
+        delivery_fixture().await;
+    let mut payload = crate::current_terminal_fixture::current_payload(
+        "missing-completion",
+        "missing-ingress",
+        0,
+        "valid visible answer",
+    );
+    enqueue_fenced_terminal(
+        &runtime_events,
+        &store,
+        "missing-completion",
+        "missing-message",
+        "missing-request",
+        "missing-turn",
+        "missing-ingress",
+        &artifacts,
+        payload.clone(),
+    )
+    .await;
+    let pending = runtime_events
+        .session_terminal("missing-completion")
+        .unwrap()
+        .unwrap();
+    // Corrupt only the required field after the valid original producer
+    // transaction. Keep the artifact's actual bytes/hash/scope valid.
+    payload.as_object_mut().unwrap().remove("goal_completion");
+    let body = serde_json::to_vec(&payload).unwrap();
+    let artifact = artifacts
+        .write_bytes(
+            runtime::ArtifactWriteDescriptor {
+                media_type: "application/vnd.cowd.session-terminal+json".into(),
+                visibility_scope: "session:s1".into(),
+                expected_bytes: Some(body.len() as u64),
+                original_name: None,
+            },
+            &body,
+        )
+        .await
+        .unwrap();
+    let malformed = runtime::encode_session_terminal_artifact_ref(&artifact).unwrap();
+    crate::current_terminal_fixture::poison_terminal_ref(
+        &topology.postgres_executor,
+        "missing-completion",
+        &pending.payload_ref,
+        &malformed,
+    );
+    let record = outbox
+        .claim("missing-worker", now_ms(), 30_000, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    // Recovery reads this same canonical loader, before deriving live status.
+    let (class, reason) = crate::session_runtime_bridge::load_terminal_payload(&artifacts, &record)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        class,
+        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload
+    );
+    assert!(reason.contains("goal_completion"), "{reason}");
+    assert!(deliver_terminal(
+        &outbox,
+        &artifacts,
+        &sessions,
+        &bus,
+        None,
+        "missing-worker",
+        record
+    )
+    .await
+    .is_err());
+    let blocked = outbox.blocked(10).unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].terminal_id, "missing-completion");
+    assert_eq!(blocked[0].failure_class.as_deref(), Some("corrupt_payload"));
+    assert!(store
         .get_all_messages("s1")
         .await
         .unwrap()
