@@ -268,7 +268,7 @@ where
         "items": items,
         "count": count,
         "limit": limit,
-        "source": "cowd.structured_data.core",
+        "source": "cowd.matrix.engine",
         "backing": "matrix",
         "list_status": "ready",
     })

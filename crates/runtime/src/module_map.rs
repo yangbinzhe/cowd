@@ -601,12 +601,6 @@ fn approval_context_modules() -> Vec<RuntimeModuleDescriptor> {
 fn reality_recovery_policy_modules() -> Vec<RuntimeModuleDescriptor> {
     vec![
         RuntimeModuleDescriptor::public(
-            "structured_data",
-            RealityBridge,
-            "runtime",
-            &[adapter("reality.structured", "runtime.reality.decision")],
-        ),
-        RuntimeModuleDescriptor::public(
             "fact_extraction",
             RealityBridge,
             "runtime",
@@ -638,12 +632,6 @@ fn reality_recovery_policy_modules() -> Vec<RuntimeModuleDescriptor> {
             Recovery,
             "runtime",
             &[coordinator("recovery.coordinate", "runtime.event.store")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "recovery_recipes",
-            Recovery,
-            "runtime",
-            &[adapter("recovery.recipe", "runtime.event.store")],
         ),
         RuntimeModuleDescriptor::public(
             "runtime_event_replay",
@@ -778,12 +766,6 @@ fn configuration_infrastructure_modules() -> Vec<RuntimeModuleDescriptor> {
             Infrastructure,
             "mcp",
             &[external("mcp.tool.bridge", "mcp.lifecycle")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "quality_gate",
-            Infrastructure,
-            "runtime",
-            &[worker("quality.gate", "runtime.collaboration.program")],
         ),
         RuntimeModuleDescriptor::public(
             "release_gate",

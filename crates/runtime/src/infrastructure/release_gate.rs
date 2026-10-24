@@ -84,8 +84,8 @@ impl CowdReleaseGateReport {
             ),
             check(
                 "structured_data.core.registered",
-                registry.capability("cowd.structured_data.core").is_some(),
-                "Structured data core is registered as cowd kernel capability.",
+                registry.capability("cowd.matrix.engine").is_some(),
+                "Matrix Engine is registered as the structured-data kernel capability.",
             ),
             check(
                 "surface.webui_tui.parity",

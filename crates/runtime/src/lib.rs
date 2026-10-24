@@ -18,8 +18,6 @@
 #[path = "infrastructure/cowd_dirs.rs"]
 pub mod cowd_dirs;
 pub use cowd_dirs::expand_tilde;
-#[path = "app_operation/mod.rs"]
-pub mod app_operation;
 #[path = "infrastructure/bash_validation.rs"]
 pub mod bash_validation;
 #[path = "infrastructure/bootstrap.rs"]
@@ -128,8 +126,6 @@ mod prompt;
 mod prompt_assembly;
 #[path = "recovery/recovery.rs"]
 pub mod recovery;
-#[path = "recovery/recovery_recipes.rs"]
-pub mod recovery_recipes;
 #[path = "infrastructure/remote.rs"]
 mod remote;
 #[path = "conversation/request_compiler.rs"]
@@ -265,8 +261,6 @@ pub mod provider_transcript;
 pub mod provider_transport_policy;
 #[path = "provider/transport_pool.rs"]
 pub mod provider_transport_pool;
-#[path = "infrastructure/quality_gate.rs"]
-pub mod quality_gate;
 #[path = "context/reality_decision.rs"]
 pub mod reality_decision;
 #[path = "context/reality_recall_port.rs"]
@@ -315,7 +309,6 @@ pub mod stale_branch;
 pub mod step_snapshot;
 #[path = "steward/steward_agent.rs"]
 pub mod steward_agent;
-pub mod structured_data;
 #[path = "conversation/summary_compression.rs"]
 pub mod summary_compression;
 #[path = "infrastructure/surface_contract.rs"]
@@ -675,10 +668,6 @@ pub use reality_recall_port::{
 pub use recovery::{
     RecoveryAppliedAction, RecoveryExecutionReport, RecoveryExecutor, RecoveryFailedAction,
     RecoveryPlan, RecoveryPlanner, RecoverySkippedAction,
-};
-pub use recovery_recipes::{
-    attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
-    RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep,
 };
 pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,

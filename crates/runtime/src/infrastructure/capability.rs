@@ -160,14 +160,6 @@ impl CowdCapabilityRegistry {
                     &["read:matrix", "write:matrix"],
                 ),
                 kernel_capability(
-                    "cowd.structured_data.core",
-                    "Structured Data Core",
-                    CowdCapabilityKind::StructuredData,
-                    "runtime::structured_data",
-                    "Source, mapping, fact, evidence, ingest, watermark and delta contracts.",
-                    &["read:structured_data", "write:structured_data"],
-                ),
-                kernel_capability(
                     "cowd.growth.channel",
                     "Growth Channel",
                     CowdCapabilityKind::Fact,
@@ -390,24 +382,7 @@ mod tests {
         assert!(registry.capability("cowd.matrix.engine").is_some());
         assert!(registry.capability("cowd.growth.channel").is_some());
         assert!(registry.capability("cowd.audit.trace").is_some());
-        assert!(registry.capability("cowd.structured_data.core").is_some());
-    }
-
-    #[test]
-    fn capability_registry_declares_structured_data_as_kernel_contract() {
-        let registry = CowdCapabilityRegistry::core();
-        let structured_data = registry
-            .capability("cowd.structured_data.core")
-            .expect("structured data core capability should exist");
-
-        assert_eq!(structured_data.layer, CowdCapabilityLayer::Kernel);
-        assert_eq!(structured_data.kind, CowdCapabilityKind::StructuredData);
-        assert_eq!(structured_data.owner_module, "runtime::structured_data");
-        assert!(
-            structured_data
-                .description
-                .contains("Source, mapping, fact")
-        );
+        assert!(registry.capability("cowd.structured_data.core").is_none());
     }
 
     #[test]

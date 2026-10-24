@@ -134,7 +134,7 @@ mod tests {
             projection
                 .capabilities
                 .iter()
-                .any(|capability| capability.id == "cowd.structured_data.core")
+                .any(|capability| capability.id == "cowd.matrix.engine")
         );
         assert!(
             !projection
