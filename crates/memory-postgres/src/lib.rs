@@ -28,8 +28,8 @@ use memory::{
 use postgres::{types::ToSql, Row};
 use serde::{de::DeserializeOwned, Serialize};
 use storage::{
-    PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationMode,
-    PostgresMigrationSpec, PostgresTransaction, SecretRefResolver,
+    PostgresClient, PostgresExecutor, PostgresMigrationMode, PostgresMigrationSpec,
+    PostgresTransaction,
 };
 
 const MEMORY_DOMAIN: &str = "memory";
@@ -499,27 +499,6 @@ impl PostgresMemoryStore {
                 Ok(store)
             },
             || MemoryError::Store("PostgreSQL memory initialization thread panicked".to_string()),
-        )
-    }
-
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> MemoryResult<Self> {
-        run_driver_sync(
-            move || {
-                let executor =
-                    PostgresExecutor::connect(config, resolver).map_err(storage_memory_error)?;
-                executor
-                    .apply_migrations(MEMORY_DOMAIN, MEMORY_MIGRATIONS)
-                    .map_err(storage_memory_error)?;
-                let store = Self { executor };
-                if store.executor.migration_mode() == PostgresMigrationMode::Maintenance {
-                    store.backfill_authority_fingerprints()?;
-                }
-                Ok(store)
-            },
-            || MemoryError::Store("PostgreSQL memory connection thread panicked".to_string()),
         )
     }
 
@@ -1868,26 +1847,6 @@ impl PostgresKnowledgeStore {
             || {
                 KnowledgeStoreError::Backend(
                     "PostgreSQL knowledge initialization thread panicked".to_string(),
-                )
-            },
-        )
-    }
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> Result<Self, KnowledgeStoreError> {
-        run_driver_sync(
-            move || {
-                let executor =
-                    PostgresExecutor::connect(config, resolver).map_err(storage_knowledge_error)?;
-                executor
-                    .apply_migrations(KNOWLEDGE_DOMAIN, KNOWLEDGE_MIGRATIONS)
-                    .map_err(storage_knowledge_error)?;
-                Ok(Self { executor })
-            },
-            || {
-                KnowledgeStoreError::Backend(
-                    "PostgreSQL knowledge connection thread panicked".to_string(),
                 )
             },
         )

@@ -22,13 +22,6 @@ impl PostgresTaskStore {
         Ok(Self { executor })
     }
 
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> Result<Self, String> {
-        Self::new(PostgresExecutor::connect(config, resolver).map_err(|error| error.to_string())?)
-    }
-
     #[must_use]
     pub fn executor(&self) -> &PostgresExecutor {
         &self.executor

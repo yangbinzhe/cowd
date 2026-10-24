@@ -30,9 +30,10 @@ use session::{
     SessionTerminalTranscriptReceipt, SessionUsageBucket, SessionUsageSummary,
 };
 use session::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
+#[cfg(test)]
+use storage::PostgresConnectionConfig;
 use storage::{
-    PostgresConnection, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
-    PostgresTransaction, SecretRefResolver,
+    PostgresConnection, PostgresExecutor, PostgresMigrationSpec, PostgresTransaction,
 };
 
 const SESSION_DOMAIN: &str = "session";

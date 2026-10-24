@@ -10,10 +10,9 @@ use fact_kernel::{
 };
 use harness_contract::growth::GrowthEvent;
 use postgres::Row;
-use storage::{
-    PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
-    SecretRefResolver,
-};
+#[cfg(test)]
+use storage::PostgresConnectionConfig;
+use storage::{PostgresClient, PostgresExecutor, PostgresMigrationSpec};
 
 mod catalog;
 
@@ -123,15 +122,6 @@ impl PostgresFactLedger {
             .apply_migrations(FACT_LEDGER_DOMAIN, FACT_LEDGER_MIGRATIONS)
             .map_err(storage_error)?;
         Ok(Self { executor })
-    }
-
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> FactLedgerResult<Self> {
-        PostgresExecutor::connect(config, resolver)
-            .map_err(storage_error)
-            .and_then(Self::new)
     }
 
     #[must_use]

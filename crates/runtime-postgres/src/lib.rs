@@ -49,9 +49,11 @@ use runtime::{
     TaskMissionAssignmentReceipt, VerifiedDecisionLease,
 };
 use serde_json::Value;
+#[cfg(test)]
+use storage::PostgresConnectionConfig;
 use storage::{
-    PostgresClient, PostgresConnection, PostgresConnectionConfig, PostgresExecutor,
-    PostgresMigrationSpec, PostgresTransaction, SecretRefResolver, StorageError,
+    PostgresClient, PostgresConnection, PostgresExecutor, PostgresMigrationSpec, PostgresTransaction,
+    StorageError,
 };
 
 const RUNTIME_EVENT_DOMAIN: &str = "runtime_event";

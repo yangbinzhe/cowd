@@ -10,10 +10,7 @@ use std::path::PathBuf;
 use postgres::Row;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use storage::{
-    PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
-    SecretRefResolver,
-};
+use storage::{PostgresClient, PostgresExecutor, PostgresMigrationSpec};
 use surface::{
     normalize_surface_id, SurfaceDeliveryEvent, SurfaceFrame, SurfaceInboxReceipt,
     SurfaceInboxRecord, SurfaceIngressClaim, SurfaceMessageLedger, SurfaceMessageSnapshot,
@@ -73,13 +70,6 @@ impl PostgresSurfaceMessageLedger {
             .apply_migrations(DOMAIN, MIGRATIONS)
             .map_err(|error| error.to_string())?;
         Ok(Self { executor })
-    }
-
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> Result<Self, String> {
-        Self::new(PostgresExecutor::connect(config, resolver).map_err(|error| error.to_string())?)
     }
 
     #[must_use]

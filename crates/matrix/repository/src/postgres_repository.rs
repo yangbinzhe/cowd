@@ -25,9 +25,10 @@ use matrix_core::{
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+#[cfg(test)]
+use storage::PostgresConnectionConfig;
 use storage::{
-    PostgresClient, PostgresConnection, PostgresConnectionConfig, PostgresExecutor,
-    PostgresMigrationSpec, PostgresTransaction, SecretRefResolver,
+    PostgresClient, PostgresConnection, PostgresExecutor, PostgresMigrationSpec, PostgresTransaction,
 };
 
 use crate::port::matrix_store_operations;
@@ -325,15 +326,6 @@ impl PostgresMatrixRepository {
             .apply_migrations(MATRIX_DOMAIN, MATRIX_MIGRATIONS)
             .map_err(storage_error)?;
         Ok(Self { executor })
-    }
-
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> MatrixStoreResult<Self> {
-        PostgresExecutor::connect(config, resolver)
-            .map_err(storage_error)
-            .and_then(Self::new)
     }
 
     #[must_use]

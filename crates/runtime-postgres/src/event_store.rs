@@ -232,13 +232,6 @@ impl PostgresRuntimeEventStore {
         })
     }
 
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> RuntimeEventStoreResult<Self> {
-        Self::new(PostgresExecutor::connect(config, resolver)?)
-    }
-
     #[must_use]
     pub fn executor(&self) -> &PostgresExecutor {
         &self.executor

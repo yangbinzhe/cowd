@@ -414,15 +414,6 @@ impl PostgresSessionStore {
         Ok(Self { executor })
     }
 
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> session::SessionResult<Self> {
-        PostgresExecutor::connect(config, resolver)
-            .map_err(storage_error)
-            .and_then(Self::new)
-    }
-
     #[must_use]
     pub fn executor(&self) -> &PostgresExecutor {
         &self.executor

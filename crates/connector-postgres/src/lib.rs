@@ -22,8 +22,7 @@ use connector::{
 };
 use postgres::Row;
 use storage::{
-    PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec, SecretRefResolver,
-    StorageBackendKind, StorageHandle,
+    PostgresExecutor, PostgresMigrationSpec, StorageBackendKind, StorageHandle,
 };
 
 const CONNECTOR_DIRECTORY_DOMAIN: &str = "connector_directory";
@@ -72,15 +71,6 @@ impl PostgresResourceDirectory {
             .apply_migrations(CONNECTOR_DIRECTORY_DOMAIN, CONNECTOR_DIRECTORY_MIGRATIONS)
             .map_err(ResourceDirectoryError::backend)?;
         Ok(Self { executor })
-    }
-
-    pub fn connect(
-        config: PostgresConnectionConfig,
-        resolver: &dyn SecretRefResolver,
-    ) -> ResourceDirectoryResult<Self> {
-        PostgresExecutor::connect(config, resolver)
-            .map_err(ResourceDirectoryError::backend)
-            .and_then(Self::new)
     }
 
     #[must_use]
