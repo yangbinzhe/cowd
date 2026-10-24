@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 cd "$ROOT"
 
-cargo test -p gateway memory_without_config_returns_disabled -- --nocapture
+report="$(python3 scripts/test/cargo-selection.py report)"
+python3 scripts/test/cargo-selection.py run --package gateway --lib \
+  --filter memory_without_config_returns_disabled --nocapture --output "$report"
 
 echo "memory degraded scenario passed"

@@ -6,8 +6,12 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/cowd-context-runtime-lean-spik
 
 cd "$ROOT"
 
-cargo test -p runtime stable_head_comparison -- --nocapture
-cargo test -p runtime lean_probe -- --nocapture
+report="$(python3 scripts/test/cargo-selection.py report)"
+python3 scripts/test/cargo-selection.py run --package runtime --lib \
+  --filter stable_head_comparison --nocapture --output "$report"
+report="$(python3 scripts/test/cargo-selection.py report)"
+python3 scripts/test/cargo-selection.py run --package runtime --lib \
+  --filter lean_probe --nocapture --output "$report"
 cargo check -p gateway
 
 echo "context runtime lean spike passed"

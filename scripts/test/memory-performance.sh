@@ -11,6 +11,8 @@ tests=(
 )
 
 for test_name in "${tests[@]}"; do
-  cargo test --release -p memory --test performance_bench "$test_name" \
-    -- --ignored --nocapture --test-threads=1
+  report="$(python3 scripts/test/cargo-selection.py report)"
+  python3 scripts/test/cargo-selection.py run --package memory --test performance_bench \
+    --release --filter "$test_name" --ignored --entry scripts/test/memory-performance.sh \
+    --nocapture --test-threads 1 --output "$report"
 done

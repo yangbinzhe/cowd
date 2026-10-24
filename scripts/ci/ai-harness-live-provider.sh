@@ -39,12 +39,15 @@ case "$MODE" in
     ;;
 esac
 
+report="$(python3 scripts/test/cargo-selection.py report)"
 if [[ -n "$FILTER" ]]; then
   timeout "${COWD_AI_HARNESS_LIVE_TIMEOUT:-120s}" \
-    cargo test -p provider --test provider_config_live_smoke \
-      -- --ignored --nocapture "$FILTER"
+    python3 scripts/test/cargo-selection.py run --package provider --test provider_config_live_smoke \
+      --filter "$FILTER" --ignored --entry 'scripts/validate.sh manual live-provider' \
+      --nocapture --output "$report"
 else
   timeout "${COWD_AI_HARNESS_LIVE_TIMEOUT:-180s}" \
-    cargo test -p provider --test provider_config_live_smoke \
-      -- --ignored --nocapture
+    python3 scripts/test/cargo-selection.py run --package provider --test provider_config_live_smoke \
+      --all-in-target --ignored --entry 'scripts/validate.sh manual live-provider' \
+      --nocapture --output "$report"
 fi

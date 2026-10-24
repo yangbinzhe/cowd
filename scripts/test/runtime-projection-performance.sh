@@ -10,6 +10,8 @@ tests=(
 )
 
 for test_name in "${tests[@]}"; do
-  cargo test --release -p runtime --lib "$test_name" \
-    -- --ignored --nocapture --test-threads=1
+  report="$(python3 scripts/test/cargo-selection.py report)"
+  python3 scripts/test/cargo-selection.py run --package runtime --lib --release \
+    --filter "$test_name" --ignored --entry scripts/test/runtime-projection-performance.sh \
+    --nocapture --test-threads 1 --output "$report"
 done
