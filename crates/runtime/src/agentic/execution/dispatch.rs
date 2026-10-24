@@ -39,6 +39,74 @@ fn agentic_attempt_settlement(
     }
 }
 
+// A one-shot test interleave at the actual read-to-submit boundary. It commits
+// through the original action owner, never edits a projection or manufactures exit.
+#[cfg(test)]
+tokio::task_local! {
+    static SETTLEMENT_RACE_1112: (
+        AgentActionEnvelope,
+        Arc<std::sync::Mutex<Option<AgentActionEnvelope>>>,
+    );
+}
+
+#[cfg(test)]
+fn interleave_settlement_1112(services: &RuntimeServices, envelope: &AgentActionEnvelope) {
+    let _ = SETTLEMENT_RACE_1112.try_with(|(change, observed)| {
+        assert!(observed.lock().unwrap().replace(envelope.clone()).is_none());
+        let result = services.agent_action_service().apply(change).unwrap();
+        assert_eq!(
+            result.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        assert!(!result.duplicate);
+    });
+}
+
+#[cfg(test)]
+pub(super) async fn settlement_race_1112(
+    services: &Arc<RuntimeServices>,
+    packet: &AgentTaskPacket,
+    task_ref: &str,
+    entry: u8,
+    change: AgentActionEnvelope,
+) -> (Result<(), String>, Option<AgentActionEnvelope>) {
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let result = SETTLEMENT_RACE_1112
+        .scope((change, observed.clone()), async {
+            match entry {
+                0 => {
+                    services
+                        .settle_abandoned_agentic_attempt(packet, "1112 normal exit")
+                        .await
+                }
+                1 => services
+                    .retry_agentic_run_exit(packet.graph_id())
+                    .await
+                    .map(|_| ()),
+                2 => {
+                    let projection = services
+                        .agent_action_service()
+                        .project_snapshot(&packet.agentic_binding.as_ref().unwrap().program_id)
+                        .unwrap();
+                    services
+                        .settle_agentic_task_attempt(
+                            &projection,
+                            task_ref,
+                            packet.graph_id(),
+                            harness_contract::agent_action::AgentAttemptMode::Execute,
+                            "1112 stranded attempt",
+                            true,
+                        )
+                        .await
+                }
+                _ => panic!("unknown original settlement entry"),
+            }
+        })
+        .await;
+    let envelope = observed.lock().unwrap().take();
+    (result, envelope)
+}
+
 /// Deferral state keyed by `program|task|mode`: consecutive count and the
 /// earliest time this dispatch may be retried. A repeatedly-deferred dispatch
 /// backs off exponentially so a wedged Program is not re-attempted (and logged)
@@ -720,6 +788,8 @@ impl RuntimeServices {
             true,
         );
         envelope.expected_revision = Some(projection.revision);
+        #[cfg(test)]
+        interleave_settlement_1112(self, &envelope);
         let observation = self.submit_agent_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(
@@ -1147,6 +1217,8 @@ impl RuntimeServices {
                 false,
             );
             envelope.expected_revision = Some(projection.revision);
+            #[cfg(test)]
+            interleave_settlement_1112(self, &envelope);
             let observation = self.submit_agent_action(&envelope).await?;
             if observation.status != AgentActionStatus::Applied {
                 return Err(format!(
@@ -1254,6 +1326,8 @@ impl RuntimeServices {
             retryable,
         );
         envelope.expected_revision = Some(projection.revision);
+        #[cfg(test)]
+        interleave_settlement_1112(self, &envelope);
         let observation = self.submit_agent_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(

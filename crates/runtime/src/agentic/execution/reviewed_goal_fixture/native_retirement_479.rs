@@ -2163,3 +2163,147 @@ async fn r1_1100_process_original_closure_identity_controls_hot_settlement() {
     assert_eq!(report.forced_aborts, 0);
     assert_eq!(report.remaining_keys, 0);
 }
+
+// The three witnesses call the actual dispatch owners, not the envelope helper.
+// A real Program action lands after their snapshot and before their submit.
+async fn settlement_program_race_1112(entry: u8) {
+    let (physical, backend, worker, _cleanup) = process_retirement_1100("1112-program-race").await;
+    let services = &physical.services;
+    let _release_fault = ReleaseRetirement1100(backend.clone());
+    if entry == 1 {
+        worker.withdraw().await;
+    }
+    worker.process.finish().await;
+    worker.wait_exit().await;
+    if entry == 1 {
+        services
+            .cancel_execution_tree(worker.packet.graph_id(), "1112 original retirement")
+            .await
+            .unwrap();
+    }
+    let mut commits = services.event_store().subscribe_commits();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while original_binding_closures_ready(
+            services,
+            worker.packet.graph_id(),
+            Some(&worker.packet),
+        )
+        .unwrap()
+        .is_none()
+        {
+            commits.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("real producer closure establishes the legal settlement baseline");
+    services.shutdown_maintenance().await;
+    let before = services
+        .agent_action_service()
+        .project(&worker.root_actor.program_id)
+        .unwrap();
+    let original_task = before.tasks[&worker.task_ref].clone();
+    assert!(original_task
+        .active_attempts
+        .contains_key(worker.packet.graph_id()));
+    assert_eq!(
+        original_task.status,
+        if entry == 1 {
+            crate::AgenticTaskStatus::CancelRequested
+        } else {
+            crate::AgenticTaskStatus::Claimed
+        }
+    );
+    let mut change = root(
+        "1112-concurrent-program-change",
+        AgentAction::TeamCreate(TeamCreateInput {
+            name: "independent concurrent team".into(),
+            mission: "advance real Program revision".into(),
+            objective: None,
+        }),
+    );
+    change.actor = worker.root_actor.clone();
+    change.expected_revision = Some(before.revision);
+    let (result, observed) = super::super::dispatch::settlement_race_1112(
+        services,
+        &worker.packet,
+        &worker.task_ref,
+        entry,
+        change,
+    )
+    .await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|error| error.contains("stale_revision")),
+        "actual production settlement must reject its stale Program snapshot: {result:?}"
+    );
+    let mut actual =
+        observed.expect("the selected production entry must reach its real submit boundary");
+    assert_eq!(actual.expected_revision, Some(before.revision));
+    assert_eq!(
+        actual.action_id,
+        format!(
+            "runtime-attempt-settle:{}:{}:{}",
+            worker.root_actor.program_id,
+            worker.task_ref,
+            worker.packet.graph_id()
+        )
+    );
+    assert!(matches!(&actual.action, AgentAction::TaskAttemptFail(input)
+        if input.task_ref == worker.task_ref && input.execution_id == worker.packet.graph_id()
+            && input.mode == AgentAttemptMode::Execute));
+    let after = services
+        .agent_action_service()
+        .project(&worker.root_actor.program_id)
+        .unwrap();
+    assert!(after.revision > before.revision);
+    assert_eq!(
+        after.tasks[&worker.task_ref], original_task,
+        "CAS rejection must retain the exact original claim/attempt/pending identity"
+    );
+    assert!(services
+        .event_store()
+        .event_by_idempotency_key(
+            &format!("agentic-program:{}", before.program_id),
+            &format!("agent-action:{}", actual.action_id)
+        )
+        .unwrap()
+        .is_none());
+    // Finish the already-exited original owners before releasing the append hold.
+    // This is a negative CAS witness, not an automatic-recovery positive.
+    let report = services.shutdown_execution().await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.forced_aborts, 0);
+    assert_eq!(report.remaining_keys, 0);
+    backend.allow();
+    // Mutation control: the genuine captured request with ONLY its fence removed
+    // can settle this otherwise legal original attempt. No hand-built expected
+    // envelope or projection is used to simulate the production entry.
+    actual.expected_revision = None;
+    let unfenced = services.agent_action_service().apply(&actual).unwrap();
+    assert_eq!(unfenced.status, AgentActionStatus::Applied, "{unfenced:?}");
+    assert!(!unfenced.duplicate);
+    let settled = services
+        .agent_action_service()
+        .project(&worker.root_actor.program_id)
+        .unwrap();
+    assert!(!settled.tasks[&worker.task_ref]
+        .active_attempts
+        .contains_key(worker.packet.graph_id()));
+    assert_not_success(services, &worker);
+}
+
+#[tokio::test]
+async fn r1_1112_abandoned_exit_fences_concurrent_program_change() {
+    settlement_program_race_1112(0).await;
+}
+
+#[tokio::test]
+async fn r1_1112_retirement_exit_fences_concurrent_program_change() {
+    settlement_program_race_1112(1).await;
+}
+
+#[tokio::test]
+async fn r1_1112_startup_settlement_fences_concurrent_program_change() {
+    settlement_program_race_1112(2).await;
+}
