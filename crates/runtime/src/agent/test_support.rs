@@ -6,30 +6,123 @@ use harness_contract::{
 use std::sync::{Arc, OnceLock};
 
 use session::UnifiedSessionStore;
-use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
+use storage::{PostgresConnectionConfig, PostgresExecutor};
+
+type TestPostgresExecutorKey = (
+    Result<[u8; 32], String>,
+    Result<PostgresConnectionConfig, String>,
+);
+
+struct TestPostgresExecutorCache {
+    key: TestPostgresExecutorKey,
+    result: Result<PostgresExecutor, String>,
+}
+
+impl TestPostgresExecutorCache {
+    fn get(&self, key: &TestPostgresExecutorKey) -> Result<PostgresExecutor, String> {
+        if &self.key != key {
+            return Err(
+                "Runtime PostgreSQL test executor configuration changed; start a new process"
+                    .into(),
+            );
+        }
+        self.result.clone()
+    }
+}
 
 fn postgres_executor() -> PostgresExecutor {
-    static EXECUTOR: OnceLock<Result<PostgresExecutor, String>> = OnceLock::new();
+    static EXECUTOR: OnceLock<TestPostgresExecutorCache> = OnceLock::new();
+    let config = storage::test_fixture_pool_budget(1, None).map(|budget| {
+        let mut config =
+            PostgresConnectionConfig::new("runtime-test", "runtime.test.pg", "cowd-runtime-test");
+        config.max_connections = budget;
+        config.min_idle_connections = None;
+        config.checkout_timeout_ms = storage::test_fixture_checkout_timeout_ms();
+        config
+    });
+    let snapshot = std::env::var("COWD_TEST_POSTGRES_URL")
+        .map_err(|_| "COWD_TEST_POSTGRES_URL is required".to_string())
+        .map(|url| {
+            storage::test_fixture_postgres_url_snapshot(
+                "runtime.test.pg",
+                &storage::ResolvedPostgresUrl::new(url),
+            )
+        });
+    let key = (
+        snapshot
+            .as_ref()
+            .map(|(token, _)| *token)
+            .map_err(Clone::clone),
+        config.clone(),
+    );
     EXECUTOR
         .get_or_init(|| {
-            let url = std::env::var("COWD_TEST_POSTGRES_URL")
-                .map_err(|_| "COWD_TEST_POSTGRES_URL is required".to_string())?;
-            let resolver = StaticSecretRefResolver::new([("runtime.test.pg".to_string(), url)]);
-            let mut config = PostgresConnectionConfig::new(
-                "runtime-test",
-                "runtime.test.pg",
-                "cowd-runtime-test",
-            );
-            config.max_connections = storage::test_fixture_pool_size();
-            config.min_idle_connections = None;
-            // The 5s production ceiling turns one slow query into a queue-wide
-            // failure when 24 test threads share one pool. See
-            // `storage::test_fixture_checkout_timeout_ms`.
-            config.checkout_timeout_ms = storage::test_fixture_checkout_timeout_ms();
-            PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
+            let result = config.and_then(|config| {
+                snapshot.and_then(|(_, resolver)| {
+                    PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
+                })
+            });
+            TestPostgresExecutorCache {
+                key: key.clone(),
+                result,
+            }
         })
-        .clone()
+        .get(&key)
         .unwrap_or_else(|error| panic!("isolated PostgreSQL test executor: {error}"))
+}
+
+#[cfg(test)]
+mod fixture_cache_tests {
+    use super::*;
+
+    #[test]
+    fn fixture_cache_rejects_changed_url_role_and_budget_and_keeps_failure() {
+        let config = PostgresConnectionConfig::new("runtime-test", "same-reference", "test");
+        let snapshot = |value| {
+            storage::test_fixture_postgres_url_snapshot(
+                "same-reference",
+                &storage::ResolvedPostgresUrl::new(value),
+            )
+            .0
+        };
+        let token = snapshot("postgres://role_a:secret@localhost/fixture");
+        let key = (Ok(token), Ok(config.clone()));
+        let cache = std::sync::OnceLock::new();
+        let attempts = std::cell::Cell::new(0);
+        let read = |key: &TestPostgresExecutorKey| {
+            cache
+                .get_or_init(|| {
+                    attempts.set(attempts.get() + 1);
+                    TestPostgresExecutorCache {
+                        key: key.clone(),
+                        result: Err("original failed attempt".into()),
+                    }
+                })
+                .get(key)
+        };
+        assert_eq!(read(&key).unwrap_err(), "original failed attempt");
+        for url in [
+            "postgres://role_a:secret@localhost/other",
+            "postgres://role_b:secret@localhost/fixture",
+            "postgres://role_a:changed@localhost/fixture",
+        ] {
+            let error = read(&(Ok(snapshot(url)), Ok(config.clone()))).unwrap_err();
+            assert!(error.contains("configuration changed"));
+            assert!(!error.contains(url));
+        }
+        let mut changed = config.clone();
+        changed.max_connections += 1;
+        assert!(read(&(Ok(token), Ok(changed)))
+            .unwrap_err()
+            .contains("configuration changed"));
+        assert!(read(&(Err("URL unavailable".into()), Ok(config)))
+            .unwrap_err()
+            .contains("configuration changed"));
+        assert_eq!(read(&key).unwrap_err(), "original failed attempt");
+        assert_eq!(attempts.get(), 1, "changed keys must not initialize a pool");
+    }
+
+
 }
 
 /// Build a complete Session contract over an isolated PostgreSQL schema.

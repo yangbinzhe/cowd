@@ -194,6 +194,7 @@ impl SelectedStorageTopology {
         config_home: &Path,
         workspace_root: &Path,
     ) -> Result<Self, String> {
+        let budget = storage::test_fixture_pool_budget(3, Some(24))?;
         let permit = acquire_test_postgres_fixture_permit();
         let mut postgres = runtime::PostgresTopologyConfig::default();
         postgres.logical_identity = format!("cowd-test-{}", std::process::id());
@@ -201,11 +202,11 @@ impl SelectedStorageTopology {
         // All isolated schemas share one bounded process pool. Domain work
         // still retains separate workload lanes while schema count does not
         // multiply server connections.
-        postgres.max_connections = 24;
+        postgres.max_connections = budget;
         postgres.server_reserve = 4;
-        postgres.critical.max_connections = Some(8);
-        postgres.online_read.max_connections = Some(12);
-        postgres.background.max_connections = Some(4);
+        postgres.critical.max_connections = None;
+        postgres.online_read.max_connections = None;
+        postgres.background.max_connections = None;
         postgres.critical.min_idle_connections = None;
         postgres.online_read.min_idle_connections = None;
         postgres.background.min_idle_connections = None;
@@ -446,15 +447,103 @@ pub(crate) struct ArtifactMaintenanceGuard {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+type TestPostgresExecutorKey = (Result<[u8; 32], String>, runtime::PostgresTopologyConfig);
+
+#[cfg(any(test, feature = "test-support"))]
+struct TestPostgresExecutorCache {
+    key: TestPostgresExecutorKey,
+    result: Result<PostgresExecutor, String>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestPostgresExecutorCache {
+    fn get(&self, key: &TestPostgresExecutorKey) -> Result<PostgresExecutor, String> {
+        if &self.key != key {
+            return Err(
+                "PostgreSQL test executor configuration changed; start a new process".into(),
+            );
+        }
+        self.result.clone()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 fn shared_test_postgres_executor(
     config: &runtime::PostgresTopologyConfig,
     config_home: &Path,
 ) -> Result<PostgresExecutor, String> {
-    static EXECUTOR: std::sync::OnceLock<Result<PostgresExecutor, String>> =
-        std::sync::OnceLock::new();
+    static EXECUTOR: std::sync::OnceLock<TestPostgresExecutorCache> = std::sync::OnceLock::new();
+    // Resolve on every request to detect changed secret values. Only the first
+    // snapshot can connect; later mismatches cannot create another pool.
+    let snapshot = ConfigHomeSecretRefResolver::new(config_home)
+        .resolve_postgres_url(&config.secret_ref)
+        .map(|url| storage::test_fixture_postgres_url_snapshot(&config.secret_ref, &url))
+        .map_err(|_| "PostgreSQL test URL could not be resolved".to_string());
+    let key = (
+        snapshot
+            .as_ref()
+            .map(|(token, _)| *token)
+            .map_err(Clone::clone),
+        config.clone(),
+    );
     EXECUTOR
-        .get_or_init(|| connect_postgres(config, PostgresMigrationMode::Maintenance, config_home))
-        .clone()
+        .get_or_init(|| {
+            let result = snapshot.and_then(|(_, resolver)| {
+                // Use the same lane rule as production, with the frozen resolver.
+                let mut connection = PostgresConnectionConfig::new(
+                    config.logical_identity.clone(),
+                    config.secret_ref.clone(),
+                    format!("cowd-{}", env!("CARGO_PKG_VERSION")),
+                );
+                connection.max_connections = config.max_connections;
+                connection.min_idle_connections = None;
+                connection.checkout_timeout_ms = config.online_read.checkout_timeout_ms;
+                let [critical, online_read, background] =
+                    resolved_postgres_lane_sizes(config.max_connections, config);
+                let lane = |maximum, minimum: Option<u32>, timeout| {
+                    PostgresPoolLaneConfig::new(
+                        maximum,
+                        minimum.map(|minimum| minimum.min(maximum)),
+                        timeout,
+                    )
+                };
+                let pool_set = PostgresPoolSetConfig {
+                    connection,
+                    server_reserve: config.server_reserve,
+                    critical: lane(
+                        critical,
+                        config.critical.min_idle_connections,
+                        config.critical.checkout_timeout_ms,
+                    ),
+                    online_read: lane(
+                        online_read,
+                        config.online_read.min_idle_connections,
+                        config.online_read.checkout_timeout_ms,
+                    ),
+                    background: lane(
+                        background,
+                        config.background.min_idle_connections,
+                        config.background.checkout_timeout_ms,
+                    ),
+                };
+                std::thread::spawn(move || {
+                    PostgresPoolSet::connect_with_migration_mode(
+                        pool_set,
+                        &resolver,
+                        PostgresMigrationMode::Maintenance,
+                    )
+                })
+                .join()
+                .map_err(|_| "PostgreSQL test executor initialization thread panicked".to_string())?
+                .map(|pool_set| pool_set.executor())
+                .map_err(stringify)
+            });
+            TestPostgresExecutorCache {
+                key: key.clone(),
+                result,
+            }
+        })
+        .get(&key)
 }
 
 fn base_registry(config_home: &Path, workspace_root: &Path) -> Result<StorageRegistry, String> {
@@ -1336,6 +1425,243 @@ mod tests {
         assert_eq!(postgres_session_workers(32, 16), 16);
         assert_eq!(postgres_session_workers(2, 16), 2);
         assert_eq!(postgres_session_workers(8, 4), 4);
+    }
+
+    #[test]
+    #[ignore = "requires isolated COWD_TEST_POSTGRES_URL and explicit COWD_TEST_POOL_CONNECTIONS=4"]
+    fn fixture_pool_budget_reuses_scopes_with_real_connections() {
+        use std::time::{Duration, Instant};
+
+        let budget = storage::test_fixture_pool_budget(3, Some(24)).expect("checked fixture budget");
+        assert_eq!(
+            budget, 4,
+            "runner must explicitly allocate four connections"
+        );
+        let barrier = match (
+            std::env::var_os("COWD_TEST_PG_READY_FILE"),
+            std::env::var_os("COWD_TEST_PG_RELEASE_FILE"),
+        ) {
+            (None, None) => None,
+            (Some(ready), Some(release)) => {
+                let ready = PathBuf::from(ready);
+                let release = PathBuf::from(release);
+                assert_ne!(
+                    ready, release,
+                    "ready and release must be separate own files"
+                );
+                assert!(
+                    !release.try_exists().expect("check release file"),
+                    "release file must start absent"
+                );
+                Some((ready, release))
+            }
+            _ => panic!("set both COWD_TEST_PG_READY_FILE and COWD_TEST_PG_RELEASE_FILE"),
+        };
+        let fail_after_ready = match std::env::var("COWD_TEST_PG_FAIL_AFTER_READY") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if value == "0" => false,
+            Ok(value) if value == "1" => true,
+            _ => panic!("COWD_TEST_PG_FAIL_AFTER_READY must be 0 or 1 when set"),
+        };
+        // tempfile respects the parent's TMPDIR. No service or alternate fixture
+        // creator is involved: only these two root topologies share the cache.
+        let home = tempfile::tempdir().expect("config home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first = SelectedStorageTopology::compose_for_test(home.path(), workspace.path())
+            .expect("first scoped topology");
+        let first_schema = first.test_namespace.as_ref().unwrap().name.clone();
+        assert_eq!(first.postgres_executor.health().max_connections, budget);
+        assert_eq!(
+            first
+                .postgres_executor
+                .health()
+                .lanes
+                .iter()
+                .map(|lane| lane.max_connections)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 1]
+        );
+        let first_pid = {
+            let mut client = first
+                .postgres_executor
+                .checkout_critical()
+                .expect("first critical client");
+            client
+                .batch_execute("CREATE VIEW fixture_pool_scope_probe AS SELECT 1::INTEGER AS marker")
+                .expect("first schema view");
+            let row = client.query_one(
+                "SELECT pg_backend_pid(), current_schema()::TEXT, marker FROM fixture_pool_scope_probe", &[],
+            ).expect("first schema identity");
+            assert_eq!(row.get::<_, String>(1), first_schema);
+            assert_eq!(row.get::<_, i32>(2), 1);
+            row.get::<_, i32>(0)
+        }; // Return the only critical slot before composing the second scope.
+        let second = SelectedStorageTopology::compose_for_test(home.path(), workspace.path())
+            .expect("second scoped topology");
+        let second_schema = second.test_namespace.as_ref().unwrap().name.clone();
+        assert_ne!(first_schema, second_schema);
+        assert_eq!(second.postgres_executor.health().max_connections, budget);
+        {
+            let mut client = second
+                .postgres_executor
+                .checkout_critical()
+                .expect("second critical client");
+            client
+                .batch_execute("CREATE VIEW fixture_pool_scope_probe AS SELECT 2::INTEGER AS marker")
+                .expect("second schema view");
+            let row = client.query_one(
+                "SELECT pg_backend_pid(), current_schema()::TEXT, marker FROM fixture_pool_scope_probe", &[],
+            ).expect("second schema identity");
+            assert_eq!(
+                row.get::<_, i32>(0),
+                first_pid,
+                "one critical slot must reuse its backend across scopes"
+            );
+            assert_eq!(row.get::<_, String>(1), second_schema);
+            assert_eq!(row.get::<_, i32>(2), 2);
+        }
+        let executor = &first.postgres_executor;
+        // Acquire exactly the original three-lane allocation from one executor.
+        // All topology/migration work above has finished before these are held.
+        let mut clients = [
+            executor.checkout_critical().expect("hold critical slot"),
+            executor
+                .checkout_online_read()
+                .expect("hold first online slot"),
+            executor
+                .checkout_online_read()
+                .expect("hold second online slot"),
+            executor
+                .checkout_background()
+                .expect("hold background slot"),
+        ];
+        let backend_pids = clients.iter_mut().map(|client| {
+            client.query_one(
+                "SELECT pg_backend_pid(), current_schema()::TEXT, marker FROM fixture_pool_scope_probe", &[],
+            ).map(|row| {
+                assert_eq!(row.get::<_, String>(1), first_schema);
+                assert_eq!(row.get::<_, i32>(2), 1, "returning to first scope must restore its view");
+                row.get::<_, i32>(0)
+            }).expect("held backend identity")
+        }).collect::<Vec<i32>>();
+        assert_eq!(backend_pids[0], first_pid);
+        assert_eq!(
+            backend_pids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(
+            executor
+                .health()
+                .lanes
+                .iter()
+                .map(|lane| lane.active_connections)
+                .sum::<u32>(),
+            budget
+        );
+        let ready = serde_json::json!({
+            "process_id": std::process::id(),
+            "budget": budget,
+            "backend_pids": backend_pids,
+            "schemas": [first_schema, second_schema],
+        });
+        println!("{ready}");
+        if let Some((ready_path, release_path)) = barrier {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(ready_path)
+                .expect("create exact own ready file");
+            file.write_all(&serde_json::to_vec(&ready).expect("serialize ready record"))
+                .expect("write ready record");
+            file.sync_all().expect("flush ready record");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !release_path.try_exists().expect("check runner release") {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "runner release did not arrive within ten seconds"
+                );
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+        if fail_after_ready {
+            // Real unwind oracle: clients drop before the topology namespace
+            // guards, so cleanup can reacquire the single critical slot.
+            panic!("requested PostgreSQL fixture failure after ready/release");
+        }
+        drop(clients);
+        drop(second);
+        drop(first);
+        // The process cache retains its pool until process exit. The parent
+        // checks server-side reaping; dropping these scopes is not that proof.
+    }
+
+    #[test]
+    fn fixture_budget_preserves_three_lanes_and_total() {
+        let config = runtime::PostgresTopologyConfig::default();
+        assert_eq!(resolved_postgres_lane_sizes(4, &config), [1, 2, 1]);
+        assert_eq!(resolved_postgres_lane_sizes(24, &config), [8, 12, 4]);
+        for budget in 3..=96 {
+            let lanes = resolved_postgres_lane_sizes(budget, &config);
+            assert!(lanes.iter().all(|size| *size >= 1));
+            assert_eq!(lanes.iter().sum::<u32>(), budget);
+        }
+    }
+
+    #[test]
+    fn fixture_cache_rejects_changed_url_role_and_budget_and_keeps_failure() {
+        let config = runtime::PostgresTopologyConfig::default();
+        let snapshot = |value| {
+            storage::test_fixture_postgres_url_snapshot(
+                "same-reference",
+                &ResolvedPostgresUrl::new(value),
+            )
+            .0
+        };
+        let token = snapshot("postgres://role_a:secret@localhost/fixture");
+        let key = (Ok(token), config.clone());
+        let cache = std::sync::OnceLock::new();
+        let attempts = std::cell::Cell::new(0);
+        let read = |key: &TestPostgresExecutorKey| {
+            cache
+                .get_or_init(|| {
+                    attempts.set(attempts.get() + 1);
+                    TestPostgresExecutorCache {
+                        key: key.clone(),
+                        result: Err("original failed attempt".into()),
+                    }
+                })
+                .get(key)
+        };
+        assert_eq!(read(&key).unwrap_err(), "original failed attempt");
+        for url in [
+            "postgres://role_a:secret@localhost/other",
+            "postgres://role_b:secret@localhost/fixture",
+            "postgres://role_a:changed@localhost/fixture",
+        ] {
+            let error = read(&(Ok(snapshot(url)), config.clone())).unwrap_err();
+            assert!(error.contains("configuration changed"));
+            assert!(!error.contains(url));
+        }
+        let mut changed = config.clone();
+        changed.max_connections = 4;
+        assert!(read(&(Ok(token), changed))
+            .unwrap_err()
+            .contains("configuration changed"));
+        let mut changed = config.clone();
+        changed.online_read.checkout_timeout_ms += 1;
+        assert!(read(&(Ok(token), changed))
+            .unwrap_err()
+            .contains("configuration changed"));
+        assert!(read(&(Err("URL unavailable".into()), config))
+            .unwrap_err()
+            .contains("configuration changed"));
+        assert_eq!(read(&key).unwrap_err(), "original failed attempt");
+        assert_eq!(attempts.get(), 1, "changed keys must not initialize a pool");
     }
 
     #[test]

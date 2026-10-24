@@ -142,15 +142,55 @@ impl PostgresConnectionConfig {
 /// Production callers set `max_connections` explicitly; this is for fixtures.
 #[must_use]
 pub fn test_fixture_pool_size() -> u32 {
-    fixture_pool_size(explicit_pool_connections())
+    test_fixture_pool_budget(1, None)
+        .unwrap_or_else(|error| panic!("invalid PostgreSQL test fixture budget: {error}"))
 }
 
-/// Read the operator's explicit per-process override.
-fn explicit_pool_connections() -> Option<u32> {
-    std::env::var("COWD_TEST_POOL_CONNECTIONS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| *value > 0)
+/// Checked total connection budget for one test process, not per lane or server.
+/// An absent override uses `fallback`, or the original CPU rule when it is None.
+pub fn test_fixture_pool_budget(minimum: u32, fallback: Option<u32>) -> Result<u32, String> {
+    let explicit = match std::env::var("COWD_TEST_POOL_CONNECTIONS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("COWD_TEST_POOL_CONNECTIONS must be a positive integer".into());
+        }
+    };
+    checked_fixture_pool_budget(explicit.as_deref(), minimum, fallback)
+}
+
+fn checked_fixture_pool_budget(
+    explicit: Option<&str>,
+    minimum: u32,
+    fallback: Option<u32>,
+) -> Result<u32, String> {
+    let budget = match explicit {
+        Some(value) => value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "COWD_TEST_POOL_CONNECTIONS must be a positive integer".to_string())?,
+        None => fallback.unwrap_or_else(|| fixture_pool_size(None)),
+    };
+    if budget < minimum.max(1) {
+        return Err(format!(
+            "COWD_TEST_POOL_CONNECTIONS must be at least {} for this fixture",
+            minimum.max(1)
+        ));
+    }
+    Ok(budget)
+}
+
+/// Snapshot a fixture's resolved URL for a private cache key and connection.
+/// The token covers the actual URL (including credentials), not the reference.
+/// This fixes client configuration only; it does not authenticate server identity.
+pub fn test_fixture_postgres_url_snapshot(
+    secret_ref: &str,
+    resolved: &ResolvedPostgresUrl,
+) -> ([u8; 32], StaticSecretRefResolver) {
+    let token = Sha256::digest(resolved.as_str().as_bytes()).into();
+    let resolver =
+        StaticSecretRefResolver::new([(secret_ref.to_string(), resolved.as_str().to_string())]);
+    (token, resolver)
 }
 
 /// The sizing rule itself, with the environment already resolved.
@@ -2232,19 +2272,32 @@ mod tests {
         assert_eq!(fixture_pool_size(Some(1)), 1);
     }
 
-    /// A blank, zero or unparsable override means "use the default", not "use one
-    /// connection". These are the values the env reader filters out before the
-    /// sizing rule ever sees them, so exercising the filter is the point.
     #[test]
-    fn a_blank_zero_or_unparsable_override_falls_back_to_the_default() {
-        for blank in ["", "   ", "\t", "not-a-number", "0", "-4"] {
-            let parsed = blank.trim().parse::<u32>().ok().filter(|value| *value > 0);
-            assert_eq!(
-                fixture_pool_size(parsed),
-                fixture_pool_size(None),
-                "`{blank}` must fall back to the derived default, not pin the pool"
-            );
+    fn checked_fixture_budget_rejects_invalid_and_below_minimum_overrides() {
+        for invalid in ["", "   ", "\t", "not-a-number", "0", "-4", "4294967296"] {
+            for minimum in [1, 3] {
+                assert!(checked_fixture_pool_budget(Some(invalid), minimum, Some(24)).is_err());
+            }
         }
+        for too_small in ["1", "2"] {
+            assert!(checked_fixture_pool_budget(Some(too_small), 3, Some(24)).is_err());
+        }
+        assert!(checked_fixture_pool_budget(None, 3, Some(0)).is_err());
+    }
+
+    #[test]
+    fn checked_fixture_budget_shares_explicit_values_and_preserves_fallbacks() {
+        for explicit in ["3", "4", "24", " 12 "] {
+            let runtime = checked_fixture_pool_budget(Some(explicit), 1, None).unwrap();
+            let gateway = checked_fixture_pool_budget(Some(explicit), 3, Some(24)).unwrap();
+            assert_eq!(runtime, gateway);
+        }
+        assert_eq!(checked_fixture_pool_budget(Some("1"), 1, None), Ok(1));
+        assert_eq!(checked_fixture_pool_budget(None, 3, Some(24)), Ok(24));
+        assert_eq!(
+            checked_fixture_pool_budget(None, 1, None),
+            Ok(fixture_pool_size(None))
+        );
     }
 
     #[test]
