@@ -278,6 +278,18 @@ pub(crate) fn describe_source_advance(
         Ok(events) => events,
         Err(_) => return format!("writer_advance=unknown head={head} event_read_failed"),
     };
+    #[cfg(test)]
+    for event in &events {
+        if matches!(
+            event.kind.as_str(),
+            "execution_graph.command_applied" | "execution_graph.recovered"
+        ) {
+            crate::agentic::execution::reviewed_goal_fixture::diagnostic_1120::record(
+                "source_advance.original_event",
+                serde_json::json!({"source":source,"after":after,"head":head,"record":event}),
+            );
+        }
+    }
     let writers = events
         .iter()
         .map(|event| {

@@ -1,4 +1,6 @@
 //! Read the existing Runtime strategy and tool journal; do not invent policy.
+#[cfg(test)]
+use crate::agentic::execution::reviewed_goal_fixture::diagnostic_1120 as obs1120;
 use crate::agentic::program::AgenticProgramProjection;
 use crate::{ExpectedStreamRevision, RuntimeEventStore};
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
@@ -264,6 +266,7 @@ pub(crate) fn completion_admission_context(
     }))
 }
 
+#[cfg_attr(test, track_caller)]
 pub(crate) fn validate_proof_inputs(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -276,6 +279,7 @@ pub(crate) fn validate_proof_inputs(
 
 /// A persisted review is revalidated against the original action that carries
 /// this exact proof. A missing, foreign or ambiguous record grants no exemption.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn validate_applied_proof_inputs(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -350,6 +354,7 @@ pub(crate) fn validate_applied_proof_inputs(
 /// Re-verify a proof against the LIVE action it is applying, so the review's
 /// own in-flight call is resolved again from the durable evidence instead of
 /// from anything the proof carries.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn validate_proof_inputs_for_action(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -358,6 +363,16 @@ pub(crate) fn validate_proof_inputs_for_action(
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
+    #[cfg(test)]
+    let _observer = obs1120::Frame::enter(serde_json::json!({
+        "callsite":format!("{}:{}", std::panic::Location::caller().file(), std::panic::Location::caller().line()),
+        "identity":match current_review { Some(super::current_review::ReviewActionIdentity::Live(_))=>"Live",
+            Some(super::current_review::ReviewActionIdentity::Applied(_))=>"Applied",None=>"None" },
+        "action_id":current_review.map(|identity| identity.action_id()),
+        "program":program.program_id,"revision":program.revision,"proof":super::proof_value_digest(proof),
+        "carried_key":proof.current_review_effect_key,"reviewer":proof.reviewer_execution_id,
+        "criterion":proof.input_set.as_ref().and_then(|inputs| inputs.condition_ref.as_deref())
+    }));
     let current = crate::AgentActionService::new(std::sync::Arc::clone(store))
         .project(&program.program_id)
         .map_err(|error| error.to_string())?;
@@ -5207,6 +5222,12 @@ fn proof_input_snapshot_for_phase(
                 Some(events) => original_review_action_id(events, proof)?,
                 None => None,
             };
+            #[cfg(test)]
+            obs1120::record(
+                "identity.original",
+                serde_json::json!({"original_action_id":original,
+                "carried":proof.current_review_effect_key}),
+            );
             super::current_review::rebind_current_review_effect_key(
                 &session_events,
                 packet,
@@ -5221,11 +5242,24 @@ fn proof_input_snapshot_for_phase(
     // call. A live action that authenticates to NOTHING exempts nothing -
     // falling back to the stored candidate would exempt a call this action
     // is not performing.
+    #[cfg(test)]
+    obs1120::record(
+        "identity.candidates",
+        serde_json::json!({"live":live_identity,"rebound":rebound_identity,
+        "packet":reviewer_delivery_packet.as_ref().map(|packet| serde_json::json!({
+            "digest":super::proof_value_digest(packet),"graph":packet.graph_id(),"node":packet.node_id(),
+            "attempt":packet.attempt,"scope":packet.agentic_binding.as_ref().map(|binding| &binding.focus)}))}),
+    );
     let current_review_effect_key = super::current_review::select_current_review_effect_key(
         current_review,
         live_identity,
         rebound_identity,
     )?;
+    #[cfg(test)]
+    obs1120::record(
+        "identity.selected",
+        serde_json::json!({"selected":current_review_effect_key}),
+    );
     // Graph lifecycle is not business work, but an unrelated graph advance
     // cannot borrow the review's exemption. Keep the current revision in the
     // original CAS even when this exact retirement has no semantic effect.
@@ -5261,6 +5295,12 @@ fn proof_input_snapshot_for_phase(
             // lifecycle revision is not itself a new business effect.
             continue;
         }
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.or",
+            serde_json::json!({"source":source,"pinned":pinned,"current":current,
+            "short_circuit":current_review_effect_key.is_none()}),
+        );
         if current_review_effect_key.is_none()
             || !super::current_review::graph_tail_is_own_review_retirement(
                 store,

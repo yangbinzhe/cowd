@@ -1,5 +1,7 @@
 //! Review retirement preserves business evidence only for the original, single
 //! reviewer node. Source revision CAS still advances to the actual durable head.
+#[cfg(test)]
+use crate::agentic::execution::reviewed_goal_fixture::diagnostic_1120 as obs1120;
 use std::sync::Arc;
 
 use harness_contract::agent::{AgentTaskPacket, AgenticExecutionFocus};
@@ -239,18 +241,40 @@ pub(crate) fn graph_tail_is_own_review_retirement(
     packet: Option<&AgentTaskPacket>,
 ) -> Result<bool, String> {
     let Some(packet) = packet.filter(|packet| packet.graph_id() == source) else {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"packet_graph","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     };
     if current.checked_sub(pinned) != Some(2) || packet.session_id() != program.session_id {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"cut_or_session","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     }
     let Some(scope) = packet.agentic_binding.as_ref() else {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"missing_scope","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     };
     let task_ref = match &scope.focus {
         AgenticExecutionFocus::TaskExecute { task_ref }
         | AgenticExecutionFocus::TaskReview { task_ref } => task_ref,
-        _ => return Ok(false),
+        _ => {
+            #[cfg(test)]
+            obs1120::record(
+                "retirement.first_false",
+                serde_json::json!({"predicate":"focus","source":source}),
+            );
+            return Ok(false);
+        }
     };
     if scope.program_id != program.program_id
         || program.tasks.get(task_ref).is_none_or(|task| {
@@ -262,6 +286,11 @@ pub(crate) fn graph_tail_is_own_review_retirement(
                 || task.cancel_evidence_refs.is_empty()
         })
     {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"program_task_cancel_evidence","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     }
     let records =
@@ -274,12 +303,22 @@ pub(crate) fn graph_tail_is_own_review_retirement(
             || record.schema_version != 2
             || record.actor.as_deref() != Some("execution_commit_service")
         {
+            #[cfg(test)]
+            obs1120::record(
+                "retirement.first_false",
+                serde_json::json!({"predicate":"record_identity","source":source,"pinned":pinned,"current":current}),
+            );
             return Ok(false);
         }
         let resolved = store.resolve_read_record(record)?;
         let event: ExecutionGraphEvent = serde_json::from_value(resolved.payload.clone())
             .map_err(|_| "review retirement graph body is invalid")?;
         if event.kind() != resolved.kind {
+            #[cfg(test)]
+            obs1120::record(
+                "retirement.first_false",
+                serde_json::json!({"predicate":"record_kind","source":source,"pinned":pinned,"current":current}),
+            );
             return Ok(false);
         }
         if resolved.sequence <= pinned {
@@ -293,6 +332,11 @@ pub(crate) fn graph_tail_is_own_review_retirement(
         }
     }
     let Some(before) = before else {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"missing_before","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     };
     if before.id != source
@@ -307,6 +351,11 @@ pub(crate) fn graph_tail_is_own_review_retirement(
         || before.node_statuses.get(packet.node_id()) != Some(&ExecutionNodeStatus::Running)
         || tail.len() != 2
     {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"before_packet_attempt_state","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     }
     let graphs = crate::ExecutionGraphStateStore::new(Arc::clone(store));
@@ -317,23 +366,57 @@ pub(crate) fn graph_tail_is_own_review_retirement(
         .binding_start_position(&before, packet.node_id(), &binding)
         .map_err(|error| error.to_string())?
     else {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"missing_start","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     };
+    #[cfg(test)]
+    obs1120::record(
+        "retirement.binding",
+        serde_json::json!({"source":source,"binding":binding,"start":start,
+        "before_revision":before.revision,"before_cursor":before.recovery_cursor.commit_cursor,
+        "tail":tail.iter().map(|(record,_)| record).collect::<Vec<_>>() }),
+    );
     if !retirement_delta_preserves_work(&before, &tail[0].1, &tail[1].1, packet.node_id())? {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"delta_preserves_work","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     }
     if !retirement_closes_original_binding(&tail[1].1, &before, packet.node_id(), &binding, start) {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"closure_matches_original","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     }
     let key = binding.lease_closure_key(&before, packet.node_id());
     if tail[1].0.idempotency_key.as_deref() != Some(key.as_str())
         || tail[1].0.commit_cursor <= tail[0].0.commit_cursor
     {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"closure_key_order","source":source,"pinned":pinned,"current":current}),
+        );
         return Ok(false);
     }
-    graphs
+    let result = graphs
         .binding_lease_closure(&before, packet.node_id(), &binding, start)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    #[cfg(test)]
+    obs1120::record(
+        "retirement.closure_reader",
+        serde_json::json!({"source":source,"result":result,
+        "first_false":matches!(result, Ok(false))}),
+    );
+    result
 }
 
 /// Graph deltas are prepared before append. As in GraphStateStore, the
@@ -374,6 +457,11 @@ fn retirement_delta_preserves_work(
         || !matches!(recovery, ExecutionGraphEvent::Recovered { recovered_nodes, blocked_nodes, lease_closures, .. }
             if recovered_nodes.is_empty() && blocked_nodes.is_empty() && lease_closures.len() == 1)
     {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"delta_event_shape"}),
+        );
         return Ok(false);
     }
     let cancelled = command.project(Some(before.clone()))?;
@@ -383,11 +471,26 @@ fn retirement_delta_preserves_work(
         .node_statuses
         .insert(node.to_owned(), ExecutionNodeStatus::Cancelled);
     if cancelled != expected {
+        #[cfg(test)]
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"cancel_delta_equality",
+            "before_cursor":before.recovery_cursor.commit_cursor,"cancelled_cursor":cancelled.recovery_cursor.commit_cursor,
+            "expected_cursor":expected.recovery_cursor.commit_cursor}),
+        );
         return Ok(false);
     }
     let closed = recovery.project(Some(cancelled.clone()))?;
     expected.revision += 1;
     expected.recovery_cursor.commit_cursor = closed.recovery_cursor.commit_cursor;
+    #[cfg(test)]
+    if closed != expected {
+        obs1120::record(
+            "retirement.first_false",
+            serde_json::json!({"predicate":"recovery_delta_equality",
+            "closed_cursor":closed.recovery_cursor.commit_cursor,"expected_cursor":expected.recovery_cursor.commit_cursor}),
+        );
+    }
     Ok(closed == expected)
 }
 

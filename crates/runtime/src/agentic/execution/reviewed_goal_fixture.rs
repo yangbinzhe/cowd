@@ -12,6 +12,164 @@ use harness_contract::agent_action::{
     TeamCreateInput,
 };
 
+#[cfg(test)]
+pub(crate) mod diagnostic_1120 {
+    use serde_json::{json, Value};
+    use std::{
+        cell::RefCell,
+        io::Write,
+        path::PathBuf,
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    static FAILED: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static CONTEXT: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+        static DIRECTORY: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn record(kind: &str, payload: Value) {
+        let directory = DIRECTORY
+            .with(|slot| slot.borrow().clone())
+            .or_else(|| std::env::var_os("COWD_DIAG_1120_DIR").map(PathBuf::from));
+        let Some(directory) = directory else {
+            return;
+        };
+        let result = (|| -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if directory.symlink_metadata()?.file_type().is_symlink()
+                    || directory.metadata()?.permissions().mode() & 0o777 != 0o700
+                {
+                    return Err(std::io::Error::other("observer directory is not private"));
+                }
+            }
+            let sequence = SEQUENCE.fetch_add(1, Ordering::SeqCst);
+            let context = CONTEXT
+                .try_with(|slot| slot.borrow().last().cloned())
+                .ok()
+                .flatten();
+            let mut event = json!({"schema":1,"pid":std::process::id(),"sequence":sequence,
+                "kind":kind,"context":context,"payload":payload});
+            let mut bytes = serde_json::to_vec(&event)?;
+            if bytes.len() > 65536 {
+                event["payload"] = json!({"oversize":true,"bytes":bytes.len(),
+                    "digest":crate::agentic::review_evidence::proof_value_digest(&event["payload"])});
+                bytes = serde_json::to_vec(&event)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(directory.join(format!(
+                "observer-{}-{sequence:08}.json",
+                std::process::id()
+            )))?;
+            file.write_all(&bytes)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            std::fs::File::open(directory)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            FAILED.store(true, Ordering::SeqCst);
+            eprintln!("OBS1120_WRITE_FAILURE kind={kind}");
+        }
+    }
+    pub(crate) struct Frame;
+    impl Frame {
+        pub(crate) fn enter(mut context: Value) -> Self {
+            context["call_id"] = json!(SEQUENCE.fetch_add(1, Ordering::SeqCst));
+            CONTEXT.with(|slot| slot.borrow_mut().push(context));
+            record("validator.enter", json!({}));
+            Self
+        }
+    }
+    impl Drop for Frame {
+        fn drop(&mut self) {
+            record(
+                "validator.exit",
+                json!({"unwinding":std::thread::panicking()}),
+            );
+            let _ = CONTEXT.try_with(|slot| slot.borrow_mut().pop());
+        }
+    }
+    pub(crate) struct Boundary {
+        stage: &'static str,
+        identity: Value,
+        ended: bool,
+    }
+    impl Boundary {
+        pub(crate) fn enter(stage: &'static str, identity: Value) -> Self {
+            record("cleanup.begin", json!({"stage":stage,"identity":identity}));
+            Self {
+                stage,
+                identity,
+                ended: false,
+            }
+        }
+        pub(crate) fn end(mut self) {
+            self.ended = true;
+            record(
+                "cleanup.end",
+                json!({"stage":self.stage,"identity":self.identity}),
+            );
+        }
+    }
+    impl Drop for Boundary {
+        fn drop(&mut self) {
+            if !self.ended {
+                record(
+                    "cleanup.dropped",
+                    json!({"stage":self.stage,"identity":self.identity,
+                    "unwinding":std::thread::panicking()}),
+                );
+            }
+        }
+    }
+    // Explicit diagnostic admission gate: never a default-suite success with
+    // missing external evidence. The owning runner executes this exact test
+    // with --ignored and verifies the files after this process has exited.
+    #[test]
+    #[ignore = "requires the diagnostic owner's private COWD_DIAG_1120_DIR"]
+    fn external_records_survive_original_scope_unwind() {
+        let directory = std::env::var_os("COWD_DIAG_1120_DIR")
+            .map(PathBuf::from)
+            .expect("diagnostic admission supplies a private collector");
+        DIRECTORY.with(|slot| *slot.borrow_mut() = Some(directory.clone()));
+        let caught = std::panic::catch_unwind(|| {
+            let _frame = Frame::enter(json!({"callsite":"observer_contract","identity":"Applied",
+                "action_id":"independent-literal-action"}));
+            let _boundary = Boundary::enter("contract_unwind", json!({"run":"original-run"}));
+            record(
+                "contract.before_panic",
+                json!({"expected":"durable before unwind"}),
+            );
+            panic!("1120 controlled observer unwind only");
+        });
+        DIRECTORY.with(|slot| *slot.borrow_mut() = None);
+        Boundary::enter("contract_return", json!({"run":"original-return"})).end();
+        assert!(caught.is_err());
+        assert!(!FAILED.load(Ordering::SeqCst));
+        let events = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|p| {
+                serde_json::from_slice::<Value>(&std::fs::read(p.unwrap().path()).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|e| e["kind"] == "contract.before_panic"));
+        assert!(events.iter().any(|e| e["kind"] == "cleanup.dropped"
+            && e["payload"]["unwinding"] == true
+            && e["context"]["action_id"] == "independent-literal-action"));
+        assert!(events
+            .iter()
+            .any(|e| e["kind"] == "validator.exit" && e["payload"]["unwinding"] == true));
+    }
+}
+
 pub(super) fn root(action_id: &str, action: AgentAction) -> AgentActionEnvelope {
     AgentActionEnvelope {
         action_id: action_id.to_string(),
@@ -11560,6 +11718,8 @@ impl Drop for RealFixtureCleanup {
         if !std::thread::panicking() {
             return;
         }
+        #[cfg(test)]
+        diagnostic_1120::record("cleanup.drop.enter", serde_json::json!({}));
         if let Some(hold) = self.host.held_write.get() {
             hold.release.notify_one();
         }
@@ -11568,9 +11728,19 @@ impl Drop for RealFixtureCleanup {
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let services = self.services.clone();
+            #[cfg(test)]
+            diagnostic_1120::record("cleanup.spawn.requested", serde_json::json!({}));
             runtime.spawn(async move {
+                #[cfg(test)]
+                let task_boundary = diagnostic_1120::Boundary::enter("task", serde_json::json!({}));
                 for run in services.agent_runtime().list() {
                     if !run.status.is_terminal() {
+                        #[cfg(test)]
+                        let cancel_boundary = diagnostic_1120::Boundary::enter(
+                            "cancel",
+                            serde_json::json!({
+                            "run":run.run_id,"agent":run.agent_id,"revision":run.revision}),
+                        );
                         services
                             .agent_runtime()
                             .command(harness_contract::agent::AgentCommandRequest {
@@ -11581,10 +11751,22 @@ impl Drop for RealFixtureCleanup {
                                 input: None,
                             })
                             .await;
+                        #[cfg(test)]
+                        cancel_boundary.end();
                     }
                 }
+                #[cfg(test)]
+                let shutdown_boundary =
+                    diagnostic_1120::Boundary::enter("shutdown", serde_json::json!({}));
                 services.shutdown_execution().await;
+                #[cfg(test)]
+                {
+                    shutdown_boundary.end();
+                    task_boundary.end();
+                }
             });
+            #[cfg(test)]
+            diagnostic_1120::record("cleanup.spawned", serde_json::json!({}));
         }
     }
 }
