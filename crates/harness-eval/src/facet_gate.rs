@@ -334,7 +334,7 @@ mod tests {
                 "crates/provider/src/lib.rs".to_string(),
                 "crates/harness-eval/src/lib.rs".to_string(),
             ],
-            answer: "pub mod aaak_compression;".to_string(),
+            answer: "pub mod compression;".to_string(),
             marked_unresolved: false,
         }
     }

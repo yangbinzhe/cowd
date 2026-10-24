@@ -33,8 +33,6 @@
 
 // --- Public modules ---
 
-#[path = "ingestion/aaak_compression.rs"]
-pub mod aaak_compression;
 #[path = "lifecycle/automatic_governance.rs"]
 pub mod automatic_governance;
 #[path = "lifecycle/background_watcher.rs"]
@@ -129,10 +127,6 @@ pub mod write_guard;
 
 // --- Convenience re-exports ---
 
-pub use aaak_compression::{
-    AaakCompressed, AaakCompressor, AaakDictionary, Abbreviation, EntityType, GsdContext, GsdState,
-    PriorityItem,
-};
 pub use automatic_governance::{
     last_automatic_governance_report, run_automatic_governance,
     run_automatic_governance_with_resolver, AutomaticGovernanceMode, AutomaticGovernanceReport,
@@ -201,8 +195,7 @@ pub use orchestrator::{L4PromotionCommand, MemoryOrchestrator};
 pub use search::{BM25Scorer, HybridSearcher, SearchResult as HybridSearchResult};
 pub use session_resume::SessionResume;
 pub use state_rebuilder::{
-    GsdRebuildOptions, GsdRebuiltState, GsdStateRebuilder, RebuildOptions, RebuiltSessionState,
-    StateItem, StateRebuilder, StateSource,
+    RebuildOptions, RebuiltSessionState, StateItem, StateRebuilder, StateSource,
 };
 pub use store::VerbatimEntry;
 pub use store::{
