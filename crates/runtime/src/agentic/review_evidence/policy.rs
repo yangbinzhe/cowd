@@ -8988,35 +8988,76 @@ mod own872_plan_owner_tests {
 
     #[tokio::test]
     async fn own872_real_native_callback_missing_foreign_actor_and_owner_never_settle() {
-        let (_workspace, services, owner) =
-            crate::agentic::execution::reviewed_goal_fixture::native_raw_owner_fixture_for_test().await;
-        let binding = owner.activity_binding().unwrap();
-        let graph = services.graph_state_store().load(&binding.root_execution_id).unwrap();
-        let packet = graph.nodes.iter().find_map(|node| {
-            if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask { return None; }
-            serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref).ok()
-        }).unwrap();
-        let store = services.event_store();
-        let events = store.list_stream(&owner.stream_id).unwrap();
-        let mut checked = BTreeSet::new();
-        for plan in events.iter().filter(|event| event.kind == "tool.execution_plan.created") {
-            let Some(tasks) = plan.payload["tasks"].as_array() else { continue; };
-            for task in tasks.iter().filter(|task|
-                matches!(task["tool_name"].as_str(), Some("task_claim" | "task_submit")))
-            {
-                let packets = std::collections::BTreeMap::from([(packet.graph_id().to_string(), packet.clone())]);
-                let roots = BTreeSet::new();
-                if !events.iter().any(|event| event.kind == "tool.invocation.completed"
-                    && event.payload["governed_plan_id"] == plan.payload["plan_id"]
-                    && event.activity_binding().is_some_and(|binding| binding.root_execution_id == packet.graph_id()))
-                { continue; }
-                let original = delegated_plan_callback_owner(plan, &events, &roots, &packets).unwrap();
-                let effects = authenticated_delegated_plan_settled(
-                    store, plan, &events, original, &mut Default::default(),
-                ).unwrap().expect("the authenticated plan is settled");
-                let original_task = plan.payload["tasks"].as_array().unwrap().iter()
-                    .find(|original| original["tool_call_id"] == task["tool_call_id"]).unwrap();
-                assert_eq!(
+        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(
+            |services, owner| async move {
+                let binding = owner.activity_binding().unwrap();
+                let graph = services
+                    .graph_state_store()
+                    .load(&binding.root_execution_id)
+                    .unwrap();
+                let packet = graph
+                    .nodes
+                    .iter()
+                    .find_map(|node| {
+                        if node.kind
+                            != harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                        {
+                            return None;
+                        }
+                        serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(
+                            &node.payload_ref,
+                        )
+                        .ok()
+                    })
+                    .unwrap();
+                let store = services.event_store();
+                let events = store.list_stream(&owner.stream_id).unwrap();
+                let mut checked = BTreeSet::new();
+                for plan in events
+                    .iter()
+                    .filter(|event| event.kind == "tool.execution_plan.created")
+                {
+                    let Some(tasks) = plan.payload["tasks"].as_array() else {
+                        continue;
+                    };
+                    for task in tasks.iter().filter(|task| {
+                        matches!(
+                            task["tool_name"].as_str(),
+                            Some("task_claim" | "task_submit")
+                        )
+                    }) {
+                        let packets = std::collections::BTreeMap::from([(
+                            packet.graph_id().to_string(),
+                            packet.clone(),
+                        )]);
+                        let roots = BTreeSet::new();
+                        if !events.iter().any(|event| {
+                            event.kind == "tool.invocation.completed"
+                                && event.payload["governed_plan_id"] == plan.payload["plan_id"]
+                                && event.activity_binding().is_some_and(|binding| {
+                                    binding.root_execution_id == packet.graph_id()
+                                })
+                        }) {
+                            continue;
+                        }
+                        let original =
+                            delegated_plan_callback_owner(plan, &events, &roots, &packets).unwrap();
+                        let effects = authenticated_delegated_plan_settled(
+                            store,
+                            plan,
+                            &events,
+                            original,
+                            &mut Default::default(),
+                        )
+                        .unwrap()
+                        .expect("the authenticated plan is settled");
+                        let original_task = plan.payload["tasks"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|original| original["tool_call_id"] == task["tool_call_id"])
+                            .unwrap();
+                        assert_eq!(
                     effects.get(&format!(
                         "{}:{}",
                         plan.event_id,
@@ -9025,86 +9066,164 @@ mod own872_plan_owner_tests {
                     Some(original_task),
                     "only the authenticated Task, never the whole Session plan, is an effect",
                 );
-                let step: crate::step_snapshot::StepCallBinding =
-                    serde_json::from_value(original_task["step_binding"].clone()).unwrap();
-                let key = step.effect_idempotency_key();
-                let index_source = format!("execution-agent-receipts:{}:{}:{}",
-                    packet.graph_id(), packet.node_id(), packet.attempt);
-                let intent = store.event_by_idempotency_key(
-                    &index_source, &format!("agent-tool-intent:{key}"),
-                ).unwrap().unwrap();
-                let receipt = store.event_by_idempotency_key(
-                    &index_source, &format!("agent-tool-receipt:{key}"),
-                ).unwrap().unwrap();
-                admitted_intent_scope(store, &intent, &mut Default::default()).unwrap();
-                let original = authenticate_settled_effect(
-                    store, &intent, &receipt, &mut Default::default(),
-                ).unwrap();
-                assert!(super::super::results::runtime_control_descriptor(&original));
-                assert!(original.scopes.iter().all(|scope|
-                    scope.resource == harness_contract::policy::PermissionResource::Tool
-                        && scope.operation == harness_contract::policy::PermissionOperation::Control));
-                let mut foreign_receipt = receipt.clone();
-                foreign_receipt.payload["outcome"]["tool_name"] = serde_json::json!("edit");
-                assert!(authenticate_settled_effect(
-                    store, &intent, &foreign_receipt, &mut Default::default(),
-                ).is_err());
-                assert!(task["step_binding"]["snapshot"]["identity"]["attempt"].is_null());
-                for fault in ["foreign_attempt", "foreign_provider", "process_source"] {
-                    let mut invalid_plan = plan.clone();
-                    let task = invalid_plan.payload["tasks"].as_array_mut().unwrap().iter_mut()
-                        .find(|changed| changed["tool_call_id"] == task["tool_call_id"]).unwrap();
-                    match fault {
-                        "foreign_attempt" => task["step_binding"]["snapshot"]["identity"]["attempt"] =
-                            serde_json::json!(packet.attempt + 1),
-                        "foreign_provider" => task["step_binding"]["origin"]["source"]["attempt_id"] =
-                            serde_json::json!("foreign-provider-attempt"),
-                        "process_source" => task["step_binding"]["origin"]["source"] = serde_json::json!({
-                            "kind":"process","worker_id":packet.run_id(),"sequence":1,
-                        }),
-                        _ => unreachable!(),
-                    }
-                    let settled = delegated_plan_callback_owner(&invalid_plan, &events, &roots, &packets)
-                        .map(|original| authenticated_delegated_plan_settled(
-                            store, &invalid_plan, &events, original, &mut Default::default(),
-                        )).unwrap_or(Ok(None));
-                    assert!(!matches!(settled, Ok(Some(_))), "{fault}");
-                }
-                assert!(delegated_plan_callback_owner(plan, &events, &roots, &Default::default()).is_none());
-                let position = events.iter().position(|terminal|
-                    terminal.kind == "tool.invocation.completed"
-                        && terminal.payload["governed_plan_id"] == plan.payload["plan_id"]
-                        && terminal.payload["tool_call_id"] == task["tool_call_id"]).unwrap();
-                for fault in ["missing", "actor", "owner", "run", "instance", "session", "turn", "schema", "scope", "status"] {
-                    let mut invalid = events.clone();
-                    match fault {
-                        "missing" => { invalid.remove(position); }
-                        "actor" => invalid[position].actor = Some("foreign".into()),
-                        "schema" => invalid[position].schema_version = 2,
-                        "scope" => invalid[position].scope = crate::RuntimeEventScope::Session,
-                        "status" => invalid[position].status = Some("running".into()),
-                        other => {
-                            let field = match other {
-                                "owner" => "root_execution_id",
-                                "run" => "agent_run_id",
-                                "instance" => "agent_instance_id",
-                                "session" => "session_id",
-                                "turn" => "turn_id",
+                        let step: crate::step_snapshot::StepCallBinding =
+                            serde_json::from_value(original_task["step_binding"].clone()).unwrap();
+                        let key = step.effect_idempotency_key();
+                        let index_source = format!(
+                            "execution-agent-receipts:{}:{}:{}",
+                            packet.graph_id(),
+                            packet.node_id(),
+                            packet.attempt
+                        );
+                        let intent = store
+                            .event_by_idempotency_key(
+                                &index_source,
+                                &format!("agent-tool-intent:{key}"),
+                            )
+                            .unwrap()
+                            .unwrap();
+                        let receipt = store
+                            .event_by_idempotency_key(
+                                &index_source,
+                                &format!("agent-tool-receipt:{key}"),
+                            )
+                            .unwrap()
+                            .unwrap();
+                        admitted_intent_scope(store, &intent, &mut Default::default()).unwrap();
+                        let original = authenticate_settled_effect(
+                            store,
+                            &intent,
+                            &receipt,
+                            &mut Default::default(),
+                        )
+                        .unwrap();
+                        assert!(super::super::results::runtime_control_descriptor(&original));
+                        assert!(original.scopes.iter().all(|scope| scope.resource
+                            == harness_contract::policy::PermissionResource::Tool
+                            && scope.operation
+                                == harness_contract::policy::PermissionOperation::Control));
+                        let mut foreign_receipt = receipt.clone();
+                        foreign_receipt.payload["outcome"]["tool_name"] = serde_json::json!("edit");
+                        assert!(authenticate_settled_effect(
+                            store,
+                            &intent,
+                            &foreign_receipt,
+                            &mut Default::default(),
+                        )
+                        .is_err());
+                        assert!(task["step_binding"]["snapshot"]["identity"]["attempt"].is_null());
+                        for fault in ["foreign_attempt", "foreign_provider", "process_source"] {
+                            let mut invalid_plan = plan.clone();
+                            let task = invalid_plan.payload["tasks"]
+                                .as_array_mut()
+                                .unwrap()
+                                .iter_mut()
+                                .find(|changed| changed["tool_call_id"] == task["tool_call_id"])
+                                .unwrap();
+                            match fault {
+                                "foreign_attempt" => {
+                                    task["step_binding"]["snapshot"]["identity"]["attempt"] =
+                                        serde_json::json!(packet.attempt + 1)
+                                }
+                                "foreign_provider" => {
+                                    task["step_binding"]["origin"]["source"]["attempt_id"] =
+                                        serde_json::json!("foreign-provider-attempt")
+                                }
+                                "process_source" => {
+                                    task["step_binding"]["origin"]["source"] = serde_json::json!({
+                                        "kind":"process","worker_id":packet.run_id(),"sequence":1,
+                                    })
+                                }
                                 _ => unreachable!(),
-                            };
-                            invalid[position].payload["_runtime_activity_binding"][field] = serde_json::json!("foreign");
+                            }
+                            let settled = delegated_plan_callback_owner(
+                                &invalid_plan,
+                                &events,
+                                &roots,
+                                &packets,
+                            )
+                            .map(|original| {
+                                authenticated_delegated_plan_settled(
+                                    store,
+                                    &invalid_plan,
+                                    &events,
+                                    original,
+                                    &mut Default::default(),
+                                )
+                            })
+                            .unwrap_or(Ok(None));
+                            assert!(!matches!(settled, Ok(Some(_))), "{fault}");
                         }
+                        assert!(delegated_plan_callback_owner(
+                            plan,
+                            &events,
+                            &roots,
+                            &Default::default()
+                        )
+                        .is_none());
+                        let position = events
+                            .iter()
+                            .position(|terminal| {
+                                terminal.kind == "tool.invocation.completed"
+                                    && terminal.payload["governed_plan_id"]
+                                        == plan.payload["plan_id"]
+                                    && terminal.payload["tool_call_id"] == task["tool_call_id"]
+                            })
+                            .unwrap();
+                        for fault in [
+                            "missing", "actor", "owner", "run", "instance", "session", "turn",
+                            "schema", "scope", "status",
+                        ] {
+                            let mut invalid = events.clone();
+                            match fault {
+                                "missing" => {
+                                    invalid.remove(position);
+                                }
+                                "actor" => invalid[position].actor = Some("foreign".into()),
+                                "schema" => invalid[position].schema_version = 2,
+                                "scope" => {
+                                    invalid[position].scope = crate::RuntimeEventScope::Session
+                                }
+                                "status" => invalid[position].status = Some("running".into()),
+                                other => {
+                                    let field = match other {
+                                        "owner" => "root_execution_id",
+                                        "run" => "agent_run_id",
+                                        "instance" => "agent_instance_id",
+                                        "session" => "session_id",
+                                        "turn" => "turn_id",
+                                        _ => unreachable!(),
+                                    };
+                                    invalid[position].payload["_runtime_activity_binding"][field] =
+                                        serde_json::json!("foreign");
+                                }
+                            }
+                            let settled =
+                                delegated_plan_callback_owner(plan, &invalid, &roots, &packets)
+                                    .map(|original| {
+                                        authenticated_delegated_plan_settled(
+                                            store,
+                                            plan,
+                                            &invalid,
+                                            original,
+                                            &mut Default::default(),
+                                        )
+                                        .unwrap()
+                                        .is_some()
+                                    })
+                                    .unwrap_or(false);
+                            assert!(!settled, "{fault}");
+                        }
+                        checked.insert(task["tool_name"].as_str().unwrap().to_string());
                     }
-                    let settled = delegated_plan_callback_owner(plan, &invalid, &roots, &packets)
-                        .map(|original| authenticated_delegated_plan_settled(
-                            store, plan, &invalid, original, &mut Default::default(),
-                        ).unwrap().is_some()).unwrap_or(false);
-                    assert!(!settled, "{fault}");
                 }
-                checked.insert(task["tool_name"].as_str().unwrap().to_string());
-            }
-        }
-        assert_eq!(checked, BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()]));
+                assert_eq!(
+                    checked,
+                    BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()])
+                );
+            },
+        )
+        .await;
     }
 
     #[test]

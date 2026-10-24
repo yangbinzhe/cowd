@@ -4517,9 +4517,7 @@ mod tests {
 
     async fn original_native_primary_658(negative: bool) {
         use harness_contract::step::CallSource;
-        let (_workspace, services, owner) =
-            crate::agentic::execution::reviewed_goal_fixture::native_raw_owner_fixture_for_test()
-                .await;
+        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, owner| async move {
         let store = services.event_store();
         let binding = owner.activity_binding().unwrap();
         let events = store.list_stream(&owner.stream_id).unwrap();
@@ -4895,6 +4893,7 @@ mod tests {
             assert!(original_tool_primary(store, &owner, task, &mut stale_cut).is_err());
         }
         assert_eq!(store.durable_commit_cursor().unwrap(), before);
+        }).await;
     }
 
     #[tokio::test]
@@ -5877,9 +5876,7 @@ mod tests {
 
     #[tokio::test]
     async fn r1_proof_legacy_raw_metadata_never_mints_strong_origin() {
-        let (_workspace, services, original) =
-            crate::agentic::execution::reviewed_goal_fixture::native_raw_owner_fixture_for_test()
-                .await;
+        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, original| async move {
         let history = services.session_history_reader().unwrap();
         let readers = super::super::ResultContentReaders {
             artifacts: Some(services.artifact_store().as_ref()),
@@ -6044,6 +6041,7 @@ mod tests {
         )
         .is_err());
         services.shutdown_maintenance().await;
+        }).await;
     }
 
     #[test]

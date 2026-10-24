@@ -12,6 +12,8 @@ async fn root_delivery_review_case(file: bool) {
         services: services.0.clone(),
         host: host.clone(),
     };
+    _cleanup.protect(async {
+
     host.services.set(Arc::downgrade(&services.0)).unwrap();
     install_real_process_fixture(&services, &host).await;
     services.publish_session_execution_policy(
@@ -193,6 +195,7 @@ async fn root_delivery_review_case(file: bool) {
     assert_eq!(program.artifacts.len(), 1);
     assert!(program.objective_verdict.is_some());
     services.shutdown_execution().await;
+    }, || {}).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

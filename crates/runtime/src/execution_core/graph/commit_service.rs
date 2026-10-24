@@ -11782,181 +11782,197 @@ mod recovery_physical_450_tests {
     async fn r1_643_native_claim_uses_original_principal_and_rejects_foreign_step_actors() {
         use harness_contract::step::CallSource;
 
-        let (_workspace, services, owner) =
-            crate::agentic::execution::reviewed_goal_fixture::native_raw_owner_fixture_for_test()
-                .await;
-        let native_run = owner.activity_binding().unwrap().agent_run_id.unwrap();
-        let state = services.graph_state_store();
-        let graphs = state
-            .graph_ids()
-            .unwrap()
-            .into_iter()
-            .map(|graph_id| state.load(&graph_id).unwrap())
-            .collect::<Vec<_>>();
-        let (graph, spec, packet, payload) = graphs
-            .iter()
-            .find_map(|graph| {
-                let parent = graph.parent_execution.as_ref()?;
-                let parent_graph = graphs
+        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(
+            |services, owner| async move {
+                let native_run = owner.activity_binding().unwrap().agent_run_id.unwrap();
+                let state = services.graph_state_store();
+                let graphs = state
+                    .graph_ids()
+                    .unwrap()
+                    .into_iter()
+                    .map(|graph_id| state.load(&graph_id).unwrap())
+                    .collect::<Vec<_>>();
+                let (graph, spec, packet, payload) = graphs
                     .iter()
-                    .find(|graph| graph.id == parent.execution_id)?;
-                let parent_node = parent_graph.nodes.iter().find(|node| {
-                    node.id == parent.node_id && node.kind == ExecutionNodeKind::AgentTask
-                })?;
-                let packet: AgentTaskPacket =
-                    serde_json::from_str(&parent_node.payload_ref).ok()?;
-                if packet.run_id() != native_run {
-                    return None;
-                }
-                for spec in &graph.nodes {
-                    if spec.kind != ExecutionNodeKind::ToolBatch
-                        || spec.executor_kind != "tool_batch"
-                        || super::super::executors::agent_tool::is_bound_agent_tool_graph(graph)
-                    {
-                        continue;
-                    }
-                    let payload =
-                        crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref)
+                    .find_map(|graph| {
+                        let parent = graph.parent_execution.as_ref()?;
+                        let parent_graph = graphs
+                            .iter()
+                            .find(|graph| graph.id == parent.execution_id)?;
+                        let parent_node = parent_graph.nodes.iter().find(|node| {
+                            node.id == parent.node_id && node.kind == ExecutionNodeKind::AgentTask
+                        })?;
+                        let packet: AgentTaskPacket =
+                            serde_json::from_str(&parent_node.payload_ref).ok()?;
+                        if packet.run_id() != native_run {
+                            return None;
+                        }
+                        for spec in &graph.nodes {
+                            if spec.kind != ExecutionNodeKind::ToolBatch
+                                || spec.executor_kind != "tool_batch"
+                                || super::super::executors::agent_tool::is_bound_agent_tool_graph(
+                                    graph,
+                                )
+                            {
+                                continue;
+                            }
+                            let payload = crate::step_snapshot::decode_persisted_tool_batch_value(
+                                &spec.payload_ref,
+                            )
                             .ok()?;
-                    if payload["calls"][0]["id"] == "native-claim"
-                        && payload["calls"][0]["name"] == "task_claim"
-                    {
-                        return Some((graph.clone(), spec.clone(), packet, payload));
-                    }
-                }
-                None
-            })
-            .expect("actual Native first claim must retain its registered Host and packet");
-        let principal = packet.assignment.execution_identity.principal_id();
-        assert_ne!(principal, packet.agent_id());
-        assert_ne!(
-            principal,
-            packet.agentic_binding.as_ref().unwrap().agent_id.as_str()
-        );
-        assert!(packet.allowed_tools.iter().any(|tool| tool == "task_claim"));
-        let (calls, _) = crate::host::decode_tool_batch(&spec.payload_ref).unwrap();
-        let step = calls[0].binding.as_ref().unwrap();
-        assert!(
-            matches!(&step.origin.source, CallSource::Provider { attempt_id }
+                            if payload["calls"][0]["id"] == "native-claim"
+                                && payload["calls"][0]["name"] == "task_claim"
+                            {
+                                return Some((graph.clone(), spec.clone(), packet, payload));
+                            }
+                        }
+                        None
+                    })
+                    .expect("actual Native first claim must retain its registered Host and packet");
+                let principal = packet.assignment.execution_identity.principal_id();
+                assert_ne!(principal, packet.agent_id());
+                assert_ne!(
+                    principal,
+                    packet.agentic_binding.as_ref().unwrap().agent_id.as_str()
+                );
+                assert!(packet.allowed_tools.iter().any(|tool| tool == "task_claim"));
+                let (calls, _) = crate::host::decode_tool_batch(&spec.payload_ref).unwrap();
+                let step = calls[0].binding.as_ref().unwrap();
+                assert!(
+                    matches!(&step.origin.source, CallSource::Provider { attempt_id }
             if attempt_id == &step.snapshot.provider_attempt.attempt_id)
-        );
-        assert_eq!(step.snapshot.identity.actor_ref.as_deref(), Some(principal));
-        assert_eq!(
-            step.snapshot.identity.run_ref.as_deref(),
-            Some(packet.run_id())
-        );
-        let parent = state.load(packet.graph_id()).unwrap();
-        assert!(parent.node_statuses[packet.node_id()].is_terminal());
-        let binding = state
-            .current_binding(
-                &graph,
-                &spec.id,
-                graph.recovery_cursor.node_attempts[&spec.id],
-            )
-            .unwrap();
-        let commits = services.commit_service();
-        let sources = commits
-            .lease_recovery_leaf_sources_with_fact(&graph, &spec.id, &binding, &spec, false, None)
-            .unwrap()
-            .expect("real Native claim must close using its original principal after Task exit");
-        let index = format!(
-            "execution-agent-receipts:{}:{}:{}",
-            packet.graph_id(),
-            packet.node_id(),
-            packet.attempt
-        );
-        let primary = format!("execution-effect:{}", step.effect_idempotency_key());
-        for stream in [
-            index,
-            primary,
-            packet.graph_id().to_string(),
-            node_stream_id(packet.graph_id(), packet.node_id()),
-        ] {
-            assert!(sources.iter().any(|source| source.stream_id == stream));
-        }
-        let before = services.event_store().durable_commit_cursor().unwrap();
-        for mutation in [
-            "principal",
-            "instance",
-            "definition-agent",
-            "run",
-            "execution",
-            "session",
-            "turn",
-            "attempt",
-            "catalog",
-            "allowlist",
-            "provider-attempt",
-            "process-source",
-            "system-source",
-            "offline-source",
-        ] {
-            let mut changed = payload.clone();
-            let step_id = step.snapshot.identity.step_id.as_str();
-            match mutation {
-                "principal" => {
-                    changed["step_snapshots"][step_id]["identity"]["actor_ref"] =
-                        json!("foreign-principal")
+                );
+                assert_eq!(step.snapshot.identity.actor_ref.as_deref(), Some(principal));
+                assert_eq!(
+                    step.snapshot.identity.run_ref.as_deref(),
+                    Some(packet.run_id())
+                );
+                let parent = state.load(packet.graph_id()).unwrap();
+                assert!(parent.node_statuses[packet.node_id()].is_terminal());
+                let binding = state
+                    .current_binding(
+                        &graph,
+                        &spec.id,
+                        graph.recovery_cursor.node_attempts[&spec.id],
+                    )
+                    .unwrap();
+                let commits = services.commit_service();
+                let sources = commits
+                    .lease_recovery_leaf_sources_with_fact(
+                        &graph, &spec.id, &binding, &spec, false, None,
+                    )
+                    .unwrap()
+                    .expect(
+                        "real Native claim must close using its original principal after Task exit",
+                    );
+                let index = format!(
+                    "execution-agent-receipts:{}:{}:{}",
+                    packet.graph_id(),
+                    packet.node_id(),
+                    packet.attempt
+                );
+                let primary = format!("execution-effect:{}", step.effect_idempotency_key());
+                for stream in [
+                    index,
+                    primary,
+                    packet.graph_id().to_string(),
+                    node_stream_id(packet.graph_id(), packet.node_id()),
+                ] {
+                    assert!(sources.iter().any(|source| source.stream_id == stream));
                 }
-                "instance" => {
-                    changed["step_snapshots"][step_id]["identity"]["actor_ref"] =
-                        json!(packet.agent_id())
+                let before = services.event_store().durable_commit_cursor().unwrap();
+                for mutation in [
+                    "principal",
+                    "instance",
+                    "definition-agent",
+                    "run",
+                    "execution",
+                    "session",
+                    "turn",
+                    "attempt",
+                    "catalog",
+                    "allowlist",
+                    "provider-attempt",
+                    "process-source",
+                    "system-source",
+                    "offline-source",
+                ] {
+                    let mut changed = payload.clone();
+                    let step_id = step.snapshot.identity.step_id.as_str();
+                    match mutation {
+                        "principal" => {
+                            changed["step_snapshots"][step_id]["identity"]["actor_ref"] =
+                                json!("foreign-principal")
+                        }
+                        "instance" => {
+                            changed["step_snapshots"][step_id]["identity"]["actor_ref"] =
+                                json!(packet.agent_id())
+                        }
+                        "definition-agent" => {
+                            changed["step_snapshots"][step_id]["identity"]["actor_ref"] =
+                                json!(packet.agentic_binding.as_ref().unwrap().agent_id)
+                        }
+                        "run" => {
+                            changed["step_snapshots"][step_id]["identity"]["run_ref"] =
+                                json!("foreign-run")
+                        }
+                        "execution" => {
+                            changed["step_snapshots"][step_id]["identity"]["execution_id"] =
+                                json!("foreign-execution")
+                        }
+                        "session" => {
+                            changed["step_snapshots"][step_id]["identity"]["session_id"] =
+                                json!("foreign-session")
+                        }
+                        "turn" => {
+                            changed["step_snapshots"][step_id]["identity"]["turn_id"] =
+                                json!("foreign-turn")
+                        }
+                        "attempt" => {
+                            changed["step_snapshots"][step_id]["identity"]["attempt"] =
+                                json!(packet.attempt + 1)
+                        }
+                        "catalog" => {
+                            changed["calls"][0]["origin"]["catalog_digest"] = json!("foreign")
+                        }
+                        "allowlist" => {
+                            changed["calls"][0]["name"] = json!("not-in-original-packet")
+                        }
+                        "provider-attempt" => {
+                            changed["calls"][0]["origin"]["source"]["attempt_id"] = json!("foreign")
+                        }
+                        "process-source" => {
+                            changed["calls"][0]["origin"]["source"] =
+                                json!({"kind":"process","worker_id":packet.run_id(),"sequence":1})
+                        }
+                        "system-source" => {
+                            changed["calls"][0]["origin"]["source"] =
+                                json!({"kind":"system_derived","parent_step_id":step_id});
+                            changed["step_snapshots"][step_id]["context_refs"] =
+                                json!([format!("step:{step_id}")]);
+                        }
+                        _ => {
+                            changed["calls"][0]["origin"]["source"] = json!({"kind":"offline_test"})
+                        }
+                    }
+                    let mut rejected = spec.clone();
+                    rejected.payload_ref =
+                        crate::step_snapshot::encode_persisted_tool_batch(&changed).unwrap();
+                    assert!(
+                        commits
+                            .delegated_host_leaf_owner(&graph, &rejected)
+                            .is_err(),
+                        "{mutation}"
+                    );
                 }
-                "definition-agent" => {
-                    changed["step_snapshots"][step_id]["identity"]["actor_ref"] =
-                        json!(packet.agentic_binding.as_ref().unwrap().agent_id)
-                }
-                "run" => {
-                    changed["step_snapshots"][step_id]["identity"]["run_ref"] = json!("foreign-run")
-                }
-                "execution" => {
-                    changed["step_snapshots"][step_id]["identity"]["execution_id"] =
-                        json!("foreign-execution")
-                }
-                "session" => {
-                    changed["step_snapshots"][step_id]["identity"]["session_id"] =
-                        json!("foreign-session")
-                }
-                "turn" => {
-                    changed["step_snapshots"][step_id]["identity"]["turn_id"] =
-                        json!("foreign-turn")
-                }
-                "attempt" => {
-                    changed["step_snapshots"][step_id]["identity"]["attempt"] =
-                        json!(packet.attempt + 1)
-                }
-                "catalog" => changed["calls"][0]["origin"]["catalog_digest"] = json!("foreign"),
-                "allowlist" => changed["calls"][0]["name"] = json!("not-in-original-packet"),
-                "provider-attempt" => {
-                    changed["calls"][0]["origin"]["source"]["attempt_id"] = json!("foreign")
-                }
-                "process-source" => {
-                    changed["calls"][0]["origin"]["source"] =
-                        json!({"kind":"process","worker_id":packet.run_id(),"sequence":1})
-                }
-                "system-source" => {
-                    changed["calls"][0]["origin"]["source"] =
-                        json!({"kind":"system_derived","parent_step_id":step_id});
-                    changed["step_snapshots"][step_id]["context_refs"] =
-                        json!([format!("step:{step_id}")]);
-                }
-                _ => changed["calls"][0]["origin"]["source"] = json!({"kind":"offline_test"}),
-            }
-            let mut rejected = spec.clone();
-            rejected.payload_ref =
-                crate::step_snapshot::encode_persisted_tool_batch(&changed).unwrap();
-            assert!(
-                commits
-                    .delegated_host_leaf_owner(&graph, &rejected)
-                    .is_err(),
-                "{mutation}"
-            );
-        }
-        assert_eq!(
-            services.event_store().durable_commit_cursor().unwrap(),
-            before
-        );
-        services.shutdown_maintenance().await;
+                assert_eq!(
+                    services.event_store().durable_commit_cursor().unwrap(),
+                    before
+                );
+                services.shutdown_maintenance().await;
+            },
+        )
+        .await;
     }
 
     #[test]

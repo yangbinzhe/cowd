@@ -2979,8 +2979,7 @@ async fn agentic_root_terminal_requires_real_a_verdict_and_refuses_supplied_verd
         .unwrap()
         .is_none());
 
-    let (_workspace, services, _raw_owner) =
-        crate::agentic::execution::reviewed_goal_fixture::native_raw_owner_fixture_for_test().await;
+    crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, _raw_owner| async move {
     let events = services.event_store();
     let goal = services
         .goal_store()
@@ -3255,6 +3254,7 @@ async fn agentic_root_terminal_requires_real_a_verdict_and_refuses_supplied_verd
         program
     );
     services.shutdown_maintenance().await;
+    }).await;
 }
 
 #[test]

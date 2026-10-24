@@ -168,6 +168,246 @@ pub(crate) mod diagnostic_1120 {
             .iter()
             .any(|e| e["kind"] == "validator.exit" && e["payload"]["unwinding"] == true));
     }
+
+    fn cleanup_records() -> (Option<tempfile::TempDir>, PathBuf) {
+        // Reuse the original runner's admitted private collector. Datas may
+        // report a successful chmod while still exposing mode 0777.
+        if let Some(directory) = std::env::var_os("COWD_DIAG_1120_DIR") {
+            return (None, PathBuf::from(directory));
+        }
+        let parent = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let owner = tempfile::Builder::new()
+            .prefix("cowd-cleanup-records-")
+            .tempdir_in(parent)
+            .unwrap();
+        let directory = owner.path().to_path_buf();
+        (Some(owner), directory)
+    }
+
+    fn collected(directory: &std::path::Path) -> Vec<Value> {
+        let mut events = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                serde_json::from_slice::<Value>(&std::fs::read(entry.unwrap().path()).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event["sequence"].as_u64().unwrap());
+        events
+    }
+
+    #[tokio::test]
+    async fn r1_fixture_panic_scope_preserves_payload_and_awaits_cleanup() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+        let workspace = tempfile::tempdir().unwrap();
+        let (_records, records) = cleanup_records();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&records).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "observer requires an actually private directory"
+            );
+        }
+        DIRECTORY.with(|slot| *slot.borrow_mut() = Some(records.clone()));
+        let services =
+            super::RuntimeServices::test_builder(workspace.path().join("home"), workspace.path())
+                .build()
+                .unwrap();
+        let cleanup = super::RealFixtureCleanup {
+            services: services.clone(),
+            host: Arc::new(super::ReviewReadHost::default()),
+        };
+        let token = Arc::new("independent original panic");
+        let original = token.clone();
+        let caught = std::panic::AssertUnwindSafe(cleanup.protect(
+            async move {
+                std::panic::panic_any(original);
+            },
+            || panic!("independent secondary gate-release panic"),
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_err();
+        let restored = caught
+            .downcast::<Arc<&'static str>>()
+            .expect("original payload type");
+        assert!(
+            Arc::ptr_eq(&token, &restored),
+            "cleanup must resume the exact original payload"
+        );
+        let events = collected(&records);
+        assert!(events
+            .iter()
+            .any(|e| e["kind"] == "cleanup.begin" && e["payload"]["stage"] == "task"));
+        assert!(events
+            .iter()
+            .any(|e| e["kind"] == "cleanup.end" && e["payload"]["stage"] == "shutdown"));
+        assert!(events.iter().any(|e| e["kind"] == "cleanup.result"
+            && e["payload"]["status"] == "returned_clean_execution"));
+        let health = services.execution_health();
+        assert_eq!(health.lifecycle, "closed");
+        assert_eq!(
+            (
+                health.active_drivers,
+                health.active_owned_tasks,
+                health.tracked_keys,
+                health.forced_aborts
+            ),
+            (0, 0, 0, 0)
+        );
+        DIRECTORY.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[tokio::test]
+    async fn r1_fixture_success_scope_keeps_services_live_until_original_close() {
+        use std::sync::Arc;
+        let workspace = tempfile::tempdir().unwrap();
+        let services =
+            super::RuntimeServices::test_builder(workspace.path().join("home"), workspace.path())
+                .build()
+                .unwrap();
+        let cleanup = super::RealFixtureCleanup {
+            services: services.clone(),
+            host: Arc::new(super::ReviewReadHost::default()),
+        };
+        assert_eq!(
+            cleanup
+                .protect(async { 17 }, || panic!(
+                    "normal return must not release a fault gate"
+                ))
+                .await,
+            17
+        );
+        assert_eq!(services.execution_health().lifecycle, "open");
+        services.shutdown_maintenance().await;
+        let report = services.shutdown_execution().await;
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!((report.remaining_keys, report.forced_aborts), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn r1_fixture_process_cleanup_timeout_preserves_panic_without_claiming_exit() {
+        use futures::FutureExt;
+        use std::sync::{Arc, OnceLock};
+        let fixture = super::PhysicalProcessFixture::new(
+            crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+            "cleanup-timeout",
+        )
+        .await;
+        let services = &fixture.services;
+        let cleanup = super::RealFixtureCleanup {
+            services: services.clone(),
+            host: fixture.host.clone(),
+        };
+        let (_records, records) = cleanup_records();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&records).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "observer requires an actually private directory"
+            );
+        }
+        DIRECTORY.with(|slot| *slot.borrow_mut() = Some(records.clone()));
+        // The real driver gate stays outside the caught business future. Its
+        // 30s watchdog is longer than the one 10s cleanup deadline.
+        let gate = services.agent_runtime().process_fixture_exit_gate(false);
+        let _release_gate = super::native_retirement_479::ReleaseProcessGate(gate.clone());
+        let retained = OnceLock::new();
+        let token = Arc::new("original Process cleanup timeout panic");
+        let original = token.clone();
+        let caught = std::panic::AssertUnwindSafe(cleanup.protect(
+            async {
+                let worker = fixture
+                    .dispatch("cleanup-timeout", vec!["read:.".into()], false, false, true)
+                    .await;
+                assert!(retained.set(worker).is_ok());
+                let worker = retained.get().unwrap();
+                // Complete the actual wire before cancellation; do not race a
+                // finish request against withdrawal-driven Process termination.
+                worker
+                    .process
+                    .command(json!({"finish":true}))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !gate.entered.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("real driver must enter its original exit gate");
+                assert!(crate::agent_runtime::confirmed_run_exit(
+                    services.event_store(),
+                    &worker.packet
+                )
+                .unwrap()
+                .is_none());
+                // The actual result response and gate already exist, so this
+                // original Task withdrawal cannot race a later finish write.
+                // Retire the fixture Task instead of requesting ordinary review
+                // work when its producer's held exit eventually arrives.
+                worker.withdraw().await;
+                let pending = services
+                    .agent_action_service()
+                    .project(&worker.root_actor.program_id)
+                    .unwrap();
+                assert_eq!(
+                    pending.tasks[&worker.task_ref].status,
+                    crate::AgenticTaskStatus::CancelRequested
+                );
+                assert!(!pending.tasks[&worker.task_ref].active_attempts.is_empty());
+                std::panic::panic_any(original);
+            },
+            || {},
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_err();
+        let restored = caught
+            .downcast::<Arc<&'static str>>()
+            .expect("original payload type");
+        assert!(Arc::ptr_eq(&token, &restored));
+        let events = collected(&records);
+        let worker = retained
+            .get()
+            .expect("the intended Process gate was reached");
+        assert!(events.iter().any(|e| e["kind"] == "cleanup.begin"
+            && e["payload"]["stage"] == "cancel"
+            && e["payload"]["identity"]["run"] == worker.packet.run_id()));
+        assert!(events.iter().any(|e| e["kind"] == "cleanup.dropped"
+            && e["payload"]["stage"] == "cancel"
+            && e["payload"]["identity"]["run"] == worker.packet.run_id()));
+        assert!(!events
+            .iter()
+            .any(|e| e["kind"] == "cleanup.end" && e["payload"]["stage"] == "task"));
+        assert!(events.iter().any(|e| e["kind"] == "cleanup.result"
+            && e["payload"]["status"] == "deadline_physical_return_unproven"));
+        let worker = retained
+            .get()
+            .expect("the intended Process gate was reached");
+        assert!(
+            crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
+                .unwrap()
+                .is_none(),
+            "timeout cannot manufacture physical exit"
+        );
+        // Releasing a fault gate is not a test-side recovery/retry. The same
+        // retained production driver must publish its original exit.
+        gate.release();
+        worker.wait_exit().await;
+        services.shutdown_maintenance().await;
+        let report = services.shutdown_execution().await;
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!((report.remaining_keys, report.forced_aborts), (0, 0));
+        DIRECTORY.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 pub(super) fn root(action_id: &str, action: AgentAction) -> AgentActionEnvelope {
@@ -1590,11 +1830,38 @@ pub(super) async fn exercise_reviewed_goal_proof_scenario(
     drain_timing: PhysicalDrainTiming,
     proof_scenario: R1ProofScenario,
 ) {
-    let services = ReviewedFixtureServices(services);
-    let _cleanup = RealFixtureCleanup {
-        services: services.0.clone(),
+    let cleanup = RealFixtureCleanup {
+        services: services.clone(),
         host: read_host.clone(),
     };
+    cleanup
+        .protect(
+            exercise_reviewed_goal_proof_body(
+                services,
+                read_host,
+                with_disclosure,
+                with_effect,
+                delegated_case,
+                direct_text,
+                drain_timing,
+                proof_scenario,
+            ),
+            || {},
+        )
+        .await;
+}
+
+async fn exercise_reviewed_goal_proof_body(
+    services: Arc<RuntimeServices>,
+    read_host: Arc<ReviewReadHost>,
+    with_disclosure: bool,
+    with_effect: bool,
+    delegated_case: DelegatedEffectCase,
+    direct_text: bool,
+    drain_timing: PhysicalDrainTiming,
+    proof_scenario: R1ProofScenario,
+) {
+    let services = ReviewedFixtureServices(services);
     let probes_final_b = proof_scenario.native_sources()
         || matches!(
             proof_scenario,
@@ -7612,6 +7879,8 @@ pub(crate) async fn exercise_r1_backend_resource_lifetime_for_test(backend: R1Re
         services: services.clone(),
         host: fixture.host.clone(),
     };
+    _cleanup.protect(async {
+
     let wire = if backend == R1ResourceBackend::Native {
         Some(install_physical_native_wire(services).await)
     } else {
@@ -8124,6 +8393,7 @@ pub(crate) async fn exercise_r1_backend_resource_lifetime_for_test(backend: R1Re
     }
     wait_r1_resource_drain(services).await;
     services.shutdown_maintenance().await;
+    }, || {}).await;
 }
 
 #[cfg(test)]
@@ -8140,6 +8410,8 @@ pub(super) async fn exercise_r1_backend_unknown_exit_for_test() {
         services: services.clone(),
         host: fixture.host.clone(),
     };
+    _cleanup.protect(async {
+
     let worker = fixture
         .dispatch(
             "backend-resource-unknown",
@@ -8205,6 +8477,7 @@ pub(super) async fn exercise_r1_backend_unknown_exit_for_test() {
         .values()
         .any(|attempt| attempt.execution_id == worker.packet.graph_id()));
     services.shutdown_maintenance().await;
+    }, || {}).await;
 }
 
 fn register_opaque_process_variant(services: &Arc<RuntimeServices>) -> String {
@@ -11713,60 +11986,132 @@ struct RealFixtureCleanup {
     host: Arc<ReviewReadHost>,
 }
 
-impl Drop for RealFixtureCleanup {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            return;
-        }
-        #[cfg(test)]
-        diagnostic_1120::record("cleanup.drop.enter", serde_json::json!({}));
+impl RealFixtureCleanup {
+    fn release_holds(&self) {
         if let Some(hold) = self.host.held_write.get() {
             hold.release.notify_one();
         }
-        if let Some(hold) = self.host.read_hold.lock().unwrap().as_ref() {
+        let held_read = self
+            .host
+            .read_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hold) = held_read {
             hold.release.notify_one();
         }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let services = self.services.clone();
-            #[cfg(test)]
-            diagnostic_1120::record("cleanup.spawn.requested", serde_json::json!({}));
-            runtime.spawn(async move {
+    }
+
+    /// The original async caller remains inside its Runtime while cleanup is
+    /// awaited. The panic payload is never replaced by a secondary failure.
+    async fn protect<F, Release>(&self, body: F, release: Release) -> F::Output
+    where
+        F: std::future::Future,
+        Release: FnOnce(),
+    {
+        use futures::FutureExt;
+        let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+        match outcome {
+            Ok(value) => value,
+            Err(payload) => {
                 #[cfg(test)]
-                let task_boundary = diagnostic_1120::Boundary::enter("task", serde_json::json!({}));
-                for run in services.agent_runtime().list() {
-                    if !run.status.is_terminal() {
-                        #[cfg(test)]
-                        let cancel_boundary = diagnostic_1120::Boundary::enter(
-                            "cancel",
-                            serde_json::json!({
-                            "run":run.run_id,"agent":run.agent_id,"revision":run.revision}),
-                        );
-                        services
-                            .agent_runtime()
-                            .command(harness_contract::agent::AgentCommandRequest {
-                                command_id: format!("fixture-panic:{}", run.run_id),
-                                agent_id: run.agent_id,
-                                expected_revision: run.revision,
-                                command: harness_contract::agent::AgentCommand::Cancel,
-                                input: None,
-                            })
-                            .await;
-                        #[cfg(test)]
-                        cancel_boundary.end();
-                    }
+                diagnostic_1120::record("cleanup.primary_preserved", serde_json::json!({}));
+                let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.release_holds();
+                    release();
+                }));
+                if released.is_err() {
+                    eprintln!("fixture cleanup secondary: original fault-gate release panicked");
                 }
+                let cleanup = std::panic::AssertUnwindSafe(self.finish()).catch_unwind();
+                // One absolute cleanup budget. It does not extend the outer
+                // original process deadline or certify a dropped future as exit.
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), cleanup).await;
+                let status = match &result {
+                    Ok(Ok(Ok(()))) => "returned_clean_execution",
+                    Ok(Ok(Err(_))) => "returned_incomplete_execution",
+                    Ok(Err(_)) => "cleanup_panicked",
+                    Err(_) => "deadline_physical_return_unproven",
+                };
                 #[cfg(test)]
-                let shutdown_boundary =
-                    diagnostic_1120::Boundary::enter("shutdown", serde_json::json!({}));
-                services.shutdown_execution().await;
-                #[cfg(test)]
-                {
-                    shutdown_boundary.end();
-                    task_boundary.end();
+                diagnostic_1120::record("cleanup.result", serde_json::json!({"status":status}));
+                if status != "returned_clean_execution" {
+                    eprintln!("fixture cleanup secondary: {status}; original panic retained");
                 }
-            });
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Same cancellation and shutdown owners as the former Drop task. No new
+    /// lifecycle or terminal writer; maintenance returning unit is not proof
+    /// that every maintenance lane completed successfully.
+    async fn finish(&self) -> Result<(), &'static str> {
+        #[cfg(test)]
+        let task = diagnostic_1120::Boundary::enter(
+            "task",
+            serde_json::json!({"owner":"awaited_fixture_scope"}),
+        );
+        self.release_holds();
+        let mut rejected = false;
+        for run in self.services.agent_runtime().list() {
+            if !run.status.is_terminal() {
+                #[cfg(test)]
+                let cancel = diagnostic_1120::Boundary::enter(
+                    "cancel",
+                    serde_json::json!({"run":run.run_id,"agent":run.agent_id,"revision":run.revision}),
+                );
+                let receipt = self
+                    .services
+                    .agent_runtime()
+                    .command(harness_contract::agent::AgentCommandRequest {
+                        command_id: format!("fixture-panic:{}", run.run_id),
+                        agent_id: run.agent_id,
+                        expected_revision: run.revision,
+                        command: harness_contract::agent::AgentCommand::Cancel,
+                        input: None,
+                    })
+                    .await;
+                rejected |= !receipt.accepted;
+                #[cfg(test)]
+                cancel.end();
+            }
+        }
+        #[cfg(test)]
+        let shutdown = diagnostic_1120::Boundary::enter("shutdown", serde_json::json!({}));
+        let report = self.services.shutdown_execution().await;
+        #[cfg(test)]
+        {
+            diagnostic_1120::record(
+                "cleanup.execution_report",
+                serde_json::json!({"errors":report.errors.len(),"remaining_keys":report.remaining_keys,"forced_aborts":report.forced_aborts,"cancel_rejected":rejected}),
+            );
+            shutdown.end();
+        }
+        self.services.shutdown_maintenance().await;
+        #[cfg(test)]
+        task.end();
+        if rejected
+            || !report.errors.is_empty()
+            || report.remaining_keys != 0
+            || report.forced_aborts != 0
+        {
+            Err("original execution owner returned an incomplete cleanup report")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for RealFixtureCleanup {
+    fn drop(&mut self) {
+        // Async cleanup belongs to the enclosing awaited scope, never a task
+        // submitted while that very Runtime is unwinding and shutting down.
+        if std::thread::panicking() {
+            self.release_holds();
             #[cfg(test)]
-            diagnostic_1120::record("cleanup.spawned", serde_json::json!({}));
+            diagnostic_1120::record("cleanup.drop.sync_only", serde_json::json!({}));
         }
     }
 }
@@ -13854,39 +14199,57 @@ fn exercise_native_task_sources<'fixture>(
 }
 
 #[cfg(test)]
-pub(crate) async fn native_raw_owner_fixture_for_test() -> (
-    tempfile::TempDir,
-    Arc<RuntimeServices>,
-    crate::DurableRuntimeEvent,
-) {
+pub(crate) async fn with_native_raw_owner_fixture_for_test<F, Fut>(consume: F)
+where
+    F: FnOnce(Arc<RuntimeServices>, crate::DurableRuntimeEvent) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let workspace = tempfile::tempdir().unwrap();
     let host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::test_builder(workspace.path().join("home"), workspace.path())
         .tool_execution_host(host.clone())
         .build()
         .unwrap();
-    Box::pin(exercise_reviewed_goal_proof_scenario(
-        services.clone(),
-        host,
-        false,
-        false,
-        DelegatedEffectCase::Review,
-        false,
-        PhysicalDrainTiming::AfterGoal,
-        R1ProofScenario::ReadDelivery(RealProcessProofCase::NativeSources),
-    ))
-    .await;
-    let owner = services
-        .event_store()
-        .list_stream("session:session-dispatch")
-        .unwrap()
-        .into_iter()
-        .find(|event| {
-            event.kind == "tool.invocation.completed"
-                && event.payload["tool_call_id"] == "native-publication-small"
-        })
-        .unwrap();
-    (workspace, services, owner)
+    let cleanup = RealFixtureCleanup {
+        services: services.clone(),
+        host: host.clone(),
+    };
+    cleanup
+        .protect(
+            async {
+                Box::pin(exercise_reviewed_goal_proof_body(
+                    services.clone(),
+                    host.clone(),
+                    false,
+                    false,
+                    DelegatedEffectCase::Review,
+                    false,
+                    PhysicalDrainTiming::AfterGoal,
+                    R1ProofScenario::ReadDelivery(RealProcessProofCase::NativeSources),
+                ))
+                .await;
+                let owner = services
+                    .event_store()
+                    .list_stream("session:session-dispatch")
+                    .unwrap()
+                    .into_iter()
+                    .find(|event| {
+                        event.kind == "tool.invocation.completed"
+                            && event.payload["tool_call_id"] == "native-publication-small"
+                    })
+                    .unwrap();
+                consume(services.clone(), owner).await;
+            },
+            || {},
+        )
+        .await;
+    // This raw fixture's normal consumer is now finished. Do not close
+    // services before the consumer's original async reads/assertions.
+    services.shutdown_maintenance().await;
+    let report = services.shutdown_execution().await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.remaining_keys, 0, "{report:?}");
+    assert_eq!(report.forced_aborts, 0, "{report:?}");
 }
 
 #[cfg(test)]
@@ -14581,7 +14944,12 @@ async fn r1_772_original_self_withdrawal_761_retires_without_control_graph() {
         "772-semantic-retirement-discriminator",
     ).await;
     let services = &fixture.services;
-    let _cleanup = RealFixtureCleanup { services: services.clone(), host: fixture.host.clone() };
+    let _cleanup = RealFixtureCleanup {
+        services: services.clone(),
+        host: fixture.host.clone(),
+    };
+    _cleanup.protect(async {
+
     let worker = fixture.dispatch("772-self-withdraw", vec!["read:.".into()], false, false, true).await;
     let goal_id = format!("goal:{}", worker.root_actor.root_execution_id.as_ref().unwrap());
     let goal_before = services.goal_store().get(&goal_id).unwrap();
@@ -14628,6 +14996,7 @@ async fn r1_772_original_self_withdrawal_761_retires_without_control_graph() {
         "goal_present": goal_present,
         "goal_unchanged": services.goal_store().get(&goal_id).unwrap() == goal_before,
     }));
+    }, || {}).await;
 }
 
 #[cfg(test)]
@@ -14644,195 +15013,204 @@ async fn r1_known_exited_process_helpers_reject_without_recreating_control() {
         services: services.clone(),
         host: fixture.host.clone(),
     };
-    let worker = fixture
-        .dispatch(
-            "known-exited-helper-regression-319",
-            vec!["read:.".into()],
-            false,
-            false,
-            true,
+    _cleanup
+        .protect(
+            async {
+                let worker = fixture
+                    .dispatch(
+                        "known-exited-helper-regression-319",
+                        vec!["read:.".into()],
+                        false,
+                        false,
+                        true,
+                    )
+                    .await;
+                let directory = worker.directory();
+                worker.finish_readonly_control().await;
+                assert!(
+                    confirmed_run_exit_with_retry(services.event_store(), &worker.packet).is_some()
+                );
+                let program = services
+                    .agent_action_service()
+                    .project(&worker.root_actor.program_id)
+                    .unwrap();
+                let task = &program.tasks[&worker.task_ref];
+                assert_eq!(task.status, crate::AgenticTaskStatus::Withdrawn);
+                assert_eq!(task.claim_generation, 2);
+                assert!(task.claimant.is_none() && task.claim_execution_id.is_none());
+                assert!(task.active_attempts.is_empty());
+                assert!(!directory.exists());
+                let applied = services
+                    .event_store()
+                    .event_by_idempotency_key(
+                        &format!("agentic-program:{}", program.program_id),
+                        &format!(
+                            "agent-action:readonly-control-withdraw:{}",
+                            worker.packet.run_id()
+                        ),
+                    )
+                    .unwrap()
+                    .expect("original Process withdrawal must be durable");
+                assert_eq!(applied.kind, "agentic.action_applied");
+                let withdrawal: AgentActionEnvelope =
+                    serde_json::from_value(applied.payload["envelope"].clone()).unwrap();
+                assert!(
+                    matches!(&withdrawal.action, AgentAction::TaskWithdraw(input)
+        if input.task_ref == worker.task_ref)
+                );
+                assert_eq!(
+                    applied.actor.as_deref(),
+                    Some(withdrawal.actor.actor_id.as_str())
+                );
+                worker.assert_original_control_action(&withdrawal);
+                let original_request_id = format!("{}:invocation:retirement", withdrawal.action_id);
+                let mut original_requests = Vec::new();
+                for stream in services
+                    .event_store()
+                    .stream_ids_for_scope(crate::RuntimeEventScope::Agent)
+                    .unwrap()
+                {
+                    if !stream.starts_with("agent-process-transport:") {
+                        continue;
+                    }
+                    for event in services.event_store().list_stream(&stream).unwrap() {
+                        if event.kind != "agent.process_request_completed" {
+                            continue;
+                        }
+                        let Some(output) = event.payload["response"]["output"].as_str() else {
+                            continue;
+                        };
+                        let Ok(observation) = serde_json::from_str::<
+                            harness_contract::agent_action::AgentActionObservation,
+                        >(output) else {
+                            continue;
+                        };
+                        if observation.action_id == withdrawal.action_id && !observation.duplicate {
+                            original_requests
+                                .push(event.payload["request_id"].as_str().unwrap().to_string());
+                        }
+                    }
+                }
+                assert!(original_requests.len() <= 1);
+                if let Some(completed_request) = original_requests.first() {
+                    assert_eq!(completed_request, &original_request_id);
+                    worker.assert_original_control_transport(&withdrawal);
+                }
+                let original_request = &original_request_id;
+                let fresh_request = format!("{}:late-regression", original_request);
+                services.shutdown_maintenance().await;
+                let cursor = services.event_store().durable_commit_cursor().unwrap();
+                let host_calls = fixture.host.calls.lock().unwrap().len();
+                let program_before = serde_json::to_value(&program).unwrap();
+                let graph_before = serde_json::to_value(
+                    services
+                        .graph_state_store()
+                        .load(worker.packet.graph_id())
+                        .unwrap(),
+                )
+                .unwrap();
+                let sentinel = services.workspace_root().join("out/a");
+                let sentinel_before = std::fs::read(&sentinel).unwrap();
+                let effects_before = services
+                    .event_store()
+                    .stream_ids_for_scope(crate::RuntimeEventScope::ExecutionNode)
+                    .unwrap();
+                let unchanged = || {
+                    assert!(!directory.exists());
+                    assert!(!directory.join("actionmeta").exists());
+                    assert_eq!(
+                        services.event_store().durable_commit_cursor().unwrap(),
+                        cursor
+                    );
+                    assert_eq!(fixture.host.calls.lock().unwrap().len(), host_calls);
+                    assert_eq!(
+                        serde_json::to_value(
+                            services
+                                .agent_action_service()
+                                .project(&program.program_id)
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                        program_before
+                    );
+                    assert_eq!(
+                        serde_json::to_value(
+                            services
+                                .graph_state_store()
+                                .load(worker.packet.graph_id())
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                        graph_before
+                    );
+                    assert_eq!(
+                        services
+                            .event_store()
+                            .stream_ids_for_scope(crate::RuntimeEventScope::ExecutionNode,)
+                            .unwrap(),
+                        effects_before
+                    );
+                    assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_before);
+                };
+                let expected = "tool_effect_authority: original Process has physically exited";
+                unchanged();
+                let denied = tokio::time::timeout(Duration::from_secs(2), worker.process.started())
+                    .await
+                    .expect("known exit must not wait for a deleted startup marker")
+                    .unwrap_err();
+                assert_eq!(denied, expected);
+                unchanged();
+                let denied = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    worker.process.command(serde_json::json!({"finish":true})),
+                )
+                .await
+                .expect("known exit must not publish a command")
+                .unwrap_err();
+                assert_eq!(denied, expected);
+                unchanged();
+                let denied = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    worker.process.execute_tool(
+                        "late-after-exit-regression",
+                        "edit",
+                        r#"{"action":"write","path":"out/a","content":"must not execute"}"#,
+                    ),
+                )
+                .await
+                .expect("known exit must reject before Process IPC")
+                .unwrap_err();
+                assert_eq!(denied, expected);
+                unchanged();
+                for request in [&fresh_request, original_request] {
+                    let denied = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        worker.process.action_with_request_id(&withdrawal, request),
+                    )
+                    .await
+                    .expect("late action and transport replay must reject before metadata")
+                    .unwrap_err();
+                    assert_eq!(denied, expected);
+                    unchanged();
+                    let started = Instant::now();
+                    let denied = worker
+                        .process
+                        .prepare_action_metadata_239(&withdrawal, request)
+                        .unwrap_err();
+                    assert_eq!(denied, expected);
+                    assert!(started.elapsed() < Duration::from_secs(2));
+                    unchanged();
+                }
+                tokio::time::timeout(Duration::from_secs(2), worker.process.finish())
+                    .await
+                    .expect(
+                        "known-exited finish must use original exit, not recreate startup state",
+                    );
+                unchanged();
+            },
+            || {},
         )
         .await;
-    let directory = worker.directory();
-    worker.finish_readonly_control().await;
-    assert!(
-        confirmed_run_exit_with_retry(services.event_store(), &worker.packet)
-            .is_some()
-    );
-    let program = services
-        .agent_action_service()
-        .project(&worker.root_actor.program_id)
-        .unwrap();
-    let task = &program.tasks[&worker.task_ref];
-    assert_eq!(task.status, crate::AgenticTaskStatus::Withdrawn);
-    assert_eq!(task.claim_generation, 2);
-    assert!(task.claimant.is_none() && task.claim_execution_id.is_none());
-    assert!(task.active_attempts.is_empty());
-    assert!(!directory.exists());
-    let applied = services
-        .event_store()
-        .event_by_idempotency_key(
-            &format!("agentic-program:{}", program.program_id),
-            &format!(
-                "agent-action:readonly-control-withdraw:{}",
-                worker.packet.run_id()
-            ),
-        )
-        .unwrap()
-        .expect("original Process withdrawal must be durable");
-    assert_eq!(applied.kind, "agentic.action_applied");
-    let withdrawal: AgentActionEnvelope =
-        serde_json::from_value(applied.payload["envelope"].clone()).unwrap();
-    assert!(
-        matches!(&withdrawal.action, AgentAction::TaskWithdraw(input)
-        if input.task_ref == worker.task_ref)
-    );
-    assert_eq!(
-        applied.actor.as_deref(),
-        Some(withdrawal.actor.actor_id.as_str())
-    );
-    worker.assert_original_control_action(&withdrawal);
-    let original_request_id = format!("{}:invocation:retirement", withdrawal.action_id);
-    let mut original_requests = Vec::new();
-    for stream in services
-        .event_store()
-        .stream_ids_for_scope(crate::RuntimeEventScope::Agent)
-        .unwrap()
-    {
-        if !stream.starts_with("agent-process-transport:") {
-            continue;
-        }
-        for event in services.event_store().list_stream(&stream).unwrap() {
-            if event.kind != "agent.process_request_completed" {
-                continue;
-            }
-            let Some(output) = event.payload["response"]["output"].as_str() else {
-                continue;
-            };
-            let Ok(observation) = serde_json::from_str::<
-                harness_contract::agent_action::AgentActionObservation,
-            >(output) else {
-                continue;
-            };
-            if observation.action_id == withdrawal.action_id && !observation.duplicate {
-                original_requests.push(event.payload["request_id"].as_str().unwrap().to_string());
-            }
-        }
-    }
-    assert!(original_requests.len() <= 1);
-    if let Some(completed_request) = original_requests.first() {
-        assert_eq!(completed_request, &original_request_id);
-        worker.assert_original_control_transport(&withdrawal);
-    }
-    let original_request = &original_request_id;
-    let fresh_request = format!("{}:late-regression", original_request);
-    services.shutdown_maintenance().await;
-    let cursor = services.event_store().durable_commit_cursor().unwrap();
-    let host_calls = fixture.host.calls.lock().unwrap().len();
-    let program_before = serde_json::to_value(&program).unwrap();
-    let graph_before = serde_json::to_value(
-        services
-            .graph_state_store()
-            .load(worker.packet.graph_id())
-            .unwrap(),
-    )
-    .unwrap();
-    let sentinel = services.workspace_root().join("out/a");
-    let sentinel_before = std::fs::read(&sentinel).unwrap();
-    let effects_before = services
-        .event_store()
-        .stream_ids_for_scope(crate::RuntimeEventScope::ExecutionNode)
-        .unwrap();
-    let unchanged = || {
-        assert!(!directory.exists());
-        assert!(!directory.join("actionmeta").exists());
-        assert_eq!(
-            services.event_store().durable_commit_cursor().unwrap(),
-            cursor
-        );
-        assert_eq!(fixture.host.calls.lock().unwrap().len(), host_calls);
-        assert_eq!(
-            serde_json::to_value(
-                services
-                    .agent_action_service()
-                    .project(&program.program_id)
-                    .unwrap(),
-            )
-            .unwrap(),
-            program_before
-        );
-        assert_eq!(
-            serde_json::to_value(
-                services
-                    .graph_state_store()
-                    .load(worker.packet.graph_id())
-                    .unwrap(),
-            )
-            .unwrap(),
-            graph_before
-        );
-        assert_eq!(
-            services
-                .event_store()
-                .stream_ids_for_scope(crate::RuntimeEventScope::ExecutionNode,)
-                .unwrap(),
-            effects_before
-        );
-        assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_before);
-    };
-    let expected = "tool_effect_authority: original Process has physically exited";
-    unchanged();
-    let denied = tokio::time::timeout(Duration::from_secs(2), worker.process.started())
-        .await
-        .expect("known exit must not wait for a deleted startup marker")
-        .unwrap_err();
-    assert_eq!(denied, expected);
-    unchanged();
-    let denied = tokio::time::timeout(
-        Duration::from_secs(2),
-        worker.process.command(serde_json::json!({"finish":true})),
-    )
-    .await
-    .expect("known exit must not publish a command")
-    .unwrap_err();
-    assert_eq!(denied, expected);
-    unchanged();
-    let denied = tokio::time::timeout(
-        Duration::from_secs(2),
-        worker.process.execute_tool(
-            "late-after-exit-regression",
-            "edit",
-            r#"{"action":"write","path":"out/a","content":"must not execute"}"#,
-        ),
-    )
-    .await
-    .expect("known exit must reject before Process IPC")
-    .unwrap_err();
-    assert_eq!(denied, expected);
-    unchanged();
-    for request in [&fresh_request, original_request] {
-        let denied = tokio::time::timeout(
-            Duration::from_secs(2),
-            worker.process.action_with_request_id(&withdrawal, request),
-        )
-        .await
-        .expect("late action and transport replay must reject before metadata")
-        .unwrap_err();
-        assert_eq!(denied, expected);
-        unchanged();
-        let started = Instant::now();
-        let denied = worker
-            .process
-            .prepare_action_metadata_239(&withdrawal, request)
-            .unwrap_err();
-        assert_eq!(denied, expected);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        unchanged();
-    }
-    tokio::time::timeout(Duration::from_secs(2), worker.process.finish())
-        .await
-        .expect("known-exited finish must use original exit, not recreate startup state");
-    unchanged();
 }
 
 fn r1_goal_proof_diagnostic(services: &ReviewedFixtureServices, program_id: &str) -> String {

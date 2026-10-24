@@ -435,91 +435,99 @@ impl NativeRetirementFixture {
             services: services.clone(),
             host: physical.host.clone(),
         };
-        let wire = install_physical_native_wire(services).await;
+        let wire = cleanup
+            .protect(install_physical_native_wire(services), || {})
+            .await;
         let arrived = Arc::new(tokio::sync::Notify::new());
         let resume = Arc::new(tokio::sync::Notify::new());
         *wire.pause.lock().unwrap() =
             Some((format!("{name}:held-read"), arrived.clone(), resume.clone()));
-        let worker = dispatch_native_resource_worker(
-            &physical,
-            &wire,
-            name,
-            "479 original Native write",
-            true,
-        )
-        .await;
-        backend.hold(&worker.packet);
-        tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+        let (worker, paused_ticket, goal_before) =
+            cleanup
+                .protect(
+                    async {
+                        let worker = dispatch_native_resource_worker(
+                            &physical,
+                            &wire,
+                            name,
+                            "479 original Native write",
+                            true,
+                        )
+                        .await;
+                        backend.hold(&worker.packet);
+                        tokio::time::timeout(Duration::from_secs(30), arrived.notified())
             .await
             .expect("actual Native claim must reach the original local-provider barrier");
-        let run = services
-            .agent_runtime()
-            .get(worker.packet.agent_id())
-            .unwrap();
-        assert_eq!(run.run_id, worker.packet.run_id());
-        assert_eq!(
-            run.backend,
-            crate::agent_run_handle::AgentBackendKind::InProcess
-        );
-        let program = services
-            .agent_action_service()
-            .project(&worker.root_actor.program_id)
-            .unwrap();
-        let task = &program.tasks[&worker.task_ref];
-        assert_eq!(
-            task.claim_execution_id.as_deref(),
-            Some(worker.packet.graph_id())
-        );
-        assert_eq!(task.claim_generation, u64::from(worker.packet.attempt));
-        assert_eq!(
-            task.claimant.as_deref(),
-            Some(
-                worker
-                    .packet
-                    .agentic_binding
-                    .as_ref()
-                    .unwrap()
-                    .agent_id
-                    .as_str()
-            )
-        );
-        assert!(task.active_attempts.contains_key(worker.packet.graph_id()));
-        let attempt = &task.active_attempts[worker.packet.graph_id()];
-        assert_eq!(attempt.generation + 1, u64::from(worker.packet.attempt));
-        assert_eq!(
-            attempt.agent_id,
-            worker.packet.agentic_binding.as_ref().unwrap().agent_id
-        );
-        assert_eq!(
-            attempt.membership_id,
-            worker
-                .packet
-                .agentic_binding
-                .as_ref()
-                .unwrap()
-                .membership_id
-        );
-        let compiled = worker.packet.binding.as_ref().unwrap();
-        assert_eq!(
-            crate::agent::binding::recompute_binding_digest(compiled).unwrap(),
-            compiled.binding_digest
-        );
-        assert!(physical.host.calls.lock().unwrap().iter().any(|request| {
-            request.tool_name == "task_claim"
-                && request.step_binding.as_ref().is_some_and(|step| {
-                    step.snapshot.identity.run_ref.as_deref() == Some(worker.packet.run_id())
-                })
-        }));
-        assert!(
-            crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
-                .unwrap()
-                .is_none()
-        );
-        let children = services
-            .graph_state_store()
-            .child_links(worker.packet.graph_id())
-            .unwrap();
-        let child = children
+                        let run = services
+                            .agent_runtime()
+                            .get(worker.packet.agent_id())
+                            .unwrap();
+                        assert_eq!(run.run_id, worker.packet.run_id());
+                        assert_eq!(
+                            run.backend,
+                            crate::agent_run_handle::AgentBackendKind::InProcess
+                        );
+                        let program = services
+                            .agent_action_service()
+                            .project(&worker.root_actor.program_id)
+                            .unwrap();
+                        let task = &program.tasks[&worker.task_ref];
+                        assert_eq!(
+                            task.claim_execution_id.as_deref(),
+                            Some(worker.packet.graph_id())
+                        );
+                        assert_eq!(task.claim_generation, u64::from(worker.packet.attempt));
+                        assert_eq!(
+                            task.claimant.as_deref(),
+                            Some(
+                                worker
+                                    .packet
+                                    .agentic_binding
+                                    .as_ref()
+                                    .unwrap()
+                                    .agent_id
+                                    .as_str()
+                            )
+                        );
+                        assert!(task.active_attempts.contains_key(worker.packet.graph_id()));
+                        let attempt = &task.active_attempts[worker.packet.graph_id()];
+                        assert_eq!(attempt.generation + 1, u64::from(worker.packet.attempt));
+                        assert_eq!(
+                            attempt.agent_id,
+                            worker.packet.agentic_binding.as_ref().unwrap().agent_id
+                        );
+                        assert_eq!(
+                            attempt.membership_id,
+                            worker
+                                .packet
+                                .agentic_binding
+                                .as_ref()
+                                .unwrap()
+                                .membership_id
+                        );
+                        let compiled = worker.packet.binding.as_ref().unwrap();
+                        assert_eq!(
+                            crate::agent::binding::recompute_binding_digest(compiled).unwrap(),
+                            compiled.binding_digest
+                        );
+                        assert!(physical.host.calls.lock().unwrap().iter().any(|request| {
+                            request.tool_name == "task_claim"
+                                && request.step_binding.as_ref().is_some_and(|step| {
+                                    step.snapshot.identity.run_ref.as_deref()
+                                        == Some(worker.packet.run_id())
+                                })
+                        }));
+                        assert!(crate::agent_runtime::confirmed_run_exit(
+                            services.event_store(),
+                            &worker.packet
+                        )
+                        .unwrap()
+                        .is_none());
+                        let children = services
+                            .graph_state_store()
+                            .child_links(worker.packet.graph_id())
+                            .unwrap();
+                        let child = children
             .iter()
             .map(|link| {
                 services
@@ -534,32 +542,41 @@ impl NativeRetirementFixture {
                     .any(|node| node.kind == ExecutionNodeKind::InlineModel)
             })
             .expect("the original Native backend must register its actual Conversation child");
-        let node = child
-            .nodes
-            .iter()
-            .find(|node| {
-                node.kind == ExecutionNodeKind::InlineModel
-                    && child.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::Running)
-            })
-            .unwrap();
-        let binding = services
-            .graph_state_store()
-            .current_binding(
-                &child,
-                &node.id,
-                child.recovery_cursor.node_attempts[&node.id],
-            )
-            .unwrap();
-        let (paused_ticket, _) = services
-            .graph_state_store()
-            .binding_start_ticket(&child, &node.id, &binding)
-            .unwrap();
-        create_open_retirement_goal(services, &worker.root_actor);
-        let goal_before = services
-            .goal_store()
-            .get("goal:root-agentic-execution")
-            .unwrap()
-            .unwrap();
+                        let node = child
+                            .nodes
+                            .iter()
+                            .find(|node| {
+                                node.kind == ExecutionNodeKind::InlineModel
+                                    && child.node_statuses.get(&node.id)
+                                        == Some(&ExecutionNodeStatus::Running)
+                            })
+                            .unwrap();
+                        let binding = services
+                            .graph_state_store()
+                            .current_binding(
+                                &child,
+                                &node.id,
+                                child.recovery_cursor.node_attempts[&node.id],
+                            )
+                            .unwrap();
+                        let (paused_ticket, _) = services
+                            .graph_state_store()
+                            .binding_start_ticket(&child, &node.id, &binding)
+                            .unwrap();
+                        create_open_retirement_goal(services, &worker.root_actor);
+                        let goal_before = services
+                            .goal_store()
+                            .get("goal:root-agentic-execution")
+                            .unwrap()
+                            .unwrap();
+                        (worker, paused_ticket, goal_before)
+                    },
+                    || {
+                        backend.allow();
+                        resume.notify_one();
+                    },
+                )
+                .await;
         Self {
             physical,
             wire,
@@ -570,6 +587,15 @@ impl NativeRetirementFixture {
             resume,
             _cleanup: cleanup,
         }
+    }
+
+    async fn protect<F: std::future::Future>(&self, body: F) -> F::Output {
+        self._cleanup
+            .protect(body, || {
+                self.backend.allow();
+                self.resume.notify_one();
+            })
+            .await
     }
 
     async fn cancel_while_holding_settlement(&self) {
@@ -713,12 +739,28 @@ impl NativeRetirementFixture {
         let packet = worker.packet.clone();
         let task_ref = worker.task_ref.clone();
         let root_actor = worker.root_actor.clone();
-        let PhysicalProcessFixture { services, spec, definition, _storage_root, .. } = physical;
-        services.shutdown_maintenance().await;
-        let shutdown = services.shutdown_execution().await;
-        assert!(shutdown.errors.is_empty(), "{shutdown:?}");
-        assert_eq!(shutdown.remaining_keys, 0, "{shutdown:?}");
-        assert_eq!(shutdown.forced_aborts, 0, "{shutdown:?}");
+        let PhysicalProcessFixture {
+            services,
+            spec,
+            definition,
+            _storage_root,
+            ..
+        } = physical;
+        _cleanup
+            .protect(
+                async {
+                    services.shutdown_maintenance().await;
+                    let shutdown = services.shutdown_execution().await;
+                    assert!(shutdown.errors.is_empty(), "{shutdown:?}");
+                    assert_eq!(shutdown.remaining_keys, 0, "{shutdown:?}");
+                    assert_eq!(shutdown.forced_aborts, 0, "{shutdown:?}");
+                },
+                || {
+                    backend.allow();
+                    resume.notify_one();
+                },
+            )
+            .await;
         let original = Arc::downgrade(&services);
         let artifacts = services.artifact_store().clone();
         let tasks = services.task_aggregate_service().clone();
@@ -736,14 +778,31 @@ impl NativeRetirementFixture {
             .tool_execution_host(host.clone())
             .build()
             .unwrap();
-        host.services.set(Arc::downgrade(&services)).unwrap();
-        let worker = PhysicalWorker {
-            process: RealProcessSession { services: services.clone(), packet: packet.clone() },
-            root_actor,
-            packet,
-            task_ref,
+        let cleanup = RealFixtureCleanup {
+            services: services.clone(),
+            host: host.clone(),
         };
-        let cleanup = RealFixtureCleanup { services: services.clone(), host: host.clone() };
+        let worker = cleanup
+            .protect(
+                async {
+                    host.services.set(Arc::downgrade(&services)).unwrap();
+                    let worker = PhysicalWorker {
+                        process: RealProcessSession {
+                            services: services.clone(),
+                            packet: packet.clone(),
+                        },
+                        root_actor,
+                        packet,
+                        task_ref,
+                    };
+                    worker
+                },
+                || {
+                    backend.allow();
+                    resume.notify_one();
+                },
+            )
+            .await;
         Self {
             physical: PhysicalProcessFixture { services, spec, host, definition, _storage_root },
             wire, backend, worker, paused_ticket, goal_before, resume, _cleanup: cleanup,
@@ -1032,156 +1091,226 @@ async fn assert_withdrawn_evidence(fixture: &NativeRetirementFixture) {
 #[tokio::test]
 async fn r1_479_native_started_cancel_withdraws_once_without_accepting_goal() {
     let fixture = NativeRetirementFixture::new("479-native-control").await;
-    fixture.worker.withdraw().await;
-    assert!(!fixture.physical.services
-        .retry_agentic_run_exit(fixture.worker.packet.graph_id()).await.unwrap());
-    assert_rejected_without_program_mutation(
-        &fixture.physical.services, &fixture.worker, "exact local backend exit",
-    );
-    fixture.cancel_while_holding_settlement().await;
-    let services = &fixture.physical.services;
-    let stream = ExecutionNodeBinding::effect_stream_id(&fixture.paused_ticket);
-    let original_head = services.event_store().stream_revision(&stream).unwrap();
-    let original_events = services.event_store().list_stream(&stream).unwrap();
-    let original_effect = services.commit_service()
-        .inspect_execution_effect(&fixture.paused_ticket).unwrap();
-    assert!(matches!(&original_effect,
-        crate::execution_core::graph::ExecutionEffectState::Completed(_)
-            | crate::execution_core::graph::ExecutionEffectState::Uncertain));
+    let (stream, original_head, original_events, original_effect) = fixture
+        .protect(async {
+            fixture.worker.withdraw().await;
+            assert!(!fixture
+                .physical
+                .services
+                .retry_agentic_run_exit(fixture.worker.packet.graph_id())
+                .await
+                .unwrap());
+            assert_rejected_without_program_mutation(
+                &fixture.physical.services,
+                &fixture.worker,
+                "exact local backend exit",
+            );
+            fixture.cancel_while_holding_settlement().await;
+            let services = &fixture.physical.services;
+            let stream = ExecutionNodeBinding::effect_stream_id(&fixture.paused_ticket);
+            let original_head = services.event_store().stream_revision(&stream).unwrap();
+            let original_events = services.event_store().list_stream(&stream).unwrap();
+            let original_effect = services
+                .commit_service()
+                .inspect_execution_effect(&fixture.paused_ticket)
+                .unwrap();
+            assert!(matches!(
+                &original_effect,
+                crate::execution_core::graph::ExecutionEffectState::Completed(_)
+                    | crate::execution_core::graph::ExecutionEffectState::Uncertain
+            ));
+
+            (stream, original_head, original_events, original_effect)
+        })
+        .await;
     let fixture = fixture.cold_rebuild().await;
-    let services = &fixture.physical.services;
-    assert_eq!(services.event_store().stream_revision(&stream).unwrap(), original_head);
-    assert_eq!(services.event_store().list_stream(&stream).unwrap(), original_events);
-    assert_eq!(services.commit_service()
-        .inspect_execution_effect(&fixture.paused_ticket).unwrap(), original_effect);
-    assert_pending(&fixture.physical.services, &fixture.worker);
-    assert_withdrawn_once(&fixture).await;
-    fixture.finish().await;
+    fixture
+        .protect(async {
+            let services = &fixture.physical.services;
+            assert_eq!(
+                services.event_store().stream_revision(&stream).unwrap(),
+                original_head
+            );
+            assert_eq!(
+                services.event_store().list_stream(&stream).unwrap(),
+                original_events
+            );
+            assert_eq!(
+                services
+                    .commit_service()
+                    .inspect_execution_effect(&fixture.paused_ticket)
+                    .unwrap(),
+                original_effect
+            );
+            assert_pending(&fixture.physical.services, &fixture.worker);
+            assert_withdrawn_once(&fixture).await;
+            fixture.finish().await;
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn r1_479_native_cancelled_synthesis_exit_before_retirement_cold_replay() {
     let fixture = NativeRetirementFixture::new("479-native-exit-first").await;
-    fixture.worker.withdraw().await;
-    fixture.worker.cancel().await;
-    fixture.resume.notify_one();
-    fixture.worker.wait_exit().await;
-    let services = &fixture.physical.services;
-    let child = services.graph_state_store().load(&fixture.paused_ticket.graph_id).unwrap();
-    let cancelled = child.nodes.iter().find_map(|node| {
-        if node.kind != ExecutionNodeKind::Synthesize {
-            return None;
-        }
-        child.node_results.get(&node.id).filter(|result| {
-            result.status == ExecutionNodeStatus::Cancelled
-                && result.result_ref.is_none()
-                && result.evidence_refs.is_empty()
-                && result.failure.as_ref().is_some_and(|failure| {
-                    failure.kind == "terminal_presentation_cancelled"
-                        && !failure.retryable && failure.evidence_refs.is_empty()
-                })
-        }).map(|result| (node.id.clone(), result.clone()))
-    });
-    assert!(cancelled.is_some(), "the real Native producer must reproduce candidate-3 cancelled Synthesize: {:?}", child.node_results);
-    fixture.cancel_while_holding_settlement().await;
+    let (cancelled,) = fixture
+        .protect(async {
+            fixture.worker.withdraw().await;
+            fixture.worker.cancel().await;
+            fixture.resume.notify_one();
+            fixture.worker.wait_exit().await;
+            let services = &fixture.physical.services;
+            let child = services
+                .graph_state_store()
+                .load(&fixture.paused_ticket.graph_id)
+                .unwrap();
+            let cancelled = child.nodes.iter().find_map(|node| {
+                if node.kind != ExecutionNodeKind::Synthesize {
+                    return None;
+                }
+                child
+                    .node_results
+                    .get(&node.id)
+                    .filter(|result| {
+                        result.status == ExecutionNodeStatus::Cancelled
+                            && result.result_ref.is_none()
+                            && result.evidence_refs.is_empty()
+                            && result.failure.as_ref().is_some_and(|failure| {
+                                failure.kind == "terminal_presentation_cancelled"
+                                    && !failure.retryable
+                                    && failure.evidence_refs.is_empty()
+                            })
+                    })
+                    .map(|result| (node.id.clone(), result.clone()))
+            });
+            assert!(
+                cancelled.is_some(),
+                "the real Native producer must reproduce candidate-3 cancelled Synthesize: {:?}",
+                child.node_results
+            );
+            fixture.cancel_while_holding_settlement().await;
+
+            (cancelled,)
+        })
+        .await;
     let fixture = fixture.cold_rebuild().await;
-    let recovered = fixture.physical.services.graph_state_store()
-        .load(&fixture.paused_ticket.graph_id).unwrap();
-    let (node_id, result) = cancelled.unwrap();
-    assert_eq!(recovered.node_results.get(&node_id), Some(&result));
-    assert_pending(&fixture.physical.services, &fixture.worker);
-    assert_withdrawn_once(&fixture).await;
-    fixture.finish().await;
+    fixture
+        .protect(async {
+            let recovered = fixture
+                .physical
+                .services
+                .graph_state_store()
+                .load(&fixture.paused_ticket.graph_id)
+                .unwrap();
+            let (node_id, result) = cancelled.unwrap();
+            assert_eq!(recovered.node_results.get(&node_id), Some(&result));
+            assert_pending(&fixture.physical.services, &fixture.worker);
+            assert_withdrawn_once(&fixture).await;
+            fixture.finish().await;
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn r1_479_native_live_owner_cannot_settle() {
     let fixture = NativeRetirementFixture::new("479-live-owner").await;
-    let services = &fixture.physical.services;
-    let graph = services
-        .graph_state_store()
-        .load(&fixture.paused_ticket.graph_id)
-        .unwrap();
-    let binding = services
-        .graph_state_store()
-        .current_binding(
-            &graph,
-            &fixture.paused_ticket.node_id,
-            fixture.paused_ticket.attempt,
-        )
-        .unwrap();
-    let key = binding.lease_closure_key(&graph, &fixture.paused_ticket.node_id);
-    let fence = key.rsplit(':').next().unwrap();
-    assert_eq!(
-        services
-            .execution_supervisor()
-            .active_binding_for_ticket_for_test(&fixture.paused_ticket)
-            .await,
-        Some(binding.clone())
-    );
-    let checker_hits = AtomicUsize::new(0);
-    let owner = services.scope_locks().acquire_binding_owner(fence, || {
-        checker_hits.fetch_add(1, Ordering::SeqCst);
-        Err("479 must never acquire an admitted live owner's fence".into())
-    });
-    assert!(owner.is_err());
-    assert_eq!(checker_hits.load(Ordering::SeqCst), 0);
-    assert!(services
-        .scope_locks()
-        .try_recover_binding_owner(fence)
-        .unwrap()
-        .is_none());
-    fixture.worker.withdraw().await;
-    assert!(crate::agent_runtime::confirmed_run_exit(
-        services.event_store(),
-        &fixture.worker.packet
-    )
-    .unwrap()
-    .is_none());
-    assert_rejected_without_program_mutation(services, &fixture.worker, "exact local backend exit");
-    fixture.cancel_while_holding_settlement().await;
-    assert_withdrawn_once(&fixture).await;
-    fixture.finish().await;
+    fixture
+        .protect(async {
+            let services = &fixture.physical.services;
+            let graph = services
+                .graph_state_store()
+                .load(&fixture.paused_ticket.graph_id)
+                .unwrap();
+            let binding = services
+                .graph_state_store()
+                .current_binding(
+                    &graph,
+                    &fixture.paused_ticket.node_id,
+                    fixture.paused_ticket.attempt,
+                )
+                .unwrap();
+            let key = binding.lease_closure_key(&graph, &fixture.paused_ticket.node_id);
+            let fence = key.rsplit(':').next().unwrap();
+            assert_eq!(
+                services
+                    .execution_supervisor()
+                    .active_binding_for_ticket_for_test(&fixture.paused_ticket)
+                    .await,
+                Some(binding.clone())
+            );
+            let checker_hits = AtomicUsize::new(0);
+            let owner = services.scope_locks().acquire_binding_owner(fence, || {
+                checker_hits.fetch_add(1, Ordering::SeqCst);
+                Err("479 must never acquire an admitted live owner's fence".into())
+            });
+            assert!(owner.is_err());
+            assert_eq!(checker_hits.load(Ordering::SeqCst), 0);
+            assert!(services
+                .scope_locks()
+                .try_recover_binding_owner(fence)
+                .unwrap()
+                .is_none());
+            fixture.worker.withdraw().await;
+            assert!(crate::agent_runtime::confirmed_run_exit(
+                services.event_store(),
+                &fixture.worker.packet
+            )
+            .unwrap()
+            .is_none());
+            assert_rejected_without_program_mutation(
+                services,
+                &fixture.worker,
+                "exact local backend exit",
+            );
+            fixture.cancel_while_holding_settlement().await;
+            assert_withdrawn_once(&fixture).await;
+            fixture.finish().await;
+        })
+        .await;
 }
 
 async fn reject_closure_fault(fault: ClosureFault, name: &str) {
     let fixture = NativeRetirementFixture::new(name).await;
-    fixture.cancel_while_holding_settlement().await;
-    let services = &fixture.physical.services;
-    let graph = services
-        .graph_state_store()
-        .load(&fixture.paused_ticket.graph_id)
-        .unwrap();
-    let binding = services
-        .graph_state_store()
-        .current_binding(
-            &graph,
-            &fixture.paused_ticket.node_id,
-            fixture.paused_ticket.attempt,
-        )
-        .unwrap();
-    let key = binding.lease_closure_key(&graph, &fixture.paused_ticket.node_id);
-    let before = fixture
-        .backend
-        .inner
-        .event_by_idempotency_key(&graph.id, &key)
-        .unwrap()
-        .unwrap();
-    fixture.backend.control.lock().unwrap().closure = Some((graph.id.clone(), key.clone(), fault));
-    assert_rejected_without_program_mutation(services, &fixture.worker, "closure");
-    assert!(fixture.backend.closure_hits.load(Ordering::SeqCst) > 0);
-    assert_eq!(
-        fixture
-            .backend
-            .inner
-            .event_by_idempotency_key(&graph.id, &key)
-            .unwrap()
-            .unwrap(),
-        before
-    );
-    fixture.backend.control.lock().unwrap().closure = None;
-    assert_withdrawn_once(&fixture).await;
-    fixture.finish().await;
+    fixture
+        .protect(async {
+            fixture.cancel_while_holding_settlement().await;
+            let services = &fixture.physical.services;
+            let graph = services
+                .graph_state_store()
+                .load(&fixture.paused_ticket.graph_id)
+                .unwrap();
+            let binding = services
+                .graph_state_store()
+                .current_binding(
+                    &graph,
+                    &fixture.paused_ticket.node_id,
+                    fixture.paused_ticket.attempt,
+                )
+                .unwrap();
+            let key = binding.lease_closure_key(&graph, &fixture.paused_ticket.node_id);
+            let before = fixture
+                .backend
+                .inner
+                .event_by_idempotency_key(&graph.id, &key)
+                .unwrap()
+                .unwrap();
+            fixture.backend.control.lock().unwrap().closure =
+                Some((graph.id.clone(), key.clone(), fault));
+            assert_rejected_without_program_mutation(services, &fixture.worker, "closure");
+            assert!(fixture.backend.closure_hits.load(Ordering::SeqCst) > 0);
+            assert_eq!(
+                fixture
+                    .backend
+                    .inner
+                    .event_by_idempotency_key(&graph.id, &key)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            fixture.backend.control.lock().unwrap().closure = None;
+            assert_withdrawn_once(&fixture).await;
+            fixture.finish().await;
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -1197,6 +1326,8 @@ async fn r1_479_native_wrong_attempt_closure_cannot_settle() {
 #[tokio::test]
 async fn r1_479_native_source_cas_conflict_cannot_partially_withdraw() {
     let fixture = NativeRetirementFixture::new("479-source-cas").await;
+    fixture.protect(async {
+
     fixture.cancel_while_holding_settlement().await;
     let services = &fixture.physical.services;
     let stream = format!("agent:{}", fixture.worker.packet.agent_id());
@@ -1252,6 +1383,7 @@ async fn r1_479_native_source_cas_conflict_cannot_partially_withdraw() {
         .is_none());
     assert_withdrawn_once(&fixture).await;
     fixture.finish().await;
+    }).await;
 }
 
 #[derive(Default)]
@@ -1321,6 +1453,8 @@ impl crate::execution_core::graph::executors::ScopedNodeBackendResolver for Scri
 #[tokio::test]
 async fn r1_479_native_wait_result_then_cancel_preserves_original_receipt() {
     let fixture = NativeRetirementFixture::new("479-wait-then-cancel").await;
+    fixture.protect(async {
+
     let services = &fixture.physical.services;
     let backend = Arc::new(ScriptedWaitBackend::default());
     services
@@ -1422,86 +1556,97 @@ async fn r1_479_native_wait_result_then_cancel_preserves_original_receipt() {
     assert_eq!(backend.publications.load(Ordering::SeqCst), 1);
     assert_withdrawn_once(&fixture).await;
     fixture.finish().await;
+    }).await;
 }
 
 #[tokio::test]
 async fn r1_479_native_unexited_physical_leaf_cannot_settle() {
     let fixture = NativeRetirementFixture::new("479-physical-leaf").await;
-    let services = &fixture.physical.services;
-    let hold = Arc::new(ReviewWriteHold::default());
-    *fixture.physical.host.read_hold.lock().unwrap() = Some(hold.clone());
-    fixture.resume.notify_one();
-    tokio::time::timeout(Duration::from_secs(30), hold.entered.notified())
-        .await
-        .expect("the original Native ToolHost leaf must physically enter the held read");
-    let request = fixture
-        .physical
-        .host
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|request| request.tool_name == "read_file")
-        .unwrap()
-        .clone();
-    assert_eq!(
-        request.parent_execution_attempt,
-        Some(fixture.worker.packet.attempt)
-    );
-    assert_eq!(
-        request
-            .step_binding
-            .as_ref()
-            .unwrap()
-            .snapshot
-            .identity
-            .run_ref
-            .as_deref(),
-        Some(fixture.worker.packet.run_id())
-    );
-    fixture.worker.withdraw().await;
-    let cancellation = {
-        let services = services.clone();
-        let graph_id = fixture.worker.packet.graph_id().to_string();
-        tokio::spawn(async move {
-            services
-                .cancel_execution_tree(&graph_id, "479 leaf remains physically owned")
+    fixture
+        .protect(async {
+            let services = &fixture.physical.services;
+            let hold = Arc::new(ReviewWriteHold::default());
+            *fixture.physical.host.read_hold.lock().unwrap() = Some(hold.clone());
+            fixture.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(30), hold.entered.notified())
                 .await
+                .expect("the original Native ToolHost leaf must physically enter the held read");
+            let request = fixture
+                .physical
+                .host
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|request| request.tool_name == "read_file")
+                .unwrap()
+                .clone();
+            assert_eq!(
+                request.parent_execution_attempt,
+                Some(fixture.worker.packet.attempt)
+            );
+            assert_eq!(
+                request
+                    .step_binding
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .identity
+                    .run_ref
+                    .as_deref(),
+                Some(fixture.worker.packet.run_id())
+            );
+            fixture.worker.withdraw().await;
+            let cancellation = {
+                let services = services.clone();
+                let graph_id = fixture.worker.packet.graph_id().to_string();
+                tokio::spawn(async move {
+                    services
+                        .cancel_execution_tree(&graph_id, "479 leaf remains physically owned")
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(!cancellation.is_finished());
+            assert!(crate::agent_runtime::confirmed_run_exit(
+                services.event_store(),
+                &fixture.worker.packet
+            )
+            .unwrap()
+            .is_none());
+            assert!(fixture.backend.control.lock().unwrap().attempted.is_empty());
+            assert_rejected_without_program_mutation(
+                services,
+                &fixture.worker,
+                "exact local backend exit",
+            );
+            let receipts = services
+                .commit_service()
+                .load_delegated_agent_tool_receipts(
+                    fixture.worker.packet.graph_id(),
+                    fixture.worker.packet.node_id(),
+                    fixture.worker.packet.attempt,
+                )
+                .unwrap();
+            assert!(!receipts
+                .iter()
+                .any(|receipt| receipt.outcome.tool_use_id == request.tool_use_id));
+            hold.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(30), cancellation)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            fixture.cancel_while_holding_settlement().await;
+            assert_withdrawn_once(&fixture).await;
+            fixture.finish().await;
         })
-    };
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(!cancellation.is_finished());
-    assert!(crate::agent_runtime::confirmed_run_exit(
-        services.event_store(),
-        &fixture.worker.packet
-    )
-    .unwrap()
-    .is_none());
-    assert!(fixture.backend.control.lock().unwrap().attempted.is_empty());
-    assert_rejected_without_program_mutation(services, &fixture.worker, "exact local backend exit");
-    let receipts = services
-        .commit_service()
-        .load_delegated_agent_tool_receipts(
-            fixture.worker.packet.graph_id(),
-            fixture.worker.packet.node_id(),
-            fixture.worker.packet.attempt,
-        )
-        .unwrap();
-    assert!(!receipts
-        .iter()
-        .any(|receipt| receipt.outcome.tool_use_id == request.tool_use_id));
-    hold.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(30), cancellation)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    fixture.cancel_while_holding_settlement().await;
-    assert_withdrawn_once(&fixture).await;
-    fixture.finish().await;
+        .await;
 }
 
-struct ReleaseProcessGate(Arc<crate::agent_process_jsonl_adapter::ProcessExitGate>);
+pub(super) struct ReleaseProcessGate(
+    pub(super) Arc<crate::agent_process_jsonl_adapter::ProcessExitGate>,
+);
 
 impl Drop for ReleaseProcessGate {
     fn drop(&mut self) {
@@ -1535,68 +1680,82 @@ async fn r1_479_process_unreaped_owner_cannot_settle() {
         services: services.clone(),
         host: fixture.host.clone(),
     };
-    let worker = fixture
-        .dispatch(
-            "479-original-process",
-            r1_resource_write_scopes(),
-            true,
-            false,
-            true,
-        )
-        .await;
-    backend.hold(&worker.packet);
-    create_open_retirement_goal(services, &worker.root_actor);
-    assert_eq!(
-        services
-            .agent_runtime()
-            .get(worker.packet.agent_id())
-            .unwrap()
-            .backend,
-        crate::agent_run_handle::AgentBackendKind::ProcessJsonl
-    );
-    let gate = services.agent_runtime().process_fixture_exit_gate(false);
-    let _release_gate = ReleaseProcessGate(gate.clone());
-    worker.finish_only().await;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !gate.entered.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the original Process driver must hit its real exit-witness barrier");
-    assert!(worker.directory().exists());
-    assert!(
-        crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
-            .unwrap()
-            .is_none()
-    );
-    assert_rejected_without_program_mutation(services, &worker, "exact local backend exit");
-    gate.release();
-    worker.wait_exit().await;
-    backend.allow();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            services
-                .retry_agentic_run_exit(worker.packet.graph_id())
+    _cleanup
+        .protect(
+            async {
+                let worker = fixture
+                    .dispatch(
+                        "479-original-process",
+                        r1_resource_write_scopes(),
+                        true,
+                        false,
+                        true,
+                    )
+                    .await;
+                backend.hold(&worker.packet);
+                create_open_retirement_goal(services, &worker.root_actor);
+                assert_eq!(
+                    services
+                        .agent_runtime()
+                        .get(worker.packet.agent_id())
+                        .unwrap()
+                        .backend,
+                    crate::agent_run_handle::AgentBackendKind::ProcessJsonl
+                );
+                let gate = services.agent_runtime().process_fixture_exit_gate(false);
+                let _release_gate = ReleaseProcessGate(gate.clone());
+                worker.finish_only().await;
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !gate.entered.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the original Process driver must hit its real exit-witness barrier");
+                assert!(worker.directory().exists());
+                assert!(crate::agent_runtime::confirmed_run_exit(
+                    services.event_store(),
+                    &worker.packet
+                )
+                .unwrap()
+                .is_none());
+                assert_rejected_without_program_mutation(
+                    services,
+                    &worker,
+                    "exact local backend exit",
+                );
+                gate.release();
+                worker.wait_exit().await;
+                backend.allow();
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        services
+                            .retry_agentic_run_exit(worker.packet.graph_id())
+                            .await
+                            .unwrap();
+                        let program = services
+                            .agent_action_service()
+                            .project(&worker.root_actor.program_id)
+                            .unwrap();
+                        if program.tasks[&worker.task_ref].status
+                            == crate::AgenticTaskStatus::Withdrawn
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
                 .await
                 .unwrap();
-            let program = services
-                .agent_action_service()
-                .project(&worker.root_actor.program_id)
-                .unwrap();
-            if program.tasks[&worker.task_ref].status == crate::AgenticTaskStatus::Withdrawn {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_not_success(services, &worker);
-    assert_real_closures(services, worker.packet.graph_id());
-    assert!(!worker.directory().exists());
-    services.shutdown_maintenance().await;
-    services.shutdown_execution().await;
+                assert_not_success(services, &worker);
+                assert_real_closures(services, worker.packet.graph_id());
+                assert!(!worker.directory().exists());
+                services.shutdown_maintenance().await;
+                services.shutdown_execution().await;
+            },
+            || {},
+        )
+        .await;
 }
 
 #[path = "receipt_index_791_retirement_tests.rs"]
@@ -1610,6 +1769,8 @@ async fn n1_native_retirement_recovers_automatically_after_fault_release() {
 #[tokio::test]
 async fn n1_failed_control_receipt_retires_only_after_exact_physical_exit() {
     let fixture = Box::pin(NativeRetirementFixture::new("n1-failed-control")).await;
+    fixture.protect(async {
+
     let services = &fixture.physical.services;
     let worker = &fixture.worker;
     let backend = &fixture.backend;
@@ -1761,6 +1922,7 @@ async fn n1_failed_control_receipt_retires_only_after_exact_physical_exit() {
     let report = services.shutdown_execution().await;
     assert!(report.errors.is_empty(), "{report:?}");
     assert_eq!(report.remaining_keys, 0);
+    }).await;
 }
 
 #[tokio::test]
@@ -1770,61 +1932,70 @@ async fn n1_native_retirement_recovers_automatically_after_cold_rebuild() {
 
 async fn automatic_retirement_after_fault(cold: bool) {
     let fixture = NativeRetirementFixture::new("n1-auto-retirement").await;
-    fixture.worker.withdraw().await;
-    fixture.worker.cancel().await;
-    fixture.resume.notify_one();
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        fixture.physical.services.cancel_execution_tree(
-            fixture.worker.packet.graph_id(),
-            "N1 automatic retirement cancellation",
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    fixture.worker.wait_exit().await;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if !fixture.backend.control.lock().unwrap().attempted.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("production lane must hit the held settlement fault");
-    assert_pending(&fixture.physical.services, &fixture.worker);
+    fixture
+        .protect(async {
+            fixture.worker.withdraw().await;
+            fixture.worker.cancel().await;
+            fixture.resume.notify_one();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                fixture.physical.services.cancel_execution_tree(
+                    fixture.worker.packet.graph_id(),
+                    "N1 automatic retirement cancellation",
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            fixture.worker.wait_exit().await;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if !fixture.backend.control.lock().unwrap().attempted.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("production lane must hit the held settlement fault");
+            assert_pending(&fixture.physical.services, &fixture.worker);
+        })
+        .await;
     let fixture = if cold {
         fixture.cold_rebuild().await
     } else {
         fixture
     };
-    fixture.backend.allow();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let program = fixture
-                .physical
-                .services
-                .agent_action_service()
-                .project(&fixture.worker.root_actor.program_id)
-                .unwrap();
-            if program.tasks[&fixture.worker.task_ref].status == crate::AgenticTaskStatus::Withdrawn
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("production lane must recover without test-driven retry");
-    assert_withdrawn_evidence(&fixture).await;
-    assert_real_closures(&fixture.physical.services, fixture.worker.packet.graph_id());
-    fixture.physical.services.shutdown_maintenance().await;
-    let report = fixture.physical.services.shutdown_execution().await;
-    assert!(report.errors.is_empty(), "{report:?}");
-    assert_eq!(report.forced_aborts, 0, "{report:?}");
-    assert_eq!(report.remaining_keys, 0, "{report:?}");
+    fixture
+        .protect(async {
+            fixture.backend.allow();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let program = fixture
+                        .physical
+                        .services
+                        .agent_action_service()
+                        .project(&fixture.worker.root_actor.program_id)
+                        .unwrap();
+                    if program.tasks[&fixture.worker.task_ref].status
+                        == crate::AgenticTaskStatus::Withdrawn
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("production lane must recover without test-driven retry");
+            assert_withdrawn_evidence(&fixture).await;
+            assert_real_closures(&fixture.physical.services, fixture.worker.packet.graph_id());
+            fixture.physical.services.shutdown_maintenance().await;
+            let report = fixture.physical.services.shutdown_execution().await;
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert_eq!(report.forced_aborts, 0, "{report:?}");
+            assert_eq!(report.remaining_keys, 0, "{report:?}");
+        })
+        .await;
 }
 
 async fn process_retirement_1100(
@@ -1849,11 +2020,19 @@ async fn process_retirement_1100(
         services: physical.services.clone(),
         host: physical.host.clone(),
     };
-    let worker = physical
-        .dispatch(name, r1_resource_write_scopes(), true, false, true)
+    let worker = cleanup
+        .protect(
+            async {
+                let worker = physical
+                    .dispatch(name, r1_resource_write_scopes(), true, false, true)
+                    .await;
+                backend.hold(&worker.packet);
+                create_open_retirement_goal(&physical.services, &worker.root_actor);
+                worker
+            },
+            || backend.allow(),
+        )
         .await;
-    backend.hold(&worker.packet);
-    create_open_retirement_goal(&physical.services, &worker.root_actor);
     (physical, backend, worker, cleanup)
 }
 
@@ -1866,6 +2045,8 @@ impl Drop for ReleaseRetirement1100 {
 
 async fn process_hot_closure_1100(startup: bool) {
     let (physical, backend, worker, _cleanup) = process_retirement_1100("1100-hot-closure").await;
+    _cleanup.protect(async {
+
     let services = &physical.services;
     let _release_fault = ReleaseRetirement1100(backend.clone());
     let graph = services
@@ -2057,6 +2238,7 @@ async fn process_hot_closure_1100(startup: bool) {
     assert!(report.errors.is_empty(), "{report:?}");
     assert_eq!(report.forced_aborts, 0, "{report:?}");
     assert_eq!(report.remaining_keys, 0, "{report:?}");
+    }, || backend.allow()).await;
 }
 
 #[tokio::test]
@@ -2073,6 +2255,8 @@ async fn r1_1100_startup_program_retirement_uses_the_same_closure_boundary() {
 async fn r1_1100_process_original_closure_identity_controls_hot_settlement() {
     let (physical, backend, worker, _cleanup) =
         process_retirement_1100("1100-closure-identity").await;
+    _cleanup.protect(async {
+
     let services = &physical.services;
     let _release_fault = ReleaseRetirement1100(backend.clone());
     worker.withdraw().await;
@@ -2162,135 +2346,143 @@ async fn r1_1100_process_original_closure_identity_controls_hot_settlement() {
     assert!(report.errors.is_empty(), "{report:?}");
     assert_eq!(report.forced_aborts, 0);
     assert_eq!(report.remaining_keys, 0);
+    }, || backend.allow()).await;
 }
 
 // The three witnesses call the actual dispatch owners, not the envelope helper.
 // A real Program action lands after their snapshot and before their submit.
 async fn settlement_program_race_1112(entry: u8) {
     let (physical, backend, worker, _cleanup) = process_retirement_1100("1112-program-race").await;
-    let services = &physical.services;
-    let _release_fault = ReleaseRetirement1100(backend.clone());
-    if entry == 1 {
-        worker.withdraw().await;
-    }
-    worker.process.finish().await;
-    worker.wait_exit().await;
-    if entry == 1 {
-        services
-            .cancel_execution_tree(worker.packet.graph_id(), "1112 original retirement")
-            .await
-            .unwrap();
-    }
-    let mut commits = services.event_store().subscribe_commits();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while original_binding_closures_ready(
-            services,
-            worker.packet.graph_id(),
-            Some(&worker.packet),
-        )
-        .unwrap()
-        .is_none()
-        {
-            commits.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("real producer closure establishes the legal settlement baseline");
-    services.shutdown_maintenance().await;
-    let before = services
-        .agent_action_service()
-        .project(&worker.root_actor.program_id)
-        .unwrap();
-    let original_task = before.tasks[&worker.task_ref].clone();
-    assert!(original_task
-        .active_attempts
-        .contains_key(worker.packet.graph_id()));
-    assert_eq!(
-        original_task.status,
-        if entry == 1 {
-            crate::AgenticTaskStatus::CancelRequested
-        } else {
-            crate::AgenticTaskStatus::Claimed
-        }
-    );
-    let mut change = root(
-        "1112-concurrent-program-change",
-        AgentAction::TeamCreate(TeamCreateInput {
-            name: "independent concurrent team".into(),
-            mission: "advance real Program revision".into(),
-            objective: None,
-        }),
-    );
-    change.actor = worker.root_actor.clone();
-    change.expected_revision = Some(before.revision);
-    let (result, observed) = super::super::dispatch::settlement_race_1112(
-        services,
-        &worker.packet,
-        &worker.task_ref,
-        entry,
-        change,
-    )
-    .await;
-    assert!(
+    _cleanup
+        .protect(
+            async {
+                let services = &physical.services;
+                let _release_fault = ReleaseRetirement1100(backend.clone());
+                if entry == 1 {
+                    worker.withdraw().await;
+                }
+                worker.process.finish().await;
+                worker.wait_exit().await;
+                if entry == 1 {
+                    services
+                        .cancel_execution_tree(worker.packet.graph_id(), "1112 original retirement")
+                        .await
+                        .unwrap();
+                }
+                let mut commits = services.event_store().subscribe_commits();
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while original_binding_closures_ready(
+                        services,
+                        worker.packet.graph_id(),
+                        Some(&worker.packet),
+                    )
+                    .unwrap()
+                    .is_none()
+                    {
+                        commits.changed().await.unwrap();
+                    }
+                })
+                .await
+                .expect("real producer closure establishes the legal settlement baseline");
+                services.shutdown_maintenance().await;
+                let before = services
+                    .agent_action_service()
+                    .project(&worker.root_actor.program_id)
+                    .unwrap();
+                let original_task = before.tasks[&worker.task_ref].clone();
+                assert!(original_task
+                    .active_attempts
+                    .contains_key(worker.packet.graph_id()));
+                assert_eq!(
+                    original_task.status,
+                    if entry == 1 {
+                        crate::AgenticTaskStatus::CancelRequested
+                    } else {
+                        crate::AgenticTaskStatus::Claimed
+                    }
+                );
+                let mut change = root(
+                    "1112-concurrent-program-change",
+                    AgentAction::TeamCreate(TeamCreateInput {
+                        name: "independent concurrent team".into(),
+                        mission: "advance real Program revision".into(),
+                        objective: None,
+                    }),
+                );
+                change.actor = worker.root_actor.clone();
+                change.expected_revision = Some(before.revision);
+                let (result, observed) = super::super::dispatch::settlement_race_1112(
+                    services,
+                    &worker.packet,
+                    &worker.task_ref,
+                    entry,
+                    change,
+                )
+                .await;
+                assert!(
         result
             .as_ref()
             .is_err_and(|error| error.contains("stale_revision")),
         "actual production settlement must reject its stale Program snapshot: {result:?}"
     );
-    let mut actual =
-        observed.expect("the selected production entry must reach its real submit boundary");
-    assert_eq!(actual.expected_revision, Some(before.revision));
-    assert_eq!(
-        actual.action_id,
-        format!(
-            "runtime-attempt-settle:{}:{}:{}",
-            worker.root_actor.program_id,
-            worker.task_ref,
-            worker.packet.graph_id()
-        )
-    );
-    assert!(matches!(&actual.action, AgentAction::TaskAttemptFail(input)
+                let mut actual = observed
+                    .expect("the selected production entry must reach its real submit boundary");
+                assert_eq!(actual.expected_revision, Some(before.revision));
+                assert_eq!(
+                    actual.action_id,
+                    format!(
+                        "runtime-attempt-settle:{}:{}:{}",
+                        worker.root_actor.program_id,
+                        worker.task_ref,
+                        worker.packet.graph_id()
+                    )
+                );
+                assert!(matches!(&actual.action, AgentAction::TaskAttemptFail(input)
         if input.task_ref == worker.task_ref && input.execution_id == worker.packet.graph_id()
             && input.mode == AgentAttemptMode::Execute));
-    let after = services
-        .agent_action_service()
-        .project(&worker.root_actor.program_id)
-        .unwrap();
-    assert!(after.revision > before.revision);
-    assert_eq!(
-        after.tasks[&worker.task_ref], original_task,
-        "CAS rejection must retain the exact original claim/attempt/pending identity"
-    );
-    assert!(services
-        .event_store()
-        .event_by_idempotency_key(
-            &format!("agentic-program:{}", before.program_id),
-            &format!("agent-action:{}", actual.action_id)
+                let after = services
+                    .agent_action_service()
+                    .project(&worker.root_actor.program_id)
+                    .unwrap();
+                assert!(after.revision > before.revision);
+                assert_eq!(
+                    after.tasks[&worker.task_ref], original_task,
+                    "CAS rejection must retain the exact original claim/attempt/pending identity"
+                );
+                assert!(services
+                    .event_store()
+                    .event_by_idempotency_key(
+                        &format!("agentic-program:{}", before.program_id),
+                        &format!("agent-action:{}", actual.action_id)
+                    )
+                    .unwrap()
+                    .is_none());
+                // Finish the already-exited original owners before releasing the append hold.
+                // This is a negative CAS witness, not an automatic-recovery positive.
+                let report = services.shutdown_execution().await;
+                assert!(report.errors.is_empty(), "{report:?}");
+                assert_eq!(report.forced_aborts, 0);
+                assert_eq!(report.remaining_keys, 0);
+                backend.allow();
+                // Mutation control: the genuine captured request with ONLY its fence removed
+                // can settle this otherwise legal original attempt. No hand-built expected
+                // envelope or projection is used to simulate the production entry.
+                actual.expected_revision = None;
+                let unfenced = services.agent_action_service().apply(&actual).unwrap();
+                assert_eq!(unfenced.status, AgentActionStatus::Applied, "{unfenced:?}");
+                assert!(!unfenced.duplicate);
+                let settled = services
+                    .agent_action_service()
+                    .project(&worker.root_actor.program_id)
+                    .unwrap();
+                assert!(!settled.tasks[&worker.task_ref]
+                    .active_attempts
+                    .contains_key(worker.packet.graph_id()));
+                assert_not_success(services, &worker);
+            },
+            || backend.allow(),
         )
-        .unwrap()
-        .is_none());
-    // Finish the already-exited original owners before releasing the append hold.
-    // This is a negative CAS witness, not an automatic-recovery positive.
-    let report = services.shutdown_execution().await;
-    assert!(report.errors.is_empty(), "{report:?}");
-    assert_eq!(report.forced_aborts, 0);
-    assert_eq!(report.remaining_keys, 0);
-    backend.allow();
-    // Mutation control: the genuine captured request with ONLY its fence removed
-    // can settle this otherwise legal original attempt. No hand-built expected
-    // envelope or projection is used to simulate the production entry.
-    actual.expected_revision = None;
-    let unfenced = services.agent_action_service().apply(&actual).unwrap();
-    assert_eq!(unfenced.status, AgentActionStatus::Applied, "{unfenced:?}");
-    assert!(!unfenced.duplicate);
-    let settled = services
-        .agent_action_service()
-        .project(&worker.root_actor.program_id)
-        .unwrap();
-    assert!(!settled.tasks[&worker.task_ref]
-        .active_attempts
-        .contains_key(worker.packet.graph_id()));
-    assert_not_success(services, &worker);
+        .await;
 }
 
 #[tokio::test]
