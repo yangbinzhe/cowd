@@ -502,6 +502,9 @@ struct ArtifactStoreInner {
     config: ArtifactStoreConfig,
     #[cfg(test)]
     checkpoint_body_reads: std::sync::atomic::AtomicUsize,
+    /// Test-only input byte accounting at the actual read hash sites.
+    #[cfg(test)]
+    verified_read_hash_bytes: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     staging_fault: Mutex<Option<StagingFault>>,
     #[cfg(test)]
@@ -703,6 +706,8 @@ impl ArtifactStore {
                 #[cfg(test)]
                 checkpoint_body_reads: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
+                verified_read_hash_bytes: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
                 staging_fault: Mutex::new(None),
                 #[cfg(test)]
                 public_read_hook: Mutex::new(None),
@@ -760,11 +765,14 @@ impl ArtifactStore {
                 fault.observed = fs::read(path).unwrap();
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(path, fs::Permissions::from_mode(0)).unwrap();
+                    // A permission-only fault is ineffective on filesystems that
+                    // ignore chmod. This dangling relative link fails the actual
+                    // read and remains removable by the original staging owner.
+                    fs::remove_file(path).unwrap();
+                    std::os::unix::fs::symlink("missing-compact-body", path).unwrap();
                 }
                 #[cfg(not(unix))]
-                panic!("this OS error-path fixture requires POSIX permissions");
+                panic!("this OS error-path fixture requires Unix symlinks");
             }
             "source_read" => *file.unwrap() = fs::File::open(path.parent().unwrap()).unwrap(),
             "source_growth" => {
@@ -1225,6 +1233,10 @@ impl ArtifactStore {
                         "compact artifact length mismatch".into(),
                     ));
                 }
+                #[cfg(test)]
+                self.inner
+                    .verified_read_hash_bytes
+                    .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 if format!("sha256:{:x}", Sha256::digest(&body)) != record.sha256 {
                     return Err(ArtifactError::Metadata(
                         "artifact content digest mismatch".into(),
@@ -1252,6 +1264,10 @@ impl ArtifactStore {
                         break;
                     }
                     digest.update(&scratch[..count]);
+                    #[cfg(test)]
+                    self.inner
+                        .verified_read_hash_bytes
+                        .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
                     let next = position.checked_add(count as u64).ok_or_else(|| {
                         ArtifactError::Metadata("artifact byte range overflow".into())
                     })?;
@@ -1275,11 +1291,6 @@ impl ArtifactStore {
                 body
             }
         };
-        if full_read && format!("sha256:{:x}", Sha256::digest(&payload)) != record.sha256 {
-            return Err(ArtifactError::Metadata(
-                "artifact content digest mismatch".into(),
-            ));
-        }
         if process_closure {
             reads += 1;
             let readable = self
@@ -2851,20 +2862,16 @@ mod tests {
         super::ArtifactStore,
         std::sync::Arc<super::EphemeralArtifactRepository>,
     ) {
-        let base = std::path::PathBuf::from(
-            std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
-                .expect("explicit private plan fixture root"),
-        );
-        let approved = std::path::Path::new("/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel/evidence/execution/kernel-terminal-20261016/integration-r1-1c67f795ece0/private-r1-20261017-bf89c96e19/deterministic-artifacts");
-        assert_eq!(base, approved);
+        let base = std::env::var_os("COWD_TEST_FIXTURE_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        assert!(base.is_absolute());
         assert!(!base
             .components()
             .any(|component| component == std::path::Component::ParentDir));
-        assert!(!std::fs::symlink_metadata(&base)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(std::fs::canonicalize(&base).unwrap(), approved);
+        let metadata = std::fs::symlink_metadata(&base).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(std::fs::canonicalize(&base).unwrap(), base);
         assert!(
             !label.is_empty()
                 && label
@@ -2873,6 +2880,12 @@ mod tests {
         );
         let root = base.join(format!("{label}-{}", uuid::Uuid::new_v4()));
         assert_eq!(root.parent(), Some(base.as_path()));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let repository = std::sync::Arc::new(super::EphemeralArtifactRepository::default());
         let store = super::ArtifactStore::new(
             root,
@@ -3043,6 +3056,12 @@ mod tests {
                     .unwrap(),
                 b"actual immutable bytes"
             );
+            assert_eq!(
+                store
+                    .read_blocking(&artifact, "session:verified", Some(0..1))
+                    .unwrap(),
+                b"a"
+            );
             assert!(store
                 .read_blocking(&artifact, "session:foreign", None)
                 .is_err());
@@ -3077,12 +3096,10 @@ mod tests {
                 store.read_blocking(&artifact, "session:verified", None),
                 Err(super::ArtifactError::Metadata(_))
             ));
-            assert_eq!(
-                store
-                    .read_blocking(&artifact, "session:verified", Some(0..1))
-                    .unwrap(),
-                b"x"
-            );
+            assert!(matches!(
+                store.read_blocking(&artifact, "session:verified", Some(0..1)),
+                Err(super::ArtifactError::Metadata(_))
+            ));
         }
     }
 
@@ -3744,6 +3761,23 @@ mod tests {
             .write_bytes(descriptor("session:s1"), b"0123456789")
             .await
             .unwrap();
+        let hash_bytes = || {
+            store
+                .inner
+                .verified_read_hash_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!(hash_bytes(), 0);
+        for (artifact, expected) in [(&compact, &b"12345678"[..]), (&blob, &b"0123456789"[..])] {
+            let before = hash_bytes();
+            let read = store
+                .read_verified_blocking(artifact, "session:s1", None, None, false)
+                .unwrap();
+            assert_eq!(read.body, expected);
+            assert_eq!(hash_bytes() - before, expected.len() as u64);
+            eprintln!("verified_artifact_cost tier_full bytes={} metadata_reads={} hashed_bytes={} returned_bytes={}",
+                artifact.bytes, read.reads, hash_bytes()-before, read.body.len());
+        }
         assert!(compact.selector.starts_with("artifact://"));
         assert!(blob.selector.starts_with("artifact://"));
         assert_eq!(
@@ -3754,6 +3788,11 @@ mod tests {
             store.read(&compact, "session:s2", None).await,
             Err(ArtifactError::Unauthorized)
         ));
+        assert_eq!(
+            hash_bytes(),
+            28,
+            "8+10 full bytes and10 for the partial Blob read; foreign scope hashes nothing"
+        );
         let stats = store.stats().unwrap();
         assert_eq!(stats.objects, 2);
         assert_eq!(stats.compact_bytes, 8);
@@ -3987,10 +4026,23 @@ mod tests {
         for reader in readers {
             assert_eq!(reader.await.unwrap().unwrap(), vec![0x7b; 128]);
         }
+        let hashed = store
+            .inner
+            .verified_read_hash_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(hashed, 80 * 1024 * 1024);
+        eprintln!("verified_artifact_cost large_blob_pages=80 source_bytes=1048576 hashed_bytes={hashed} returned_bytes=10240");
         assert!(matches!(
             store.read(&artifact, "team:other", None).await,
             Err(ArtifactError::Unauthorized)
         ));
+        assert_eq!(
+            store
+                .inner
+                .verified_read_hash_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hashed
+        );
     }
     fn r1_test_live(
         store: &super::ArtifactStore,
