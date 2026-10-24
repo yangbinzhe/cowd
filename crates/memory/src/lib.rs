@@ -81,8 +81,6 @@ pub mod fact_checker;
 pub mod fresh_context;
 #[path = "session/handoff.rs"]
 pub mod handoff;
-#[path = "lifecycle/hot_reload.rs"]
-pub mod hot_reload;
 #[path = "ingestion/impact_analyzer.rs"]
 pub mod impact_analyzer;
 #[path = "kernel/kernel.rs"]
@@ -117,8 +115,6 @@ pub mod search;
 pub mod seeds;
 #[path = "session/session_resume.rs"]
 pub mod session_resume;
-#[path = "ops/shared.rs"]
-pub mod shared;
 #[path = "ingestion/splitter.rs"]
 pub mod splitter;
 #[path = "session/state_rebuilder.rs"]
@@ -170,10 +166,6 @@ pub use eval::{
 pub use fact_checker::{FactCheckResult, FactChecker};
 pub use fresh_context::{FreshContextManager, FreshEntry, SessionBudgetStatus, SessionTokenBudget};
 pub use handoff::HandoffManager;
-pub use hot_reload::{
-    ConfigChangeEvent, ConfigFile, ConfigHotReloader, HotReloadConfig, HotReloadHandle,
-    SharedConfigReloader,
-};
 pub use kernel::reality_recall::{
     rank_and_deduplicate_candidates, rank_candidates, RecallCandidate, RecallCandidateEvidence,
     RecallCandidateScores, RecallFence, RecallOmission, RecallReport, RecallRequest, RecallSource,

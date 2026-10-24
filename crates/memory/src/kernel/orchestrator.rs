@@ -24,9 +24,7 @@ use crate::{
         deep::DeepLayer, essential::EssentialLayer, identity::IdentityLayer, project::ProjectLayer,
         shared::SharedLayer, LayerManager,
     },
-    performance_monitor::PerformanceReport,
     project_scope::MemoryScope,
-    shared::SharedMemoryManager,
     store::MemoryStore,
     types::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource,
@@ -525,16 +523,6 @@ impl MemoryOrchestrator {
     /// This is useful for advanced operations like custom FTS5 queries.
     pub fn store(&self) -> &Arc<dyn MemoryStore> {
         &self.store
-    }
-
-    /// Return a snapshot of current performance metrics from the shared
-    /// cognitive context manager, if available.
-    #[must_use]
-    pub fn performance_report(&self) -> PerformanceReport {
-        SharedMemoryManager::global()
-            .get()
-            .map(|ccm| ccm.performance_report())
-            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------

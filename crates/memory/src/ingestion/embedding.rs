@@ -37,14 +37,11 @@ use crate::{config::VectorConfig, error::MemoryError};
 ///
 /// Determines which search strategies are available:
 /// - `Remote` – full semantic search via a remote embedding API
-/// - `Local` – local model-based embedding (reserved for future use)
 /// - `Fts5Only` – keyword-only search via SQLite FTS5, no vector support
 #[derive(Clone)]
 pub enum EmbeddingCapability {
     /// Remote embedding API (e.g. OpenAI, Ollama, vLLM).
     Remote { client: EmbeddingClient },
-    /// Local embedding model (reserved for future use).
-    Local { model_path: String },
     /// FTS5 keyword search only — no vector embeddings.
     Fts5Only,
 }
@@ -53,7 +50,6 @@ impl std::fmt::Debug for EmbeddingCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Remote { .. } => write!(f, "Remote {{ client: EmbeddingClient }}"),
-            Self::Local { model_path } => write!(f, "Local {{ model_path: {model_path} }}"),
             Self::Fts5Only => write!(f, "Fts5Only"),
         }
     }
@@ -64,14 +60,13 @@ impl EmbeddingCapability {
     pub fn search_mode_label(&self) -> &'static str {
         match self {
             Self::Remote { .. } => "semantic",
-            Self::Local { .. } => "local",
             Self::Fts5Only => "keyword",
         }
     }
 
     /// Return true if this capability supports vector/semantic search.
     pub fn supports_semantic(&self) -> bool {
-        matches!(self, Self::Remote { .. } | Self::Local { .. })
+        matches!(self, Self::Remote { .. })
     }
 
     /// Construct from a VectorConfig: Remote if configured, Fts5Only otherwise.
@@ -883,6 +878,41 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn configured_remote_and_keyword_fallback_report_only_real_capabilities() {
+        let configured = VectorConfig {
+            enabled: true,
+            model: "local-http-embedding".into(),
+            api_url: "http://127.0.0.1:1/embeddings".into(),
+            ..VectorConfig::default()
+        };
+        // Construction never sends a request. Local HTTP remains a Remote API.
+        let remote = EmbeddingCapability::from_config(&configured);
+        assert!(matches!(remote, EmbeddingCapability::Remote { .. }));
+        assert_eq!(remote.search_mode_label(), "semantic");
+        assert!(remote.supports_semantic());
+        for config in [
+            VectorConfig::default(),
+            VectorConfig {
+                enabled: false,
+                ..configured.clone()
+            },
+            VectorConfig {
+                model: String::new(),
+                ..configured.clone()
+            },
+            VectorConfig {
+                api_url: String::new(),
+                ..configured
+            },
+        ] {
+            let fallback = EmbeddingCapability::from_config(&config);
+            assert!(matches!(fallback, EmbeddingCapability::Fts5Only));
+            assert_eq!(fallback.search_mode_label(), "keyword");
+            assert!(!fallback.supports_semantic());
+        }
+    }
 
     pub(crate) async fn partial_server() -> (
         String,

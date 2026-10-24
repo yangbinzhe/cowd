@@ -108,14 +108,7 @@ impl Drop for BackgroundWatcherHandle {
 ///     // Replace the current KG with `kg`.
 /// }
 /// ```
-pub struct BackgroundWatcher {
-    #[allow(dead_code)]
-    config: BackgroundWatcherConfig,
-    #[allow(dead_code)]
-    workspace_root: PathBuf,
-    #[allow(dead_code)]
-    kg_rebuild_tx: mpsc::UnboundedSender<KnowledgeGraph>,
-}
+pub struct BackgroundWatcher;
 
 impl BackgroundWatcher {
     /// Start a background watcher on `workspace_root`.
