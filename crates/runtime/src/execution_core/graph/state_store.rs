@@ -1380,6 +1380,10 @@ mod tests {
                         "/media/yi/Datas/workspace/plan/2026-10/1016-cowd-future-kernel"
                     )
             );
+            Self::new_at(root)
+        }
+
+        fn new_at(root: PathBuf) -> Self {
             std::fs::create_dir_all(&root).unwrap();
             let backend = GraphFaultBackend::new();
             let events = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
@@ -1775,6 +1779,199 @@ mod tests {
             self.records = self.events.list_stream(&self.expected.id).unwrap();
             started
         }
+    }
+
+    // A synthetic shape witness, not a reconstruction of the lost 1090 event.
+    // Complete construction synchronously before entering the cold reader.
+    fn observed_result_fixture(root: PathBuf) -> CanonicalGraphFixture {
+        use harness_contract::context::{
+            EvidenceTargetIdentity, ObservedAcceptance, ObservedEvidence,
+            ObservedEvidenceProvenance,
+        };
+        use harness_contract::execution_graph::{
+            ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
+        };
+
+        let mut fixture = CanonicalGraphFixture::new_at(root);
+        let node_id = fixture.bindings[0].0.clone();
+        assert_eq!(
+            fixture.expected.node_statuses[&node_id],
+            ExecutionNodeStatus::Running
+        );
+        let result = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: None,
+            wait_class: None,
+            summary: Some("synthetic reader shape only".into()),
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: ExecutionUsage {
+                input_tokens: 17,
+                output_tokens: 5,
+                duration_ms: 23,
+                observed_acceptance: ObservedAcceptance {
+                    satisfied_criteria: vec!["synthetic-criterion".into()],
+                    observed_evidence: vec![ObservedEvidence {
+                        obligation_id: "synthetic-obligation".into(),
+                        target: EvidenceTargetIdentity::Network {
+                            endpoint: "https://reader-witness.invalid/not-executed".into(),
+                        },
+                        observed_at_sequence: 7,
+                        tool_name: "synthetic-reader-no-tool-dispatch".into(),
+                        provenance: ObservedEvidenceProvenance::RetainedReplay,
+                        evidence_ref: None,
+                        model_observation: None,
+                        workspace_prior_state: None,
+                    }],
+                    unresolved_obligation_ids: Vec::new(),
+                },
+                ..ExecutionUsage::default()
+            },
+            finished_at_ms: 123_456,
+        };
+        fixture.expected = fixture
+            .writer
+            .transition_node(
+                &fixture.expected,
+                &node_id,
+                ExecutionNodeStatus::Completed,
+                Some(result),
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        fixture.records = fixture.events.list_stream(&fixture.expected.id).unwrap();
+        fixture
+    }
+
+    #[test]
+    fn r1_1090_cold_graph_reader_preserves_observed_result_shape() {
+        use harness_contract::context::{EvidenceTargetIdentity, ObservedEvidenceProvenance};
+        use harness_contract::execution_graph::ExecutionNodeStatus;
+
+        // The owner outlives every store/artifact handle; never use the old plan tree.
+        let root = tempfile::tempdir_in("/media/yi/Datas/workspace/.cowd-build/tmp-main").unwrap();
+        let fixture = observed_result_fixture(root.path().to_path_buf());
+        let node_id = &fixture.bindings[0].0;
+        let tail = fixture.records.last().unwrap();
+        assert_eq!(tail.kind, "execution_graph.node_transitioned");
+        assert_eq!(tail.sequence, fixture.expected.revision);
+        assert_eq!(tail.stream_id, fixture.expected.id);
+        let body = fixture.events.resolve_graph_record(tail).unwrap();
+        assert_eq!(body["event"], "node_transitioned");
+        assert!(
+            body["delta"].is_object(),
+            "must hit a real Delta tail, not a checkpoint"
+        );
+        assert_eq!(body["delta"]["revision"], tail.sequence);
+        let nested = &body["delta"]["node_result_updates"][node_id]["usage"]["observed_acceptance"]
+            ["observed_evidence"];
+        assert_eq!(nested.as_array().unwrap().len(), 1);
+        assert_eq!(nested[0]["obligation_id"], "synthetic-obligation");
+        assert_eq!(
+            nested[0]["target"]["endpoint"],
+            "https://reader-witness.invalid/not-executed"
+        );
+
+        let before = fixture.events.list_stream(&fixture.expected.id).unwrap();
+        let cursor = fixture.events.durable_commit_cursor().unwrap();
+        let assert_positive = || {
+            let (store, plane) = fixture.cold();
+            assert!(plane.graphs().get(&fixture.expected.id).is_none());
+            let graph = store.load(&fixture.expected.id).unwrap();
+            assert_eq!(graph.id, tail.stream_id);
+            assert_eq!(graph.revision, tail.sequence);
+            assert_eq!(graph.recovery_cursor.commit_cursor, tail.commit_cursor);
+            assert_eq!(graph.node_statuses[node_id], ExecutionNodeStatus::Completed);
+            let result = &graph.node_results[node_id];
+            assert_eq!(result.status, ExecutionNodeStatus::Completed);
+            assert_eq!(result.finished_at_ms, 123_456);
+            assert_eq!(
+                result.summary.as_deref(),
+                Some("synthetic reader shape only")
+            );
+            assert!(
+                result.result_ref.is_none()
+                    && result.wait_class.is_none()
+                    && result.failure.is_none()
+            );
+            assert!(result.evidence_refs.is_empty());
+            assert_eq!(
+                (
+                    result.usage.input_tokens,
+                    result.usage.output_tokens,
+                    result.usage.duration_ms
+                ),
+                (17, 5, 23)
+            );
+            assert!(result.usage.provider_usage_observed.is_none());
+            let observed = &result.usage.observed_acceptance;
+            assert_eq!(observed.satisfied_criteria, ["synthetic-criterion"]);
+            assert!(observed.unresolved_obligation_ids.is_empty());
+            assert_eq!(observed.observed_evidence.len(), 1);
+            let evidence = &observed.observed_evidence[0];
+            assert_eq!(evidence.obligation_id, "synthetic-obligation");
+            assert_eq!(
+                evidence.target,
+                EvidenceTargetIdentity::Network {
+                    endpoint: "https://reader-witness.invalid/not-executed".into(),
+                }
+            );
+            assert_eq!(evidence.observed_at_sequence, 7);
+            assert_eq!(evidence.tool_name, "synthetic-reader-no-tool-dispatch");
+            assert_eq!(
+                evidence.provenance,
+                ObservedEvidenceProvenance::RetainedReplay
+            );
+            assert!(
+                evidence.evidence_ref.is_none()
+                    && evidence.model_observation.is_none()
+                    && evidence.workspace_prior_state.is_none()
+            );
+            assert_eq!(graph, fixture.expected); // Secondary whole-graph roundtrip oracle.
+            assert_eq!(plane.metrics().snapshot().graph_recoveries, 1);
+            assert_eq!(plane.metrics().snapshot().graph_publishes, 1);
+        };
+        assert_positive();
+
+        let mut wrong_kind = tail.clone();
+        wrong_kind.kind = "execution_graph.checkpoint".into();
+        let mut foreign_identity = tail.clone();
+        foreign_identity.payload["_runtime_activity_binding"]["activity_id"] =
+            "activity:execution:foreign-reader-witness".into();
+        for altered in [wrong_kind, foreign_identity] {
+            fixture
+                .backend
+                .set_fault(Some(GraphReadFault::Replace(tail.sequence, altered)), false);
+            let (store, plane) = fixture.cold();
+            assert!(plane.graphs().get(&fixture.expected.id).is_none());
+            assert!(matches!(
+                store.load(&fixture.expected.id),
+                Err(ExecutionStateStoreError::Corrupt { .. })
+            ));
+            assert!(
+                fixture
+                    .backend
+                    .hits
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+            );
+            assert_eq!(plane.metrics().snapshot().graph_recoveries, 0);
+            assert_eq!(plane.metrics().snapshot().graph_publishes, 0);
+            assert!(plane.graphs().get(&fixture.expected.id).is_none());
+            assert_eq!(
+                fixture.events.list_stream(&fixture.expected.id).unwrap(),
+                before
+            );
+            assert_eq!(fixture.events.durable_commit_cursor().unwrap(), cursor);
+        }
+        fixture.backend.set_fault(None, false);
+        assert_positive();
+        assert_eq!(
+            fixture.events.list_stream(&fixture.expected.id).unwrap(),
+            before
+        );
+        assert_eq!(fixture.events.durable_commit_cursor().unwrap(), cursor);
     }
 
     #[test]
