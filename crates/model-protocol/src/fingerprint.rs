@@ -27,7 +27,8 @@ mod tests {
 
     #[test]
     fn stable_hash_is_deterministic() {
-        assert_eq!(stable_hash_bytes(b"cowd"), stable_hash_bytes(b"cowd"));
+        assert_eq!(stable_hash_bytes(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(stable_hash_bytes(b"cowd"), 0x0be2_0691_1972_151c);
         assert_ne!(stable_hash_bytes(b"cowd"), stable_hash_bytes(b"cowd-next"));
     }
 }

@@ -1990,9 +1990,33 @@ mod workspace_sessions_dir_tests {
     use super::*;
     use std::fs;
 
+    struct ConfigHomeOverride(Option<std::ffi::OsString>);
+
+    impl ConfigHomeOverride {
+        fn new(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("COWD_CONFIG_HOME");
+            std::env::set_var("COWD_CONFIG_HOME", path);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ConfigHomeOverride {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
+                None => std::env::remove_var("COWD_CONFIG_HOME"),
+            }
+        }
+    }
+
     #[test]
     fn workspace_sessions_dir_returns_fingerprinted_path_for_valid_cwd() {
-        let tmp = std::env::temp_dir().join("cowd-session-dir-test");
+        let _lock = crate::test_env_lock();
+        let root = tempfile::tempdir().expect("private session fixture");
+        let config = root.path().join("config");
+        let original = std::env::var_os("COWD_CONFIG_HOME");
+        let restore = ConfigHomeOverride::new(&config);
+        let tmp = root.path().join("cwd");
         fs::create_dir_all(&tmp).expect("create temp dir");
 
         let result = workspace_sessions_dir(&tmp);
@@ -2001,30 +2025,39 @@ mod workspace_sessions_dir_tests {
             "workspace_sessions_dir should succeed for a valid CWD, got: {result:?}"
         );
         let dir = result.unwrap();
+        assert!(dir.starts_with(config.join("sessions/projects")));
         // The returned path should be non-empty and end with a hash component
         assert!(!dir.as_os_str().is_empty());
         // Two calls with the same CWD should produce identical paths (deterministic)
         let result2 = workspace_sessions_dir(&tmp).unwrap();
         assert_eq!(dir, result2, "workspace_sessions_dir must be deterministic");
 
-        fs::remove_dir_all(&tmp).ok();
+        drop(restore);
+        assert_eq!(std::env::var_os("COWD_CONFIG_HOME"), original);
     }
 
     #[test]
     fn workspace_sessions_dir_differs_for_different_cwds() {
-        let tmp_a = std::env::temp_dir().join("cowd-session-dir-a");
-        let tmp_b = std::env::temp_dir().join("cowd-session-dir-b");
+        let _lock = crate::test_env_lock();
+        let root = tempfile::tempdir().expect("private session fixture");
+        let config = root.path().join("config");
+        let original = std::env::var_os("COWD_CONFIG_HOME");
+        let restore = ConfigHomeOverride::new(&config);
+        let tmp_a = root.path().join("cwd-a");
+        let tmp_b = root.path().join("cwd-b");
         fs::create_dir_all(&tmp_a).expect("create dir a");
         fs::create_dir_all(&tmp_b).expect("create dir b");
 
         let dir_a = workspace_sessions_dir(&tmp_a).expect("dir a");
         let dir_b = workspace_sessions_dir(&tmp_b).expect("dir b");
+        assert!(dir_a.starts_with(config.join("sessions/projects")));
+        assert!(dir_b.starts_with(config.join("sessions/projects")));
         assert_ne!(
             dir_a, dir_b,
             "different CWDs must produce different session dirs"
         );
 
-        fs::remove_dir_all(&tmp_a).ok();
-        fs::remove_dir_all(&tmp_b).ok();
+        drop(restore);
+        assert_eq!(std::env::var_os("COWD_CONFIG_HOME"), original);
     }
 }

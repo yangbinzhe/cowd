@@ -4566,31 +4566,10 @@ time.sleep(300)
             name: &str,
             input: &serde_json::Value,
         ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-            use harness_contract::{policy::*, tool::*};
             if name != "read_file" {
                 return None;
             }
-            Some(ToolEffectDescriptor {
-                tool_id: name.into(),
-                descriptor_hash: "topic-read-contract".into(),
-                effect_kind: ToolEffectKind::Read,
-                idempotency: ToolIdempotency::Idempotent,
-                scopes: vec![PermissionScope {
-                    resource: PermissionResource::File,
-                    operation: PermissionOperation::Read,
-                    target: input
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
-                }],
-                required_permission: ToolPermissionMode::ReadOnly,
-                approval_class: ToolApprovalClass::None,
-                uses_network: false,
-                spawns_process: false,
-                mutates_packages: false,
-                mutates_system: false,
-                assessment: EffectAssessment::default(),
-            })
+            Some(self.catalog.pin_snapshot().describe_effect(name, input))
         }
     }
 
@@ -5017,7 +4996,7 @@ assert 'process-working-context-source' in json.dumps(reply['working_context'])
 send('result',result=json.loads(RESULT_JSON))
 "###.replace("RESULT_JSON",&format!("{:?}",result_json))
             .replace("LIMITS_JSON", &format!("{:?}", serde_json::to_string(&limits).unwrap()))
-            .replace("CACHE_SIZE", &MAX_PROCESS_CACHED_TOOL_RESPONSES.to_string());
+            .replace("CACHE_SIZE", &limits.cached_tool_responses.to_string());
         let script = if changed_retry {
             script.replace("reply=receive();assert reply.get('context_delta') is None,reply", "reply=receive();assert reply.get('context_delta') is None,reply\nsend('tool_request',request_id='read-1',tool_name='read_file',input={'path':'different.txt'})\nreceive()")
         } else {
@@ -5073,7 +5052,7 @@ else:
  send('result',result=json.loads(RESULT_JSON))
 "###
                 .replace("CONTENT_CASE", &format!("{case:?}"))
-                .replace("MAX_UPLOADS", &MAX_PROCESS_PENDING_CONTENT_UPLOADS.to_string())
+                .replace("MAX_UPLOADS", &limits.pending_uploads.to_string())
                 .replace("RESULT_JSON", &format!("{result_json:?}"));
             script
                 .replace(
@@ -5136,7 +5115,7 @@ else:
         } else if content_case == Some("sequential") {
             let artifacts: Vec<harness_contract::context::ArtifactRef> =
                 serde_json::from_str(&received.unwrap().outcome).unwrap();
-            assert_eq!(artifacts.len(), MAX_PROCESS_PENDING_CONTENT_UPLOADS + 1);
+            assert_eq!(artifacts.len(), limits.pending_uploads + 1);
             for (index, artifact) in artifacts.iter().enumerate() {
                 let expected = format!("顺序正文{index}").into_bytes();
                 assert_eq!(
@@ -5177,7 +5156,7 @@ else:
                 initial_artifacts
                     + match content_case {
                         Some("commit") => 1,
-                        Some("sequential") => (MAX_PROCESS_PENDING_CONTENT_UPLOADS + 1) as u64,
+                        Some("sequential") => (limits.pending_uploads + 1) as u64,
                         _ => 0,
                     }
             );

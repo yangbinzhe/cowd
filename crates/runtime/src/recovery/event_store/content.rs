@@ -2548,12 +2548,35 @@ mod process_closure_roots_428_tests {
             expected_streams: vec![],
             events: vec![as_input(&primary), as_input(&index)],
         };
-        assert!(store.process_closure_publications(&request).is_err());
+        RuntimeEventStore::validate_process_closure_pair(
+            &request.events[0].event,
+            request.events[0].idempotency_key.as_deref().unwrap(),
+            request.events[0].schema_version,
+            &request.events[1].event,
+            request.events[1].idempotency_key.as_deref().unwrap(),
+            request.events[1].schema_version,
+        )
+        .expect("complete primary/index identity baseline is valid");
+        assert!(
+            matches!(
+                store.process_closure_publications(&request),
+                Err(RuntimeEventStoreError::InvalidTransaction(reason))
+                    if reason == "artifact metadata failed: process closure metadata bounds exceeded"
+            ),
+            "a structurally valid pair still rejects a Live closure artifact"
+        );
         let lone = AppendTransactionRequest {
             events: vec![as_input(&index)],
             ..request
         };
-        assert!(store.process_closure_publications(&lone).is_err());
+        assert!(
+            matches!(
+                store.process_closure_publications(&lone),
+                Err(RuntimeEventStoreError::InvalidTransaction(reason))
+                    if reason == "unowned process closure slot"
+            ),
+            "lone index must fail ownership before artifact lookup"
+        );
     }
 }
 

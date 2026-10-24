@@ -566,8 +566,34 @@ mod tests {
 
     #[test]
     fn jsonl_sink_persists_events() {
-        let path =
-            std::env::temp_dir().join(format!("telemetry-jsonl-{}.log", current_timestamp_ms()));
+        struct TestDirectory(PathBuf);
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let directory = loop {
+            let path = std::env::temp_dir().join(format!(
+                "telemetry-jsonl-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => break TestDirectory(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create private telemetry test directory: {error}"),
+            }
+        };
+        let path = directory.0.join("events.jsonl");
         let sink = JsonlTelemetrySink::new(&path).expect("sink should create file");
 
         sink.record(TelemetryEvent::Analytics(
@@ -575,10 +601,15 @@ mod tests {
         ));
 
         let contents = std::fs::read_to_string(&path).expect("telemetry log should be readable");
-        assert!(contents.contains("\"type\":\"analytics\""));
-        assert!(contents.contains("\"action\":\"turn_completed\""));
-
-        let _ = std::fs::remove_file(path);
+        let events: Vec<Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each telemetry line should be JSON"))
+            .collect();
+        assert_eq!(events.len(), 1, "expected exactly one telemetry event");
+        assert_eq!(events[0]["type"], "analytics");
+        assert_eq!(events[0]["namespace"], "cli");
+        assert_eq!(events[0]["action"], "turn_completed");
+        assert_eq!(events[0]["properties"]["ok"], true);
     }
 
     #[cfg(target_os = "linux")]

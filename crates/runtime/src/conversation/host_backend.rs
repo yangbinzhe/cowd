@@ -301,6 +301,18 @@ fn record_undelivered_guidance(
 
 #[test]
 fn duplicate_result_stubbing_is_on_unless_the_operator_opts_out() {
+    let _lock = crate::test_env_lock();
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("COWD_LOOP_STUB_RESULTS", value),
+                None => std::env::remove_var("COWD_LOOP_STUB_RESULTS"),
+            }
+        }
+    }
+    let original = std::env::var_os("COWD_LOOP_STUB_RESULTS");
+    let restore = Restore(original.clone());
     // Default-on matters: one live delegated Agent issued the same `read_file`
     // sixteen times in a row against a 145k-token context, and the stub that
     // would have broken that loop was opt-in, so it never ran. Only an explicit
@@ -321,7 +333,15 @@ fn duplicate_result_stubbing_is_on_unless_the_operator_opts_out() {
         !result_stub_disabled(),
         "the old opt-in spelling must not silently disable it"
     );
-    std::env::remove_var("COWD_LOOP_STUB_RESULTS");
+    drop(restore);
+    assert_eq!(std::env::var_os("COWD_LOOP_STUB_RESULTS"), original);
+    let result = std::panic::catch_unwind(|| {
+        let _restore = Restore(original.clone());
+        std::env::set_var("COWD_LOOP_STUB_RESULTS", "panic-scope");
+        panic!("exercise environment restoration during unwind");
+    });
+    assert!(result.is_err());
+    assert_eq!(std::env::var_os("COWD_LOOP_STUB_RESULTS"), original);
 }
 
 #[test]

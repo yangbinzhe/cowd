@@ -2324,18 +2324,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual browser regression; set COWD_CHROMIUM to a Chromium binary and run with --ignored --exact"]
     fn chromium_loads_same_origin_app_iframe() {
-        let chromium = [
-            "/snap/bin/chromium",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-        ]
-        .into_iter()
-        .find(|path| Path::new(path).is_file());
-        let Some(chromium) = chromium else {
-            eprintln!("skipping real iframe regression: Chromium is unavailable");
-            return;
-        };
+        let chromium = std::env::var_os("COWD_CHROMIUM").expect(
+            "manual iframe regression requires COWD_CHROMIUM pointing to a Chromium binary",
+        );
+        assert!(
+            Path::new(&chromium).is_file(),
+            "COWD_CHROMIUM must name an existing Chromium binary"
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind iframe regression server");
         listener
             .set_nonblocking(true)

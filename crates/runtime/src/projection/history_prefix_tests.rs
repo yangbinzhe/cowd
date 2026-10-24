@@ -1129,7 +1129,30 @@ async fn own843_malformed_or_foreign_generation_prefix_is_rejected_not_rebuilt()
         .resolve_content(content_scope, &saved.payload["body"], &origin)
         .unwrap();
     let baseline = decode_checkpoint(6, value).unwrap();
-    for fault in ["audit", "position", "generation", "source", "missing", "effect_owner", "effect_cut", "terminal_owner", "terminal_cut", "terminal_pending"] {
+    let terminal_slot = baseline.bindings.keys().next().unwrap().clone();
+    let mut terminal_budget = RequestBudget::default();
+    terminal_budget.capture_source_fence(&services).unwrap();
+    let terminal_read = settlement::read_binding(
+        &services,
+        &baseline,
+        &terminal_slot,
+        baseline.through,
+        &mut terminal_budget,
+    )
+    .expect("original terminal reader supplies the positive proof observations");
+    for fault in [
+        "audit",
+        "position",
+        "generation",
+        "source",
+        "missing",
+        "effect_owner",
+        "effect_cut",
+        "terminal_valid",
+        "terminal_owner",
+        "terminal_cut",
+        "terminal_pending",
+    ] {
         let mut changed = baseline.clone();
         match fault {
             "audit" => changed.prefix.as_mut().unwrap().audit_index = usize::MAX,
@@ -1143,13 +1166,25 @@ async fn own843_malformed_or_foreign_generation_prefix_is_rejected_not_rebuilt()
                 });
             }
             "effect_cut" => changed.prefix.as_mut().unwrap().completed_through = saved.source_cursor + 1,
-            "terminal_owner" | "terminal_cut" => {
-                let slot = changed.bindings.keys().next().unwrap().clone();
-                let identity = if fault == "terminal_owner" { "foreign-terminal-owner".into() }
-                    else { effect_proof_identity(&changed, &slot).unwrap() };
-                changed.terminal_proofs.insert(slot, TerminalBindingProof {
-                    identity, through: saved.source_cursor + 1, read: settlement::ClosureRead::default(),
-                });
+            "terminal_valid" | "terminal_owner" | "terminal_cut" => {
+                let slot = terminal_slot.clone();
+                let identity = if fault == "terminal_owner" {
+                    "foreign-terminal-owner".into()
+                } else {
+                    effect_proof_identity(&changed, &slot).unwrap()
+                };
+                changed.terminal_proofs.insert(
+                    slot,
+                    TerminalBindingProof {
+                        identity,
+                        through: if fault == "terminal_cut" {
+                            saved.source_cursor + 1
+                        } else {
+                            baseline.through
+                        },
+                        read: terminal_read.clone(),
+                    },
+                );
             }
             "terminal_pending" => changed.terminal_pending = Some(TerminalMemo {
                 slot: "foreign-terminal-slot".into(), identity: "foreign".into(),
@@ -1201,12 +1236,14 @@ async fn own843_malformed_or_foreign_generation_prefix_is_rejected_not_rebuilt()
         write.unwrap();
         let mut budget = RequestBudget::default();
         budget.enable_incremental();
-        assert!(
-            super::super::load_scope_budgeted(&services, &scope, through, false, &mut budget)
-                .is_err(),
-            "{fault}"
-        );
-        assert!(budget.checkpoints.is_empty());
+        let result =
+            super::super::load_scope_budgeted(&services, &scope, through, false, &mut budget);
+        if fault == "terminal_valid" {
+            assert!(result.is_ok(), "valid terminal proof baseline: {result:?}");
+        } else {
+            assert!(result.is_err(), "{fault}");
+            assert!(budget.checkpoints.is_empty());
+        }
     }
     services.shutdown_execution().await;
     services.shutdown_maintenance().await;

@@ -925,24 +925,41 @@ mod tests {
         assert_eq!(plane.stats().timed_out_waiters, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn blocking_adapter_does_not_stall_the_async_runtime() {
         let ticks = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&ticks);
+        let (entered, began) = tokio::sync::oneshot::channel();
+        let (progress, progressed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        // This thread can release even an adapter that blocks the sole runtime
+        // thread. A Tokio timeout alone cannot break that regression.
+        let watchdog = std::thread::spawn(move || {
+            let heartbeat_before_release = progressed.recv_timeout(Duration::from_secs(5));
+            let _ = release.send(());
+            heartbeat_before_release
+        });
         let heartbeat = tokio::spawn(async move {
+            began.await.expect("blocking operation entered");
             for _ in 0..5 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 observed.fetch_add(1, Ordering::SeqCst);
             }
+            let _ = progress.send(());
         });
 
-        ToolExecutionPlane::adapt_blocking(|| {
-            std::thread::sleep(Duration::from_millis(40));
+        let result = ToolExecutionPlane::adapt_blocking(move || {
+            entered.send(()).expect("heartbeat awaits entry");
+            released
+                .recv()
+                .expect("external watchdog releases operation");
         })
-        .await
-        .expect("blocking adapter");
+        .await;
+        let heartbeat_before_release = watchdog.join().expect("external watchdog thread");
+        result.expect("blocking adapter");
         heartbeat.await.expect("heartbeat task");
 
+        heartbeat_before_release.expect("async heartbeat must progress before blocking release");
         assert_eq!(ticks.load(Ordering::SeqCst), 5);
     }
 

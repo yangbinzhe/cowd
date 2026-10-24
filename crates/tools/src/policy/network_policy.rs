@@ -419,7 +419,10 @@ mod tests {
         let _guard = crate::test_process_environment_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var_os("COWD_ALLOW_PRIVATE_NETWORK");
+        let _restore = RestoreEnvironment {
+            name: "COWD_ALLOW_PRIVATE_NETWORK",
+            previous: std::env::var_os("COWD_ALLOW_PRIVATE_NETWORK"),
+        };
         std::env::remove_var("COWD_ALLOW_PRIVATE_NETWORK");
         let receipt = policy(NetworkDomainMode::Allow, &["127.0.0.1"], &[])
             .enforce_domain("127.0.0.1", false)
@@ -429,10 +432,6 @@ mod tests {
             .violations
             .iter()
             .any(|violation| violation.reason.contains("private")));
-        match previous {
-            Some(value) => std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", value),
-            None => std::env::remove_var("COWD_ALLOW_PRIVATE_NETWORK"),
-        }
     }
 
     #[test]
@@ -456,13 +455,27 @@ mod tests {
         let _guard = crate::test_process_environment_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var_os("COWD_NETWORK_DOMAIN_MODE");
+        let _restore = RestoreEnvironment {
+            name: "COWD_NETWORK_DOMAIN_MODE",
+            previous: std::env::var_os("COWD_NETWORK_DOMAIN_MODE"),
+        };
         std::env::set_var("COWD_NETWORK_DOMAIN_MODE", "denny");
         let policy = NetworkDomainPolicy::from_env();
         assert_eq!(policy.mode, NetworkDomainMode::Deny);
-        match previous {
-            Some(value) => std::env::set_var("COWD_NETWORK_DOMAIN_MODE", value),
-            None => std::env::remove_var("COWD_NETWORK_DOMAIN_MODE"),
+    }
+
+    // Declared after the original process lock so restoration precedes unlock.
+    struct RestoreEnvironment {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for RestoreEnvironment {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
         }
     }
 }

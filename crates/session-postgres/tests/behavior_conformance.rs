@@ -804,25 +804,54 @@ fn checkpoint_batch_timestamp_overflow_rolls_back_without_partial_event() {
         .create_session(&make_record("s-checkpoint-timestamp-overflow"))
         .unwrap();
     let checkpoint_id = "checkpoint-timestamp-overflow";
-    let event = SessionEvent {
-        session_id: "s-checkpoint-timestamp-overflow".to_string(),
-        event_type: SESSION_DOMAIN_EVENT_TYPE.to_string(),
-        event_json: serde_json::json!({
-            "kind": "memory.semantic_checkpoint.created",
-            "payload": {"checkpoint": {"checkpoint_id": checkpoint_id}},
-        })
-        .to_string(),
-        sequence: usize::MAX,
-        created_at_ms: u64::MAX,
-    };
+    let event = SessionDomainEvent::new(
+        "s-checkpoint-timestamp-overflow",
+        usize::MAX,
+        SessionDomainScope::Memory,
+        "memory.semantic_checkpoint.created",
+        serde_json::json!({"checkpoint": {"checkpoint_id": checkpoint_id}}),
+        1,
+    )
+    .to_session_event()
+    .unwrap();
+    // A separate namespace keeps this exact session/checkpoint fresh for the
+    // overflow attempt: only the outer persisted timestamp differs.
+    let (_baseline_fixture, baseline_store) = make_store();
+    baseline_store
+        .create_session(&make_record("s-checkpoint-timestamp-overflow"))
+        .unwrap();
+    let baseline = baseline_store
+        .append_events_allocating_sequence_if_checkpoint_absent(
+            std::slice::from_ref(&event),
+            checkpoint_id,
+        )
+        .expect("legal envelope and representable timestamp must append")
+        .expect("baseline checkpoint must be fresh");
+    assert_eq!(baseline.len(), 1);
+    assert_eq!(
+        baseline_store
+            .get_events("s-checkpoint-timestamp-overflow", 0)
+            .unwrap(),
+        baseline
+    );
+    let mut overflow = event.clone();
+    overflow.created_at_ms = u64::MAX;
 
     assert!(store
-        .append_events_allocating_sequence_if_checkpoint_absent(&[event], checkpoint_id)
+        .append_events_allocating_sequence_if_checkpoint_absent(&[overflow], checkpoint_id)
         .is_err());
     assert!(store
         .get_events("s-checkpoint-timestamp-overflow", 0)
         .unwrap()
         .is_empty());
+    assert_eq!(
+        store
+            .append_events_allocating_sequence_if_checkpoint_absent(&[event], checkpoint_id)
+            .expect("overflow must roll back checkpoint admission too")
+            .expect("checkpoint remains absent after rollback")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -1086,16 +1115,18 @@ fn source_message_and_outbox_are_atomic_and_idempotent() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn classifier_rejections_are_auditable_terminal_inputs_and_never_runnable() {
-    for (suffix, decision, expected_status) in [
+    for (suffix, decision, expected_status, expected_kind) in [
         (
             "duplicate",
             InputRoutingDecision::RejectDuplicate,
             SessionRuntimeInputStatus::RejectedDuplicate,
+            "session.input.rejected_duplicate.v1",
         ),
         (
             "policy",
             InputRoutingDecision::RejectPolicy,
             SessionRuntimeInputStatus::RejectedPolicy,
+            "session.input.rejected_policy.v1",
         ),
     ] {
         let (_fixture, store) = make_store();
@@ -1135,9 +1166,9 @@ fn classifier_rejections_are_auditable_terminal_inputs_and_never_runnable() {
                 .map(|event| event.kind.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                SessionRuntimeInputStatus::Accepted.timeline_event_kind(),
-                SessionRuntimeInputStatus::Classified.timeline_event_kind(),
-                expected_status.timeline_event_kind(),
+                "session.input.accepted.v1",
+                "session.input.classified.v1",
+                expected_kind,
             ]
         );
         assert_eq!(

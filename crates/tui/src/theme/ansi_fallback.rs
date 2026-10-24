@@ -168,8 +168,26 @@ pub fn to_terminal_color(r: u8, g: u8, b: u8) -> Color {
 mod tests {
     use super::*;
 
+    // Shared by every COLORTERM-mutating test; OSC 52 owns disjoint TMUX/STY.
+    static COLORTERM_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RestoreColorterm(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreColorterm {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("COLORTERM", value),
+                None => std::env::remove_var("COLORTERM"),
+            }
+        }
+    }
+
     #[test]
     fn detects_no_truecolor() {
+        let _guard = COLORTERM_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = RestoreColorterm(std::env::var_os("COLORTERM"));
         // When COLORTERM is unset, detect_truecolor should return false
         std::env::remove_var("COLORTERM");
         assert!(!detect_truecolor());
@@ -191,15 +209,13 @@ mod tests {
 
     #[test]
     fn truecolor_passthrough() {
-        let old = std::env::var("COLORTERM").ok();
+        let _guard = COLORTERM_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = RestoreColorterm(std::env::var_os("COLORTERM"));
         std::env::set_var("COLORTERM", "truecolor");
         let c = to_terminal_color(100, 150, 200);
         assert_eq!(c, Color::Rgb(100, 150, 200));
-        // Restore original state
-        match old {
-            Some(v) => std::env::set_var("COLORTERM", v),
-            None => std::env::remove_var("COLORTERM"),
-        }
     }
 
     #[test]

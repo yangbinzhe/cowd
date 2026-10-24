@@ -964,18 +964,29 @@ async fn list_sessions_returns_empty() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["sessions"], serde_json::json!([]));
+    assert_eq!(json["total"], 0);
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["limit"], 20);
+    assert_eq!(json["sort"], "updated_at");
+    assert_eq!(json["order"], "desc");
+    assert!(json.get("error").is_none());
 }
 
 #[tokio::test]
 async fn list_sessions_reads_unified_store_metadata() {
     let store = Arc::new(crate::pg_test_support::session_store());
-    store
-        .create_session(&new_api_session_record(
-            "stored-session",
-            Some("test-model".into()),
-        ))
-        .await
-        .unwrap();
+    let mut record = new_api_session_record("stored-session", Some("test-model".into()));
+    record.metadata_json =
+        Some(serde_json::json!({"title": "Stored session metadata"}).to_string());
+    record.message_count = 7;
+    record.input_tokens = 123;
+    record.output_tokens = 45;
+    record.created_at = "2026-06-04T00:00:00Z".to_string();
+    record.last_activity = "2026-06-04T00:03:00Z".to_string();
+    store.create_session(&record).await.unwrap();
     let state = test_state_with_store(store.clone());
     let app = api_router(state);
 
@@ -990,6 +1001,29 @@ async fn list_sessions_reads_unified_store_metadata() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json.get("error").is_none(),
+        "session catalog failed: {json}"
+    );
+    assert_eq!(json["total"], 1);
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["limit"], 20);
+    assert_eq!(json["sort"], "updated_at");
+    assert_eq!(json["order"], "desc");
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session["id"], "stored-session");
+    assert_eq!(session["title"], "Stored session metadata");
+    assert_eq!(session["model"], "test-model");
+    assert_eq!(session["status"], "active");
+    assert_eq!(session["message_count"], 7);
+    assert_eq!(session["input_tokens"], 123);
+    assert_eq!(session["output_tokens"], 45);
+    assert_eq!(session["created_at"], "2026-06-04T00:00:00Z");
+    assert_eq!(session["updated_at"], "2026-06-04T00:03:00Z");
 }
 
 #[tokio::test]

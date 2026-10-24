@@ -956,13 +956,10 @@ async fn health_logs_restart_and_global_limits_are_enforced() {
 #[tokio::test]
 async fn shutdown_drains_leases_then_leaves_no_child() {
     let (root, snapshot, ids) = fixture(&[app("shutdown", AppActivationPolicyV1::Lazy, false)]);
+    let connector = Arc::new(FakeConnector::new([], Duration::ZERO));
     let supervisor = Arc::new(
-        AppRuntimeSupervisor::new(
-            snapshot,
-            Arc::new(FakeConnector::new([], Duration::ZERO)),
-            config(root.path()),
-        )
-        .expect("supervisor"),
+        AppRuntimeSupervisor::new(snapshot, Arc::clone(&connector), config(root.path()))
+            .expect("supervisor"),
     );
     let lease = supervisor
         .acquire(
@@ -974,16 +971,40 @@ async fn shutdown_drains_leases_then_leaves_no_child() {
         .await
         .expect("lease");
     let pid = lease.connection().pid;
-    let shutdown = {
-        let supervisor = Arc::clone(&supervisor);
-        tokio::spawn(async move { supervisor.shutdown().await })
-    };
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(!shutdown.is_finished(), "shutdown skipped lease drain");
+    let slot = supervisor.inner.slot(&ids[0].0).expect("admitted app slot");
+    // The current-thread test does not yield between releasing this state lock
+    // and polling shutdown. Its first Pending is therefore not a busy slot lock.
+    drop(slot.state.lock().await);
+    let shutdown = supervisor.shutdown();
+    tokio::pin!(shutdown);
+    let pending_with_lease = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx).is_pending())
+    })
+    .await;
+    let held_state = slot.state.try_lock().expect("shutdown released slot state");
+    let held_lease = held_state.active_leases == 1
+        && held_state.connection.is_some()
+        && held_state.worker.is_some()
+        && held_state.lifecycle != AppLifecycleStateV1::Stopping;
+    drop(held_state);
+    let entered_shutdown = supervisor.inner.shutting_down.load(Ordering::Acquire);
+    let disconnected_while_held = connector.disconnect_count();
     lease.release().await;
     let released_at = Instant::now();
-    shutdown.await.expect("shutdown task").expect("shutdown");
+    // A completed future must not be polled again, even on the failure path.
+    if pending_with_lease {
+        shutdown.await.expect("shutdown");
+    }
     let shutdown_elapsed = released_at.elapsed();
+    assert!(pending_with_lease, "shutdown skipped lease drain");
+    assert!(
+        entered_shutdown && held_lease,
+        "shutdown must wait with its original leased child retained"
+    );
+    assert_eq!(
+        disconnected_while_held, 0,
+        "lease must prevent physical disconnect"
+    );
     assert!(shutdown_elapsed <= Duration::from_millis(100) + Duration::from_secs(1));
     assert!(
         !Path::new("/proc").join(pid.to_string()).exists(),

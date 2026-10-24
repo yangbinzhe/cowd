@@ -21,6 +21,7 @@ mod perf {
     fn json_parsing_performance() {
         use crate::types::{InputContentBlock, InputMessage};
 
+        let mut last_parsed = None;
         let start = Instant::now();
         for _ in 0..1000 {
             let msg = InputMessage {
@@ -30,13 +31,27 @@ mod perf {
                 }],
             };
             let json = serde_json::to_string(&msg).unwrap();
-            let _parsed: InputMessage = serde_json::from_str(&json).unwrap();
+            last_parsed = Some(serde_json::from_str::<InputMessage>(&json).unwrap());
         }
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() < 200,
             "json roundtrip too slow: {:?}",
             elapsed
+        );
+
+        // Check the wire contract independently of the serializer and timed loop.
+        let parsed: InputMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"benchmark test message content"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(last_parsed.as_ref(), Some(&parsed));
+        assert_eq!(parsed.role, "user");
+        assert_eq!(
+            parsed.content,
+            vec![InputContentBlock::Text {
+                text: "benchmark test message content".to_string(),
+            }]
         );
     }
 }

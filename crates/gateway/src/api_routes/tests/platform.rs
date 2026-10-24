@@ -1475,8 +1475,7 @@
 
     #[tokio::test]
     async fn memory_packet_returns_explainable_packet() {
-        let tmp =
-            std::env::temp_dir().join(format!("cowd-api-memory-packet-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-packet-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
             crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
@@ -1505,6 +1504,7 @@
             source_agent: Some("api".to_string()),
             visibility: AgentVisibility::Shared,
         };
+        let entry_id = entry.id;
         manager.remember(entry).await.unwrap();
 
         let app = api_router(test_state_with_memory(manager));
@@ -1521,15 +1521,36 @@
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["enabled"], true);
-        assert!(json["packet"]["selected"].as_array().unwrap().len() <= 5);
+        assert_eq!(json["query"], "PACKET_API_ALPHA");
+        assert_eq!(json["degraded"], false);
+        assert_eq!(json["degraded_reason"], serde_json::Value::Null);
+        let selected = json["packet"]["selected"].as_array().unwrap();
+        assert!(!selected.is_empty() && selected.len() <= 5);
+        let item = selected
+            .iter()
+            .find(|item| item["atom"]["id"] == entry_id.to_string())
+            .expect("packet must select the seeded memory");
+        assert_eq!(item["atom"]["title"], "PACKET_API_ALPHA");
+        assert_eq!(item["atom"]["layer"], "L2");
+        assert_eq!(
+            item["atom"]["evidence_pointer"],
+            format!("memory:{entry_id}")
+        );
+        assert_eq!(item["role"], "Orientation");
+        assert!(item["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()));
+        assert_eq!(
+            item["content_preview"],
+            "PACKET_API_ALPHA should appear in an explainable packet."
+        );
 
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[tokio::test]
     async fn memory_links_returns_kernel_links() {
-        let tmp =
-            std::env::temp_dir().join(format!("cowd-api-memory-links-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-links-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
             crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
@@ -1576,6 +1597,7 @@
             source_agent: None,
             visibility: AgentVisibility::Shared,
         };
+        let source_id = source.id;
         manager.remember(source).await.unwrap();
 
         let app = api_router(test_state_with_memory(manager));
@@ -1591,7 +1613,18 @@
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["total"].as_u64().unwrap() >= 1);
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["degraded"], false);
+        assert_eq!(json["degraded_reason"], serde_json::Value::Null);
+        let links: Vec<memory::MemoryLink> = serde_json::from_value(json["links"].clone()).unwrap();
+        assert_eq!(json["total"].as_u64().unwrap(), links.len() as u64);
+        let link = links
+            .iter()
+            .find(|link| link.from == source_id && link.to == target_id)
+            .expect("kernel links must contain the seeded directed relation");
+        assert_eq!(link.kind, memory::MemoryLinkKind::DependsOn);
+        assert_eq!(link.weight, 0.8);
+        assert_eq!(link.evidence, "relation:DependsOn");
 
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -2049,7 +2082,7 @@
     }
 
     #[tokio::test]
-    async fn config_returns_version() {
+    async fn config_returns_redacted_runtime_configuration() {
         let state = test_state();
         let app = api_router(state);
         let response = app
@@ -2062,6 +2095,16 @@
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.is_object(),
+            "runtime configuration must be a JSON object"
+        );
+        assert!(
+            json.get("error").is_none(),
+            "configuration must load without fallback"
+        );
     }
 
     #[tokio::test]

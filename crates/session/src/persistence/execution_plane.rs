@@ -1086,24 +1086,80 @@ mod tests {
     #[tokio::test]
     async fn blocking_job_does_not_block_tokio_heartbeat() {
         let plane = Arc::new(plane(1, 2));
-        let task = {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel();
+        let forced_release = Arc::new(AtomicBool::new(false));
+        // This thread can release even a broken implementation running inline on Tokio.
+        let watchdog = {
+            let release = release.clone();
+            let forced_release = Arc::clone(&forced_release);
+            std::thread::spawn(move || {
+                if watchdog_stopped
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_err()
+                {
+                    forced_release.store(true, Ordering::Release);
+                    let _ = release.send(());
+                }
+            })
+        };
+        let mut task = {
             let plane = Arc::clone(&plane);
             tokio::spawn(async move {
                 plane
-                    .execute(StorageExecutionLane::InteractiveRead, false, || {
-                        std::thread::sleep(Duration::from_millis(40));
+                    .execute(StorageExecutionLane::InteractiveRead, false, move || {
+                        let _ = entered.send(());
+                        released.recv().expect("explicit job release");
                         Ok(())
                     })
                     .await
             })
         };
-        tokio::time::timeout(
+        let started = tokio::time::timeout(Duration::from_secs(2), started).await;
+        let heartbeat = tokio::time::timeout(
             Duration::from_millis(15),
             tokio::time::sleep(Duration::from_millis(2)),
         )
-        .await
-        .expect("Tokio timer must progress");
-        task.await.expect("task").expect("job");
+        .await;
+        let held_stats = plane.stats();
+        let held = !task.is_finished() && !forced_release.load(Ordering::Acquire);
+
+        // Release and finish cleanup before asserting any observations.
+        let explicit_release = release.send(());
+        let _ = stop_watchdog.send(());
+        let watchdog_result = watchdog.join();
+        let job = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        if job.is_err() {
+            task.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
+        let drained = plane.shutdown_and_drain(Duration::from_secs(2)).await;
+
+        started
+            .expect("job entry deadline")
+            .expect("closure entered");
+        heartbeat.expect("Tokio timer must progress before job release");
+        assert!(held, "heartbeat must run while the closure is held");
+        assert_eq!(held_stats.active, 1);
+        assert_eq!(held_stats.queued, 0);
+        assert_eq!(held_stats.completed, 0);
+        assert_eq!(held_stats.interactive_read.active, 1);
+        explicit_release.expect("test releases the held closure");
+        watchdog_result.expect("watchdog thread");
+        assert!(
+            !forced_release.load(Ordering::Acquire),
+            "watchdog released job"
+        );
+        job.expect("job completion deadline")
+            .expect("task")
+            .expect("job");
+        let stats = drained.expect("bounded cleanup drain");
+        assert!(stats.drained);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.interactive_read.completed, 1);
     }
 
     #[tokio::test]
@@ -1350,27 +1406,88 @@ mod tests {
     #[tokio::test]
     async fn dropping_started_waiter_does_not_cancel_the_transaction() {
         let plane = Arc::new(plane(1, 1));
-        let completed = Arc::new(AtomicBool::new(false));
-        let waiter = {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel();
+        let forced_release = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let release = release.clone();
+            let forced_release = Arc::clone(&forced_release);
+            std::thread::spawn(move || {
+                if watchdog_stopped
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_err()
+                {
+                    forced_release.store(true, Ordering::Release);
+                    let _ = release.send(());
+                }
+            })
+        };
+        let mut waiter = {
             let plane = Arc::clone(&plane);
-            let completed = Arc::clone(&completed);
             tokio::spawn(async move {
                 plane
                     .execute(StorageExecutionLane::InteractiveWrite, true, move || {
-                        std::thread::sleep(Duration::from_millis(30));
-                        completed.store(true, Ordering::Release);
+                        let _ = entered.send(());
+                        released.recv().expect("explicit transaction release");
+                        let _ = completed.send(());
                         Ok(())
                     })
                     .await
             })
         };
-        wait_until(|| plane.stats().active == 1).await;
+        let started = tokio::time::timeout(Duration::from_secs(2), started).await;
+        let held_stats = plane.stats();
         waiter.abort();
-        let _ = waiter.await;
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(completed.load(Ordering::Acquire));
-        assert_eq!(plane.stats().completed, 1);
-        assert_eq!(plane.stats().active, 0);
+        let aborted = tokio::time::timeout(Duration::from_secs(2), &mut waiter).await;
+        let after_abort = plane.stats();
+        let explicit_release = release.send(());
+        let _ = stop_watchdog.send(());
+        let watchdog_result = watchdog.join();
+        let completion = tokio::time::timeout(Duration::from_secs(2), completion).await;
+        let settled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stats = plane.stats();
+                if stats.completed == 1 && stats.active == 0 {
+                    break stats;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if aborted.is_err() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+        }
+        let drained = plane.shutdown_and_drain(Duration::from_secs(2)).await;
+
+        started
+            .expect("transaction entry deadline")
+            .expect("closure entered");
+        assert_eq!(held_stats.active, 1);
+        assert_eq!(held_stats.completed, 0);
+        assert_eq!(held_stats.interactive_write.active, 1);
+        assert!(aborted
+            .expect("waiter abort deadline")
+            .expect_err("aborted waiter")
+            .is_cancelled());
+        assert_eq!(after_abort.active, 1);
+        assert_eq!(after_abort.completed, 0);
+        explicit_release.expect("test releases the transaction after abort");
+        watchdog_result.expect("watchdog thread");
+        assert!(
+            !forced_release.load(Ordering::Acquire),
+            "watchdog released transaction"
+        );
+        completion
+            .expect("transaction completion deadline")
+            .expect("closure completed");
+        let stats = settled.expect("completed transaction releases capacity");
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.interactive_write.completed, 1);
+        assert!(drained.expect("bounded cleanup drain").drained);
     }
 
     #[tokio::test]

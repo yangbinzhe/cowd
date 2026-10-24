@@ -566,6 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_store_adapter_roundtrips_verified_raw_payload() {
+        let artifact_root = tempfile::tempdir().expect("artifact tempdir");
         let store = Arc::new(crate::test_support::session_store());
         store
             .create_session(&session::SessionRecord {
@@ -587,7 +588,7 @@ mod tests {
             .unwrap();
         let artifacts = Arc::new(
             crate::ArtifactStore::for_test(
-                tempfile::tempdir().unwrap().keep(),
+                artifact_root.path().to_path_buf(),
                 crate::ArtifactStoreConfig::default(),
             )
             .expect("artifact store"),

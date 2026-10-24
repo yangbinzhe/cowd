@@ -214,10 +214,12 @@ mod structured_output_probe {
     }
 
     #[test]
+    #[ignore = "manual: no approved real arbiter fixture; set COWD_REAL_ARBITER_TERMINAL_FIXTURE to an approved capture and run with --ignored --exact"]
     fn real_arbiter_terminal_extracts_all_contract_fields() {
-        let Ok(text) = std::fs::read_to_string("/tmp/arbiter_final.txt") else {
-            return;
-        };
+        let fixture = std::env::var_os("COWD_REAL_ARBITER_TERMINAL_FIXTURE")
+            .expect("manual real arbiter test requires an approved fixture path");
+        let text = std::fs::read_to_string(fixture)
+            .expect("explicitly requested real arbiter fixture must be readable UTF-8");
         let parsed = structured_agent_output(&text);
         assert!(
             parsed.is_some(),

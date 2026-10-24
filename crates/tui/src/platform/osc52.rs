@@ -80,6 +80,22 @@ fn base64_encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    // TMUX/STY are disjoint from the ANSI tests' COLORTERM domain.
+    static MULTIPLEXER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RestoreMultiplexer([(&'static str, Option<std::ffi::OsString>); 2]);
+
+    impl Drop for RestoreMultiplexer {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     #[test]
     fn base64_basic() {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
@@ -91,9 +107,31 @@ mod tests {
 
     #[test]
     fn osc52_sequence_structure() {
+        let _guard = MULTIPLEXER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore =
+            RestoreMultiplexer(["TMUX", "STY"].map(|name| (name, std::env::var_os(name))));
+        std::env::remove_var("TMUX");
+        std::env::remove_var("STY");
         let seq = build_osc52_sequence("c", "aGVsbG8=");
         assert!(
             seq.contains("\x1b]52;c;aGVsbG8=\x07") || seq.contains("tmux") || seq.contains("P")
+        );
+        assert_eq!(seq.as_bytes(), b"\x1b]52;c;aGVsbG8=\x07");
+
+        std::env::set_var("TMUX", "test-tmux");
+        std::env::remove_var("STY");
+        assert_eq!(
+            build_osc52_sequence("c", "aGVsbG8=").as_bytes(),
+            b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\"
+        );
+
+        std::env::remove_var("TMUX");
+        std::env::set_var("STY", "test-screen");
+        assert_eq!(
+            build_osc52_sequence("c", "aGVsbG8=").as_bytes(),
+            b"\x1bP\x1b]52;c;aGVsbG8=\x07\x1b\\"
         );
     }
 }

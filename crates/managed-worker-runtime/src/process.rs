@@ -1290,9 +1290,51 @@ time.sleep(60)
         fs::remove_dir_all(runtime).expect("cleanup");
     }
 
+    struct RejectedWorkerPaths {
+        runtime: PathBuf,
+        bundle: Option<PathBuf>,
+    }
+
+    impl RejectedWorkerPaths {
+        fn reserve(label: &str) -> Self {
+            let runtime = temp_path(label);
+            let bundle = runtime.with_extension("bundle");
+            assert_ne!(runtime, bundle);
+            fs::create_dir(&runtime).expect("reserve exclusive runtime directory");
+            let mut owned = Self {
+                runtime,
+                bundle: None,
+            };
+            fs::create_dir(&bundle).expect("reserve exclusive matching bundle directory");
+            owned.bundle = Some(bundle);
+            owned
+        }
+    }
+
+    impl Drop for RejectedWorkerPaths {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.runtime);
+            if let Some(bundle) = &self.bundle {
+                let _ = fs::remove_dir_all(bundle);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn enforced_mode_rejects_a_fake_cgroup_hierarchy_before_spawn() {
-        let mut spec = shell_spec("fake-cgroup", "sleep 60");
+        let owned = RejectedWorkerPaths::reserve("fake-cgroup");
+        let runtime = owned.runtime.clone();
+        let bundle = owned.bundle.as_ref().unwrap().clone();
+        let mut spec = configure_test_spec(
+            ManagedWorkerSpec::new("/bin/sh", &runtime, "generation-1").args(["-c", "sleep 60"]),
+        );
+        spec.require_socket = false;
+        spec.startup_timeout = Duration::from_secs(2);
+        spec.graceful_shutdown_timeout = Duration::from_millis(150);
+        spec.log_capacity_bytes = 1024;
+        assert_eq!(spec.runtime_dir, runtime);
+        assert_eq!(spec.bundle_dir, bundle);
+        assert!(runtime.is_dir() && bundle.is_dir());
         spec.isolation_mode = IsolationModeV1::Enforce;
         let fake = spec.runtime_dir.join("fake-cgroup");
         fs::create_dir_all(&fake).expect("fake hierarchy");
@@ -1303,16 +1345,34 @@ time.sleep(60)
             ManagedWorkerHandle::spawn(spec).await,
             Err(ManagedWorkerError::Launcher(message)) if message.contains("not a v2 hierarchy")
         ));
+        drop(owned);
+        assert!(!runtime.exists());
+        assert!(!bundle.exists());
     }
 
     #[tokio::test]
     async fn launcher_artifact_tamper_is_rejected_before_spawn() {
-        let mut spec = shell_spec("tampered-launcher", "sleep 60");
+        let owned = RejectedWorkerPaths::reserve("tampered-launcher");
+        let runtime = owned.runtime.clone();
+        let bundle = owned.bundle.as_ref().unwrap().clone();
+        let mut spec = configure_test_spec(
+            ManagedWorkerSpec::new("/bin/sh", &runtime, "generation-1").args(["-c", "sleep 60"]),
+        );
+        spec.require_socket = false;
+        spec.startup_timeout = Duration::from_secs(2);
+        spec.graceful_shutdown_timeout = Duration::from_millis(150);
+        spec.log_capacity_bytes = 1024;
+        assert_eq!(spec.runtime_dir, runtime);
+        assert_eq!(spec.bundle_dir, bundle);
+        assert!(runtime.is_dir() && bundle.is_dir());
         spec.launcher_sha256 = "sha256:00".to_string();
         assert!(matches!(
             ManagedWorkerHandle::spawn(spec).await,
             Err(ManagedWorkerError::Launcher(message)) if message.contains("digest mismatch")
         ));
+        drop(owned);
+        assert!(!runtime.exists());
+        assert!(!bundle.exists());
     }
 
     #[tokio::test]

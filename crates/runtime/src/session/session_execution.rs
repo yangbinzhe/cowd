@@ -1370,7 +1370,8 @@ mod tests {
 
     struct SlowCountingExecutor {
         calls: AtomicUsize,
-        delay: Duration,
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<SessionRuntimeOutboxRecord>>>,
+        release: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1381,7 +1382,12 @@ mod tests {
             _content: &str,
         ) -> Result<SessionIngressExecutionReceipt, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(record.clone());
+            }
+            tokio::time::timeout(Duration::from_secs(5), self.release.notified())
+                .await
+                .map_err(|_| "test executor release deadline".to_string())?;
             Ok(SessionIngressExecutionReceipt {
                 graph_id: session_ingress_graph_id(
                     &record.session_id,
@@ -1436,25 +1442,100 @@ mod tests {
             .persist_input("s1", "slow", &request)
             .await
             .unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
         let executor = Arc::new(SlowCountingExecutor {
             calls: AtomicUsize::new(0),
-            delay: Duration::from_millis(1_500),
+            started: std::sync::Mutex::new(Some(entered)),
+            release: tokio::sync::Notify::new(),
         });
-        let task = {
+        let mut task = {
             let router = Arc::clone(&router_a);
             let executor = Arc::clone(&executor);
             tokio::spawn(async move { router.route_pending_with(executor.as_ref(), 1).await })
         };
-        // Wait past the first 1/3-lease heartbeat but remain comfortably
-        // inside the renewed lease. Tiny 5-30ms wall-clock windows become a
-        // scheduler-contention test when the full suite runs in parallel.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let second = router_b
-            .route_pending_with(executor.as_ref(), 1)
-            .await
-            .unwrap();
+        struct Cleanup {
+            abort: tokio::task::AbortHandle,
+            executor: Arc<SlowCountingExecutor>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.executor.release.notify_one();
+                self.abort.abort();
+            }
+        }
+        let _cleanup = Cleanup {
+            abort: task.abort_handle(),
+            executor: Arc::clone(&executor),
+        };
+        let observation = tokio::time::timeout(Duration::from_secs(3), async {
+            let original = started
+                .await
+                .expect("executor actually entered with a claim");
+            let original_expiry = original.claim_expires_at_ms.expect("original claim expiry");
+            let initial = store
+                .get_session_runtime_outbox("long-r1")
+                .await
+                .unwrap()
+                .expect("durable running claim");
+            loop {
+                let renewed = store
+                    .get_session_runtime_outbox("long-r1")
+                    .await
+                    .unwrap()
+                    .expect("durable renewed claim");
+                let before = now_ms();
+                if before > original_expiry
+                    && renewed.revision > original.revision
+                    && renewed
+                        .claim_expires_at_ms
+                        .is_some_and(|expiry| before < expiry)
+                {
+                    let second = router_b.route_pending_with(executor.as_ref(), 1).await;
+                    let after = now_ms();
+                    let retained = store
+                        .get_session_runtime_outbox("long-r1")
+                        .await
+                        .unwrap()
+                        .expect("claim remains durable after worker B probe");
+                    break (original, initial, renewed, retained, before, second, after);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        executor.release.notify_one();
+        let completion = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        if completion.is_err() {
+            task.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        }
+        let (original, initial, renewed, retained, before, second, after) =
+            observation.expect("observe renewal after original expiry within deadline");
+        assert_eq!(original.claim_owner.as_deref(), Some("worker-a"));
+        assert!(original.claim_token.is_some());
+        assert!(original.claim_fence_epoch.is_some());
+        for snapshot in [&initial, &renewed, &retained] {
+            assert_eq!(snapshot.status, session::SessionRuntimeInputStatus::Running);
+            assert_eq!(snapshot.claim_owner, original.claim_owner);
+            assert_eq!(snapshot.claim_token, original.claim_token);
+            assert_eq!(snapshot.claim_fence_epoch, original.claim_fence_epoch);
+            assert_eq!(snapshot.session_generation, original.session_generation);
+        }
+        assert!(initial.revision >= original.revision);
+        assert!(renewed.revision > original.revision);
+        assert!(renewed.claim_expires_at_ms > original.claim_expires_at_ms);
+        assert!(before > original.claim_expires_at_ms.unwrap());
+        assert!(after < renewed.claim_expires_at_ms.unwrap());
+        let second = second.unwrap();
         assert_eq!(second.claimed, 0, "renewed lease must not be reclaimed");
-        assert_eq!(task.await.unwrap().unwrap().materialized, 1);
+        assert_eq!(
+            completion
+                .expect("completion deadline")
+                .unwrap()
+                .unwrap()
+                .materialized,
+            1
+        );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     }
 
