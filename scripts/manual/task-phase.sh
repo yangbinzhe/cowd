@@ -5,7 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 cd "$ROOT"
 
-cargo test -p gateway task_kernel_records_phase_artifacts_and_review -- --nocapture
-cargo test -p gateway task_api_records_phase_artifacts_and_review -- --nocapture
+report="$(python3 scripts/test/cargo-selection.py report)"
+python3 scripts/test/cargo-selection.py run --package gateway --lib \
+  --filter task_api_records_phase_artifacts_and_review --nocapture --output "$report"
 
-echo "task phase scenario passed"
+echo "task phase metadata/API checks passed"

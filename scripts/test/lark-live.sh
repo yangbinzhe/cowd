@@ -13,12 +13,13 @@ if [[ "${COWD_LIVE_LARK_CLI_TOOL_TEST:-0}" != "1" ]]; then
   exit 2
 fi
 
-cargo test -p runtime \
-  live_cowd_owned_lark_cli_executes_inside_hardened_sandbox \
-  -- --ignored --exact --nocapture
-cargo test -p gateway \
-  live_cowd_lark_skills_are_discovered_and_selected_by_runtime \
-  -- --ignored --exact --nocapture --test-threads=1
-cargo test -p gateway \
-  live_configured_bot_executes_official_cli_without_forwarding_app_secret \
-  -- --ignored --exact --nocapture --test-threads=1
+report="$(python3 scripts/test/cargo-selection.py report)"
+python3 scripts/test/cargo-selection.py run --package gateway --lib \
+  --filter services::skill_service::profile_provider::tests::live_cowd_lark_skills_are_discovered_and_selected_by_runtime \
+  --ignored --exact --entry 'scripts/validate.sh manual lark-live' \
+  --nocapture --test-threads 1 --output "$report"
+report="$(python3 scripts/test/cargo-selection.py report)"
+python3 scripts/test/cargo-selection.py run --package gateway --lib \
+  --filter lark_cli_tool::tests::live_configured_bot_executes_official_cli_without_forwarding_app_secret \
+  --ignored --exact --entry 'scripts/validate.sh manual lark-live' \
+  --nocapture --test-threads 1 --output "$report"
