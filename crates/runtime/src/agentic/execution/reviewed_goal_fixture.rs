@@ -10006,6 +10006,32 @@ fn exercise_process_proof_case<'fixture>(
     content_ref: &'fixture str,
     root_actor: &'fixture AgentActorBinding,
     case: RealProcessProofCase,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'fixture>> {
+    match case {
+        RealProcessProofCase::Sources | RealProcessProofCase::NativeSources => {
+            exercise_source_process_proof_case(services, host, reviewer, envelope, case)
+        }
+        _ => exercise_non_source_process_proof_case(
+            services,
+            host,
+            reviewer,
+            envelope,
+            content_ref,
+            root_actor,
+            case,
+        ),
+    }
+}
+
+#[inline(never)]
+fn exercise_non_source_process_proof_case<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    host: &'fixture Arc<ReviewReadHost>,
+    reviewer: &'fixture R1ScopedReviewer,
+    envelope: &'fixture AgentActionEnvelope,
+    content_ref: &'fixture str,
+    root_actor: &'fixture AgentActorBinding,
+    case: RealProcessProofCase,
 ) -> std::pin::Pin<Box<impl std::future::Future<Output = bool> + 'fixture>> {
     Box::pin(async move {
         let session = &reviewer.reader;
@@ -10591,11 +10617,174 @@ fn exercise_process_proof_case<'fixture>(
                 )
                 .await;
             }
-            RealProcessProofCase::Authorized
-            | RealProcessProofCase::Mechanical
-            | RealProcessProofCase::Sources
-            | RealProcessProofCase::NativeSources => {}
+            RealProcessProofCase::Authorized | RealProcessProofCase::Mechanical => {}
+            RealProcessProofCase::Sources | RealProcessProofCase::NativeSources => {
+                unreachable!("source cases are selected before future construction")
+            }
         }
+        let _material = process_proof_common_delivery(services, reviewer, case).await;
+        assert!(!host.calls.lock().unwrap().is_empty());
+        false
+    })
+}
+
+#[inline(never)]
+fn exercise_source_process_proof_case<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    host: &'fixture Arc<ReviewReadHost>,
+    reviewer: &'fixture R1ScopedReviewer,
+    envelope: &'fixture AgentActionEnvelope,
+    case: RealProcessProofCase,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = bool> + 'fixture>> {
+    Box::pin(async move {
+        assert!(matches!(
+            case,
+            RealProcessProofCase::Sources | RealProcessProofCase::NativeSources
+        ));
+        let session = &reviewer.reader;
+        let packet = &reviewer.packet;
+        let before = services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap();
+        assert!(before.terminal.is_none());
+        assert!(confirmed_run_exit_with_retry(services.event_store(), packet).is_none());
+        let _material = process_proof_common_delivery(services, reviewer, case).await;
+        #[cfg(test)]
+        {
+            let program = services
+                .agent_action_service()
+                .project(&envelope.actor.program_id)
+                .unwrap();
+            services.assert_read_delivery_actor_matrix_for_test(
+                &program,
+                packet,
+                "real-independent-final-file",
+                case == RealProcessProofCase::NativeSources,
+            );
+        }
+        let mut initial = envelope.clone();
+        initial.action_id = "delivery-source-initial-review".into();
+        let observed = services.submit_agent_action(&initial).await.unwrap();
+        assert_eq!(
+            observed.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let goal = services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap();
+        let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
+        let program = services
+            .agent_action_service()
+            .project(&envelope.actor.program_id)
+            .unwrap();
+        let snapshot = crate::agentic::review_evidence::validate_proof_inputs(
+            services.event_store(),
+            &program,
+            Some(&goal),
+            proof,
+            crate::agentic::review_evidence::ResultContentReaders {
+                process_inputs: None,
+                artifacts: Some(services.artifact_store().as_ref()),
+                history: services.session_history_reader().as_deref(),
+            },
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&snapshot.sources).unwrap();
+        assert!(serialized.contains(&format!("session:{}", packet.session_id())));
+        session
+            .execute_tool(
+                "advance-real-delivery-source",
+                "read_file",
+                r#"{"path":"review-effect.txt","complete":true}"#,
+            )
+            .await
+            .unwrap();
+        let refreshed = crate::agentic::review_evidence::validate_proof_inputs(
+            services.event_store(),
+            &program,
+            Some(&goal),
+            proof,
+            crate::agentic::review_evidence::ResultContentReaders {
+                process_inputs: None,
+                artifacts: Some(services.artifact_store().as_ref()),
+                history: services.session_history_reader().as_deref(),
+            },
+        )
+        .unwrap();
+        assert!(snapshot.sources.iter().any(|old| refreshed
+            .sources
+            .iter()
+            .any(|current| current.stream_id == old.stream_id
+                && current.expected_revision > old.expected_revision)));
+        let rejected_stream = format!("proof-stale-cut:{}", packet.run_id());
+        let mut expected_sources = snapshot.sources.clone();
+        expected_sources.push(crate::ExpectedStreamRevision {
+            stream_id: rejected_stream.clone(),
+            expected_revision: 0,
+        });
+        let rejected =
+            services
+                .event_store()
+                .append_transaction(crate::AppendTransactionRequest {
+                    transaction_id: format!("proof-stale-cut:{}", packet.run_id()),
+                    expected_streams: expected_sources,
+                    events: vec![crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: rejected_stream.clone(),
+                            scope: crate::RuntimeEventScope::Agent,
+                            kind: "fixture.stale_cut_never_committed".into(),
+                            status: None,
+                            actor: None,
+                            refs: vec![],
+                            payload: serde_json::json!({}),
+                        },
+                        idempotency_key: None,
+                        schema_version: 1,
+                    }],
+                });
+        match rejected {
+            Err(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
+                stream_id,
+                expected,
+                actual,
+            }) => {
+                assert_ne!(stream_id, rejected_stream);
+                assert!(actual > expected);
+                assert!(snapshot
+                    .sources
+                    .iter()
+                    .any(|source| source.stream_id == stream_id
+                        && source.expected_revision == expected));
+            }
+            other => panic!("original source cut must fail at stale CAS, got {other:?}"),
+        }
+        assert!(services
+            .event_store()
+            .list_stream(&rejected_stream)
+            .unwrap()
+            .is_empty());
+        assert!(!host.calls.lock().unwrap().is_empty());
+        false
+    })
+}
+
+#[inline(never)]
+fn process_proof_common_delivery<'fixture>(
+    services: &'fixture ReviewedFixtureServices,
+    reviewer: &'fixture R1ScopedReviewer,
+    case: RealProcessProofCase,
+) -> std::pin::Pin<
+    Box<
+        impl std::future::Future<Output = crate::context_evidence::ReadDeliveryMaterial> + 'fixture,
+    >,
+> {
+    Box::pin(async move {
+        let session = &reviewer.reader;
+        let packet = &reviewer.packet;
         session
             .execute_tool(
                 "real-independent-final-file",
@@ -10626,129 +10815,7 @@ fn exercise_process_proof_case<'fixture>(
                 crate::context_evidence::ReadDeliveryGrade::AgentChannelSend
             );
         }
-        if matches!(
-            case,
-            RealProcessProofCase::Sources | RealProcessProofCase::NativeSources
-        ) {
-            #[cfg(test)]
-            {
-                let program = services
-                    .agent_action_service()
-                    .project(&envelope.actor.program_id)
-                    .unwrap();
-                services.assert_read_delivery_actor_matrix_for_test(
-                    &program,
-                    packet,
-                    "real-independent-final-file",
-                    case == RealProcessProofCase::NativeSources,
-                );
-            }
-            let mut initial = envelope.clone();
-            initial.action_id = "delivery-source-initial-review".into();
-            let observed = services.submit_agent_action(&initial).await.unwrap();
-            assert_eq!(
-                observed.status,
-                harness_contract::agent_action::AgentActionStatus::Applied
-            );
-            let goal = services
-                .goal_store()
-                .get("goal:root-agentic-execution")
-                .unwrap()
-                .unwrap();
-            let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
-            let program = services
-                .agent_action_service()
-                .project(&envelope.actor.program_id)
-                .unwrap();
-            let snapshot = crate::agentic::review_evidence::validate_proof_inputs(
-                services.event_store(),
-                &program,
-                Some(&goal),
-                proof,
-                crate::agentic::review_evidence::ResultContentReaders {
-                    process_inputs: None,
-                    artifacts: Some(services.artifact_store().as_ref()),
-                    history: services.session_history_reader().as_deref(),
-                },
-            )
-            .unwrap();
-            let serialized = serde_json::to_string(&snapshot.sources).unwrap();
-            assert!(serialized.contains(&format!("session:{}", packet.session_id())));
-            session
-                .execute_tool(
-                    "advance-real-delivery-source",
-                    "read_file",
-                    r#"{"path":"review-effect.txt","complete":true}"#,
-                )
-                .await
-                .unwrap();
-            let refreshed = crate::agentic::review_evidence::validate_proof_inputs(
-                services.event_store(),
-                &program,
-                Some(&goal),
-                proof,
-                crate::agentic::review_evidence::ResultContentReaders {
-                    process_inputs: None,
-                    artifacts: Some(services.artifact_store().as_ref()),
-                    history: services.session_history_reader().as_deref(),
-                },
-            )
-            .unwrap();
-            assert!(snapshot.sources.iter().any(|old| refreshed
-                .sources
-                .iter()
-                .any(|current| current.stream_id == old.stream_id
-                    && current.expected_revision > old.expected_revision)));
-            let rejected_stream = format!("proof-stale-cut:{}", packet.run_id());
-            let mut expected_sources = snapshot.sources.clone();
-            expected_sources.push(crate::ExpectedStreamRevision {
-                stream_id: rejected_stream.clone(),
-                expected_revision: 0,
-            });
-            let rejected =
-                services
-                    .event_store()
-                    .append_transaction(crate::AppendTransactionRequest {
-                        transaction_id: format!("proof-stale-cut:{}", packet.run_id()),
-                        expected_streams: expected_sources,
-                        events: vec![crate::RuntimeTransactionEventInput {
-                            event: crate::RuntimeEventInput {
-                                stream_id: rejected_stream.clone(),
-                                scope: crate::RuntimeEventScope::Agent,
-                                kind: "fixture.stale_cut_never_committed".into(),
-                                status: None,
-                                actor: None,
-                                refs: vec![],
-                                payload: serde_json::json!({}),
-                            },
-                            idempotency_key: None,
-                            schema_version: 1,
-                        }],
-                    });
-            match rejected {
-                Err(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
-                    stream_id,
-                    expected,
-                    actual,
-                }) => {
-                    assert_ne!(stream_id, rejected_stream);
-                    assert!(actual > expected);
-                    assert!(snapshot
-                        .sources
-                        .iter()
-                        .any(|source| source.stream_id == stream_id
-                            && source.expected_revision == expected));
-                }
-                other => panic!("original source cut must fail at stale CAS, got {other:?}"),
-            }
-            assert!(services
-                .event_store()
-                .list_stream(&rejected_stream)
-                .unwrap()
-                .is_empty());
-        }
-        assert!(!host.calls.lock().unwrap().is_empty());
-        false
+        material
     })
 }
 
