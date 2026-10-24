@@ -203,7 +203,6 @@ pub(crate) mod pg_test_support {
         memory::CognitiveContextManager::new_with_selected_store(
             config,
             None,
-            None,
             Arc::new(memory::EphemeralMemoryStore::new()),
         )
         .await

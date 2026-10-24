@@ -1571,9 +1571,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             match CognitiveContextManager::new_with_selected_store_auxiliaries_and_summarizer(
                 mem_cfg.clone(),
                 Some(workspace_root.clone()),
-                unified_store
-                    .as_ref()
-                    .map(|store| Arc::new(store.history_reader())),
                 Arc::clone(&selected_storage.memory_store),
                 Some(selected_storage.memory_maintenance_queue.clone()),
                 llm_summarizer,
@@ -2581,14 +2578,9 @@ mod tests {
         config.governance.enabled = false;
         config.governance.startup_delay_secs = 86400;
         let manager = Arc::new(
-            CognitiveContextManager::new_with_selected_store(
-                config.clone(),
-                None,
-                None,
-                store.clone(),
-            )
-            .await
-            .unwrap(),
+            CognitiveContextManager::new_with_selected_store(config.clone(), None, store.clone())
+                .await
+                .unwrap(),
         );
         let id = manager
             .orchestrator()
@@ -2671,14 +2663,9 @@ mod tests {
         drop(manager);
         assert!(old.upgrade().is_none());
         let manager = Arc::new(
-            CognitiveContextManager::new_with_selected_store(
-                config.clone(),
-                None,
-                None,
-                store.clone(),
-            )
-            .await
-            .unwrap(),
+            CognitiveContextManager::new_with_selected_store(config.clone(), None, store.clone())
+                .await
+                .unwrap(),
         );
         let tasks = GatewayRuntimeTaskSet::new(Duration::from_secs(2));
         start_memory_governance_task(

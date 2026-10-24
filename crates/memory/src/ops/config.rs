@@ -335,8 +335,6 @@ impl Default for LayerConfig {
 pub struct TuningConfig {
     #[serde(default = "default_sandbox_min_lines")]
     pub sandbox_min_lines: usize,
-    #[serde(default = "default_rebuild_confidence")]
-    pub rebuild_confidence: f32,
     #[serde(default = "default_freshness_trigger")]
     pub freshness_trigger_ratio: f32,
     #[serde(default = "default_closet_rebuild_ticks")]
@@ -361,9 +359,6 @@ pub struct TuningConfig {
 
 fn default_sandbox_min_lines() -> usize {
     2000
-}
-fn default_rebuild_confidence() -> f32 {
-    0.3
 }
 fn default_freshness_trigger() -> f32 {
     0.8
@@ -393,7 +388,6 @@ impl Default for TuningConfig {
     fn default() -> Self {
         Self {
             sandbox_min_lines: 2000,
-            rebuild_confidence: 0.3,
             freshness_trigger_ratio: 0.8,
             closet_rebuild_ticks: 10,
             audit_truncate_len: 120,

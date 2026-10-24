@@ -376,7 +376,6 @@ memory:
   # ── 可调阈值 (替代硬编码常量) ──
   tuning:
     sandbox_min_lines: 2000
-    rebuild_confidence: 0.3
     freshness_trigger_ratio: 0.8
     closet_rebuild_ticks: 10
     audit_truncate_len: 120

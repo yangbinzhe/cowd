@@ -191,7 +191,6 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         CognitiveContextManager::new_with_selected_store(
             memory_config(&tmp.path().join("blobs")),
             None,
-            None,
             memory_store,
         )
         .await

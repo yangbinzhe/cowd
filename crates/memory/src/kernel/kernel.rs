@@ -2663,9 +2663,13 @@ mod tests {
             .expect("manager"),
         );
         let kernel = MemoryKernel::new(Arc::clone(&manager));
-        let visible = memory_entry("Visible", "current project fact", 0.0, 0.95, 0);
+        let visible = MemoryEntry {
+            source: MemorySource::UserExplicit,
+            ..memory_entry("Visible", "current project fact", 0.0, 0.95, 0)
+        };
         let visible_id = visible.id;
         let hidden = MemoryEntry {
+            source: MemorySource::UserExplicit,
             scope: MemoryScope::Project("other-project".to_string()),
             ..memory_entry("Hidden", "other project fact", 0.0, 0.95, 0)
         };

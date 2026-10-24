@@ -1877,14 +1877,10 @@ mod legacy_auxiliary_hold_tests {
         let mut config = crate::MemoryConfig::default();
         config.store.blob_dir = root.path().join("blobs");
         config.store.enable_vector_index = false;
-        let manager = crate::CognitiveContextManager::new_with_selected_store(
-            config,
-            None,
-            None,
-            store.clone(),
-        )
-        .await
-        .unwrap();
+        let manager =
+            crate::CognitiveContextManager::new_with_selected_store(config, None, store.clone())
+                .await
+                .unwrap();
         assert_eq!(manager.list_entities().await.unwrap().len(), 3);
         assert_eq!(
             store

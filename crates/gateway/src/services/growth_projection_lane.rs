@@ -457,7 +457,6 @@ mod tests {
             CognitiveContextManager::new_with_selected_store_and_auxiliaries(
                 test_memory_config(&config_home.join("storage/memory-index")),
                 Some(workspace),
-                None,
                 Arc::clone(&topology.memory_store),
                 Some(topology.memory_maintenance_queue.clone()),
             )

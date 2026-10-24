@@ -1564,14 +1564,9 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         config
     };
     let manager = Arc::new(
-        memory::CognitiveContextManager::new_with_selected_store(
-            config(),
-            None,
-            None,
-            store.clone(),
-        )
-        .await
-        .unwrap(),
+        memory::CognitiveContextManager::new_with_selected_store(config(), None, store.clone())
+            .await
+            .unwrap(),
     );
     let weak = Arc::downgrade(&manager);
     let kernel = memory::MemoryKernel::new(manager.clone());
@@ -1675,7 +1670,6 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     .with_memory_sources(reopened_store.clone());
     let reopened = memory::CognitiveContextManager::new_with_selected_store(
         config(),
-        None,
         None,
         reopened_store.clone(),
     )
@@ -3034,7 +3028,7 @@ async fn real_postgres_legacy_retirement_adopts_original_cut_after_reopen_withou
     config.store.enable_vector_index = false;
     config.governance.enabled = false;
     let manager =
-        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+        memory::CognitiveContextManager::new_with_selected_store(config, None, store.clone())
             .await
             .unwrap();
     // The oversized row is reported/held but cannot starve the next source.
@@ -3121,7 +3115,7 @@ async fn real_postgres_runtime_turn_writes_keep_original_cuts_and_legacy_unknown
     config.store.blob_dir = root.join("blobs");
     config.store.enable_vector_index = false;
     let manager = Arc::new(
-        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+        memory::CognitiveContextManager::new_with_selected_store(config, None, store.clone())
             .await
             .unwrap(),
     );
@@ -3307,7 +3301,7 @@ async fn real_postgres_runtime_turn_writes_keep_original_cuts_and_legacy_unknown
     config.store.blob_dir = root.join("reopened-blobs");
     config.store.enable_vector_index = false;
     let manager =
-        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+        memory::CognitiveContextManager::new_with_selected_store(config, None, store.clone())
             .await
             .unwrap();
     assert_eq!(manager.list_entities().await.unwrap().len(), 3);
@@ -3338,7 +3332,6 @@ async fn real_postgres_erasure_result_keeps_exact_cleanup_and_retention_after_re
     let manager = Arc::new(
         memory::CognitiveContextManager::new_with_selected_store(
             config.clone(),
-            None,
             None,
             store.clone(),
         )
@@ -3388,7 +3381,7 @@ async fn real_postgres_erasure_result_keeps_exact_cleanup_and_retention_after_re
     let executor = fixture.reconnect();
     let store = Arc::new(PostgresMemoryStore::new(executor.clone()).unwrap());
     let manager = Arc::new(
-        memory::CognitiveContextManager::new_with_selected_store(config, None, None, store.clone())
+        memory::CognitiveContextManager::new_with_selected_store(config, None, store.clone())
             .await
             .unwrap(),
     );

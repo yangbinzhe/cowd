@@ -236,68 +236,8 @@ impl CognitiveContextManager {
         // Track which IDs are already loaded so other layers can skip them.
         let mut already_surfaced: HashSet<MemoryId> = entries.iter().map(|e| e.id).collect();
 
-        // ── Step 2a2: State rebuild from previous session state ──────────────
-        if let Some(ref rebuilder) = self.state_rebuilder {
-            let rebuilt = rebuilder.quick_rebuild().await;
-            if rebuilt.overall_confidence > self.config.tuning.rebuild_confidence {
-                if let Some(ref summary) = rebuilt.context_summary {
-                    entries.push(MemoryEntry {
-                        id: uuid::Uuid::new_v4(),
-                        layer: MemoryLayer::L2,
-                        category: MemoryCategory::CompressedSummary,
-                        priority: Priority::Normal,
-                        source: MemorySource::AutoExtracted,
-                        title: "Rebuilt Context Summary".into(),
-                        content: format!(
-                            "[REBUILT STATE confidence={:.2}] {}",
-                            rebuilt.overall_confidence, summary.data
-                        ),
-                        embedding: None,
-                        tags: vec!["rebuilt".into(), "state".into()],
-                        relations: vec![],
-                        confidence: summary.confidence,
-                        access_count: 0,
-                        staleness: 0.0,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                        last_accessed_at: None,
-                        scope: MemoryScope::default(),
-                        session_id: None,
-                        source_agent: None,
-                        visibility: crate::types::AgentVisibility::default(),
-                    });
-                }
-                for item in rebuilt.get_incomplete_work() {
-                    entries.push(MemoryEntry {
-                        id: uuid::Uuid::new_v4(),
-                        layer: MemoryLayer::L1,
-                        category: MemoryCategory::Reference,
-                        priority: item.priority,
-                        source: MemorySource::AutoExtracted,
-                        title: format!("Rebuilt: {}", item.title),
-                        content: format!("[REBUILT WORK ITEM] {}", item.description),
-                        embedding: None,
-                        tags: vec!["rebuilt".into(), "work".into()],
-                        relations: vec![],
-                        confidence: 0.7,
-                        access_count: 0,
-                        staleness: 0.0,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                        last_accessed_at: None,
-                        scope: MemoryScope::default(),
-                        session_id: None,
-                        source_agent: None,
-                        visibility: crate::types::AgentVisibility::default(),
-                    });
-                }
-                tracing::info!(
-                    confidence = rebuilt.overall_confidence,
-                    work_items = rebuilt.get_incomplete_work().len(),
-                    "state_rebuilder: surfaced rebuilt state"
-                );
-            }
-        }
+        // Runtime owns current-Session transcript reconstruction and explicit
+        // authorized history retrieval. Memory recalls only its scoped entries.
 
         // ── Step 2b: P1 project knowledge graph query ───────────────────────
         {

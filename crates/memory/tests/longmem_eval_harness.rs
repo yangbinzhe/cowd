@@ -142,7 +142,6 @@ async fn test_longmem_persistence_recall() {
         let mgr = CognitiveContextManager::new_with_selected_store(
             test_config(&db_path),
             None,
-            None,
             Arc::clone(&store),
         )
         .await
@@ -179,7 +178,6 @@ async fn test_longmem_persistence_recall() {
     {
         let mgr = CognitiveContextManager::new_with_selected_store(
             test_config(&db_path),
-            None,
             None,
             Arc::clone(&store),
         )

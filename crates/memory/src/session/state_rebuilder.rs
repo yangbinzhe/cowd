@@ -220,6 +220,8 @@ impl StateRebuilder {
 
     /// Attach the selected durable session owner. State rebuilding must not
     /// infer a SQLite filename or open a database behind composition's back.
+    /// This standalone reader is trusted and unscoped, not a model grant.
+    /// Runtime context must use its own current-Session or authorized history path.
     #[must_use]
     pub fn with_session_history(
         workspace: impl Into<PathBuf>,

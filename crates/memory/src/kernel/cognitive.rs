@@ -28,7 +28,6 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 use chrono::Utc;
-use session::SessionHistoryReader;
 
 use crate::performance_monitor::{AutoTuner, PerformanceMonitor};
 use crate::{
@@ -62,7 +61,6 @@ use crate::{
     project_scope::{build_project_kg, ProjectScopeManager},
     search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
-    state_rebuilder::StateRebuilder,
     store::vector::VectorIndex,
     store::{
         AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryScanCursor,
@@ -1088,8 +1086,6 @@ pub struct CognitiveContextManager {
     cross_store_verify_counter: AtomicU64,
     /// In-memory FTS5 sandbox for indexing large tool outputs.
     tool_sandbox: Mutex<ToolOutputSandbox>,
-    /// State rebuilder for session restoration from previous session data.
-    state_rebuilder: Option<StateRebuilder>,
     /// Blockers preventing forward progress, collected during session.
     blockers: Mutex<Vec<String>>,
     /// Last action performed by the agent, used for handoff context.
@@ -1140,7 +1136,6 @@ impl CognitiveContextManager {
         Self::new_with_selected_store(
             config,
             None,
-            None,
             Arc::new(crate::store::EphemeralMemoryStore::new()),
         )
         .await
@@ -1169,19 +1164,6 @@ impl CognitiveContextManager {
         ))
     }
 
-    /// Initialise with the selected durable session owner.  Session recovery
-    /// is deliberately injected rather than inferred from a SQLite path.
-    pub async fn new_with_workspace_and_session_history(
-        config: MemoryConfig,
-        workspace_root: Option<PathBuf>,
-        session_history: Option<Arc<SessionHistoryReader>>,
-    ) -> Result<Self> {
-        let _ = (config, workspace_root, session_history);
-        Err(MemoryError::Store(
-            "CognitiveContextManager requires an injected MemoryStore".to_string(),
-        ))
-    }
-
     /// Initialise the complete cognitive runtime over a host-selected durable
     /// Memory port. The relational backend is already chosen at the process
     /// composition root, so this constructor never infers or opens SQLite.
@@ -1190,11 +1172,9 @@ impl CognitiveContextManager {
     pub async fn new_with_selected_store(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(config, workspace_root, session_history, store, None, None)
-            .await
+        Self::new_with_storage_selection(config, workspace_root, store, None, None).await
     }
 
     /// Variant used by a composition root that also owns the durable
@@ -1202,14 +1182,12 @@ impl CognitiveContextManager {
     pub async fn new_with_selected_store_and_auxiliaries(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
         maintenance_queue: Option<MaintenanceQueue>,
     ) -> Result<Self> {
         Self::new_with_selected_store_auxiliaries_and_summarizer(
             config,
             workspace_root,
-            session_history,
             store,
             maintenance_queue,
             None,
@@ -1221,7 +1199,6 @@ impl CognitiveContextManager {
     pub async fn new_with_selected_store_auxiliaries_and_summarizer(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
         maintenance_queue: Option<MaintenanceQueue>,
         llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
@@ -1229,7 +1206,6 @@ impl CognitiveContextManager {
         Self::new_with_storage_selection(
             config,
             workspace_root,
-            session_history,
             store,
             maintenance_queue,
             llm_summarizer,
@@ -1240,7 +1216,6 @@ impl CognitiveContextManager {
     async fn new_with_storage_selection(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_history: Option<Arc<SessionHistoryReader>>,
         selected_store: Arc<dyn MemoryStore>,
         selected_maintenance_queue: Option<MaintenanceQueue>,
         llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
@@ -1823,13 +1798,6 @@ impl CognitiveContextManager {
             Mutex::new(registry)
         };
 
-        // Build state_rebuilder if workspace_root is available
-        let ws_root = workspace_root.clone();
-        let state_rebuilder = ws_root.as_ref().and_then(|workspace| {
-            session_history.as_ref().map(|history| {
-                StateRebuilder::with_session_history(workspace.clone(), Arc::clone(history))
-            })
-        });
         let tool_sandbox = ToolOutputSandbox::new().map(Mutex::new).map_err(|error| {
             MemoryError::Other(format!("failed to initialize tool output sandbox: {error}"))
         })?;
@@ -1867,7 +1835,6 @@ impl CognitiveContextManager {
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),
             tool_sandbox,
-            state_rebuilder,
             blockers: Mutex::new(Vec::new()),
             last_action: Mutex::new(None),
             l0_cache: Mutex::new(None),

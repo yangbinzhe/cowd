@@ -940,7 +940,7 @@ mod tests {
         config.store.enable_vector_index = false;
         let store = Arc::new(EphemeralMemoryStore::new());
         let manager = Arc::new(
-            GatewayMemoryManager::new_with_selected_store(config, None, None, store.clone())
+            GatewayMemoryManager::new_with_selected_store(config, None, store.clone())
                 .await
                 .unwrap(),
         );

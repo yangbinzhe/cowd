@@ -75,7 +75,6 @@ async fn memory_entries_across_layers_survive_manager_reopen() {
         let mgr = CognitiveContextManager::new_with_selected_store(
             test_config(&db_path),
             None,
-            None,
             Arc::clone(&store),
         )
         .await
@@ -120,7 +119,6 @@ async fn memory_entries_across_layers_survive_manager_reopen() {
     {
         let mgr = CognitiveContextManager::new_with_selected_store(
             test_config(&db_path),
-            None,
             None,
             Arc::clone(&store),
         )

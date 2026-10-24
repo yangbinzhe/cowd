@@ -1563,7 +1563,6 @@ async fn malformed_lifecycle_cannot_become_active_or_an_observed_projection() {
         CognitiveContextManager::new_with_selected_store(
             test_config(&tmp.path().join("lifecycle-read.db")),
             None,
-            None,
             store.clone(),
         )
         .await
@@ -1780,7 +1779,6 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("first")),
             None,
-            None,
             store.clone(),
         )
         .await
@@ -1919,7 +1917,6 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     assert!(weak.upgrade().is_none());
     let reopened = CognitiveContextManager::new_with_selected_store(
         test_config(&root.path().join("second")),
-        None,
         None,
         store.clone(),
     )
@@ -2248,7 +2245,6 @@ async fn later_retirement_epoch_preserves_earlier_pending_and_exact_receipts() {
     let manager = Arc::new(
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("manager")),
-            None,
             None,
             store.clone(),
         )
@@ -2717,7 +2713,6 @@ async fn packet_use_checks_original_preview_cut_current_scope_and_read_lease() {
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("packet-use")),
             None,
-            None,
             store.clone(),
         )
         .await
@@ -2807,7 +2802,6 @@ async fn packet_use_rejects_selected_source_after_visibility_revocation_or_retir
     let manager = Arc::new(
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("packet-revoke")),
-            None,
             None,
             store.clone(),
         )
@@ -3264,7 +3258,6 @@ async fn explicit_erasure_has_its_own_receipt_and_cannot_recreate_or_confirm_a_f
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("memory")),
             None,
-            None,
             store.clone(),
         )
         .await
@@ -3425,7 +3418,6 @@ async fn erasure_preserves_original_layer_scope_and_operation_kind_guards() {
     let manager = Arc::new(
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("memory")),
-            None,
             None,
             store.clone(),
         )
@@ -3598,7 +3590,6 @@ async fn auxiliary_original_cuts_keep_independent_support_and_fence_late_snapsho
     let manager = Arc::new(
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("manager")),
-            None,
             None,
             store.clone(),
         )
@@ -3897,7 +3888,6 @@ async fn original_runtime_turn_write_cannot_drop_its_consumed_source_cut() {
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("memory")),
             None,
-            None,
             store.clone(),
         )
         .await
@@ -4066,7 +4056,6 @@ async fn unknown_legacy_extraction_and_broken_lifecycle_are_not_independent_live
     let manager = Arc::new(
         CognitiveContextManager::new_with_selected_store(
             test_config(&root.path().join("memory")),
-            None,
             None,
             store,
         )
