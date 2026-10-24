@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::green_contract::GreenLevel;
-use crate::stale_branch::BranchFreshness;
+use tools::stale_branch::BranchFreshness;
 
 const STALE_BRANCH_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 

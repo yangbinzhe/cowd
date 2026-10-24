@@ -303,8 +303,6 @@ pub mod source_self_audit;
 mod sse;
 #[path = "infrastructure/stale_base.rs"]
 pub mod stale_base;
-#[path = "infrastructure/stale_branch.rs"]
-pub mod stale_branch;
 #[path = "conversation/step_snapshot.rs"]
 pub mod step_snapshot;
 #[path = "steward/steward_agent.rs"]
@@ -575,8 +573,7 @@ pub use mcp_client::{
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
 pub use mcp_lifecycle_hardened::{
-    McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
-    McpLifecycleValidator, McpPhaseResult,
+    McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
@@ -758,10 +755,6 @@ pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_cowd_base_file, resolve_expected_base,
     BaseCommitSource, BaseCommitState,
-};
-pub use stale_branch::{
-    apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
-    StaleBranchPolicy,
 };
 pub use steward_agent::{
     StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
