@@ -17,10 +17,10 @@ use harness_contract::{
     turn::InputRoutingDecision,
 };
 use runtime::{
-    RuntimeEventInput, RuntimeEventScope, RuntimeEventStore, RuntimeServices,
-    RuntimeTransactionEventInput, SessionTerminalInput,
+    ArtifactStore, ArtifactStoreConfig, RuntimeEventInput, RuntimeEventScope, RuntimeEventStore,
+    RuntimeServices, RuntimeTransactionEventInput, SessionTerminalInput,
 };
-use runtime_postgres::PostgresRuntimeEventStore;
+use runtime_postgres::{PostgresArtifactRepository, PostgresRuntimeEventStore};
 use session::{
     SessionMessage, SessionRecord, SessionRuntimeInputStatus, SessionRuntimeOutboxRequest,
     SessionTerminalExecutionFence, SessionTerminalTranscriptCommit,
@@ -41,6 +41,17 @@ fn connect(fixture: &PostgresTestScope) -> Arc<RuntimeEventStore> {
     )
 }
 
+fn artifact_store(fixture: &PostgresTestScope, root: &std::path::Path) -> Arc<ArtifactStore> {
+    Arc::new(
+        ArtifactStore::new(
+            root.join("artifacts"),
+            Arc::new(PostgresArtifactRepository::new(fixture.reconnect()).unwrap()),
+            ArtifactStoreConfig::default(),
+        )
+        .unwrap(),
+    )
+}
+
 fn services(
     fixture: &PostgresTestScope,
     root: &std::path::Path,
@@ -50,6 +61,7 @@ fn services(
     let events = connect(fixture);
     let services = RuntimeServices::builder(root.join("home"), &workspace)
         .non_durable_backends_for_testing(root)
+        .artifact_store(artifact_store(fixture, root))
         .runtime_event_store(Arc::clone(&events))
         .build()
         .unwrap();
@@ -73,6 +85,7 @@ async fn real_independently_reviewed_satisfied_a_survives_postgres_adapter_resta
                 temporary.path().join("workspace"),
             )
             .non_durable_backends_for_testing(temporary.path())
+            .artifact_store(artifact_store(&fixture, temporary.path()))
             .runtime_event_store(events.clone())
             .tool_execution_host(host)
             .build()
