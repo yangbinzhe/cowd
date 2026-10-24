@@ -346,10 +346,7 @@ mod tests {
         assert!(resolved.allowed_tools.contains("tool_orchestrate"));
         assert!(resolved.allowed_tools.contains("workspace_snapshot"));
         assert!(resolved.allowed_tools.contains("grep_search"));
-        assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("glob_search"));
-        assert!(resolved.allowed_tools.contains("tool_orchestrate"));
-        assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("lsp"));
         assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
@@ -367,7 +364,6 @@ mod tests {
         });
 
         assert_eq!(resolved.permission_mode, PermissionMode::WorkspaceWrite);
-        assert!(resolved.allowed_tools.contains("edit"));
         assert!(resolved.allowed_tools.contains("edit"));
         assert!(resolved.allowed_tools.contains("bash"));
         assert!(resolved.allowed_tools.contains("execute_code"));

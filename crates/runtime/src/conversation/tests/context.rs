@@ -2913,15 +2913,18 @@ fn m2_error_propagation_returns_result() {
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
         vec!["sys".to_string()],
     );
-    let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .handle()
-            .clone()
-    });
+    let (handle, runtime_owner) = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => (handle, None),
+        Err(_) => {
+            let owner = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            (owner.handle().clone(), Some(owner))
+        }
+    };
     let r = handle.block_on(rt.run_memory_post_turn(""));
+    drop(runtime_owner);
     assert!(
         r.is_ok(),
         "run_memory_post_turn should return Ok when no memory manager"

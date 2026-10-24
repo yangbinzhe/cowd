@@ -3624,10 +3624,14 @@ mod omitted_marker_tests {
 
     #[test]
     fn distinct_sources_get_distinct_markers() {
-        assert_ne!(
-            omitted_source_marker(crate::context_runtime::ContextSourceKind::Memory),
-            omitted_source_marker(crate::context_runtime::ContextSourceKind::Knowledge)
-        );
+        use crate::context_runtime::ContextSourceKind;
+
+        for (left, right) in [
+            (ContextSourceKind::Memory, ContextSourceKind::Knowledge),
+            (ContextSourceKind::Fact, ContextSourceKind::Matrix),
+        ] {
+            assert_ne!(omitted_source_marker(left), omitted_source_marker(right));
+        }
     }
 }
 
@@ -3868,23 +3872,4 @@ mod immutable_native_acquisition_tests {
             );
         }
     }
-}
-
-#[cfg(test)]
-mod degraded_source_marker_tests {
-    use super::{degraded_source_marker_tests_marker, ContextSourceKind};
-
-    #[test]
-    fn a_degraded_fact_and_matrix_source_are_marked_separately() {
-        assert_ne!(
-            degraded_source_marker_tests_marker(ContextSourceKind::Fact),
-            degraded_source_marker_tests_marker(ContextSourceKind::Matrix)
-        );
-    }
-}
-
-fn degraded_source_marker_tests_marker(
-    source: crate::context_runtime::ContextSourceKind,
-) -> String {
-    omitted_source_marker(source)
 }

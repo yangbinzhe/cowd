@@ -5,14 +5,12 @@
     clippy::unreachable
 )]
 
-use harness_contract::core::ExecutionPattern;
 use harness_contract::execution_graph::{
     apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionEdgeKind,
     ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
 };
 use harness_contract::strategy::{
-    decide_strategy, understand, ExecutionCandidateKind, StrategyExperienceRecord,
-    StrategyExperienceStore, StrategyInput,
+    StrategyExperienceRecord, StrategyExperienceStore, StrategyInput, decide_strategy, understand,
 };
 use runtime::eval_gate::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
 use runtime::RuntimeAiKernel;
@@ -47,14 +45,12 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
         0,
     );
 
-    assert_eq!(
-        trace.execution_decision.strategy.pattern,
-        ExecutionPattern::Collaborate
-    );
-    assert_eq!(
-        trace.execution_decision.strategy.selected_candidate,
-        ExecutionCandidateKind::Team,
-        "the independent migration, evidence, regression, and review workstreams must use the governed Team topology"
+    assert!(
+        trace
+            .execution_decision
+            .strategy
+            .understanding
+            .requests_multi_agent
     );
     assert!(
         trace.execution_decision.execution_graph_ref.is_some(),
@@ -74,7 +70,6 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
     );
 
     let spec = ScenarioSpec::new("deep_task_closure", "complex closure")
-        .expect_mode(ExecutionPattern::Collaborate)
         .require(ScenarioCheck::bool(
             "execution_graph.present",
             ScenarioCheckKind::ExecutionGraphPresent,

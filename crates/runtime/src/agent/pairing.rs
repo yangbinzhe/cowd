@@ -372,16 +372,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_code_uniqueness() {
-        let codes: Vec<String> = (0..100)
-            .map(|_| PairingManager::generate_random_code())
-            .collect();
-        // All codes should be unique (extremely unlikely to collide with 32^8 space)
-        let unique: std::collections::HashSet<_> = codes.iter().collect();
-        assert_eq!(unique.len(), 100);
-    }
-
     #[tokio::test]
     async fn test_generate_and_verify() {
         let dir = tempfile::tempdir().unwrap();

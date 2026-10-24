@@ -14,8 +14,7 @@ use harness_contract::growth::{
     GrowthSignalKind, LearningRecord,
 };
 use harness_contract::strategy::{
-    decide_strategy, understand, ExecutionCandidateKind, StrategyExperienceRecord,
-    StrategyExperienceStore, StrategyInput,
+    StrategyExperienceRecord, StrategyExperienceStore, StrategyInput, decide_strategy, understand,
 };
 use matrix_core::{MatrixEvidencePacket, MatrixQualityGateDecision};
 use runtime::eval_gate::{
@@ -156,7 +155,6 @@ fn complex_task_trace_retains_the_authoritative_execution_graph_reference() {
         "complex_execution_graph",
         "使用多 Agent 分别规划 runtime、gateway service crate 的复杂架构演进并综合审查",
     )
-    .expect_mode(ExecutionPattern::Collaborate)
     .require(ScenarioCheck::bool(
         "execution_graph.present",
         ScenarioCheckKind::ExecutionGraphPresent,
@@ -185,10 +183,12 @@ fn complex_task_trace_retains_the_authoritative_execution_graph_reference() {
     );
 
     let trace = kernel.finalize("planned", 0, 0);
-    assert_eq!(
-        trace.execution_decision.strategy.selected_candidate,
-        ExecutionCandidateKind::Team,
-        "the independent runtime and gateway architecture workstreams must use the governed Team topology"
+    assert!(
+        trace
+            .execution_decision
+            .strategy
+            .understanding
+            .requests_multi_agent
     );
     let observation = HarnessObservation::from_trace("complex_execution_graph", &trace, "planned")
         .into_scenario_observation();

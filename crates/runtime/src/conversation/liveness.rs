@@ -599,7 +599,7 @@ mod guard_tests {
         assert!(collected.iter().all(Result::is_ok));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn items_just_inside_the_window_still_progress() {
         let slow = futures::stream::unfold(0_u32, |state| async move {
             if state >= 3 {

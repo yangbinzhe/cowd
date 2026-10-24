@@ -1,18 +1,5 @@
 #[test]
 fn r1_a_applied_review_recognises_its_own_call() {
-    let action = AgentAction::TaskReview(TaskReviewInput {
-        task_ref: "task".into(),
-        decision: TaskReviewDecision::Accept,
-        reason: "actual independent evidence".into(),
-        operator_requirement: None,
-        evidence_refs: vec![],
-    });
-    let actor = actor();
-    let live = CurrentReviewContext {
-        action_id: "original",
-        action: &action,
-        actor: &actor,
-    };
     let applied = AppliedReviewContext {
         action_id: "original",
         program_source: "agentic-program:program",
