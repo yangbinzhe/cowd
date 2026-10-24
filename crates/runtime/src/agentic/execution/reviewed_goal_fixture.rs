@@ -8926,6 +8926,79 @@ async fn wait_real_process_definition(
     session
 }
 
+// The same read-only traversal backs the retirement assertions and waiting
+// fixture. Graph terminal truth alone never proves original lease publication.
+fn original_binding_closures_ready(
+    services: &RuntimeServices,
+    execution: &str,
+    packet: Option<&AgentTaskPacket>,
+) -> Result<Option<usize>, String> {
+    let store = services.graph_state_store();
+    let mut pending = vec![execution.to_string()];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut observed = 0;
+    let mut original_seen = packet.is_none();
+    while let Some(graph_id) = pending.pop() {
+        if !seen.insert(graph_id.clone()) {
+            return Err("retirement lineage cycle".into());
+        }
+        let graph = store.load(&graph_id).map_err(|error| error.to_string())?;
+        if !graph
+            .node_statuses
+            .values()
+            .all(|status| status.is_terminal())
+        {
+            return Ok(None);
+        }
+        let mut after = 0;
+        while after < graph.revision {
+            let (next, starts) = store
+                .binding_starts_page(&graph.id, after, graph.revision)
+                .map_err(|error| error.to_string())?;
+            if next <= after {
+                return Err("retirement binding page made no progress".into());
+            }
+            for (node, binding, start) in starts {
+                let (ticket, spec) = store
+                    .binding_start_ticket(&graph, &node, &binding)
+                    .map_err(|error| error.to_string())?;
+                if ticket.attempt != binding.attempt || ticket.payload_ref != spec.payload_ref {
+                    return Err("retirement original ticket/spec mismatch".into());
+                }
+                if let Some(packet) = packet
+                    .filter(|packet| packet.graph_id() == graph_id && packet.node_id() == node)
+                {
+                    let original: AgentTaskPacket = serde_json::from_str(&ticket.payload_ref)
+                        .map_err(|error| error.to_string())?;
+                    if original != *packet || ticket.attempt != packet.attempt {
+                        return Err("retirement original packet/attempt mismatch".into());
+                    }
+                    original_seen = true;
+                }
+                if !store
+                    .binding_lease_closure(&graph, &node, &binding, start)
+                    .map_err(|error| error.to_string())?
+                {
+                    return Ok(None);
+                }
+                observed += 1;
+            }
+            after = next;
+        }
+        pending.extend(
+            store
+                .child_links(&graph_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|link| link.child_execution_id),
+        );
+    }
+    if !original_seen || observed == 0 {
+        return Err("retirement original binding was not observed".into());
+    }
+    Ok(Some(observed))
+}
+
 async fn wait_retired_process(
     services: &Arc<RuntimeServices>,
     packet: &AgentTaskPacket,
@@ -8945,6 +9018,8 @@ async fn wait_retired_process(
             let graph = services.graph_state_store().load(packet.graph_id()).unwrap();
             if task.status == crate::AgenticTaskStatus::Withdrawn && task.active_attempts.is_empty()
                 && graph.node_statuses.values().all(|status| status.is_terminal())
+                && original_binding_closures_ready(services, packet.graph_id(), Some(packet))
+                    .expect("original retirement closure must authenticate").is_some()
             {
                 break;
             }

@@ -711,7 +711,7 @@ impl RuntimeServices {
                 Err("Agent retirement awaits graph, exit or effect reconciliation".into())
             };
         }
-        let envelope = agentic_attempt_settlement(
+        let mut envelope = agentic_attempt_settlement(
             &projection,
             task_ref,
             packet.graph_id(),
@@ -719,6 +719,7 @@ impl RuntimeServices {
             reason,
             true,
         );
+        envelope.expected_revision = Some(projection.revision);
         let observation = self.submit_agent_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(
@@ -1060,10 +1061,84 @@ impl RuntimeServices {
                 settled = false;
                 continue;
             }
+            if packet.graph_id() != graph.id
+                || packet.node_id() != node.id
+                || graph.recovery_cursor.node_attempts.get(&node.id) != Some(&packet.attempt)
+            {
+                return Err("Agent retirement packet no longer names the current attempt".into());
+            }
+            let original_binding = self
+                .graph_state_store()
+                .current_binding(&graph, &node.id, packet.attempt)
+                .map_err(|error| error.to_string())?;
+            let original_start = self
+                .graph_state_store()
+                .binding_start_position(&graph, &node.id, &original_binding)
+                .map_err(|error| error.to_string())?
+                .ok_or("Agent retirement original binding start missing")?;
+            let original_attempt = task.active_attempts.get(graph_id).cloned();
+            let original_claim = task.claim_execution_id.clone();
             self.cancel_execution_tree(graph_id, "Original Agent exited during Task retirement")
                 .await
                 .map_err(|error| error.to_string())?;
-            let envelope = agentic_attempt_settlement(
+            // Terminal Graph truth and authenticated backend exit precede lease
+            // closure. Re-enter the existing owner before consuming the durable
+            // CancelRequested attempt that makes a failed closure retryable.
+            self.execution_supervisor()
+                .recover_graph(graph_id)
+                .await
+                .map_err(|error| {
+                    format!("agentic_retirement_closure_pending:{graph_id}:{error}")
+                })?;
+            let current = self
+                .graph_state_store()
+                .load_async(graph_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let current_binding = self
+                .graph_state_store()
+                .current_binding(&current, &node.id, packet.attempt)
+                .map_err(|error| error.to_string())?;
+            if !agentic_graph_is_terminal(&current)
+                || current.recovery_cursor.node_attempts.get(&node.id) != Some(&packet.attempt)
+                || current.lineage != graph.lineage
+                || current.parent_execution != graph.parent_execution
+                || current
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.id == node.id)
+                    != Some(node)
+                || current_binding != original_binding
+                || self
+                    .graph_state_store()
+                    .binding_start_position(&current, &node.id, &current_binding)
+                    .map_err(|error| error.to_string())?
+                    != Some(original_start)
+                || !self
+                    .graph_state_store()
+                    .binding_lease_closure(&current, &node.id, &current_binding, original_start)
+                    .map_err(|error| error.to_string())?
+            {
+                return Err("Agent retirement original binding/closure changed or pending".into());
+            }
+            let projection = self
+                .agent_action_service()
+                .project_snapshot(&binding.program_id)
+                .map_err(|error| error.to_string())?;
+            let task = projection
+                .tasks
+                .get(task_ref)
+                .ok_or("Agent retirement Task disappeared")?;
+            if task.status == AgenticTaskStatus::Withdrawn && task.active_attempts.is_empty() {
+                continue;
+            }
+            if task.status != AgenticTaskStatus::CancelRequested
+                || task.active_attempts.get(graph_id) != original_attempt.as_ref()
+                || task.claim_execution_id != original_claim
+            {
+                return Err("Agent retirement registered attempt changed during recovery".into());
+            }
+            let mut envelope = agentic_attempt_settlement(
                 &projection,
                 task_ref,
                 graph_id,
@@ -1071,6 +1146,7 @@ impl RuntimeServices {
                 "original Agent local exit and retirement reconciliation",
                 false,
             );
+            envelope.expected_revision = Some(projection.revision);
             let observation = self.submit_agent_action(&envelope).await?;
             if observation.status != AgentActionStatus::Applied {
                 return Err(format!(
@@ -1130,6 +1206,27 @@ impl RuntimeServices {
         reason: &str,
         retryable: bool,
     ) -> Result<(), String> {
+        let projection = self
+            .agent_action_service()
+            .project_snapshot(&projection.program_id)
+            .map_err(|error| error.to_string())?;
+        if projection
+            .tasks
+            .get(task_ref)
+            .is_some_and(|task| task.status == AgenticTaskStatus::CancelRequested)
+        {
+            if mode == harness_contract::agent_action::AgentAttemptMode::Coordination {
+                return Err("Coordination retirement awaits its original owner".into());
+            }
+            return if self
+                .retry_agentic_run_exit(execution_graph_id(execution_id))
+                .await?
+            {
+                Ok(())
+            } else {
+                Err("Agent retirement awaits original binding closure".into())
+            };
+        }
         let graph = self
             .graph_state_store()
             .load(execution_graph_id(execution_id))
@@ -1148,8 +1245,15 @@ impl RuntimeServices {
         if crate::agent_runtime::confirmed_run_exit(self.event_store(), &packet)?.is_none() {
             return Err("Agent attempt awaits original durable local exit".into());
         }
-        let envelope =
-            agentic_attempt_settlement(projection, task_ref, execution_id, mode, reason, retryable);
+        let mut envelope = agentic_attempt_settlement(
+            &projection,
+            task_ref,
+            execution_id,
+            mode,
+            reason,
+            retryable,
+        );
+        envelope.expected_revision = Some(projection.revision);
         let observation = self.submit_agent_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(
@@ -1258,6 +1362,19 @@ impl RuntimeServices {
                 .collect::<Vec<_>>();
             let mut settled_attempt = false;
             for (task_ref, attempt) in stranded_attempts {
+                projection = self.agent_action_service().project_snapshot(program_id)
+                    .map_err(|error| error.to_string())?;
+                if projection.tasks.get(&task_ref).is_some_and(|task|
+                    task.status == AgenticTaskStatus::CancelRequested)
+                {
+                    if attempt.mode == harness_contract::agent_action::AgentAttemptMode::Coordination
+                        || !self.retry_agentic_run_exit(execution_graph_id(&attempt.execution_id)).await?
+                    {
+                        return Err("startup retirement awaits original binding closure".into());
+                    }
+                    settled_attempt = true;
+                    continue;
+                }
                 let reason = match self
                     .graph_state_store()
                     .load_async(execution_graph_id(&attempt.execution_id))
@@ -1287,7 +1404,7 @@ impl RuntimeServices {
                     let release = AgentActionEnvelope {
                         action_id: format!("startup-coordination-reply:{}:{}", program_id, attempt.execution_id),
                         actor: agentic_supervisor_actor(&projection, Some(attempt.execution_id.clone())),
-                        expected_revision: None,
+                        expected_revision: Some(projection.revision),
                         action: AgentAction::TaskRelease(harness_contract::agent_action::TaskReleaseInput {
                             task_ref: task_ref.clone(), reason: "recovered durable coordination reply".into(),
                         }),
@@ -2228,6 +2345,61 @@ mod cohort_tests {
         assert_ne!(
             foreign.action_id,
             "runtime-attempt-settle:exit-program:exit-task:exit-graph"
+        );
+    }
+
+    #[test]
+    fn r1_1100_exit_settlement_program_fence_preserves_canonical_replay() {
+        use harness_contract::agent_action::{AgentActionStatus, TeamCreateInput};
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let actions = crate::AgentActionService::new(store.clone());
+        let create = |id: &str| {
+            super::super::reviewed_goal_fixture::root(
+                id,
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: id.into(),
+                    mission: "independent CAS and replay oracle".into(),
+                    objective: None,
+                }),
+            )
+        };
+        let opened = create("1100-open");
+        assert_eq!(
+            actions.apply(&opened).unwrap().status,
+            AgentActionStatus::Applied
+        );
+        let before = actions.project(&opened.actor.program_id).unwrap().revision;
+        let mut stale = create("1100-fenced");
+        stale.expected_revision = Some(before);
+        assert_eq!(
+            actions.apply(&create("1100-concurrent")).unwrap().status,
+            AgentActionStatus::Applied
+        );
+        let rejected = actions.apply(&stale).unwrap();
+        assert_eq!(rejected.status, AgentActionStatus::Rejected);
+        assert_eq!(rejected.error.unwrap().code, "stale_revision");
+        stale.expected_revision = Some(actions.project(&opened.actor.program_id).unwrap().revision);
+        let applied = actions.apply(&stale).unwrap();
+        assert_eq!(applied.status, AgentActionStatus::Applied);
+        assert!(!applied.duplicate);
+        let head = actions.project(&opened.actor.program_id).unwrap().revision;
+        stale.expected_revision = Some(0);
+        let replay = actions.apply(&stale).unwrap();
+        assert_eq!(replay.status, AgentActionStatus::Applied);
+        assert!(replay.duplicate);
+        let mut foreign = stale.clone();
+        foreign.action = AgentAction::TeamCreate(TeamCreateInput {
+            name: "foreign".into(),
+            mission: "changed payload".into(),
+            objective: None,
+        });
+        assert_eq!(
+            actions.apply(&foreign).unwrap().error.unwrap().code,
+            "action_id_conflict"
+        );
+        assert_eq!(
+            actions.project(&opened.actor.program_id).unwrap().revision,
+            head
         );
     }
 

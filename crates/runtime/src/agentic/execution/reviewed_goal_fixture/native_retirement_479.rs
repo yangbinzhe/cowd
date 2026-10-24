@@ -9,6 +9,7 @@ use std::time::Duration;
 
 tokio::task_local! {
     static JOURNAL_479: Arc<RuntimeEventStore>;
+    static CALLBACK_1100: ();
 }
 
 pub(super) async fn scope_journal_763<Future: std::future::Future>(
@@ -39,6 +40,9 @@ struct FaultControl {
     closure: Option<(String, String, ClosureFault)>,
     race_source: Option<String>,
     attempted: Vec<AppendTransactionRequest>,
+    blocked_closure: Option<(String, String)>,
+    exit_probe: Option<(String, String)>,
+    callback_probe: Option<(AgentTaskPacket, ExecutionNodeBinding, u64)>,
 }
 
 #[derive(Debug)]
@@ -49,6 +53,10 @@ struct RetirementJournal {
     closure_hits: AtomicUsize,
     race_hits: AtomicUsize,
     release_failure_hits: AtomicUsize,
+    closure_append_hits: AtomicUsize,
+    scoped_settlement_hits: AtomicUsize,
+    missing_exit_observed: tokio::sync::Notify,
+    closure_append_observed: tokio::sync::Notify,
 }
 
 impl RetirementJournal {
@@ -60,6 +68,10 @@ impl RetirementJournal {
             closure_hits: AtomicUsize::new(0),
             race_hits: AtomicUsize::new(0),
             release_failure_hits: AtomicUsize::new(0),
+            closure_append_hits: AtomicUsize::new(0),
+            scoped_settlement_hits: AtomicUsize::new(0),
+            missing_exit_observed: tokio::sync::Notify::new(),
+            closure_append_observed: tokio::sync::Notify::new(),
         });
         let store = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
         backend.store.set(Arc::downgrade(&store)).unwrap();
@@ -77,6 +89,7 @@ impl RetirementJournal {
         control.hold_settlement = false;
         control.closure = None;
         control.race_source = None;
+        control.blocked_closure = None;
     }
 }
 
@@ -103,6 +116,23 @@ impl RuntimeEventStoreBackend for RetirementJournal {
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
         {
             let mut control = self.control.lock().unwrap();
+            if control
+                .blocked_closure
+                .as_ref()
+                .is_some_and(|(stream, key)| {
+                    request.events.iter().any(|event| {
+                        event.event.stream_id == *stream
+                            && event.idempotency_key.as_deref() == Some(key.as_str())
+                            && event.event.kind == "execution_graph.recovered"
+                    })
+                })
+            {
+                self.closure_append_hits.fetch_add(1, Ordering::SeqCst);
+                self.closure_append_observed.notify_one();
+                return Err(RuntimeEventStoreError::Corrupt(
+                    "1100 original binding closure append held".into(),
+                ));
+            }
             if control.fail_release_once
                 && request.events.iter().any(|event| {
                     serde_json::from_value::<AgentActionEnvelope>(
@@ -129,6 +159,9 @@ impl RuntimeEventStoreBackend for RetirementJournal {
                         AgentAction::TaskAttemptFail(input) if input.execution_id == control.execution))
             });
             if selected {
+                if CALLBACK_1100.try_with(|_| ()).is_ok() {
+                    self.scoped_settlement_hits.fetch_add(1, Ordering::SeqCst);
+                }
                 control.attempted.push(request.clone());
                 (control.hold_settlement, control.race_source.take())
             } else {
@@ -169,6 +202,75 @@ impl RuntimeEventStoreBackend for RetirementJournal {
         key: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
         let original = self.inner.event_by_idempotency_key(stream_id, key)?;
+        if original.is_none() && CALLBACK_1100.try_with(|_| ()).is_ok() {
+            let probe = {
+                let control = self.control.lock().unwrap();
+                control
+                    .exit_probe
+                    .as_ref()
+                    .filter(|(stream, selected)| stream == stream_id && selected == key)
+                    .and(control.callback_probe.as_ref())
+                    .cloned()
+            };
+            if let Some((packet, binding, revision)) = probe {
+                let store = self.store.get().unwrap().upgrade().unwrap();
+                let records = self
+                    .inner
+                    .list_stream(packet.graph_id())
+                    .map_err(RuntimeEventStoreError::Corrupt)?;
+                let cancellation = records.into_iter().find(|record| {
+                    record.sequence == revision + 1
+                        && record.scope == RuntimeEventScope::ExecutionGraph
+                        && record.actor.as_deref() == Some("execution_commit_service")
+                        && record.kind == "execution_graph.command_applied"
+                        && record.transaction_id
+                            == format!("{}:command:cancel:{}", packet.graph_id(), revision + 1)
+                        && record.idempotency_key.as_deref()
+                            == Some(
+                                format!("{}:revision:{}", packet.graph_id(), revision + 1).as_str(),
+                            )
+                });
+                if let Some(record) = cancellation {
+                    let resolved = store
+                        .resolve_read_record(record)
+                        .map_err(RuntimeEventStoreError::Corrupt)?;
+                    let event: crate::execution_core::graph::ExecutionGraphEvent =
+                        serde_json::from_value(resolved.payload)?;
+                    if matches!(event, crate::execution_core::graph::ExecutionGraphEvent::CommandApplied {
+                        command, reason, ..
+                    } if command == "cancel"
+                        && reason.as_deref() == Some("1100 original cancellation before real exit"))
+                    {
+                        let graphs = crate::ExecutionGraphStateStore::new(store);
+                        let graph = graphs
+                            .load(packet.graph_id())
+                            .map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+                        let original: AgentTaskPacket = serde_json::from_str(
+                            &graph
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == packet.node_id())
+                                .unwrap()
+                                .payload_ref,
+                        )?;
+                        if original == packet
+                            && graph.recovery_cursor.node_attempts.get(packet.node_id())
+                                == Some(&packet.attempt)
+                            && graph.node_statuses.get(packet.node_id())
+                                == Some(&ExecutionNodeStatus::Cancelled)
+                            && graphs
+                                .current_binding(&graph, packet.node_id(), packet.attempt)
+                                .map_err(|error| {
+                                    RuntimeEventStoreError::Corrupt(error.to_string())
+                                })?
+                                == binding
+                        {
+                            self.missing_exit_observed.notify_one();
+                        }
+                    }
+                }
+            }
+        }
         let fault = self
             .control
             .lock()
@@ -827,55 +929,9 @@ fn assert_rejected_without_program_mutation(
 }
 
 fn assert_real_closures(services: &RuntimeServices, execution: &str) -> usize {
-    let mut pending = vec![execution.to_string()];
-    let mut seen = BTreeSet::new();
-    let mut starts_observed = 0;
-    while let Some(graph_id) = pending.pop() {
-        assert!(seen.insert(graph_id.clone()));
-        let graph = services.graph_state_store().load(&graph_id).unwrap();
-        assert!(graph
-            .node_statuses
-            .values()
-            .all(|status| status.is_terminal()));
-        let mut after = 0;
-        while after < graph.revision {
-            let (next, starts) = services
-                .graph_state_store()
-                .binding_starts_page(&graph.id, after, graph.revision)
-                .unwrap();
-            assert!(next > after);
-            for (node, binding, start) in starts {
-                let (ticket, spec) = services
-                    .graph_state_store()
-                    .binding_start_ticket(&graph, &node, &binding)
-                    .unwrap();
-                assert_eq!(ticket.attempt, binding.attempt);
-                assert_eq!(ticket.payload_ref, spec.payload_ref);
-                assert!(
-                    services
-                        .graph_state_store()
-                        .binding_lease_closure(&graph, &node, &binding, start)
-                        .unwrap(),
-                    "original owner must publish exact closure even for zero resource handles: {graph_id}/{node}"
-                );
-                starts_observed += 1;
-            }
-            after = next;
-        }
-        pending.extend(
-            services
-                .graph_state_store()
-                .child_links(&graph_id)
-                .unwrap()
-                .into_iter()
-                .map(|link| link.child_execution_id),
-        );
-    }
-    assert!(
-        starts_observed > 0,
-        "closure checks must observe real admitted bindings"
-    );
-    starts_observed
+    original_binding_closures_ready(services, execution, None)
+        .expect("original closures must authenticate")
+        .expect("original owner must publish exact closure even for zero resource handles")
 }
 
 async fn assert_withdrawn_once(fixture: &NativeRetirementFixture) {
@@ -1449,7 +1505,16 @@ struct ReleaseProcessGate(Arc<crate::agent_process_jsonl_adapter::ProcessExitGat
 
 impl Drop for ReleaseProcessGate {
     fn drop(&mut self) {
-        self.0.release();
+        if std::thread::panicking() {
+            // Preserve the first assertion if the bounded gate poisoned its
+            // mutex; report cleanup failure without aborting unwinding.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.0.release())).is_err()
+            {
+                eprintln!("479 Process exit gate release failed during primary panic cleanup");
+            }
+        } else {
+            self.0.release();
+        }
     }
 }
 
@@ -1760,4 +1825,341 @@ async fn automatic_retirement_after_fault(cold: bool) {
     assert!(report.errors.is_empty(), "{report:?}");
     assert_eq!(report.forced_aborts, 0, "{report:?}");
     assert_eq!(report.remaining_keys, 0, "{report:?}");
+}
+
+async fn process_retirement_1100(
+    name: &str,
+) -> (
+    PhysicalProcessFixture,
+    Arc<RetirementJournal>,
+    PhysicalWorker,
+    RealFixtureCleanup,
+) {
+    let (journal, backend) = RetirementJournal::new();
+    let physical = JOURNAL_479
+        .scope(
+            journal,
+            PhysicalProcessFixture::new(
+                crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly,
+                name,
+            ),
+        )
+        .await;
+    let cleanup = RealFixtureCleanup {
+        services: physical.services.clone(),
+        host: physical.host.clone(),
+    };
+    let worker = physical
+        .dispatch(name, r1_resource_write_scopes(), true, false, true)
+        .await;
+    backend.hold(&worker.packet);
+    create_open_retirement_goal(&physical.services, &worker.root_actor);
+    (physical, backend, worker, cleanup)
+}
+
+struct ReleaseRetirement1100(Arc<RetirementJournal>);
+impl Drop for ReleaseRetirement1100 {
+    fn drop(&mut self) {
+        self.0.allow();
+    }
+}
+
+async fn process_hot_closure_1100(startup: bool) {
+    let (physical, backend, worker, _cleanup) = process_retirement_1100("1100-hot-closure").await;
+    let services = &physical.services;
+    let _release_fault = ReleaseRetirement1100(backend.clone());
+    let graph = services
+        .graph_state_store()
+        .load(worker.packet.graph_id())
+        .unwrap();
+    let binding = services
+        .graph_state_store()
+        .current_binding(&graph, worker.packet.node_id(), worker.packet.attempt)
+        .unwrap();
+    let start = services
+        .graph_state_store()
+        .binding_start_position(&graph, worker.packet.node_id(), &binding)
+        .unwrap()
+        .unwrap();
+    let key = binding.lease_closure_key(&graph, worker.packet.node_id());
+    {
+        let mut control = backend.control.lock().unwrap();
+        control.blocked_closure = Some((graph.id.clone(), key.clone()));
+        control.exit_probe = Some((
+            format!("agent:{}", worker.packet.agent_id()),
+            format!("agent.local_exit:{}", worker.packet.run_id()),
+        ));
+        control.callback_probe = Some((worker.packet.clone(), binding.clone(), graph.revision));
+    }
+    let gate = services.agent_runtime().process_fixture_exit_gate(false);
+    let _release_exit = ReleaseProcessGate(gate.clone());
+    worker.finish_only().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !gate.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual Process driver must reach its exit gate before cancellation");
+    let host_calls = physical.host.calls.lock().unwrap().len();
+    assert!(matches!(
+        worker.packet.binding.as_ref().unwrap().executor,
+        harness_contract::agent::AgentExecutorPolicy::ProcessJsonl { .. }
+    ));
+    let agent_admission = services
+        .event_store()
+        .event_by_idempotency_key(
+            &format!("agent:{}", worker.packet.agent_id()),
+            &format!("agent.run_admitted:{}", worker.packet.run_id()),
+        )
+        .unwrap()
+        .unwrap();
+    let mut commits = services.event_store().subscribe_commits();
+    let cancel = CALLBACK_1100.scope(
+        (),
+        services.cancel_execution_tree(
+            worker.packet.graph_id(),
+            "1100 original cancellation before real exit",
+        ),
+    );
+    let stages = async {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            backend.missing_exit_observed.notified(),
+        )
+        .await
+        .expect("original cancel callback must query absent exact exit after committing cancel");
+        assert!(gate.entered.load(Ordering::Acquire));
+        assert!(
+            crate::agent_runtime::confirmed_run_exit(services.event_store(), &worker.packet)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!services
+            .retry_agentic_run_exit(worker.packet.graph_id())
+            .await
+            .unwrap());
+        assert_pending(services, &worker);
+        gate.release();
+        worker.wait_exit().await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            backend.closure_append_observed.notified(),
+        )
+        .await
+        .expect("the original owner must hit the exact closure append fault");
+        let result = if startup {
+            services
+                .recover_agentic_programs_on_startup()
+                .await
+                .map(|_| true)
+        } else {
+            services
+                .retry_agentic_run_exit(worker.packet.graph_id())
+                .await
+        };
+        assert!(
+            result.is_err() || result == Ok(false),
+            "closure fault cannot report retirement complete"
+        );
+        assert!(backend.control.lock().unwrap().attempted.is_empty(),
+            "1100 RED: terminal plus real exit must not reach Task settlement before original closure");
+        assert_pending(services, &worker);
+        assert!(!services
+            .graph_state_store()
+            .binding_lease_closure(
+                &services.graph_state_store().load(&graph.id).unwrap(),
+                worker.packet.node_id(),
+                &binding,
+                start,
+            )
+            .unwrap());
+        backend.allow();
+        // Only the existing production exit lane drives the positive recovery.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let program = services
+                    .agent_action_service()
+                    .project(&worker.root_actor.program_id)
+                    .unwrap();
+                if program.tasks[&worker.task_ref].status == crate::AgenticTaskStatus::Withdrawn {
+                    break;
+                }
+                commits.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("original exit lane must close and settle without test retry/recover");
+        assert_real_closures(services, worker.packet.graph_id());
+        let closure = services
+            .event_store()
+            .event_by_idempotency_key(&graph.id, &key)
+            .unwrap()
+            .unwrap();
+        let action_id = format!(
+            "runtime-attempt-settle:{}:{}:{}",
+            worker.root_actor.program_id,
+            worker.task_ref,
+            worker.packet.graph_id()
+        );
+        let actions = services
+            .event_store()
+            .list_stream(&format!("agentic-program:{}", worker.root_actor.program_id))
+            .unwrap();
+        let settled = actions
+            .iter()
+            .filter(|record| record.payload["envelope"]["action_id"] == action_id)
+            .collect::<Vec<_>>();
+        assert_eq!(settled.len(), 1);
+        assert!(closure.commit_cursor < settled[0].commit_cursor);
+        assert_eq!(
+            settled[0].payload["envelope"]["expected_revision"].as_u64(),
+            Some(settled[0].sequence - 1)
+        );
+        assert!(services
+            .retry_agentic_run_exit(worker.packet.graph_id())
+            .await
+            .unwrap());
+        assert_eq!(
+            services
+                .event_store()
+                .stream_revision(&format!("agentic-program:{}", worker.root_actor.program_id))
+                .unwrap(),
+            actions.last().unwrap().sequence
+        );
+        assert_not_success(services, &worker);
+        assert_eq!(
+            physical.host.calls.lock().unwrap().len(),
+            host_calls,
+            "retirement recovery must not redispatch Host work"
+        );
+        assert_eq!(
+            services
+                .event_store()
+                .event_by_idempotency_key(
+                    &format!("agent:{}", worker.packet.agent_id()),
+                    &format!("agent.run_admitted:{}", worker.packet.run_id()),
+                )
+                .unwrap()
+                .unwrap(),
+            agent_admission,
+            "recovery must reuse the original Agent admission"
+        );
+    };
+    let (cancelled, ()) = tokio::join!(cancel, stages);
+    assert!(
+        cancelled.is_err(),
+        "the exact injected closure append must fail the original cancel caller"
+    );
+    assert!(backend.closure_append_hits.load(Ordering::SeqCst) > 0);
+    services.shutdown_maintenance().await;
+    let report = services.shutdown_execution().await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.forced_aborts, 0, "{report:?}");
+    assert_eq!(report.remaining_keys, 0, "{report:?}");
+}
+
+#[tokio::test]
+async fn r1_1100_process_cancelled_exit_retains_pending_until_original_closure() {
+    process_hot_closure_1100(false).await;
+}
+
+#[tokio::test]
+async fn r1_1100_startup_program_retirement_uses_the_same_closure_boundary() {
+    process_hot_closure_1100(true).await;
+}
+
+#[tokio::test]
+async fn r1_1100_process_original_closure_identity_controls_hot_settlement() {
+    let (physical, backend, worker, _cleanup) =
+        process_retirement_1100("1100-closure-identity").await;
+    let services = &physical.services;
+    let _release_fault = ReleaseRetirement1100(backend.clone());
+    worker.withdraw().await;
+    worker.process.finish().await;
+    worker.wait_exit().await;
+    services
+        .cancel_execution_tree(worker.packet.graph_id(), "1100 original closure identity")
+        .await
+        .unwrap();
+    // Establish the legal baseline with real producer evidence before changing
+    // exactly one read; the transaction hold preserves the pending attempt.
+    let mut baseline_commits = services.event_store().subscribe_commits();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while original_binding_closures_ready(
+            services,
+            worker.packet.graph_id(),
+            Some(&worker.packet),
+        )
+        .unwrap()
+        .is_none()
+        {
+            baseline_commits.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the original producer must establish a legal closure baseline");
+    assert_real_closures(services, worker.packet.graph_id());
+    let graph = services
+        .graph_state_store()
+        .load(worker.packet.graph_id())
+        .unwrap();
+    let binding = services
+        .graph_state_store()
+        .current_binding(&graph, worker.packet.node_id(), worker.packet.attempt)
+        .unwrap();
+    let key = binding.lease_closure_key(&graph, worker.packet.node_id());
+    let original = backend
+        .inner
+        .event_by_idempotency_key(&graph.id, &key)
+        .unwrap()
+        .unwrap();
+    for fault in [ClosureFault::Missing, ClosureFault::WrongAttempt] {
+        backend.control.lock().unwrap().closure = Some((graph.id.clone(), key.clone(), fault));
+        let before = backend.closure_hits.load(Ordering::SeqCst);
+        let settlements_before = backend.scoped_settlement_hits.load(Ordering::SeqCst);
+        let result = CALLBACK_1100
+            .scope(
+                (),
+                services.retry_agentic_run_exit(worker.packet.graph_id()),
+            )
+            .await;
+        assert!(result.is_err() || result == Ok(false));
+        assert!(backend.closure_hits.load(Ordering::SeqCst) > before);
+        assert_eq!(backend.scoped_settlement_hits.load(Ordering::SeqCst), settlements_before,
+            "this rejected hot entry must not attempt settlement; unrelated prior legal-baseline readers are not this probe");
+        assert_pending(services, &worker);
+        assert_eq!(
+            backend
+                .inner
+                .event_by_idempotency_key(&graph.id, &key)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        backend.control.lock().unwrap().closure = None;
+        assert_real_closures(services, worker.packet.graph_id());
+    }
+    backend.allow();
+    let mut commits = services.event_store().subscribe_commits();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let program = services
+                .agent_action_service()
+                .project(&worker.root_actor.program_id)
+                .unwrap();
+            if program.tasks[&worker.task_ref].status == crate::AgenticTaskStatus::Withdrawn {
+                break;
+            }
+            commits.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("production retry must resume after the source fault is released");
+    assert_not_success(services, &worker);
+    services.shutdown_maintenance().await;
+    let report = services.shutdown_execution().await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.forced_aborts, 0);
+    assert_eq!(report.remaining_keys, 0);
 }
