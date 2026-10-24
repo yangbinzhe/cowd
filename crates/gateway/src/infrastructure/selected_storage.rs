@@ -194,22 +194,8 @@ impl SelectedStorageTopology {
         config_home: &Path,
         workspace_root: &Path,
     ) -> Result<Self, String> {
-        let budget = storage::test_fixture_pool_budget(3, Some(24))?;
+        let postgres = test_postgres_configuration()?;
         let permit = acquire_test_postgres_fixture_permit();
-        let mut postgres = runtime::PostgresTopologyConfig::default();
-        postgres.logical_identity = format!("cowd-test-{}", std::process::id());
-        postgres.secret_ref = "env:COWD_TEST_POSTGRES_URL".to_string();
-        // All isolated schemas share one bounded process pool. Domain work
-        // still retains separate workload lanes while schema count does not
-        // multiply server connections.
-        postgres.max_connections = budget;
-        postgres.server_reserve = 4;
-        postgres.critical.max_connections = None;
-        postgres.online_read.max_connections = None;
-        postgres.background.max_connections = None;
-        postgres.critical.min_idle_connections = None;
-        postgres.online_read.min_idle_connections = None;
-        postgres.background.min_idle_connections = None;
         let config = runtime::StorageTopologyConfig {
             backend: runtime::StorageBackendSelection::Postgres,
             postgres: Some(postgres),
@@ -220,10 +206,8 @@ impl SelectedStorageTopology {
             ..runtime::StorageTopologyConfig::default()
         };
         let registry = base_registry(config_home, workspace_root)?;
-        let executor = shared_test_postgres_executor(
-            config.postgres.as_ref().expect("test PostgreSQL config"),
-            config_home,
-        )?;
+        let executor =
+            test_postgres_executor(config.postgres.as_ref().expect("test PostgreSQL config"))?;
         let name = format!(
             "cowdtest_{}_{}",
             std::process::id(),
@@ -468,16 +452,43 @@ impl TestPostgresExecutorCache {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn shared_test_postgres_executor(
+pub(crate) fn test_postgres_configuration() -> Result<runtime::PostgresTopologyConfig, String> {
+    let budget = storage::test_fixture_pool_budget(3, Some(24))?;
+    let mut config = runtime::PostgresTopologyConfig::default();
+    config.logical_identity = format!("cowd-test-{}", std::process::id());
+    config.secret_ref = "env:COWD_TEST_POSTGRES_URL".to_string();
+    config.max_connections = budget;
+    config.server_reserve = 4;
+    config.critical.max_connections = None;
+    config.online_read.max_connections = None;
+    config.background.max_connections = None;
+    config.critical.min_idle_connections = None;
+    config.online_read.min_idle_connections = None;
+    config.background.min_idle_connections = None;
+    Ok(config)
+}
+
+/// Both test composition roots use this cache and the same explicit env source.
+/// No user config home, temporary topology or domain registry is constructed.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_postgres_executor(
     config: &runtime::PostgresTopologyConfig,
-    config_home: &Path,
 ) -> Result<PostgresExecutor, String> {
+    if config.secret_ref != "env:COWD_TEST_POSTGRES_URL" {
+        return Err(
+            "PostgreSQL test executor requires its explicit test environment source".into(),
+        );
+    }
     static EXECUTOR: std::sync::OnceLock<TestPostgresExecutorCache> = std::sync::OnceLock::new();
     // Resolve on every request to detect changed secret values. Only the first
     // snapshot can connect; later mismatches cannot create another pool.
-    let snapshot = ConfigHomeSecretRefResolver::new(config_home)
-        .resolve_postgres_url(&config.secret_ref)
-        .map(|url| storage::test_fixture_postgres_url_snapshot(&config.secret_ref, &url))
+    let snapshot = std::env::var("COWD_TEST_POSTGRES_URL")
+        .map(|url| {
+            storage::test_fixture_postgres_url_snapshot(
+                &config.secret_ref,
+                &ResolvedPostgresUrl::new(url),
+            )
+        })
         .map_err(|_| "PostgreSQL test URL could not be resolved".to_string());
     let key = (
         snapshot

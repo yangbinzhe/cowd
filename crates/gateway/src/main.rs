@@ -132,52 +132,14 @@ pub(crate) mod current_terminal_fixture;
 
 #[cfg(test)]
 pub(crate) mod pg_test_support {
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     use session::UnifiedSessionStore;
-    use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
-
-    /// Warm connections opened eagerly by a PG-backed test binary.
-    ///
-    /// Deliberately small: several test binaries share one fixture server, so
-    /// the cost of an idle connection is multiplied by the number of binaries.
-    /// The pool still grows on demand up to `config.max_connections`, which is
-    /// what keeps a concurrent test from starving while an idle one costs
-    /// almost nothing.
+    use storage::PostgresExecutor;
 
     fn postgres_executor() -> PostgresExecutor {
-        static EXECUTOR: OnceLock<Result<PostgresExecutor, String>> = OnceLock::new();
-        EXECUTOR
-            .get_or_init(|| {
-                let url = std::env::var("COWD_TEST_POSTGRES_URL")
-                    .map_err(|_| "COWD_TEST_POSTGRES_URL is required".to_string())?;
-                let resolver = StaticSecretRefResolver::new([("gateway.test.pg".to_string(), url)]);
-                let mut config = PostgresConnectionConfig::new(
-                    "gateway-test",
-                    "gateway.test.pg",
-                    "cowd-gateway-test",
-                );
-                // Gateway's unit-test binary runs hundreds of isolated-schema
-                // cases concurrently. A tiny shared pool turns unrelated
-                // tests into artificial admission failures and masks the
-                // business invariants they exercise.
-                //
-                // The ceiling stays high enough that one test binary can use
-                // real parallelism (64), but the pool must not open all 64 up
-                // front: nine PG-backed test binaries share one server, so
-                // eager creation of every slot is what exhausted the fixture.
-                // Warm a small floor and let the pool grow to the ceiling only
-                // when cases actually ask for connections.
-                config.max_connections = 64;
-                // Hold NO idle connections. Nine PG-backed test binaries share one server and
-                // libtest runs them concurrently, so a warm floor is multiplied by the
-                // binary count and most of those connections sit idle: that is what
-                // turns a shared fixture into an admission failure. Connections are
-                // created when a case actually checks one out.
-                config.min_idle_connections = Some(0);
-                PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
-            })
-            .clone()
+        crate::selected_storage::test_postgres_configuration()
+            .and_then(|config| crate::selected_storage::test_postgres_executor(&config))
             .unwrap_or_else(|error| panic!("isolated PostgreSQL test executor: {error}"))
     }
 
@@ -223,6 +185,100 @@ pub(crate) mod pg_test_support {
         )
         .expect("initialize Matrix PostgreSQL test adapter");
         Arc::new(backend)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires owned isolated PostgreSQL and COWD_TEST_POOL_CONNECTIONS=4"]
+    async fn helper_and_selected_topology_share_pool_and_keep_session_scope_alive() {
+        let helper = postgres_executor();
+        let config = crate::selected_storage::test_postgres_configuration().unwrap();
+        assert_eq!(config.max_connections, 4, "explicit runner allocation");
+        let selected = crate::selected_storage::test_postgres_executor(&config).unwrap();
+        assert_eq!(helper.health().max_connections, 4);
+        let first_pid = {
+            let mut held = helper.checkout_critical().unwrap();
+            assert_eq!(
+                selected.health().lanes[0].active_connections,
+                1,
+                "the other entry must observe this exact live checkout"
+            );
+            held.query_one("SELECT pg_backend_pid()", &[])
+                .unwrap()
+                .get::<_, i32>(0)
+        };
+        let second_pid = selected
+            .checkout_critical()
+            .unwrap()
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get::<_, i32>(0);
+        assert_eq!(
+            first_pid, second_pid,
+            "one-slot lane must reuse the same backend"
+        );
+
+        let session = session_store();
+        let record = crate::api_routes::new_api_session_record(
+            "same-id-in-separate-scopes",
+            Some("helper-scope".into()),
+        );
+        session.create_session(&record).await.unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let topology = crate::selected_storage::SelectedStorageTopology::compose_for_test(
+            home.path(),
+            workspace.path(),
+        )
+        .unwrap();
+        assert!(
+            topology
+                .session_store
+                .get_session(&record.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let other = crate::api_routes::new_api_session_record(
+            &record.session_id,
+            Some("topology-scope".into()),
+        );
+        topology.session_store.create_session(&other).await.unwrap();
+        assert_eq!(
+            topology
+                .session_store
+                .get_session(&record.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("topology-scope")
+        );
+        assert_eq!(
+            session
+                .get_session(&record.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("helper-scope")
+        );
+        // This drops only the topology-owned namespace, not the helper's schema.
+        drop(topology);
+        assert_eq!(
+            session
+                .get_session(&record.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("helper-scope")
+        );
+        println!(
+            "shared fixture critical backend {first_pid}; helper Session remains readable after topology drop"
+        );
     }
 }
 
