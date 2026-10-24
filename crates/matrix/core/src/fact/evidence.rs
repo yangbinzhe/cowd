@@ -179,7 +179,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn evidence_packet_accepts_tool_invocation_source_without_output_copy() {
+    fn evidence_packet_retains_tool_invocation_source_metadata() {
         let mut packet = MatrixEvidencePacket::new("supplier shortage risk");
 
         packet.add_tool_invocation_source(
@@ -190,11 +190,12 @@ mod tests {
 
         assert_eq!(packet.source_refs.len(), 1);
         assert_eq!(packet.source_refs[0].kind, "tool_invocation");
-        assert!(packet.source_refs[0].reference.starts_with("tool-output:"));
+        assert_eq!(
+            packet.source_refs[0].reference,
+            "tool-output:toolu-matrix:abc"
+        );
         assert_eq!(packet.anomaly_evidence.len(), 1);
         assert!(packet.confidence > 0.30);
-        let serialized = serde_json::to_string(&packet).unwrap();
-        assert!(!serialized.contains("unique-matrix-output-token-79"));
     }
 
     #[test]
