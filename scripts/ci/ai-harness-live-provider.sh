@@ -6,12 +6,12 @@ cd "$ROOT"
 
 if [[ "${COWD_AI_HARNESS_LIVE:-0}" != "1" ]]; then
   cat <<'MSG'
-Provider live validation is disabled.
+NotStarted: provider live validation is disabled.
 
 Set COWD_AI_HARNESS_LIVE=1 to run one bounded real provider request using
 the active runtime model or COWD_AI_HARNESS_LIVE_MODEL.
 MSG
-  exit 0
+  exit 2
 fi
 
 MODE="${COWD_AI_HARNESS_LIVE_MODE:-smoke}"

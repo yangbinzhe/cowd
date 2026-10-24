@@ -4,8 +4,8 @@ set -euo pipefail
 SURFACE_WEBUI_DIR="${COWD_SURFACE_WEBUI_DIR:-}"
 
 if [[ -z "$SURFACE_WEBUI_DIR" ]]; then
-  echo "live WebUI workbench scenario moved to cowd-edge; set COWD_SURFACE_WEBUI_DIR to surfaces/webui"
-  exit 0
+  echo "NotStarted: live WebUI workbench requires COWD_SURFACE_WEBUI_DIR pointing to surfaces/webui in cowd-edge"
+  exit 2
 fi
 
 if [[ ! -d "$SURFACE_WEBUI_DIR" ]]; then

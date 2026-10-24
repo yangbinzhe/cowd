@@ -114,4 +114,9 @@ if [[ "$stable_hash" != "$agent_hash" ]]; then
   exit 1
 fi
 
-curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
+curl -fsS "$BASE_URL/healthz" | python3 -c '
+import json, sys
+health = json.load(sys.stdin)
+sys.exit(0 if isinstance(health, dict) and health.get("gateway") == "gateway-runtime-host"
+         and health.get("api_router") == "gateway-api-router" else 1)
+'
