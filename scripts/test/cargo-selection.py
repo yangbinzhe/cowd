@@ -2,6 +2,7 @@
 """Metadata selection and admission shared by the existing Cargo test lanes."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -18,26 +19,70 @@ class NotStarted(Exception):
     pass
 
 
-def run_process(args, cwd, capture_output=True, timeout=120):
-    with subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+class Cancelled(NotStarted):
+    pass
+
+
+@contextmanager
+def cli_signals():
+    def cancel(signum, frame):
+        raise Cancelled(f"selection cancelled by signal {signum}")
+
+    previous = {sig: signal.signal(sig, cancel) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def stop_owned_process(process):
+    # A group member may retain a pipe even after the leader exits. Always kill
+    # the owned group, and bound both draining and direct-child reaping.
+    previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, sig)
             except ProcessLookupError:
                 pass
             try:
-                process.communicate(timeout=5)
+                process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
                 pass
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate()
-            raise
-        return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+        for pipe in (process.stdout, process.stderr):
+            if pipe:
+                pipe.close()
+        process.wait(timeout=1)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def run_process(args, cwd, capture_output=True, timeout=120):
+    process, pending, previous = None, [], {}
+
+    def defer(signum, frame):
+        pending[:] = [signum]
+
+    try:
+        # Do not raise asynchronously until Popen has published its owner. This
+        # defers Python handlers, not the OS signal mask inherited by the child.
+        try:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                previous[sig] = signal.signal(sig, defer)
+            process = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+        if pending:
+            raise Cancelled(f"selection cancelled by signal {pending[0]}")
+        stdout, stderr = process.communicate(timeout=timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt, Cancelled):
+        if process is not None:
+            stop_owned_process(process)
+        raise
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
 def command(root, args, timeout=120):
@@ -128,6 +173,37 @@ def owners(root, packages, paths):
     return matched, unmatched
 
 
+def target_entry(package, target, dependencies):
+    kind = next((kind for kind in target["kind"]
+                 if kind in {"lib", "rlib", "proc-macro", "bin", "test", "example", "bench"}), None)
+    if kind is None:
+        return None
+    flag = "--lib" if kind in {"lib", "rlib", "proc-macro"} else "--" + kind
+    return {"package": package["name"], "package_id": package["id"], "target": target["name"], "kind": kind,
+            "target_kind": target["kind"],
+            "target_args": [flag] if flag == "--lib" else [flag, target["name"]],
+            "features": "all", "required_features": target.get("required-features", []),
+            "compile_only": not target.get("test", True),
+            "needs_pg": any(dep.endswith("-postgres") for dep in dependencies),
+            "needs_process": bool(dependencies & {"sandbox-launcher", "managed-worker-runtime"}),
+            "model_resource": "offline; live tests remain in canonical ignored/manual lanes",
+            "qualified_selector": None, "expected_selected": None}
+
+
+def plan_envelope(root, data, reason, paths, direct, unmatched, selected, entries):
+    return {"schema": 1, "source": source_identity(root),
+            "metadata_sha256": digest(json.dumps(data, sort_keys=True).encode()),
+            "reason": reason, "changed_paths": paths, "direct_packages": sorted(direct),
+            "unmapped_paths": unmatched, "packages": sorted(selected), "targets": entries,
+            "external_checks": [["cargo", "check", "--locked", "--manifest-path", "tests/interactive/Cargo.toml", "--all-targets", "--all-features"]]
+            if any(path.startswith("tests/interactive/") for path in paths) else [],
+            "status": "Planned", "business_acceptance": "NotAssessed",
+            "final_gates": ["scripts/validate.sh full-regression", "scripts/validate.sh contract",
+                            "scripts/validate.sh scenario", "scripts/validate.sh surface",
+                            "scripts/validate.sh manual postgres-contract", "tests/interactive/Cargo.toml",
+                            "canonical ignored/manual/model lanes"]}
+
+
 def make_plan(root, data, paths, quick=False):
     packages = workspace_packages(data)
     edges = dependency_map(packages)
@@ -148,39 +224,72 @@ def make_plan(root, data, paths, quick=False):
     for name in sorted(selected):
         dependencies = closure({name}, edges)
         for target in packages[name]["targets"]:
-            kind = next((kind for kind in target["kind"]
-                         if kind in {"lib", "rlib", "proc-macro", "bin", "test", "example", "bench"}), None)
-            if kind is None:
-                continue
-            flag = "--lib" if kind in {"lib", "rlib", "proc-macro"} else "--" + kind
-            entries.append({"package": name, "package_id": packages[name]["id"], "target": target["name"], "kind": kind,
-                            "target_kind": target["kind"],
-                            "target_args": [flag] if flag == "--lib" else [flag, target["name"]],
-                            "features": "all", "required_features": target.get("required-features", []),
-                            "compile_only": not target.get("test", True),
-                            "needs_pg": any(dep.endswith("-postgres") for dep in dependencies),
-                            "needs_process": bool(dependencies & {"sandbox-launcher", "managed-worker-runtime"}),
-                            "model_resource": "offline; live tests remain in canonical ignored/manual lanes",
-                            "qualified_selector": None, "expected_selected": None})
+            entry = target_entry(packages[name], target, dependencies)
+            if entry is not None:
+                entries.append(entry)
     if not entries:
         raise NotStarted("selection has no testable Cargo targets")
-    return {"schema": 1, "source": source_identity(root),
-            "metadata_sha256": digest(json.dumps(data, sort_keys=True).encode()),
-            "reason": reason, "changed_paths": paths, "direct_packages": sorted(direct),
-            "unmapped_paths": unmatched, "packages": sorted(selected), "targets": entries,
-            "external_checks": [["cargo", "check", "--locked", "--manifest-path", "tests/interactive/Cargo.toml", "--all-targets", "--all-features"]]
-            if any(path.startswith("tests/interactive/") for path in paths) else [],
-            "status": "Planned", "business_acceptance": "NotAssessed",
-            "final_gates": ["scripts/validate.sh full-regression", "scripts/validate.sh contract",
-                            "scripts/validate.sh scenario", "scripts/validate.sh surface",
-                            "scripts/validate.sh manual postgres-contract", "tests/interactive/Cargo.toml",
-                            "canonical ignored/manual/model lanes"]}
+    return plan_envelope(root, data, reason, paths, direct, unmatched, selected, entries)
 
 
-def ignored_reasons(root, data):
+def canonical_runners(root):
+    return re.findall(r"^    marker: (.+)\n    runner: (.+)$",
+                      (root / "tests/test-governance/test-inventory.yaml").read_text(), re.M)
+
+
+def check_narrow_admission(root, request):
+    if not request["ignored"]:
+        return
+    registered = [(marker, runner) for marker, runner in canonical_runners(root)
+                  if request["entry"] == runner or (marker.startswith("scripts/") and request["entry"] == marker)]
+    if not registered:
+        raise NotStarted("ignored execution requires its registered canonical entry")
+    environment = cargo_environment(root)
+    for marker, runner in registered:
+        if marker == "COWD_TEST_POSTGRES_URL" and not environment.get(marker):
+            raise NotStarted("missing isolated PG configuration for canonical entry")
+        required = re.findall(r"\b(COWD_[A-Z0-9_]+)=1\b", marker)
+        if runner == "scripts/validate.sh manual lark-live":
+            required += ["COWD_LIVE_LARK_SKILL_TEST", "COWD_LIVE_LARK_CLI_TOOL_TEST"]
+        if any(environment.get(name) != "1" for name in required):
+            raise NotStarted("missing LIVE opt-in for canonical entry")
+
+
+def make_narrow_plan(root, data, request):
+    packages = workspace_packages(data)
+    package = packages.get(request["package"])
+    if package is None:
+        raise NotStarted("requested package is not a workspace member")
+    if bool(request["lib"]) == bool(request["test"]):
+        raise NotStarted("narrow request requires exactly one lib or named test target")
+    if (bool(request["filter"]) == bool(request["all_in_target"])
+            or (request["exact"] and not request["filter"])
+            or (request["all_in_target"] and not request["test"])
+            or (request["filter"] is not None and not request["filter"].strip())
+            or (request["filter"] is not None and request["filter"].startswith("-"))
+            or (request["test_threads"] is not None and request["test_threads"] < 1)
+            or (request["entry"] is not None and not request["ignored"])):
+        raise NotStarted("invalid narrow filter/mode/thread/entry request")
+    matches = [target for target in package["targets"]
+               if (request["lib"] and any(k in target["kind"] for k in {"lib", "rlib", "proc-macro"}))
+               or (request["test"] == target["name"] and "test" in target["kind"])]
+    if len(matches) != 1 or not matches[0].get("test", True):
+        raise NotStarted("narrow request must resolve to one executable libtest target")
+    check_narrow_admission(root, request)
+    entry = target_entry(package, matches[0], closure({package["name"]}, dependency_map(packages)))
+    entry.update(features="default", request=dict(request))
+    if request["ignored"]:
+        entry["model_resource"] = "canonical ignored/manual lane; original LIVE and resource admission required"
+    return plan_envelope(root, data, "explicit single package/target request", [], {package["name"]}, [],
+                         {package["name"]}, [entry])
+
+
+def ignored_reasons(root, data, selected=None):
     markers = re.findall(r"^    marker: (.+)$", (root / "tests/test-governance/test-inventory.yaml").read_text(), re.M)
     reasons = {}
     for name, package in workspace_packages(data).items():
+        if selected is not None and name not in selected:
+            continue
         entries = {}
         for path in Path(package["manifest_path"]).parent.rglob("*.rs"):
             for match in re.finditer(r'#\[ignore(?:\s*=\s*"([^"\n]*)")?\s*\]([\s\S]{0,600}?)\bfn\s+(\w+)\s*\(', path.read_text()):
@@ -237,6 +346,9 @@ def cargo_environment(root, check_runner=True):
 
 def check_resources(root, plan, data=None):
     environment = cargo_environment(root)
+    for item in plan["targets"]:
+        if "request" in item:
+            check_narrow_admission(root, item["request"])
     if any(item["needs_pg"] for item in plan["targets"]) and not environment.get("COWD_TEST_POSTGRES_URL"):
         raise NotStarted("missing isolated PG configuration (COWD_TEST_POSTGRES_URL)")
     if any(item["needs_process"] for item in plan["targets"]):
@@ -271,9 +383,41 @@ def native_host(root):
     return host[1]
 
 
+def cargo_test_args(item, build=False):
+    args = ["cargo", "test", "--locked", "-p", item["package"]]
+    if "request" in item:
+        args += item["target_args"]
+        if item["request"]["release"]:
+            args.append("--release")
+    else:
+        args += ["--all-targets"] if build else item["target_args"]
+        args.append("--all-features")
+    return args
+
+
+def libtest_args(item, phase):
+    if "request" not in item:
+        return (["--format", "pretty"] if phase == "run" else
+                ["--list", *(["--ignored"] if phase == "ignored" else []), "--format", "terse"])
+    request = item.get("request", {})
+    args = [request["filter"]] if request.get("filter") else []
+    if request.get("exact"):
+        args.append("--exact")
+    if phase == "ignored" or (phase == "run" and request.get("ignored")):
+        args.append("--ignored")
+    if phase != "run":
+        return [*args, "--list", "--format", "terse"]
+    args += ["--format", "pretty"]
+    if request.get("nocapture"):
+        args.append("--nocapture")
+    if request.get("test_threads") is not None:
+        args += ["--test-threads", str(request["test_threads"])]
+    return args
+
+
 def guarded_cargo_args(item, admission, host):
     runner = [sys.executable, str(Path(__file__).resolve()), "launch", str(admission)]
-    return ["cargo", "test", "--locked", "-p", item["package"], *item["target_args"], "--all-features",
+    return [*cargo_test_args(item),
             "--config", f"target.{host}.runner=" + json.dumps(runner)]
 
 
@@ -298,15 +442,15 @@ def discover(root, plan, data, log_dir):
         write_log(log_dir / f"external-{index}.stderr", result.stderr)
         if result.returncode:
             raise NotStarted(f"external manifest check failed (exit {result.returncode})")
-    reasons = ignored_reasons(root, data)
-    runners = re.findall(r"^    marker: (.+)\n    runner: (.+)$",
-                         (root / "tests/test-governance/test-inventory.yaml").read_text(), re.M)
+    narrow = any("request" in item for item in plan["targets"])
+    reasons = {} if narrow else ignored_reasons(root, data)
+    runners = canonical_runners(root)
     plan["launcher_version"] = workspace_packages(data).get("sandbox-launcher", {}).get("version")
     prepared = {}
     host = None
     for index, item in enumerate(plan["targets"]):
-        item["build_command"] = ["cargo", "test", "--locked", "-p", item["package"], "--all-targets", "--all-features", "--no-run", "--message-format=json"]
-        key = (item["package"], item["features"])
+        item["build_command"] = [*cargo_test_args(item, build=True), "--no-run", "--message-format=json"]
+        key = tuple(item["build_command"])
         if key not in prepared:
             result = run_process(item["build_command"], cwd=root, capture_output=True, timeout=1200)
             write_log(log_dir / f"{index}-build.stderr", result.stderr)
@@ -346,24 +490,43 @@ def discover(root, plan, data, log_dir):
             host = native_host(root)
         item["cargo_args"] = guarded_cargo_args(item, admission, host)
         validate_executables(root, launch_plan)
-        listed = listed_output(root, [*item["cargo_args"], "--", "--list", "--format", "terse"], log_dir / f"{index}-list.txt")
+        listed = listed_output(root, [*item["cargo_args"], "--", *libtest_args(item, "complete")], log_dir / f"{index}-list.txt")
         validate_executables(root, launch_plan)
-        ignored = listed_output(root, [*item["cargo_args"], "--", "--list", "--ignored", "--format", "terse"], log_dir / f"{index}-ignored.txt")
+        ignored = listed_output(root, [*item["cargo_args"], "--", *libtest_args(item, "ignored")], log_dir / f"{index}-ignored.txt")
         names, ignored_names = parse_listing(listed), parse_listing(ignored)
         if not ignored_names <= names:
             raise NotStarted("ignored discovery differs from complete discovery")
+        request = item.get("request", {})
+        if request.get("exact") and names != {request["filter"]}:
+            raise NotStarted("exact selector must match one qualified registration")
+        if narrow and ignored_names and item["package"] not in reasons:
+            reasons.update(ignored_reasons(root, data, {item["package"]}))
         item["ignored"], item["ignored_runners"] = {}, {}
         for name in sorted(ignored_names):
             known = reasons[item["package"]].get(name.split("::")[-1], set())
             if not known or None in known:
                 raise NotStarted("unknown ignored reason; register in canonical governance inventory")
+            if request.get("ignored") and len(known) != 1:
+                raise NotStarted("ambiguous ignored reason for qualified selector")
             item["ignored"][name] = sorted(known)
             item["ignored_runners"][name] = sorted({runner for reason in known for marker, runner in runners if marker in reason})
             if not item["ignored_runners"][name]:
                 raise NotStarted("ignored test lacks canonical runner")
-        item["selectors"] = sorted(names - ignored_names)
+            if request.get("ignored"):
+                matches = [(marker, runner) for marker, runner in runners for reason in known if marker in reason]
+                if len({runner for _, runner in matches}) != 1:
+                    raise NotStarted("ambiguous canonical owner for ignored selector")
+                if not any(request["entry"] == runner or (marker.startswith("scripts/") and request["entry"] == marker)
+                           for marker, runner in matches):
+                    raise NotStarted("selected ignored test belongs to a different canonical entry")
+                check_narrow_admission(root, {**request, "entry": matches[0][1]})
+        item["selectors"] = sorted(ignored_names if request.get("ignored") else names - ignored_names)
+        if narrow:
+            item["expected_skipped"] = [] if request.get("ignored") else sorted(ignored_names)
         item["expected_selected"] = len(item["selectors"])
         item["status"] = "Discovered" if item["selectors"] else "CanonicalManualOnly" if ignored_names else "CompiledOnly"
+        if narrow and not item["selectors"]:
+            raise NotStarted("zero selected tests for requested filter/mode")
         check_source(root, plan)
     if not any(item["expected_selected"] for item in plan["targets"]):
         raise NotStarted("zero selected tests; no executable regression coverage")
@@ -378,10 +541,12 @@ def execute(root, plan, data, log_dir):
         if digest(Path(item["binary"]).read_bytes()) != item["binary_sha256"]:
             raise NotStarted("binary changed since discovery")
         check_source(root, plan)
+        launch_plan = {**plan, "targets": [item], "executables": item["executables"]}
+        validate_executables(root, launch_plan)
         if not item["expected_selected"]:
             continue
         item["status"] = "Running"
-        result = run_process([*item["cargo_args"], "--", "--format", "pretty"], cwd=root, capture_output=True,
+        result = run_process([*item["cargo_args"], "--", *libtest_args(item, "run")], cwd=root, capture_output=True,
                                 timeout=int(os.environ.get("COWD_TEST_TIMEOUT_SECONDS", "1200")))
         write_log(log_dir / f"{index}-run.stdout", result.stdout)
         write_log(log_dir / f"{index}-run.stderr", result.stderr)
@@ -395,13 +560,15 @@ def execute(root, plan, data, log_dir):
         observed = re.findall(rb"^test (.+?) \.\.\. (ok|FAILED|ignored)(?:,.*)?$", result.stdout, re.M)
         executed = [name.decode() for name, state in observed if state != b"ignored"]
         skipped = [name.decode() for name, state in observed if state == b"ignored"]
-        if sorted(executed) != item["selectors"] or sorted(skipped) != sorted(item["ignored"]):
+        expected_skipped = item.get("expected_skipped", sorted(item["ignored"]))
+        if sorted(executed) != item["selectors"] or sorted(skipped) != expected_skipped:
             raise NotStarted("executed selector set differs from discovery")
-        if passed + failed != item["expected_selected"] or ignored != len(item["ignored"]):
+        if passed + failed != item["expected_selected"] or ignored != len(expected_skipped):
             raise NotStarted("executed count differs from discovery")
         check_source(root, plan)
         if digest(Path(item["binary"]).read_bytes()) != item["binary_sha256"]:
             raise NotStarted("binary changed during execution")
+        validate_executables(root, launch_plan)
         if result.returncode:
             plan["status"] = "TestsFailed"
             return result.returncode
@@ -424,13 +591,33 @@ def main():
             return 2
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["plan", "discover", "run", "owners", "report"])
-    parser.add_argument("--base", default=os.environ.get("COWD_CHANGED_BASE", "HEAD"))
+    parser.add_argument("--base")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--workspace", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--plan", type=Path)
+    parser.add_argument("--package")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--lib", action="store_true")
+    target.add_argument("--test")
+    filtering = parser.add_mutually_exclusive_group()
+    filtering.add_argument("--filter")
+    filtering.add_argument("--all-in-target", action="store_true")
+    parser.add_argument("--release", action="store_true")
+    parser.add_argument("--exact", action="store_true")
+    parser.add_argument("--ignored", action="store_true")
+    parser.add_argument("--nocapture", action="store_true")
+    parser.add_argument("--test-threads", type=int)
+    parser.add_argument("--entry", help="registered canonical runner or script marker for ignored execution")
     parser.add_argument("paths", nargs="*")
     args = parser.parse_args()
+    keys = ("package", "lib", "test", "filter", "all_in_target", "release", "exact", "ignored", "nocapture", "test_threads", "entry")
+    request = {key: getattr(args, key) for key in keys}
+    if args.package is not None:
+        if args.mode not in {"plan", "discover", "run"} or args.paths or args.base is not None or args.quick or args.workspace:
+            parser.error("narrow package request cannot mix wide selection or owners/report")
+    elif any(value is not None and value is not False for value in request.values()):
+        parser.error("narrow arguments require --package")
     root = Path(__file__).resolve().parents[2]
     if args.mode == "report":
         directory = Path(os.environ.get("COWD_TEST_EVIDENCE_ROOT", str(root.parent / ".cowd-test-evidence"))).resolve()
@@ -445,12 +632,14 @@ def main():
             args.output = None
             raise NotStarted("report must be a new file outside the source tree")
         data = metadata(root)
-        paths = ["Cargo.toml"] if args.workspace else args.paths or ([] if args.quick else changed_paths(root, args.base))
+        paths = ([] if args.package is not None else ["Cargo.toml"] if args.workspace else
+                 args.paths or ([] if args.quick else changed_paths(root, args.base if args.base is not None else
+                                                                  os.environ.get("COWD_CHANGED_BASE", "HEAD"))))
         if args.mode == "owners":
             matched, _ = owners(root, workspace_packages(data), args.paths)
             print("\n".join(sorted(matched)))
             return 0
-        plan = make_plan(root, data, paths, args.quick)
+        plan = make_narrow_plan(root, data, request) if args.package is not None else make_plan(root, data, paths, args.quick)
         if args.plan and json.loads(args.plan.read_text()) != plan:
             raise NotStarted("stale or modified plan; regenerate from current metadata/source")
         if args.mode != "plan":
@@ -462,7 +651,7 @@ def main():
             discover(root, plan, data, log_dir)
             if args.mode == "run":
                 status = execute(root, plan, data, log_dir)
-    except (NotStarted, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+    except (NotStarted, KeyboardInterrupt, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         started = any("exit" in item or item.get("status") == "Running" for item in plan.get("targets", []))
         plan["status"] = "Incomplete" if started else "NotStarted"
         plan["reason"] = str(error) if isinstance(error, NotStarted) else type(error).__name__
@@ -482,4 +671,5 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    with cli_signals():
+        sys.exit(main())
