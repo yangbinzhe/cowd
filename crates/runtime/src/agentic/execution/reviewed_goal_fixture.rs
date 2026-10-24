@@ -284,10 +284,18 @@ pub(crate) mod diagnostic_1120 {
             17
         );
         assert_eq!(services.execution_health().lifecycle, "open");
-        services.shutdown_maintenance().await;
-        let report = services.shutdown_execution().await;
-        assert!(report.errors.is_empty(), "{report:?}");
-        assert_eq!((report.remaining_keys, report.forced_aborts), (0, 0));
+        cleanup.close_completed_consumer().await;
+        let closed = services.execution_health();
+        assert_eq!(closed.lifecycle, "closed");
+        assert_eq!(
+            (
+                closed.active_drivers,
+                closed.active_owned_tasks,
+                closed.tracked_keys,
+                closed.forced_aborts
+            ),
+            (0, 0, 0, 0)
+        );
     }
 
     #[tokio::test]
@@ -630,56 +638,67 @@ pub(crate) async fn with_native_task_review_setup(
     let host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
     let complete_goal = case.complete_goal;
-    NATIVE_PROBE_HOST
-        .scope(
-            host.clone(),
-            NATIVE_TASK_CASE.scope(
-                case,
-                NATIVE_TASK_SETUP.scope(
-                    std::cell::RefCell::new(Some(Box::new(setup))),
-                    NATIVE_TASK_ASYNC_PROBE.scope(
-                        std::cell::RefCell::new(Some(Box::new(probe))),
-                        async {
-                            Box::pin(exercise_reviewed_goal_proof_scenario(
-                                services.clone(),
-                                host,
-                                false,
-                                false,
-                                DelegatedEffectCase::Review,
-                                false,
-                                PhysicalDrainTiming::BeforeGoal,
-                                R1ProofScenario::TaskReviewAdmission,
-                            ))
-                            .await;
-                            if complete_goal {
-                                let goal = services
-                                    .goal_store()
-                                    .get("goal:root-agentic-execution")
-                                    .unwrap()
-                                    .unwrap();
-                                let program = services
-                                    .agent_action_service()
-                                    .project(
-                                        &goal
-                                            .execution_binding
-                                            .as_ref()
-                                            .unwrap()
-                                            .agentic_program_id,
-                                    )
-                                    .unwrap();
-                                assert_eq!(program.status, crate::AgenticProgramStatus::Verified);
-                                assert!(program.completion_request.is_some());
-                                assert_eq!(
-                                    goal.completion,
-                                    harness_contract::goal::GoalCompletion::Satisfied
-                                );
-                            }
-                        },
+    let cleanup = RealFixtureCleanup {
+        services: services.clone(),
+        host: host.clone(),
+    };
+    cleanup
+        .protect(
+            NATIVE_PROBE_HOST.scope(
+                host.clone(),
+                NATIVE_TASK_CASE.scope(
+                    case,
+                    NATIVE_TASK_SETUP.scope(
+                        std::cell::RefCell::new(Some(Box::new(setup))),
+                        NATIVE_TASK_ASYNC_PROBE.scope(
+                            std::cell::RefCell::new(Some(Box::new(probe))),
+                            async {
+                                Box::pin(exercise_reviewed_goal_proof_body(
+                                    services.clone(),
+                                    host,
+                                    false,
+                                    false,
+                                    DelegatedEffectCase::Review,
+                                    false,
+                                    PhysicalDrainTiming::BeforeGoal,
+                                    R1ProofScenario::TaskReviewAdmission,
+                                ))
+                                .await;
+                                if complete_goal {
+                                    let goal = services
+                                        .goal_store()
+                                        .get("goal:root-agentic-execution")
+                                        .unwrap()
+                                        .unwrap();
+                                    let program = services
+                                        .agent_action_service()
+                                        .project(
+                                            &goal
+                                                .execution_binding
+                                                .as_ref()
+                                                .unwrap()
+                                                .agentic_program_id,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(
+                                        program.status,
+                                        crate::AgenticProgramStatus::Verified
+                                    );
+                                    assert!(program.completion_request.is_some());
+                                    assert_eq!(
+                                        goal.completion,
+                                        harness_contract::goal::GoalCompletion::Satisfied
+                                    );
+                                }
+                            },
+                        ),
                     ),
                 ),
             ),
+            || {},
         )
         .await;
+    cleanup.close_completed_consumer().await;
 }
 
 #[cfg(test)]
@@ -694,27 +713,35 @@ pub(crate) async fn with_native_review_async(
 ) {
     let host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
-    NATIVE_PROBE_HOST
-        .scope(
-            host.clone(),
-            NATIVE_REVIEW_ASYNC_PROBE.scope(
-                std::cell::RefCell::new(Some(Box::new(probe))),
-                async {
-                    Box::pin(exercise_reviewed_goal_proof_scenario(
-                        services,
-                        host,
-                        false,
-                        false,
-                        DelegatedEffectCase::Review,
-                        false,
-                        PhysicalDrainTiming::BeforeGoal,
-                        R1ProofScenario::ReviewAdmission,
-                    ))
-                    .await;
-                },
+    let cleanup = RealFixtureCleanup {
+        services: services.clone(),
+        host: host.clone(),
+    };
+    cleanup
+        .protect(
+            NATIVE_PROBE_HOST.scope(
+                host.clone(),
+                NATIVE_REVIEW_ASYNC_PROBE.scope(
+                    std::cell::RefCell::new(Some(Box::new(probe))),
+                    async {
+                        Box::pin(exercise_reviewed_goal_proof_body(
+                            services.clone(),
+                            host,
+                            false,
+                            false,
+                            DelegatedEffectCase::Review,
+                            false,
+                            PhysicalDrainTiming::BeforeGoal,
+                            R1ProofScenario::ReviewAdmission,
+                        ))
+                        .await;
+                    },
+                ),
             ),
+            || {},
         )
         .await;
+    cleanup.close_completed_consumer().await;
 }
 
 #[cfg(test)]
@@ -12044,6 +12071,17 @@ impl RealFixtureCleanup {
         }
     }
 
+    /// A unit-returning fixture has no remaining live consumer. Preserve the
+    /// original normal close order, after every callback and postcondition.
+    /// Maintenance returning unit is not evidence that all its lanes succeeded.
+    async fn close_completed_consumer(&self) {
+        self.services.shutdown_maintenance().await;
+        let report = self.services.shutdown_execution().await;
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.remaining_keys, 0, "{report:?}");
+        assert_eq!(report.forced_aborts, 0, "{report:?}");
+    }
+
     /// Same cancellation and shutdown owners as the former Drop task. No new
     /// lifecycle or terminal writer; maintenance returning unit is not proof
     /// that every maintenance lane completed successfully.
@@ -14245,11 +14283,7 @@ where
         .await;
     // This raw fixture's normal consumer is now finished. Do not close
     // services before the consumer's original async reads/assertions.
-    services.shutdown_maintenance().await;
-    let report = services.shutdown_execution().await;
-    assert!(report.errors.is_empty(), "{report:?}");
-    assert_eq!(report.remaining_keys, 0, "{report:?}");
-    assert_eq!(report.forced_aborts, 0, "{report:?}");
+    cleanup.close_completed_consumer().await;
 }
 
 #[cfg(test)]
