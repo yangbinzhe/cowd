@@ -215,20 +215,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nothing_to_migrate_when_no_skin_yaml() {
-        let tmp = std::env::temp_dir().join(format!("cowd-migrate-empty-{}", std::process::id()));
-        let _ = fs::create_dir_all(&tmp);
-
-        // Create a fake .cowd dir in tmp without skin.yaml
-        let cowd_dir = tmp.join(".cowd");
-        let _ = fs::create_dir_all(&cowd_dir);
-
-        // We can't easily override config_dir(), but we can test the
-        // individual conversion logic
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
     fn skin_to_theme_yaml_format() {
         let skin = crate::skin::SkinConfig {
             name: "test-skin".into(),
