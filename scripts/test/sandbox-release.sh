@@ -17,6 +17,7 @@ fi
 
 export COWD_SANDBOX_LAUNCHER_BINARY="$LAUNCHER"
 cargo test --manifest-path "$ROOT/Cargo.toml" -p sandbox-launcher --lib -- --test-threads=1
-cargo test --manifest-path "$ROOT/Cargo.toml" -p tools --lib -- bash:: sandbox_exec:: -- --test-threads=1
+cargo test --manifest-path "$ROOT/Cargo.toml" -p tools --lib bash:: -- --test-threads=1
+cargo test --manifest-path "$ROOT/Cargo.toml" -p tools --lib sandbox_exec:: -- --test-threads=1
 
 echo "sandbox release tests passed with launcher: $LAUNCHER"
