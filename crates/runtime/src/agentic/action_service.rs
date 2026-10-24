@@ -3569,7 +3569,7 @@ impl AgentActionService {
                         "required review {condition} has no verification"
                     ))
                 })?;
-                let snapshot = super::review_evidence::validate_proof_inputs(
+                let snapshot = super::review_evidence::validate_applied_proof_inputs(
                     &self.store,
                     projection,
                     Some(&prepared.goal),
@@ -3917,7 +3917,7 @@ impl AgentActionService {
                             "bound verdict requires current review".into(),
                         )
                     })?;
-                let snapshot = super::review_evidence::validate_proof_inputs(
+                let snapshot = super::review_evidence::validate_applied_proof_inputs(
                     &self.store,
                     &projection,
                     Some(goal),

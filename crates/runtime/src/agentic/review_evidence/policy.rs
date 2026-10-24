@@ -216,7 +216,7 @@ pub(crate) fn completion_admission_context(
             })
             .ok_or_else(|| format!("completion context requires latest v2 proof:{condition}"))?;
         super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)?;
-        let snapshot = validate_proof_inputs(store, program, Some(&goal), proof, readers)?;
+        let snapshot = validate_applied_proof_inputs(store, program, Some(&goal), proof, readers)?;
         super::validate_review_coverage(
             &goal, program, review, &results, &review.evidence_refs, &snapshot,
         ).map_err(|error| format!("completion context review {condition}: {error}"))?;
@@ -287,6 +287,20 @@ pub(crate) fn validate_applied_proof_inputs(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
 ) -> Result<ProofInputSnapshot, String> {
+    with_authenticated_applied_review(store, program, proof, |identity| {
+        validate_proof_inputs_for_action(store, program, goal, proof, readers, Some(identity))
+    })
+}
+
+/// Authenticate once from the original durable action, then consume its
+/// borrowed identity synchronously. Neither a stored proof key nor a failed
+/// live invocation can enter this persisted-review boundary.
+fn with_authenticated_applied_review<T>(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+    consume: impl FnOnce(super::current_review::ReviewActionIdentity<'_>) -> Result<T, String>,
+) -> Result<T, String> {
     let source = format!("agentic-program:{}", program.program_id);
     let pinned = proof
         .input_set
@@ -339,16 +353,9 @@ pub(crate) fn validate_applied_proof_inputs(
         through: program.revision,
         program_events: &events,
     };
-    validate_proof_inputs_for_action(
-        store,
-        program,
-        goal,
-        proof,
-        readers,
-        Some(super::current_review::ReviewActionIdentity::Applied(
-            &context,
-        )),
-    )
+    consume(super::current_review::ReviewActionIdentity::Applied(
+        &context,
+    ))
 }
 
 /// Re-verify a proof against the LIVE action it is applying, so the review's
@@ -504,15 +511,17 @@ pub(crate) fn committed_proof_sources(
         {
             results.extend(obligation.artifact_refs.iter().cloned());
         }
-        let snapshot = proof_input_snapshot_for_phase(
-            store,
-            program,
-            Some(goal),
-            proof,
-            Some(&inputs.acceptance_policy_digest),
-            readers,
-            None,
-        )?;
+        let snapshot = with_authenticated_applied_review(store, program, proof, |identity| {
+            proof_input_snapshot_for_phase(
+                store,
+                program,
+                Some(goal),
+                proof,
+                Some(&inputs.acceptance_policy_digest),
+                readers,
+                Some(identity),
+            )
+        })?;
         super::validate_review_coverage(
             goal, program, review, &results, &review.evidence_refs, &snapshot,
         ).map_err(|error| format!("committed A review {condition}: {error}"))?;

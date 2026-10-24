@@ -88,7 +88,11 @@ impl Fixture {
         }
     }
 
-    fn review(&self, id: &str, condition: &str) -> ObjectiveReviewVerification {
+    fn pending_review(
+        &self,
+        id: &str,
+        condition: &str,
+    ) -> (AgentActionEnvelope, ObjectiveReviewVerification) {
         let mut proof = ObjectiveReviewVerification {
             input_set: Some(ProofInputSet {
                 version: 2,
@@ -154,6 +158,11 @@ impl Fixture {
                 reason: String::new(),
             }),
         );
+        (envelope, proof)
+    }
+
+    fn review(&self, id: &str, condition: &str) -> ObjectiveReviewVerification {
+        let (envelope, proof) = self.pending_review(id, condition);
         // This source-level fixture does not manufacture result coverage. The
         // native record writer requires a producer attribution; acceptance of
         // real delivered results remains the separate coverage reader's job.
@@ -435,6 +444,10 @@ fn carrier_admission_still_recomputes_full_proof_and_preserves_original_cas() {
         Default::default(),
     )
     .unwrap();
+    let original_goal_cut = fixture
+        .store
+        .stream_revision("goal:goal:carrier-root")
+        .unwrap();
     let goals = GoalStore::new(Arc::clone(&fixture.store));
     goals
         .revise(
@@ -448,12 +461,17 @@ fn carrier_admission_still_recomputes_full_proof_and_preserves_original_cas() {
             },
         )
         .unwrap();
+    let mut expected_streams = snapshot.sources;
+    expected_streams.push(crate::ExpectedStreamRevision {
+        stream_id: "conclusion-test".into(),
+        expected_revision: 0,
+    });
     let outcome =
         fixture
             .store
             .append_transaction(crate::runtime_event_store::AppendTransactionRequest {
                 transaction_id: "conclusion-after-stale-goal".into(),
-                expected_streams: snapshot.sources,
+                expected_streams,
                 events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
                     event: crate::RuntimeEventInput {
                         stream_id: "conclusion-test".into(),
@@ -468,6 +486,304 @@ fn carrier_admission_still_recomputes_full_proof_and_preserves_original_cas() {
                     schema_version: 1,
                 }],
             });
-    assert!(outcome.is_err());
-    assert_eq!(fixture.store.stream_revision("conclusion-test").unwrap(), 0);
+    let Err(crate::RuntimeEventStoreError::StaleRevision {
+        stream_id,
+        expected,
+        actual,
+    }) = outcome
+    else {
+        panic!("the changed Goal must reject the original read cut: {outcome:?}");
+    };
+    assert_eq!(stream_id, "goal:goal:carrier-root");
+    assert_eq!(expected, original_goal_cut);
+    assert_eq!(actual, original_goal_cut + 1);
+    let output_revision = fixture.store.stream_revision("conclusion-test").unwrap();
+    assert_eq!(output_revision, 0);
+    eprintln!("CAS_REJECT Goal stream={stream_id} expected={expected} actual={actual} output_revision={output_revision}");
+}
+
+#[test]
+fn applied_authentication_uses_original_action_without_a_tool_plan() {
+    let fixture = Fixture::new();
+    let proof = fixture.review("direct-original-review", "source");
+    let program = fixture.program();
+    let session_events = fixture
+        .store
+        .list_stream("session:carrier-session")
+        .unwrap();
+    assert!(session_events
+        .iter()
+        .all(|event| event.kind != "tool.execution_plan.created"));
+    assert!(proof.current_review_effect_key.is_none());
+    let snapshot = validate_applied_proof_inputs(
+        &fixture.store,
+        &program,
+        Some(&fixture.goal()),
+        &proof,
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot.current_review_effect_key.as_deref(),
+        Some("direct-original-review")
+    );
+    // A foreign carrier is a single changed input after a real legal baseline.
+    for field in ["session", "objective", "turn", "root"] {
+        let mut foreign = program.clone();
+        match field {
+            "session" => foreign.session_id = "foreign-session".into(),
+            "objective" => foreign.objective_id = "foreign-objective".into(),
+            "turn" => foreign.turn_id = "foreign-turn".into(),
+            "root" => foreign.root_execution_id = Some("foreign-root".into()),
+            _ => unreachable!(),
+        }
+        let result =
+            with_authenticated_applied_review(&fixture.store, &foreign, &proof, |_| Ok(()));
+        assert_eq!(
+            result.unwrap_err(),
+            "original applied review identity mismatch",
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn applied_authentication_rejects_missing_ambiguous_and_unindexed_originals() {
+    let fixture = Fixture::new();
+    let proof = fixture.review("legal-original", "source");
+    assert_eq!(
+        with_authenticated_applied_review(&fixture.store, &fixture.program(), &proof, |identity| {
+            Ok(identity.action_id().to_owned())
+        })
+        .unwrap(),
+        "legal-original"
+    );
+
+    let missing = Fixture::new();
+    let (_, pending) = missing.pending_review("not-applied", "source");
+    assert_eq!(
+        with_authenticated_applied_review(&missing.store, &missing.program(), &pending, |_| Ok(()))
+            .unwrap_err(),
+        "original applied review action missing"
+    );
+
+    // Public journal append only: no backend mutation/index override seam.
+    // The authentic original remains, and one second same-proof application
+    // is the only added factor. It must fail uniqueness before any exemption.
+    let original = fixture.events(&proof).pop().unwrap();
+    let mut duplicate = original.payload.clone();
+    duplicate["envelope"]["action_id"] = serde_json::json!("second-original");
+    fixture
+        .store
+        .append(crate::RuntimeEventInput {
+            stream_id: original.stream_id.clone(),
+            scope: original.scope,
+            kind: original.kind.clone(),
+            status: original.status.clone(),
+            actor: original.actor.clone(),
+            refs: original.refs.clone(),
+            payload: duplicate,
+        })
+        .unwrap();
+    assert_eq!(
+        with_authenticated_applied_review(&fixture.store, &fixture.program(), &proof, |_| Ok(()))
+            .unwrap_err(),
+        "original review action is ambiguous"
+    );
+
+    // A separately valid original establishes the exact raw record shape.
+    // Its exact payload in another original Fixture with no action primary
+    // is journal data, not authority, even though the actor/proof match.
+    let unindexed = Fixture::new();
+    let (envelope, pending) = unindexed.pending_review("unindexed-review", "source");
+    unindexed
+        .store
+        .append(crate::RuntimeEventInput {
+            stream_id: "agentic-program:carrier-program".into(),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.action_applied".into(),
+            status: Some("applied".into()),
+            actor: Some(envelope.actor.actor_id.clone()),
+            refs: original.refs,
+            payload: serde_json::json!({"envelope":envelope,"review_verification":pending}),
+        })
+        .unwrap();
+    assert_eq!(
+        with_authenticated_applied_review(
+            &unindexed.store,
+            &unindexed.program(),
+            &pending,
+            |_| Ok(())
+        )
+        .unwrap_err(),
+        "original applied review primary missing"
+    );
+}
+
+#[test]
+fn applied_phase_keeps_the_accepted_policy_and_current_source_cuts() {
+    let fixture = Fixture::new();
+    let proof = fixture.review("phase-original", "source");
+    let program = fixture.program();
+    let goal = fixture.goal();
+    let accepted = &proof.input_set.as_ref().unwrap().acceptance_policy_digest;
+    let read = |accepted_policy| {
+        with_authenticated_applied_review(&fixture.store, &program, &proof, |identity| {
+            proof_input_snapshot_for_phase(
+                &fixture.store,
+                &program,
+                Some(&goal),
+                &proof,
+                accepted_policy,
+                Default::default(),
+                Some(identity),
+            )
+        })
+    };
+    let before = read(Some(accepted.as_str())).unwrap();
+    assert_eq!(before.policy_digest, *accepted);
+    // A new real Session strategy record changes current policy. The already
+    // accepted policy parameter must remain authoritative only for this phase;
+    // neither this helper test nor source-only coverage grants completion.
+    fixture
+        .store
+        .append(crate::RuntimeEventInput {
+            stream_id: "session:carrier-session".into(),
+            scope: crate::RuntimeEventScope::Session,
+            kind: "runtime.strategy.selected".into(),
+            status: None,
+            actor: Some("conversation_runtime.strategy_owner".into()),
+            refs: vec![],
+            payload: serde_json::json!({"execution_graph_ref":"carrier-root",
+            "session_ref":"carrier-session","turn_ref":"carrier-turn",
+            "risk":"high","modifiers":[],"gates":[]}),
+        })
+        .unwrap();
+    let current = read(None).unwrap();
+    let phase = read(Some(accepted.as_str())).unwrap();
+    assert_ne!(
+        current.policy_digest, *accepted,
+        "current strategy must reach the real policy reader"
+    );
+    assert_eq!(phase.policy_digest, *accepted);
+    assert_ne!(current.semantic_digest, phase.semantic_digest);
+    assert_eq!(
+        phase.current_review_effect_key.as_deref(),
+        Some("phase-original")
+    );
+    assert!(phase
+        .sources
+        .iter()
+        .any(|cut| cut.stream_id == "session:carrier-session" && cut.expected_revision == 1));
+}
+
+#[test]
+fn applied_phase_program_advance_rejects_the_original_transaction_cut() {
+    let fixture = Fixture::new();
+    let proof = fixture.review("program-fence-original", "source");
+    let program = fixture.program();
+    let snapshot =
+        with_authenticated_applied_review(&fixture.store, &program, &proof, |identity| {
+            proof_input_snapshot_for_phase(
+                &fixture.store,
+                &program,
+                Some(&fixture.goal()),
+                &proof,
+                Some(&proof.input_set.as_ref().unwrap().acceptance_policy_digest),
+                Default::default(),
+                Some(identity),
+            )
+        })
+        .unwrap();
+    assert!(snapshot
+        .sources
+        .iter()
+        .any(|cut| cut.stream_id == "agentic-program:carrier-program"
+            && cut.expected_revision == program.revision));
+    let mut legal_cuts = snapshot.sources.clone();
+    legal_cuts.push(crate::ExpectedStreamRevision {
+        stream_id: "phase-cut-positive-test".into(),
+        expected_revision: 0,
+    });
+    fixture
+        .store
+        .append_transaction(crate::runtime_event_store::AppendTransactionRequest {
+            transaction_id: "phase-with-current-program".into(),
+            expected_streams: legal_cuts,
+            events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: "phase-cut-positive-test".into(),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "test.conclusion".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                },
+                idempotency_key: Some("legal-publication".into()),
+                schema_version: 1,
+            }],
+        })
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .stream_revision("phase-cut-positive-test")
+            .unwrap(),
+        1
+    );
+    let advanced = fixture
+        .service()
+        .apply(&fixture.envelope(
+            "concurrent-required-work",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "new team".into(),
+                mission: "new required work".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap();
+    assert_eq!(advanced.status, AgentActionStatus::Applied);
+    let mut expected_streams = snapshot.sources;
+    expected_streams.push(crate::ExpectedStreamRevision {
+        stream_id: "phase-conclusion-test".into(),
+        expected_revision: 0,
+    });
+    let outcome =
+        fixture
+            .store
+            .append_transaction(crate::runtime_event_store::AppendTransactionRequest {
+                transaction_id: "phase-after-stale-program".into(),
+                expected_streams,
+                events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: "phase-conclusion-test".into(),
+                        scope: crate::RuntimeEventScope::Program,
+                        kind: "test.conclusion".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({}),
+                    },
+                    idempotency_key: Some("never-committed".into()),
+                    schema_version: 1,
+                }],
+            });
+    let Err(crate::RuntimeEventStoreError::StaleRevision {
+        stream_id,
+        expected,
+        actual,
+    }) = outcome
+    else {
+        panic!("the original Program read cut must reject publication: {outcome:?}");
+    };
+    assert_eq!(stream_id, "agentic-program:carrier-program");
+    assert_eq!(expected, program.revision);
+    assert_eq!(actual, program.revision + 1);
+    let output_revision = fixture
+        .store
+        .stream_revision("phase-conclusion-test")
+        .unwrap();
+    assert_eq!(output_revision, 0);
+    eprintln!("CAS_REJECT Program stream={stream_id} expected={expected} actual={actual} output_revision={output_revision}");
 }
