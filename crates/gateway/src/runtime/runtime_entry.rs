@@ -4,6 +4,7 @@ use crate::gateway_tool_executor::GatewayToolExecutor;
 
 pub(crate) struct GatewayRuntimeEntry {
     runtime: Option<runtime::StandardRuntimeHost<GatewayToolExecutor>>,
+    hook_scope: runtime::HookExecutionScope,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     resume_context_loaded: bool,
@@ -16,6 +17,7 @@ impl GatewayRuntimeEntry {
         resume_context_loaded: bool,
     ) -> Self {
         Self {
+            hook_scope: runtime.hook_execution_scope(),
             runtime: Some(runtime),
             plugin_registry,
             plugins_active: true,
@@ -27,10 +29,18 @@ impl GatewayRuntimeEntry {
     pub(crate) fn test_runtime_entry() -> Self {
         Self {
             runtime: None,
+            hook_scope: runtime::HookExecutionScope::default(),
             plugin_registry: PluginRegistry::default(),
             plugins_active: false,
             resume_context_loaded: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_runtime_entry_with_hook_scope(scope: runtime::HookExecutionScope) -> Self {
+        let mut entry = Self::test_runtime_entry();
+        entry.hook_scope = scope;
+        entry
     }
 
     #[allow(
@@ -81,9 +91,18 @@ impl GatewayRuntimeEntry {
         self.runtime.is_none()
     }
 
+    pub(crate) fn hook_execution_scope(&self) -> runtime::HookExecutionScope {
+        self.hook_scope.clone()
+    }
+
     pub(crate) fn take_runtime_for_turn(
         &mut self,
     ) -> Result<runtime::StandardRuntimeHost<GatewayToolExecutor>, runtime::RuntimeError> {
+        if !self.hook_scope.try_quiesce() {
+            return Err(runtime::RuntimeError::new(
+                "previous Hook physical scope is not closed",
+            ));
+        }
         self.runtime.take().ok_or_else(|| {
             runtime::RuntimeError::new("session runtime is already executing a turn")
         })
@@ -96,6 +115,11 @@ impl GatewayRuntimeEntry {
         debug_assert!(
             self.runtime.is_none(),
             "runtime must be empty while turn owner returns it"
+        );
+        debug_assert!(
+            self.hook_scope
+                .is_same_owner(&runtime.hook_execution_scope()),
+            "restored Host must retain its original Hook owner"
         );
         self.runtime = Some(runtime);
     }

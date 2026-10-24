@@ -124,6 +124,36 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         packet: AgentTaskPacket,
         selection: AgentModelSelection,
     ) -> Result<AgentReturnPacket, String> {
+        let cancellation = crate::CancellationToken::new();
+        let hook_scope = crate::HookExecutionScope::default();
+        let packet_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&packet).map_err(|error| error.to_string())?)
+        );
+        {
+            let mut active = self
+                .active_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.contains_key(packet.run_id()) {
+                return Err("original Native run scope has not been released".into());
+            }
+            active.insert(
+                packet.run_id().to_string(),
+                ActiveInProcessRun {
+                    cancellation: cancellation.clone(),
+                    session_id: packet.session_id().to_string(),
+                    input_stream: None,
+                    packet_sha256,
+                    hook_scope: hook_scope.clone(),
+                    owner_ended: false,
+                },
+            );
+        }
+        let active_run_cleanup = ActiveRunCleanup {
+            worker: self,
+            run_id: packet.run_id().to_string(),
+        };
         let binding = packet.binding.as_ref().ok_or_else(|| {
             "in-process Agent execution requires a Runtime-compiled Binding".to_string()
         })?;
@@ -295,7 +325,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             packet.permission_ceiling,
             &allowed_tools,
         );
-        let cancellation = crate::CancellationToken::new();
         let (provider_event_sender, mut provider_event_receiver) = tokio::sync::mpsc::channel(64);
         let progress_runtime = Arc::clone(services.agent_runtime());
         let progress_agent_id = packet.agent_id().to_string();
@@ -477,21 +506,18 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // only the parent Turn may publish conversation messages. The child
         // result returns through AgentReturnPacket and the Team reducer.
         let input_stream = runtime.session_input_stream();
-        self.active_runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                packet.run_id().to_string(),
-                ActiveInProcessRun {
-                    cancellation: cancellation.clone(),
-                    session_id: child_session_id.clone(),
-                    input_stream: input_stream.clone(),
-                },
-            );
-        let active_run_cleanup = ActiveRunCleanup {
-            worker: self,
-            run_id: packet.run_id().to_string(),
-        };
+        {
+            let mut active = self
+                .active_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let original = active
+                .get_mut(packet.run_id())
+                .ok_or("original Native run owner missing")?;
+            original.session_id = child_session_id.clone();
+            original.input_stream = Some(input_stream.clone());
+        }
+        runtime.set_hook_execution_scope(hook_scope);
         // Durable replay happens at the original ModelStep checkpoint, after
         // its child Turn identity exists (not as a new parent Session turn).
         if self
@@ -927,6 +953,52 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         })
     }
 
+    fn local_hook_scope_closed(&self, run_id: &str, packet_sha256: &str) -> Option<bool> {
+        // The retained child/pipe contract is Unix-specific. Other platforms
+        // retain their pre-existing backend-future contract; no new token
+        // linkage or physical proof is inferred from an empty Unix scope.
+        #[cfg(not(unix))]
+        {
+            let _ = (run_id, packet_sha256);
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            let scope = {
+                let active = self
+                    .active_runs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(run) = active.get(run_id) else {
+                    return Some(false);
+                };
+                if run.packet_sha256 != packet_sha256 || !run.owner_ended {
+                    return Some(false);
+                }
+                run.hook_scope.clone()
+            };
+            Some(scope.try_quiesce())
+        }
+    }
+
+    fn release_local_hook_scope(&self, run_id: &str, packet_sha256: &str) {
+        let mut active = self
+            .active_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let releasable = active.get(run_id).is_some_and(|run| {
+            run.packet_sha256 == packet_sha256 && run.owner_ended && run.hook_scope.is_closed()
+        });
+        if releasable {
+            self.record_completed_run(run_id);
+            active.remove(run_id);
+            self.pending_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(run_id);
+        }
+    }
+
     async fn command(
         &self,
         handle: &AgentRunHandle,
@@ -985,7 +1057,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     .ok_or(
                         harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
                     )?;
-                if active.input_stream.active_turn_id().is_none() {
+                let input_stream = active.input_stream.as_ref().ok_or(
+                    harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
+                )?;
+                if active.owner_ended || input_stream.active_turn_id().is_none() {
                     // The durable intent remains queued for the first actual
                     // ModelStep; do not misclassify it as a new Session turn.
                     return Err(
@@ -999,9 +1074,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 )
                 .with_source_ref(format!("agent-input:{}", handle.run_id))
                 .with_source_message_id(request.command_id.clone());
-                let receipt = active
-                    .input_stream
-                    .admit(envelope, active.input_stream.runtime_state());
+                let receipt = input_stream.admit(envelope, input_stream.runtime_state());
                 if matches!(
                     receipt.status,
                     harness_contract::turn::SessionInputStatus::RejectedPolicy

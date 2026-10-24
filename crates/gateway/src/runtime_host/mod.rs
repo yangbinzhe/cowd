@@ -1342,7 +1342,12 @@ async fn shutdown_runtime_host_resources(
             if active_turns_drained {
                 if let Some(session_activation) = resources.session_activation {
                     for session_id in &active_session_ids {
-                        session_activation.unload_runtime(session_id).await;
+                        if let Err(error) = session_activation.unload_runtime(session_id).await {
+                            failures.push(format!(
+                                "Session {session_id} physical unload incomplete: {error}"
+                            ));
+                            coordinator.publish("unload_sessions", &failures);
+                        }
                     }
                 }
             }

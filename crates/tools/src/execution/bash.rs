@@ -932,117 +932,97 @@ where
     Ok(captured)
 }
 
-/// Sends `SIGKILL` to the process group led by `pgid` so descendants that
-/// outlived the foreground command are reclaimed.
-///
-/// The group id is the pid of the command process itself: the executor spawns
-/// every foreground command with `process_group(0)`, so the command leads its
-/// own group.
-#[cfg(target_os = "linux")]
-fn signal_process_group(pgid: u32) -> bool {
-    use rustix::process::{kill_process_group, Signal};
-    match process_group_pid(pgid) {
-        Some(pid) => kill_process_group(pid, Signal::KILL).is_ok(),
-        None => false,
+/// Signal only a group created by the caller with `process_group(0)`.
+/// ESRCH is already quiet; all other errors remain observable.
+#[cfg(unix)]
+pub fn terminate_owned_process_group(pgid: u32) -> io::Result<()> {
+    let pid = owned_process_group_pid(pgid)?;
+    match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
-/// Translates a process-group id into the pid handle used by the group
-/// syscalls. An out-of-range id is rejected instead of being turned into the
-/// "own process group" signal, which would hit unrelated processes.
-#[cfg(target_os = "linux")]
-fn process_group_pid(pgid: u32) -> Option<rustix::process::Pid> {
-    let raw = i32::try_from(pgid).ok()?;
-    rustix::process::Pid::from_raw(raw)
+/// Observe the original group. Unknown permissions/proc data are errors,
+/// never evidence that a physical resource disappeared.
+#[cfg(unix)]
+pub fn owned_process_group_is_quiet(pgid: u32) -> io::Result<bool> {
+    let pid = owned_process_group_pid(pgid)?;
+    match rustix::process::test_kill_process_group(pid) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::SRCH) => return Ok(true),
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(target_os = "linux")]
+    {
+        live_group_member_count(pgid).map(|count| count == 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
+fn owned_process_group_pid(pgid: u32) -> io::Result<rustix::process::Pid> {
+    i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| io::Error::other("invalid owned process group"))
+}
+
+#[cfg(unix)]
 fn signal_process_group(pgid: u32) -> bool {
-    Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
-        .status()
-        .is_ok_and(|status| status.success())
+    terminate_owned_process_group(pgid).is_ok()
 }
-
 #[cfg(not(unix))]
 fn signal_process_group(_pgid: u32) -> bool {
     false
 }
 
-/// True when the process group still holds at least one live member.
-///
-/// A group that holds only members which already exited (and are merely
-/// waiting for the init reaper) counts as quiet: those processes own no
-/// physical resource anymore. When the liveness of the group cannot be
-/// established the answer is `true`, so an unproven group is never reported
-/// as closed.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn process_group_has_live_member(pgid: u32) -> bool {
-    use rustix::io::Errno;
-    use rustix::process::test_kill_process_group;
-    let Some(pid) = process_group_pid(pgid) else {
-        return false;
-    };
-    match test_kill_process_group(pid) {
-        // The group still exists: only members that are still running count.
-        Ok(()) => live_group_member_count(pgid).is_none_or(|count| count > 0),
-        // The group exists but is not ours to signal.
-        Err(Errno::PERM) | Err(Errno::INTR) => true,
-        // ESRCH: the group is gone.
-        Err(_) => false,
-    }
+    !owned_process_group_is_quiet(pgid).unwrap_or(false)
 }
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn process_group_has_live_member(pgid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", "--", &format!("-{pgid}")])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 #[cfg(not(unix))]
 fn process_group_has_live_member(_pgid: u32) -> bool {
     false
 }
 
-/// Counts the members of `pgid` that are still running.
-///
-/// Returns `None` when `/proc` is unavailable, in which case the caller has
-/// to treat the group as unproven.
 #[cfg(target_os = "linux")]
-fn live_group_member_count(pgid: u32) -> Option<usize> {
-    let entries = std::fs::read_dir("/proc").ok()?;
+fn live_group_member_count(pgid: u32) -> io::Result<usize> {
     let mut live = 0usize;
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
         let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
+        let Some(name) = name.to_str() else { continue };
         if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         };
-        // `pid (comm) state ppid pgrp ...`; `comm` may contain spaces and
-        // parentheses, so the fields are located after the last `)`.
-        let Some(close) = stat.rfind(')') else {
-            continue;
-        };
+        let close = stat
+            .rfind(')')
+            .ok_or_else(|| io::Error::other("incomplete process stat"))?;
         let mut fields = stat[close + 1..].split_whitespace();
-        let Some(state) = fields.next() else {
-            continue;
-        };
-        let _parent = fields.next();
-        let Some(group) = fields.next() else {
-            continue;
-        };
-        if group.parse::<u32>().ok() == Some(pgid) && state != "Z" && state != "X" {
+        let state = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing process state"))?;
+        let _parent = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing process parent"))?;
+        let group = fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| io::Error::other("missing process group"))?;
+        if group == pgid && state != "Z" && state != "X" {
             live += 1;
         }
     }
-    Some(live)
+    Ok(live)
 }
 
 /// Terminates the leftovers of a foreground command and proves that its

@@ -148,6 +148,7 @@ where
         }
 
         Ok(Self {
+            hook_scope: runtime.hook_execution_scope(),
             runtime: Some(runtime),
             poisoned: false,
             inflight_turn: None,
@@ -201,6 +202,16 @@ where
                 .with_cancellation_token(cancellation_token)
                 .with_hook_abort_signal(hook_abort_signal),
         );
+    }
+
+    /// The original host keeps this same scope when its turn controls change.
+    pub fn hook_execution_scope(&self) -> crate::HookExecutionScope {
+        self.hook_scope.clone()
+    }
+
+    pub(crate) fn set_hook_execution_scope(&mut self, scope: crate::HookExecutionScope) {
+        self.runtime_mut().set_hook_execution_scope(scope.clone());
+        self.hook_scope = scope;
     }
 
     pub fn cowd_bus(&self) -> Option<&CowdEventBus> {
@@ -314,6 +325,15 @@ where
                 "conversation runtime was not reclaimed; Host control is refused",
             ));
         }
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.hook_execution_scope().try_quiesce())
+        {
+            return Err(RuntimeError::new(
+                "previous Hook physical scope is not closed",
+            ));
+        }
         self.runtime.as_ref().ok_or_else(|| RuntimeError::new(
             "conversation runtime is unavailable while its turn owner holds it; Host control is refused",
         ))
@@ -348,6 +368,7 @@ where
         prompter: &SharedPrompter,
     ) -> Result<TurnSummary, RuntimeError> {
         self.restore_inflight_turn().await?;
+        self.conversation_control_available()?;
         if self.poisoned {
             return Err(RuntimeError::new(
                 "conversation runtime was not returned to this host; the turn is refused",
@@ -369,6 +390,7 @@ where
         ingress: TurnIngressRef,
     ) -> Result<TurnSummary, RuntimeError> {
         self.restore_inflight_turn().await?;
+        self.conversation_control_available()?;
         if self.poisoned {
             return Err(RuntimeError::new(
                 "conversation runtime was not returned to this host; the ingress turn is refused",

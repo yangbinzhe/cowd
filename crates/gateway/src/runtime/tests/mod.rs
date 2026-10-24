@@ -1163,6 +1163,87 @@ async fn first_policy_read_materializes_the_current_config_default() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn hook_unknown_retains_original_runtime_carrier_and_policy_until_eof() {
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let pid = root.path().join("escaped-pid");
+    let release = root.path().join("release");
+    let _release = Release(release.clone());
+    let script = format!(
+        "setsid sh -c 'echo $$ > {}; while ! test -e {}; do sleep 0.02; done' & while ! test -s {}; do sleep 0.01; done; exit 0",
+        pid.display(), release.display(), pid.display());
+    let runner = runtime::HookRunner::new(runtime::RuntimeHookConfig::new(
+        vec![script],
+        vec![],
+        vec![],
+    ));
+    let result = runner.run_pre_tool_use("read_file", "{}");
+    assert!(result.is_failed());
+    let scope = runner.execution_scope();
+    assert!(!scope.is_closed());
+    let sessions = Arc::new(ActiveSessionDirectory::default());
+    let service = test_runtime_service(sessions.clone(), None);
+    let entry = crate::runtime_entry::GatewayRuntimeEntry::test_runtime_entry_with_hook_scope(
+        scope.clone(),
+    );
+    sessions.register("hook-original".into(), entry).unwrap();
+    service
+        .gateway_tasks
+        .open_session("hook-original")
+        .await
+        .unwrap();
+    let control = runtime::permissions::SessionExecutionPolicyControl::from_policy(
+        service.default_execution_policy(),
+    );
+    service
+        .runtime_services
+        .publish_session_execution_policy("hook-original", control.clone());
+    let original = sessions.get("hook-original").unwrap();
+    let error = service
+        .remove_active_runtime("hook-original")
+        .await
+        .err()
+        .expect("unknown cannot unload");
+    assert!(error.contains("unclosed Hook"));
+    assert!(Arc::ptr_eq(
+        &original,
+        &sessions.get("hook-original").unwrap()
+    ));
+    assert!(service
+        .runtime_services
+        .session_execution_policy_control("hook-original")
+        .is_some());
+    let mut guard = original.lock().await;
+    assert!(guard
+        .take_runtime_for_turn()
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("physical scope"));
+    drop(guard);
+    std::fs::write(&release, b"release").unwrap();
+    assert!(scope.quiesce().await);
+    assert!(service
+        .remove_active_runtime("hook-original")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(sessions.get("hook-original").is_none());
+    assert!(service
+        .runtime_services
+        .session_execution_policy_control("hook-original")
+        .is_none());
+    assert_eq!(service.gateway_tasks.tracked_task_count(), 0);
+    service.gateway_tasks.shutdown().await;
+}
+
 #[tokio::test]
 async fn remove_active_runtime_keeps_other_session_restorations_isolated() {
     let service = test_runtime_service(Arc::new(ActiveSessionDirectory::default()), None);
@@ -1197,7 +1278,11 @@ async fn remove_active_runtime_keeps_other_session_restorations_isolated() {
         )
         .unwrap();
 
-    assert!(service.remove_active_runtime("session-a").await.is_none());
+    assert!(service
+        .remove_active_runtime("session-a")
+        .await
+        .unwrap()
+        .is_none());
 
     assert_eq!(service.gateway_tasks.tracked_task_count(), 1);
     service
@@ -2110,7 +2195,10 @@ async fn runtime_event_relay_forwards_render_events_to_gateway_session_bus() {
     assert_eq!(payload["text"], "current relay");
     assert_eq!(service.gateway_tasks.tracked_task_count(), 1);
 
-    service.remove_active_runtime("relay-session").await;
+    service
+        .remove_active_runtime("relay-session")
+        .await
+        .unwrap();
     assert_eq!(service.gateway_tasks.tracked_task_count(), 0);
     current_runtime_bus.emit(runtime::CowdEvent::TextDelta {
         text: "after removal".to_string(),

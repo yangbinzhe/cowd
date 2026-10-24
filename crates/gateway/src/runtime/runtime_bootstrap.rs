@@ -780,10 +780,27 @@ fn mcp_annotation_flag(tool: &runtime::McpTool, key: &str) -> bool {
 }
 
 fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::RuntimeHookConfig {
+    fn command(entry: String) -> String {
+        // Registry validates/resolves plugin ./ paths to absolute file paths.
+        // Render that path as one shell word. Literal commands remain commands;
+        // the Runtime retains its general sh -lc / executable/shebang contract.
+        #[cfg(unix)]
+        if Path::new(&entry).is_absolute() {
+            let file = format!("'{}'", entry.replace('\'', "'\"'\"'"));
+            // Preserve the old Plugin file-only shell fallback, without
+            // forcing executable ELF/Python paths through a shell interpreter.
+            return format!("if test -x {file}; then exec {file}; else exec sh {file}; fi");
+        }
+        entry
+    }
     runtime::RuntimeHookConfig::new(
-        hooks.pre_tool_use,
-        hooks.post_tool_use,
-        hooks.post_tool_use_failure,
+        hooks.pre_tool_use.into_iter().map(command).collect(),
+        hooks.post_tool_use.into_iter().map(command).collect(),
+        hooks
+            .post_tool_use_failure
+            .into_iter()
+            .map(command)
+            .collect(),
     )
 }
 
@@ -1272,3 +1289,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "runtime_bootstrap_hook_tests.rs"]
+mod hook_owner_tests;

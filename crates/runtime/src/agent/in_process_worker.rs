@@ -1493,7 +1493,10 @@ const COMPLETED_RUN_TOMBSTONE_LIMIT: usize = 1_024;
 struct ActiveInProcessRun {
     cancellation: crate::CancellationToken,
     session_id: String,
-    input_stream: crate::SessionInputStream,
+    input_stream: Option<crate::SessionInputStream>,
+    packet_sha256: String,
+    hook_scope: crate::HookExecutionScope,
+    owner_ended: bool,
 }
 
 struct ActiveRunCleanup<'a> {
@@ -1503,20 +1506,18 @@ struct ActiveRunCleanup<'a> {
 
 impl Drop for ActiveRunCleanup<'_> {
     fn drop(&mut self) {
-        // The tombstone is visible before the active handle disappears; the
-        // completion flag/notification are published only after all maps are
-        // clean. This also runs when the execute future is aborted.
-        self.worker.record_completed_run(&self.run_id);
-        self.worker
+        // Returning/aborting a future is not a physical exit receipt. Keep the
+        // exact original scope until the Kernel's single durable exit publisher
+        // acknowledges it. Pending children survive errors and unwinding.
+        if let Some(active) = self
+            .worker
             .active_runs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.run_id);
-        self.worker
-            .pending_cancellations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.run_id);
+            .get_mut(&self.run_id)
+        {
+            active.owner_ended = true;
+        }
     }
 }
 

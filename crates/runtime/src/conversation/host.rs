@@ -210,6 +210,8 @@ where
     T: ToolExecutor,
 {
     runtime: Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
+    /// Same original child owner while the Conversation itself lives in Graph.
+    hook_scope: crate::HookExecutionScope,
     /// Set when the conversation runtime could not be returned to this host
     /// (its turn executors still held it). A poisoned host refuses further
     /// turns instead of pretending to be usable.

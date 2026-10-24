@@ -7349,6 +7349,63 @@ fn delegated_child_session_inherits_the_runtime_services_workspace() {
     assert_eq!(session.workspace_root(), Some(workspace));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn native_scope_registers_before_validation_and_fences_full_packet_on_release() {
+    let worker = InProcessAgentWorker::new(Weak::new());
+    let packet = test_agent_packet(vec![]);
+    let digest = |packet: &AgentTaskPacket| {
+        format!("{:x}", Sha256::digest(serde_json::to_vec(packet).unwrap()))
+    };
+    let original = digest(&packet);
+    assert_eq!(
+        worker.local_hook_scope_closed(packet.run_id(), &original),
+        Some(false)
+    );
+    let error = worker
+        .execute(
+            packet.clone(),
+            AgentModelSelection {
+                model: "inert".into(),
+                provider: "not-called".into(),
+                registry_revision: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("Binding"));
+    assert_eq!(
+        worker.local_hook_scope_closed(packet.run_id(), &original),
+        Some(true)
+    );
+    let mut foreign_attempt = packet.clone();
+    foreign_attempt.attempt += 1;
+    let mut foreign_payload = packet.clone();
+    foreign_payload.objective = "foreign payload".into();
+    for foreign in [foreign_attempt, foreign_payload] {
+        assert_eq!(
+            worker.local_hook_scope_closed(packet.run_id(), &digest(&foreign)),
+            Some(false)
+        );
+        worker.release_local_hook_scope(packet.run_id(), &digest(&foreign));
+        assert!(worker
+            .active_runs
+            .lock()
+            .unwrap()
+            .contains_key(packet.run_id()));
+    }
+    worker.release_local_hook_scope(packet.run_id(), &original);
+    assert!(!worker
+        .active_runs
+        .lock()
+        .unwrap()
+        .contains_key(packet.run_id()));
+    assert_eq!(
+        worker.local_hook_scope_closed(packet.run_id(), &original),
+        Some(false)
+    );
+}
+
 #[tokio::test]
 async fn send_input_enters_the_live_child_turn_inbox() {
     let worker = InProcessAgentWorker::new(Weak::new());
@@ -7359,7 +7416,10 @@ async fn send_input_enters_the_live_child_turn_inbox() {
         ActiveInProcessRun {
             cancellation: crate::CancellationToken::new(),
             session_id: "child-session".into(),
-            input_stream: stream.clone(),
+            input_stream: Some(stream.clone()),
+            packet_sha256: "input-packet".into(),
+            hook_scope: crate::HookExecutionScope::default(),
+            owner_ended: false,
         },
     );
     worker
@@ -7397,7 +7457,10 @@ async fn cancel_acknowledges_delivery_before_cleanup_and_tombstones_are_race_saf
         ActiveInProcessRun {
             cancellation: cancellation.clone(),
             session_id: "child-session".into(),
-            input_stream: crate::SessionInputStream::new("child-session"),
+            input_stream: Some(crate::SessionInputStream::new("child-session")),
+            packet_sha256: "original-cancel-packet".into(),
+            hook_scope: crate::HookExecutionScope::default(),
+            owner_ended: false,
         },
     );
     let cleanup = ActiveRunCleanup {
@@ -7440,7 +7503,38 @@ async fn cancel_acknowledges_delivery_before_cleanup_and_tombstones_are_race_saf
         .lock()
         .unwrap()
         .contains("run-cancel"));
+    assert_eq!(
+        worker.local_hook_scope_closed("run-cancel", "original-cancel-packet"),
+        Some(false)
+    );
     drop(cleanup);
+    assert!(worker
+        .active_runs
+        .lock()
+        .unwrap()
+        .contains_key("run-cancel"));
+    assert!(!worker.run_completed("run-cancel"));
+    assert_eq!(
+        worker.local_hook_scope_closed("run-cancel", "foreign-packet"),
+        Some(false)
+    );
+    worker.release_local_hook_scope("run-cancel", "foreign-packet");
+    assert!(worker
+        .active_runs
+        .lock()
+        .unwrap()
+        .contains_key("run-cancel"));
+    assert_eq!(
+        worker.local_hook_scope_closed("run-cancel", "original-cancel-packet"),
+        Some(true)
+    );
+    // The Kernel calls this acknowledgement only after its exact local_exit
+    // commit. Future Drop and a foreign packet cannot free the original owner.
+    worker.release_local_hook_scope("run-cancel", "original-cancel-packet");
+    assert_eq!(
+        worker.local_hook_scope_closed("run-cancel", "original-cancel-packet"),
+        Some(false)
+    );
     assert!(worker.active_runs.lock().unwrap().is_empty());
     assert!(worker.pending_cancellations.lock().unwrap().is_empty());
     assert!(worker.run_completed("run-cancel"));

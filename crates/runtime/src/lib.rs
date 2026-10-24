@@ -478,8 +478,8 @@ pub use harness_contract::agent::AgentLifecycleEvent;
 pub use harness_contract::context::{ArtifactRef, ArtifactWriteDescriptor};
 pub use harness_contract::outcome::RuntimeBuildIdentity;
 pub use hooks::{
-    format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
-    HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
+    format_hook_output, HookAbortSignal, HookEvent, HookExecutionScope, HookProgressEvent,
+    HookProgressReporter, HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
 pub use host::normalize_bare_evidence_ref;
 #[path = "conversation/host.rs"]

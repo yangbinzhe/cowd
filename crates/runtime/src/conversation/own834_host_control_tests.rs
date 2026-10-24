@@ -37,6 +37,7 @@ fn host() -> StandardRuntimeHost<NoTools> {
         Vec::new(),
     ).without_memory();
     StandardRuntimeHost {
+        hook_scope: runtime.hook_execution_scope(),
         runtime: Some(runtime),
         poisoned: false,
         inflight_turn: None,
@@ -53,13 +54,21 @@ fn host() -> StandardRuntimeHost<NoTools> {
 async fn own834_required_control_refuses_absent_and_poisoned_owners() {
     let mut host = host();
     host.require_next_model_tool_action(["read_file".into()]).unwrap();
+    let original_scope = host.hook_execution_scope();
     let runtime = host.runtime.take().unwrap();
-    assert!(host.require_next_model_tool_action(["read_file".into()]).is_err());
+    assert!(
+        original_scope.is_same_owner(&host.hook_execution_scope()),
+        "original physical owner remains observable while Graph holds Conversation"
+    );
+    assert!(host
+        .require_next_model_tool_action(["read_file".into()])
+        .is_err());
     let (_sender, receiver) = tokio::sync::oneshot::channel();
     host.inflight_turn = Some(receiver);
     assert!(host.require_next_model_tool_action(["read_file".into()]).is_err());
     host.inflight_turn = None;
     host.runtime = Some(runtime);
+    assert!(original_scope.is_same_owner(&host.hook_execution_scope()));
     host.poisoned = true;
     assert!(host.require_next_model_tool_action(["read_file".into()]).is_err());
     assert!(host.runtime.is_some());

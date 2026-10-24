@@ -9,7 +9,6 @@
     )
 )]
 
-mod hooks;
 #[cfg(test)]
 pub mod test_isolation;
 
@@ -23,8 +22,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-
-pub use hooks::{HookEvent, HookRunResult, HookRunner};
 
 const EXTERNAL_MARKETPLACE: &str = "external";
 const BUILTIN_MARKETPLACE: &str = "builtin";

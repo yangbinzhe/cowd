@@ -797,6 +797,7 @@ where
     /// T35: Set a cancellation token for graceful shutdown.
     #[must_use]
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.hook_abort_signal = self.hook_abort_signal.with_cancellation(token.clone());
         self.cancellation_token = token;
         self
     }
@@ -985,9 +986,18 @@ where
         self
     }
 
+    pub(crate) fn hook_execution_scope(&self) -> crate::HookExecutionScope {
+        self.hook_runner.execution_scope()
+    }
+
+    pub(crate) fn set_hook_execution_scope(&mut self, scope: crate::HookExecutionScope) {
+        self.hook_runner.set_execution_scope(scope);
+    }
+
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
-        self.hook_abort_signal = hook_abort_signal;
+        self.hook_abort_signal =
+            hook_abort_signal.with_cancellation(self.cancellation_token.clone());
         self
     }
 

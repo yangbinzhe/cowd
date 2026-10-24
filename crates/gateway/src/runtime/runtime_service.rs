@@ -313,12 +313,18 @@ impl RuntimeTurnOwner {
             .ok_or_else(|| "Runtime host was already restored before turn execution".to_string())
     }
 
-    async fn restore(&mut self) {
+    async fn restore(&mut self) -> Result<(), String> {
         let Some(runtime) = self.runtime.take() else {
-            return;
+            return Ok(());
         };
+        let closed = runtime.hook_execution_scope().quiesce().await;
         let mut entry = lock_runtime_entry(&self.entry).await;
         entry.restore_runtime_after_turn(runtime);
+        if closed {
+            Ok(())
+        } else {
+            Err("original Hook physical scope remains unknown; Session owner retained".into())
+        }
     }
 }
 
@@ -2009,7 +2015,7 @@ impl RuntimeService {
                     }
                     runtime.install_turn_control(
                         task_cancellation_token.clone(),
-                        runtime::HookAbortSignal::default(),
+                        runtime::HookAbortSignal::default().with_owner_cancellation(shutdown.clone()),
                     );
                     service.record_live_execution(
                         &task_record.session_id,
@@ -2043,13 +2049,18 @@ impl RuntimeService {
                     }
                 };
                 let guarded = AssertUnwindSafe(result).catch_unwind().await;
-                owned_runtime.restore().await;
+                let cleanup = owned_runtime.restore().await;
                 let result = match guarded {
                     Ok(result) => result,
                     Err(_) => Err(
                         "Session Runtime turn panicked after its host was safely restored"
                             .to_string(),
                     ),
+                };
+                let result = match (result, cleanup) {
+                    (Ok(value), Ok(())) => Ok(value),
+                    (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+                    (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup: {cleanup}")),
                 };
                 let _ = result_tx.send(result);
             },
@@ -2062,7 +2073,7 @@ impl RuntimeService {
                     .take()
             };
             if let Some(mut owned_runtime) = rejected_owner {
-                owned_runtime.restore().await;
+                owned_runtime.restore().await?;
             }
             return Err(format!(
                 "unable to start tracked Session Runtime turn: {error}"
@@ -3339,11 +3350,11 @@ impl RuntimeService {
     pub(crate) async fn remove_active_runtime(
         &self,
         session_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>> {
+    ) -> Result<Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>>, String>
+    {
         let transition_lock = self.sessions.transition_lock(session_id);
         let _transition = transition_lock.lock().await;
-        let removed = self.sessions.remove_aggregate(session_id);
-        let carrier = removed.as_ref().map(|session| session.carrier());
+        let carrier = self.sessions.get(session_id);
         let task_report = self
             .gateway_tasks
             .close_session_and_drain(session_id, Duration::from_secs(5))
@@ -3357,6 +3368,17 @@ impl RuntimeService {
                 "session-scoped Gateway background tasks required forced cleanup"
             );
         }
+        if let Some(carrier) = &carrier {
+            // Never hold the entry lock across TaskSet drain/physical polling:
+            // the original turn owner must be able to restore its Host.
+            let scope = lock_runtime_entry(carrier).await.hook_execution_scope();
+            if !scope.quiesce().await {
+                return Err(format!(
+                    "session {session_id} retains an unclosed Hook physical scope"
+                ));
+            }
+        }
+        self.sessions.remove_aggregate(session_id);
         self.active_turns
             .state
             .lock()
@@ -3365,7 +3387,7 @@ impl RuntimeService {
             .remove(session_id);
         self.runtime_services
             .remove_session_execution_policy(session_id);
-        carrier
+        Ok(carrier)
     }
 
     /// Runtime emits transient rendering/progress events on its own bus while
@@ -3507,8 +3529,13 @@ impl RuntimeService {
         Ok(SessionRelayLease::new(task_id))
     }
 
-    pub(crate) async fn remove_active_runtime_if_present(&self, session_id: &str) -> bool {
-        self.remove_active_runtime(session_id).await.is_some()
+    pub(crate) async fn remove_active_runtime_if_present(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        self.remove_active_runtime(session_id)
+            .await
+            .map(|carrier| carrier.is_some())
     }
 
     pub(crate) async fn cowd_event_receiver(

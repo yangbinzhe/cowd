@@ -106,6 +106,13 @@ pub trait AgentRuntimeBackend: Send + Sync {
         packet: AgentTaskPacket,
         selection: AgentModelSelection,
     ) -> Result<AgentReturnPacket, String>;
+    /// None means this backend has no private Hook child owner. A backend
+    /// which owns one must return false for missing/mismatched evidence.
+    fn local_hook_scope_closed(&self, _run_id: &str, _packet_sha256: &str) -> Option<bool> {
+        None
+    }
+    /// Called only after this exact run's local_exit is confirmed durable.
+    fn release_local_hook_scope(&self, _run_id: &str, _packet_sha256: &str) {}
     async fn command(
         &self,
         _handle: &AgentRunHandle,
@@ -136,6 +143,8 @@ struct AgentRunRecord {
 
 struct RetainedAgentRun {
     packet_sha256: String,
+    // Retain the exact admitted backend, even if its registration changes.
+    local_hook_owner: Mutex<Option<Arc<dyn AgentRuntimeBackend>>>,
     run_key: (String, String, String, u32),
     /// The identity of the immutable packet of this run, as the run facts
     /// must carry it. It is bound to this run by the packet digest and the run
@@ -1391,6 +1400,7 @@ impl AgentRuntime {
         let (result, _) = tokio::sync::watch::channel(None);
         let retained = Arc::new(RetainedAgentRun {
             packet_sha256: digest.clone(),
+            local_hook_owner: Mutex::new(None),
             run_key: run_cancellation_key(&packet),
             identity_refs: identity_refs(
                 &packet.assignment.execution_identity,
@@ -1831,6 +1841,16 @@ impl AgentRuntime {
         self.persist_run_fact_until_durable(evidence, "agent.local_exit")
             .await;
         retained.exit_committed.store(true, Ordering::Release);
+        if let Some(digest) = evidence.backend_packet_sha256.as_deref() {
+            let backend = retained
+                .local_hook_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(backend) = backend {
+                backend.release_local_hook_scope(&evidence.run_id, digest);
+            }
+        }
         self.pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2200,6 +2220,12 @@ impl AgentRuntime {
             None => None,
         };
         if backend.is_some() {
+            *retained
+                .local_hook_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = backend
+                .as_ref()
+                .map(|registered| Arc::clone(&registered.backend));
             exit_evidence.backend_packet_sha256 = Some(run_packet_sha256(&packet)?);
             exit_evidence.phase = LocalRunPhase::BackendPending;
             exit_evidence.process_envelope = process_prepared
@@ -2229,7 +2255,7 @@ impl AgentRuntime {
             exit_evidence.phase = LocalRunPhase::NotStarted;
             cancelled_return(&packet, "cancelled before backend invocation".into())
         } else {
-            match backend {
+            match backend.as_ref() {
             Some(registered) => match if let Some(prepared) = process_prepared.take() {
                 process_exit_owner.as_ref().ok_or("prepared Process owner missing")?.execute_prepared(prepared).await
             } else { registered.backend.execute(packet.clone(), selection).await } {
@@ -2247,7 +2273,27 @@ impl AgentRuntime {
         let cancelled = self.cancellation_observed(&packet);
         if !cancelled_before_start && exit_evidence.backend_packet_sha256.is_some() {
             if backend_kind == AgentBackendKind::InProcess {
-                exit_evidence.phase = retained.decide_exit_phase(if cancelled {
+                let deadline =
+                    tokio::time::Instant::now() + tools::bash::BASH_PROCESS_QUIESCENCE_TIMEOUT;
+                let closed = loop {
+                    let closed = backend.as_ref().and_then(|registered| {
+                        exit_evidence
+                            .backend_packet_sha256
+                            .as_deref()
+                            .and_then(|digest| {
+                                registered
+                                    .backend
+                                    .local_hook_scope_closed(packet.run_id(), digest)
+                            })
+                    });
+                    if closed != Some(false) || tokio::time::Instant::now() >= deadline {
+                        break closed;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                };
+                exit_evidence.phase = retained.decide_exit_phase(if closed == Some(false) {
+                    LocalRunPhase::Unknown
+                } else if cancelled {
                     LocalRunPhase::Cancelled
                 } else {
                     LocalRunPhase::LocalReturned
@@ -3116,6 +3162,35 @@ impl AgentRuntime {
             // The run owner owns the exit fact whenever it can publish it.
             if retained.exit_publication_claimed() {
                 return;
+            }
+            // Native cancellation reads the same actual child scope retained
+            // by the backend, authenticated by the original mirrored packet.
+            let native_evidence = retained.mirrored_exit_evidence().filter(|evidence| {
+                evidence.backend == AgentBackendKind::InProcess
+                    && evidence.packet_sha256 == retained.packet_sha256
+                    && evidence.agent_id == snapshot.agent_id
+                    && evidence.run_id == snapshot.run_id
+                    && evidence.graph_id == snapshot.graph_id
+                    && evidence.node_id == snapshot.node_id
+                    && evidence.attempt == snapshot.attempt
+            });
+            let native_owner_ended =
+                retained.result.borrow().is_some() || retained.owner_ended().await;
+            if let Some(evidence) = native_evidence.filter(|_| native_owner_ended) {
+                let backend = retained
+                    .local_hook_owner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let (Some(backend), Some(digest)) =
+                    (backend, evidence.backend_packet_sha256.as_deref())
+                {
+                    if backend.local_hook_scope_closed(&snapshot.run_id, digest) == Some(true) {
+                        self.publish_cancelled_exit(&retained, LocalRunPhase::Cancelled)
+                            .await;
+                        return;
+                    }
+                }
             }
             let scope_closed = adapter
                 .as_ref()
@@ -4496,6 +4571,106 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    struct HookExitBackend {
+        packet: Mutex<Option<(String, String)>>,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl AgentRuntimeBackend for HookExitBackend {
+        fn kind(&self) -> AgentBackendKind {
+            AgentBackendKind::InProcess
+        }
+        fn capabilities(&self) -> AgentBackendCapabilities {
+            AgentBackendCapabilities::in_process()
+        }
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            selection: AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            *self.packet.lock().unwrap() =
+                Some((packet.run_id().into(), run_packet_sha256(&packet)?));
+            CompletedBackend(AgentBackendKind::InProcess)
+                .execute(packet, selection)
+                .await
+        }
+        fn local_hook_scope_closed(&self, run_id: &str, digest: &str) -> Option<bool> {
+            Some(
+                self.packet
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|(run, sha)| run == run_id && sha == digest),
+            )
+        }
+        fn release_local_hook_scope(&self, run_id: &str, digest: &str) {
+            assert_eq!(self.local_hook_scope_closed(run_id, digest), Some(true));
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_scope_release_waits_for_exact_durable_single_exit_publisher() {
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        let backend = Arc::new(HookExitBackend {
+            packet: Mutex::new(None),
+            releases: 0.into(),
+        });
+        runtime.register_observation_authority_backend(backend.clone());
+        runtime.exit_append_failures.store(1000, Ordering::SeqCst);
+        let packet = task("hook-durable-exit");
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        runtime.exit_append_failed.notified().await;
+        let retained = runtime
+            .records
+            .read()
+            .unwrap()
+            .get(packet.agent_id())
+            .unwrap()
+            .retained
+            .clone()
+            .unwrap();
+        let fact = retained.pending_exit.lock().unwrap().clone().unwrap();
+        assert!(fact.positive());
+        assert!(!retained.exit_committed.load(Ordering::Acquire));
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 0);
+        // The competing publisher returns immediately, with no release.
+        runtime.publish_run_exit(&retained, &fact).await;
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 0);
+        assert!(confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .is_none());
+        let replacement = Arc::new(HookExitBackend {
+            packet: Mutex::new(None),
+            releases: 0.into(),
+        });
+        runtime.register_observation_authority_backend(replacement.clone());
+        runtime.exit_append_failures.store(0, Ordering::SeqCst);
+        caller.await.unwrap().unwrap();
+        assert_eq!(
+            replacement.releases.load(Ordering::SeqCst),
+            0,
+            "registration changes cannot borrow or release the original scope"
+        );
+        assert!(retained.exit_committed.load(Ordering::Acquire));
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            confirmed_run_exit(&runtime.event_store, &packet)
+                .unwrap()
+                .unwrap()
+                .0
+                .fact,
+            fact
+        );
+        runtime.publish_run_exit(&retained, &fact).await;
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
     }
 
     fn held_exit_runtime(

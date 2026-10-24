@@ -1,11 +1,18 @@
+#[path = "hooks/process.rs"]
+mod process;
+pub use process::HookExecutionScope;
+
 use std::ffi::OsStr;
+#[cfg(not(unix))]
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(not(unix))]
 use std::thread;
+#[cfg(not(unix))]
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -79,12 +86,34 @@ pub trait HookProgressReporter: Send {
 #[derive(Debug, Clone, Default)]
 pub struct HookAbortSignal {
     aborted: Arc<AtomicBool>,
+    cancellation: Option<crate::CancellationToken>,
+    owner_cancellation: Option<crate::CancellationToken>,
 }
 
 impl HookAbortSignal {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_cancellation(mut self, token: crate::CancellationToken) -> Self {
+        #[cfg(unix)]
+        {
+            self.cancellation = Some(token);
+        }
+        #[cfg(not(unix))]
+        let _ = token;
+        self
+    }
+
+    pub fn with_owner_cancellation(mut self, token: crate::CancellationToken) -> Self {
+        #[cfg(unix)]
+        {
+            self.owner_cancellation = Some(token);
+        }
+        #[cfg(not(unix))]
+        let _ = token;
+        self
     }
 
     pub fn abort(&self) {
@@ -94,6 +123,14 @@ impl HookAbortSignal {
     #[must_use]
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
+            || self
+                .owner_cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
     }
 }
 
@@ -168,15 +205,31 @@ impl HookRunResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct HookRunner {
     config: RuntimeHookConfig,
+    scope: HookExecutionScope,
 }
 
 impl HookRunner {
     #[must_use]
     pub fn new(config: RuntimeHookConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            scope: HookExecutionScope::default(),
+        }
+    }
+
+    pub fn execution_scope(&self) -> HookExecutionScope {
+        self.scope.clone()
+    }
+
+    pub(crate) fn set_execution_scope(&mut self, scope: HookExecutionScope) {
+        assert!(
+            self.scope.is_closed(),
+            "cannot replace an unclosed Hook owner"
+        );
+        self.scope = scope;
     }
 
     #[must_use]
@@ -197,7 +250,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        self.run_commands(
             HookEvent::PreToolUse,
             self.config.pre_tool_use(),
             tool_name,
@@ -247,7 +300,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        self.run_commands(
             HookEvent::PostToolUse,
             self.config.post_tool_use(),
             tool_name,
@@ -297,7 +350,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        self.run_commands(
             HookEvent::PostToolUseFailure,
             self.config.post_tool_use_failure(),
             tool_name,
@@ -339,6 +392,7 @@ impl HookRunner {
 
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
+        &self,
         event: HookEvent,
         commands: &[String],
         tool_name: &str,
@@ -348,101 +402,115 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         mut reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        if commands.is_empty() {
-            return HookRunResult::allow(Vec::new());
-        }
+        let mut execute = || {
+            if commands.is_empty() {
+                return HookRunResult::allow(Vec::new());
+            }
 
-        if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
-            return HookRunResult {
-                denied: false,
-                failed: false,
-                cancelled: true,
-                messages: vec![format!(
-                    "{} hook cancelled before execution",
-                    event.as_str()
-                )],
-                permission_override: None,
-                permission_reason: None,
-                updated_input: None,
-            };
-        }
+            if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
+                return HookRunResult {
+                    denied: false,
+                    failed: false,
+                    cancelled: true,
+                    messages: vec![format!(
+                        "{} hook cancelled before execution",
+                        event.as_str()
+                    )],
+                    permission_override: None,
+                    permission_reason: None,
+                    updated_input: None,
+                };
+            }
 
-        let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
-        let mut result = HookRunResult::allow(Vec::new());
+            let payload =
+                hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
+            let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
-            if let Some(reporter) = reporter.as_deref_mut() {
-                reporter.on_event(&HookProgressEvent::Started {
+            for command in commands {
+                if let Some(reporter) = reporter.as_deref_mut() {
+                    reporter.on_event(&HookProgressEvent::Started {
+                        event,
+                        tool_name: tool_name.to_string(),
+                        command: command.clone(),
+                    });
+                }
+
+                match self.run_command(
+                    command,
                     event,
-                    tool_name: tool_name.to_string(),
-                    command: command.clone(),
-                });
+                    tool_name,
+                    tool_input,
+                    tool_output,
+                    is_error,
+                    &payload,
+                    abort_signal,
+                ) {
+                    HookCommandOutcome::Allow { parsed } => {
+                        if let Some(reporter) = reporter.as_deref_mut() {
+                            reporter.on_event(&HookProgressEvent::Completed {
+                                event,
+                                tool_name: tool_name.to_string(),
+                                command: command.clone(),
+                            });
+                        }
+                        merge_parsed_hook_output(&mut result, parsed);
+                    }
+                    HookCommandOutcome::Deny { parsed } => {
+                        if let Some(reporter) = reporter.as_deref_mut() {
+                            reporter.on_event(&HookProgressEvent::Completed {
+                                event,
+                                tool_name: tool_name.to_string(),
+                                command: command.clone(),
+                            });
+                        }
+                        merge_parsed_hook_output(&mut result, parsed);
+                        result.denied = true;
+                        return result;
+                    }
+                    HookCommandOutcome::Failed { parsed } => {
+                        if let Some(reporter) = reporter.as_deref_mut() {
+                            reporter.on_event(&HookProgressEvent::Completed {
+                                event,
+                                tool_name: tool_name.to_string(),
+                                command: command.clone(),
+                            });
+                        }
+                        merge_parsed_hook_output(&mut result, parsed);
+                        result.failed = true;
+                        return result;
+                    }
+                    HookCommandOutcome::Cancelled { message } => {
+                        if let Some(reporter) = reporter.as_deref_mut() {
+                            reporter.on_event(&HookProgressEvent::Cancelled {
+                                event,
+                                tool_name: tool_name.to_string(),
+                                command: command.clone(),
+                            });
+                        }
+                        result.cancelled = true;
+                        result.messages.push(message);
+                        return result;
+                    }
+                }
             }
 
-            match Self::run_command(
-                command,
-                event,
-                tool_name,
-                tool_input,
-                tool_output,
-                is_error,
-                &payload,
-                abort_signal,
-            ) {
-                HookCommandOutcome::Allow { parsed } => {
-                    if let Some(reporter) = reporter.as_deref_mut() {
-                        reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
-                        });
-                    }
-                    merge_parsed_hook_output(&mut result, parsed);
-                }
-                HookCommandOutcome::Deny { parsed } => {
-                    if let Some(reporter) = reporter.as_deref_mut() {
-                        reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
-                        });
-                    }
-                    merge_parsed_hook_output(&mut result, parsed);
-                    result.denied = true;
-                    return result;
-                }
-                HookCommandOutcome::Failed { parsed } => {
-                    if let Some(reporter) = reporter.as_deref_mut() {
-                        reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
-                        });
-                    }
-                    merge_parsed_hook_output(&mut result, parsed);
-                    result.failed = true;
-                    return result;
-                }
-                HookCommandOutcome::Cancelled { message } => {
-                    if let Some(reporter) = reporter.as_deref_mut() {
-                        reporter.on_event(&HookProgressEvent::Cancelled {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
-                        });
-                    }
-                    result.cancelled = true;
-                    result.messages.push(message);
-                    return result;
-                }
-            }
+            result
+        };
+        // Keep the same task-local context, reporter and resource owner while
+        // allowing async cancellation senders to run when all workers hook.
+        // current_thread and ordinary synchronous callers cannot use this API.
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(execute)
+        } else {
+            execute()
         }
-
-        result
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_command(
+        &self,
         command: &str,
         event: HookEvent,
         tool_name: &str,
@@ -464,7 +532,7 @@ impl HookRunner {
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
-        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+        match child.output_with_stdin(payload.as_bytes(), abort_signal, &self.scope) {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -510,7 +578,7 @@ impl HookRunner {
             Err(error) => HookCommandOutcome::Failed {
                 parsed: ParsedHookOutput {
                     messages: vec![format!(
-                        "{} hook `{command}` failed to start for `{}`: {error}",
+                        "{} hook `{command}` failed while handling `{}`: {error}",
                         event.as_str(),
                         tool_name
                     )],
@@ -717,22 +785,34 @@ impl CommandWithStdin {
         &mut self,
         stdin: &[u8],
         abort_signal: Option<&HookAbortSignal>,
+        scope: &HookExecutionScope,
     ) -> std::io::Result<CommandExecution> {
-        let mut child = self.command.spawn()?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin)?;
+        #[cfg(unix)]
+        {
+            scope.execute(&mut self.command, stdin, abort_signal)
         }
-
-        loop {
-            if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
-                let _ = child.kill();
-                let _ = child.wait_with_output();
-                return Ok(CommandExecution::Cancelled);
+        #[cfg(not(unix))]
+        {
+            let mut child = self.command.spawn()?;
+            if let Some(mut child_stdin) = child.stdin.take() {
+                match child_stdin.write_all(stdin) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(error) => return Err(error),
+                }
             }
 
-            match child.try_wait()? {
-                Some(_) => return child.wait_with_output().map(CommandExecution::Finished),
-                None => thread::sleep(Duration::from_millis(20)),
+            loop {
+                if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
+                    let _ = child.kill();
+                    let _ = child.wait_with_output();
+                    return Ok(CommandExecution::Cancelled);
+                }
+
+                match child.try_wait()? {
+                    Some(_) => return child.wait_with_output().map(CommandExecution::Finished),
+                    None => thread::sleep(Duration::from_millis(20)),
+                }
             }
         }
     }
@@ -1022,6 +1102,50 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_file_hook_preserves_spaces_and_shell_script_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("review hook with spaces.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'script input'; exit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // No word splitting of the executable path; the original shell
+        // still selects its shebang rather than forcing a new interpreter.
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![format!("'{}'", script.display())],
+            vec![],
+            vec![],
+        ));
+        let result = runner.run_pre_tool_use("read_file", "{}");
+        assert_eq!(result, HookRunResult::allow(vec!["script input".into()]));
+        assert!(runner.execution_scope().is_closed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_file_preserves_non_shell_shebang_and_literal_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("review.py");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env python3\nimport sys\nprint('python-original')\nsys.exit(2)\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![script.to_str().unwrap().into()],
+            vec![],
+            vec![],
+        ));
+        let result = runner.run_pre_tool_use("read_file", "{}");
+        assert!(result.is_denied());
+        assert!(!result.is_failed());
+        assert_eq!(result.messages(), &["python-original"]);
+        assert!(runner.execution_scope().is_closed());
     }
 
     #[test]

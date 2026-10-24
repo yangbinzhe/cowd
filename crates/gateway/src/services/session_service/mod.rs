@@ -1258,7 +1258,7 @@ impl SessionService {
                 session::SessionLifecyclePhase::TombstoneCommitted => {
                     self.coordinator()?
                         .unload_runtime_under_guard(&intent.session_id)
-                        .await;
+                        .await?;
                     self.kernel()
                         .transition_session_lifecycle(&session::SessionLifecycleTransition {
                             operation_id: intent.operation_id.clone(),
@@ -1416,7 +1416,7 @@ impl SessionService {
     }
 
     pub(crate) async fn unload_runtime(&self, session_id: &str) -> Result<bool, String> {
-        Ok(self.coordinator()?.unload_runtime(session_id).await)
+        self.coordinator()?.unload_runtime(session_id).await
     }
 
     pub(crate) async fn recover_active_sessions(&self) -> Result<SessionRecoverySummary, String> {

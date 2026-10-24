@@ -453,21 +453,28 @@ impl SessionActivationCoordinator {
                 return false;
             }
             let bytes = entry.transcript_bytes;
-            state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
             state.evicting_bytes = state.evicting_bytes.saturating_add(bytes);
-            if let Some(entry) = state.entries.get_mut(session_id) {
-                entry.status = SessionHydrationStatus::MetadataLoaded;
-                entry.last_error = None;
-            }
             bytes
         };
-        self.runtime
+        let removed = self
+            .runtime
             .remove_active_runtime_if_present(session_id)
             .await;
-        self.resource_lifecycle.unregister(session_id).await;
         let mut state = self.working_set.lock().await;
         state.evicting_bytes = state.evicting_bytes.saturating_sub(victim_bytes);
+        if let Err(error) = removed {
+            if let Some(entry) = state.entries.get_mut(session_id) {
+                entry.last_error = Some(error);
+            }
+            return false;
+        }
+        state.hot_bytes = state.hot_bytes.saturating_sub(victim_bytes);
+        if let Some(entry) = state.entries.get_mut(session_id) {
+            entry.status = SessionHydrationStatus::MetadataLoaded;
+            entry.last_error = None;
+        }
         drop(state);
+        self.resource_lifecycle.unregister(session_id).await;
         tracing::info!(
             session_id,
             "evicted unpinned hot Runtime carrier under keyed working-set gate"
@@ -924,7 +931,8 @@ impl SessionActivationCoordinator {
         {
             self.runtime
                 .remove_active_runtime_if_present(session_id)
-                .await;
+                .await
+                .map_err(|cleanup| format!("{error}; cleanup: {cleanup}"))?;
             if created {
                 return Err(self.rollback_created_session(&record, error).await);
             }
@@ -933,7 +941,8 @@ impl SessionActivationCoordinator {
         if let Err(error) = self.register_lifecycle(session_id, !created).await {
             self.runtime
                 .remove_active_runtime_if_present(session_id)
-                .await;
+                .await
+                .map_err(|cleanup| format!("{error}; cleanup: {cleanup}"))?;
             self.mark_metadata_only(session_id).await;
             self.resource_lifecycle.unregister(session_id).await;
             if created {
@@ -1048,20 +1057,23 @@ impl SessionActivationCoordinator {
 
     /// Remove only process-local execution state. Durable transcript and Session
     /// identity remain available for lazy recovery.
-    pub(crate) async fn unload_runtime(&self, session_id: &str) -> bool {
+    pub(crate) async fn unload_runtime(&self, session_id: &str) -> Result<bool, String> {
         let lock = self.lock_for(session_id).await;
         let _guard = lock.lock().await;
         self.unload_runtime_under_guard(session_id).await
     }
 
-    pub(super) async fn unload_runtime_under_guard(&self, session_id: &str) -> bool {
+    pub(super) async fn unload_runtime_under_guard(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, String> {
         let removed = self
             .runtime
             .remove_active_runtime_if_present(session_id)
-            .await;
+            .await?;
         self.resource_lifecycle.unregister(session_id).await;
         self.mark_metadata_only(session_id).await;
-        removed
+        Ok(removed)
     }
 
     pub(crate) async fn recover_active_sessions(&self) -> SessionRecoverySummary {
@@ -1410,8 +1422,12 @@ impl SessionActivationCoordinator {
                 self.resource_lifecycle.mark_active(&session_id).await;
                 continue;
             }
-            if self.unload_runtime(&session_id).await {
-                unloaded += 1;
+            match self.unload_runtime(&session_id).await {
+                Ok(true) => unloaded += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "Session physical owner retained during cleanup")
+                }
             }
         }
         unloaded
@@ -1682,7 +1698,7 @@ mod tests {
         );
         owner_request.owner_principal_id = Some("principal-a".to_string());
         manager.activate_for_test(owner_request).await.unwrap();
-        assert!(manager.unload_runtime("session-owned").await);
+        assert!(manager.unload_runtime("session-owned").await.unwrap());
         assert!(active.get("session-owned").is_none());
         assert!(lifecycle.check_session("session-owned").await.is_none());
 
@@ -1724,7 +1740,10 @@ mod tests {
             ))
             .await
             .expect("legacy record fixture");
-        assert!(manager.unload_runtime("session-legacy-ownerless").await);
+        assert!(manager
+            .unload_runtime("session-legacy-ownerless")
+            .await
+            .unwrap());
 
         let mut ordinary =
             EnsureSessionRequest::new("session-legacy-ownerless", None, SessionSource::Tui);
@@ -1869,7 +1888,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(manager.unload_runtime("session-recover").await);
+        assert!(manager.unload_runtime("session-recover").await.unwrap());
         assert!(active.get("session-recover").is_none());
         assert!(store
             .get_session("session-recover")
