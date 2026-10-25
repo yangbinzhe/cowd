@@ -629,7 +629,9 @@ impl TaskRuntimePort {
     }
 
     fn project_task_evidence(&self, task_id: &str, limit: usize) -> Result<usize, String> {
-        self.require_non_structured_task(task_id)?;
+        // Project the original durable outbox for both Task kinds. This does
+        // not authorize external lifecycle writes to a structured Task.
+        self.require_visible_task(task_id)?;
         let records = self.tasks.pending_outbox(Some(task_id), limit)?;
         self.project_evidence_records(records)
     }

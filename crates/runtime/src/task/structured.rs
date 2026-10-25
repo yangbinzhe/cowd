@@ -1336,6 +1336,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_creation_projects_original_evidence_without_external_lifecycle_authority() {
+        let services = RuntimeServices::in_memory().unwrap();
+        services.shutdown_maintenance().await;
+        let mut command = command("task-project-structured");
+        command.mission_id = services.mission_runtime().default_mission_id().into();
+        services.publish_session_execution_policy(
+            "structured-source",
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                SessionExecutionPolicy::from_profile(
+                    AutonomyProfileId::Supervised,
+                    1,
+                    SessionExecutionPolicyOrigin::ConfigDefault,
+                ),
+            ),
+        );
+        let port = services.task_runtime_port();
+        let created = port.create(command.clone()).unwrap();
+        assert_eq!(created.aggregate.revision, 1);
+        assert!(services
+            .task_aggregate_service()
+            .pending_outbox(Some("task-project-structured"), 10)
+            .unwrap()
+            .is_empty());
+        let event = services
+            .event_store()
+            .event_by_idempotency_key(
+                "task:task-project-structured",
+                "task-outbox:task-project-structured:1",
+            )
+            .unwrap()
+            .expect("original creation evidence must be projected");
+        assert_eq!(event.kind, "task.created");
+        assert_eq!(event.actor.as_deref(), Some("runtime.task"));
+        let replay = port.create(command).unwrap();
+        assert_eq!(replay.command_receipt, created.command_receipt);
+        assert_eq!(
+            services
+                .event_store()
+                .stream_revision("task:task-project-structured")
+                .unwrap(),
+            1
+        );
+        let error = port
+            .transition(
+                "task-project-structured",
+                1,
+                TaskStatus::Completed,
+                Vec::new(),
+                "external caller must not settle structured work",
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("structured execution lifecycle is owned"),
+            "{error}"
+        );
+        assert_eq!(
+            services
+                .task_aggregate_service()
+                .get("task-project-structured")
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
     async fn fresh_structured_admission_rejects_changed_original_source_policy_before_task_commit()
     {
         let services = RuntimeServices::in_memory().unwrap();
