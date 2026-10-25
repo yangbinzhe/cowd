@@ -363,6 +363,32 @@ impl ExecutionGraphRunner {
         &self.state_store
     }
 
+    pub(crate) async fn confirm_cancelled_bound_child_never_admitted(
+        &self,
+        expected: &ExecutionGraph,
+    ) -> Result<(), ExecutionRunnerError> {
+        let _coordination = self.graph_coordination_without_command(&expected.id).await;
+        if self
+            .active
+            .lock()
+            .await
+            .keys()
+            .any(|(graph_id, _)| graph_id == &expected.id)
+        {
+            return Err(ExecutionRunnerError::AdmissionRaced {
+                graph_id: expected.id.clone(),
+            });
+        }
+        let service = self.commit_service.clone();
+        let expected = expected.clone();
+        tokio::task::spawn_blocking(move || {
+            service.confirm_cancelled_bound_child_never_admitted(&expected)
+        })
+        .await
+        .map_err(|error| ExecutionRunnerError::Join(error.to_string()))??;
+        Ok(())
+    }
+
     pub(crate) async fn drain_physical_execution(&self) -> Vec<String> {
         self.registry.drain_physical_execution().await
     }
@@ -4045,6 +4071,29 @@ mod nodispatch_duration_617_tests {
             prepared.remove(0),
             backend,
         )
+    }
+
+    #[tokio::test]
+    async fn never_admitted_rejects_original_active_prepared_owner_without_clearing_it() {
+        let (_workspace, _services, runner, graph_id, prepared, backend) =
+            original_prepared617().await;
+        let expected = runner.state_store.load_async(&graph_id).await.unwrap();
+        let before = runner.active.lock().await.len();
+        let error = runner
+            .confirm_cancelled_bound_child_never_admitted(&expected)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecutionRunnerError::AdmissionRaced { .. }),
+            "{error}"
+        );
+        assert_eq!(runner.active.lock().await.len(), before);
+        assert!(runner
+            .active
+            .lock()
+            .await
+            .contains_key(&(graph_id, prepared.node.id)));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

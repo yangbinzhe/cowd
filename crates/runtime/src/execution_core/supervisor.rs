@@ -936,6 +936,15 @@ impl RuntimeExecutionSupervisor {
         self.runner.register_continuation(graph, actor).await
     }
 
+    pub(crate) async fn confirm_cancelled_bound_child_never_admitted(
+        &self,
+        expected: &ExecutionGraph,
+    ) -> Result<(), ExecutionRunnerError> {
+        self.runner
+            .confirm_cancelled_bound_child_never_admitted(expected)
+            .await
+    }
+
     pub(crate) async fn drive_registered(
         &self,
         graph_id: &str,

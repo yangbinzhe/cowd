@@ -7672,6 +7672,19 @@ impl ExecutionCommitService {
         }
     }
 
+    pub(crate) fn confirm_cancelled_bound_child_never_admitted(
+        &self,
+        expected: &ExecutionGraph,
+    ) -> Result<(), ExecutionCommitError> {
+        // Original graph append lock; no receipt, mutation, or fresh authorization.
+        self.event_store
+            .with_stream_locks(&[expected.id.clone()], || {
+                self.effect_authority_graphs
+                    .confirm_cancelled_bound_child_never_admitted(expected)
+                    .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
+            })
+    }
+
     pub fn transition_node(
         &self,
         graph: &ExecutionGraph,

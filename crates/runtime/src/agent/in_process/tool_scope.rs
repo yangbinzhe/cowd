@@ -433,6 +433,10 @@ impl ScopedRuntimeToolExecutor {
             managed_invocation: None,
             tool_progress: crate::ToolProgressSink::default(),
         };
+        if let Some(stop) = crate::bound_tool_batch::current_tool_stop() {
+            stop.check()?;
+            stop.effect_entered.store(true, Ordering::Release);
+        }
         let outcome = self.host.execute_runtime_tool(&request).await;
         match outcome.status {
             RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
@@ -529,9 +533,17 @@ impl ScopedRuntimeToolExecutor {
             if let Some(dispatcher) = &self.tool_batch {
                 dispatcher.execute(request.clone()).await?
             } else {
+                if let Some(stop) = crate::bound_tool_batch::current_tool_stop() {
+                    stop.check()?;
+                    stop.effect_entered.store(true, Ordering::Release);
+                }
                 self.host.execute_runtime_tool(&request).await
             }
         } else {
+            if let Some(stop) = crate::bound_tool_batch::current_tool_stop() {
+                stop.check()?;
+                stop.effect_entered.store(true, Ordering::Release);
+            }
             self.host.execute_runtime_tool(&request).await
         };
         if tool_name == "evidence_retrieve" {

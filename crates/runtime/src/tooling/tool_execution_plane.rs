@@ -520,6 +520,32 @@ impl ToolExecutionPlane {
         parent_class_ceiling: Option<ExecutionServiceClass>,
         session_id: Option<&str>,
     ) -> Result<ToolExecutionAdmission, ToolExecutionPlaneError> {
+        let work = self.admit_unstopped(
+            demand,
+            timeout,
+            service_class,
+            parent_class_ceiling,
+            session_id,
+        );
+        if let Some(stop) = crate::bound_tool_batch::current_tool_stop() {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => Err(ToolExecutionPlaneError::Admission("original tool call stopped during admission".into())),
+                result = work => result,
+            }
+        } else {
+            work.await
+        }
+    }
+
+    async fn admit_unstopped(
+        &self,
+        demand: &ResourceDemand,
+        timeout: Option<Duration>,
+        service_class: ExecutionServiceClass,
+        parent_class_ceiling: Option<ExecutionServiceClass>,
+        session_id: Option<&str>,
+    ) -> Result<ToolExecutionAdmission, ToolExecutionPlaneError> {
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         let admission_started = Instant::now();
         let scope_requests = scope_requests(demand)?;
@@ -828,6 +854,99 @@ mod tests {
             ])),
             Arc::new(ScopeLockManager::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn stopped_original_call_cannot_enter_a_waiting_tool_slot() {
+        let plane = plane(1);
+        let stop = crate::bound_tool_batch::BoundToolStop::default();
+        stop.request();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let actual = calls.clone();
+        let result = crate::bound_tool_batch::with_tool_stop(
+            stop,
+            plane.execute(&ResourceDemand::default(), None, move || {
+                actual.fetch_add(1, Ordering::SeqCst);
+                7
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ToolExecutionPlaneError::Admission(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(
+            plane
+                .execute(&ResourceDemand::default(), None, || 11)
+                .await
+                .unwrap(),
+            11
+        );
+    }
+
+    #[tokio::test]
+    async fn original_call_cancel_while_scope_is_held_never_runs_or_releases_sibling() {
+        let plane = Arc::new(plane(1));
+        let demand = ResourceDemand {
+            scopes: vec![ResourceScopeDemand {
+                key: "original-call-fence".into(),
+                access: ResourceAccess::Write,
+            }],
+            ..Default::default()
+        };
+        let first_demand = demand.clone();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let first_plane = plane.clone();
+        let first = tokio::spawn(async move {
+            first_plane
+                .execute_async_classified_retained(
+                    &first_demand,
+                    None,
+                    ExecutionServiceClass::Foreground,
+                    None,
+                    Some("original-sibling"),
+                    async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        17
+                    },
+                )
+                .await
+        });
+        observed.await.unwrap();
+        let stop = crate::bound_tool_batch::BoundToolStop::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let actual = calls.clone();
+        let pending = crate::bound_tool_batch::with_tool_stop(
+            stop.clone(),
+            plane.execute(&demand, None, move || {
+                actual.fetch_add(1, Ordering::SeqCst);
+                23
+            }),
+        );
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(plane.stats().active, 1);
+        stop.request();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut pending)
+            .await
+            .expect("cancel must not wait for the sibling lease");
+        assert!(matches!(result, Err(ToolExecutionPlaneError::Admission(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(plane.stats().active, 1, "sibling lease is still owned");
+        assert!(!first.is_finished());
+        release.send(()).unwrap();
+        let (result, admission) = first.await.unwrap();
+        assert_eq!(result.unwrap(), 17);
+        let next = plane.execute(&demand, None, || 31);
+        tokio::pin!(next);
+        assert!(
+            futures::poll!(&mut next).is_pending(),
+            "completed operation still owns its retained scope lease"
+        );
+        drop(admission);
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(next.await.unwrap(), 31);
     }
 
     #[tokio::test]

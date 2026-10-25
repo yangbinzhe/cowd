@@ -59,6 +59,7 @@ pub(crate) use evidence_collector::{
 /// `ScopedRuntimeToolExecutor` used by the native worker. The process never
 /// receives a raw ToolHost capability and therefore cannot mint evidence or
 /// change receipts in its terminal JSON.
+#[derive(Clone)]
 pub(crate) struct ProcessJsonlToolSession {
     services: Arc<RuntimeServices>,
     executor: Arc<ScopedRuntimeToolExecutor>,
@@ -66,11 +67,100 @@ pub(crate) struct ProcessJsonlToolSession {
     external_model_profile: String,
     topic_actions: crate::AgentActionService,
     topic_packet: AgentTaskPacket,
-    topic_transport: Mutex<crate::agentic::topic_delivery::TopicTransport>,
+    topic_transport: Arc<Mutex<crate::agentic::topic_delivery::TopicTransport>>,
     permission_policy: PermissionPolicy,
     authorization_negotiator: crate::AuthorizationNegotiator,
     event_store: Arc<crate::RuntimeEventStore>,
-    steps: Mutex<VecDeque<Arc<crate::step_snapshot::BoundStep>>>,
+    requests: Arc<Mutex<ProcessRequestScope>>,
+    steps: Arc<Mutex<VecDeque<Arc<crate::step_snapshot::BoundStep>>>>,
+}
+
+// One registry for the original authenticated run. The key is request_id,
+// never fingerprint: changed input/Step cannot acquire a second slot.
+struct ProcessRequestScope {
+    accepting: bool,
+    #[cfg(test)]
+    stop_after_child_registration: bool,
+    calls: BTreeMap<String, Arc<ProcessCallSlot>>,
+}
+impl Default for ProcessRequestScope {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            #[cfg(test)]
+            stop_after_child_registration: false,
+            calls: BTreeMap::new(),
+        }
+    }
+}
+impl ProcessRequestScope {
+    fn admit(
+        &mut self,
+        request_id: &str,
+        fingerprint: String,
+    ) -> Result<(Arc<ProcessCallSlot>, bool), String> {
+        if request_id.is_empty() {
+            return Err("Process request_id missing".into());
+        }
+        if let Some(slot) = self.calls.get(request_id) {
+            if slot.fingerprint != fingerprint {
+                return Err(
+                    "Process request_id changed original Step/tool/input/response kind".into(),
+                );
+            }
+            return Ok((slot.clone(), false));
+        }
+        if !self.accepting {
+            return Err("Process tool admission closed".into());
+        }
+        let stop = crate::bound_tool_batch::BoundToolStop::default();
+        #[cfg(test)]
+        let stop = {
+            let mut fixture_stop = stop;
+            fixture_stop.stop_after_child_registration = self.stop_after_child_registration;
+            fixture_stop
+        };
+        let slot = Arc::new(ProcessCallSlot {
+            fingerprint,
+            stop,
+            result: Mutex::new(None),
+            joined: Mutex::new(None),
+            driver_joined: std::sync::atomic::AtomicBool::new(false),
+            returned: std::sync::atomic::AtomicBool::new(false),
+            settled: std::sync::atomic::AtomicBool::new(false),
+            completed: Default::default(),
+        });
+        self.calls.insert(request_id.into(), slot.clone());
+        Ok((slot, true))
+    }
+}
+struct ProcessCallSlot {
+    fingerprint: String,
+    stop: crate::bound_tool_batch::BoundToolStop,
+    result: Mutex<Option<Result<String, String>>>,
+    joined: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    driver_joined: std::sync::atomic::AtomicBool,
+    returned: std::sync::atomic::AtomicBool,
+    settled: std::sync::atomic::AtomicBool,
+    completed: tokio::sync::Notify,
+}
+impl ProcessCallSlot {
+    async fn replay(&self) -> Result<String, String> {
+        loop {
+            let ready = self.completed.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if let Some(result) = self
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return result;
+            }
+            ready.await;
+        }
+    }
 }
 
 pub(crate) fn process_tool_approval_ceiling_allows(
@@ -308,11 +398,12 @@ impl ProcessJsonlToolSession {
             external_model_profile: selection.model.clone(),
             topic_actions: services.agent_action_service(),
             topic_packet: packet.clone(),
-            topic_transport: Mutex::new(Default::default()),
+            topic_transport: Arc::new(Mutex::new(Default::default())),
             permission_policy: process_permission_policy,
             authorization_negotiator: crate::AuthorizationNegotiator::new(),
             event_store: Arc::clone(services.event_store()),
-            steps: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(ProcessRequestScope::default())),
+            steps: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -459,6 +550,15 @@ impl ProcessJsonlToolSession {
         Ok(response)
     }
 
+    #[cfg(test)]
+    pub(crate) fn latest_process_step_id_for_test(&self) -> Option<String> {
+        self.steps
+            .lock()
+            .ok()?
+            .back()
+            .map(|step| step.snapshot().identity.step_id.clone())
+    }
+
     pub(crate) async fn execute_step_tool(
         &self,
         step_id: &str,
@@ -466,6 +566,26 @@ impl ProcessJsonlToolSession {
         request_id: &str,
         tool_name: &str,
         input: &str,
+    ) -> Result<String, String> {
+        self.execute_step_tool_response(
+            step_id,
+            sequence,
+            request_id,
+            tool_name,
+            input,
+            "tool_result",
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_step_tool_response(
+        &self,
+        step_id: &str,
+        sequence: u64,
+        request_id: &str,
+        tool_name: &str,
+        input: &str,
+        response_kind: &str,
     ) -> Result<String, String> {
         let step = self
             .steps
@@ -490,8 +610,143 @@ impl ProcessJsonlToolSession {
             chrono::Utc::now().timestamp_millis(),
         )
         .map_err(|error| error.to_string())?;
-        self.execute_tool_bound(Some(&binding), request_id, tool_name, input)
-            .await
+        let value: serde_json::Value =
+            serde_json::from_str(input).map_err(|error| error.to_string())?;
+        let fingerprint = crate::agent_process_jsonl_adapter::process_call_fingerprint(
+            step_id,
+            response_kind,
+            tool_name,
+            &value,
+        )?;
+        let (slot, first) = self.admit_call(request_id, fingerprint)?;
+        if !first {
+            return tokio::select! { biased;
+                _=slot.stop.cancelled()=>Err("Process original tool stop requested; completion retained".into()),
+                result=slot.replay()=>result,
+            };
+        }
+        let session = self.clone();
+        let task_slot = slot.clone();
+        let binding = binding.clone();
+        let request_id = request_id.to_string();
+        let tool_name = tool_name.to_string();
+        let input = input.to_string();
+        use futures::FutureExt;
+        let handle = tokio::spawn(async move {
+            let result = std::panic::AssertUnwindSafe(crate::bound_tool_batch::with_tool_stop(
+                task_slot.stop.clone(),
+                session.execute_tool_bound(Some(&binding), &request_id, &tool_name, &input),
+            ))
+            .catch_unwind()
+            .await;
+            let returned = result.is_ok();
+            let result = result.unwrap_or_else(|_| {
+                Err("Process original tool task panicked; physical settlement unknown".into())
+            });
+            let no_dispatch = !task_slot.stop.effect_entered.load(Ordering::Acquire)
+                && task_slot
+                    .stop
+                    .child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none();
+            let settled = returned
+                && (result.is_ok()
+                    || no_dispatch
+                    || task_slot.stop.effect_settled.load(Ordering::Acquire));
+            task_slot.settled.store(settled, Ordering::Release);
+            task_slot.returned.store(returned, Ordering::Release);
+            *task_slot
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+            task_slot.completed.notify_waiters();
+        });
+        *slot
+            .joined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+        tokio::select! {
+            biased;
+            _=slot.stop.cancelled()=>Err("Process original tool stop requested; completion retained".into()),
+            result=slot.replay()=>result,
+        }
+    }
+
+    fn admit_call(
+        &self,
+        request_id: &str,
+        fingerprint: String,
+    ) -> Result<(Arc<ProcessCallSlot>, bool), String> {
+        self.requests
+            .lock()
+            .map_err(|_| "Process request scope poisoned")?
+            .admit(request_id, fingerprint)
+    }
+
+    pub(crate) fn close_admission_and_request_stop(&self) {
+        let calls = {
+            let mut scope = self
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            scope.accepting = false;
+            scope.calls.values().cloned().collect::<Vec<_>>()
+        };
+        for call in calls {
+            call.stop.request();
+        }
+    }
+
+    pub(crate) async fn wait_drained(&self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let calls = {
+            let scope = self
+                .requests
+                .lock()
+                .map_err(|_| "Process request scope poisoned")?;
+            if scope.accepting {
+                return Err("Process tool admission is still open".into());
+            }
+            scope.calls.values().cloned().collect::<Vec<_>>()
+        };
+        for call in calls {
+            let _ = tokio::time::timeout_at(deadline, call.replay())
+                .await
+                .map_err(|_| "Process accepted tool work remains pending at deadline")?;
+            if !call.settled.load(Ordering::Acquire) {
+                return Err(
+                    "Process original tool receipt/unknown settlement remains unproven".into(),
+                );
+            }
+            if !call.stop.child_drained.load(Ordering::Acquire) {
+                return Err("Process original child physical driver remains unproven".into());
+            }
+            if !call.returned.load(Ordering::Acquire) {
+                return Err("Process original tool task did not return normally".into());
+            }
+            let handle = call
+                .joined
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(mut handle) = handle {
+                match tokio::time::timeout_at(deadline, &mut handle).await {
+                    Ok(Ok(())) => call.driver_joined.store(true, Ordering::Release),
+                    Ok(Err(_)) => return Err("Process original tool join failed".into()),
+                    Err(_) => {
+                        *call
+                            .joined
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                        return Err("Process original tool join remains pending".into());
+                    }
+                }
+            }
+            if !call.driver_joined.load(Ordering::Acquire) {
+                return Err("Process original tool driver handle is not joined".into());
+            }
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -1560,5 +1815,271 @@ impl InProcessAgentWorker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .any(|candidate| candidate == run_id)
+    }
+}
+
+#[cfg(test)]
+mod process_request_scope_tests {
+    use super::*;
+    #[tokio::test]
+    async fn original_registered_child_cancel_before_drive_leaves_no_work_or_orphan() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, host, packet) = tests::discovery_test_services(root.path(), true);
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-fixture".into(),
+            registry_revision: 0,
+        };
+        let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+        bridge
+            .requests
+            .lock()
+            .unwrap()
+            .stop_after_child_registration = true;
+        let parent_before = services
+            .graph_state_store()
+            .load(packet.graph_id())
+            .unwrap();
+        let step = bridge.begin_step().unwrap();
+        let step_id = step["step"]["identity"]["step_id"].as_str().unwrap();
+        let result = bridge
+            .execute_step_tool(
+                step_id,
+                1,
+                "registered-stop",
+                "read_file",
+                r#"{"path":"src/a.rs"}"#,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "registered original call must be stopped before dispatch"
+        );
+        bridge.close_admission_and_request_stop();
+        let call = bridge.requests.lock().unwrap().calls["registered-stop"].clone();
+        let child_id = call
+            .stop
+            .child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("fault must hit after durable registration")
+            .0
+            .clone();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), call.replay())
+                .await
+                .unwrap()
+                .is_err(),
+            "await original cancellation completion, not only its request"
+        );
+        let child = services
+            .graph_state_store()
+            .load_async(&child_id)
+            .await
+            .unwrap();
+        assert_eq!(child.nodes.len(), 1);
+        assert_eq!(
+            child.node_statuses[&child.nodes[0].id],
+            harness_contract::execution_graph::ExecutionNodeStatus::Cancelled
+        );
+        assert!(
+            child.recovery_cursor.node_attempts.is_empty(),
+            "fault must be before original child drive"
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read_to_string(services.workspace_root().join("src/a.rs")).unwrap(),
+            "narrow-read-proof"
+        );
+        assert_eq!(
+            services
+                .graph_state_store()
+                .load(packet.graph_id())
+                .unwrap(),
+            parent_before,
+            "exact child cancellation must leave parent unchanged"
+        );
+        bridge
+            .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .expect("never-driven original child must not strand the Process tool scope");
+        assert!(call.driver_joined.load(Ordering::Acquire));
+        let revision = child.revision;
+        bridge
+            .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            services
+                .graph_state_store()
+                .load(&child_id)
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn original_admitted_child_keeps_attempt_receipt_drain_when_stop_follows_start() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, host, packet) = tests::discovery_test_services(root.path(), true);
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-fixture".into(),
+            registry_revision: 0,
+        };
+        let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+        let step = bridge.begin_step().unwrap();
+        let result = bridge
+            .execute_step_tool(
+                step["step"]["identity"]["step_id"].as_str().unwrap(),
+                1,
+                "start-wins",
+                "read_file",
+                r#"{"path":"src/a.rs"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("narrow-read-proof"));
+        bridge.close_admission_and_request_stop();
+        let call = bridge.requests.lock().unwrap().calls["start-wins"].clone();
+        let child_id = call.stop.child.lock().unwrap().as_ref().unwrap().0.clone();
+        let child = services
+            .graph_state_store()
+            .load_async(&child_id)
+            .await
+            .unwrap();
+        assert_eq!(child.recovery_cursor.node_attempts[&child.nodes[0].id], 1);
+        assert_eq!(
+            child.node_statuses[&child.nodes[0].id],
+            harness_contract::execution_graph::ExecutionNodeStatus::Completed
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            call.stop.effect_settled.load(Ordering::Acquire),
+            "original attempted receipt path must settle"
+        );
+        assert!(
+            services
+                .execution_supervisor()
+                .confirm_cancelled_bound_child_never_admitted(&child)
+                .await
+                .is_err(),
+            "attempted history cannot borrow never-start fact"
+        );
+        bridge
+            .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(call.driver_joined.load(Ordering::Acquire));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn original_call_drain_requires_registered_join_not_result_flags() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, _host, packet) = tests::discovery_test_services(root.path(), true);
+        let selection = AgentModelSelection {
+            model: packet.model_lease.clone(),
+            provider: "local-fixture".into(),
+            registry_revision: 0,
+        };
+        let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+        let (call, fresh) = bridge
+            .admit_call("original-retained-call", "fixture-immutable-call".into())
+            .unwrap();
+        assert!(fresh);
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(async move {
+            entered.send(()).unwrap();
+            let _ = released.await;
+        });
+        observed.await.unwrap();
+        // A business result may be visible before the physical task returns.
+        // Keep its real handle locally to hit the registration gap deterministically.
+        *call.result.lock().unwrap() = Some(Ok("business result".into()));
+        call.returned.store(true, Ordering::Release);
+        call.settled.store(true, Ordering::Release);
+        bridge.close_admission_and_request_stop();
+        let without_handle = bridge
+            .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            without_handle.is_err(),
+            "result flags without an actual joined handle cannot prove physical drain"
+        );
+        *call.joined.lock().unwrap() = Some(driver);
+        let pending = bridge
+            .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_millis(10))
+            .await;
+        assert!(
+            pending.is_err(),
+            "running original driver must remain pending"
+        );
+        assert!(
+            call.joined.lock().unwrap().is_some(),
+            "timeout retains the real driver"
+        );
+        release.send(()).unwrap();
+        bridge
+            .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(call.joined.lock().unwrap().is_none());
+        bridge
+            .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn original_request_key_replays_and_closed_admission_rejects_new_work() {
+        let mut scope = ProcessRequestScope::default();
+        let (first, is_new) = scope
+            .admit("call-7", "original-Step-tool-input-kind".into())
+            .unwrap();
+        assert!(is_new);
+        for fingerprint in [
+            "changed-Step",
+            "changed-tool",
+            "changed-input",
+            "changed-response-kind",
+        ] {
+            assert!(scope
+                .admit("call-7", fingerprint.into())
+                .err()
+                .unwrap()
+                .contains("changed"));
+        }
+        assert_eq!(scope.calls.len(), 1);
+        let (same, is_new) = scope
+            .admit("call-7", "original-Step-tool-input-kind".into())
+            .unwrap();
+        assert!(!is_new);
+        assert!(Arc::ptr_eq(&same, &first));
+        scope.accepting = false;
+        first.stop.request();
+        assert!(scope
+            .admit("fresh-after-stop", "original-Step-tool-input-kind".into())
+            .err()
+            .unwrap()
+            .contains("closed"));
+        assert!(scope
+            .admit("call-7", "original-Step-tool-input-kind".into())
+            .is_ok());
+        assert!(first.stop.check().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), first.replay())
+                .await
+                .is_err(),
+            "stop is not a completion"
+        );
+        *first.result.lock().unwrap() = Some(Ok("late real result".into()));
+        first.completed.notify_waiters();
+        assert_eq!(same.replay().await.unwrap(), "late real result");
+        assert!(!scope.accepting, "late completion cannot reopen admission");
     }
 }

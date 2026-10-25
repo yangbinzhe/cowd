@@ -1,15 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
+#[cfg(test)]
+use std::process::Stdio;
+#[cfg(test)]
+use std::process::{Child, ChildStdin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::process::CommandExt;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use harness_contract::agent::{
     AgentCommand, AgentCommandRejectReason, AgentCommandRequest, AgentReturnPacket, AgentTaskPacket,
 };
@@ -286,12 +290,118 @@ struct ProcessCapabilities {
     model_control: Option<String>,
 }
 
+enum ProcessHost {
+    Controlled(sandbox_launcher::ControlledSandbox),
+    #[cfg(test)]
+    Fixture(Child),
+}
+#[cfg(test)]
+impl From<Child> for ProcessHost {
+    fn from(child: Child) -> Self {
+        Self::Fixture(child)
+    }
+}
+impl ProcessHost {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Controlled(host) => host.id(),
+            #[cfg(test)]
+            Self::Fixture(child) => child.id(),
+        }
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Controlled(host) => host.try_wait().map_err(std::io::Error::other),
+            #[cfg(test)]
+            Self::Fixture(child) => child.try_wait(),
+        }
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Controlled(host) => host.request_stop().map_err(std::io::Error::other),
+            #[cfg(test)]
+            Self::Fixture(child) => child.kill(),
+        }
+    }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + CANCELLED_REAP_BOUND;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::other("Process host reap remains pending"));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+enum ProcessInput {
+    Controlled(std::fs::File),
+    #[cfg(test)]
+    Fixture(ChildStdin),
+}
+impl From<std::fs::File> for ProcessInput {
+    fn from(input: std::fs::File) -> Self {
+        Self::Controlled(input)
+    }
+}
+#[cfg(test)]
+impl From<ChildStdin> for ProcessInput {
+    fn from(input: ChildStdin) -> Self {
+        Self::Fixture(input)
+    }
+}
+impl Write for ProcessInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Controlled(pipe) => pipe.write(bytes),
+            #[cfg(test)]
+            Self::Fixture(pipe) => pipe.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Controlled(pipe) => pipe.flush(),
+            #[cfg(test)]
+            Self::Fixture(pipe) => pipe.flush(),
+        }
+    }
+}
+struct ProcessRead<R> {
+    pipe: R,
+    stop: Arc<AtomicBool>,
+}
+impl<R: Read> Read for ProcessRead<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.pipe.read(bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if self.stop.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+}
+
 struct ActiveProcess {
     // Process lifecycle and stdin are independent locks. A blocked external
     // stdin write must never prevent a cancellation from killing the process
     // tree, nor may Runtime hold a process lifecycle lock while writing.
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    child: Mutex<ProcessHost>,
+    host_stop: Option<sandbox_launcher::ControlledSandboxStop>,
+    stdin: Mutex<ProcessInput>,
+    stop: Arc<AtomicBool>,
+    tool_session: Option<Arc<ProcessJsonlToolSession>>,
+    host_exit: Mutex<Option<sandbox_launcher::ControlledHostExit>>,
+    host_nonce: [u8; 32],
+    io_drained: AtomicBool,
+    tools_drained: AtomicBool,
     /// The owned process group of this launch. The adapter creates the child
     /// as the leader of a fresh group, so this id addresses only the tree this
     /// adapter owns. A cancelled child stays inside its own group until the
@@ -308,6 +418,7 @@ struct ActiveProcess {
     terminal_received: AtomicBool,
     command_slots: Arc<tokio::sync::Semaphore>,
     command_writer: Arc<tokio::sync::Mutex<()>>,
+    command_writes: ProcessCommandWrites,
     command_ack_supported: AtomicBool,
     pending_commands: Mutex<BTreeMap<String, PendingProcessCommand>>,
     limits: AgentProcessTransportLimits,
@@ -322,6 +433,64 @@ struct ActiveProcess {
 /// cannot silently free capacity (PLAN R-06).
 const COMMAND_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+type ProcessCommandWrite = futures::future::Shared<
+    futures::future::BoxFuture<'static, Result<Result<(), AgentCommandRejectReason>, String>>,
+>;
+
+/// Original stream owner retains each accepted blocking writer until real join.
+/// A caller timing out does not detach a queued or running write from IO drain.
+#[derive(Default)]
+struct ProcessCommandWrites(Mutex<Vec<ProcessCommandWrite>>);
+impl ProcessCommandWrites {
+    fn start(
+        &self,
+        protocol_ready: &AtomicBool,
+        write: impl FnOnce() -> Result<(), AgentCommandRejectReason> + Send + 'static,
+    ) -> Result<ProcessCommandWrite, AgentCommandRejectReason> {
+        let mut writes = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // close_commands clears readiness before drain takes this same lock.
+        // Thus a racing admission either registers here or cannot start.
+        if !protocol_ready.load(Ordering::Acquire) {
+            return Err(AgentCommandRejectReason::UnsupportedByBackend);
+        }
+        writes.retain(|write| !matches!(write.clone().now_or_never(), Some(Ok(_))));
+        let handle = tokio::task::spawn_blocking(write);
+        let write = async move { handle.await.map_err(|error| error.to_string()) }
+            .boxed()
+            .shared();
+        writes.push(write.clone());
+        Ok(write)
+    }
+
+    async fn wait(
+        write: ProcessCommandWrite,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), AgentCommandRejectReason> {
+        tokio::time::timeout_at(deadline, write)
+            .await
+            .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)?
+            .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)?
+    }
+
+    async fn drain(&self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let writes = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for write in writes {
+            // Business rejection is distinct from whether the original writer joined.
+            let _ = tokio::time::timeout_at(deadline, write)
+                .await
+                .map_err(|_| "Process command writer join remains pending".to_owned())??;
+        }
+        Ok(())
+    }
+}
+
 struct PendingProcessCommand {
     expected_run_revision: u64,
     completion: tokio::sync::oneshot::Sender<Result<(), AgentCommandRejectReason>>,
@@ -330,6 +499,54 @@ struct PendingProcessCommand {
 }
 
 impl ActiveProcess {
+    fn request_stop(&self) {
+        self.close_commands();
+        if let Some(host_stop) = &self.host_stop {
+            let _ = host_stop.request_stop();
+        }
+        self.stop.store(true, Ordering::Release);
+        if let Some(session) = &self.tool_session {
+            session.close_admission_and_request_stop();
+        }
+        match self.child.try_lock() {
+            Ok(mut child) => {
+                let _ = child.kill();
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let _ = error.into_inner().kill();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {} // owner sees stop before GO or already finishes
+        }
+    }
+    fn finish_host(&self, deadline: std::time::Instant) -> Result<(), String> {
+        self.request_stop();
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *child {
+            ProcessHost::Controlled(host) => {
+                let exit = host.finish(deadline)?;
+                *self
+                    .host_exit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(exit);
+                Ok(())
+            }
+            #[cfg(test)]
+            ProcessHost::Fixture(child) => {
+                let _ = child.kill();
+                while std::time::Instant::now() < deadline {
+                    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err("fixture host exit pending".into())
+            }
+        }
+    }
+
     fn close_commands(&self) {
         self.protocol_ready.store(false, Ordering::Release);
         self.command_slots.close();
@@ -472,6 +689,10 @@ pub(crate) struct ProcessLocalExitEvidence {
     /// reaped parent never stands in for an observed empty group.
     owned_process_group: Option<i32>,
     phase: ProcessLocalExitPhase,
+    host: Option<sandbox_launcher::ControlledHostExit>,
+    host_nonce: Option<[u8; 32]>,
+    io_drained: bool,
+    tools_drained: bool,
 }
 
 impl ProcessLocalExitEvidence {
@@ -497,6 +718,13 @@ impl ProcessLocalExitEvidence {
 
     pub(crate) fn is_reaped(&self) -> bool {
         self.phase == ProcessLocalExitPhase::Reaped
+            && self.io_drained
+            && self.tools_drained
+            && self
+                .host
+                .as_ref()
+                .zip(self.host_nonce.as_ref())
+                .is_some_and(|(host, nonce)| host.authentic_for(nonce))
     }
 }
 
@@ -534,7 +762,27 @@ impl ProcessJsonlRegistry {
         owned_process_group: Option<i32>,
     ) -> Result<(), String> {
         let packet_bytes = serde_json::to_vec(packet).map_err(|error| error.to_string())?;
+        let active = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .get(packet.run_id())
+            .cloned();
+        let host = active
+            .as_ref()
+            .and_then(|active| active.host_exit.lock().ok()?.clone());
+        let io_drained = active
+            .as_ref()
+            .is_some_and(|active| active.io_drained.load(Ordering::Acquire));
+        let tools_drained = active
+            .as_ref()
+            .is_some_and(|active| active.tools_drained.load(Ordering::Acquire));
         let evidence = ProcessLocalExitEvidence {
+            host,
+            host_nonce: active.as_ref().map(|active| active.host_nonce),
+            io_drained,
+            tools_drained,
             packet_sha256: crate::context_evidence::read_sha256(&packet_bytes),
             attempt: packet.attempt,
             owned_process_group,
@@ -546,6 +794,9 @@ impl ProcessJsonlRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !lifecycle.starting.contains(packet.run_id()) {
             return Ok(());
+        }
+        if evidence.phase == ProcessLocalExitPhase::Reaped && !evidence.is_reaped() {
+            return Err("ProcessJsonl three-axis local exit remains unproven".into());
         }
         if let Some(existing) = lifecycle.local_exits.get(packet.run_id()) {
             if existing != &evidence {
@@ -885,6 +1136,7 @@ impl ProcessJsonlAdapter {
     ///
     /// `None` means the group could not be inspected completely: a member that
     /// cannot be read is never read as an empty group.
+    #[cfg(test)]
     fn process_group_has_live_member(process_group: i32) -> Option<bool> {
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return None;
@@ -930,6 +1182,7 @@ impl ProcessJsonlAdapter {
     /// never cached, so a recycled group id can never be reported as the
     /// closed scope of an earlier run, and a reaped parent never stands in
     /// for an observed empty group.
+    #[cfg(test)]
     pub(crate) fn owned_process_group_is_empty(&self, run_id: &str, attempt: u32) -> Option<bool> {
         #[cfg(unix)]
         {
@@ -981,6 +1234,32 @@ impl ProcessJsonlAdapter {
             let _ = (run_id, attempt);
             None
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_exit_diagnostic(&self, packet: &AgentTaskPacket) -> serde_json::Value {
+        let (active, recorded) = {
+            let lifecycle = self.registry.lifecycle.lock().unwrap();
+            (
+                lifecycle.active.get(packet.run_id()).cloned(),
+                lifecycle.local_exits.get(packet.run_id()).map(|exit| {
+                    serde_json::json!({"phase":format!("{:?}", exit.phase),
+                     "matches_packet":exit.matches_packet(packet),
+                     "io_drained":exit.io_drained,"tools_drained":exit.tools_drained,
+                     "host_started":exit.host.as_ref().map(|host|host.started())})
+                }),
+            )
+        };
+        let active = active.map(|active| {
+            let host = active.host_exit.try_lock().ok().and_then(|exit| exit.clone());
+            serde_json::json!({"stop":active.stop.load(Ordering::Acquire),
+                "protocol_ready":active.protocol_ready.load(Ordering::Acquire),
+                "io_drained":active.io_drained.load(Ordering::Acquire),
+                "tools_drained":active.tools_drained.load(Ordering::Acquire),
+                "host_started":host.as_ref().map(|host|host.started()),
+                "host_authenticated":host.as_ref().is_some_and(|host|host.authentic_for(&active.host_nonce))})
+        });
+        serde_json::json!({"recorded":recorded,"active":active})
     }
 
     pub(crate) fn take_local_exit_evidence(
@@ -1656,45 +1935,8 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
             }
             AgentCommand::Cancel | AgentCommand::Shutdown => {
                 active.close_commands();
-                let cancelled = Arc::clone(&active);
-                #[cfg(any(test, feature = "test-fixtures"))]
-                let owned_scratch = cancelled.fixture_scratch.clone();
-                // The signal alone leaves the killed leader inside its own
-                // process group until the OS reaps it, so an owned group can
-                // never look empty. Reap the leader here: the Runtime proves
-                // the cancelled exit from that empty group, and the run owner
-                // observes the same cached exit status when it waits.
-                let killed = tokio::task::spawn_blocking(move || {
-                    let mut child = cancelled
-                        .child
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let killed = terminate_process_tree(&mut child);
-                    if killed.is_ok() {
-                        reap_cancelled_child(&mut child);
-                    }
-                    killed
-                })
-                .await
-                .unwrap_or_else(|_| Err(std::io::Error::other("ProcessJsonl cancel join failed")));
-                if killed.is_ok() {
-                    // A cancelled run owns a physical scratch directory. The
-                    // run owner may never reach its own exit path - it can be
-                    // stuck in a wait that the cancellation cut short - so the
-                    // cancelling authority reclaims that scope here. Leaving
-                    // it behind would keep the run's physical footprint open
-                    // after the Runtime already published its exit.
-                    #[cfg(any(test, feature = "test-fixtures"))]
-                    if let Some(scratch) = owned_scratch {
-                        if let Err(error) =
-                            cleanup_owned_scratch_ids(&handle.run_id, 0, &scratch, "cancelled")
-                        {
-                            tracing::warn!(run_id = %handle.run_id, path = %scratch.display(),
-                                error = %error, "cancelled Process scratch reclaim failed");
-                        }
-                    }
-                }
-                killed.map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)
+                active.request_stop();
+                Ok(())
             }
             AgentCommand::SendInput | AgentCommand::Interrupt => {
                 let queued_at = std::time::Instant::now();
@@ -1703,71 +1945,81 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
                 {
                     return Err(AgentCommandRejectReason::UnsupportedByBackend);
                 }
-                let permit = Arc::clone(&active.command_slots)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)?;
-                let writer = Arc::clone(&active.command_writer).lock_owned().await;
+                let deadline = queued_at + COMMAND_ACK_TIMEOUT;
+                let until = tokio::time::Instant::from_std(deadline);
+                let permit = tokio::time::timeout_at(
+                    until,
+                    Arc::clone(&active.command_slots).acquire_owned(),
+                )
+                .await
+                .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)?
+                .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)?;
+                let writer =
+                    tokio::time::timeout_at(until, Arc::clone(&active.command_writer).lock_owned())
+                        .await
+                        .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)?;
                 let queue_wait = queued_at.elapsed();
                 if !active.protocol_ready.load(Ordering::Acquire) {
                     return Err(AgentCommandRejectReason::UnsupportedByBackend);
                 }
                 let message = Self::command_envelope(handle, request);
                 let (completion, acknowledged) = tokio::sync::oneshot::channel();
-                tokio::task::spawn_blocking(move || {
-                    let _writer = writer;
-                    let mut pending = active
-                        .pending_commands
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !active.protocol_ready.load(Ordering::Acquire)
-                        || active.terminal_received.load(Ordering::Acquire)
-                    {
-                        return Err(AgentCommandRejectReason::UnsupportedByBackend);
-                    }
-                    let command_id = message["command_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    if command_id.is_empty() || pending.contains_key(&command_id) {
-                        return Err(AgentCommandRejectReason::InvalidInput);
-                    }
-                    pending.insert(
-                        command_id.clone(),
-                        PendingProcessCommand {
-                            expected_run_revision: message["expected_run_revision"]
-                                .as_u64()
-                                .expect("typed command revision"),
-                            completion,
-                            _permit: permit,
-                        },
-                    );
-                    drop(pending);
-                    let write_started = std::time::Instant::now();
-                    let result = write_process_message(&active, &message);
-                    if result.is_err() {
-                        active.close_commands();
-                        let _ = terminate_process_tree(
-                            &mut active
-                                .child
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                let write_active = Arc::clone(&active);
+                let write = active
+                    .command_writes
+                    .start(&active.protocol_ready, move || {
+                        let active = write_active;
+                        let _writer = writer;
+                        let mut pending = active
+                            .pending_commands
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if !active.protocol_ready.load(Ordering::Acquire)
+                            || active.terminal_received.load(Ordering::Acquire)
+                        {
+                            return Err(AgentCommandRejectReason::UnsupportedByBackend);
+                        }
+                        let command_id = message["command_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        if command_id.is_empty() || pending.contains_key(&command_id) {
+                            return Err(AgentCommandRejectReason::InvalidInput);
+                        }
+                        pending.insert(
+                            command_id.clone(),
+                            PendingProcessCommand {
+                                expected_run_revision: message["expected_run_revision"]
+                                    .as_u64()
+                                    .expect("typed command revision"),
+                                completion,
+                                _permit: permit,
+                            },
                         );
-                    }
-                    tracing::debug!(
-                        run_id = message["run_id"].as_str().unwrap_or_default(),
-                        queue_wait_us = queue_wait.as_micros() as u64,
-                        write_us = write_started.elapsed().as_micros() as u64,
-                        quota_source = "operator_process_manifest",
-                        pending_command_limit = active.limits.pending_commands,
-                        success = result.is_ok(),
-                        "ProcessJsonl transport write observation"
-                    );
-                    result.map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)
-                })
-                .await
-                .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)??;
-                match tokio::time::timeout(COMMAND_ACK_TIMEOUT, acknowledged).await {
+                        drop(pending);
+                        let write_started = std::time::Instant::now();
+                        let result =
+                            write_process_message_until(&active, &message, deadline).map(|_| ());
+                        if result.is_err() {
+                            active.request_stop();
+                        }
+                        tracing::debug!(
+                            run_id = message["run_id"].as_str().unwrap_or_default(),
+                            queue_wait_us = queue_wait.as_micros() as u64,
+                            write_us = write_started.elapsed().as_micros() as u64,
+                            quota_source = "operator_process_manifest",
+                            pending_command_limit = active.limits.pending_commands,
+                            success = result.is_ok(),
+                            "ProcessJsonl transport write observation"
+                        );
+                        result.map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)
+                    })?;
+                if let Err(error) = ProcessCommandWrites::wait(write, until).await {
+                    // Keep the real writer in the original IO owner on expiry.
+                    active.request_stop();
+                    return Err(error);
+                }
+                match tokio::time::timeout_at(until, acknowledged).await {
                     Ok(Ok(result)) => result,
                     Ok(Err(_)) => Err(AgentCommandRejectReason::UnsupportedByBackend),
                     Err(_) => Err(AgentCommandRejectReason::UnsupportedByBackend),
@@ -1835,57 +2087,50 @@ fn execute_prepared_child(
     prepared: sandbox_launcher::PreparedSandboxCommand,
     scratch: Option<&Path>,
 ) -> Result<AgentReturnPacket, String> {
-    let mut command = prepared.into_command();
-    #[cfg(unix)]
-    command.process_group(0);
-    let launch = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to start ProcessJsonl worker: {error}"));
-    let mut child = match launch {
+    let host_nonce = process_host_nonce(packet)?;
+    let mut child = match prepared.spawn_controlled(host_nonce) {
         Ok(child) => child,
         Err(error) => {
             return combine_process_cleanup(
-                Err(error),
+                Err(format!(
+                    "ProcessJsonl trusted host start failed before spawn: {error}"
+                )),
                 record_exit_and_cleanup(
                     registry,
                     packet,
                     ProcessLocalExitPhase::NotStarted,
                     None,
                     scratch,
-                    "spawn_failed",
+                    "trusted_host_before_spawn",
                 ),
-            );
+            )
         }
     };
     #[cfg(test)]
     registry.spawn_count.fetch_add(1, Ordering::SeqCst);
-    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
-        let _ = terminate_process_tree(&mut child);
-        let spawned_group = child.id() as i32;
-        let cleanup = match child.wait() {
-            Ok(_) => record_exit_and_cleanup(
-                registry,
-                packet,
-                ProcessLocalExitPhase::Reaped,
-                Some(spawned_group),
-                scratch,
-                "pipes_unavailable",
-            ),
-            Err(error) => Err(format!("ProcessJsonl local exit remains unknown: {error}")),
-        };
-        return combine_process_cleanup(
-            Err("ProcessJsonl piped stdio is unavailable".into()),
-            cleanup,
-        );
-    };
-    let process_group = child.id() as i32;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or("ProcessJsonl business stdin missing")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("ProcessJsonl business stdout missing")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("ProcessJsonl business stderr missing")?;
+    let process_group = child.id() as i32; // diagnostics only, never physical authority
     let active = Arc::new(ActiveProcess {
-        child: Mutex::new(child),
-        stdin: Mutex::new(stdin),
+        host_stop: Some(child.stop_handle()),
+        child: Mutex::new(ProcessHost::Controlled(child)),
+        stdin: Mutex::new(stdin.into()),
+        stop: Arc::new(AtomicBool::new(false)),
+        tool_session: tool_session.clone(),
+        host_exit: Mutex::new(None),
+        host_nonce,
+        io_drained: AtomicBool::new(false),
+        tools_drained: AtomicBool::new(false),
         process_group,
         attempt: packet.attempt,
         next_runtime_sequence: Mutex::new(1),
@@ -1895,6 +2140,7 @@ fn execute_prepared_child(
             spec.transport_limits.pending_commands,
         )),
         command_writer: Arc::new(tokio::sync::Mutex::new(())),
+        command_writes: ProcessCommandWrites::default(),
         command_ack_supported: AtomicBool::new(false),
         pending_commands: Mutex::new(BTreeMap::new()),
         limits: spec.transport_limits,
@@ -1912,12 +2158,84 @@ fn execute_prepared_child(
         lifecycle.pending_cancellation.remove(packet.run_id())
     };
     if cancel_before_activation {
-        let mut child = active
-            .child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = terminate_process_tree(&mut child);
+        active.request_stop();
     }
+    let start = match &mut *active
+        .child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        ProcessHost::Controlled(host) => {
+            host.allow_go(std::time::Instant::now() + handshake_timeout)
+        }
+        #[cfg(test)]
+        ProcessHost::Fixture(_) => Err("fixture cannot authorize host GO".into()),
+    };
+    if let Err(error) = start {
+        let cleanup = active
+            .finish_host(std::time::Instant::now() + CANCELLED_REAP_BOUND)
+            .and_then(|()| {
+                let started = active
+                    .host_exit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(|exit| exit.started())
+                    .ok_or("start failure has no authenticated host exit")?;
+                // No business reader/stderr driver has been created yet. Close
+                // both original pipes, then join every admitted tool/writer.
+                // GO may have won before cancellation interrupted its start ACK;
+                // that is a reaped launch, not a never-started one or unknown IO.
+                drop(stdout);
+                drop(stderr);
+                if let Some(session) = &tool_session {
+                    runtime_handle.block_on(
+                        session.wait_drained(tokio::time::Instant::now() + CANCELLED_REAP_BOUND),
+                    )?;
+                }
+                runtime_handle.block_on(
+                    active
+                        .command_writes
+                        .drain(tokio::time::Instant::now() + CANCELLED_REAP_BOUND),
+                )?;
+                active.io_drained.store(true, Ordering::Release);
+                active.tools_drained.store(true, Ordering::Release);
+                record_exit_and_cleanup(
+                    registry,
+                    packet,
+                    if started {
+                        ProcessLocalExitPhase::Reaped
+                    } else {
+                        ProcessLocalExitPhase::NotStarted
+                    },
+                    started.then_some(process_group),
+                    scratch,
+                    if started {
+                        "start_handshake_failed_after_GO"
+                    } else {
+                        "cancelled_before_GO"
+                    },
+                )?;
+                registry
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active
+                    .remove(packet.run_id());
+                Ok(())
+            });
+        // Physical closure does not turn the failed startup into business
+        // success. Preserve the first error and report cleanup separately.
+        return combine_process_cleanup(Err(error), cleanup);
+    }
+    let stdout = ProcessRead {
+        pipe: stdout,
+        stop: active.stop.clone(),
+    };
+    let stderr = ProcessRead {
+        pipe: stderr,
+        stop: active.stop.clone(),
+    };
 
     let stderr_limit = spec.transport_limits.stderr_tail_bytes;
     #[cfg(test)]
@@ -2062,20 +2380,20 @@ fn execute_prepared_child(
                     reader_joined = true;
                     result
                 }
-                Err(_) => Err("ProcessJsonl reader thread panicked during the V2 exchange".into()),
+                Err(_) => {
+                    reader_joined = true;
+                    Err("ProcessJsonl reader thread panicked during the V2 exchange".into())
+                }
             },
             Err(error) => {
                 // The reader may still be blocked in an OS pipe read (for
                 // example after the handshake deadline). Close its producer
                 // before joining it; dropping only the gate is insufficient
                 // while no ready frame has arrived.
-                let mut child = active
-                    .child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = terminate_process_tree(&mut child);
-                drop(child);
-                reader_joined = reader.join().is_ok();
+                active.request_stop();
+                let _ = active.finish_host(std::time::Instant::now() + CANCELLED_REAP_BOUND);
+                let _ = reader.join();
+                reader_joined = true;
                 Err(error)
             }
         }
@@ -2085,14 +2403,17 @@ fn execute_prepared_child(
     // worker to decide to exit: cancellation is the only safe outcome once
     // the protocol is no longer trustworthy.
     let terminal_received = active.terminal_received.load(Ordering::Acquire);
-    active.close_commands();
-    if result.is_err() || terminal_received {
-        let mut child = active
-            .child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = terminate_process_tree(&mut child);
-    }
+    active.request_stop();
+    let physical_exit = active.finish_host(std::time::Instant::now() + CANCELLED_REAP_BOUND);
+    let tools_exit = if let Some(session) = &tool_session {
+        runtime_handle
+            .block_on(session.wait_drained(tokio::time::Instant::now() + CANCELLED_REAP_BOUND))
+    } else {
+        Ok(())
+    };
+    active
+        .tools_drained
+        .store(tools_exit.is_ok(), Ordering::Release);
     #[cfg(test)]
     if let Some(gate) = registry.exit_gate.lock().unwrap().take() {
         gate.wait();
@@ -2103,15 +2424,8 @@ fn execute_prepared_child(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .wait()
         .map_err(|error| format!("failed to wait for ProcessJsonl worker: {error}"));
-    registry
-        .lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .active
-        .remove(packet.run_id());
-
     let stderr_result = stderr_tail.join();
-    let stderr_joined = stderr_result.is_ok();
+    let stderr_joined = true;
     let stderr_tail = stderr_result.unwrap_or_else(|_| ProcessStderrTail {
         tail: String::new(),
         dropped_bytes: None,
@@ -2124,7 +2438,20 @@ fn execute_prepared_child(
         quota_source = "operator_process_manifest",
         "ProcessJsonl stderr drain observation"
     );
+    let command_writes_exit = runtime_handle.block_on(
+        active
+            .command_writes
+            .drain(tokio::time::Instant::now() + CANCELLED_REAP_BOUND),
+    );
     let status = exit_status?;
+    active.io_drained.store(
+        reader_joined && stderr_joined && command_writes_exit.is_ok(),
+        Ordering::Release,
+    );
+    physical_exit?;
+    tools_exit?;
+    command_writes_exit?;
+
     if !reader_joined || !stderr_joined {
         return Err(format!(
             "ProcessJsonl local exit remains unknown after driver join failure: reader_joined={reader_joined}, stderr_joined={stderr_joined}"
@@ -2138,7 +2465,18 @@ fn execute_prepared_child(
         scratch,
         "reaped",
     );
+    if cleanup.is_ok() {
+        registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(packet.run_id());
+    }
     let primary = (|| {
+        if let Some(error) = &stderr_tail.read_error {
+            return Err(format!("ProcessJsonl stderr collector failed: {error}"));
+        }
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -2185,7 +2523,7 @@ fn execute_prepared_child(
 /// `try_wait` caches the exit status, so a later `wait` on the same handle
 /// observes the same status instead of losing it. The bounded loop keeps a
 /// child that cannot be reaped from holding the process lifecycle lock.
-fn reap_cancelled_child(child: &mut Child) -> Option<std::process::ExitStatus> {
+fn reap_cancelled_child(child: &mut ProcessHost) -> Option<std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + CANCELLED_REAP_BOUND;
     loop {
         match child.try_wait() {
@@ -2205,29 +2543,16 @@ fn reap_cancelled_child(child: &mut Child) -> Option<std::process::ExitStatus> {
 /// while the Runtime waits for the OS to reap it.
 const CANCELLED_REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[cfg(unix)]
-fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
-    let process_group = child.id() as i32;
-    // SAFETY: `execute_child` creates the child as leader of a fresh process
-    // group. A negative PID therefore targets only this adapter-owned launch
-    // tree; the live `Child` handle prevents confusing it with an arbitrary
-    // unrelated process in normal operation.
-    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-    if result == 0 {
-        Ok(())
-    } else {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            child.kill().or(Ok(()))
-        } else {
-            Err(error)
-        }
-    }
+fn terminate_process_tree(child: &mut ProcessHost) -> std::io::Result<()> {
+    child.kill()
 }
 
-#[cfg(not(unix))]
-fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
-    child.kill()
+fn process_host_nonce(packet: &AgentTaskPacket) -> Result<[u8; 32], String> {
+    let mut digest = Sha256::new();
+    digest.update(b"cowd/process-host/launch/v1\0");
+    digest.update(serde_json::to_vec(packet).map_err(|error| error.to_string())?);
+    digest.update(uuid::Uuid::new_v4().as_bytes());
+    Ok(digest.finalize().into())
 }
 
 #[derive(Debug)]
@@ -2369,7 +2694,22 @@ fn read_process_ready(
     Ok(capabilities)
 }
 
-fn process_tool_request_fingerprint(
+pub(crate) fn process_call_fingerprint(
+    step: &str,
+    kind: &str,
+    tool: &str,
+    input: &serde_json::Value,
+) -> Result<String, String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(step, process_tool_request_fingerprint(kind, tool, input)?))
+                .map_err(|error| error.to_string())?
+        )
+    ))
+}
+
+pub(crate) fn process_tool_request_fingerprint(
     kind: &str,
     tool_name: &str,
     input: &serde_json::Value,
@@ -2460,7 +2800,7 @@ fn read_process_exchange(
                 .filter(|id| !id.is_empty())
                 .ok_or("Process action/tool request omitted runtime step_id")?;
             let fingerprint =
-                process_tool_request_fingerprint(response_kind, &tool_name, &input_value)?;
+                process_call_fingerprint(step_id, response_kind, &tool_name, &input_value)?;
             let response = if let Some((_, prior_fingerprint, response)) = handled_tool_requests
                 .iter()
                 .find(|(id, _, _)| id == &request_id)
@@ -2487,30 +2827,32 @@ fn read_process_exchange(
                 {
                     response
                 } else {
-                    let response = match runtime_handle.block_on(session.execute_step_tool(
-                        step_id,
-                        envelope.sequence,
-                        &request_id,
-                        &tool_name,
-                        &input,
-                    )) {
-                        Ok(output) => serde_json::json!({
-                            "kind": response_kind,
-                            "run_id": packet.run_id(),
-                            "agent_id": packet.agent_id(),
-                            "request_id": request_id.clone(),
-                            "origin_step_id": step_id,
-                            "output": output,
-                        }),
-                        Err(error) => serde_json::json!({
-                            "kind": response_kind,
-                            "run_id": packet.run_id(),
-                            "agent_id": packet.agent_id(),
-                            "request_id": request_id.clone(),
-                            "origin_step_id": step_id,
-                            "error": error,
-                        }),
-                    };
+                    let response =
+                        match runtime_handle.block_on(session.execute_step_tool_response(
+                            step_id,
+                            envelope.sequence,
+                            &request_id,
+                            &tool_name,
+                            &input,
+                            response_kind,
+                        )) {
+                            Ok(output) => serde_json::json!({
+                                "kind": response_kind,
+                                "run_id": packet.run_id(),
+                                "agent_id": packet.agent_id(),
+                                "request_id": request_id.clone(),
+                                "origin_step_id": step_id,
+                                "output": output,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "kind": response_kind,
+                                "run_id": packet.run_id(),
+                                "agent_id": packet.agent_id(),
+                                "request_id": request_id.clone(),
+                                "origin_step_id": step_id,
+                                "error": error,
+                            }),
+                        };
                     let response = runtime_handle.block_on(session.bounded_transport_response(
                         &request_id,
                         &tool_name,
@@ -2870,10 +3212,29 @@ fn write_process_message_recorded(
     active: &ActiveProcess,
     message: &serde_json::Value,
 ) -> Result<(serde_json::Value, String, usize), String> {
-    let mut stdin = active
-        .stdin
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    write_process_message_until(
+        active,
+        message,
+        std::time::Instant::now() + COMMAND_ACK_TIMEOUT,
+    )
+}
+fn write_process_message_until(
+    active: &ActiveProcess,
+    message: &serde_json::Value,
+    deadline: std::time::Instant,
+) -> Result<(serde_json::Value, String, usize), String> {
+    let mut stdin = loop {
+        if active.stop.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            return Err("ProcessJsonl write cancelled or command deadline expired".into());
+        }
+        match active.stdin.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+        }
+    };
     let mut message = message.clone();
     let object = message
         .as_object_mut()
@@ -2896,16 +3257,62 @@ fn write_process_message_recorded(
         ));
     }
     *sequence = sequence.saturating_add(1);
-    stdin
-        .write_all(format!("{payload}\n").as_bytes())
-        .and_then(|()| stdin.flush())
-        .map_err(|error| format!("write ProcessJsonl Runtime message: {error}"))?;
+    let bytes = format!("{payload}\n").into_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        if active.stop.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            return Err("ProcessJsonl write cancelled or command deadline expired".into());
+        }
+        match stdin.write(&bytes[written..]) {
+            Ok(0) => return Err("ProcessJsonl stdin made no progress".into()),
+            Ok(count) => written += count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+            Err(error) => return Err(format!("write ProcessJsonl Runtime message: {error}")),
+        }
+    }
+    stdin.flush().map_err(|error| error.to_string())?;
     let digest = crate::context_evidence::read_sha256(payload.as_bytes());
     Ok((message, digest, payload.len()))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn original_call_fingerprint_binds_step_tool_kind_and_canonical_input() {
+        let value = serde_json::json!({"path":"a.txt","complete":true});
+        let base =
+            super::process_call_fingerprint("step-A", "tool_result", "read_file", &value).unwrap();
+        for (step, kind, tool, input) in [
+            ("step-B", "tool_result", "read_file", value.clone()),
+            ("step-A", "action_result", "read_file", value.clone()),
+            ("step-A", "tool_result", "edit", value.clone()),
+            (
+                "step-A",
+                "tool_result",
+                "read_file",
+                serde_json::json!({"path":"other.txt","complete":true}),
+            ),
+        ] {
+            assert_ne!(
+                base,
+                super::process_call_fingerprint(step, kind, tool, &input).unwrap()
+            );
+        }
+        let reordered = serde_json::from_str(r#"{"complete":true,"path":"a.txt"}"#).unwrap();
+        assert_eq!(
+            base,
+            super::process_call_fingerprint("step-A", "tool_result", "read_file", &reordered)
+                .unwrap()
+        );
+    }
+
     /// A killed child that nobody reaped yet stays in its process group as a
     /// zombie. It holds no descriptor, no lease and no ability to act, so it
     /// must not keep the physical scope open.
@@ -3401,7 +3808,7 @@ time.sleep(300)
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn r1_optional_unknown_process_driver_join_errors_cannot_mint_reaped() {
+    async fn joined_driver_faults_fail_business_and_require_authenticated_three_axis_exit() {
         for driver in [ProcessDriverFault::Reader, ProcessDriverFault::Stderr] {
             let (_temporary, _services, adapter, packet) = driver_exit_fixture();
             *adapter.registry.driver_panic.lock().unwrap() = Some((packet.run_id().into(), driver));
@@ -3418,10 +3825,17 @@ time.sleep(300)
             )
             .await
             .expect("driver failure must complete physical cleanup");
-            assert!(returned
-                .unwrap_err()
-                .contains("local exit remains unknown after driver join failure"));
+            let expected = match driver {
+                ProcessDriverFault::Reader => "reader thread panicked during the V2 exchange",
+                ProcessDriverFault::Stderr => "stderr collector failed",
+            };
+            assert!(returned.unwrap_err().contains(expected));
             assert!(adapter.registry.driver_panic.lock().unwrap().is_none());
+            let witness = adapter
+                .take_local_exit_evidence(&packet)
+                .expect("actual drivers joined and trusted host exited");
+            assert!(witness.matches_packet(&packet));
+            assert!(witness.is_reaped());
             assert!(adapter.take_local_exit_evidence(&packet).is_none());
             let lifecycle = adapter.registry.lifecycle.lock().unwrap();
             assert!(!lifecycle.starting.contains(packet.run_id()));
@@ -3449,7 +3863,17 @@ time.sleep(300)
         .expect("original driver must really return")
         .unwrap();
         assert_eq!(returned.run_id, packet.run_id());
-        assert!(returned.acceptance_evaluation.is_none());
+        // This fixture has no obligations or tools. The original terminal
+        // producer always attaches its own typed evaluation, even without a bridge.
+        let evaluation = returned.acceptance_evaluation.as_ref().unwrap();
+        assert_eq!(evaluation.evaluator_revision, 2);
+        assert_eq!(
+            evaluation.verdict,
+            harness_contract::acceptance::AcceptanceVerdict::Satisfied
+        );
+        assert!(evaluation.derived_obligations.is_empty());
+        assert!(returned.observed_acceptance.observed_evidence.is_empty());
+        assert_eq!(returned.tool_calls, 0);
         let mut foreign = packet.clone();
         foreign.objective.push_str(" changed immutable packet");
         assert!(adapter.take_local_exit_evidence(&foreign).is_none());
@@ -3739,6 +4163,64 @@ time.sleep(300)
     }
 
     #[test]
+    fn queued_command_deadline_retains_writer_until_actual_join() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release_pool, pool_ready) = std::sync::mpsc::channel();
+            let (entered, pool_entered) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let _ = pool_ready.recv();
+            });
+            pool_entered.await.unwrap();
+            let writes = ProcessCommandWrites::default();
+            let ready = AtomicBool::new(true);
+            let invoked = Arc::new(AtomicBool::new(false));
+            let actual = invoked.clone();
+            let write = writes
+                .start(&ready, move || {
+                    actual.store(true, Ordering::Release);
+                    Err(AgentCommandRejectReason::InvalidInput)
+                })
+                .unwrap();
+            assert!(ProcessCommandWrites::wait(
+                write.clone(),
+                tokio::time::Instant::now() + Duration::from_millis(10)
+            )
+            .await
+            .is_err());
+            assert!(
+                !invoked.load(Ordering::Acquire),
+                "queued job has not started"
+            );
+            ready.store(false, Ordering::Release);
+            assert!(writes
+                .start(&ready, || panic!("closed stream admitted write"))
+                .is_err());
+            assert!(writes
+                .drain(tokio::time::Instant::now() + Duration::from_millis(10))
+                .await
+                .is_err());
+            assert!(write.peek().is_none(), "timeout is not a completed join");
+            release_pool.send(()).unwrap();
+            blocker.await.unwrap();
+            writes
+                .drain(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(invoked.load(Ordering::Acquire));
+            assert!(matches!(
+                write.peek(),
+                Some(Ok(Err(AgentCommandRejectReason::InvalidInput)))
+            ));
+        });
+    }
+
+    #[test]
     #[cfg(unix)]
     fn full_stdin_command_queue_does_not_block_tokio_or_cancel_and_releases_all_permits() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3749,19 +4231,26 @@ time.sleep(300)
         runtime.block_on(async {
             let adapter = ProcessJsonlAdapter::for_workspace(std::env::temp_dir());
             let packet = task();
-            let mut command = std::process::Command::new("sh");
-            command.args(["-c", "exec sleep 30"]).process_group(0);
-            let mut child = command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+            let workspace = tempfile::tempdir().unwrap();
+            let spec = SandboxLaunchSpec::workspace(workspace.path());
+            let prepared = sandbox_launcher::shell_command("exec sleep 30", &spec).unwrap();
+            let host_nonce = process_host_nonce(&packet).unwrap();
+            let mut child = prepared.spawn_controlled(host_nonce).unwrap();
+            child
+                .allow_go(std::time::Instant::now() + Duration::from_secs(10))
                 .unwrap();
             let stdin = child.stdin.take().unwrap();
             let process_group = child.id() as i32;
             let active = Arc::new(ActiveProcess {
-                child: Mutex::new(child),
-                stdin: Mutex::new(stdin),
+                host_stop: Some(child.stop_handle()),
+                child: Mutex::new(ProcessHost::Controlled(child)),
+                stdin: Mutex::new(stdin.into()),
+                stop: Arc::new(AtomicBool::new(false)),
+                tool_session: None,
+                host_exit: Mutex::new(None),
+                host_nonce,
+                io_drained: AtomicBool::new(false),
+                tools_drained: AtomicBool::new(false),
                 process_group: process_group,
                 attempt: packet.attempt,
                 next_runtime_sequence: Mutex::new(1),
@@ -3769,6 +4258,7 @@ time.sleep(300)
                 terminal_received: AtomicBool::new(false),
                 command_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PROCESS_PENDING_COMMANDS)),
                 command_writer: Arc::new(tokio::sync::Mutex::new(())),
+                command_writes: ProcessCommandWrites::default(),
                 command_ack_supported: AtomicBool::new(true),
                 pending_commands: Mutex::new(BTreeMap::new()),
                 limits: AgentProcessTransportLimits::default(),
@@ -3875,7 +4365,16 @@ time.sleep(300)
             })
             .await
             .expect("all blocked and queued writes must be released");
-            assert!(!active.child.lock().unwrap().wait().unwrap().success());
+            active
+                .finish_host(std::time::Instant::now() + CANCELLED_REAP_BOUND)
+                .unwrap();
+            assert!(active
+                .host_exit
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .authentic_for(&host_nonce));
             assert_eq!(
                 active.command_slots.available_permits(),
                 MAX_PROCESS_PENDING_COMMANDS
@@ -3911,8 +4410,15 @@ time.sleep(300)
         let stdin = child.stdin.take().expect("test process stdin");
         let process_group = child.id() as i32;
         let active = Arc::new(ActiveProcess {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            host_stop: None,
+            child: Mutex::new(child.into()),
+            stdin: Mutex::new(stdin.into()),
+            stop: Arc::new(AtomicBool::new(false)),
+            tool_session: None,
+            host_exit: Mutex::new(None),
+            host_nonce: [0; 32],
+            io_drained: AtomicBool::new(false),
+            tools_drained: AtomicBool::new(false),
             process_group: process_group,
             attempt: packet.attempt,
             next_runtime_sequence: Mutex::new(1),
@@ -3920,6 +4426,7 @@ time.sleep(300)
             terminal_received: AtomicBool::new(false),
             command_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PROCESS_PENDING_COMMANDS)),
             command_writer: Arc::new(tokio::sync::Mutex::new(())),
+            command_writes: ProcessCommandWrites::default(),
             command_ack_supported: AtomicBool::new(false),
             pending_commands: Mutex::new(BTreeMap::new()),
             limits: AgentProcessTransportLimits::default(),
@@ -3991,8 +4498,15 @@ time.sleep(300)
         let stdin = child.stdin.take().unwrap();
         let process_group = child.id() as i32;
         let active = Arc::new(ActiveProcess {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            host_stop: None,
+            child: Mutex::new(child.into()),
+            stdin: Mutex::new(stdin.into()),
+            stop: Arc::new(AtomicBool::new(false)),
+            tool_session: None,
+            host_exit: Mutex::new(None),
+            host_nonce: [0; 32],
+            io_drained: AtomicBool::new(false),
+            tools_drained: AtomicBool::new(false),
             process_group: process_group,
             attempt: packet.attempt,
             next_runtime_sequence: Mutex::new(1),
@@ -4000,6 +4514,7 @@ time.sleep(300)
             terminal_received: AtomicBool::new(false),
             command_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             command_writer: Arc::new(tokio::sync::Mutex::new(())),
+            command_writes: ProcessCommandWrites::default(),
             command_ack_supported: AtomicBool::new(true),
             pending_commands: Mutex::new(BTreeMap::new()),
             limits: AgentProcessTransportLimits::default(),
@@ -4904,13 +5419,23 @@ time.sleep(300)
                 .is_err());
         }
         assert_eq!(host.reads.load(Ordering::SeqCst), 0);
-        let read_fingerprint = process_tool_request_fingerprint(
-            "tool_result",
-            "read_file",
-            &serde_json::json!({"path":"source.txt"}),
-        )
-        .unwrap();
-        if content_case == Some("pending-request") {
+        // The crash fixture seeds the original journal only after a real
+        // production Step has been bound. Its worker receives that exact fixture
+        // input; ordinary cases still negotiate their own Step over JSONL.
+        let pending_step = (content_case == Some("pending-request")).then(|| {
+            bridge.begin_step().unwrap()["step"]["identity"]["step_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        });
+        if let Some(step_id) = &pending_step {
+            let read_fingerprint = process_call_fingerprint(
+                step_id,
+                "tool_result",
+                "read_file",
+                &serde_json::json!({"path":"source.txt"}),
+            )
+            .unwrap();
             assert!(bridge
                 .replay_or_begin_transport_request("pending-crash", &read_fingerprint)
                 .unwrap()
@@ -4997,6 +5522,12 @@ send('result',result=json.loads(RESULT_JSON))
 "###.replace("RESULT_JSON",&format!("{:?}",result_json))
             .replace("LIMITS_JSON", &format!("{:?}", serde_json::to_string(&limits).unwrap()))
             .replace("CACHE_SIZE", &limits.cached_tool_responses.to_string());
+        let script = if let Some(step_id) = &pending_step {
+            script.replace("def receive():return json.loads(sys.stdin.readline())",
+                &format!("def receive():return json.loads(sys.stdin.readline())\nsend.step_id={step_id:?}"))
+        } else {
+            script
+        };
         let script = if changed_retry {
             script.replace("reply=receive();assert reply.get('context_delta') is None,reply", "reply=receive();assert reply.get('context_delta') is None,reply\nsend('tool_request',request_id='read-1',tool_name='read_file',input={'path':'different.txt'})\nreceive()")
         } else {
@@ -5168,6 +5699,14 @@ else:
                 "all streaming staging files must be reclaimed on return"
             );
         }
+        let original_step = bridge.latest_process_step_id_for_test().unwrap();
+        let read_fingerprint = process_call_fingerprint(
+            &original_step,
+            "tool_result",
+            "read_file",
+            &serde_json::json!({"path":"source.txt"}),
+        )
+        .unwrap();
         let rebuilt_bridge =
             ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
         if content_case.is_none() && !changed_retry {

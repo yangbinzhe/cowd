@@ -9,6 +9,77 @@ use crate::{
 };
 use harness_contract::tool::ToolEffectDescriptor;
 
+/// Stop propagation for one original accepted call. It never owns an effect or
+/// declares it drained; the retained operation must return its real outcome.
+#[derive(Clone)]
+pub(crate) struct BoundToolStop {
+    pub(crate) requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) child: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
+    pub(crate) child_drained: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) effect_entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) effect_settled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) process: tools::ToolExecutionCancellation,
+    #[cfg(test)]
+    pub(crate) stop_after_child_registration: bool,
+}
+impl Default for BoundToolStop {
+    fn default() -> Self {
+        Self {
+            requested: Default::default(),
+            wake: Default::default(),
+            child: Default::default(),
+            child_drained: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            effect_entered: Default::default(),
+            effect_settled: Default::default(),
+            process: tools::ToolExecutionCancellation::new(),
+            #[cfg(test)]
+            stop_after_child_registration: false,
+        }
+    }
+}
+impl BoundToolStop {
+    pub(crate) fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.process.cancel();
+        self.wake.notify_waiters();
+    }
+    pub(crate) fn check(&self) -> Result<(), ToolError> {
+        if self.requested.load(std::sync::atomic::Ordering::Acquire) {
+            Err(ToolError::new(
+                "original tool call stop requested before effect",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.requested.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+tokio::task_local! { static ORIGINAL_TOOL_STOP: BoundToolStop; }
+pub(crate) fn current_tool_stop() -> Option<BoundToolStop> {
+    ORIGINAL_TOOL_STOP.try_with(Clone::clone).ok()
+}
+pub(crate) async fn with_tool_stop<T>(
+    stop: BoundToolStop,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    ORIGINAL_TOOL_STOP.scope(stop, work).await
+}
+fn check_tool_stop() -> Result<(), ToolError> {
+    current_tool_stop().map_or(Ok(()), |stop| stop.check())
+}
+
 #[cfg(test)]
 mod resource_frame_tests {
     use super::*;
@@ -1802,8 +1873,10 @@ pub(crate) async fn execute_bounded_process_observed(
     let artifacts = service
         .bounded_process_artifacts()
         .map_err(|error| ToolError::new(error.to_string()))?;
-    let cancellation = tools::ToolExecutionCancellation::new();
-    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = current_tool_stop().unwrap_or_default();
+    stop.check()?;
+    let cancellation = stop.process.clone();
+    let cancelled = stop.requested.clone();
     let waiter = BoundedProcessWaiter {
         signal: cancellation.clone(),
         cancelled: cancelled.clone(),
@@ -1854,7 +1927,13 @@ pub(crate) async fn execute_bounded_process_observed(
                 let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(lease.workspace_root())
                     .map_err(|error| ToolError::new(error.to_string()))?;
                 let (requests, identities) = bound_effect_lock_requests(&resolver, &descriptor)?;
-                let canonical = handle.block_on(locks.acquire(requests, None)).map_err(|error| ToolError::new(error.to_string()))?;
+                let canonical = handle.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => Err(ToolError::new("original tool call stopped waiting for locks")),
+                        lease = locks.acquire(requests, None) => lease.map_err(|error| ToolError::new(error.to_string())),
+                    }
+                })?;
                 authority.check_context(&request)?;
                 let scope = admitted_effect_scope(&request, &descriptor, Some(lease.clone()), &resolver)?;
                 if identities.iter().any(|(path, identity)| scope.targets.iter()
@@ -1873,6 +1952,7 @@ pub(crate) async fn execute_bounded_process_observed(
                     crate::execution_core::graph::ToolEffectState::NotRequired => return Err(ToolError::new("bounded process requires original durable intent")),
                 }
                 let binding = service.bounded_process_binding(&request, &descriptor).map_err(|error| ToolError::new(error.to_string()))?;
+                stop.effect_entered.store(true,std::sync::atomic::Ordering::Release);
                 authority.begin(&request)?;
                 if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     return Err(ToolError::new("bounded process cancelled before copy"));
@@ -1965,7 +2045,42 @@ pub(crate) async fn execute_bound_agent_tool(
     .await
 }
 
-pub(crate) async fn execute_bound_agent_tool_observed(
+pub(crate) fn execute_bound_agent_tool_observed<'a>(
+    host: &'a dyn RuntimeExecutionHost,
+    commit_service: Option<&'a ExecutionCommitService>,
+    path_identity_resolver: &'a crate::path_identity::WorkspacePathIdentityResolver,
+    scope_locks: &'a ScopeLockManager,
+    request: &'a RuntimeToolExecutionRequest,
+    descriptor: &'a ToolEffectDescriptor,
+    observation: Option<
+        &'a crate::execution_core::graph::executors::agent_tool::NoDispatchObservation,
+    >,
+) -> futures::future::BoxFuture<'a, Result<RuntimeToolExecutionOutcome, ToolError>> {
+    // The actual default-stack fault was the nested inline observed/core poll
+    // (1157 first SIGSEGV). Construct only captures here; the original body is
+    // first polled under the caller's same task-local scope, not another task.
+    Box::pin(async move {
+        let result = execute_bound_agent_tool_observed_inner(
+            host,
+            commit_service,
+            path_identity_resolver,
+            scope_locks,
+            request,
+            descriptor,
+            observation,
+        )
+        .await;
+        if result.is_ok() {
+            if let Some(stop) = current_tool_stop() {
+                stop.effect_settled
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        result
+    })
+}
+
+async fn execute_bound_agent_tool_observed_inner(
     host: &dyn RuntimeExecutionHost,
     commit_service: Option<&ExecutionCommitService>,
     path_identity_resolver: &crate::path_identity::WorkspacePathIdentityResolver,
@@ -2024,6 +2139,8 @@ pub(crate) async fn execute_bound_agent_tool_observed(
         )
         .await;
     }
+    check_tool_stop()?;
+    let stop = current_tool_stop();
     let requested = crate::governed_tool_plan::resource_scope_from_effect(descriptor);
     let (lock_requests, resolved_identities) =
         bound_effect_lock_requests(path_identity_resolver, descriptor).map_err(|error| {
@@ -2036,10 +2153,16 @@ pub(crate) async fn execute_bound_agent_tool_observed(
         None
     } else {
         Some(
-            scope_locks
-                .acquire(lock_requests, None)
-                .await
-                .map_err(|error| {
+            async {
+                let acquire = scope_locks.acquire(lock_requests, None);
+                if let Some(stop) = &stop {
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => Err("original tool call stopped waiting for locks".to_string()),
+                        lease = acquire => lease.map_err(|error| error.to_string()),
+                    }
+                } else { acquire.await.map_err(|error| error.to_string()) }
+            }.await.map_err(|error| {
                     let error = ToolError::new(format!(
                         "tool `{tool_name}` could not acquire its scoped resource lease: {error}"
                     ));
@@ -2074,6 +2197,7 @@ pub(crate) async fn execute_bound_agent_tool_observed(
             ));
         }
     }
+    check_tool_stop()?;
     let effect_state = commit_service
         .map(|service| {
             service.begin_bound_tool_effect_observed(
@@ -2125,6 +2249,11 @@ pub(crate) async fn execute_bound_agent_tool_observed(
             } else {
                 None
             };
+            check_tool_stop()?;
+            if let Some(stop) = current_tool_stop() {
+                stop.effect_entered
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             let outcome = host.execute_runtime_tool(&request).await;
             (outcome, true, admission)
         }

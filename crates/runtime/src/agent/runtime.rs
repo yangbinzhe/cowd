@@ -2300,9 +2300,6 @@ impl AgentRuntime {
                 });
             } else {
                 let mut proposed = LocalRunPhase::Unknown;
-                let scope_closed = process_exit_owner.as_ref().and_then(|adapter| {
-                    adapter.owned_process_group_is_empty(&packet.run_id(), packet.attempt)
-                });
                 if let Some(witness) = process_exit_owner
                     .as_ref()
                     .and_then(|adapter| adapter.local_exit_evidence(&packet))
@@ -2310,11 +2307,7 @@ impl AgentRuntime {
                     if witness.matches_packet(&packet) {
                         if witness.is_reaped() {
                             proposed = if cancelled {
-                                if scope_closed == Some(true) {
-                                    LocalRunPhase::Cancelled
-                                } else {
-                                    LocalRunPhase::Unknown
-                                }
+                                LocalRunPhase::Cancelled
                             } else {
                                 LocalRunPhase::ProcessReaped
                             };
@@ -3192,10 +3185,6 @@ impl AgentRuntime {
                     }
                 }
             }
-            let scope_closed = adapter
-                .as_ref()
-                .and_then(|adapter| adapter.owned_process_group_is_empty(&snapshot.run_id, snapshot.attempt))
-                == Some(true);
             let witnessed = retained
                 .mirrored_exit_evidence()
                 .filter(|evidence| {
@@ -3217,7 +3206,7 @@ impl AgentRuntime {
                     })
                 })
                 .is_some_and(|witness| witness.is_reaped());
-            if scope_closed && witnessed {
+            if witnessed {
                 self.reclaim_cancelled_run_scope(snapshot).await;
                 self.publish_cancelled_exit(&retained, LocalRunPhase::Cancelled)
                     .await;
@@ -5036,7 +5025,13 @@ mod tests {
                     == Some(format!("agent.local_exit:{}", packet.run_id()).as_str())
             })
             .count();
-        assert_eq!(exits, 1, "a cancelled run keeps exactly one local exit");
+        assert_eq!(
+            exits,
+            1,
+            "a cancelled run keeps exactly one local exit; owner_finished={} adapter={}",
+            caller.is_finished(),
+            adapter.fixture_exit_diagnostic(&packet)
+        );
         let (evidence, _) = confirmed_run_exit(&runtime.event_store, &packet)
             .unwrap()
             .expect("a cancelled run keeps its authenticated local exit");

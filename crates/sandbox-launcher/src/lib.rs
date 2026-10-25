@@ -36,8 +36,11 @@ const SYSTEM_READ_ONLY_ROOTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/et
 const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const BOOTSTRAP_SHELL: &str = "/bin/bash";
 const INNER_LAUNCHER_PATH: &str = "/run/cowd-sandbox-inner";
-const LAUNCHER_PROTOCOL: &str =
-    concat!("sandbox-launcher/", env!("CARGO_PKG_VERSION"), "/kernel-v2");
+const LAUNCHER_PROTOCOL: &str = concat!(
+    "sandbox-launcher/",
+    env!("CARGO_PKG_VERSION"),
+    "/kernel-v3-controlled-host"
+);
 const INTERNAL_DISPATCH: &str = "__cowd_internal";
 const INTERNAL_ROLE: &str = "sandbox-launcher";
 static COWD_PROCESS_HOST: AtomicBool = AtomicBool::new(false);
@@ -95,6 +98,14 @@ fn platform_internal_process_command() -> Result<Command, String> {
 /// 只读挂载进 bwrap，再通过 `--inner` 安装 Landlock 与 seccomp。
 #[doc(hidden)]
 pub fn internal_process_entry(args: &[String]) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("--stream-outer") {
+        return bounded::stream_outer_entry(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("--stream-inner") {
+        return bounded::stream_inner_entry(&args[1..]);
+    }
     #[cfg(target_os = "linux")]
     if args.first().map(String::as_str) == Some("--bounded-outer") {
         return bounded::outer_entry(&args[1..]);
@@ -559,6 +570,8 @@ pub struct PreparedSandboxCommand {
     /// A minimal trusted host wrapper. It only closes descriptors then `exec`s
     /// the absolute bwrap binary; untrusted shell content remains after the
     /// bwrap `--` boundary.
+    host_args: Vec<String>,
+    host_project: PathBuf,
     pub program: String,
     pub args: Vec<String>,
     /// Empty by design. Bubblewrap receives its allowlisted environment via
@@ -665,6 +678,8 @@ pub fn shell_command(
         command.to_string(),
     )?;
     Ok(PreparedSandboxCommand {
+        host_args: args.clone(),
+        host_project: canonical(&spec.workspace_root)?,
         program: BOOTSTRAP_SHELL.to_string(),
         args: vec![
             "-c".to_string(),
@@ -1431,13 +1446,15 @@ mod bounded {
             },
         })
     }
-    fn send_capabilities(
+    fn send_capabilities<'a>(
         socket: &UnixDatagram,
-        descriptors: [std::os::fd::BorrowedFd<'_>; 4],
+        descriptors: impl AsRef<[std::os::fd::BorrowedFd<'a>]>,
     ) -> Result<(), String> {
-        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(5))];
         let mut ancillary = rustix::net::SendAncillaryBuffer::new(&mut space);
-        if !ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(&descriptors)) {
+        if !ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(
+            descriptors.as_ref(),
+        )) {
             return Err("bounded_handoff_capacity".into());
         }
         let sent = rustix::net::sendmsg(
@@ -1453,7 +1470,13 @@ mod bounded {
         Ok(())
     }
     fn receive_capabilities(socket: impl AsFd) -> Result<Vec<OwnedFd>, String> {
-        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+        receive_host_capabilities(socket, false)
+    }
+    fn receive_host_capabilities(
+        socket: impl AsFd,
+        streaming: bool,
+    ) -> Result<Vec<OwnedFd>, String> {
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(5))];
         let mut ancillary = rustix::net::RecvAncillaryBuffer::new(&mut space);
         let mut magic = [0; 8];
         let received = rustix::net::recvmsg(
@@ -1471,26 +1494,40 @@ mod bounded {
         }
         if received.bytes != 8
             || magic != *b"CWDFD702"
-            || received.flags.intersects(rustix::net::ReturnFlags::CTRUNC | rustix::net::ReturnFlags::TRUNC)
-            || descriptors.len() != 4
+            || received
+                .flags
+                .intersects(rustix::net::ReturnFlags::CTRUNC | rustix::net::ReturnFlags::TRUNC)
+            || descriptors.len() != if streaming { 5 } else { 4 }
         {
             return Err("bounded_handoff_invalid".into());
         }
-        let metadata = descriptors.iter().map(|descriptor| {
-            rustix::fs::fstat(descriptor).map_err(|error| error.to_string())
-        }).collect::<Result<Vec<_>, _>>()?;
-        if rustix::fs::FileType::from_raw_mode(metadata[0].st_mode) != rustix::fs::FileType::Directory
-            || rustix::fs::FileType::from_raw_mode(metadata[1].st_mode) != rustix::fs::FileType::Fifo
-            || rustix::fs::FileType::from_raw_mode(metadata[2].st_mode) != rustix::fs::FileType::Fifo
+        let metadata = descriptors
+            .iter()
+            .map(|descriptor| rustix::fs::fstat(descriptor).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if rustix::fs::FileType::from_raw_mode(metadata[0].st_mode)
+            != rustix::fs::FileType::Directory
+            || rustix::fs::FileType::from_raw_mode(metadata[1].st_mode)
+                != rustix::fs::FileType::Fifo
+            || rustix::fs::FileType::from_raw_mode(metadata[2].st_mode)
+                != rustix::fs::FileType::Fifo
             || metadata[1].st_ino == metadata[2].st_ino
-            || rustix::fs::FileType::from_raw_mode(metadata[3].st_mode) != rustix::fs::FileType::RegularFile
+            || rustix::fs::FileType::from_raw_mode(metadata[3].st_mode)
+                != rustix::fs::FileType::RegularFile
+            || (streaming
+                && rustix::fs::FileType::from_raw_mode(metadata[4].st_mode)
+                    != rustix::fs::FileType::Fifo)
         {
             return Err("bounded_handoff_types_invalid".into());
         }
         for (index, descriptor) in descriptors.iter().enumerate() {
             let access = rustix::fs::fcntl_getfl(descriptor).map_err(|error| error.to_string())?
                 & rustix::fs::OFlags::ACCMODE;
-            let expected = if index == 2 { rustix::fs::OFlags::WRONLY } else { rustix::fs::OFlags::RDONLY };
+            let expected = if index == 2 {
+                rustix::fs::OFlags::WRONLY
+            } else {
+                rustix::fs::OFlags::RDONLY
+            };
             if access != expected {
                 return Err("bounded_handoff_access_invalid".into());
             }
@@ -1498,7 +1535,7 @@ mod bounded {
         Ok(descriptors)
     }
     pub(super) fn outer_entry(args: &[String]) -> ExitCode {
-        match run_outer(args) {
+        match run_outer(args, false) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("bounded outer: {error}");
@@ -1506,66 +1543,607 @@ mod bounded {
             }
         }
     }
-    fn run_outer(args: &[String]) -> Result<(), String> {
+    pub(super) fn stream_outer_entry(args: &[String]) -> ExitCode {
+        match run_outer(args, true) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("stream outer: {error}");
+                ExitCode::from(125)
+            }
+        }
+    }
+    fn run_outer(args: &[String], streaming: bool) -> Result<(), String> {
         if args.len() < 2
             || !Path::new(&args[0]).is_absolute()
-            || Path::new(&args[0]).file_name().is_none_or(|name| name != "bwrap")
+            || Path::new(&args[0])
+                .file_name()
+                .is_none_or(|name| name != "bwrap")
             || !Path::new(&args[0]).is_file()
         {
             return Err("bounded_outer_arguments_invalid".into());
         }
-        let descriptors = receive_capabilities(std::io::stdin())?;
-        let pinned = descriptors.iter().map(|descriptor| {
-            rustix::io::fcntl_dupfd_cloexec(descriptor, 16).map_err(|error| error.to_string())
-        }).collect::<Result<Vec<_>, _>>()?;
+        let descriptors = receive_host_capabilities(std::io::stdin(), streaming)?;
+        let pinned = descriptors
+            .iter()
+            .map(|descriptor| {
+                rustix::io::fcntl_dupfd_cloexec(descriptor, 16).map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         drop(descriptors);
         for descriptor in &pinned {
             rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
                 .map_err(|error| error.to_string())?;
         }
+        let business_input = if streaming {
+            format!(
+                "exec 0</proc/self/fd/{} || exit 125;",
+                pinned[4].as_raw_fd()
+            )
+        } else {
+            "exec 0</dev/null;".into()
+        };
         let script = format!(
-            "exec 3</proc/self/fd/{} || exit 125; exec 4</proc/self/fd/{} || exit 125; exec 5>/proc/self/fd/{} || exit 125; exec 6</proc/self/fd/{} || exit 125; exec 0</dev/null; for entry in /proc/$$/fd/*; do fd=${{entry##*/}}; case \"$fd\" in 0|1|2|3|4|5|6|*[!0-9]*|'') ;; *) eval \"exec $fd>&-\" ;; esac; done; exec {}",
+            "exec 3</proc/self/fd/{} || exit 125; exec 4</proc/self/fd/{} || exit 125; exec 5>/proc/self/fd/{} || exit 125; exec 6</proc/self/fd/{} || exit 125; {business_input} for entry in /proc/$$/fd/*; do fd=${{entry##*/}}; case \"$fd\" in 0|1|2|3|4|5|6|*[!0-9]*|'') ;; *) eval \"exec $fd>&-\" ;; esac; done; exec {}",
             pinned[3].as_raw_fd(), pinned[1].as_raw_fd(), pinned[2].as_raw_fd(), pinned[0].as_raw_fd(),
             args.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>().join(" "),
         );
-        let error = Command::new(BOOTSTRAP_SHELL).args(["-c", &script]).env_clear().exec();
+        let error = Command::new(BOOTSTRAP_SHELL)
+            .args(["-c", &script])
+            .env_clear()
+            .exec();
         Err(error.to_string())
     }
     struct RunningTree {
         child: std::process::Child,
-        wrapper: OwnedFd,
+        wrapper: Option<OwnedFd>,
         init: Option<OwnedFd>,
         reaped: bool,
     }
-    impl Drop for RunningTree {
-        fn drop(&mut self) {
-            if self.init.is_none() && !self.reaped {
-                self.init = find_init(self.child.id(), None).map(|(_, descriptor, _)| descriptor);
+    impl RunningTree {
+        fn request_stop(&self) {
+            if let Some(init) = &self.init {
+                let _ = rustix::process::pidfd_send_signal(init, rustix::process::Signal::TERM);
             }
+        }
+        fn force_stop(&mut self) {
             if let Some(init) = &self.init {
                 let _ = rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL);
             }
-            if !self.reaped {
-                let _ = rustix::process::pidfd_send_signal(
-                    &self.wrapper,
-                    rustix::process::Signal::KILL,
-                );
-                if self.child.wait().is_ok() {
-                    self.reaped = true;
-                }
+            if let Some(wrapper) = &self.wrapper {
+                let _ = rustix::process::pidfd_send_signal(wrapper, rustix::process::Signal::KILL);
+            } else if !self.reaped {
+                let _ = self.child.kill();
             }
-            if let Some(init) = &self.init {
-                while !pidfd_exited(init) {
-                    let _ = rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL);
-                    std::thread::sleep(Duration::from_millis(2));
-                }
+        }
+        fn try_reap(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+            let result = self.child.try_wait().map_err(|error| error.to_string())?;
+            self.reaped |= result.is_some();
+            Ok(result)
+        }
+    }
+    impl Drop for RunningTree {
+        fn drop(&mut self) {
+            if self.reaped && self.init.as_ref().is_none_or(pidfd_exited) {
+                return;
             }
+            if self.init.is_none() {
+                self.init = find_init(self.child.id(), None).map(|(_, descriptor, _)| descriptor);
+            }
+            self.force_stop();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < deadline {
+                let _ = self.try_reap();
+                if self.reaped && self.init.as_ref().is_some_and(pidfd_exited) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // No success receipt comes from Drop. Explicit owners must retain
+            // unresolved handles and retry finish; this fallback is bounded.
+            eprintln!("sandbox host drop: physical exit not confirmed");
         }
     }
     fn nonblocking(descriptor: impl AsFd) -> Result<(), String> {
         let flags = rustix::fs::fcntl_getfl(&descriptor).map_err(|error| error.to_string())?;
         rustix::fs::fcntl_setfl(&descriptor, flags | rustix::fs::OFlags::NONBLOCK)
             .map_err(|error| error.to_string())
+    }
+    /// The sole physical owner of a long-lived sandbox. Business pipes are
+    /// separate from the trusted bootstrap's private control/status pipes.
+    #[derive(Clone)]
+    pub struct ControlledSandboxStop(std::sync::Arc<std::sync::Mutex<ControlledGate>>);
+    struct ControlledGate {
+        control: File,
+        authenticated: bool,
+        stop_at: Option<Instant>,
+    }
+    impl ControlledSandboxStop {
+        /// Stop and GO are serialized on the original private control channel,
+        /// independently of the long-lived child/reap lock.
+        pub fn request_stop(&self) -> Result<(), String> {
+            let mut gate = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gate.stop_at.get_or_insert_with(Instant::now);
+            if !gate.authenticated {
+                return Ok(());
+            }
+            match gate.control.write(b"C") {
+                Ok(1) => Ok(()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    Ok(())
+                }
+                Ok(_) => Err("sandbox stop channel made no progress".into()),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        fn authenticate(&self) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .authenticated = true;
+        }
+        fn allow_go(&self) -> Result<(), String> {
+            let mut gate = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !gate.authenticated || gate.stop_at.is_some() {
+                return Err("sandbox cancelled before GO or host identity unverified".into());
+            }
+            gate.control
+                .write_all(b"G")
+                .map_err(|error| error.to_string())
+        }
+        fn requested_at(&self) -> Option<Instant> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop_at
+        }
+    }
+    pub struct ControlledSandbox {
+        tree: RunningTree,
+        control: ControlledSandboxStop,
+        status: File,
+        digest: [u8; 32],
+        frames: Vec<u8>,
+        identity: Option<(u32, u64)>,
+        go: bool,
+        #[cfg(test)]
+        before_go: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        finished: Option<ControlledHostExit>,
+        launch_error: Option<String>,
+        pub stdin: Option<File>,
+        pub stdout: Option<std::process::ChildStdout>,
+        pub stderr: Option<std::process::ChildStderr>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ControlledHostExit {
+        nonce: [u8; 32],
+        wrapper_pid: u32,
+        init_pid: u32,
+        init_starttime: u64,
+        started: bool,
+        wrapper_reaped: bool,
+        init_exited: bool,
+        children_reaped: bool,
+    }
+    impl ControlledHostExit {
+        pub fn authentic_for(&self, nonce: &[u8; 32]) -> bool {
+            &self.nonce == nonce
+                && self.wrapper_pid != 0
+                && self.init_pid != 0
+                && self.init_starttime != 0
+                && self.wrapper_reaped
+                && self.init_exited
+                && self.children_reaped
+        }
+        pub fn host_identity(&self) -> (u32, u32, u64) {
+            (self.wrapper_pid, self.init_pid, self.init_starttime)
+        }
+        pub fn started(&self) -> bool {
+            self.started
+        }
+    }
+    impl PreparedSandboxCommand {
+        pub fn spawn_controlled(self, nonce: [u8; 32]) -> Result<ControlledSandbox, String> {
+            let (stop_read, stop_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                .map_err(|e| e.to_string())?;
+            let (status_read, status_write) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                    .map_err(|e| e.to_string())?;
+            let (input_read, input_write) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                    .map_err(|e| e.to_string())?;
+            let image = File::open(&self.preflight.cowd_binary_path).map_err(|e| e.to_string())?;
+            let project = File::open(&self.host_project).map_err(|e| e.to_string())?;
+            let (sender, inherited) = UnixDatagram::pair().map_err(|e| e.to_string())?;
+            send_capabilities(
+                &sender,
+                [
+                    project.as_fd(),
+                    stop_read.as_fd(),
+                    status_write.as_fd(),
+                    image.as_fd(),
+                    input_read.as_fd(),
+                ],
+            )?;
+            let mut args = self.host_args;
+            let boundary = args
+                .iter()
+                .position(|arg| arg == "--")
+                .ok_or("sandbox exec boundary missing")?;
+            let original = args.split_off(boundary + 1);
+            args.pop();
+            args.splice(
+                0..0,
+                ["--cap-drop".into(), "ALL".into(), "--as-pid-1".into()],
+            );
+            let nonce_hex = nonce
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            args.extend([
+                "--".into(),
+                INNER_LAUNCHER_PATH.into(),
+                INTERNAL_DISPATCH.into(),
+                INTERNAL_ROLE.into(),
+                "--stream-inner".into(),
+                nonce_hex,
+            ]);
+            args.extend(original);
+            let control = File::from(stop_write);
+            let status = File::from(status_read);
+            let stdin = File::from(input_write);
+            nonblocking(&control)?;
+            nonblocking(&status)?;
+            nonblocking(&stdin)?;
+            let inherited: OwnedFd = inherited.into();
+            let child = Command::new(format!("/proc/self/fd/{}", image.as_raw_fd()))
+                .args([INTERNAL_DISPATCH, INTERNAL_ROLE, "--stream-outer"])
+                .arg(&self.preflight.bwrap_path)
+                .args(args)
+                .env_clear()
+                .stdin(Stdio::from(inherited))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            // From this point every failure is retained in the returned owner,
+            // not a String error that could drop an unconfirmed live Child.
+            let wrapper = rustix::process::Pid::from_raw(child.id() as i32).and_then(|pid| {
+                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
+            });
+            let mut tree = RunningTree {
+                child,
+                wrapper,
+                init: None,
+                reaped: false,
+            };
+            let stdout = tree.child.stdout.take();
+            let stderr = tree.child.stderr.take();
+            let mut launch_error = if tree.wrapper.is_none() {
+                Some("sandbox wrapper pidfd unavailable".into())
+            } else {
+                None
+            };
+            if let Some(pipe) = &stdout {
+                if let Err(error) = nonblocking(pipe) {
+                    launch_error.get_or_insert(error);
+                }
+            }
+            if let Some(pipe) = &stderr {
+                if let Err(error) = nonblocking(pipe) {
+                    launch_error.get_or_insert(error);
+                }
+            }
+            Ok(ControlledSandbox {
+                tree,
+                control: ControlledSandboxStop(std::sync::Arc::new(std::sync::Mutex::new(
+                    ControlledGate {
+                        control,
+                        authenticated: false,
+                        stop_at: None,
+                    },
+                ))),
+                status,
+                digest: nonce,
+                frames: Vec::new(),
+                identity: None,
+                go: false,
+                #[cfg(test)]
+                before_go: None,
+                finished: None,
+                launch_error,
+                stdin: Some(stdin),
+                stdout,
+                stderr,
+            })
+        }
+    }
+    impl ControlledSandbox {
+        pub fn id(&self) -> u32 {
+            self.tree.child.id()
+        }
+        pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+            self.tree.try_reap()
+        }
+        /// Authentication is OS-derived before GO. No PID from a worker frame
+        /// is accepted as a host capability.
+        pub fn stop_handle(&self) -> ControlledSandboxStop {
+            self.control.clone()
+        }
+        pub fn allow_go(&mut self, deadline: Instant) -> Result<(), String> {
+            if let Some(error) = &self.launch_error {
+                return Err(error.clone());
+            }
+            while self.identity.is_none() {
+                if let Some((pid, fd, ticks)) = find_init(self.id(), None) {
+                    self.tree.init = Some(fd);
+                    self.identity = Some((pid, ticks));
+                    self.control.authenticate();
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    self.request_stop()?;
+                    return Err("sandbox deadline before host authentication".into());
+                }
+                if self.try_wait()?.is_some() {
+                    return Err("sandbox host exited before GO".into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            #[cfg(test)]
+            if let Some(before_go) = &self.before_go {
+                before_go();
+            }
+            if let Err(error) = self.control.allow_go() {
+                self.request_stop()?;
+                return Err(error);
+            }
+            self.go = true;
+            while self.frames.len() < FRAME_BYTES {
+                self.read_status()?;
+                if Instant::now() >= deadline || self.control.requested_at().is_some() {
+                    self.request_stop()?;
+                    return Err("sandbox start authentication incomplete".into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.validate_start()
+        }
+        fn read_status(&mut self) -> Result<(), String> {
+            let mut bytes = [0; FRAME_BYTES * 2];
+            loop {
+                match self.status.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if self.frames.len() + n > FRAME_BYTES * 2 {
+                            return Err("sandbox host status overflow".into());
+                        }
+                        self.frames.extend_from_slice(&bytes[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            Ok(())
+        }
+        fn validate_start(&self) -> Result<(), String> {
+            let first: &[u8; FRAME_BYTES] = self
+                .frames
+                .get(..FRAME_BYTES)
+                .ok_or("sandbox start frame missing")?
+                .try_into()
+                .map_err(|_| "sandbox start frame invalid")?;
+            if !valid_frame(first, 1, &self.digest)
+                || self
+                    .identity
+                    .is_none_or(|(_, ticks)| ticks != u64_at(first, 64))
+                || first[72] != u8::from(self.go)
+            {
+                return Err("sandbox host start authentication mismatch".into());
+            }
+            Ok(())
+        }
+        pub fn request_stop(&mut self) -> Result<(), String> {
+            self.control.request_stop()
+        }
+        /// Deadline limits waiting; on error this object remains retained by
+        /// the original run. No Drop or protocol terminal can mint this fact.
+        pub fn finish(&mut self, deadline: Instant) -> Result<ControlledHostExit, String> {
+            if let Some(exit) = &self.finished {
+                return Ok(exit.clone());
+            }
+            self.request_stop()?;
+            loop {
+                if self.identity.is_none() {
+                    if let Some((pid, fd, ticks)) = find_init(self.id(), None) {
+                        self.identity = Some((pid, ticks));
+                        self.tree.init = Some(fd);
+                        self.control.authenticate();
+                        self.request_stop()?;
+                    }
+                }
+                self.read_status()?;
+                let _ = self.try_wait()?;
+                let init_exited = self.tree.init.as_ref().is_some_and(pidfd_exited);
+                if self.tree.reaped && init_exited {
+                    // Namespace init exit is kernel-enforced subtree teardown,
+                    // including setsid descendants, independent of worker output.
+                    self.validate_start()?;
+                    let (init_pid, init_starttime) =
+                        self.identity.ok_or("sandbox init identity missing")?;
+                    let exit = ControlledHostExit {
+                        nonce: self.digest,
+                        wrapper_pid: self.id(),
+                        init_pid,
+                        init_starttime,
+                        started: self.go,
+                        wrapper_reaped: true,
+                        init_exited: true,
+                        children_reaped: true,
+                    };
+                    self.finished = Some(exit.clone());
+                    return Ok(exit);
+                }
+                if self
+                    .control
+                    .requested_at()
+                    .is_some_and(|at| at.elapsed() >= Duration::from_millis(250))
+                    && self.identity.is_some()
+                {
+                    self.tree.force_stop();
+                }
+                if Instant::now() >= deadline {
+                    return Err("sandbox trusted host physical exit remains pending".into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    pub(super) fn stream_inner_entry(args: &[String]) -> ExitCode {
+        match run_stream_init(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("stream init: {error}");
+                ExitCode::from(125)
+            }
+        }
+    }
+    fn run_stream_init(args: &[String]) -> Result<(), String> {
+        if rustix::process::getpid().as_raw_nonzero().get() != 1 || args.len() < 2 {
+            return Err("stream requires namespace init".into());
+        }
+        let mut digest = [0; 32];
+        if args[0].len() != 64 || !args[0].is_ascii() {
+            return Err("stream nonce invalid".into());
+        }
+        for (i, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&args[0][i * 2..i * 2 + 2], 16)
+                .map_err(|_| "stream nonce invalid")?;
+        }
+        let mut control = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open("/proc/self/fd/4")
+            .map_err(|e| e.to_string())?;
+        let mut status = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open("/proc/self/fd/5")
+            .map_err(|e| e.to_string())?;
+        let read = control.metadata().map_err(|e| e.to_string())?;
+        let write = status.metadata().map_err(|e| e.to_string())?;
+        if !read.file_type().is_fifo() || !write.file_type().is_fifo() || read.ino() == write.ino()
+        {
+            return Err("stream private channels invalid".into());
+        }
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .map_err(|e| e.to_string())?;
+        let namespace = fs::metadata("/proc/self/ns/pid")
+            .map_err(|e| e.to_string())?
+            .ino();
+        let ticks = process_ticks(1).ok_or("stream init starttime unavailable")?;
+        let _tree = NamespaceTree;
+        let began = Instant::now();
+        let mut go = false;
+        while began.elapsed() < Duration::from_secs(10) {
+            let mut input = [0];
+            match control.read(&mut input) {
+                Ok(1) if input[0] == b'G' => {
+                    go = true;
+                    break;
+                }
+                Ok(_) => break,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let mut child_pid = None;
+        if go {
+            let script = format!(
+                "exec 3<&-; exec 4<&-; exec 5>&-; exec 6<&-; exec {}",
+                args[1..]
+                    .iter()
+                    .map(|arg| shell_quote(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let child = Command::new(BOOTSTRAP_SHELL)
+                .args(["-c", &script])
+                .stdin(Stdio::inherit())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            child_pid = Some(child.id());
+        }
+        status
+            .write_all(&frame(
+                1, &digest, namespace, ticks, None, None,
+                1, // shared codec: start shape; launched=false authenticates no GO
+                false, go,
+            ))
+            .map_err(|e| e.to_string())?;
+        let mut exit = None;
+        let mut signal = None;
+        let mut done = !go;
+        let mut stop = if go { 1 } else { 3 };
+        loop {
+            let mut input = [0];
+            match control.read(&mut input) {
+                Ok(_) => {
+                    stop = 3;
+                    done = true;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    stop = 3;
+                    done = true;
+                }
+            }
+            if done {
+                kill_descendants();
+            }
+            match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
+                Ok(Some((pid, result))) => {
+                    if Some(pid.as_raw_nonzero().get() as u32) == child_pid {
+                        exit = result.exit_status();
+                        signal = result.terminating_signal();
+                        done = true;
+                    }
+                }
+                Err(rustix::io::Errno::CHILD) => break,
+                Ok(None) | Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        status
+            .write_all(&frame(
+                2, &digest, namespace, ticks, exit, signal, stop, true, go,
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
     impl PreparedBoundedCommand {
         pub fn run(self, cancellation: &AtomicBool) -> BoundedSandboxObservation {
@@ -1680,7 +2258,7 @@ mod bounded {
                 };
             let mut tree = RunningTree {
                 child,
-                wrapper,
+                wrapper: Some(wrapper),
                 init: None,
                 reaped: false,
             };
@@ -1841,10 +2419,7 @@ mod bounded {
                         let _ =
                             rustix::process::pidfd_send_signal(init, rustix::process::Signal::KILL);
                     }
-                    let _ = rustix::process::pidfd_send_signal(
-                        &tree.wrapper,
-                        rustix::process::Signal::KILL,
-                    );
+                    tree.force_stop();
                 }
                 match tree.child.try_wait() {
                     Ok(Some(status)) => {
@@ -2481,15 +3056,130 @@ print('production-payload-complete')
             assert_settled(&result);
             assert_eq!(result.exit_code(), Some(0));
             assert_eq!(result.stdout(), b"production-payload-complete\n");
-            assert!(rustix::io::fcntl_getfd(&observer).unwrap().contains(rustix::io::FdFlags::CLOEXEC));
-            assert_eq!(rustix::process::dumpable_behavior().unwrap(), rustix::process::DumpableBehavior::NotDumpable);
+            assert!(rustix::io::fcntl_getfd(&observer)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC));
+            assert_eq!(
+                rustix::process::dumpable_behavior().unwrap(),
+                rustix::process::DumpableBehavior::NotDumpable
+            );
+        }
+
+        #[test]
+        fn controlled_stop_wins_between_authentication_and_go_without_child_lock() {
+            let project = Project::new();
+            let prepared = shell_command("printf forbidden-business", &project.spec()).unwrap();
+            let nonce = [61; 32];
+            let mut host = prepared.spawn_controlled(nonce).unwrap();
+            let stop = host.stop_handle();
+            let (entered, authenticated) = std::sync::mpsc::channel();
+            let (release, proceed) = std::sync::mpsc::channel();
+            let proceed = std::sync::Mutex::new(proceed);
+            host.before_go = Some(std::sync::Arc::new(move || {
+                entered.send(()).unwrap();
+                proceed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }));
+            let runner = std::thread::spawn(move || {
+                let started = host.allow_go(Instant::now() + Duration::from_secs(10));
+                (host, started)
+            });
+            authenticated.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The runner owns the complete host, as allow_go does under the
+            // adapter child lock. Stop still serializes before the actual G byte.
+            stop.request_stop().unwrap();
+            release.send(()).unwrap();
+            let (mut host, started) = runner.join().unwrap();
+            assert!(started.unwrap_err().contains("cancelled before GO"));
+            let exit = host
+                .finish(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            assert!(exit.authentic_for(&nonce));
+            assert!(!exit.started());
+            let mut stdout = host.stdout.take().unwrap();
+            let mut observed = Vec::new();
+            let (_, eof) = drain(&mut stdout, &mut observed, 4096).unwrap();
+            assert!(eof);
+            assert!(observed.is_empty(), "cancel won but business ran");
+        }
+
+        #[test]
+        fn controlled_host_go_gate_and_detached_pipe_descendants_have_one_exit_owner() {
+            for cancelled in [true, false] {
+                let project = Project::new();
+                let nonce = [41; 32];
+                let command = if cancelled {
+                    "printf forbidden-business"
+                } else {
+                    "python3 -c 'import os,time; p=os.fork(); os.setsid() if p==0 else None; print(\"detached-ready\",flush=True) if p==0 else None; time.sleep(600)'"
+                };
+                let prepared = shell_command(command, &project.spec()).unwrap();
+                let mut host = prepared.spawn_controlled(nonce).unwrap();
+                if cancelled {
+                    host.stop_handle().request_stop().unwrap();
+                }
+                let started = host.allow_go(Instant::now() + Duration::from_secs(10));
+                assert_eq!(started.is_err(), cancelled);
+                let mut stdout = host.stdout.take().unwrap();
+                let mut stderr = host.stderr.take().unwrap();
+                if !cancelled {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut entered = Vec::new();
+                    loop {
+                        let _ = drain(&mut stdout, &mut entered, 4096).unwrap();
+                        if entered
+                            .windows(b"detached-ready".len())
+                            .any(|window| window == b"detached-ready")
+                        {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "setsid descendant handshake not hit"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                let exit = host
+                    .finish(Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+                assert!(exit.authentic_for(&nonce));
+                assert!(!exit.authentic_for(&[42; 32]));
+                assert_eq!(exit.started(), !cancelled);
+                assert_eq!(
+                    host.finish(Instant::now() + Duration::from_secs(1))
+                        .unwrap(),
+                    exit
+                );
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let (_, stdout_eof) = drain(&mut stdout, &mut out, 4096).unwrap();
+                let (_, stderr_eof) = drain(&mut stderr, &mut err, 4096).unwrap();
+                assert!(
+                    stdout_eof && stderr_eof,
+                    "namespace init exit must end descendant pipes"
+                );
+                if cancelled {
+                    assert!(
+                        out.is_empty(),
+                        "GO-before-cancel cannot execute business content"
+                    );
+                }
+            }
         }
 
         #[test]
         fn r1_702_bounded_mount_stays_pinned_across_path_replacement() {
             let project = Project::new();
             fs::write(project.0.join("input.txt"), "original").unwrap();
-            let prepared = command(&project, "assert open('/project/input.txt').read() == 'original'; print('pinned')", Duration::from_secs(15));
+            let prepared = command(
+                &project,
+                "assert open('/project/input.txt').read() == 'original'; print('pinned')",
+                Duration::from_secs(15),
+            );
             let replacement = Project::new();
             let original = replacement.0.join("original");
             fs::rename(&project.0, &original).unwrap();
@@ -2768,6 +3458,10 @@ raise SystemExit(7)
             let started = frame(1, &digest, 42, 99, None, None, 1, false, false);
             let terminal = frame(2, &digest, 42, 99, Some(7), None, 1, true, true);
             assert!(valid_frame(&started, 1, &digest));
+            let before_go = frame(1, &digest, 41, 73, None, None, 1, false, false);
+            assert!(valid_frame(&before_go, 1, &digest));
+            let cancelled_as_start = frame(1, &digest, 41, 73, None, None, 3, false, false);
+            assert!(!valid_frame(&cancelled_as_start, 1, &digest));
             assert!(valid_frame(&terminal, 2, &digest));
             assert!(!valid_frame(&terminal, 1, &digest));
             for offset in [0, 8, 9, 11, 12, 52, 100] {
@@ -2841,7 +3535,10 @@ raise SystemExit(7)
     }
 }
 #[cfg(target_os = "linux")]
-pub use bounded::{prepare_bounded_command, BoundedSandboxObservation, PreparedBoundedCommand};
+pub use bounded::{
+    prepare_bounded_command, BoundedSandboxObservation, ControlledHostExit, ControlledSandbox,
+    ControlledSandboxStop, PreparedBoundedCommand,
+};
 
 #[cfg(not(target_os = "linux"))]
 mod bounded_unsupported {
@@ -3669,5 +4366,64 @@ print('original-native-traps-and-supported-foreign-abi-checked')
         )
         .expect("prepare hardened sandbox");
         assert!(prepared.into_command().status().unwrap().success());
+    }
+}
+
+// Unsupported platforms never substitute group liveness for host proof.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledHostExit;
+#[cfg(not(target_os = "linux"))]
+impl ControlledHostExit {
+    pub fn authentic_for(&self, _nonce: &[u8; 32]) -> bool {
+        false
+    }
+    pub fn started(&self) -> bool {
+        false
+    }
+    pub fn host_identity(&self) -> (u32, u32, u64) {
+        (0, 0, 0)
+    }
+}
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
+pub struct ControlledSandboxStop;
+#[cfg(not(target_os = "linux"))]
+impl ControlledSandboxStop {
+    pub fn request_stop(&self) -> Result<(), String> {
+        Err("trusted host unsupported".into())
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub struct ControlledSandbox {
+    pub stdin: Option<std::fs::File>,
+    pub stdout: Option<std::process::ChildStdout>,
+    pub stderr: Option<std::process::ChildStderr>,
+}
+#[cfg(not(target_os = "linux"))]
+impl PreparedSandboxCommand {
+    pub fn spawn_controlled(self, _nonce: [u8; 32]) -> Result<ControlledSandbox, String> {
+        Err("trusted sandbox host unsupported on this platform".into())
+    }
+}
+#[cfg(not(target_os = "linux"))]
+impl ControlledSandbox {
+    pub fn id(&self) -> u32 {
+        0
+    }
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        Err("trusted host unsupported".into())
+    }
+    pub fn request_stop(&mut self) -> Result<(), String> {
+        Err("trusted host unsupported".into())
+    }
+    pub fn stop_handle(&self) -> ControlledSandboxStop {
+        ControlledSandboxStop
+    }
+    pub fn allow_go(&mut self, _deadline: std::time::Instant) -> Result<(), String> {
+        Err("trusted host unsupported".into())
+    }
+    pub fn finish(&mut self, _deadline: std::time::Instant) -> Result<ControlledHostExit, String> {
+        Err("trusted host unsupported".into())
     }
 }

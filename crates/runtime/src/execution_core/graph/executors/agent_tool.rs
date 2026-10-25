@@ -622,14 +622,151 @@ impl AgentToolBatchDispatcher {
                     return Err(ToolError::new("Agent ToolBatch durable identity conflict"));
                 }
             }
-            supervisor
-                .drive_registered(&graph_id)
+            let stop = crate::bound_tool_batch::current_tool_stop();
+            if let Some(stop) = &stop {
+                let mut child = stop
+                    .child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let identity = (graph_id.clone(), digest.clone());
+                if child.as_ref().is_some_and(|prior| prior != &identity) {
+                    return Err(ToolError::new(
+                        "original call cannot bind a foreign child graph",
+                    ));
+                }
+                *child = Some(identity);
+                stop.child_drained
+                    .store(false, std::sync::atomic::Ordering::Release);
+                #[cfg(test)]
+                if stop.stop_after_child_registration {
+                    stop.request();
+                }
+            }
+            let drive = async {
+                if let Some(stop) = &stop {
+                    stop.check()?;
+                }
+                supervisor
+                    .drive_registered(&graph_id)
+                    .await
+                    .map_err(|e| ToolError::new(e.to_string()))?;
+                supervisor
+                    .wait_for_terminal(&graph_id)
+                    .await
+                    .map_err(|e| ToolError::new(e.to_string()))?;
+                Ok::<_, ToolError>(())
+            };
+            tokio::pin!(drive);
+            let driven = if let Some(stop) = &stop {
+                if stop.check().is_err() {
+                    services
+                        .cancel_execution_tree(
+                            &graph_id,
+                            "original Process call stopped after registration",
+                        )
+                        .await
+                        .map_err(|e| ToolError::new(e.to_string()))?;
+                    Err(ToolError::new(
+                        "original tool call stopped before child drive",
+                    ))
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => {
+                            // Keep the original driver alive while the original
+                            // supervisor cancels this exact child, never parent.
+                            let (cancelled, driven) = tokio::join!(
+                                services.cancel_execution_tree(&graph_id,"original Process call stopped"),
+                                &mut drive);
+                            cancelled.map_err(|e|ToolError::new(e.to_string()))?;
+                            driven
+                        },
+                        result = &mut drive => result,
+                    }
+                }
+            } else {
+                drive.await
+            };
+            let settled = services
+                .graph_state_store()
+                .load_async(&graph_id)
                 .await
                 .map_err(|e| ToolError::new(e.to_string()))?;
-            supervisor
-                .wait_for_terminal(&graph_id)
-                .await
-                .map_err(|e| ToolError::new(e.to_string()))?;
+            if settled.nodes != graph.nodes || settled.parent_execution != graph.parent_execution {
+                return Err(ToolError::new(
+                    "original Agent child binding changed during drain",
+                ));
+            }
+            if let Some(attempt) = settled
+                .recovery_cursor
+                .node_attempts
+                .get(&node_id)
+                .filter(|attempt| **attempt > 0)
+            {
+                let node = graph
+                    .nodes
+                    .first()
+                    .ok_or_else(|| ToolError::new("original Agent child node missing"))?;
+                let ticket = NodeExecutionTicket {
+                    graph_id: graph_id.clone(),
+                    node_id: node.id.clone(),
+                    executor_kind: node.executor_kind.clone(),
+                    service_class: graph.service_class,
+                    attempt: *attempt,
+                    idempotency_key: node.idempotency_key.clone(),
+                    payload_ref: node.payload_ref.clone(),
+                };
+                services
+                    .tool_batch_executor()
+                    .close_and_drain(&ticket, false)
+                    .await
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                if let Some(stop) = &stop {
+                    let no_dispatch = services
+                        .tool_batch_executor()
+                        .binding_observation(&ticket)
+                        .and_then(|observation| observation.witness())
+                        .is_some_and(|witness| witness.authenticate(&ticket, None).is_ok());
+                    let receipted = if let Some(invocation) = &preflight_request.compiled_invocation
+                    {
+                        services
+                            .commit_service()
+                            .completed_tool_effect(&preflight_request, &invocation.effect)
+                            .map_err(|error| ToolError::new(error.to_string()))?
+                            .is_some()
+                    } else {
+                        false
+                    };
+                    stop.effect_settled.store(
+                        no_dispatch || receipted,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                }
+            } else if let Some(stop) = &stop {
+                if stop.check().is_err() {
+                    supervisor
+                        .confirm_cancelled_bound_child_never_admitted(&graph)
+                        .await
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    stop.effect_settled
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            if let Some(stop) = &stop {
+                if !settled.nodes.iter().all(|node| {
+                    settled
+                        .node_statuses
+                        .get(&node.id)
+                        .is_some_and(|state| state.is_terminal())
+                }) {
+                    return Err(ToolError::new(
+                        "original Agent child is not terminal after drain",
+                    ));
+                }
+                stop.child_drained
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            driven?;
             let graph = services
                 .graph_state_store()
                 .load_async(&graph_id)
@@ -686,12 +823,14 @@ impl ScopedNodeBackendResolver for AgentToolBatchResolver {
         Some(Arc::new(AgentToolBatchBackend {
             services: self.services.upgrade()?,
             bound,
+            stop: Default::default(),
         }))
     }
 }
 struct AgentToolBatchBackend {
     services: Arc<RuntimeServices>,
     bound: BoundAgentTool,
+    stop: crate::bound_tool_batch::BoundToolStop,
 }
 
 fn agent_tool_outcome(
@@ -1138,6 +1277,9 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
     fn retains_physical_execution(&self) -> bool {
         true
     }
+    fn request_stop(&self, _ticket: &NodeExecutionTicket) {
+        self.stop.request();
+    }
     async fn execute(
         &self,
         ticket: &NodeExecutionTicket,
@@ -1304,26 +1446,28 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
             }
         }
         let demand = crate::governed_tool_plan::resource_demand_from_effect(&descriptor);
-        let (outcome, admission) = self
-            .services
-            .tool_execution_plane()
-            .execute_async_classified_retained(
-                &demand,
-                None,
-                ticket.service_class,
-                Some(ticket.service_class),
-                request.session_id.as_deref(),
-                crate::bound_tool_batch::execute_bound_agent_tool_observed(
-                    host.as_ref(),
-                    Some(self.services.commit_service()),
-                    self.services.path_identity_resolver(),
-                    self.services.scope_locks(),
-                    request,
-                    &descriptor,
-                    observation.as_deref(),
+        let (outcome, admission) = crate::bound_tool_batch::with_tool_stop(
+            self.stop.clone(),
+            self.services
+                .tool_execution_plane()
+                .execute_async_classified_retained(
+                    &demand,
+                    None,
+                    ticket.service_class,
+                    Some(ticket.service_class),
+                    request.session_id.as_deref(),
+                    crate::bound_tool_batch::execute_bound_agent_tool_observed(
+                        host.as_ref(),
+                        Some(self.services.commit_service()),
+                        self.services.path_identity_resolver(),
+                        self.services.scope_locks(),
+                        request,
+                        &descriptor,
+                        observation.as_deref(),
+                    ),
                 ),
-            )
-            .await;
+        )
+        .await;
         if let Err(error) = &outcome {
             if let Some(observation) = &observation {
                 match error {
@@ -1519,12 +1663,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod carrier_437_tests {
+pub(crate) mod carrier_437_tests {
     use super::*;
     use base64::Engine;
     use harness_contract::policy::PermissionMode;
 
-    fn real_request(workspace: &std::path::Path) -> RuntimeToolExecutionRequest {
+    pub(crate) fn real_request(workspace: &std::path::Path) -> RuntimeToolExecutionRequest {
         std::fs::write(workspace.join("proof.txt"), "original input").unwrap();
         let host = tools::ToolHost::builtin("carrier-437", workspace);
         let lease = host.pin_snapshot();
@@ -1624,7 +1768,7 @@ mod carrier_437_tests {
         request
     }
 
-    fn graph_for(request: RuntimeToolExecutionRequest) -> ExecutionGraph {
+    pub(crate) fn graph_for(request: RuntimeToolExecutionRequest) -> ExecutionGraph {
         let parent = request.parent_execution.clone();
         let payload = encode_bound_agent_tool("agent-437", "run-437", request).unwrap();
         let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));

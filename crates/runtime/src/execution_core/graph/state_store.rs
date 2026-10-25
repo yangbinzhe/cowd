@@ -330,23 +330,18 @@ impl ExecutionGraphStateStore {
         self.binding_starts_page(graph_id, after, head)
     }
 
-    pub(crate) fn binding_starts_page(
+    fn binding_history_page(
         &self,
-        graph_id: &str,
+        graph: &ExecutionGraph,
         after: u64,
         head: u64,
-    ) -> Result<
-        (
-            u64,
-            Vec<(String, super::events::ExecutionNodeBinding, (u64, u64, u32))>,
-        ),
-        ExecutionStateStoreError,
-    > {
+    ) -> Result<Vec<(crate::DurableRuntimeEvent, ExecutionGraphEvent)>, ExecutionStateStoreError>
+    {
+        let graph_id = graph.id.as_str();
         let corrupt = |reason: String| ExecutionStateStoreError::Corrupt {
             graph_id: graph_id.into(),
             reason,
         };
-        let graph = self.load(graph_id)?;
         let lineage = graph
             .lineage
             .as_ref()
@@ -365,7 +360,7 @@ impl ExecutionGraphStateStore {
             return Err(corrupt("lease start history gap".into()));
         }
         let mut cursor = after;
-        let mut starts = Vec::new();
+        let mut authenticated = Vec::new();
         for record in records {
             if record.stream_id != graph_id
                 || record.sequence != cursor + 1
@@ -397,6 +392,29 @@ impl ExecutionGraphStateStore {
             cursor = record.sequence;
             let event =
                 decode_execution_graph_event(&self.event_store, &record).map_err(&corrupt)?;
+            authenticated.push((record, event));
+        }
+        Ok(authenticated)
+    }
+
+    pub(crate) fn binding_starts_page(
+        &self,
+        graph_id: &str,
+        after: u64,
+        head: u64,
+    ) -> Result<
+        (
+            u64,
+            Vec<(String, super::events::ExecutionNodeBinding, (u64, u64, u32))>,
+        ),
+        ExecutionStateStoreError,
+    > {
+        let graph = self.load(graph_id)?;
+        let records = self.binding_history_page(&graph, after, head)?;
+        let mut cursor = after;
+        let mut starts = Vec::new();
+        for (record, event) in records {
+            cursor = record.sequence;
             let bindings = match event {
                 ExecutionGraphEvent::NodeTransitioned {
                     node_id,
@@ -428,6 +446,200 @@ impl ExecutionGraphStateStore {
             }
         }
         Ok((cursor, starts))
+    }
+
+    /// A read-only fact for the original bound ToolBatch cancellation owner.
+    /// Replay every authenticated record: a terminal snapshot cannot erase a start.
+    pub(crate) fn confirm_cancelled_bound_child_never_admitted(
+        &self,
+        expected: &ExecutionGraph,
+    ) -> Result<(), ExecutionStateStoreError> {
+        use harness_contract::execution_graph::ExecutionNodeStatus;
+        let corrupt = |reason: &str| ExecutionStateStoreError::Corrupt {
+            graph_id: expected.id.clone(),
+            reason: reason.into(),
+        };
+        super::executors::agent_tool::decode_bound_agent_tool_graph(expected)
+            .map_err(|_| corrupt("never-admitted original bound child identity invalid"))?;
+        let fence = self.event_store.source_mutation_fence()?;
+        let head = self.event_store.stream_revision(&expected.id)?;
+        if head < 2 {
+            return Err(corrupt("never-admitted cancellation missing"));
+        }
+        let mut cursor = 0;
+        let mut state: Option<ExecutionGraph> = None;
+        let mut cancelled = false;
+        while cursor < head {
+            for (record, event) in self.binding_history_page(expected, cursor, head)? {
+                let node = &expected.nodes[0];
+                let command = match &event {
+                    ExecutionGraphEvent::Planned { .. }
+                        if record.sequence == 1
+                            && record.transaction_id == format!("{}:planned", expected.id) =>
+                    {
+                        None
+                    }
+                    ExecutionGraphEvent::CommandApplied { command, .. }
+                        if state.is_some()
+                            && !cancelled
+                            && matches!(command.as_str(), "start" | "cancel")
+                            && record.transaction_id
+                                == format!(
+                                    "{}:command:{}:{}",
+                                    expected.id, command, record.sequence
+                                ) =>
+                    {
+                        Some(command.as_str())
+                    }
+                    ExecutionGraphEvent::NodeTransitioned {
+                        node_id,
+                        from: ExecutionNodeStatus::Planned,
+                        to: ExecutionNodeStatus::Ready,
+                        result: None,
+                        binding: None,
+                        ..
+                    } if state.is_some()
+                        && !cancelled
+                        && node_id == &node.id
+                        && state.as_ref().and_then(|g| g.node_statuses.get(node_id))
+                            == Some(&ExecutionNodeStatus::Planned)
+                        && record.transaction_id
+                            == format!(
+                                "{}:{}:{}:{}",
+                                expected.id,
+                                node.id,
+                                record.sequence,
+                                ExecutionNodeStatus::Ready as u8
+                            ) =>
+                    {
+                        None
+                    }
+                    ExecutionGraphEvent::Checkpoint {
+                        cause,
+                        bindings,
+                        lease_closures,
+                        ..
+                    } if state.is_some()
+                        && !cancelled
+                        && bindings.is_empty()
+                        && lease_closures.is_empty()
+                        && cause == "execution_graph.command_applied" =>
+                    {
+                        if record.transaction_id
+                            == format!("{}:command:cancel:{}", expected.id, record.sequence)
+                        {
+                            Some("cancel")
+                        } else if record.transaction_id
+                            == format!("{}:command:start:{}", expected.id, record.sequence)
+                        {
+                            Some("start")
+                        } else {
+                            return Err(corrupt("never-admitted checkpoint command unknown"));
+                        }
+                    }
+                    ExecutionGraphEvent::Checkpoint {
+                        cause,
+                        bindings,
+                        lease_closures,
+                        ..
+                    } if state.is_some()
+                        && !cancelled
+                        && bindings.is_empty()
+                        && lease_closures.is_empty()
+                        && cause == "execution_graph.node_transitioned"
+                        && state.as_ref().and_then(|g| g.node_statuses.get(&node.id))
+                            == Some(&ExecutionNodeStatus::Planned)
+                        && record.transaction_id
+                            == format!(
+                                "{}:{}:{}:{}",
+                                expected.id,
+                                node.id,
+                                record.sequence,
+                                ExecutionNodeStatus::Ready as u8
+                            ) =>
+                    {
+                        None
+                    }
+                    _ => {
+                        return Err(corrupt(
+                            "never-admitted history contains admission or ambiguous mutation",
+                        ))
+                    }
+                };
+                let mut projected = event
+                    .project(state.clone())
+                    .map_err(|_| corrupt("never-admitted history projection failed"))?;
+                if projected.revision != record.sequence
+                    || projected
+                        .recovery_cursor
+                        .node_attempts
+                        .values()
+                        .any(|attempt| *attempt != 0)
+                    || projected
+                        .recovery_cursor
+                        .node_attempts
+                        .keys()
+                        .any(|key| key != &node.id)
+                    || !projected.node_results.is_empty()
+                    || record.transaction_index != 0
+                    || record.idempotency_key.as_deref()
+                        != Some(format!("{}:revision:{}", expected.id, record.sequence).as_str())
+                {
+                    return Err(corrupt("never-admitted history contains attempt or result"));
+                }
+                // Only original dependency readiness and the exact Cancel may change status.
+                let ready_transition = matches!(
+                    event,
+                    ExecutionGraphEvent::NodeTransitioned { .. }
+                ) || matches!(&event, ExecutionGraphEvent::Checkpoint { cause, .. } if cause == "execution_graph.node_transitioned");
+                let wanted = if command == Some("cancel") {
+                    ExecutionNodeStatus::Cancelled
+                } else if ready_transition {
+                    ExecutionNodeStatus::Ready
+                } else {
+                    state
+                        .as_ref()
+                        .and_then(|g| g.node_statuses.get(&node.id))
+                        .copied()
+                        .unwrap_or(ExecutionNodeStatus::Planned)
+                };
+                if projected.node_statuses.len() != 1
+                    || projected.node_statuses.get(&node.id) != Some(&wanted)
+                {
+                    return Err(corrupt("never-admitted node status mismatch"));
+                }
+                let mut identity = projected.clone();
+                identity.revision = expected.revision;
+                identity.node_statuses = expected.node_statuses.clone();
+                identity.node_results = expected.node_results.clone();
+                identity.recovery_cursor = expected.recovery_cursor.clone();
+                if identity != *expected {
+                    return Err(corrupt("never-admitted original graph identity changed"));
+                }
+                projected.recovery_cursor.commit_cursor = record.commit_cursor;
+                state = Some(projected);
+                cancelled |= command == Some("cancel");
+                cursor = record.sequence;
+            }
+        }
+        if !cancelled
+            || self.event_store.stream_revision(&expected.id)? != head
+            || self.event_store.source_mutation_fence()? != fence
+        {
+            return Err(corrupt("never-admitted source head or fence changed"));
+        }
+        // Also reject a stale/foreign hot view rather than relying on it as proof.
+        if self.load_current(&expected.id)?
+            != state.ok_or_else(|| corrupt("never-admitted history missing"))?
+        {
+            return Err(corrupt("never-admitted current projection mismatch"));
+        }
+        if self.event_store.stream_revision(&expected.id)? != head
+            || self.event_store.source_mutation_fence()? != fence
+        {
+            return Err(corrupt("never-admitted source head or fence changed"));
+        }
+        Ok(())
     }
 
     pub(crate) fn committed_binding_result(
@@ -2798,42 +3010,111 @@ mod tests {
         let key = original.idempotency_key.as_deref().unwrap();
         let mut changed = original.clone();
         changed.payload["sha256"] = serde_json::json!("sha256:view-replaced");
-        fixture.backend.set_fault(Some(GraphReadFault::Replace(changed.sequence, changed.clone())), false);
+        fixture.backend.set_fault(
+            Some(GraphReadFault::Replace(changed.sequence, changed.clone())),
+            false,
+        );
         let current = fixture.backend.source_mutation_fence().unwrap();
         assert_ne!(source, current);
-        let observed = fixture.events.event_by_idempotency_key(&original.stream_id, key).unwrap().unwrap();
+        let observed = fixture
+            .events
+            .event_by_idempotency_key(&original.stream_id, key)
+            .unwrap()
+            .unwrap();
         assert_eq!(observed, changed);
-        assert!(fixture.backend.hits.load(std::sync::atomic::Ordering::SeqCst) > 0);
-        assert!(fixture.backend.compare_and_put_projection_checkpoint_fenced(
-            "843-view-fence", original.commit_cursor, 0, &serde_json::json!({}), 0, &source,
-        ).is_err());
-        assert!(fixture.backend.projection_checkpoint("843-view-fence").unwrap().is_none());
+        assert!(
+            fixture
+                .backend
+                .hits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        assert!(fixture
+            .backend
+            .compare_and_put_projection_checkpoint_fenced(
+                "843-view-fence",
+                original.commit_cursor,
+                0,
+                &serde_json::json!({}),
+                0,
+                &source,
+            )
+            .is_err());
+        assert!(fixture
+            .backend
+            .projection_checkpoint("843-view-fence")
+            .unwrap()
+            .is_none());
         fixture.backend.set_fault(None, false);
         let restored = fixture.backend.source_mutation_fence().unwrap();
         assert_ne!(restored, source);
         assert_ne!(restored, current);
-        assert!(fixture.backend.compare_and_put_projection_checkpoint_fenced(
-            "843-view-fence", original.commit_cursor, 0, &serde_json::json!({}), 0, &inner,
-        ).is_err());
-        fixture.backend.compare_and_put_projection_checkpoint_fenced(
-            "843-view-fence", original.commit_cursor, 0, &serde_json::json!({}), 0, &restored,
-        ).unwrap();
+        assert!(fixture
+            .backend
+            .compare_and_put_projection_checkpoint_fenced(
+                "843-view-fence",
+                original.commit_cursor,
+                0,
+                &serde_json::json!({}),
+                0,
+                &inner,
+            )
+            .is_err());
+        fixture
+            .backend
+            .compare_and_put_projection_checkpoint_fenced(
+                "843-view-fence",
+                original.commit_cursor,
+                0,
+                &serde_json::json!({}),
+                0,
+                &restored,
+            )
+            .unwrap();
     }
 
     #[tokio::test]
     async fn own843_previously_folded_original_metadata_change_is_rejected_on_resume() {
         let fixture = CanonicalGraphFixture::new();
         let services = fixture.services();
-        let first = crate::execution_projection::snapshot(&services, &fixture.expected.id, &fixture.context(&services)).await.unwrap();
-        assert!(first.health.iter().any(|entity| entity.kind == "history_verification" && entity.status.as_deref() == Some("incomplete")));
+        let first = crate::execution_projection::snapshot(
+            &services,
+            &fixture.expected.id,
+            &fixture.context(&services),
+        )
+        .await
+        .unwrap();
+        assert!(first
+            .health
+            .iter()
+            .any(|entity| entity.kind == "history_verification"
+                && entity.status.as_deref() == Some("incomplete")));
         assert!(!first.terminal_axes.execution.coverage_complete);
         let mut changed = fixture.records[0].clone();
         changed.payload["sha256"] = format!("sha256:{}", "0".repeat(64)).into();
-        fixture.backend.set_fault(Some(GraphReadFault::Replace(changed.sequence, changed)), false);
+        fixture.backend.set_fault(
+            Some(GraphReadFault::Replace(changed.sequence, changed)),
+            false,
+        );
         let error = fixture.projection(&services).await.unwrap_err();
-        assert!(error.to_string().contains("verified original record changed"), "{error}");
-        assert!(fixture.backend.hits.load(std::sync::atomic::Ordering::SeqCst) > 0);
-        let saved = fixture.events.projection_checkpoint(&format!("projection-history:{}", fixture.expected.id)).unwrap().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("verified original record changed"),
+            "{error}"
+        );
+        assert!(
+            fixture
+                .backend
+                .hits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        let saved = fixture
+            .events
+            .projection_checkpoint(&format!("projection-history:{}", fixture.expected.id))
+            .unwrap()
+            .unwrap();
         assert_eq!(saved.payload["incomplete"], true);
     }
 
@@ -2841,18 +3122,427 @@ mod tests {
     async fn own843_foreign_prefix_owner_cannot_supply_current_history() {
         let original = CanonicalGraphFixture::new();
         let original_services = original.services();
-        let first = crate::execution_projection::snapshot(&original_services, &original.expected.id, &original.context(&original_services)).await.unwrap();
-        assert!(first.health.iter().any(|entity| entity.status.as_deref() == Some("incomplete")));
-        let saved = original.events.projection_checkpoint(&format!("projection-history:{}", original.expected.id)).unwrap().unwrap();
+        let first = crate::execution_projection::snapshot(
+            &original_services,
+            &original.expected.id,
+            &original.context(&original_services),
+        )
+        .await
+        .unwrap();
+        assert!(first
+            .health
+            .iter()
+            .any(|entity| entity.status.as_deref() == Some("incomplete")));
+        let saved = original
+            .events
+            .projection_checkpoint(&format!("projection-history:{}", original.expected.id))
+            .unwrap()
+            .unwrap();
         let foreign = CanonicalGraphFixture::new();
         let foreign_services = foreign.services();
         let result = foreign.events.compare_and_put_projection_checkpoint(
-            &format!("projection-history:{}", foreign.expected.id), saved.source_cursor, 0, &saved.payload, 0);
+            &format!("projection-history:{}", foreign.expected.id),
+            saved.source_cursor,
+            0,
+            &saved.payload,
+            0,
+        );
         if result.is_ok() {
             assert!(foreign.projection(&foreign_services).await.is_err());
         } else {
-            assert!(foreign.events.projection_checkpoint(&format!("projection-history:{}", foreign.expected.id)).unwrap().is_none());
+            assert!(foreign
+                .events
+                .projection_checkpoint(&format!("projection-history:{}", foreign.expected.id))
+                .unwrap()
+                .is_none());
         }
+    }
+
+    fn replace_never_admitted_record_body(
+        events: &RuntimeEventStore,
+        record: &mut crate::DurableRuntimeEvent,
+        event: ExecutionGraphEvent,
+    ) {
+        let binding = record
+            .activity_binding()
+            .expect("retain original source identity");
+        let activity = record.payload["_runtime_activity_binding"].clone();
+        record.kind = event.kind().into();
+        record.payload = events
+            .prepare_content(
+                &format!("session:{}", binding.session_id),
+                &format!("graph:{}:revision:{}", record.stream_id, record.sequence),
+                &serde_json::to_value(&event).unwrap(),
+                &crate::PreparedArtifactOrigin::EventBody {
+                    stream_id: record.stream_id.clone(),
+                    idempotency_key: record.idempotency_key.clone().unwrap(),
+                    kind: record.kind.clone(),
+                },
+            )
+            .unwrap();
+        record.payload["_runtime_activity_binding"] = activity;
+        assert_eq!(record.activity_binding(), Some(binding));
+        assert_eq!(
+            decode_execution_graph_event(events, record).unwrap().kind(),
+            event.kind(),
+            "fault body must satisfy original content decoder first"
+        );
+    }
+
+    fn never_admitted_fixture() -> (
+        tempfile::TempDir,
+        Arc<GraphFaultBackend>,
+        Arc<RuntimeEventStore>,
+        Arc<ExecutionCommitService>,
+        ExecutionGraph,
+        ExecutionGraph,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let request =
+            super::super::executors::agent_tool::carrier_437_tests::real_request(root.path());
+        let mut expected =
+            super::super::executors::agent_tool::carrier_437_tests::graph_for(request);
+        crate::test_support::attach_execution_graph_lineage(&mut expected);
+        let backend = GraphFaultBackend::new();
+        let events = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
+        let writer = Arc::new(ExecutionCommitService::new(events.clone()));
+        let registered = writer.register_graph(expected.clone()).unwrap().graph;
+        (root, backend, events, writer, expected, registered)
+    }
+
+    #[test]
+    fn never_admitted_cancel_wins_is_read_only_and_old_start_cas_loses() {
+        let (_root, _backend, events, writer, expected, registered) = never_admitted_fixture();
+        let cancelled = writer
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: registered.revision,
+                    reason: "original call stopped".into(),
+                },
+            )
+            .unwrap()
+            .graph;
+        let before = events.list_stream(&expected.id).unwrap();
+        for _ in 0..2 {
+            writer
+                .confirm_cancelled_bound_child_never_admitted(&expected)
+                .unwrap();
+        }
+        assert_eq!(
+            events.list_stream(&expected.id).unwrap(),
+            before,
+            "read fact must not publish receipt or attempt"
+        );
+        assert!(cancelled.recovery_cursor.node_attempts.is_empty());
+        let error = writer
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::Start {
+                    expected_revision: registered.revision,
+                },
+            )
+            .err()
+            .expect("stale snapshot Start must reject");
+        assert!(
+            matches!(&error, super::super::commit_service::ExecutionCommitError::EventStore(RuntimeEventStoreError::InvalidTransaction(reason)) if reason == "event idempotency key already belongs to another transaction"),
+            "{error:?}"
+        );
+        let error = writer
+            .apply_command(
+                &cancelled,
+                &ExecutionGraphCommand::Start {
+                    expected_revision: registered.revision,
+                },
+            )
+            .err()
+            .expect("old revision must fail original command CAS");
+        assert!(
+            matches!(
+                error,
+                super::super::commit_service::ExecutionCommitError::StaleRevision { .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            events.list_stream(&expected.id).unwrap(),
+            before,
+            "both losing starts publish nothing"
+        );
+    }
+
+    #[test]
+    fn never_admitted_dependency_ready_is_not_a_started_attempt() {
+        use harness_contract::execution_graph::ExecutionNodeStatus;
+        let (_root, _backend, _events, writer, expected, registered) = never_admitted_fixture();
+        let started = writer
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::Start {
+                    expected_revision: registered.revision,
+                },
+            )
+            .unwrap()
+            .graph;
+        let ready = writer
+            .transition_node(
+                &started,
+                &expected.nodes[0].id,
+                ExecutionNodeStatus::Ready,
+                None,
+                vec![],
+            )
+            .unwrap()
+            .graph;
+        assert_eq!(
+            ready.recovery_cursor.node_attempts[&expected.nodes[0].id],
+            0
+        );
+        let cancelled = writer
+            .apply_command(
+                &ready,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: ready.revision,
+                    reason: "before admission".into(),
+                },
+            )
+            .unwrap()
+            .graph;
+        writer
+            .confirm_cancelled_bound_child_never_admitted(&expected)
+            .unwrap();
+        assert_eq!(
+            cancelled.node_statuses[&expected.nodes[0].id],
+            ExecutionNodeStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn never_admitted_original_checkpoints_and_multiple_pages_are_authenticated() {
+        let (_root, _backend, events, writer, expected, registered) = never_admitted_fixture();
+        let mut current = registered;
+        for _ in 0..105 {
+            current = writer
+                .apply_command(
+                    &current,
+                    &ExecutionGraphCommand::Start {
+                        expected_revision: current.revision,
+                    },
+                )
+                .unwrap()
+                .graph;
+        }
+        writer
+            .apply_command(
+                &current,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: current.revision,
+                    reason: "cancel before any admission".into(),
+                },
+            )
+            .unwrap();
+        let records = events.list_stream(&expected.id).unwrap();
+        assert!(records.len() > 100, "must cross original bounded page");
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == "execution_graph.checkpoint"),
+            "must hit real writer checkpoint"
+        );
+        writer
+            .confirm_cancelled_bound_child_never_admitted(&expected)
+            .unwrap();
+        assert_eq!(events.list_stream(&expected.id).unwrap(), records);
+    }
+
+    #[test]
+    fn never_admitted_history_gap_foreign_identity_and_checkpoint_fail_closed() {
+        let (_root, backend, events, writer, expected, registered) = never_admitted_fixture();
+        writer
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: registered.revision,
+                    reason: "cancel".into(),
+                },
+            )
+            .unwrap();
+        let reader = ExecutionGraphStateStore::new(events.clone());
+        reader
+            .confirm_cancelled_bound_child_never_admitted(&expected)
+            .unwrap();
+        let records = events.list_stream(&expected.id).unwrap();
+        let cancel = records.last().unwrap().clone();
+        let mut foreign = cancel.clone();
+        foreign.actor = Some("foreign".into());
+        let mut unknown = cancel.clone();
+        unknown.transaction_id = "foreign:command:cancel:2".into();
+        let projected = reader.load_current(&expected.id).unwrap();
+        let mut ambiguous = cancel.clone();
+        replace_never_admitted_record_body(
+            &events,
+            &mut ambiguous,
+            ExecutionGraphEvent::Checkpoint {
+                cause: "execution_graph.recovered".into(),
+                graph: projected,
+                bindings: BTreeMap::new(),
+                lease_closures: vec![],
+            },
+        );
+        for (fault, predicate) in [
+            (GraphReadFault::Missing(1), "lease start source mismatch"),
+            (GraphReadFault::Duplicate(1), "lease start source mismatch"),
+            (
+                GraphReadFault::Replace(cancel.sequence, foreign),
+                "lease start source mismatch",
+            ),
+            (
+                GraphReadFault::Replace(cancel.sequence, unknown),
+                "admission or ambiguous mutation",
+            ),
+            (
+                GraphReadFault::Replace(cancel.sequence, ambiguous),
+                "admission or ambiguous mutation",
+            ),
+        ] {
+            backend.set_fault(Some(fault), true);
+            let error = reader
+                .confirm_cancelled_bound_child_never_admitted(&expected)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(predicate),
+                "target {predicate}, actual {error}"
+            );
+            assert!(
+                backend.hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "fault must be read"
+            );
+        }
+        backend.set_fault(None, false);
+        for variant in 0..4 {
+            let mut wrong = expected.clone();
+            match variant {
+                0 => wrong
+                    .parent_execution
+                    .as_mut()
+                    .unwrap()
+                    .node_id
+                    .push_str("foreign"),
+                1 => wrong.nodes[0].payload_ref.push(' '),
+                2 => wrong.id.push_str("foreign"),
+                _ => wrong
+                    .lineage
+                    .as_mut()
+                    .unwrap()
+                    .session_id
+                    .push_str("foreign"),
+            }
+            assert!(reader
+                .confirm_cancelled_bound_child_never_admitted(&wrong)
+                .is_err());
+        }
+        reader
+            .confirm_cancelled_bound_child_never_admitted(&expected)
+            .unwrap();
+    }
+
+    #[test]
+    fn never_admitted_historical_start_cannot_be_erased_by_terminal_snapshot() {
+        use harness_contract::execution_graph::ExecutionNodeStatus;
+        let (_root, backend, events, writer, expected, registered) = never_admitted_fixture();
+        let node = &expected.nodes[0];
+        let ready = writer
+            .transition_node(
+                &registered,
+                &node.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                vec![],
+            )
+            .unwrap()
+            .graph;
+        let binding = super::super::events::ExecutionNodeBinding {
+            executor_kind: node.executor_kind.clone(),
+            ticket_idempotency_key: node.idempotency_key.clone(),
+            attempt: 1,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        let running = writer
+            .bind_and_start_node(&ready, &node.id, binding)
+            .unwrap()
+            .graph;
+        assert_eq!(running.recovery_cursor.node_attempts[&node.id], 1);
+        let mut cancelled = writer
+            .apply_command(
+                &running,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: running.revision,
+                    reason: "after admission".into(),
+                },
+            )
+            .unwrap()
+            .graph;
+        cancelled.recovery_cursor.node_attempts.clear();
+        let mut record = events.list_stream(&expected.id).unwrap().pop().unwrap();
+        replace_never_admitted_record_body(
+            &events,
+            &mut record,
+            ExecutionGraphEvent::Checkpoint {
+                cause: "execution_graph.command_applied".into(),
+                graph: cancelled,
+                bindings: BTreeMap::new(),
+                lease_closures: vec![],
+            },
+        );
+        assert!(
+            matches!(decode_execution_graph_event(&events, &record).unwrap(), ExecutionGraphEvent::Checkpoint { graph, .. } if graph.recovery_cursor.node_attempts.is_empty()),
+            "injected terminal snapshot must actually conceal original attempt"
+        );
+        backend.set_fault(
+            Some(GraphReadFault::Replace(record.sequence, record)),
+            false,
+        );
+        let reader = ExecutionGraphStateStore::new(events);
+        let error = reader
+            .confirm_cancelled_bound_child_never_admitted(&expected)
+            .unwrap_err();
+        assert!(
+            backend.hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "production bounded reader must consume actual replaced terminal record"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("admission or ambiguous mutation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn never_admitted_head_change_during_final_read_rejects() {
+        let (_root, backend, events, writer, expected, registered) = never_admitted_fixture();
+        let cancelled = writer
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: registered.revision,
+                    reason: "before read".into(),
+                },
+            )
+            .unwrap()
+            .graph;
+        *backend.append_on_read.lock().unwrap() = Some((writer, cancelled.clone()));
+        let reader = ExecutionGraphStateStore::new(events.clone());
+        assert!(reader
+            .confirm_cancelled_bound_child_never_admitted(&expected)
+            .is_err());
+        assert_eq!(
+            events.stream_revision(&expected.id).unwrap(),
+            cancelled.revision + 1,
+            "actual concurrent append must hit"
+        );
     }
 
     #[test]
