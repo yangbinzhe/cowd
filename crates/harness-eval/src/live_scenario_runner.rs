@@ -119,7 +119,21 @@ fn u5_proc_stat(pid: u32) -> Result<(u32, u64), String> {
 
 impl U5Host {
     pub(crate) fn inherited() -> Result<Self, String> {
-        use std::{io::Read, os::unix::fs::MetadataExt};
+        Self::inherited_observed(|| {})
+    }
+
+    // One reader, with a private observation point for deterministic stability
+    // faults. Production supplies no mutation or alternative authority.
+    fn inherited_observed(after_read: impl FnOnce()) -> Result<Self, String> {
+        use std::{
+            io::{Read, Seek, SeekFrom},
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        if !cfg!(target_os = "linux") {
+            return Err("U5 inherited host requires the original Linux launcher".into());
+        }
+
         let root = std::env::var("XDG_RUNTIME_DIR").map_err(|_| "U5 private root missing")?;
         let meta = std::fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
         let uid = std::fs::metadata("/proc/self")
@@ -128,8 +142,14 @@ impl U5Host {
         if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o777 != 0o700 {
             return Err("U5 private root invalid".into());
         }
-        let file =
-            std::fs::File::open("/proc/self/fd/9").map_err(|_| "U5 inherited host FD missing")?;
+        // Linux /proc descriptor reopening must not wait for a FIFO writer
+        // before fstat can reject it. No unsafe fd adoption or blocking open.
+        const LINUX_O_NONBLOCK: i32 = 0x800;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(LINUX_O_NONBLOCK)
+            .open("/proc/self/fd/9")
+            .map_err(|_| "U5 inherited host FD missing")?;
         let fm = file.metadata().map_err(|e| e.to_string())?;
         if !fm.is_file() || fm.uid() != uid || fm.mode() & 0o777 != 0o400 || fm.len() > 16384 {
             return Err("U5 inherited host FD invalid".into());
@@ -147,12 +167,62 @@ impl U5Host {
         if target != std::path::Path::new(&root).join("u5-host.json") {
             return Err("U5 host FD outside original root".into());
         }
+        let named_path = std::path::Path::new(&root).join("u5-host.json");
+        let stamp = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mode(),
+                m.uid(),
+                m.nlink(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        let named = std::fs::symlink_metadata(&named_path).map_err(|e| e.to_string())?;
+        if !named.is_file()
+            || fm.nlink() != 1
+            || stamp(&named) != stamp(&fm)
+            || Instant::now() >= deadline
+        {
+            return Err("U5 host file identity is not the original private regular file".into());
+        }
         let mut bytes = Vec::new();
-        file.take(16385)
+        (&mut file)
+            .take(16385)
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
-        if bytes.len() > 16384 {
-            return Err("U5 host FD grew".into());
+        if bytes.len() as u64 != fm.len() || Instant::now() >= deadline {
+            return Err("U5 host extent changed or deadline elapsed".into());
+        }
+        after_read();
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut confirmed = Vec::new();
+        (&mut file)
+            .take(16385)
+            .read_to_end(&mut confirmed)
+            .map_err(|e| e.to_string())?;
+        let after = file.metadata().map_err(|e| e.to_string())?;
+        let named_after = std::fs::symlink_metadata(&named_path).map_err(|e| e.to_string())?;
+        let root_after = std::fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
+        if bytes != confirmed
+            || stamp(&fm) != stamp(&after)
+            || !named_after.is_file()
+            || stamp(&fm) != stamp(&named_after)
+            || !root_after.is_dir()
+            || (meta.dev(), meta.ino(), meta.uid(), meta.mode())
+                != (
+                    root_after.dev(),
+                    root_after.ino(),
+                    root_after.uid(),
+                    root_after.mode(),
+                )
+            || Instant::now() >= deadline
+        {
+            return Err("U5 host file/content/private root changed during read".into());
         }
         let host: Self = serde_json::from_slice(&bytes).map_err(|_| "U5 invalid host handoff")?;
         let namespace = format!(
@@ -187,7 +257,7 @@ impl U5Host {
         {
             return Err("U5 original launcher binding mismatch".into());
         }
-        host.validate_live()?;
+        host.validate_live_until(deadline)?;
         Ok(host)
     }
 

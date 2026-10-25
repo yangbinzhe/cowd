@@ -3554,7 +3554,57 @@ fn u5_inherited_host_fd_contract_probe() {
     // The shell double executes this exact reader through the original exec
     // chain. No API/model/PG is contacted. Without that owned host it must deny.
     let expected = std::env::var("COWD_U5_TEST_HOST_EXPECT").unwrap_or_else(|_| "deny".into());
-    match (expected.as_str(), U5Host::inherited()) {
+    let mutation = std::env::var("COWD_U5_TEST_HOST_MUTATION").unwrap_or_default();
+    let result = if mutation.is_empty() {
+        U5Host::inherited()
+    } else {
+        U5Host::inherited_observed(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap());
+            let path = root.join("u5-host.json");
+            let original = std::fs::read(&path).unwrap();
+            match mutation.as_str() {
+                "content" | "size" => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    let mut bytes = original;
+                    if mutation == "size" {
+                        bytes.push(b' ');
+                    } else {
+                        let n = bytes.len() - 1;
+                        bytes[n] = b' ';
+                    }
+                    std::fs::write(&path, bytes).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+                "inode" => {
+                    std::fs::rename(&path, root.join("old-host.json")).unwrap();
+                    std::fs::write(&path, original).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+                "root" => {
+                    let old = root.with_extension("retained");
+                    std::fs::rename(&root, &old).unwrap();
+                    std::fs::create_dir(&root).unwrap();
+                    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    std::fs::write(&path, original).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+                _ => panic!("unknown test-only mutation"),
+            }
+        })
+    };
+    if let Ok(reason) = std::env::var("COWD_U5_TEST_EXPECT_REASON") {
+        assert!(
+            result.as_ref().err().is_some_and(|e| e.contains(&reason)),
+            "target reader rejection must be reached"
+        );
+    }
+    match (expected.as_str(), result) {
         ("allow", Ok(host)) => {
             assert_eq!(host.owner().principal_actor, "");
             assert!(u5_valid_owner(&host.owner(), &host.base_url));

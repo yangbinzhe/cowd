@@ -1167,7 +1167,8 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
     let checks = [
         (
             "u5_exact_focused_selection",
-            report["level"] == "deep"
+            report.get("u5_lifecycle_aborted").is_none()
+                && report["level"] == "deep"
                 && report["authorized_real_model"] == true
                 && live["status"] == "pending_outer_cleanup"
                 && live["claim_scope"] == "focused"

@@ -86,18 +86,52 @@ pub fn run_eval_cli(
     store: &HarnessEvalReportStore,
     options: HarnessEvalRunnerOptions,
 ) -> Result<(HarnessEvalRunRecord, CliEvalDisposition), String> {
-    if std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_deref()
-        != Some("live_u5_shared_session_fairness")
-    {
-        return run_eval(store, options).map(|r| (r, CliEvalDisposition::Finished));
+    run_eval_owned(store, options, HarnessEvalRunControl::default())
+}
+
+struct EvalDraft {
+    report: Value,
+    stable_ai: StableAiHealthReport,
+    u5_host: Option<crate::live_scenario_runner::U5Host>,
+    #[cfg(test)]
+    completion_test: Option<CompletionTest>,
+}
+
+fn selected_u5_strategy() -> bool {
+    #[cfg(test)]
+    if TEST_F_DRAFT.with(|slot| slot.borrow().is_some()) {
+        return true;
     }
-    if options.level != HarnessEvalLevel::Deep || !options.allow_real_model {
-        return Err("U5 explicit real focused authorization required".into());
+    std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_deref()
+        == Some("live_u5_shared_session_fairness")
+}
+
+fn produce_u5_report(
+    options: &HarnessEvalRunnerOptions,
+    run_id: &str,
+    requested: u128,
+) -> Result<EvalDraft, String> {
+    #[cfg(test)]
+    if let Some(mut draft) = TEST_F_DRAFT.with(|slot| slot.borrow_mut().take()) {
+        draft.report["run_id"] = json!(run_id);
+        if let Some(test) = &draft.completion_test {
+            let observed = HarnessEvalReportStore::new(&test.report_root)
+                .get_run(run_id)
+                .expect("original lifecycle reader")
+                .expect("Running before strategy execution");
+            assert_eq!(observed.status, "running");
+            assert_eq!(observed.run_id, run_id);
+        }
+        if let Some(flag) = draft
+            .completion_test
+            .as_ref()
+            .and_then(|t| t.cancel_after_execute.as_ref())
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
+        return Ok(draft);
     }
     let host = crate::live_scenario_runner::U5Host::inherited()?;
-    let requested = now_ms();
-    let run_id = format!("harness-eval-u5-{}", uuid::Uuid::new_v4());
-    store.upsert_run(&running_record(&options, &run_id, requested))?;
     let details = run_live_gateway_scenarios(&options);
     let leaves = details
         .pointer("/scenarios/0/sessions")
@@ -113,76 +147,211 @@ pub fn run_eval_cli(
     if let Some(object) = trace_usage.as_object_mut() {
         object.insert("usage_source".into(), json!("live_gateway_canonical_usage"));
     }
-    let mut report = json!({"kind":"harness_eval.u5_internal","level":"deep","authorized_real_model":true,
+    let report = json!({"kind":"harness_eval.u5_internal","level":"deep","authorized_real_model":true,
         "run_id":run_id,"u5_host":host.binding(),"u5_usage":usage,
         "provider":options.provider,"budget":options.budget,
         "live_gateway_scenarios":live_gateway_scenario_summary(&details),"live_gateway_scenario_details":details,
         "scenarios":[{"capability":"live_u5_shared_session_fairness","status":"pending_outer_cleanup"}],
         "execution_trace":{"started_at_ms":requested,"total_elapsed_ms":now_ms().saturating_sub(requested),
             "provider_rounds":calls,"tool_calls":tools,"total_usage":trace_usage}});
-    let stable = stable_ai_report_for(&options);
-    let gate = evaluate_report_gate(&report);
-    if gate.status == "failed" {
-        report["scenarios"][0]["status"] = json!("failed");
-    }
-    let summary = store.write_report("deep", &mut report, &stable)?;
-    let pending =
-        gate.status == "pending_outer_cleanup" && summary.status == "pending_outer_cleanup";
-    let mut record = completed_record(
-        run_id,
-        &summary,
-        if pending {
-            HarnessEvalRunStatus::Gated
+    Ok(EvalDraft {
+        report,
+        stable_ai: stable_ai_report_for(options),
+        u5_host: Some(host),
+        #[cfg(test)]
+        completion_test: None,
+    })
+}
+
+fn revalidate_u5(draft: &EvalDraft) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(test) = &draft.completion_test {
+        if let Some(flag) = &test.cancel_on_validate {
+            flag.store(true, Ordering::SeqCst);
+        }
+        return if test.revalidate_fail {
+            Err("test original host revalidation refused".into())
         } else {
-            HarnessEvalRunStatus::Failed
-        },
-        &options,
-        requested,
-        false,
-    );
-    record.message = if pending {
-        "U5 internal stage pending original host shutdown; not accepted"
-    } else {
-        "U5 internal hardgate failed"
+            Ok(())
+        };
     }
-    .into();
-    store.upsert_run(&record)?;
-    if !pending {
-        return Ok((record, CliEvalDisposition::Finished));
-    }
-    // Revalidate original inherited host after all actor work, before publishing
-    // the sole pending receipt. A body containing "pending" cannot enter here.
+    let host = draft.u5_host.as_ref().ok_or("U5 original host missing")?;
     let current = crate::live_scenario_runner::U5Host::inherited()?;
     if current.binding() != host.binding() {
         return Err("U5 host changed after run".into());
     }
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let report_path = record
-        .report_path
-        .as_deref()
-        .ok_or("U5 report not persisted")?;
-    let bytes = std::fs::read(report_path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// A local handoff file guard, not a new lifecycle/receipt authority. Only fully
+// written bytes become visible at the original final path; failed publication
+// or final record write removes only the exact file this call created.
+struct PendingReceipt {
+    path: std::path::PathBuf,
+    dev: u64,
+    ino: u64,
+    keep: bool,
+}
+impl PendingReceipt {
+    fn own(path: std::path::PathBuf) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        Ok(Self {
+            path,
+            dev: m.dev(),
+            ino: m.ino(),
+            keep: false,
+        })
+    }
+}
+impl Drop for PendingReceipt {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if !self.keep
+            && std::fs::symlink_metadata(&self.path)
+                .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == (self.dev, self.ino))
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn publish_u5_receipt(
+    draft: &EvalDraft,
+    run_id: &str,
+    report_path: &str,
+) -> Result<PendingReceipt, String> {
     use sha2::{Digest, Sha256};
-    let receipt = json!({"schema_version":1,"disposition":"pending_outer_cleanup","run_id":record.run_id,
-        "owner":host.binding(),"report_path":report_path,"report_sha256":format!("{:x}",Sha256::digest(&bytes)),
-        "scenario":"live_u5_shared_session_fairness","usage":report["u5_usage"]});
-    let path =
-        std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").map_err(|e| e.to_string())?)
-            .join("u5-inner-receipt.json");
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let host = draft.u5_host.as_ref().ok_or("U5 original host missing")?;
+    let final_path = std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_default())
+        .join("u5-inner-receipt.json");
+    #[cfg(test)]
+    let final_path = draft
+        .completion_test
+        .as_ref()
+        .map_or(final_path, |t| t.path.clone());
+    let parent = final_path
+        .parent()
+        .ok_or("U5 private receipt parent missing")?;
+    let staged = parent.join(format!(".u5-inner-{}.staged", uuid::Uuid::new_v4()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
+        .open(&staged)
         .map_err(|e| e.to_string())?;
+    let stage_guard = PendingReceipt::own(staged.clone())?;
+    let bytes = std::fs::read(report_path).map_err(|e| e.to_string())?;
+    let receipt = json!({"schema_version":1,"disposition":"pending_outer_cleanup","run_id":run_id,
+        "owner":host.binding(),"report_path":report_path,"report_sha256":format!("{:x}",Sha256::digest(&bytes)),
+        "scenario":"live_u5_shared_session_fairness","usage":draft.report["u5_usage"]});
     file.write_all(
         serde_json::to_string(&receipt)
             .map_err(|e| e.to_string())?
             .as_bytes(),
     )
-    .and_then(|_| file.sync_all())
     .map_err(|e| e.to_string())?;
-    Ok((record, CliEvalDisposition::PendingOuterCleanup))
+    #[cfg(test)]
+    if draft
+        .completion_test
+        .as_ref()
+        .is_some_and(|t| t.fail_after_write)
+    {
+        return Err("test receipt write/sync failed after bytes".into());
+    }
+    #[cfg(test)]
+    if let Some(flag) = draft
+        .completion_test
+        .as_ref()
+        .and_then(|t| t.cancel_during_receipt.as_ref())
+    {
+        flag.store(true, Ordering::SeqCst);
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    std::fs::hard_link(&staged, &final_path).map_err(|e| e.to_string())?;
+    let final_guard = PendingReceipt {
+        path: final_path,
+        dev: stage_guard.dev,
+        ino: stage_guard.ino,
+        keep: false,
+    };
+    drop(stage_guard);
+    Ok(final_guard)
+}
+
+fn finish_eval_owned(
+    store: &HarnessEvalReportStore,
+    options: &HarnessEvalRunnerOptions,
+    control: &HarnessEvalRunControl,
+    run_id: String,
+    requested: u128,
+    mut draft: EvalDraft,
+) -> Result<(HarnessEvalRunRecord, CliEvalDisposition), String> {
+    let is_u5 = draft.u5_host.is_some();
+    let mut completion_error = None;
+    if is_u5 {
+        if control.is_cancel_requested() {
+            draft.report["u5_lifecycle_aborted"] = json!("cancelled_after_execution");
+        } else if evaluate_report_gate(&draft.report).status == "pending_outer_cleanup" {
+            if let Err(error) = revalidate_u5(&draft) {
+                draft.report["u5_lifecycle_aborted"] = json!("host_revalidation_failed");
+                completion_error = Some(error);
+            }
+        }
+        if control.is_cancel_requested() {
+            draft.report["u5_lifecycle_aborted"] = json!("cancelled_before_report_write");
+        }
+    }
+    let gate = evaluate_report_gate(&draft.report);
+    draft.report["report_gate"] = serde_json::to_value(&gate).map_err(|e| e.to_string())?;
+    draft.report["status"] = json!(gate.status);
+    if is_u5 && gate.status == "failed" {
+        draft.report["scenarios"][0]["status"] = json!("failed");
+    }
+    let summary =
+        store.write_report(options.level.as_str(), &mut draft.report, &draft.stable_ai)?;
+    let pending = is_u5
+        && gate.status == "pending_outer_cleanup"
+        && summary.status == "pending_outer_cleanup";
+    let mut receipt = None;
+    if pending && !control.is_cancel_requested() {
+        match publish_u5_receipt(&draft, &run_id, &summary.report_path) {
+            Ok(guard) => receipt = Some(guard),
+            Err(error) => completion_error = Some(error),
+        }
+    }
+    // The original atomic cancellation token is sampled again after all work
+    // and publication, before deciding the one final durable run record.
+    let cancelled = control.is_cancel_requested();
+    let status = if cancelled {
+        HarnessEvalRunStatus::Cancelled
+    } else if completion_error.is_some() {
+        HarnessEvalRunStatus::Failed
+    } else if pending && receipt.is_some() {
+        HarnessEvalRunStatus::Gated
+    } else if summary.status == "passed" {
+        HarnessEvalRunStatus::Completed
+    } else {
+        HarnessEvalRunStatus::Failed
+    };
+    let accepted_pending = status == HarnessEvalRunStatus::Gated && pending && receipt.is_some();
+    let mut record = completed_record(run_id, &summary, status, options, requested, cancelled);
+    if let Some(error) = completion_error {
+        record.message = format!("U5 completion refused: {error}; original report retained");
+    } else if accepted_pending {
+        record.message = "U5 internal stage pending original host shutdown; not accepted".into();
+    }
+    store.upsert_run(&record)?;
+    if accepted_pending {
+        receipt
+            .as_mut()
+            .expect("validated owned pending receipt")
+            .keep = true;
+        Ok((record, CliEvalDisposition::PendingOuterCleanup))
+    } else {
+        Ok((record, CliEvalDisposition::Finished))
+    }
 }
 
 pub fn run_eval(
@@ -232,6 +401,14 @@ pub fn run_eval_controlled(
     options: HarnessEvalRunnerOptions,
     control: HarnessEvalRunControl,
 ) -> Result<HarnessEvalRunRecord, String> {
+    run_eval_owned(store, options, control).map(|(record, _)| record)
+}
+
+fn run_eval_owned(
+    store: &HarnessEvalReportStore,
+    options: HarnessEvalRunnerOptions,
+    control: HarnessEvalRunControl,
+) -> Result<(HarnessEvalRunRecord, CliEvalDisposition), String> {
     let requested_at_ms = now_ms();
     let run_id = control.run_id.clone().unwrap_or_else(|| {
         format!(
@@ -241,7 +418,10 @@ pub fn run_eval_controlled(
         )
     });
     store.upsert_run(&running_record(&options, &run_id, requested_at_ms))?;
-    if options.level == HarnessEvalLevel::Deep && !options.allow_real_model {
+    if (options.level == HarnessEvalLevel::Deep && !options.allow_real_model)
+        || (selected_u5_strategy()
+            && (options.level != HarnessEvalLevel::Deep || !options.allow_real_model))
+    {
         let record = HarnessEvalRunRecord {
             run_id,
             level: options.level.as_str().to_string(),
@@ -263,10 +443,58 @@ pub fn run_eval_controlled(
                 .to_string(),
         };
         store.upsert_run(&record)?;
-        return Ok(record);
+        return Ok((record, CliEvalDisposition::Finished));
     }
 
     let started = Instant::now();
+    if control.is_cancel_requested() {
+        let record = cancelled_record(
+            run_id,
+            &options,
+            requested_at_ms,
+            Some(0),
+            "harness eval cancelled before execution",
+        );
+        store.upsert_run(&record)?;
+        return Ok((record, CliEvalDisposition::Finished));
+    }
+    let draft = if selected_u5_strategy() {
+        produce_u5_report(&options, &run_id, requested_at_ms).map(Some)
+    } else {
+        produce_normal_report(&options, &control, requested_at_ms, started)
+    };
+    match draft {
+        Ok(Some(draft)) => {
+            finish_eval_owned(store, &options, &control, run_id, requested_at_ms, draft)
+        }
+        Ok(None) => {
+            let record = cancelled_record(
+                run_id,
+                &options,
+                requested_at_ms,
+                Some(started.elapsed().as_millis()),
+                "harness eval cancelled before provider review/report write",
+            );
+            store.upsert_run(&record)?;
+            Ok((record, CliEvalDisposition::Finished))
+        }
+        Err(error) => {
+            let mut record = running_record(&options, &run_id, requested_at_ms);
+            record.status = HarnessEvalRunStatus::Failed.as_str().into();
+            record.finished_at_ms = Some(now_ms());
+            record.message = error;
+            store.upsert_run(&record)?;
+            Ok((record, CliEvalDisposition::Finished))
+        }
+    }
+}
+
+fn produce_normal_report(
+    options: &HarnessEvalRunnerOptions,
+    control: &HarnessEvalRunControl,
+    requested_at_ms: u128,
+    started: Instant,
+) -> Result<Option<EvalDraft>, String> {
     let stable_ai = stable_ai_report_for(&options);
     let complex =
         (options.level != HarnessEvalLevel::Quick).then(evaluate_complex_harness_scenarios);
@@ -536,15 +764,7 @@ pub fn run_eval_controlled(
     });
     report["next_gen_harness_closure"]["provider_rounds"] = json!(execution_provider_rounds);
     if control.is_cancel_requested() {
-        let record = cancelled_record(
-            run_id,
-            &options,
-            requested_at_ms,
-            Some(started.elapsed().as_millis()),
-            "harness eval cancelled before provider review/report write",
-        );
-        store.upsert_run(&record)?;
-        return Ok(record);
+        return Ok(None);
     }
     if options.level == HarnessEvalLevel::Deep
         && options.allow_real_model
@@ -603,28 +823,13 @@ pub fn run_eval_controlled(
         });
         report["next_gen_harness_closure"]["provider_rounds"] = json!(execution_provider_rounds);
     }
-    let cancelled_after_provider = control.is_cancel_requested();
-    let gate = evaluate_report_gate(&report);
-    report["report_gate"] = serde_json::to_value(&gate).map_err(|error| error.to_string())?;
-    report["status"] = Value::String(gate.status.clone());
-    let summary = store.write_report(options.level.as_str(), &mut report, &stable_ai)?;
-    let run_status = if cancelled_after_provider {
-        HarnessEvalRunStatus::Cancelled
-    } else if summary.status == "passed" {
-        HarnessEvalRunStatus::Completed
-    } else {
-        HarnessEvalRunStatus::Failed
-    };
-    let record = completed_record(
-        run_id,
-        &summary,
-        run_status,
-        &options,
-        requested_at_ms,
-        cancelled_after_provider,
-    );
-    store.upsert_run(&record)?;
-    Ok(record)
+    Ok(Some(EvalDraft {
+        report,
+        stable_ai,
+        u5_host: None,
+        #[cfg(test)]
+        completion_test: None,
+    }))
 }
 
 /// The record a run leaves when it reaches its report. Kept separate from
@@ -1671,5 +1876,185 @@ mod tests {
                     && item["status"] == "failed"
             ));
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+// Test only the original lifecycle with a pre-authorized strategy draft. Host
+// authentication itself is exercised independently by the real exec/FD tests.
+#[cfg(test)]
+struct CompletionTest {
+    report_root: std::path::PathBuf,
+    path: std::path::PathBuf,
+    revalidate_fail: bool,
+    fail_after_write: bool,
+    cancel_after_execute: Option<Arc<AtomicBool>>,
+    cancel_on_validate: Option<Arc<AtomicBool>>,
+    cancel_during_receipt: Option<Arc<AtomicBool>>,
+}
+#[cfg(test)]
+thread_local! { static TEST_F_DRAFT:std::cell::RefCell<Option<EvalDraft>>=const {std::cell::RefCell::new(None)}; }
+
+#[cfg(test)]
+mod shared_lifecycle_tests {
+    use super::*;
+    struct ClearDraft;
+    impl Drop for ClearDraft {
+        fn drop(&mut self) {
+            TEST_F_DRAFT.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    fn options() -> HarnessEvalRunnerOptions {
+        HarnessEvalRunnerOptions {
+            level: HarnessEvalLevel::Deep,
+            provider: Some("no-provider-test".into()),
+            budget: None,
+            allow_real_model: true,
+        }
+    }
+    fn install(root: &std::path::Path, fault: &str, flag: &Arc<AtomicBool>) -> ClearDraft {
+        let mut report = crate::report::u5_stage_tests::original_stage();
+        let host:crate::live_scenario_runner::U5Host=serde_json::from_value(json!({"nonce":"a".repeat(64),"launcher_pid":1,"launcher_start":1,"pid":2,"starttime":2,"image_sha256":format!("sha256:{}","c".repeat(64)),"exe_dev":1,"exe_ino":1,"listener_inode":1,"port":1,"candidate":"b".repeat(40),"source_sha256":"d".repeat(64),"namespace":"test-only-contract","base_url":"http://127.0.0.1:1","harness_sha256":"e".repeat(64),"runtime_dev":1,"runtime_ino":1})).unwrap();
+        report["u5_host"] = host.binding();
+        let path = if fault == "missing-parent" {
+            root.join("absent/receipt.json")
+        } else {
+            root.join("u5-inner-receipt.json")
+        };
+        let test = CompletionTest {
+            report_root: root.join("reports"),
+            path,
+            revalidate_fail: fault == "revalidate",
+            fail_after_write: fault == "partial-write",
+            cancel_after_execute: (fault == "after-execute").then(|| flag.clone()),
+            cancel_on_validate: (fault == "on-validate").then(|| flag.clone()),
+            cancel_during_receipt: (fault == "during-receipt").then(|| flag.clone()),
+        };
+        TEST_F_DRAFT.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(EvalDraft {
+                report,
+                stable_ai: stable_ai_report_for(&options()),
+                u5_host: Some(host),
+                completion_test: Some(test),
+            });
+        });
+        ClearDraft
+    }
+    #[test]
+    fn shared_f_library_and_cli_have_identical_hardgates_and_original_run_records() {
+        let mut observed = Vec::new();
+        for cli in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = HarnessEvalReportStore::new(root.path().join("reports"));
+            let flag = Arc::new(AtomicBool::new(false));
+            let _clear = install(root.path(), "none", &flag);
+            let record = if cli {
+                let (r, d) = run_eval_cli(&store, options()).unwrap();
+                assert_eq!(d, CliEvalDisposition::PendingOuterCleanup);
+                r
+            } else {
+                run_eval_controlled(
+                    &store,
+                    options(),
+                    HarnessEvalRunControl::with_run_id("fixed-library-request"),
+                )
+                .unwrap()
+            };
+            assert_eq!(record.status, "gated");
+            assert_eq!(record.provider_rounds, 2);
+            assert_eq!(record.tool_calls, 2);
+            assert_eq!(record.total_tokens, Some(10));
+            if !cli {
+                assert_eq!(record.run_id, "fixed-library-request");
+            } else {
+                assert!(record.run_id.starts_with("harness-eval-deep-"));
+            }
+            let report: Value = serde_json::from_slice(
+                &std::fs::read(record.report_path.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report["run_id"], record.run_id);
+            assert_eq!(report["status"], "pending_outer_cleanup");
+            let receipt: Value = serde_json::from_slice(
+                &std::fs::read(root.path().join("u5-inner-receipt.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["run_id"], record.run_id);
+            observed.push((
+                report["report_gate"].clone(),
+                record.status,
+                record.provider_rounds,
+                record.tool_calls,
+                record.total_tokens,
+            ));
+        }
+        assert_eq!(observed[0], observed[1]);
+    }
+    #[test]
+    fn shared_f_cancellation_before_and_after_work_never_publishes_pending75() {
+        for phase in [
+            "before-execute",
+            "after-execute",
+            "on-validate",
+            "during-receipt",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = HarnessEvalReportStore::new(root.path().join("reports"));
+            let flag = Arc::new(AtomicBool::new(phase == "before-execute"));
+            let _clear = install(root.path(), phase, &flag);
+            let (record, disposition) = run_eval_owned(
+                &store,
+                options(),
+                HarnessEvalRunControl::with_run_id(format!("cancel-{phase}")).with_cancel(flag),
+            )
+            .unwrap();
+            assert_eq!(record.status, "cancelled", "{phase}");
+            assert_eq!(disposition, CliEvalDisposition::Finished);
+            assert!(!root.path().join("u5-inner-receipt.json").exists());
+            assert!(!std::fs::read_dir(root.path()).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".staged")));
+            if phase == "before-execute" {
+                assert!(TEST_F_DRAFT.with(|slot| slot.borrow().is_some()));
+                assert!(record.report_path.is_none());
+            } else {
+                assert!(record.report_path.is_some());
+            }
+        }
+    }
+    #[test]
+    fn shared_f_host_or_receipt_failure_cannot_leave_a_pending_terminal_record() {
+        for fault in [
+            "revalidate",
+            "missing-parent",
+            "partial-write",
+            "failed-hardgate",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = HarnessEvalReportStore::new(root.path().join("reports"));
+            let flag = Arc::new(AtomicBool::new(false));
+            let _clear = install(root.path(), fault, &flag);
+            if fault == "failed-hardgate" {
+                TEST_F_DRAFT.with(|slot| {
+                    slot.borrow_mut().as_mut().unwrap().report["live_gateway_scenarios"]
+                        ["scenarios"][0]["sessions"][0]["status"] = json!("failed")
+                });
+            }
+            let (record, disposition) = run_eval_cli(&store, options()).unwrap();
+            assert_eq!(record.status, "failed", "{fault}");
+            assert_eq!(disposition, CliEvalDisposition::Finished);
+            assert!(!root.path().join("u5-inner-receipt.json").exists());
+            assert!(!std::fs::read_dir(root.path()).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".staged")));
+            let persisted = store.get_run(&record.run_id).unwrap().unwrap();
+            assert_eq!(persisted.status, "failed");
+        }
     }
 }
