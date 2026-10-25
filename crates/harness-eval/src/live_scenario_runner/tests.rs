@@ -1,6 +1,7 @@
 use super::*;
 
-// All U5 fixtures below test consumer decisions, not real Runtime/owner proof.
+// U5 fixtures test consumer decisions; the producer test uses real in-memory
+// Runtime resource events, but supplies no live owner/Gateway/provider IO proof.
 fn u5_fixture_owner() -> U5Owner {
     U5Owner {
         pid: 42,
@@ -53,13 +54,23 @@ fn u5_fixture_resources() -> U5ResourceEvidence {
     let b = uuid::Uuid::from_u128(2);
     U5ResourceEvidence {
         owner: u5_fixture_owner(),
-        complete: true,
+        selected_witnesses_complete: true,
+        source_refs: vec![
+            "fixture:grant-a".into(),
+            "fixture:wait-b".into(),
+            "fixture:grant-b".into(),
+        ],
         active: None,
-        overlap: Some((a, b, "fixture:independently-specified-overlap".into())),
         observations: vec![
             observation(a, "a", ResourceAdmissionObservationStatus::Granted),
-            observation(b, "b", ResourceAdmissionObservationStatus::Waiting),
-            observation(b, "b", ResourceAdmissionObservationStatus::Granted),
+            ResourceAdmissionObservation {
+                blocker: Some(a),
+                ..observation(b, "b", ResourceAdmissionObservationStatus::Waiting)
+            },
+            ResourceAdmissionObservation {
+                blocker: Some(a),
+                ..observation(b, "b", ResourceAdmissionObservationStatus::Granted)
+            },
         ],
     }
 }
@@ -99,6 +110,43 @@ fn u5_fairness_consumer_rejects_each_independent_counterexample() {
         &u5_fixture_report("b"),
         &u5_fixture_resources()
     ));
+    // A/B are roles, not a model scheduling policy. Unrelated writer losses do
+    // not invalidate selected witnesses: no global writer-health certificate.
+    let mut swapped = u5_fixture_resources();
+    for observation in &mut swapped.observations {
+        observation.fairness_key = if observation.fairness_key == "session:session-a" {
+            "session:session-b".into()
+        } else {
+            "session:session-a".into()
+        };
+    }
+    assert!(verdict(
+        &u5_fixture_report("a"),
+        &u5_fixture_report("b"),
+        &swapped
+    ));
+    let mut coalesced = u5_fixture_resources();
+    coalesced.observations.remove(1);
+    coalesced.source_refs.remove(1);
+    assert!(verdict(
+        &u5_fixture_report("a"),
+        &u5_fixture_report("b"),
+        &coalesced
+    ));
+    let mut token_pool = u5_fixture_resources();
+    for o in &mut token_pool.observations {
+        o.demands = vec![(
+            runtime::execution_core::graph::ExecutionResourceKind::ProviderTokenPool(
+                "shared".into(),
+            ),
+            1,
+        )];
+    }
+    assert!(verdict(
+        &u5_fixture_report("a"),
+        &u5_fixture_report("b"),
+        &token_pool
+    ));
     for fault in [
         "foreign-owner",
         "URL-only",
@@ -110,15 +158,80 @@ fn u5_fairness_consumer_rejects_each_independent_counterexample() {
         "bad-read",
         "bad-ACK",
         "missing-grant",
+        "third-blocker",
+        "conflicting-grant",
+        "missing-enqueue-sequence",
+        "missing-enqueue-time",
+        "context-bytes",
+        "mixed-tool",
+        "disjoint-capacity",
     ] {
         let mut a = u5_fixture_report("a");
         let mut b = u5_fixture_report("b");
         let mut e = u5_fixture_resources();
         match fault {
+            "conflicting-grant" => {
+                let mut conflict = e.observations[0].clone();
+                conflict.demands = vec![(
+                    runtime::execution_core::graph::ExecutionResourceKind::ProviderModel(
+                        "conflict".into(),
+                    ),
+                    1,
+                )];
+                e.observations.push(conflict);
+                e.source_refs.push("fixture:conflicting-grant".into());
+            }
+            "missing-enqueue-sequence" => {
+                for o in &mut e.observations {
+                    o.enqueue_sequence = None;
+                }
+            }
+            "missing-enqueue-time" => {
+                for o in &mut e.observations {
+                    o.enqueued_at_ms = None;
+                }
+            }
+            "third-blocker" => {
+                for o in &mut e.observations {
+                    o.blocker = Some(uuid::Uuid::from_u128(99));
+                }
+            }
+            "mixed-tool" => {
+                // Shared Provider alone cannot identify the exhausted kind:
+                // both atomic bundles also contend on Tool.
+                for o in &mut e.observations {
+                    o.demands.push((
+                        runtime::execution_core::graph::ExecutionResourceKind::Tool,
+                        1,
+                    ));
+                }
+            }
+            "context-bytes" => {
+                for o in &mut e.observations {
+                    o.demands = vec![(
+                        runtime::execution_core::graph::ExecutionResourceKind::ContextBytes,
+                        1,
+                    )];
+                }
+            }
+            "disjoint-capacity" => {
+                for o in &mut e.observations[1..] {
+                    o.demands = vec![(
+                        runtime::execution_core::graph::ExecutionResourceKind::ProviderModel(
+                            "other".into(),
+                        ),
+                        1,
+                    )];
+                }
+            }
             "foreign-owner" => e.owner.pid += 1,
             "URL-only" => e.owner.starttime += 1,
-            "serial" => e.overlap = None,
-            "incomplete" => e.complete = false,
+            "serial" => {
+                for o in &mut e.observations {
+                    o.blocker = None;
+                }
+            }
+            "incomplete" => e.selected_witnesses_complete = false,
             "wrong-session" => e.observations[2].fairness_key = "session:foreign".into(),
             "no-capacity-reason" => {
                 for o in &mut e.observations {
@@ -131,6 +244,7 @@ fn u5_fairness_consumer_rejects_each_independent_counterexample() {
             "bad-ACK" => b["status"] = json!("failed"),
             "missing-grant" => {
                 e.observations.pop();
+                e.source_refs.pop();
             }
             _ => unreachable!(),
         }
@@ -256,7 +370,11 @@ fn u5_outer_recovery_is_separate_and_never_defaults_to_success() {
 
 fn u5_fixture_runner(url: &str) -> LiveScenarioRunner {
     LiveScenarioRunner {
-        client: Client::new(),
+        client: Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
         base_url: url.into(),
         timeout_cap: None,
         poll_interval: Duration::from_millis(1),
@@ -345,6 +463,538 @@ fn u5_scoped_pair_runs_both_branches_and_honors_pre_dispatch_deadline() {
     assert_eq!(runner.observation_poll_delay(), Duration::ZERO);
 }
 
+// This maps real store records to the existing Gateway wire shape. It is a
+// consumer fixture, not a Gateway invocation or authenticated public ACL proof.
+fn u5_store_event_wire(event: runtime::DurableRuntimeEvent) -> Value {
+    json!({"source":"runtime_lifecycle", "scope":event.scope.as_str(),
+        "stream_id":event.stream_id, "sequence":event.sequence,
+        "commit_cursor":event.commit_cursor, "transaction_index":event.transaction_index,
+        "kind":event.kind, "status":event.status, "payload":event.payload,
+        "created_at_ms":event.created_at_ms,
+        "refs":event.refs.into_iter().map(|r| json!({"type":r.kind,"id":r.id})).collect::<Vec<_>>()})
+}
+
+fn u5_resource_page(
+    session: &str,
+    cursor: Option<&str>,
+    next: Option<&str>,
+    more: bool,
+    events: Vec<Value>,
+) -> Value {
+    json!({"session_id":session,"cursor":cursor,"next_cursor":next,
+        "has_more":more,"degraded":false,"events":events})
+}
+
+fn u5_resource_path(session: &str, cursor: Option<&str>, limit: usize) -> String {
+    let mut url = reqwest::Url::parse("http://127.0.0.1/api/runtime/timeline").unwrap();
+    url.query_pairs_mut()
+        .append_pair("session_id", session)
+        .append_pair("limit", &limit.to_string());
+    if let Some(cursor) = cursor {
+        url.query_pairs_mut().append_pair("cursor", cursor);
+    }
+    format!("GET {}?{}", url.path(), url.query().unwrap())
+}
+
+fn u5_fixture_resource_events() -> [Vec<Value>; 2] {
+    let evidence = u5_fixture_resources();
+    let events: Vec<_> = evidence
+        .observations
+        .into_iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let session = o.fairness_key.strip_prefix("session:").unwrap().to_string();
+            let state = serde_json::to_value(o.status).unwrap();
+            json!({"source":"runtime_lifecycle","scope":"schedule",
+            "stream_id":format!("resource-admission:{}",o.request_id),"sequence":i+1,
+            "commit_cursor":i+1,"transaction_index":0,
+            "kind":format!("resource.admission.{}",state.as_str().unwrap()),"status":state,
+            "refs":[{"type":"session","id":session},{"type":"resource_request","id":o.request_id}],
+            "payload":o})
+        })
+        .collect();
+    [vec![events[0].clone()], events[1..].to_vec()]
+}
+
+// ApiClient's original synchronous collector owns the current-thread Tokio
+// context. No direct Tokio dependency, alternate observer, or model call.
+struct U5LocalDriver<F>(Option<F>);
+impl<F: std::future::Future<Output = ()> + Send> runtime::ApiClient for U5LocalDriver<F> {
+    fn stream(
+        &mut self,
+        _: runtime::ApiRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<runtime::AssistantEvent, runtime::RuntimeError>>
+                + Send
+                + '_,
+        >,
+    > {
+        use futures::StreamExt;
+        Box::pin(
+            futures::stream::once(self.0.take().unwrap())
+                .filter_map(|()| futures::future::ready(None)),
+        )
+    }
+}
+
+fn u5_local_job(job: impl std::future::Future<Output = ()> + Send) {
+    use runtime::ApiClient;
+    let request = runtime::ApiRequest {
+        bound_step: None,
+        prompt: runtime::PromptAssembly::new(vec![]),
+        messages: vec![].into(),
+        model: "fixture-no-model".into(),
+        reasoning_effort_override: None,
+        request_compiler_cache_hit: false,
+        budget: runtime::context_ledger::RequestBudgetReport::for_attempt(
+            "fixture-no-model",
+            1000,
+            100,
+            1,
+            1,
+            0,
+        ),
+        preparation: Default::default(),
+        provider_evidence_context: None,
+    };
+    assert!(U5LocalDriver(Some(job))
+        .stream_collect(request)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn u5_resource_reader_real_manager_writer_store_selected_witnesses_and_symmetric_roles() {
+    use runtime::execution_core::graph::*;
+    use std::future::Future;
+    for reverse in [false, true] {
+        let sessions = [
+            format!("u5-{}", uuid::Uuid::new_v4()),
+            format!("u5-{}", uuid::Uuid::new_v4()),
+        ];
+        let output = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result = output.clone();
+        let pair = sessions.clone();
+        // Compose outside Tokio: retain the original writer installation without
+        // starting unrelated reactor tasks on the local collector runtime.
+        let services = runtime::RuntimeServices::in_memory().unwrap();
+        u5_local_job(async move {
+            let manager = services.resource_manager();
+            manager
+                .reconcile_quotas(
+                    [(
+                        ExecutionResourceKind::Provider,
+                        ResourceQuota::new(1, 1, 1).unwrap(),
+                    )],
+                    [],
+                )
+                .unwrap();
+            let deadline = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 1000;
+            let request = |side: usize| {
+                ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    [(ExecutionResourceKind::Provider, 1)],
+                )
+                .with_fairness_key(format!("session:{}", pair[side]))
+                .with_deadline_at_ms(deadline)
+            };
+            let first = usize::from(reverse);
+            let a = manager.admit(request(first)).await.unwrap();
+            let ResourceAdmissionDecision::Granted { lease: a, .. } = a else {
+                panic!("first admission must grant")
+            };
+            let blocking_id = a.id();
+            let mut waiting = Box::pin(manager.admit(request(1 - first)));
+            let pending = futures::future::poll_fn(|cx| {
+                std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            drop(a);
+            let second = waiting.await.unwrap();
+            let granted = matches!(&second, ResourceAdmissionDecision::Granted { .. });
+            drop(second);
+            services.shutdown_maintenance().await;
+            assert!(pending && granted, "real Capacity wait then grant required");
+            let mut pages = Vec::new();
+            for session in &pair {
+                let records = services
+                    .event_reader()
+                    .session_timeline_events(session, None, 100)
+                    .unwrap();
+                assert!(!records.is_empty());
+                assert!(records.iter().all(|r| r
+                    .refs
+                    .iter()
+                    .any(|r| r.kind == "session" && r.id == *session)));
+                let events: Vec<_> = records.into_iter().map(u5_store_event_wire).collect();
+                if session == &pair[1 - first] {
+                    assert!(events.iter().any(|e| e["status"] == "granted"
+                        && e["payload"]["wait_reason"] == "capacity"
+                        && e["payload"]["blocker"] == blocking_id.to_string()));
+                }
+                let last = events.last().unwrap();
+                let next = format!(
+                    "v2:0:{}:{}",
+                    last["commit_cursor"].as_u64().unwrap(),
+                    last["transaction_index"].as_u64().unwrap()
+                );
+                pages.push(u5_resource_page(session, None, Some(&next), false, events));
+            }
+            *result.lock().unwrap() = Some(pages);
+        });
+        let pages = output.lock().unwrap().take().unwrap();
+        let originals: Vec<_> = pages
+            .iter()
+            .flat_map(|p| p["events"].as_array().unwrap().iter().cloned())
+            .collect();
+        let script = sessions
+            .iter()
+            .zip(pages)
+            .map(|(s, p)| (u5_resource_path(s, None, 100), p, false, Duration::ZERO))
+            .collect();
+        let mut fixture = U5SingleCaseHttpFixture::start_wire(script);
+        let runner = u5_fixture_runner(&fixture.url);
+        let mut owner = u5_fixture_owner();
+        owner.base_url = fixture.url.clone();
+        let evidence = runner
+            .read_u5_resource_witnesses(&owner, &sessions, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(fixture.finish().len(), 2);
+        assert!(evidence.selected_witnesses_complete);
+        for (observation, source) in evidence.observations.iter().zip(&evidence.source_refs) {
+            assert!(
+                originals.iter().any(|e| u5_resource_observation(
+                    e,
+                    observation.fairness_key.strip_prefix("session:").unwrap()
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|(o, r)| o == *observation && r == *source)),
+                "source must resolve to an original same-store record"
+            );
+        }
+        let report = |i: usize| {
+            json!({"status":"passed","session_id":sessions[i],"turn_id":format!("turn-{i}"),
+            "execution_id":format!("root-{i}"),"acceptance":{"passed":true},"actor_cleanup":{"passed":true}})
+        };
+        assert_eq!(
+            u5_pair_acceptance(
+                U5Mode::Fairness,
+                &owner,
+                &sessions,
+                &report(0),
+                &report(1),
+                &evidence,
+                None
+            )["internal_passed"],
+            true
+        );
+    }
+}
+
+#[test]
+fn u5_resource_reader_loopback_binding_cursor_and_page_counterexamples() {
+    let sessions: [String; 2] = ["session-a".into(), "session-b".into()];
+    for fault in [
+        "none",
+        "unrelated-writer-loss",
+        "kind",
+        "refs",
+        "source",
+        "scope",
+        "stream",
+        "status",
+        "fairness",
+        "zero-sequence",
+        "zero-commit",
+        "index-overflow",
+        "refs-type",
+        "third-session",
+        "page-session",
+        "page-cursor",
+        "has-more-type",
+        "degraded",
+        "repeat-cursor",
+        "replay-conflict",
+        "same-position-kind",
+        "replay-position",
+        "next-cursor-skip",
+        "missing-grant",
+    ] {
+        let [a, b] = u5_fixture_resource_events();
+        let mut first = u5_resource_page(&sessions[0], None, Some("v2:0:1:0"), false, a);
+        let mut second = u5_resource_page(&sessions[1], None, Some("v2:0:3:0"), false, b);
+        match fault {
+            "unrelated-writer-loss" => {
+                // Metadata is not a full-history certificate. The selected
+                // final grant retains Capacity/blocker even without Waiting.
+                first["resource_writer_health"] =
+                    json!({"coalesced":7,"coalescible_dropped":11,"priority_dropped":2});
+                second["events"].as_array_mut().unwrap().remove(0);
+            }
+            "scope" => first["events"][0]["scope"] = json!("session"),
+            "stream" => first["events"][0]["stream_id"] = json!("resource-admission:not-a-uuid"),
+            "status" => first["events"][0]["status"] = json!("waiting"),
+            "fairness" => {
+                first["events"][0]["payload"]["fairness_key"] = json!("session:session-c")
+            }
+            "zero-sequence" => first["events"][0]["sequence"] = json!(0),
+            "zero-commit" => first["events"][0]["commit_cursor"] = json!(0),
+            "index-overflow" => {
+                first["events"][0]["transaction_index"] = json!(u64::from(u32::MAX) + 1)
+            }
+            "refs-type" => first["events"][0]["refs"][1]["type"] = json!("other"),
+            "kind" => first["events"][0]["kind"] = json!("resource.admission.waiting"),
+            "refs" => first["events"][0]["refs"][1]["id"] = json!(uuid::Uuid::from_u128(99)),
+            "source" => first["events"][0]["source"] = json!("foreign"),
+            "third-session" => first["events"][0]["refs"][0]["id"] = json!("session-c"),
+            "page-session" => first["session_id"] = json!("session-c"),
+            "page-cursor" => first["cursor"] = json!("v2:0:0:0"),
+            "has-more-type" => first["has_more"] = json!("false"),
+            "degraded" => first["degraded"] = json!(true),
+            "repeat-cursor" | "replay-conflict" | "same-position-kind" | "replay-position" => {
+                first["has_more"] = json!(true)
+            }
+            "next-cursor-skip" => first["next_cursor"] = json!("v2:0:99:0"),
+            "missing-grant" => {
+                second["events"].as_array_mut().unwrap().pop();
+                second["next_cursor"] = json!("v2:0:2:0");
+            }
+            _ => {}
+        }
+        let mut script = vec![(
+            u5_resource_path(&sessions[0], None, 100),
+            first.clone(),
+            false,
+            Duration::ZERO,
+        )];
+        if matches!(
+            fault,
+            "repeat-cursor" | "replay-conflict" | "same-position-kind" | "replay-position"
+        ) {
+            let mut replay = first.clone();
+            replay["cursor"] = json!("v2:0:1:0");
+            replay["has_more"] = json!(false);
+            if fault != "repeat-cursor" {
+                // An actual new source at commit 2 makes next_cursor legal;
+                // the old position at commit 1 must still reject changed data.
+                replay["next_cursor"] = json!("v2:0:2:0");
+                if fault == "same-position-kind" {
+                    replay["events"][0]["kind"] = json!("resource.admission.waiting");
+                    replay["events"][0]["status"] = json!("waiting");
+                    replay["events"][0]["payload"]["status"] = json!("waiting");
+                } else if fault == "replay-position" {
+                    // A different stream/sequence cannot reuse the same
+                    // (commit,index), even when its own event is coherent.
+                    replay["events"][0]["stream_id"] = json!("fixture-rebound");
+                    replay["events"][0]["kind"] = json!("fixture.progress");
+                    replay["events"][0]["status"] = json!("observed");
+                    replay["events"][0]["payload"] = json!({});
+                    replay["events"][0]["refs"] = json!([]);
+                } else {
+                    replay["events"][0]["payload"]["queue_age_ms"] = json!(999);
+                }
+                replay["events"].as_array_mut().unwrap().push(json!({
+                    "source":"runtime_lifecycle","scope":"schedule","stream_id":"fixture-progress",
+                    "sequence":1,"commit_cursor":2,"transaction_index":0,
+                    "kind":"fixture.progress","status":"observed","refs":[],"payload":{}}));
+            }
+            script.push((
+                u5_resource_path(&sessions[0], Some("v2:0:1:0"), 100),
+                replay,
+                false,
+                Duration::ZERO,
+            ));
+        }
+        script.push((
+            u5_resource_path(&sessions[1], None, 100),
+            second,
+            false,
+            Duration::ZERO,
+        ));
+        let mut fixture = U5SingleCaseHttpFixture::start_wire(script);
+        let mut owner = u5_fixture_owner();
+        owner.base_url = fixture.url.clone();
+        let result = u5_fixture_runner(&fixture.url).read_u5_resource_witnesses(
+            &owner,
+            &sessions,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let requests = fixture.finish();
+        match fault {
+            "none" | "unrelated-writer-loss" => {
+                let evidence = result.unwrap();
+                assert!(u5_capacity_witness(&evidence, &sessions).is_some());
+                assert_eq!(requests.len(), 2);
+            }
+            "missing-grant" => assert!(u5_capacity_witness(&result.unwrap(), &sessions).is_none()),
+            "replay-conflict" | "same-position-kind" | "replay-position" => {
+                let error = result.err().expect("immutable source conflict must reject");
+                assert_eq!(requests.len(), 2, "must reach the replay page: {fault}");
+                assert!(
+                    error.contains("immutable source")
+                        || error
+                            .contains("stable timeline event identity carried a different payload"),
+                    "must reject the source conflict, not a fabricated cursor: {fault}: {error}"
+                );
+            }
+            "next-cursor-skip" => {
+                let error = result.err().expect("unsupported next cursor must reject");
+                assert!(
+                    error.contains("not supported by page source positions"),
+                    "{error}"
+                );
+            }
+            _ => assert!(result.is_err(), "{fault}"),
+        }
+    }
+}
+
+#[test]
+fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
+    let sessions: [String; 2] = ["session-a".into(), "session-b".into()];
+    for fault in [
+        "events",
+        "exact512-before-IO-more",
+        "exact512-before-IO-second-session",
+        "pages",
+        "known-bytes",
+        "unknown-bytes",
+        "cumulative-bytes",
+        "expired",
+        "shared-expired",
+        "body-timeout",
+    ] {
+        let [a, _] = u5_fixture_resource_events();
+        let mut script = Vec::new();
+        let mut cursor: Option<String> = None;
+        let exact = fault.starts_with("exact512-before-IO");
+        let count = match fault {
+            "events" | "exact512-before-IO-more" | "exact512-before-IO-second-session" => 6,
+            "pages" => 32,
+            "cumulative-bytes" => 3,
+            _ => 1,
+        };
+        let mut position = 0usize;
+        for i in 0..count {
+            let event_count = if exact && i == 5 {
+                12
+            } else if exact || fault == "events" {
+                100
+            } else {
+                1
+            };
+            let events = (0..event_count)
+                .map(|_| {
+                    position += 1;
+                    let mut event = a[0].clone();
+                    event["sequence"] = json!(position);
+                    event["commit_cursor"] = json!(position);
+                    event
+                })
+                .collect();
+            let next = format!("v2:0:{position}:0");
+            let more = !(fault == "body-timeout"
+                || (fault == "exact512-before-IO-second-session" && i == 5));
+            let mut page =
+                u5_resource_page(&sessions[0], cursor.as_deref(), Some(&next), more, events);
+            // First five pages consume 500; events deliberately returns 100
+            // for the sixth request's remaining limit of 12.
+            if matches!(fault, "known-bytes" | "unknown-bytes") {
+                page["padding"] = json!("x".repeat(2 * 1024 * 1024));
+            }
+            if fault == "cumulative-bytes" {
+                page["padding"] = json!("x".repeat(750_000));
+            }
+            let limit = if (exact || fault == "events") && i == 5 {
+                12
+            } else {
+                100
+            };
+            script.push((
+                u5_resource_path(&sessions[0], cursor.as_deref(), limit),
+                page,
+                fault == "unknown-bytes",
+                if fault == "body-timeout" {
+                    Duration::from_millis(300)
+                } else {
+                    Duration::ZERO
+                },
+            ));
+            cursor = Some(next);
+        }
+        if exact {
+            // A sentinel catches any seventh HTTP request, including an attempt
+            // to start the second Session after exactly exhausting the budget.
+            let (session, request_cursor) = if fault == "exact512-before-IO-more" {
+                (&sessions[0], cursor.as_deref())
+            } else {
+                (&sessions[1], None)
+            };
+            script.push((
+                u5_resource_path(session, request_cursor, 1),
+                u5_resource_page(session, request_cursor, request_cursor, false, vec![]),
+                false,
+                Duration::ZERO,
+            ));
+        }
+        let mut fixture = U5SingleCaseHttpFixture::start_wire(script);
+        let mut owner = u5_fixture_owner();
+        owner.base_url = fixture.url.clone();
+        let mut runner = u5_fixture_runner(&fixture.url);
+        if fault == "shared-expired" {
+            runner.u5_deadline = Some(Instant::now() - Duration::from_millis(1));
+        }
+        let deadline = if fault == "expired" {
+            Instant::now() - Duration::from_millis(1)
+        } else if fault == "body-timeout" {
+            Instant::now() + Duration::from_millis(100)
+        } else {
+            Instant::now() + Duration::from_secs(3)
+        };
+        let started = Instant::now();
+        let error = runner
+            .read_u5_resource_witnesses(&owner, &sessions, deadline)
+            .err()
+            .expect(fault);
+        let requests = fixture.finish();
+        match fault {
+            "expired" | "shared-expired" => {
+                assert!(requests.is_empty());
+                assert!(error.contains("before IO"), "{error}");
+            }
+            "events" => {
+                assert_eq!(requests.len(), 6);
+                assert!(error.contains("event budget"), "{error}");
+            }
+            "exact512-before-IO-more" | "exact512-before-IO-second-session" => {
+                assert_eq!(
+                    requests.len(),
+                    6,
+                    "no seventh HTTP after 512 events: {fault}"
+                );
+                assert!(error.contains("before IO"), "{error}");
+            }
+            "pages" => {
+                assert_eq!(requests.len(), 32);
+                assert!(error.contains("before IO"), "{error}");
+            }
+            "known-bytes" | "cumulative-bytes" => assert!(error.contains("byte budget"), "{error}"),
+            "unknown-bytes" => assert!(error.contains("byte budget"), "{error}"),
+            "body-timeout" => {
+                assert_eq!(requests.len(), 1);
+                assert!(started.elapsed() < Duration::from_secs(1));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 // NoRealU5: this bounded loopback double exercises the original single-case
 // consumers; it supplies no real owner/resource/Runtime/provider evidence.
 struct U5SingleCaseHttpFixture {
@@ -355,6 +1005,17 @@ struct U5SingleCaseHttpFixture {
 
 impl U5SingleCaseHttpFixture {
     fn start(script: Vec<(&'static str, Value)>) -> Self {
+        Self::start_wire(
+            script
+                .into_iter()
+                .map(|(path, body)| (path.to_string(), body, false, Duration::ZERO))
+                .collect(),
+        )
+    }
+
+    // close-delimited bodies exercise unknown Content-Length; delay starts
+    // after headers so timeout tests cover an in-flight body read.
+    fn start_wire(script: Vec<(String, Value, bool, Duration)>) -> Self {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -364,7 +1025,7 @@ impl U5SingleCaseHttpFixture {
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut requests = Vec::new();
-            for (expected, response) in script {
+            for (expected, response, unknown_length, delay) in script {
                 let mut stream = loop {
                     if stopping.load(std::sync::atomic::Ordering::SeqCst)
                         || Instant::now() >= deadline
@@ -423,8 +1084,27 @@ impl U5SingleCaseHttpFixture {
                 assert_eq!(request, expected, "NoRealU5 request order");
                 requests.push((request, headers, body));
                 let body = serde_json::to_vec(&response).unwrap();
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-                stream.write_all(&body).unwrap();
+                let header = if unknown_length {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                };
+                // A bounded consumer may close early on size/deadline errors.
+                // Request parsing/order and all consumer assertions still fail normally.
+                if stream.write_all(header.as_bytes()).is_err() {
+                    return requests;
+                }
+                let wake = Instant::now() + delay;
+                while Instant::now() < wake {
+                    if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                        return requests;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if stream.write_all(&body).is_err() {
+                    return requests;
+                }
             }
             requests
         });

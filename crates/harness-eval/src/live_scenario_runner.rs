@@ -111,12 +111,212 @@ impl AdmittedLiveScenario {
 struct U5ResourceEvidence {
     owner: U5Owner,
     observations: Vec<runtime::execution_core::graph::ResourceAdmissionObservation>,
-    complete: bool,
+    source_refs: Vec<String>,
+    // Completeness of this bounded selected witness collection, not a claim
+    // that the best-effort writer persisted every admission transition.
+    selected_witnesses_complete: bool,
     // A producer-certified active physical source, never merely an intent.
     active: Option<(U5Identity, String)>,
-    // The original producer must certify actual overlap, not infer it from a
-    // blocker UUID or two successful answers. No live adapter exists yet.
-    overlap: Option<(uuid::Uuid, uuid::Uuid, String)>,
+}
+
+fn u5_capacity_witness(evidence: &U5ResourceEvidence, sessions: &[String; 2]) -> Option<Value> {
+    use runtime::execution_core::graph::{
+        ExecutionResourceKind, ResourceAdmissionObservation,
+        ResourceAdmissionObservationStatus as Status, ResourceWaitReason,
+    };
+    let provider = |kind: &ExecutionResourceKind| {
+        matches!(
+            kind,
+            ExecutionResourceKind::Provider
+                | ExecutionResourceKind::ProviderAccount(_)
+                | ExecutionResourceKind::ProviderModel(_)
+                | ExecutionResourceKind::ProviderTokenPool(_)
+        )
+    };
+    let mut grants: BTreeMap<uuid::Uuid, (usize, &ResourceAdmissionObservation)> = BTreeMap::new();
+    for (index, grant) in evidence.observations.iter().enumerate() {
+        if grant.status == Status::Granted {
+            if let Some((_, previous)) = grants.get(&grant.request_id) {
+                if *previous != grant {
+                    return None;
+                }
+            } else {
+                grants.insert(grant.request_id, (index, grant));
+            }
+        }
+    }
+    // A single lookup per Capacity fact, independent of page/persistence order.
+    // Capacity's blocker comes from the original manager's active lease set;
+    // a final grant can retain that fact. It is not a physical IO start/end.
+    for (index, wait) in evidence.observations.iter().enumerate() {
+        if wait.wait_reason != Some(ResourceWaitReason::Capacity)
+            || !matches!(wait.status, Status::Waiting | Status::Granted)
+        {
+            continue;
+        }
+        let Some(blocker_id) = wait.blocker else {
+            continue;
+        };
+        let Some((blocked_index, blocked)) = grants.get(&wait.request_id) else {
+            continue;
+        };
+        let Some((blocking_index, blocking)) = grants.get(&blocker_id) else {
+            continue;
+        };
+        let different_sessions = [(0, 1), (1, 0)].iter().any(|(a, b)| {
+            blocked.fairness_key == format!("session:{}", sessions[*a])
+                && blocking.fairness_key == format!("session:{}", sessions[*b])
+        });
+        if blocked.request_id == blocking.request_id
+            || !different_sessions
+            || blocked.enqueue_sequence.is_none()
+            || blocking.enqueue_sequence.is_none()
+            || blocked.enqueued_at_ms.is_none()
+            || blocking.enqueued_at_ms.is_none()
+            || wait.fairness_key != blocked.fairness_key
+            || wait.demands != blocked.demands
+            || wait.policy_revision != blocked.policy_revision
+            || wait.enqueue_sequence != blocked.enqueue_sequence
+            || !blocked.demands.iter().any(|(kind, n)| {
+                *n > 0
+                    && provider(kind)
+                    && blocking
+                        .demands
+                        .iter()
+                        .any(|(other, count)| other == kind && *count > 0)
+            })
+            || blocked.demands.iter().any(|(kind, n)| {
+                *n > 0
+                    && !provider(kind)
+                    && blocking
+                        .demands
+                        .iter()
+                        .any(|(other, count)| other == kind && *count > 0)
+            })
+        {
+            continue;
+        }
+        return Some(
+            json!({"grants":[evidence.source_refs.get(*blocked_index)?,evidence.source_refs.get(*blocking_index)?],
+            "capacity":evidence.source_refs.get(index)?,"blocked_request":blocked.request_id,
+            "blocking_request":blocking.request_id,"claim":"resource_contention_and_progress_not_physical_IO_overlap"}),
+        );
+    }
+    None
+}
+
+fn u5_resource_observation(
+    event: &Value,
+    session: &str,
+) -> Result<
+    Option<(
+        runtime::execution_core::graph::ResourceAdmissionObservation,
+        String,
+    )>,
+    String,
+> {
+    let stream = event["stream_id"].as_str().unwrap_or("");
+    let kind = event["kind"].as_str().unwrap_or("");
+    if !stream.starts_with("resource-admission:") && !kind.starts_with("resource.admission.") {
+        return Ok(None);
+    }
+    let observation: runtime::execution_core::graph::ResourceAdmissionObservation =
+        serde_json::from_value(event["payload"].clone())
+            .map_err(|_| "U5 invalid resource observation")?;
+    let status = serde_json::to_value(observation.status).map_err(|e| e.to_string())?;
+    let state = status.as_str().ok_or("U5 resource status missing")?;
+    let refs = event["refs"].as_array().ok_or("U5 resource refs missing")?;
+    let request_id = observation.request_id.to_string();
+    let valid_ref = |reference: &Value| match reference["type"].as_str() {
+        Some("session") => reference["id"] == session,
+        Some("resource_request") => reference["id"] == request_id,
+        _ => true,
+    };
+    if event["source"] != "runtime_lifecycle"
+        || event["scope"] != "schedule"
+        || stream != format!("resource-admission:{request_id}")
+        || kind != format!("resource.admission.{state}")
+        || event["status"] != state
+        || observation.fairness_key != format!("session:{session}")
+        || !refs.iter().all(valid_ref)
+        || !refs
+            .iter()
+            .any(|r| r["type"] == "session" && r["id"] == session)
+        || !refs
+            .iter()
+            .any(|r| r["type"] == "resource_request" && r["id"] == request_id)
+    {
+        return Err("U5 resource stream/request/kind/status/refs/session binding mismatch".into());
+    }
+    let sequence = event["sequence"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .ok_or("U5 resource sequence missing")?;
+    let cursor = event["commit_cursor"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .ok_or("U5 resource cursor missing")?;
+    let index = event["transaction_index"]
+        .as_u64()
+        .filter(|n| *n <= u64::from(u32::MAX))
+        .ok_or("U5 resource transaction index missing")?;
+    // Read-only source position, never a new Runtime receipt selector.
+    Ok(Some((
+        observation,
+        format!("{stream}#{sequence}@{cursor}:{index}"),
+    )))
+}
+
+// Preserve the existing v2 two-source cursor contract: only positions present
+// in this page may advance the caller's cursor. No fixed-through snapshot is
+// inferred. The ordinary observer still owns cursor monotonicity/replay gates.
+fn u5_page_cursor(previous: Option<&str>, events: &[Value]) -> Result<Value, String> {
+    let mut session = 0u64;
+    let mut runtime: Option<(u64, u32)> = None;
+    if let Some(previous) = previous {
+        let parts = previous.split(':').collect::<Vec<_>>();
+        if parts.len() != 4 || parts[0] != "v2" {
+            return Err("U5 invalid v2 cursor".into());
+        }
+        session = parts[1].parse().map_err(|_| "U5 invalid Session cursor")?;
+        runtime = match (parts[2], parts[3]) {
+            ("-", "-") => None,
+            (a, b) => Some((
+                a.parse().map_err(|_| "U5 invalid runtime cursor")?,
+                b.parse().map_err(|_| "U5 invalid transaction cursor")?,
+            )),
+        };
+    }
+    for event in events {
+        match event["source"].as_str() {
+            Some("session_domain") => {
+                let next = event["sequence"]
+                    .as_u64()
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or("U5 Session event position missing or overflow")?;
+                session = session.max(next);
+            }
+            Some("runtime_lifecycle") => {
+                let cursor = event["commit_cursor"]
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .ok_or("U5 runtime event position missing")?;
+                let index = event["transaction_index"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or("U5 runtime event index missing")?;
+                runtime = Some(runtime.map_or((cursor, index), |old| old.max((cursor, index))));
+            }
+            _ => return Err("U5 unknown timeline source".into()),
+        }
+    }
+    if events.is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(json!(match runtime {
+        Some((cursor, index)) => format!("v2:{session}:{cursor}:{index}"),
+        None => format!("v2:{session}:-:-"),
+    }))
 }
 
 trait U5EvidenceReader: Sync {
@@ -273,9 +473,6 @@ fn u5_pair_acceptance(
     evidence: &U5ResourceEvidence,
     cancellation: Option<&U5CancelContext>,
 ) -> Value {
-    use runtime::execution_core::graph::{
-        ExecutionResourceKind, ResourceAdmissionObservationStatus as Status, ResourceWaitReason,
-    };
     let identities = u5_identity(left).zip(u5_identity(right));
     let identity_ok = identities.as_ref().is_some_and(|(a, b)| {
         a.session == sessions[0]
@@ -284,36 +481,13 @@ fn u5_pair_acceptance(
             && a.turn != b.turn
             && a.root != b.root
     });
-    let origin_ok =
-        evidence.owner == *owner && evidence.complete && evidence.observations.len() <= 512;
-    let contention = evidence.overlap.as_ref().is_some_and(|(a, b, source)| {
-        if a == b || source.is_empty() {
-            return false;
-        }
-        let grant = |request, session: &str| {
-            evidence.observations.iter().any(|o| {
-                o.request_id == request
-                    && o.status == Status::Granted
-                    && o.fairness_key == format!("session:{session}")
-                    && o.demands.iter().any(|(kind, n)| {
-                        *n > 0
-                            && matches!(
-                                kind,
-                                ExecutionResourceKind::Provider
-                                    | ExecutionResourceKind::ProviderAccount(_)
-                                    | ExecutionResourceKind::ProviderModel(_)
-                            )
-                    })
-            })
-        };
-        let capacity_wait = evidence.observations.iter().any(|o| {
-            (o.request_id == *a || o.request_id == *b)
-                && o.wait_reason == Some(ResourceWaitReason::Capacity)
-                && o.queue_age_ms > 0
-                && matches!(o.status, Status::Waiting | Status::Granted)
-        });
-        grant(*a, &sessions[0]) && grant(*b, &sessions[1]) && capacity_wait
-    });
+    let origin_ok = evidence.owner == *owner
+        && evidence.selected_witnesses_complete
+        && evidence.observations.len() <= 512
+        && evidence.source_refs.len() == evidence.observations.len()
+        && evidence.source_refs.iter().all(|source| !source.is_empty());
+    let witness = u5_capacity_witness(evidence, sessions);
+    let contention = witness.is_some();
     let left_ok = match mode {
         U5Mode::Fairness => u5_normal_passed(left),
         U5Mode::Cancel => identities.as_ref().is_some_and(|(a, _)| {
@@ -342,8 +516,9 @@ fn u5_pair_acceptance(
         && left_ok
         && u5_normal_passed(right)
         && (mode == U5Mode::Cancel || contention);
-    json!({"internal_passed":internal,"identity":identity_ok,"source_complete":origin_ok,
+    json!({"internal_passed":internal,"identity":identity_ok,"selected_witnesses_complete":origin_ok,
         "left_business":left_ok,"right_business":u5_normal_passed(right),"capacity_competition":contention,
+        "capacity_witness":witness,"whole_history_complete":"not_claimed",
         "outer_cleanup_observed":false})
 }
 
@@ -840,6 +1015,14 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
         .unwrap_or(MAX_DEFAULT_SCENARIO_TIMEOUT)
         .saturating_add(Duration::from_secs(15));
     let mut builder = Client::builder().timeout(client_timeout);
+    if selected_live_scenario_ids()
+        .as_ref()
+        .is_some_and(|ids| ids.iter().any(|id| U5Mode::from_id(id).is_some()))
+    {
+        builder = builder
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+    }
     if let Some(token) = std::env::var("COWD_API_TOKEN")
         .ok()
         .map(|value| value.trim().to_string())
@@ -1263,6 +1446,175 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
 }
 
 impl LiveScenarioRunner {
+    /// Consume only the two fresh Sessions created by this composite driver.
+    /// The caller supplies the original authenticated client and trusted host
+    /// owner. This method does not authenticate a caller-authored owner object;
+    /// G1 is still unavailable at live preflight.
+    fn read_u5_resource_witnesses(
+        &self,
+        owner: &U5Owner,
+        sessions: &[String; 2],
+        deadline: Instant,
+    ) -> Result<U5ResourceEvidence, String> {
+        use std::io::Read;
+        if !u5_valid_owner(owner, &self.base_url)
+            || sessions[0].is_empty()
+            || sessions[1].is_empty()
+            || sessions[0] == sessions[1]
+        {
+            return Err("U5 owner or fresh Session pair missing".into());
+        }
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+        let deadline = self
+            .u5_deadline
+            .map_or(deadline, |global| global.min(deadline));
+        let mut bytes_left = 2 * 1024 * 1024usize;
+        let mut events_left = 512usize;
+        let mut pages_left = 32usize;
+        let mut observations = Vec::new();
+        let mut source_refs = Vec::new();
+        let mut source_events: BTreeMap<(String, u64), Value> = BTreeMap::new();
+        let mut source_positions: BTreeMap<(u64, u32), (String, u64)> = BTreeMap::new();
+        for session in sessions {
+            let mut observer = LiveScenarioObserver::default();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || bytes_left == 0 || events_left == 0 || pages_left == 0 {
+                    return Err(
+                        "U5 resource consumer time/byte/event/page budget exhausted before IO"
+                            .into(),
+                    );
+                }
+                pages_left -= 1;
+                let expected_cursor = observer.timeline_cursor().map(str::to_owned);
+                let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| e.to_string())?;
+                url.set_path("/api/runtime/timeline");
+                url.set_query(None);
+                {
+                    let mut query = url.query_pairs_mut();
+                    query.append_pair("session_id", session);
+                    query.append_pair("limit", &events_left.clamp(1, 100).to_string());
+                    if let Some(cursor) = &expected_cursor {
+                        query.append_pair("cursor", cursor);
+                    }
+                }
+                let mut response = self
+                    .client
+                    .get(url.clone())
+                    .timeout(remaining)
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                if response.url() != &url || !response.status().is_success() {
+                    return Err("U5 resource response redirected or failed".into());
+                }
+                let expected_length = response.content_length();
+                if expected_length.is_some_and(|size| size > bytes_left as u64) {
+                    return Err("U5 resource response exceeds remaining byte budget".into());
+                }
+                let mut body = Vec::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err("U5 resource read deadline reached".into());
+                    }
+                    if expected_length == Some(body.len() as u64) {
+                        break;
+                    }
+                    if bytes_left == 0 {
+                        return Err("U5 resource byte budget exhausted before stream read".into());
+                    }
+                    let max = buffer.len().min(bytes_left);
+                    let count = response
+                        .read(&mut buffer[..max])
+                        .map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        break;
+                    }
+                    if count > bytes_left {
+                        return Err("U5 resource stream exceeds byte budget".into());
+                    }
+                    bytes_left -= count;
+                    body.extend_from_slice(&buffer[..count]);
+                }
+                if Instant::now() >= deadline {
+                    return Err("U5 resource read deadline reached".into());
+                }
+                if expected_length.is_some_and(|size| size != body.len() as u64) {
+                    return Err("U5 resource body length mismatch".into());
+                }
+                let page: Value = serde_json::from_slice(&body)
+                    .map_err(|_| "U5 invalid resource timeline JSON")?;
+                if page["session_id"] != *session
+                    || page.get("cursor")
+                        != Some(&expected_cursor.as_ref().map_or(Value::Null, |c| json!(c)))
+                    || page["has_more"].as_bool().is_none()
+                    || page["degraded"] != false
+                {
+                    return Err("U5 resource page Session/cursor/completeness mismatch".into());
+                }
+                let events = page["events"]
+                    .as_array()
+                    .ok_or("U5 resource page events missing")?;
+                events_left = events_left
+                    .checked_sub(events.len())
+                    .ok_or("U5 resource event budget exceeded")?;
+                if page.get("next_cursor")
+                    != Some(&u5_page_cursor(expected_cursor.as_deref(), events)?)
+                {
+                    return Err("U5 next cursor is not supported by page source positions".into());
+                }
+                for event in events {
+                    if event["source"] == "runtime_lifecycle" {
+                        let stream = event["stream_id"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .ok_or("U5 runtime stream missing")?;
+                        let sequence = event["sequence"]
+                            .as_u64()
+                            .filter(|n| *n > 0)
+                            .ok_or("U5 runtime sequence missing")?;
+                        let cursor = event["commit_cursor"]
+                            .as_u64()
+                            .ok_or("U5 runtime cursor missing")?;
+                        let index = event["transaction_index"]
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or("U5 runtime index missing")?;
+                        let key = (stream.to_string(), sequence);
+                        if source_events.get(&key).is_some_and(|old| old != event)
+                            || source_positions
+                                .get(&(cursor, index))
+                                .is_some_and(|old| old != &key)
+                        {
+                            return Err("U5 conflicting event at immutable source position".into());
+                        }
+                        source_events.insert(key.clone(), event.clone());
+                        source_positions.insert((cursor, index), key);
+                    }
+                }
+                let result = observer.observe_timeline_page(url.as_str(), &Ok(page.clone()), 0)?;
+                for event in events {
+                    if let Some((observation, source)) = u5_resource_observation(event, session)? {
+                        if !source_refs.contains(&source) {
+                            observations.push(observation);
+                            source_refs.push(source);
+                        }
+                    }
+                }
+                if !result.has_more {
+                    break;
+                }
+            }
+        }
+        Ok(U5ResourceEvidence {
+            owner: owner.clone(),
+            observations,
+            source_refs,
+            selected_witnesses_complete: true,
+            active: None,
+        })
+    }
+
     fn run_u5_pair(
         &self,
         mode: U5Mode,
@@ -1370,7 +1722,10 @@ impl LiveScenarioRunner {
                 )
             },
         );
-        let evidence = source.read(&sessions, deadline);
+        let evidence = match mode {
+            U5Mode::Fairness => runner.read_u5_resource_witnesses(&owner, &sessions, deadline),
+            U5Mode::Cancel => source.read(&sessions, deadline),
+        };
         let internal = match evidence {
             Ok(evidence) => u5_pair_acceptance(
                 mode,
@@ -1485,7 +1840,7 @@ impl LiveScenarioRunner {
             }
             actor.maintain_receipt_authority()?;
             let evidence = source.read(sessions, start_deadline)?;
-            if evidence.owner != *owner || !evidence.complete {
+            if evidence.owner != *owner || !evidence.selected_witnesses_complete {
                 return Err("U5 start evidence source incomplete or foreign".into());
             }
             if let Some((active, reference)) = evidence.active.as_ref() {
