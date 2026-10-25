@@ -117,6 +117,7 @@ fi
 
 # Fixed evaluator corpus follows the exact registered scenario, never caller paths.
 case "$SCENARIO_ID" in
+  live_u5_shared_session_fairness) EVALUATION_CORPUS_ID=live-u5-fairness-v1 ;;
   live_one_team_execution) EVALUATION_CORPUS_ID=live-one-team-v1 ;;
   *) EVALUATION_CORPUS_ID=live-scenarios-v1 ;;
 esac
