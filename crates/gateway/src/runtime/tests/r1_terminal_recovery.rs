@@ -4587,7 +4587,15 @@ async fn n3_reply_under_single_provider_lease(
     provider: &mut LoopbackProvider,
     services: &RecoveryServices,
 ) {
-    let request = provider.next().await;
+    // This original Task leaf sends one non-streaming structured request, not
+    // the conversation TaskRouter control RPC consumed by provider.next().
+    assert!(provider.pending_request.is_none());
+    assert_eq!(provider.task_route_controls, 0);
+    let request = tokio::time::timeout(Duration::from_secs(90), provider.requests.recv())
+        .await
+        .expect("original structured Provider request deadline")
+        .expect("original structured Provider channel closed");
+    assert_eq!(request.body["model"], "test-model");
     let runtime = services.runtime.runtime_services();
     let capacity = runtime
         .resource_manager()
@@ -4607,6 +4615,13 @@ async fn n3_reply_under_single_provider_lease(
         json!({"request":"bounded result"})
     );
     assert_eq!(
+        prompt["result_contract"],
+        json!({"contract_id":"result:structured","schema":{
+            "type":"object","properties":{"value":{"type":"integer"}},
+            "required":["value"],"additionalProperties":false
+        },"max_bytes":1024})
+    );
+    assert_eq!(
         prompt["instruction"],
         "Return one JSON object with value 37"
     );
@@ -4623,17 +4638,22 @@ async fn n3_structured_recovery_case(point: runtime::task::StructuredTaskFaultPo
     use crate::services::{EnsureSessionRequest, SessionSource};
     use harness_contract::task::*;
     use sha2::{Digest, Sha256};
-    let root = fixture_root();
-    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    // Retain synthetic artifacts together with the original namespace for failure diagnosis.
+    let root = fixture_root().keep();
+    eprintln!("n3 original recovery artifact root={}", root.display());
+    std::fs::create_dir_all(root.as_path().join("workspace")).unwrap();
     let mut provider = LoopbackProvider::start("root").await;
     let providers = provider_registry(&[&provider]);
     let topology = SelectedStorageTopology::compose_for_test(
-        &root.path().join("home"),
-        &root.path().join("workspace"),
+        &root.as_path().join("home"),
+        &root.as_path().join("workspace"),
     )
     .unwrap();
+    if let Some(schema) = topology.preserve_failed_test_namespace() {
+        eprintln!("n3 original recovery evidence schema={schema}");
+    }
     let services =
-        RecoveryServices::start_with_single_provider_slot(root.path(), topology, providers.clone())
+        RecoveryServices::start_with_single_provider_slot(root.as_path(), topology, providers.clone())
             .await;
     let session_id = format!("structured-recovery:{}", uuid::Uuid::new_v4());
     let mut session_request =
@@ -4786,7 +4806,7 @@ async fn n3_structured_recovery_case(point: runtime::task::StructuredTaskFaultPo
     let topology = lease.rebuild().unwrap();
     drop(lease);
     let services =
-        RecoveryServices::start_with_single_provider_slot(root.path(), topology, providers).await;
+        RecoveryServices::start_with_single_provider_slot(root.as_path(), topology, providers).await;
     if point != runtime::task::StructuredTaskFaultPoint::BeforeTaskResultProjection {
         n3_reply_under_single_provider_lease(&mut provider, &services).await;
     }

@@ -329,6 +329,32 @@ impl RuntimeServices {
             .ok_or("structured Task disappeared".into())
     }
 
+    /// Discover the original source Sessions before the ordered startup pass
+    /// consumes structured obligations. This is not admission or registration.
+    pub fn structured_task_recovery_sources(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, Option<String>), String> {
+        if limit == 0 {
+            return Err("structured recovery source page must be nonempty".into());
+        }
+        let tasks = self
+            .task_aggregate_service()
+            .structured_recovery_candidates(after, limit.saturating_add(1))?;
+        let backlog = tasks.len() > limit;
+        let mut last = None;
+        let mut sources = std::collections::BTreeSet::new();
+        for task in tasks.into_iter().take(limit) {
+            last = Some(task.task_id);
+            sources.insert(task.origin_session_id);
+        }
+        Ok((
+            sources.into_iter().collect(),
+            if backlog { last } else { None },
+        ))
+    }
+
     /// A bounded original-Task page also covers confirmed-but-not-woken work.
     pub(crate) async fn recover_structured_task_page(
         self: &Arc<Self>,
@@ -459,6 +485,11 @@ impl RuntimeServices {
             return Ok(());
         };
         let port = self.task_runtime_port();
+        // The original Task terminal transaction requires evidence. Carry the
+        // Graph already authenticated above, rather than bypassing that fence.
+        let mut graph_evidence =
+            harness_contract::reality::EvidenceRef::observed("execution_graph", graph.id.clone());
+        graph_evidence.source = Some(format!("revision:{}", graph.revision));
         if status == ExecutionNodeStatus::Completed {
             #[cfg(any(test, feature = "test-fixtures"))]
             self.task_aggregate_service()
@@ -477,7 +508,7 @@ impl RuntimeServices {
             .map_err(|e| e.to_string())?;
             validate_ticket(self, &task, &prepared.ticket)?;
             let expected = result_outcome(self, &task, &prepared).await?;
-            if result != &expected.result {
+            if !same_prepared_result_after_runner_measurement(result, &expected.result) {
                 return Err(
                     "structured Graph result differs from original prepared body/attempt".into(),
                 );
@@ -519,7 +550,12 @@ impl RuntimeServices {
                     .review_structured_phase(task_id, task.revision, &phase)?
                     .aggregate;
             }
-            port.transition_structured_from_graph(task_id, task.revision, TaskStatus::Completed)?;
+            port.transition_structured_from_graph(
+                task_id,
+                task.revision,
+                TaskStatus::Completed,
+                graph_evidence,
+            )?;
         } else {
             let terminal = if status == ExecutionNodeStatus::Cancelled {
                 TaskStatus::Cancelled
@@ -531,10 +567,27 @@ impl RuntimeServices {
             if task.status == terminal {
                 return Ok(());
             }
-            port.transition_structured_from_graph(task_id, task.revision, terminal)?;
+            port.transition_structured_from_graph(
+                task_id,
+                task.revision,
+                terminal,
+                graph_evidence,
+            )?;
         }
         Ok(())
     }
+}
+
+fn same_prepared_result_after_runner_measurement(
+    committed: &ExecutionNodeResult,
+    prepared: &ExecutionNodeResult,
+) -> bool {
+    // The original runner finalizes elapsed time after the leaf has prepared
+    // its immutable result. Preserve every other field, including observed
+    // Provider usage and the original result/acceptance identities.
+    let mut expected = prepared.clone();
+    expected.usage.duration_ms = committed.usage.duration_ms;
+    committed == &expected
 }
 
 fn parse_structured_result(raw: &str) -> Result<Value, String> {
@@ -1332,6 +1385,103 @@ mod tests {
         wrong.structured_registration = Some(TaskStructuredRegistration::pending(&wrong).unwrap());
         let error = frozen_inputs(&services, &wrong).await.unwrap_err();
         assert!(error.contains("unknown_keyword"), "{error}");
+        services.shutdown_execution().await;
+    }
+
+    #[test]
+    fn structured_result_accepts_runner_duration_but_rejects_business_or_usage_changes() {
+        let prepared = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some("artifact://original-result".into()),
+            wait_class: None,
+            summary: Some("{\"value\":37}".into()),
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: ExecutionUsage {
+                model: Some("test-model".into()),
+                provider_usage_observed: Some(true),
+                input_tokens: 13,
+                output_tokens: 7,
+                ..Default::default()
+            },
+            finished_at_ms: 17,
+        };
+        let mut committed = prepared.clone();
+        committed.usage.duration_ms = 275;
+        assert!(same_prepared_result_after_runner_measurement(
+            &committed, &prepared
+        ));
+        for field in [
+            "summary",
+            "result_ref",
+            "status",
+            "finish",
+            "model",
+            "input",
+            "output",
+            "unknown",
+        ] {
+            let mut foreign = committed.clone();
+            match field {
+                "summary" => foreign.summary = Some("{\"value\":38}".into()),
+                "result_ref" => foreign.result_ref = Some("artifact://foreign-result".into()),
+                "status" => foreign.status = ExecutionNodeStatus::Failed,
+                "finish" => foreign.finished_at_ms += 1,
+                "model" => foreign.usage.model = Some("foreign-model".into()),
+                "input" => foreign.usage.input_tokens += 1,
+                "output" => foreign.usage.output_tokens += 1,
+                "unknown" => foreign.usage.provider_usage_observed = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                !same_prepared_result_after_runner_measurement(&foreign, &prepared),
+                "{field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_recovery_source_pages_use_original_pending_tasks() {
+        let services = RuntimeServices::in_memory().unwrap();
+        services.shutdown_maintenance().await;
+        let tasks = services.task_aggregate_service();
+        tasks.create(command("task-source-a")).unwrap();
+        tasks.create(command("task-source-b")).unwrap();
+        let mut ordinary = command("task-source-c");
+        ordinary.spec.application_provenance = None;
+        tasks.create(ordinary).unwrap();
+        assert_eq!(
+            services.structured_task_recovery_sources("", 1).unwrap(),
+            (
+                vec!["structured-source".into()],
+                Some("task-source-a".into())
+            )
+        );
+        assert_eq!(
+            services
+                .structured_task_recovery_sources("task-source-a", 1)
+                .unwrap(),
+            (vec!["structured-source".into()], None)
+        );
+        assert_eq!(
+            services
+                .structured_task_recovery_sources("task-source-b", 1)
+                .unwrap(),
+            (Vec::new(), None)
+        );
+        assert!(services.structured_task_recovery_sources("", 0).is_err());
+        // Discovery alone cannot hydrate policy or publish/wake a Graph.
+        assert!(services
+            .session_execution_policy("structured-source")
+            .is_none());
+        assert!(tasks
+            .get("task-source-a")
+            .unwrap()
+            .unwrap()
+            .structured_registration
+            .unwrap()
+            .receipt
+            .is_none());
         services.shutdown_execution().await;
     }
 

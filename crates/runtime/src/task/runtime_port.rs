@@ -528,12 +528,13 @@ impl TaskRuntimePort {
         task_id: &str,
         expected_revision: u64,
         status: TaskStatus,
+        graph_evidence: EvidenceRef,
     ) -> Result<crate::TaskCommandOutcome, String> {
         self.finish_mutation(self.tasks.transition(
             task_id,
             expected_revision,
             status,
-            Vec::new(),
+            vec![graph_evidence],
             "original structured Graph execution projection",
         )?)
     }

@@ -1139,6 +1139,36 @@ impl SessionActivationCoordinator {
             .map(|index| index.session_id)
             .collect::<BTreeSet<_>>();
 
+        // A structured Task need not have a running conversation turn. Its
+        // original durable obligation still requires the source policy before
+        // Runtime can register/wake its Graph. Discover from that Task index,
+        // without fabricating a Session team-continuation signal.
+        let mut structured_sessions = BTreeSet::new();
+        let mut structured_after = String::new();
+        loop {
+            match self
+                .runtime
+                .runtime_services()
+                .structured_task_recovery_sources(&structured_after, page_size)
+            {
+                Ok((sources, next)) => {
+                    structured_sessions.extend(sources);
+                    match next {
+                        Some(next) => structured_after = next,
+                        None => break,
+                    }
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    summary.global_failures += 1;
+                    summary.failures.push(format!(
+                        "failed to discover structured source Sessions: {error}"
+                    ));
+                    return summary;
+                }
+            }
+        }
+
         if !include_warm_sessions {
             let known = manifests
                 .iter()
@@ -1146,8 +1176,11 @@ impl SessionActivationCoordinator {
                 .collect::<BTreeSet<_>>();
             let missing = pending_approval_sessions
                 .union(&continuation_sessions)
-                .filter(|session_id| !known.contains(session_id.as_str()))
                 .cloned()
+                .chain(structured_sessions.iter().cloned())
+                .filter(|session_id| !known.contains(session_id.as_str()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 match self
@@ -1280,6 +1313,7 @@ impl SessionActivationCoordinator {
             if manifest.pending_approval
                 && !manifest.in_flight_turn
                 && !manifest.mission_agent_team_continuation
+                && !structured_sessions.contains(&manifest.session_id)
             {
                 summary.required += 1;
                 summary.metadata_only += 1;
@@ -1315,7 +1349,10 @@ impl SessionActivationCoordinator {
         let mut attached = Vec::new();
         let mut recent = Vec::new();
         for manifest in runtime_manifests {
-            if manifest.in_flight_turn || manifest.mission_agent_team_continuation {
+            if manifest.in_flight_turn
+                || manifest.mission_agent_team_continuation
+                || structured_sessions.contains(&manifest.session_id)
+            {
                 summary.required += 1;
                 required.push(manifest);
             } else if manifest.active_writer_or_attachment {
