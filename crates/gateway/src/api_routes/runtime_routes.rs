@@ -661,6 +661,20 @@ mod read_evidence_api_tests {
             context,
             query: Default::default(),
         };
+        // Original registration identity, captured before querying the handler.
+        // Never derive the independent expected workspace from the returned page.
+        let expected_path = harness_contract::context::WorkspacePathIdentity {
+            workspace_id: runtime.workspace_key().to_string(),
+            repository_id: "read-repository".into(),
+            workspace_relative_path: "src/a.rs".into(),
+            repository_relative_path: "src/a.rs".into(),
+            object_kind: harness_contract::context::WorkspaceObjectKind::File,
+            observed_revision_or_digest: None,
+        };
+        println!(
+            "E1_EXPECTED_PATH:{}",
+            serde_json::to_string(&expected_path).unwrap()
+        );
         let Json(page) = get_execution_read_evidence(request(context.clone()))
             .await
             .unwrap();
