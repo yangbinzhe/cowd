@@ -2162,7 +2162,7 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
         .map_err(|error| RuntimeError::new(format!("invalid evaluation turn control: {error}")))?;
     if !matches!(
         control.corpus_id.as_str(),
-        "auto-strategy-v1" | "live-scenarios-v1"
+        "auto-strategy-v1" | "live-scenarios-v1" | "live-one-team-v1"
     ) || configured_corpus.as_deref() != Some(control.corpus_id.as_str())
         || prompt.trim().is_empty()
     {
@@ -2197,6 +2197,148 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
     }
     control.prompt = prompt.to_string();
     Ok(Some(control))
+}
+
+#[cfg(test)]
+mod evaluation_control_corpus_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires immutable envelopes exported by the actual Harness producer exact test"]
+    fn original_harness_selector_envelopes_reach_runtime_parser() {
+        let _lock = crate::test_env_lock();
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [
+                "COWD_EVAL_HARNESS",
+                "COWD_EVAL_CORPUS_ID",
+                "COWD_MODEL_TEMPERATURE",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        let path = std::env::var_os("COWD_TEST_HARNESS_CONTROL_INPUT")
+            .expect("actual Harness producer envelope file");
+        let raw = std::fs::read(path).unwrap();
+        assert!(raw.len() < 16384);
+        let originals: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(originals.len(), 3);
+        std::env::set_var("COWD_EVAL_HARNESS", "1");
+        std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
+        for (selector, corpus) in [
+            ("live_one_team_execution", "live-one-team-v1"),
+            ("live_direct_terminal", "live-scenarios-v1"),
+            ("live_tool_evidence", "live-scenarios-v1"),
+        ] {
+            let case = originals
+                .iter()
+                .find(|case| case["selector"] == selector)
+                .unwrap();
+            let content = case["content"].as_str().unwrap();
+            std::env::set_var("COWD_EVAL_CORPUS_ID", corpus);
+            let control = evaluation_turn_control(content)
+                .unwrap()
+                .expect("actual registered producer must be admitted");
+            assert_eq!(control.corpus_id, corpus);
+            assert_eq!(control.prompt, "original controlled input");
+            assert_eq!(control.provider_constraint, "normal");
+            assert_eq!(control.temperature_milli, 0);
+            let (line, prompt) = content.split_once('\n').unwrap();
+            let original: serde_json::Value =
+                serde_json::from_str(line.strip_prefix(EVALUATION_TURN_CONTROL_PREFIX).unwrap())
+                    .unwrap();
+            let envelope = |control: &serde_json::Value, prompt: &str| {
+                format!("{EVALUATION_TURN_CONTROL_PREFIX}{control}\n{prompt}")
+            };
+            // Legal existing auto corpus keeps its unchanged parser contract.
+            let mut auto = original.clone();
+            auto["corpus_id"] = serde_json::json!("auto-strategy-v1");
+            std::env::set_var("COWD_EVAL_CORPUS_ID", "auto-strategy-v1");
+            assert_eq!(
+                evaluation_turn_control(&envelope(&auto, prompt))
+                    .unwrap()
+                    .unwrap()
+                    .corpus_id,
+                "auto-strategy-v1"
+            );
+            // Equality and the fixed registry are separate guards.
+            std::env::set_var("COWD_EVAL_CORPUS_ID", "foreign");
+            assert!(evaluation_turn_control(content)
+                .unwrap_err()
+                .to_string()
+                .contains("corpus or prompt"));
+            let mut unknown = original.clone();
+            unknown["corpus_id"] = serde_json::json!("foreign");
+            assert!(evaluation_turn_control(&envelope(&unknown, prompt))
+                .unwrap_err()
+                .to_string()
+                .contains("corpus or prompt"));
+            std::env::set_var("COWD_EVAL_CORPUS_ID", corpus);
+            assert!(evaluation_turn_control(&envelope(&original, " "))
+                .unwrap_err()
+                .to_string()
+                .contains("corpus or prompt"));
+            std::env::remove_var("COWD_EVAL_CORPUS_ID");
+            assert!(evaluation_turn_control(content).is_err());
+            std::env::set_var("COWD_EVAL_CORPUS_ID", corpus);
+            let mut changed = original.clone();
+            changed["temperature_milli"] = serde_json::json!(1);
+            assert!(evaluation_turn_control(&envelope(&changed, prompt))
+                .unwrap_err()
+                .to_string()
+                .contains("temperature"));
+            std::env::set_var("COWD_MODEL_TEMPERATURE", "1");
+            assert!(evaluation_turn_control(content)
+                .unwrap_err()
+                .to_string()
+                .contains("temperature"));
+            std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
+            for (lease, limit) in [
+                (Some("lease"), None),
+                (None, Some(1)),
+                (Some(""), Some(1)),
+                (Some("lease"), Some(0)),
+            ] {
+                let mut invalid = original.clone();
+                if let Some(lease) = lease {
+                    invalid["budget_lease_id"] = serde_json::json!(lease);
+                }
+                if let Some(limit) = limit {
+                    invalid["max_total_tokens"] = serde_json::json!(limit);
+                }
+                assert!(evaluation_turn_control(&envelope(&invalid, prompt))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("telemetry lease"));
+            }
+            let mut telemetry = original.clone();
+            telemetry["budget_lease_id"] = serde_json::json!("original-lease");
+            telemetry["max_total_tokens"] = serde_json::json!(100);
+            assert_eq!(
+                evaluation_turn_control(&envelope(&telemetry, prompt))
+                    .unwrap()
+                    .unwrap()
+                    .max_total_tokens,
+                Some(100)
+            );
+            std::env::remove_var("COWD_EVAL_HARNESS");
+            assert!(evaluation_turn_control(content).unwrap().is_none());
+            std::env::set_var("COWD_EVAL_HARNESS", "1");
+        }
+        println!("ACTUAL_HARNESS_TO_RUNTIME_CORPUS_GATE: three original selector envelopes consumed; registry/equality/prompt/temperature/telemetry negatives hit");
+    }
 }
 
 struct EvaluationResourceQuotaGuard {

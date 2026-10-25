@@ -393,7 +393,7 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         resource_scopes.push("read:.");
     }
     let control = json!({
-        "corpus_id": "live-scenarios-v1",
+        "corpus_id": if spec_id == ONE_TEAM_SCENARIO_ID { "live-one-team-v1" } else { "live-scenarios-v1" },
         "workspace_fixture": "none",
         // The disposable Gateway config is the single-route authority. This
         // field belongs to Runtime's execution-resource contract, where the
@@ -5426,6 +5426,35 @@ mod tests;
 #[cfg(test)]
 mod read_evidence_consumer_tests {
     use super::*;
+
+    #[test]
+    fn original_selector_builds_the_registered_runtime_control_envelope() {
+        let cases = [
+            ("live_one_team_execution", "live-one-team-v1"),
+            ("live_direct_terminal", "live-scenarios-v1"),
+            ("live_tool_evidence", "live-scenarios-v1"),
+        ];
+        let mut originals = Vec::new();
+        for (selector, expected_corpus) in cases {
+            let prompt = "original controlled input";
+            let content = controlled_live_prompt(selector, prompt.into(), None);
+            let (line, actual_prompt) = content.split_once('\n').unwrap();
+            let control: Value =
+                serde_json::from_str(line.strip_prefix("COWD_EVAL_CONTROL ").unwrap()).unwrap();
+            assert_eq!(control["corpus_id"], expected_corpus);
+            assert_eq!(actual_prompt, prompt);
+            assert_eq!(control["temperature_milli"], 0);
+            assert_eq!(control["provider_constraint"], "normal");
+            assert!(control.get("budget_lease_id").is_none());
+            assert!(control.get("max_total_tokens").is_none());
+            originals.push(json!({"selector":selector,"content":content}));
+        }
+        // Optional immutable handoff to the original Runtime cfgtest parser.
+        // Expectations there are independent literals, never read from this file.
+        if let Some(path) = std::env::var_os("COWD_TEST_HARNESS_CONTROL_OUTPUT") {
+            std::fs::write(path, serde_json::to_vec(&originals).unwrap()).unwrap();
+        }
+    }
 
     #[test]
     fn one_team_requires_all_three_typed_sources() {
