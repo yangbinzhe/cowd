@@ -339,11 +339,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Locate,
             tier: ToolTier::Direct,
             permission_key: "glob",
-            description: "Find files by glob pattern, with continuationCursor paging. Use it to turn a where-is-X question into a concrete list before any read. Boundary: scanComplete=false with omissions reports inaccessible or depth-limited subtrees - refine an omitted subtree as a new search rather than assuming the list is complete.",
+            description: "Find file paths by glob pattern, with continuationCursor paging; matching file contents are not returned. Use it to turn a where-is-X question into a concrete list before any read. Boundary: execution defaults an omitted path to the workspace root, but the current read-only authority can certify only an explicit directory path with a simple pattern containing no path separators. Default-root and recursive patterns remain supported by execution but require separately sufficient authorization; schema acceptance does not grant permission. The same boundary applies to every patterns item. scanComplete=false with omissions reports inaccessible or depth-limited subtrees - refine an omitted subtree rather than assuming completeness. Project ignore rules are not mandatory sensitive-path protection.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
+                    "pattern": { "type": "string", "description": "Glob expression. Current read-only scope certification needs a simple pattern without / or backslash and an explicit path; recursive patterns require separately sufficient authorization." },
                     "patterns": {
                         "type": "array",
                         "maxItems": 200,
@@ -351,8 +351,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "pattern": { "type": "string" },
-                                "path": { "type": "string" },
+                                "pattern": { "type": "string", "description": "Glob expression. Current read-only scope certification needs a simple pattern without / or backslash and an explicit path; recursive patterns require separately sufficient authorization." },
+                                "path": { "type": "string", "description": "Directory root. Omission defaults execution to the workspace root, but does not certify its read scope. Use an explicit directory for current read-only scope certification; authorization and workspace boundaries still apply." },
                                 "include_ignored": { "type": "boolean" },
                                 "ignore_patterns": { "type": "array", "items": { "type": "string" } }
                             },
@@ -361,7 +361,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     },
                     "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
                     "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
-                    "path": { "type": "string" },
+                    "path": { "type": "string", "description": "Directory root. Omission defaults execution to the workspace root, but does not certify its read scope. Use an explicit directory for current read-only scope certification; authorization and workspace boundaries still apply." },
                     "cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." },
                     "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42, "description": "Only with `patterns`: cap parallel sub-searches." }
                 },
@@ -1359,6 +1359,46 @@ fn every_tool_documentation_states_power_and_boundary_without_false_claims() {
     let read_file = by_name("read_file");
     assert!(read_file.description.contains("workspace text file"));
     assert!(read_file.description.contains("complete=true"));
+}
+
+#[test]
+fn glob_scope_documentation_preserves_default_and_recursive_schema_inputs() {
+    let specs = mvp_tool_specs();
+    let glob = specs
+        .iter()
+        .find(|spec| spec.name == "glob_search")
+        .unwrap();
+    assert!(glob.description.contains("explicit directory path"));
+    assert!(glob
+        .description
+        .contains("separately sufficient authorization"));
+    assert!(glob
+        .description
+        .contains("schema acceptance does not grant permission"));
+    let properties = &glob.input_schema["properties"];
+    let batch = &properties["patterns"]["items"]["properties"];
+    for field in ["path", "pattern"] {
+        let description = properties[field]["description"].as_str().unwrap();
+        assert!(!description.is_empty());
+        assert_eq!(batch[field]["description"].as_str(), Some(description));
+    }
+    assert_eq!(glob.required_permission, PermissionMode::ReadOnly);
+
+    // Exercise the original schema validator, without executing or authorizing
+    // any search. Documentation must not remove higher-authority input forms.
+    let host = crate::ToolHost::builtin("glob-schema-contract", std::env::temp_dir());
+    let lease = host.pin_snapshot();
+    for input in [
+        json!({"pattern":"*.rs","path":"."}),
+        json!({"pattern":"**/*.rs"}),
+        json!({"pattern":"nested/*.rs","path":"."}),
+        json!({"patterns":[{"pattern":"**/*.rs"},{"pattern":"*.toml","path":"."}]}),
+    ] {
+        lease.validate_input("glob_search", &input).unwrap();
+    }
+    for input in [json!({"path":"."}), json!({"pattern":7})] {
+        assert!(lease.validate_input("glob_search", &input).is_err());
+    }
 }
 
 /// The orchestration specification must match its input schema exactly.
