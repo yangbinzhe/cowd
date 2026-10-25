@@ -26,6 +26,375 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// run report "not verified".
 const PROGRAM_EXTRACTION_RETRIES: u32 = 3;
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
+const U5_FAIRNESS: &str = "live_u5_shared_session_fairness";
+const U5_CANCEL: &str = "live_u5_active_cancel_isolation";
+const U5_MISSING: &str =
+    "u5_evidence_missing: G1 trusted owner/listener and G2 resource transport are not connected";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum U5Mode {
+    Fairness,
+    Cancel,
+}
+
+impl U5Mode {
+    fn from_id(id: &str) -> Option<Self> {
+        match id {
+            U5_FAIRNESS => Some(Self::Fairness),
+            U5_CANCEL => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+struct AdmittedLiveScenario {
+    session_id: String,
+    execution_id: String,
+    turn_id: String,
+    expected_reads: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
+    trace: Vec<Value>,
+}
+
+// Private, non-deserializable owner/observation inputs. There is deliberately
+// no environment/JSON constructor that can promote model text to authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct U5Owner {
+    pid: u32,
+    starttime: u64,
+    image_sha256: String,
+    candidate: String,
+    namespace: String,
+    base_url: String,
+    principal_actor: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct U5Identity {
+    session: String,
+    turn: String,
+    root: String,
+}
+
+// Kept by the initiating actor, not reconstructed from a returned receipt.
+#[derive(Clone)]
+struct U5CancelContext {
+    identity: U5Identity,
+    cancellation_id: String,
+    started_source: String,
+}
+
+struct U5ActorOutcome {
+    report: Value,
+    cancellation: Option<U5CancelContext>,
+}
+
+impl U5ActorOutcome {
+    fn failed(reason: &str) -> Self {
+        Self {
+            report: json!({"status":"failed","reason":reason}),
+            cancellation: None,
+        }
+    }
+}
+
+impl AdmittedLiveScenario {
+    fn identity(&self) -> U5Identity {
+        U5Identity {
+            session: self.session_id.clone(),
+            turn: self.turn_id.clone(),
+            root: self.execution_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct U5ResourceEvidence {
+    owner: U5Owner,
+    observations: Vec<runtime::execution_core::graph::ResourceAdmissionObservation>,
+    complete: bool,
+    // A producer-certified active physical source, never merely an intent.
+    active: Option<(U5Identity, String)>,
+    // The original producer must certify actual overlap, not infer it from a
+    // blocker UUID or two successful answers. No live adapter exists yet.
+    overlap: Option<(uuid::Uuid, uuid::Uuid, String)>,
+}
+
+trait U5EvidenceReader: Sync {
+    // Future trusted adapters must bind the original owner/listener and impose
+    // the approved pre-I/O byte/page/time bounds. No live adapter is enabled.
+    fn owner(&self) -> Result<U5Owner, String>;
+    fn read(&self, sessions: &[String; 2], deadline: Instant)
+        -> Result<U5ResourceEvidence, String>;
+}
+
+struct UnavailableU5Evidence;
+impl U5EvidenceReader for UnavailableU5Evidence {
+    fn owner(&self) -> Result<U5Owner, String> {
+        Err(U5_MISSING.into())
+    }
+    fn read(&self, _: &[String; 2], _: Instant) -> Result<U5ResourceEvidence, String> {
+        Err(U5_MISSING.into())
+    }
+}
+
+fn u5_gated(reason: String) -> Value {
+    json!({"kind":"harness_eval.live_gateway_scenarios", "status":"gated", "reason":reason,
+        "model_work_started":false, "release_certified":false, "scenarios":[]})
+}
+
+fn u5_selection_preflight(selected: Option<&BTreeSet<String>>) -> Option<Value> {
+    if selected.is_some_and(|ids| ids.iter().any(|id| U5Mode::from_id(id).is_some())) {
+        return UnavailableU5Evidence.owner().err().map(u5_gated);
+    }
+    None
+}
+
+fn u5_valid_owner(owner: &U5Owner, base_url: &str) -> bool {
+    owner.pid > 0
+        && owner.starttime > 0
+        && !owner.namespace.is_empty()
+        && owner.principal_actor.starts_with("principal:")
+        && owner.base_url == base_url
+        && owner
+            .image_sha256
+            .strip_prefix("sha256:")
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+        && owner.candidate.len() == 40
+        && owner.candidate.bytes().all(|c| c.is_ascii_hexdigit())
+        && reqwest::Url::parse(base_url).is_ok_and(|url| {
+            url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
+        })
+}
+
+fn u5_inputs() -> [LiveScenarioSpec; 2] {
+    [
+        LiveScenarioSpec {
+            id: "u5-read-a",
+            prompt: "请通过只读工具读取 Cargo.toml，给出 workspace package version 和文件路径，不要猜测。",
+            acceptance: LiveAcceptance::Facet {
+                facet_id: "u5-version",
+                capability: "read original version",
+                required_read_paths: &["Cargo.toml"],
+                answer_contains: &[env!("CARGO_PKG_VERSION"), "Cargo.toml"],
+                keep_unresolved_ok: false,
+            },
+            timeout: LiveScenarioTimeout::tool(),
+        },
+        LiveScenarioSpec {
+            id: "u5-read-b",
+            prompt: "请通过只读工具读取 crates/runtime/Cargo.toml，不要猜测。最终只返回 JSON 对象，package_name 字段为实际 package name，path 字段为读取的文件路径。",
+            acceptance: LiveAcceptance::Facet {
+                facet_id: "u5-name",
+                capability: "read original package name",
+                required_read_paths: &["crates/runtime/Cargo.toml"],
+                answer_contains: &["runtime", "crates/runtime/Cargo.toml"],
+                keep_unresolved_ok: false,
+            },
+            timeout: LiveScenarioTimeout::tool(),
+        },
+    ]
+}
+
+fn u5_package_answer(text: &str) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|answer| {
+        answer["package_name"] == "runtime" && answer["path"] == "crates/runtime/Cargo.toml"
+    })
+}
+
+fn u5_identity(report: &Value) -> Option<U5Identity> {
+    let field = |name| {
+        report
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(U5Identity {
+        session: field("session_id")?,
+        turn: field("turn_id")?,
+        root: field("execution_id")?,
+    })
+}
+
+fn u5_normal_passed(report: &Value) -> bool {
+    // Reports are built by observe_admitted_scenario, never accepted from an
+    // HTTP/model-authored "passed" object. Its original source/ACK gates remain.
+    report["status"] == "passed"
+        && report.pointer("/acceptance/passed") == Some(&Value::Bool(true))
+        && report.pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
+        && u5_identity(report).is_some()
+}
+
+fn u5_cancel_settled(
+    id: &U5Identity,
+    owner: &U5Owner,
+    cancellation_id: &str,
+    receipt: &harness_contract::turn::CancellationReceipt,
+    projection: &Value,
+) -> bool {
+    use harness_contract::{
+        projection::{ExecutionTerminalAxes, TerminalEffectSettlement, TerminalExecutionPhase},
+        turn::{CancellationCause, CancellationStatus},
+    };
+    let Ok(axes) = serde_json::from_value::<ExecutionTerminalAxes>(
+        projection
+            .get("terminal_axes")
+            .cloned()
+            .unwrap_or(Value::Null),
+    ) else {
+        return false;
+    };
+    receipt.cancellation_id == cancellation_id
+        && receipt.session_id == id.session
+        && receipt.turn_id == id.turn
+        && receipt.execution_id == id.root
+        && receipt.actor_id == owner.principal_actor
+        && receipt.status == CancellationStatus::Cancelled
+        && receipt.cause == CancellationCause::UserRequested
+        && receipt.journal_sequence > 0
+        && receipt.effective_at_ms.is_some()
+        && projection["execution_id"] == id.root
+        && projection["session_id"] == id.session
+        && projection["turn_id"] == id.turn
+        && axes.execution.phase == TerminalExecutionPhase::Terminal
+        && axes.execution.settlement == TerminalEffectSettlement::ProvenSettled
+        && axes.execution.coverage_complete
+        && !axes.source_race
+        && axes.source_cursor > 0
+        && axes.outcome.outcome != Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied)
+}
+
+fn u5_pair_acceptance(
+    mode: U5Mode,
+    owner: &U5Owner,
+    sessions: &[String; 2],
+    left: &Value,
+    right: &Value,
+    evidence: &U5ResourceEvidence,
+    cancellation: Option<&U5CancelContext>,
+) -> Value {
+    use runtime::execution_core::graph::{
+        ExecutionResourceKind, ResourceAdmissionObservationStatus as Status, ResourceWaitReason,
+    };
+    let identities = u5_identity(left).zip(u5_identity(right));
+    let identity_ok = identities.as_ref().is_some_and(|(a, b)| {
+        a.session == sessions[0]
+            && b.session == sessions[1]
+            && a.session != b.session
+            && a.turn != b.turn
+            && a.root != b.root
+    });
+    let origin_ok =
+        evidence.owner == *owner && evidence.complete && evidence.observations.len() <= 512;
+    let contention = evidence.overlap.as_ref().is_some_and(|(a, b, source)| {
+        if a == b || source.is_empty() {
+            return false;
+        }
+        let grant = |request, session: &str| {
+            evidence.observations.iter().any(|o| {
+                o.request_id == request
+                    && o.status == Status::Granted
+                    && o.fairness_key == format!("session:{session}")
+                    && o.demands.iter().any(|(kind, n)| {
+                        *n > 0
+                            && matches!(
+                                kind,
+                                ExecutionResourceKind::Provider
+                                    | ExecutionResourceKind::ProviderAccount(_)
+                                    | ExecutionResourceKind::ProviderModel(_)
+                            )
+                    })
+            })
+        };
+        let capacity_wait = evidence.observations.iter().any(|o| {
+            (o.request_id == *a || o.request_id == *b)
+                && o.wait_reason == Some(ResourceWaitReason::Capacity)
+                && o.queue_age_ms > 0
+                && matches!(o.status, Status::Waiting | Status::Granted)
+        });
+        grant(*a, &sessions[0]) && grant(*b, &sessions[1]) && capacity_wait
+    });
+    let left_ok = match mode {
+        U5Mode::Fairness => u5_normal_passed(left),
+        U5Mode::Cancel => identities.as_ref().is_some_and(|(a, _)| {
+            let receipt = left.get("receipt").cloned().and_then(|r| {
+                serde_json::from_value::<harness_contract::turn::CancellationReceipt>(r).ok()
+            });
+            left["status"] == "cancelled"
+                && left.pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
+                && cancellation.is_some_and(|request| {
+                    request.identity == *a
+                        && !request.started_source.is_empty()
+                        && receipt.as_ref().is_some_and(|r| {
+                            u5_cancel_settled(
+                                a,
+                                owner,
+                                &request.cancellation_id,
+                                r,
+                                &left["projection"],
+                            )
+                        })
+                })
+        }),
+    };
+    let internal = identity_ok
+        && origin_ok
+        && left_ok
+        && u5_normal_passed(right)
+        && (mode == U5Mode::Cancel || contention);
+    json!({"internal_passed":internal,"identity":identity_ok,"source_complete":origin_ok,
+        "left_business":left_ok,"right_business":u5_normal_passed(right),"capacity_competition":contention,
+        "outer_cleanup_observed":false})
+}
+
+// Pure final-merger predicate, not a second Runtime outcome. Actual outer V1
+// is produced only after harness exits; a missing source can never be success.
+fn u5_final_acceptance(
+    internal: &Value,
+    owner: &U5Owner,
+    outer: Option<(&U5Owner, bool, bool, usize)>,
+) -> bool {
+    internal["internal_passed"] == true
+        && outer.is_some_and(|(actual, v1, clean, remaining)| {
+            actual == owner && v1 && clean && remaining == 0
+        })
+}
+
+fn u5_parallel<L, R>(deadline: Instant, left: L, right: R) -> (U5ActorOutcome, U5ActorOutcome)
+where
+    L: FnOnce() -> U5ActorOutcome + Send,
+    R: FnOnce() -> U5ActorOutcome + Send,
+{
+    std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = scope.spawn(move || {
+            let _ = ready_tx.send(());
+            if go_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_err()
+            {
+                return U5ActorOutcome::failed("U5 shared deadline before dispatch");
+            }
+            right()
+        });
+        let a = if ready_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
+            && Instant::now() < deadline
+        {
+            let _ = go_tx.send(());
+            left()
+        } else {
+            U5ActorOutcome::failed("U5 shared deadline before dispatch")
+        };
+        drop(go_tx);
+        let b = thread
+            .join()
+            .unwrap_or_else(|_| U5ActorOutcome::failed("U5 peer panicked"));
+        (a, b)
+    })
+}
 const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation";
 const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
 const AUTONOMOUS_DEEPSEEK_SCENARIO_ID: &str = "live_autonomous_collaboration_deepseek";
@@ -375,7 +744,11 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
     // Scenario admission is a capability lease, not a hint. The tool-evidence
     // fixture asks the root execution to read this exact file, so grant only
     // that read rather than weakening Runtime's fail-closed scope ceiling.
-    if spec_id == "live_tool_evidence" {
+    if spec_id == "u5-read-a" {
+        resource_scopes.push("read:Cargo.toml");
+    } else if spec_id == "u5-read-b" {
+        resource_scopes.push("read:crates/runtime/Cargo.toml");
+    } else if spec_id == "live_tool_evidence" {
         resource_scopes.push("read:Cargo.toml");
     }
     if spec_id == AUTONOMOUS_DEEPSEEK_SCENARIO_ID {
@@ -386,7 +759,7 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         // exact: the isolated workspace plus network reads, never the host.
         resource_scopes.push("workspace:.");
         resource_scopes.push("network:*");
-    } else {
+    } else if !matches!(spec_id, "u5-read-a" | "u5-read-b") {
         // Read-only source-analysis scenarios must be able to read the isolated
         // candidate workspace (`crates/...`) to ground their evidence. Without
         // this lease every source read is denied by the resource ceiling.
@@ -416,6 +789,11 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
 /// Gateway. This runner never constructs Runtime objects or fakes receipts:
 /// every result is derived from public Gateway responses and durable messages.
 pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
+    // Preflight precedes HTTP health, actor creation and any model work. The
+    // missing producer adapter cannot be replaced by a caller-authored file.
+    if let Some(gated) = u5_selection_preflight(selected_live_scenario_ids().as_ref()) {
+        return gated;
+    }
     let claim_scope = match LiveClaimScope::from_environment() {
         Ok(scope) => scope,
         Err(reason) => {
@@ -502,6 +880,7 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
         poll_interval,
         model: options.provider.clone(),
         claim_scope,
+        u5_deadline: None,
     };
     runner.run(provider_token_telemetry_limit)
 }
@@ -513,6 +892,7 @@ struct LiveScenarioRunner {
     poll_interval: Duration,
     model: Option<String>,
     claim_scope: LiveClaimScope,
+    u5_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -883,6 +1263,279 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
 }
 
 impl LiveScenarioRunner {
+    fn run_u5_pair(
+        &self,
+        mode: U5Mode,
+        spec: LiveScenarioSpec,
+        telemetry: Option<u64>,
+        source: &dyn U5EvidenceReader,
+    ) -> Value {
+        let owner = match source.owner() {
+            Ok(owner) if u5_valid_owner(&owner, &self.base_url) => owner,
+            _ => return u5_gated(U5_MISSING.into()),
+        };
+        if std::env::var_os("COWD_EVAL_RESUME_SESSION").is_some() {
+            return u5_gated(
+                "U5 requires two fresh independent Sessions, not a single resumed Session".into(),
+            );
+        }
+        let started = Instant::now();
+        let timeout = spec.timeout.with_cap(self.timeout_cap);
+        let deadline = started
+            + timeout
+                .absolute_wait
+                .unwrap_or(Duration::from_secs(600))
+                .min(Duration::from_secs(600));
+        let runner = Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            timeout_cap: self.timeout_cap,
+            poll_interval: self.poll_interval,
+            model: self.model.clone(),
+            claim_scope: self.claim_scope,
+            u5_deadline: Some(deadline),
+        };
+        let inputs = u5_inputs();
+        let mut reads = Vec::new();
+        for (input, bytes) in inputs.iter().zip([
+            include_bytes!("../../../Cargo.toml").as_slice(),
+            include_bytes!("../../runtime/Cargo.toml").as_slice(),
+        ]) {
+            let expected = match preregister_read_paths(input.acceptance.read_obligations()) {
+                Ok(expected) => expected,
+                Err(error) => return u5_gated(error),
+            };
+            let root = std::env::var_os("COWD_EVAL_WORKSPACE")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_dir().ok());
+            let matches = root.as_ref().is_some_and(|root| {
+                expected
+                    .keys()
+                    .all(|path| std::fs::read(root.join(path)).is_ok_and(|actual| actual == bytes))
+            });
+            if !matches {
+                return u5_gated(
+                    "U5 input source differs from the independently frozen manifest".into(),
+                );
+            }
+            reads.push(expected);
+        }
+        // Both sources are frozen before the first actor or message exists.
+        let mut a = match SessionActor::create(
+            &runner.client,
+            &runner.base_url,
+            runner.model.as_deref(),
+            "harness-u5-a",
+            deadline,
+        ) {
+            Ok(actor) => actor,
+            Err(error) => return u5_gated(error),
+        };
+        let b = match SessionActor::create(
+            &runner.client,
+            &runner.base_url,
+            runner.model.as_deref(),
+            "harness-u5-b",
+            deadline,
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                let cleanup = a.finish();
+                return json!({"status":"failed","error":error,"actor_cleanup":cleanup});
+            }
+        };
+        let sessions = [a.session_id().to_string(), b.session_id().to_string()];
+        let right_reads = reads.pop().expect("two preregistered inputs");
+        let left_reads = reads.pop().expect("two preregistered inputs");
+        let (left, right) = u5_parallel(
+            deadline,
+            || {
+                runner.run_u5_actor(
+                    mode, inputs[0], telemetry, started, timeout, a, left_reads, source, &owner,
+                    &sessions,
+                )
+            },
+            || {
+                runner.run_u5_actor(
+                    U5Mode::Fairness,
+                    inputs[1],
+                    telemetry,
+                    started,
+                    timeout,
+                    b,
+                    right_reads,
+                    source,
+                    &owner,
+                    &sessions,
+                )
+            },
+        );
+        let evidence = source.read(&sessions, deadline);
+        let internal = match evidence {
+            Ok(evidence) => u5_pair_acceptance(
+                mode,
+                &owner,
+                &sessions,
+                &left.report,
+                &right.report,
+                &evidence,
+                left.cancellation.as_ref(),
+            ),
+            Err(error) => json!({"internal_passed":false,"reason":error}),
+        };
+        // The original launcher stops Gateway only AFTER harness exits. Never
+        // wait for that V1 here, nor publish internal success as final success.
+        json!({"scenario_id":spec.id,"status":if internal["internal_passed"]==true {"pending_outer_cleanup"} else {"failed"},
+            "acceptance":{"passed":u5_final_acceptance(&internal,&owner,None),"checks":internal},"sessions":[left.report,right.report],
+            "cancellation_request":left.cancellation.as_ref().map(|request| json!({"session_id":request.identity.session,"turn_id":request.identity.turn,"execution_id":request.identity.root,"cancellation_id":request.cancellation_id,"started_source":request.started_source})),
+            "outer_cleanup":"not_observed","release_certified":false})
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_u5_actor(
+        &self,
+        mode: U5Mode,
+        spec: LiveScenarioSpec,
+        telemetry: Option<u64>,
+        started: Instant,
+        timeout: LiveScenarioTimeout,
+        mut actor: SessionActor<'_>,
+        reads: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
+        source: &dyn U5EvidenceReader,
+        owner: &U5Owner,
+        sessions: &[String; 2],
+    ) -> U5ActorOutcome {
+        let mut active_identity = None;
+        let mut cancellation = None;
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match self.admit_scenario(
+                spec,
+                telemetry,
+                started,
+                None,
+                Vec::new(),
+                &mut actor,
+                Some(reads),
+            ) {
+                Err(error) => error,
+                Ok(admitted) => {
+                    active_identity = Some(admitted.identity());
+                    if mode == U5Mode::Cancel {
+                        let identity = admitted.identity();
+                        match self.observe_u5_cancel(
+                            &identity, owner, source, sessions, &mut actor, started,
+                        ) {
+                            Ok((result, request)) => {
+                                cancellation = Some(request);
+                                result
+                            }
+                            Err(error) => {
+                                let cleanup = self.cancel_execution_lineage(
+                                    &identity.root,
+                                    &mut actor,
+                                    &mut Vec::new(),
+                                );
+                                json!({"status":"failed","error":error,"cancellation_cleanup":cleanup,
+                                "session_id":identity.session,"turn_id":identity.turn,"execution_id":identity.root})
+                            }
+                        }
+                    } else {
+                        self.observe_admitted_scenario(spec, started, timeout, admitted, &mut actor)
+                    }
+                }
+            }
+        }));
+        let mut result = match attempt {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(identity) = active_identity {
+                    let _ =
+                        self.cancel_execution_lineage(&identity.root, &mut actor, &mut Vec::new());
+                }
+                json!({"status":"failed","reason":"U5 actor panicked; original evidence must be retained"})
+            }
+        };
+        let cleanup = actor.finish();
+        if cleanup.is_err() {
+            result["status"] = json!("failed");
+        }
+        result["actor_cleanup"] = json!({"passed":cleanup.is_ok()});
+        U5ActorOutcome {
+            report: result,
+            cancellation,
+        }
+    }
+
+    fn observe_u5_cancel(
+        &self,
+        identity: &U5Identity,
+        owner: &U5Owner,
+        source: &dyn U5EvidenceReader,
+        sessions: &[String; 2],
+        actor: &mut SessionActor<'_>,
+        started: Instant,
+    ) -> Result<(Value, U5CancelContext), String> {
+        let deadline = self
+            .u5_deadline
+            .ok_or("U5 missing shared observation deadline")?;
+        let start_deadline = deadline.min(started + Duration::from_secs(90));
+        let started_source = loop {
+            if Instant::now() >= start_deadline {
+                return Err("U5 active physical start coverage missing".into());
+            }
+            actor.maintain_receipt_authority()?;
+            let evidence = source.read(sessions, start_deadline)?;
+            if evidence.owner != *owner || !evidence.complete {
+                return Err("U5 start evidence source incomplete or foreign".into());
+            }
+            if let Some((active, reference)) = evidence.active.as_ref() {
+                if active == identity && !reference.is_empty() {
+                    break reference.clone();
+                }
+            }
+            thread::sleep(
+                self.poll_interval
+                    .min(start_deadline.saturating_duration_since(Instant::now())),
+            );
+        };
+        let cancellation_id = format!("u5:{}", uuid::Uuid::new_v4());
+        let body = json!({"cancellation_id":cancellation_id,"expected_execution_id":identity.root,"expected_turn_id":identity.turn});
+        loop {
+            if Instant::now() >= deadline {
+                return Err("U5 cancellation remains unproven at the original deadline".into());
+            }
+            actor.maintain_receipt_authority()?;
+            let raw = actor.post_mutation(
+                &format!("/api/sessions/{}/cancel", identity.session),
+                body.clone(),
+            )?;
+            let receipt: harness_contract::turn::CancellationReceipt =
+                serde_json::from_value(raw).map_err(|e| e.to_string())?;
+            if receipt.status == harness_contract::turn::CancellationStatus::AlreadyTerminal {
+                return Err("U5 AlreadyTerminal does not cover active cancellation".into());
+            }
+            let projection = self.get_json(&format!(
+                "/api/runtime/executions/{}?detail_scope=summary",
+                identity.root
+            ))?;
+            if u5_cancel_settled(identity, owner, &cancellation_id, &receipt, &projection) {
+                return Ok((
+                    json!({"status":"cancelled","session_id":identity.session,"turn_id":identity.turn,
+                    "execution_id":identity.root,"receipt":receipt,"projection":projection}),
+                    U5CancelContext {
+                        identity: identity.clone(),
+                        cancellation_id,
+                        started_source,
+                    },
+                ));
+            }
+            thread::sleep(
+                self.poll_interval
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
     fn run(&self, provider_token_telemetry_limit: Option<u64>) -> Value {
         let claim_scope = self.claim_scope;
         let health_observations = [
@@ -1091,6 +1744,20 @@ impl LiveScenarioRunner {
             }
         }
         let selected_scenario_ids = selected_live_scenario_ids();
+        // Explicit opt-in only; neither case enters the default or release suite.
+        for (id, mode) in [(U5_FAIRNESS, U5Mode::Fairness), (U5_CANCEL, U5Mode::Cancel)] {
+            if selected_scenario_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(id))
+            {
+                scenario_specs.push(LiveScenarioSpec {
+                    id,
+                    prompt: "U5 shared Session consumer",
+                    acceptance: LiveAcceptance::U5(mode),
+                    timeout: LiveScenarioTimeout::tool(),
+                });
+            }
+        }
         let registered_scenario_ids = scenario_specs
             .iter()
             .map(|spec| spec.id.to_string())
@@ -1197,6 +1864,14 @@ impl LiveScenarioRunner {
         spec: LiveScenarioSpec,
         provider_token_telemetry_limit: Option<u64>,
     ) -> Value {
+        if let LiveAcceptance::U5(mode) = spec.acceptance {
+            return self.run_u5_pair(
+                mode,
+                spec,
+                provider_token_telemetry_limit,
+                &UnavailableU5Evidence,
+            );
+        }
         let started = Instant::now();
         let mut trace = Vec::new();
         let timeout = spec.timeout.with_cap(self.timeout_cap);
@@ -1264,24 +1939,51 @@ impl LiveScenarioRunner {
         started: Instant,
         timeout: LiveScenarioTimeout,
         resume_session: Option<&str>,
-        mut trace: Vec<Value>,
+        trace: Vec<Value>,
         actor: &mut SessionActor<'_>,
     ) -> Value {
+        match self.admit_scenario(
+            spec,
+            provider_token_telemetry_limit,
+            started,
+            resume_session,
+            trace,
+            actor,
+            None,
+        ) {
+            Ok(admitted) => self.observe_admitted_scenario(spec, started, timeout, admitted, actor),
+            Err(failed) => failed,
+        }
+    }
+
+    fn admit_scenario(
+        &self,
+        spec: LiveScenarioSpec,
+        provider_token_telemetry_limit: Option<u64>,
+        started: Instant,
+        resume_session: Option<&str>,
+        mut trace: Vec<Value>,
+        actor: &mut SessionActor<'_>,
+        expected_reads: Option<BTreeMap<String, harness_contract::context::WorkspacePathIdentity>>,
+    ) -> Result<AdmittedLiveScenario, Value> {
         trace.extend(actor.drain_trace());
         let session_id = actor.session_id().to_string();
         // Capture independent expectations before admitting this objective;
         // never derive the expected repository from the proof response.
-        let expected_reads = match preregister_read_paths(spec.acceptance.read_obligations()) {
+        let expected_reads = match expected_reads
+            .map(Ok)
+            .unwrap_or_else(|| preregister_read_paths(spec.acceptance.read_obligations()))
+        {
             Ok(expected) => expected,
             Err(error) => {
-                return failed_scenario_with_session(
+                return Err(failed_scenario_with_session(
                     spec,
                     started,
                     trace,
                     session_id,
                     error,
                     Value::Null,
-                );
+                ));
             }
         };
         let (execution_id, turn_id) = if resume_session.is_some() {
@@ -1294,27 +1996,27 @@ impl LiveScenarioRunner {
                         .filter(|value| !value.trim().is_empty())
                         .map(ToString::to_string);
                     let Some(execution_id) = execution_id else {
-                        return failed_scenario_with_session(
+                        return Err(failed_scenario_with_session(
                             spec,
                             started,
                             trace,
                             session_id,
                             "resume found no in-flight session execution to observe".to_string(),
                             Value::Null,
-                        );
+                        ));
                     };
                     let turn_id = self.root_execution_turn_id(&execution_id);
                     (Some(execution_id), turn_id)
                 }
                 Err(error) => {
-                    return failed_scenario_with_session(
+                    return Err(failed_scenario_with_session(
                         spec,
                         started,
                         trace,
                         session_id,
                         error,
                         Value::Null,
-                    );
+                    ));
                 }
             }
         } else {
@@ -1335,14 +2037,14 @@ impl LiveScenarioRunner {
             let admission = match admission {
                 Ok(value) => value,
                 Err(error) => {
-                    return failed_scenario_with_session(
+                    return Err(failed_scenario_with_session(
                         spec,
                         started,
                         trace,
                         session_id,
                         error,
                         Value::Null,
-                    );
+                    ));
                 }
             };
             let execution_id = admission
@@ -1359,17 +2061,17 @@ impl LiveScenarioRunner {
             (execution_id, turn_id)
         };
         let Some(execution_id_ref) = execution_id.as_deref() else {
-            return failed_scenario_with_session(
+            return Err(failed_scenario_with_session(
                 spec,
                 started,
                 trace,
                 session_id,
                 "scenario admission lacks canonical execution.graph_id".to_string(),
                 Value::Null,
-            );
+            ));
         };
         let Some(turn_id_ref) = turn_id.as_deref() else {
-            return failed_scenario_with_session_and_execution(
+            return Err(failed_scenario_with_session_and_execution(
                 spec,
                 started,
                 trace,
@@ -1377,9 +2079,37 @@ impl LiveScenarioRunner {
                 execution_id,
                 "scenario admission lacks canonical execution.turn_id".to_string(),
                 Value::Null,
-            );
+            ));
         };
 
+        Ok(AdmittedLiveScenario {
+            session_id,
+            execution_id: execution_id_ref.to_string(),
+            turn_id: turn_id_ref.to_string(),
+            expected_reads,
+            trace,
+        })
+    }
+
+    fn observe_admitted_scenario(
+        &self,
+        spec: LiveScenarioSpec,
+        started: Instant,
+        timeout: LiveScenarioTimeout,
+        admitted: AdmittedLiveScenario,
+        actor: &mut SessionActor<'_>,
+    ) -> Value {
+        let AdmittedLiveScenario {
+            session_id,
+            execution_id,
+            turn_id,
+            expected_reads,
+            mut trace,
+        } = admitted;
+        let execution_id = Some(execution_id);
+        let turn_id = Some(turn_id);
+        let execution_id_ref = execution_id.as_deref().expect("admitted root");
+        let turn_id_ref = turn_id.as_deref().expect("admitted turn");
         let mut observer = LiveScenarioObserver::default();
         let terminal = self.wait_for_terminal_message(
             &session_id,
@@ -1452,6 +2182,13 @@ impl LiveScenarioRunner {
         let projections = descendant_wait.projections;
         let agentic_program = descendant_wait.agentic_program;
         let mut acceptance = descendant_wait.acceptance;
+        if spec.id == "u5-read-b" {
+            let package_name = u5_package_answer(&response_text);
+            acceptance
+                .checks
+                .push(json!({"name":"u5_independent_package_name","passed":package_name}));
+            acceptance.passed &= package_name;
+        }
         let delivery_confirmed = crate::report::delivery_observation_ready(
             &json!({"execution_id":execution_id,"session_id":session_id,"turn_id":turn_id,"terminal_id":terminal_id,"delivery_observation":delivery_observation}),
         );
@@ -1742,7 +2479,7 @@ impl LiveScenarioRunner {
                     observer.timeline_cursor().unwrap_or("-"),
                 ));
             }
-            thread::sleep(self.poll_interval);
+            thread::sleep(self.observation_poll_delay());
         }
     }
 
@@ -2240,7 +2977,7 @@ impl LiveScenarioRunner {
                     }),
                 };
             }
-            thread::sleep(self.poll_interval);
+            thread::sleep(self.observation_poll_delay());
         }
     }
 
@@ -2274,12 +3011,23 @@ impl LiveScenarioRunner {
         })
     }
 
+    fn observation_poll_delay(&self) -> Duration {
+        self.u5_deadline.map_or(self.poll_interval, |deadline| {
+            self.poll_interval
+                .min(deadline.saturating_duration_since(Instant::now()))
+        })
+    }
+
     fn get_json(&self, path: &str) -> Result<Value, String> {
-        let response = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .send()
-            .map_err(|error| error.to_string())?;
+        let mut request = self.client.get(format!("{}{}", self.base_url, path));
+        if let Some(deadline) = self.u5_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("U5 observation deadline reached".into());
+            }
+            request = request.timeout(remaining.min(Duration::from_secs(15)));
+        }
+        let response = request.send().map_err(|error| error.to_string())?;
         response_json(response)
     }
 
@@ -3281,6 +4029,7 @@ struct DescendantTeamWait {
 
 #[derive(Clone, Copy)]
 enum LiveAcceptance {
+    U5(U5Mode),
     Contains(&'static str),
     RequiresToolEvidence {
         tool_name: &'static str,
@@ -3382,6 +4131,11 @@ impl LiveAcceptance {
         root_execution_id: &str,
     ) -> LiveAcceptanceResult {
         let result = match self {
+            Self::U5(_) => LiveAcceptanceResult {
+                passed: false,
+                quality: None,
+                checks: vec![json!({"name":"u5_requires_composite_driver", "passed":false})],
+            },
             Self::Contains(expected) => LiveAcceptanceResult {
                 passed: response.contains(expected),
                 quality: None,

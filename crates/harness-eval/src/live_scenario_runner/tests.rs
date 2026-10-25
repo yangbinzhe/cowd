@@ -1,5 +1,768 @@
 use super::*;
 
+// All U5 fixtures below test consumer decisions, not real Runtime/owner proof.
+fn u5_fixture_owner() -> U5Owner {
+    U5Owner {
+        pid: 42,
+        starttime: 17,
+        image_sha256: format!("sha256:{}", "a".repeat(64)),
+        candidate: "b".repeat(40),
+        namespace: "fixture-run".into(),
+        base_url: "http://127.0.0.1:12345".into(),
+        principal_actor: "principal:fixture".into(),
+    }
+}
+
+fn u5_fixture_id(side: &str) -> U5Identity {
+    U5Identity {
+        session: format!("session-{side}"),
+        turn: format!("turn-{side}"),
+        root: format!("root-{side}"),
+    }
+}
+
+fn u5_fixture_report(side: &str) -> Value {
+    let id = u5_fixture_id(side);
+    json!({"status":"passed","session_id":id.session,"turn_id":id.turn,"execution_id":id.root,
+        "acceptance":{"passed":true},"actor_cleanup":{"passed":true}})
+}
+
+fn u5_fixture_resources() -> U5ResourceEvidence {
+    use runtime::execution_core::graph::*;
+    let observation = |request_id, side: &str, status| ResourceAdmissionObservation {
+        request_id,
+        status,
+        requested_priority: None,
+        deadline_at_ms: Some(1000),
+        requested_service_class: ExecutionServiceClass::Foreground,
+        resolved_service_class: ExecutionServiceClass::Foreground,
+        parent_class_ceiling: None,
+        demands: vec![(ExecutionResourceKind::Provider, 1)],
+        normalized_scope: None,
+        fairness_key: format!("session:session-{side}"),
+        enqueue_sequence: Some(if side == "a" { 1 } else { 2 }),
+        enqueued_at_ms: Some(10),
+        observed_at_ms: 20,
+        queue_age_ms: 10,
+        wait_reason: Some(ResourceWaitReason::Capacity),
+        blocker: None,
+        policy_revision: 1,
+        pending: 0,
+    };
+    let a = uuid::Uuid::from_u128(1);
+    let b = uuid::Uuid::from_u128(2);
+    U5ResourceEvidence {
+        owner: u5_fixture_owner(),
+        complete: true,
+        active: None,
+        overlap: Some((a, b, "fixture:independently-specified-overlap".into())),
+        observations: vec![
+            observation(a, "a", ResourceAdmissionObservationStatus::Granted),
+            observation(b, "b", ResourceAdmissionObservationStatus::Waiting),
+            observation(b, "b", ResourceAdmissionObservationStatus::Granted),
+        ],
+    }
+}
+
+fn u5_fixture_cancelled() -> Value {
+    let id = u5_fixture_id("a");
+    json!({"status":"cancelled","session_id":id.session,"turn_id":id.turn,"execution_id":id.root,
+        "actor_cleanup":{"passed":true},
+        "receipt":{"cancellation_id":"fixture-cancel","session_id":id.session,"turn_id":id.turn,"execution_id":id.root,
+            "actor_id":"principal:fixture","cause":"user_requested","requested_at_ms":10,"effective_at_ms":20,
+            "status":"cancelled","journal_sequence":2,"projection_revision":3},
+        "projection":{"session_id":id.session,"turn_id":id.turn,"execution_id":id.root,"terminal_axes":{
+            "outcome":{"goal_id":null,"goal_revision":null,"outcome":null,"terminal_fence":null},
+            "execution":{"phase":"terminal","settlement":"proven_settled","coverage_complete":true,"evidence_refs":["fixture:closure-a"]},
+            "delivery":{"runtime_terminal_ref":null,"session_client_evidence":"requires_fresh_context"},
+            "source_cursor":30,"source_race":false}}})
+}
+
+fn u5_fixture_cancel_context() -> U5CancelContext {
+    U5CancelContext {
+        identity: u5_fixture_id("a"),
+        cancellation_id: "fixture-cancel".into(),
+        started_source: "fixture:independently-recorded-active-a".into(),
+    }
+}
+
+#[test]
+fn u5_fairness_consumer_rejects_each_independent_counterexample() {
+    let owner = u5_fixture_owner();
+    let sessions = ["session-a".into(), "session-b".into()];
+    let verdict = |a: &Value, b: &Value, e: &U5ResourceEvidence| {
+        u5_pair_acceptance(U5Mode::Fairness, &owner, &sessions, a, b, e, None)["internal_passed"]
+            == true
+    };
+    assert!(verdict(
+        &u5_fixture_report("a"),
+        &u5_fixture_report("b"),
+        &u5_fixture_resources()
+    ));
+    for fault in [
+        "foreign-owner",
+        "URL-only",
+        "serial",
+        "incomplete",
+        "wrong-session",
+        "no-capacity-reason",
+        "old-root",
+        "bad-read",
+        "bad-ACK",
+        "missing-grant",
+    ] {
+        let mut a = u5_fixture_report("a");
+        let mut b = u5_fixture_report("b");
+        let mut e = u5_fixture_resources();
+        match fault {
+            "foreign-owner" => e.owner.pid += 1,
+            "URL-only" => e.owner.starttime += 1,
+            "serial" => e.overlap = None,
+            "incomplete" => e.complete = false,
+            "wrong-session" => e.observations[2].fairness_key = "session:foreign".into(),
+            "no-capacity-reason" => {
+                for o in &mut e.observations {
+                    o.wait_reason = None;
+                }
+            }
+            "old-root" => b["execution_id"] = a["execution_id"].clone(),
+            // An original single-case source/ACK failure cannot be promoted by pairing.
+            "bad-read" => a["acceptance"]["passed"] = json!(false),
+            "bad-ACK" => b["status"] = json!("failed"),
+            "missing-grant" => {
+                e.observations.pop();
+            }
+            _ => unreachable!(),
+        }
+        assert!(!verdict(&a, &b, &e), "{fault}");
+    }
+    assert!(!u5_valid_owner(
+        &U5Owner {
+            pid: 0,
+            ..owner.clone()
+        },
+        &owner.base_url
+    ));
+}
+
+#[test]
+fn u5_cancel_consumer_requires_settlement_and_preserves_other_session() {
+    let owner = u5_fixture_owner();
+    let sessions = ["session-a".into(), "session-b".into()];
+    let verdict = |a: &Value, b: &Value, request: Option<&U5CancelContext>| {
+        u5_pair_acceptance(
+            U5Mode::Cancel,
+            &owner,
+            &sessions,
+            a,
+            b,
+            &u5_fixture_resources(),
+            request,
+        )["internal_passed"]
+            == true
+    };
+    assert!(verdict(
+        &u5_fixture_cancelled(),
+        &u5_fixture_report("b"),
+        Some(&u5_fixture_cancel_context())
+    ));
+    assert!(!verdict(
+        &u5_fixture_cancelled(),
+        &u5_fixture_report("b"),
+        None
+    ));
+    for fault in [
+        "requested",
+        "already-terminal",
+        "not-started",
+        "wrong-start-root",
+        "wrong-cancellation-id",
+        "unsettled",
+        "no-coverage",
+        "source-race",
+        "old-root",
+        "wrong-actor",
+        "wrong-turn",
+        "goal-satisfied",
+        "B-cancelled",
+        "finish-only",
+    ] {
+        let mut a = u5_fixture_cancelled();
+        let mut b = u5_fixture_report("b");
+        let mut request = u5_fixture_cancel_context();
+        match fault {
+            "requested" => a["receipt"]["status"] = json!("requested"),
+            "already-terminal" => a["receipt"]["status"] = json!("already_terminal"),
+            "not-started" => request.started_source.clear(),
+            "wrong-start-root" => request.identity.root = "foreign-root".into(),
+            "wrong-cancellation-id" => a["receipt"]["cancellation_id"] = json!("other-request"),
+            "unsettled" => {
+                a["projection"]["terminal_axes"]["execution"]["settlement"] = json!("unsettled")
+            }
+            "no-coverage" => {
+                a["projection"]["terminal_axes"]["execution"]["coverage_complete"] = json!(false)
+            }
+            "source-race" => a["projection"]["terminal_axes"]["source_race"] = json!(true),
+            "old-root" => a["projection"]["execution_id"] = json!("old"),
+            "wrong-actor" => a["receipt"]["actor_id"] = json!("principal:foreign"),
+            "wrong-turn" => a["receipt"]["turn_id"] = json!("foreign"),
+            "goal-satisfied" => {
+                a["projection"]["terminal_axes"]["outcome"]["outcome"] = json!("satisfied")
+            }
+            "B-cancelled" => b["status"] = json!("cancelled"),
+            "finish-only" => a
+                .as_object_mut()
+                .unwrap()
+                .remove("projection")
+                .map(|_| ())
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(!verdict(&a, &b, Some(&request)), "{fault}");
+    }
+}
+
+#[test]
+fn u5_outer_recovery_is_separate_and_never_defaults_to_success() {
+    let owner = u5_fixture_owner();
+    let internal = json!({"internal_passed":true});
+    assert!(u5_final_acceptance(
+        &internal,
+        &owner,
+        Some((&owner, true, true, 0))
+    ));
+    assert!(!u5_final_acceptance(&internal, &owner, None));
+    for (v1, clean, remaining) in [(false, true, 0), (true, false, 0), (true, true, 1)] {
+        assert!(!u5_final_acceptance(
+            &internal,
+            &owner,
+            Some((&owner, v1, clean, remaining))
+        ));
+    }
+    assert!(!u5_final_acceptance(
+        &internal,
+        &owner,
+        Some((
+            &U5Owner {
+                pid: 99,
+                ..owner.clone()
+            },
+            true,
+            true,
+            0
+        ))
+    ));
+}
+
+fn u5_fixture_runner(url: &str) -> LiveScenarioRunner {
+    LiveScenarioRunner {
+        client: Client::new(),
+        base_url: url.into(),
+        timeout_cap: None,
+        poll_interval: Duration::from_millis(1),
+        model: None,
+        claim_scope: LiveClaimScope::Focused,
+        u5_deadline: None,
+    }
+}
+
+#[test]
+fn u5_live_missing_evidence_is_refused_before_any_actor_or_HTTP() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let runner = u5_fixture_runner(&format!("http://{}", listener.local_addr().unwrap()));
+    for (id, mode) in [(U5_FAIRNESS, U5Mode::Fairness), (U5_CANCEL, U5Mode::Cancel)] {
+        let selected = BTreeSet::from([id.to_string()]);
+        assert_eq!(
+            u5_selection_preflight(Some(&selected)).unwrap()["model_work_started"],
+            false
+        );
+        let report = runner.run_scenario(
+            LiveScenarioSpec {
+                id,
+                prompt: "must not dispatch",
+                acceptance: LiveAcceptance::U5(mode),
+                timeout: LiveScenarioTimeout::tool(),
+            },
+            None,
+        );
+        assert_eq!(report["status"], "gated");
+        assert!(report["reason"]
+            .as_str()
+            .unwrap()
+            .contains("u5_evidence_missing"));
+        assert!(
+            !LiveAcceptance::U5(mode)
+                .evaluate("anything", &json!({}), &[], None, "root")
+                .passed
+        );
+    }
+    assert!(u5_selection_preflight(Some(&BTreeSet::from(["live_tool_evidence".into()]))).is_none());
+    assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn u5_scoped_pair_runs_both_branches_and_honors_pre_dispatch_deadline() {
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        U5ActorOutcome {
+            report: json!({"status":"fixture-only"}),
+            cancellation: None,
+        }
+    };
+    let (a, b) = u5_parallel(Instant::now() + Duration::from_secs(1), work, work);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(a.report, b.report);
+    let _ = u5_parallel(Instant::now() - Duration::from_secs(1), work, work);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let mut runner = u5_fixture_runner("http://127.0.0.1:1");
+    runner.u5_deadline = Some(Instant::now() - Duration::from_millis(1));
+    assert_eq!(
+        runner.get_json("/must-not-connect").unwrap_err(),
+        "U5 observation deadline reached"
+    );
+    assert_eq!(runner.observation_poll_delay(), Duration::ZERO);
+
+    runner.poll_interval = Duration::from_secs(3600);
+    runner.u5_deadline = None;
+    assert_eq!(runner.observation_poll_delay(), Duration::from_secs(3600));
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(20);
+    runner.u5_deadline = Some(deadline);
+    let in_flight = || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        thread::sleep(runner.observation_poll_delay());
+        U5ActorOutcome {
+            report: json!({"status":"fixture-only"}),
+            cancellation: None,
+        }
+    };
+    let (a, b) = u5_parallel(deadline, in_flight, in_flight);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(a.report, b.report);
+    assert_eq!(runner.observation_poll_delay(), Duration::ZERO);
+}
+
+// NoRealU5: this bounded loopback double exercises the original single-case
+// consumers; it supplies no real owner/resource/Runtime/provider evidence.
+struct U5SingleCaseHttpFixture {
+    url: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    server: Option<thread::JoinHandle<Vec<(String, String, Value)>>>,
+}
+
+impl U5SingleCaseHttpFixture {
+    fn start(script: Vec<(&'static str, Value)>) -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = Vec::new();
+            for (expected, response) in script {
+                let mut stream = loop {
+                    if stopping.load(std::sync::atomic::Ordering::SeqCst)
+                        || Instant::now() >= deadline
+                    {
+                        return requests;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("NoRealU5 accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let (headers, body) = loop {
+                    assert!(bytes.len() < 16_384 && Instant::now() < deadline);
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0, "NoRealU5 incomplete HTTP request");
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        assert!(length < 16_384);
+                        if bytes.len() >= end + 4 + length {
+                            let body = if length == 0 {
+                                Value::Null
+                            } else {
+                                serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap()
+                            };
+                            break (headers, body);
+                        }
+                    }
+                };
+                let request = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .strip_suffix(" HTTP/1.1")
+                    .unwrap()
+                    .to_string();
+                assert_eq!(request, expected, "NoRealU5 request order");
+                requests.push((request, headers, body));
+                let body = serde_json::to_vec(&response).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+            requests
+        });
+        Self {
+            url,
+            stop,
+            server: Some(server),
+        }
+    }
+
+    fn finish(&mut self) -> Vec<(String, String, Value)> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.server.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for U5SingleCaseHttpFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+    }
+}
+
+#[test]
+fn u5_no_real_u5_single_case_http_consumers_confirm_delivery_and_reject_wrong_ack() {
+    use harness_contract::live::{
+        ReceiptCursor, SessionMessageAck, SessionMessageReceiptContext, SessionPublicPayloadKind,
+        SessionReceiptOutboxObservation, SessionReceiptSessionObservation,
+    };
+    const CLIENT: &str = "a1111111-1111-4111-8111-111111111111";
+    const CONTEXT: &str = "GET /api/sessions/session-1/messages/assistant:input-1/receipt-context";
+    const ACK: &str = "POST /api/sessions/session-1/messages/assistant:input-1/ack";
+    const ROOT: &str = "GET /api/runtime/executions/root?detail_scope=summary";
+    const TIMELINE: &str =
+        "GET /api/runtime/timeline?session_id=session-1&limit=500&cursor=v2:0:30:0";
+    let payload = r#"[{"type":"text","text":"56"}]"#;
+    let digest = format!(
+        "session-public-v1:sha256:{:x}",
+        Sha256::digest(payload.as_bytes())
+    );
+    let cursor = ReceiptCursor::parse("9007199254740993").unwrap();
+    let ack = SessionMessageAck {
+        session_id: "session-1".into(),
+        message_id: "assistant:input-1".into(),
+        client_id: CLIENT.into(),
+        runtime_commit_cursor: cursor.clone(),
+        content_digest: digest.clone(),
+        received_at_ms: 110,
+    };
+    let context = SessionMessageReceiptContext::Available {
+        payload_kind: SessionPublicPayloadKind::SessionPublicV1,
+        payload_json: payload.into(),
+        content_digest: digest.clone(),
+        session_id: "session-1".into(),
+        message_id: "assistant:input-1".into(),
+        client_id: CLIENT.into(),
+        message_sequence: "0".into(),
+        runtime_commit_cursor: cursor.clone(),
+        receipt: None,
+        session_source: SessionReceiptSessionObservation {
+            request_id: "request-1".into(),
+            turn_id: "turn-1".into(),
+            session_generation: "1".into(),
+            input_sequence: "1".into(),
+            presence_revision: "3".into(),
+            observed_at_ms: 100,
+        },
+        outbox_observation: SessionReceiptOutboxObservation::RuntimeOutbox {
+            terminal_id: "turn-terminal:request-1".into(),
+            revision: "1".into(),
+            status: "pending".into(),
+            materialized_at_ms: None,
+            runtime_commit_cursor: cursor,
+            execution_id: Some("root".into()),
+            turn_id: "turn-1".into(),
+            request_id: "request-1".into(),
+        },
+    };
+    let mut current = context.clone();
+    if let SessionMessageReceiptContext::Available {
+        receipt,
+        session_source,
+        ..
+    } = &mut current
+    {
+        *receipt = Some(ack.clone());
+        session_source.observed_at_ms = 120;
+    }
+    let root = json!({"execution_id":"root","session_id":"session-1","turn_id":"turn-1",
+        "revision":1,"cursor":30,"child_executions":[],
+        "graph":{"nodes":[{"kind":"synthesize","status":"completed"}]},
+        "terminal_axes":{
+            "outcome":{"goal_id":null,"goal_revision":null,"outcome":null,"terminal_fence":null},
+            "execution":{"phase":"terminal","settlement":"proven_settled","coverage_complete":true,"evidence_refs":["fixture:closure"]},
+            "delivery":{"runtime_terminal_ref":null,"session_client_evidence":"requires_fresh_context"},
+            "source_cursor":30,"source_race":false}});
+    // Reuse the established root-outcome contract, adding the observer's page identity.
+    let mut timeline =
+        successful_root_outcome_timeline(json!({"has_more":false,"next_cursor":"v2:0:30:0"}));
+    timeline["events"][0]["source"] = json!("runtime");
+    timeline["events"][0]["sequence"] = json!(1);
+    timeline["events"][0]["commit_cursor"] = json!(30);
+    timeline["events"][0]["payload"]["identity"]["session_id"] = json!("session-1");
+    timeline["events"][0]["payload"]["identity"]["turn_id"] = json!("turn-1");
+    let empty_timeline = json!({"events":[],"has_more":false});
+    for wrong_ack in [false, true] {
+        let mut returned_ack = ack.clone();
+        if wrong_ack {
+            returned_ack.client_id = "b1111111-1111-4111-8111-111111111111".into();
+        }
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        let mut script = vec![
+            ("POST /api/sessions", json!({"id":"session-1"})),
+            (
+                "POST /api/sessions/session-1/attach",
+                json!({"ok":true,"session_id":"session-1",
+                "receipt_attachment":{"client_id":CLIENT,"client_expires_at_ms":expires,"receipt_protocol":"session-public-v1"}}),
+            ),
+            (
+                "POST /api/runtime/session-leases/acquire",
+                json!({"ok":true}),
+            ),
+            (
+                "POST /api/sessions/session-1/messages",
+                json!({"execution":{"graph_id":"root","turn_id":"turn-1"}}),
+            ),
+            (
+                "GET /api/sessions/session-1/messages?from_seq=0&limit=200",
+                json!({"messages":[{"id":"assistant:input-1","role":"assistant","sequence":0}],"next_seq":1,"has_more":false}),
+            ),
+            (
+                "GET /api/sessions/session-1/execution/live",
+                json!({"execution_id":"root","live":{"revision":1,"status":"completed"}}),
+            ),
+            (ROOT, root.clone()),
+            (
+                "GET /api/runtime/timeline?session_id=session-1&limit=500",
+                timeline.clone(),
+            ),
+            (
+                "GET /api/sessions/session-1/messages?from_seq=1&limit=200",
+                json!({"messages":[],"next_seq":1,"has_more":false}),
+            ),
+            (TIMELINE, empty_timeline.clone()),
+            (CONTEXT, serde_json::to_value(&context).unwrap()),
+            (CONTEXT, serde_json::to_value(&context).unwrap()),
+            (ACK, serde_json::to_value(&returned_ack).unwrap()),
+        ];
+        if !wrong_ack {
+            script.push((CONTEXT, serde_json::to_value(&current).unwrap()));
+        }
+        script.extend([
+            (TIMELINE, empty_timeline.clone()),
+            (ROOT, root.clone()),
+            (ROOT, root.clone()),
+            (
+                "POST /api/runtime/session-leases/release",
+                json!({"ok":true}),
+            ),
+            ("POST /api/sessions/session-1/detach", json!({"ok":true})),
+        ]);
+        let expected_requests = script.len();
+        let mut fixture = U5SingleCaseHttpFixture::start(script);
+        let mut runner = u5_fixture_runner(&fixture.url);
+        runner.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let timeout = LiveScenarioTimeout {
+            initial_wait: Duration::from_secs(2),
+            inactivity_wait: Duration::from_secs(2),
+            nominal_wait: Duration::from_secs(2),
+            absolute_wait: Some(Duration::from_secs(2)),
+        };
+        let mut actor = SessionActor::create(
+            &runner.client,
+            &fixture.url,
+            None,
+            "NoRealU5",
+            started + Duration::from_secs(2),
+        )
+        .unwrap();
+        let report = runner.run_attached_scenario(
+            LiveScenarioSpec {
+                id: "u5-no-real-single-case",
+                prompt: "Return 56",
+                acceptance: LiveAcceptance::Contains("56"),
+                timeout,
+            },
+            None,
+            started,
+            timeout,
+            None,
+            Vec::new(),
+            &mut actor,
+        );
+        let cleanup = actor.finish();
+        let trace = actor.drain_trace();
+        drop(actor);
+        let requests = fixture.finish();
+        cleanup.unwrap();
+        assert_eq!(requests.len(), expected_requests);
+        assert_eq!(
+            report["status"],
+            if wrong_ack { "failed" } else { "passed" },
+            "{report:#}"
+        );
+        assert_eq!(report["acceptance"]["passed"], !wrong_ack);
+        assert!(crate::report::execution_observation_ready(
+            &report["terminal_observation"],
+            "root",
+            "session-1",
+            "turn-1"
+        ));
+        assert!(crate::report::business_observation_ready(&report));
+        assert_eq!(
+            crate::report::delivery_observation_ready(&report),
+            !wrong_ack
+        );
+        assert_eq!(report["observation_integrity"]["status"], "passed");
+        assert!(trace.contains(&json!({"operation":"confirm_terminal_delivery","status":if wrong_ack { "failed" } else { "ok" }})));
+        let ack_index = requests
+            .iter()
+            .position(|(path, _, _)| path == ACK)
+            .unwrap();
+        let (_, headers, body) = &requests[ack_index];
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains(&format!("x-cowd-client-id: {CLIENT}")));
+        assert_eq!(
+            *body,
+            json!({"runtime_commit_cursor":"9007199254740993","content_digest":digest})
+        );
+        assert_eq!(
+            requests[ack_index + 1].0,
+            if wrong_ack { TIMELINE } else { CONTEXT }
+        );
+        if wrong_ack {
+            assert_eq!(
+                report["delivery_observation"]["error"],
+                "receipt_ack_tuple_mismatch"
+            );
+        } else {
+            assert_eq!(report["terminal_response_summary"], "56");
+            assert_eq!(
+                report["delivery_observation"]["fresh_context_confirmed"],
+                true
+            );
+        }
+    }
+}
+
+#[test]
+fn u5_subinput_envelopes_keep_exact_read_grants_and_original_business_oracles() {
+    assert!(u5_package_answer(
+        r#"{"package_name":"runtime","path":"crates/runtime/Cargo.toml"}"#
+    ));
+    for wrong in [
+        "读取 crates/runtime/Cargo.toml，package name 是 wrong",
+        r#"{"package_name":"wrong","path":"crates/runtime/Cargo.toml"}"#,
+        r#"{"path":"crates/runtime/Cargo.toml"}"#,
+        r#"{"package_name":"runtime","path":"Cargo.toml"}"#,
+    ] {
+        assert!(!u5_package_answer(wrong), "{wrong}");
+    }
+    for (spec, path, wrong) in [
+        (u5_inputs()[0], "Cargo.toml", "crates/runtime/Cargo.toml"),
+        (u5_inputs()[1], "crates/runtime/Cargo.toml", "Cargo.toml"),
+    ] {
+        let prompt = controlled_live_prompt(spec.id, spec.prompt.into(), None);
+        let control: Value = serde_json::from_str(
+            prompt
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("COWD_EVAL_CONTROL ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(control["corpus_id"], "live-scenarios-v1");
+        assert!(control["resource_scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("read:{path}"))));
+        assert!(!control["resource_scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("read:.")));
+        assert!(!control["resource_scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("read:{wrong}"))));
+    }
+    let original = u5_inputs()[0].acceptance.evaluate(
+        &format!("Cargo.toml {}", env!("CARGO_PKG_VERSION")),
+        &typed_read_timeline_fixture(),
+        &[],
+        None,
+        "root",
+    );
+    assert!(original.passed);
+    assert!(
+        !u5_inputs()[0]
+            .acceptance
+            .evaluate(
+                "Cargo.toml wrong-version",
+                &typed_read_timeline_fixture(),
+                &[],
+                None,
+                "root"
+            )
+            .passed
+    );
+    let mut wrong_source = typed_read_timeline_fixture();
+    wrong_source["read_evidence"]["pages"][0]["reads"][0]["path"]["repository_id"] =
+        json!("foreign");
+    assert!(
+        !u5_inputs()[0]
+            .acceptance
+            .evaluate(
+                &format!("Cargo.toml {}", env!("CARGO_PKG_VERSION")),
+                &wrong_source,
+                &[],
+                None,
+                "root"
+            )
+            .passed
+    );
+}
+
 #[test]
 fn agentic_progress_counts_unique_structured_action_events() {
     let event = |cursor, action| {
