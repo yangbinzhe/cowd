@@ -1009,9 +1009,187 @@ impl Drop for PidFileGuard {
 struct GatewayRuntimeShutdownReport {
     phases: Vec<String>,
     failures: Vec<String>,
+    execution_started: bool,
+    execution: Option<runtime::RuntimeExecutionShutdownReport>,
     active_turns: Option<crate::runtime_service::ActiveTurnDrainReport>,
     memory: Option<memory::cognitive::MemoryBackgroundShutdownReport>,
     tasks: task_set::GatewayTaskShutdownReport,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ShutdownReceiptIdentity {
+    nonce: String,
+    pid: u32,
+    starttime: u64,
+    image_sha256: String,
+    config_sha256: String,
+}
+struct ShutdownReceiptTarget {
+    directory: std::fs::File,
+    identity: ShutdownReceiptIdentity,
+}
+impl ShutdownReceiptTarget {
+    fn from_environment(config: &RuntimeHostConfig) -> Result<Option<Self>, String> {
+        let Some(nonce) = std::env::var_os("COWD_TEST_SHUTDOWN_RECEIPT_NONCE") else {
+            return Ok(None);
+        };
+        let nonce = nonce
+            .into_string()
+            .map_err(|_| "shutdown fixture nonce is not UTF-8")?;
+        Self::validate_nonce(&nonce)?;
+        #[cfg(not(target_os = "linux"))]
+        return Err("shutdown fixture image identity requires Linux".into());
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let root = std::env::var_os("XDG_RUNTIME_DIR")
+                .ok_or("shutdown fixture requires private XDG_RUNTIME_DIR")?;
+            let root = PathBuf::from(root);
+            if !root.is_absolute() {
+                return Err("shutdown fixture directory must be absolute".into());
+            }
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&root)
+                .map_err(|e| e.to_string())?;
+            let metadata = directory.metadata().map_err(|e| e.to_string())?;
+            let owner = std::fs::metadata("/proc/self")
+                .map_err(|e| e.to_string())?
+                .uid();
+            if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o777 != 0o700 {
+                return Err("shutdown fixture directory is not private and owned".into());
+            }
+            let image_sha256 = Self::image_hash(Path::new("/proc/self/exe"))?;
+            let starttime = Self::starttime(std::process::id())?;
+            let config_bytes=serde_json::to_vec(&serde_json::json!({
+                "http_addr":config.http_addr,"workspace":config.workspace_root,"runtime":config.runtime_config,
+                "surfaces":config.surface_configs,"surface_runtime":config.surface_runtime_configs,
+                "cors_origins":config.cors_origins,
+            })).map_err(|e|e.to_string())?;
+            use sha2::{Digest, Sha256};
+            let config_sha256 = format!("sha256:{:x}", Sha256::digest(config_bytes));
+            let target = Self {
+                directory,
+                identity: ShutdownReceiptIdentity {
+                    nonce,
+                    pid: std::process::id(),
+                    starttime,
+                    image_sha256,
+                    config_sha256,
+                },
+            };
+            if target.path().symlink_metadata().is_ok() {
+                return Err("shutdown fixture receipt destination already exists".into());
+            }
+            Ok(Some(target))
+        }
+    }
+    fn validate_nonce(nonce: &str) -> Result<(), String> {
+        if nonce.len() != 64
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("shutdown fixture nonce requires 64 lowercase hex characters".into());
+        }
+        Ok(())
+    }
+    fn starttime(pid: u32) -> Result<u64, String> {
+        let stat =
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
+        stat.rsplit_once(") ")
+            .and_then(|(_, tail)| tail.split_whitespace().nth(19))
+            .and_then(|v| v.parse().ok())
+            .ok_or("shutdown process starttime unavailable".into())
+    }
+    fn image_hash(path: &Path) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let mut input = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 64 * 1024];
+        loop {
+            let n = input.read(&mut bytes).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&bytes[..n]);
+        }
+        Ok(format!("sha256:{:x}", hash.finalize()))
+    }
+    #[cfg(target_os = "linux")]
+    fn path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+            .join(format!("shutdown-{}.v1.json", self.identity.nonce))
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn path(&self) -> PathBuf {
+        PathBuf::new()
+    }
+    fn publish(&self, report: &GatewayRuntimeShutdownReport) -> Result<(), String> {
+        #[cfg(not(target_os = "linux"))]
+        return Err("shutdown fixture export unsupported".into());
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let destination = self.path();
+            let temporary = destination.with_file_name(format!(
+                ".shutdown-{}-{}.tmp",
+                self.identity.nonce,
+                uuid::Uuid::new_v4()
+            ));
+            let body = serde_json::to_vec(
+                &serde_json::json!({"schema_version":1,"identity":self.identity,"report":report}),
+            )
+            .map_err(|e| e.to_string())?;
+            let mut published = false;
+            let result = (|| {
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&temporary)
+                    .map_err(|e| e.to_string())?;
+                use std::os::unix::fs::MetadataExt;
+                let metadata = output.metadata().map_err(|error| error.to_string())?;
+                let directory = self
+                    .directory
+                    .metadata()
+                    .map_err(|error| error.to_string())?;
+                if !metadata.is_file()
+                    || metadata.mode() & 0o777 != 0o600
+                    || metadata.uid() != directory.uid()
+                {
+                    return Err("shutdown receipt filesystem did not enforce owned0600 file".into());
+                }
+                output.write_all(&body).map_err(|e| e.to_string())?;
+                output.sync_all().map_err(|e| e.to_string())?;
+                // Same-directory hard link is atomic and cannot replace an old
+                // receipt or a symlink. Directory capability stays pinned.
+                std::fs::hard_link(&temporary, &destination).map_err(|e| e.to_string())?;
+                published = true;
+                self.directory.sync_all().map_err(|e| e.to_string())?;
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&temporary);
+            if result.is_err() && published {
+                let _ = std::fs::remove_file(&destination);
+            }
+            result
+        }
+    }
+}
+impl serde::Serialize for GatewayRuntimeShutdownReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde_json::json!({"phases":self.phases,"failures":self.failures,
+            "execution_started":self.execution_started,"execution":self.execution,
+            "active_turns":self.active_turns,"memory":self.memory,
+            "tasks":{"joined":self.tasks.joined,"panicked":self.tasks.panicked,"forced_aborts":self.tasks.forced_aborts,"rejected":self.tasks.rejected}
+        }).serialize(serializer)
+    }
 }
 
 #[derive(Default)]
@@ -1026,14 +1204,22 @@ struct GatewayRuntimeShutdownState {
 /// on the same gate and receive the immutable report published by the leader.
 struct GatewayRuntimeShutdownCoordinator {
     gateway_tasks: Arc<GatewayRuntimeTaskSet>,
+    receipt: Option<ShutdownReceiptTarget>,
     gate: tokio::sync::Mutex<()>,
     state: Mutex<GatewayRuntimeShutdownState>,
 }
 
 impl GatewayRuntimeShutdownCoordinator {
     fn new(gateway_tasks: Arc<GatewayRuntimeTaskSet>) -> Arc<Self> {
+        Self::with_receipt(gateway_tasks, None)
+    }
+    fn with_receipt(
+        gateway_tasks: Arc<GatewayRuntimeTaskSet>,
+        receipt: Option<ShutdownReceiptTarget>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             gateway_tasks,
+            receipt,
             gate: tokio::sync::Mutex::new(()),
             state: Mutex::new(GatewayRuntimeShutdownState::default()),
         })
@@ -1051,7 +1237,75 @@ impl GatewayRuntimeShutdownCoordinator {
             .clone()
     }
 
-    fn finish(&self, report: GatewayRuntimeShutdownReport) {
+    fn finish(&self, mut report: GatewayRuntimeShutdownReport) -> GatewayRuntimeShutdownReport {
+        if let Some(existing) = self.completed_report() {
+            return existing;
+        }
+        if report.execution_started && report.execution.is_none() {
+            report
+                .failures
+                .push("Runtime execution shutdown report missing after startup".into());
+        }
+        if let Some(execution) = &report.execution {
+            if execution.remaining_keys > 0
+                || execution.owners.values().any(|owner| owner.active > 0)
+            {
+                report
+                    .failures
+                    .push("Runtime execution shutdown retains active owners/keys".into());
+            }
+            if execution.forced_aborts > 0
+                && !report
+                    .failures
+                    .iter()
+                    .any(|failure| failure.contains("forced abort"))
+            {
+                report
+                    .failures
+                    .push("Runtime execution shutdown forced abort".into());
+            }
+            for error in &execution.errors {
+                if !report
+                    .failures
+                    .iter()
+                    .any(|failure| failure.contains(error))
+                {
+                    report
+                        .failures
+                        .push(format!("Runtime execution shutdown incomplete: {error}"));
+                }
+            }
+        }
+        if report.tasks.forced_aborts > 0 || report.tasks.panicked > 0 {
+            report
+                .failures
+                .push("Gateway task drain did not close naturally".into());
+        }
+        if report
+            .active_turns
+            .as_ref()
+            .is_some_and(|active| !active.remaining_turn_ids.is_empty())
+        {
+            report
+                .failures
+                .push("Gateway active turn drain retains turns".into());
+        }
+        if report
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.forced_aborts > 0 || !memory.errors.is_empty())
+        {
+            report
+                .failures
+                .push("Gateway Memory drain incomplete".into());
+        }
+        if let Some(receipt) = &self.receipt {
+            if let Err(error) = receipt.publish(&report) {
+                report.failures.push(format!(
+                    "Gateway final shutdown receipt publication failed: {error}"
+                ));
+            }
+        }
         let phase = if report.failures.is_empty() {
             "closed"
         } else {
@@ -1061,7 +1315,8 @@ impl GatewayRuntimeShutdownCoordinator {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .report = Some(report);
+            .report = Some(report.clone());
+        report
     }
 
     async fn coordinate<F, Fut>(&self, shutdown: F) -> GatewayRuntimeShutdownReport
@@ -1074,8 +1329,7 @@ impl GatewayRuntimeShutdownCoordinator {
             return report;
         }
         let report = shutdown().await;
-        self.finish(report.clone());
-        report
+        self.finish(report)
     }
 }
 
@@ -1200,6 +1454,8 @@ async fn shutdown_runtime_host_resources(
             let mut phases = Vec::new();
             let mut active_turn_report = None;
             let mut memory_report = None;
+            let mut execution_shutdown_report = None;
+            let mut execution_started = false;
             let mut enter_phase = |phase: &str, failures: &[String]| {
                 phases.push(phase.to_string());
                 coordinator.publish(phase, failures);
@@ -1377,6 +1633,7 @@ async fn shutdown_runtime_host_resources(
                 .map(|runtime| runtime.runtime_services())
                 .or_else(|| resources.runtime_services.cloned())
             {
+                execution_started = true;
                 let execution_report = runtime_services.shutdown_execution().await;
                 if execution_report.forced_aborts > 0 {
                     failures.push(format!(
@@ -1390,6 +1647,7 @@ async fn shutdown_runtime_host_resources(
                         .iter()
                         .map(|error| format!("Runtime execution shutdown incomplete: {error}")),
                 );
+                execution_shutdown_report = Some(execution_report);
                 runtime_services.shutdown_maintenance().await;
             }
             if let Some(cognitive) = resources.cognitive {
@@ -1461,6 +1719,8 @@ async fn shutdown_runtime_host_resources(
             GatewayRuntimeShutdownReport {
                 phases,
                 failures,
+                execution_started,
+                execution: execution_shutdown_report,
                 active_turns: active_turn_report,
                 memory: memory_report,
                 tasks: gateway_task_report,
@@ -1473,11 +1733,13 @@ async fn shutdown_runtime_host_resources(
 
 pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String> {
     let started_at = Instant::now();
+    let receipt = ShutdownReceiptTarget::from_environment(&config)?;
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
     let composition = crate::composition_root::GatewayCompositionRoot::new(Duration::from_secs(5));
     let gateway_tasks = composition.gateway_tasks();
-    let shutdown_coordinator = GatewayRuntimeShutdownCoordinator::new(Arc::clone(&gateway_tasks));
+    let shutdown_coordinator =
+        GatewayRuntimeShutdownCoordinator::with_receipt(Arc::clone(&gateway_tasks), receipt);
     let mut startup_registry =
         GatewayRuntimeStartupRegistry::new(Arc::clone(&shutdown_coordinator));
     let auth_broker = Arc::clone(&startup_registry.auth_broker);
@@ -2896,6 +3158,8 @@ mod tests {
                                 "drain_task_set".to_string(),
                             ],
                             failures: Vec::new(),
+                            execution_started: false,
+                            execution: None,
                             active_turns: None,
                             memory: None,
                             tasks,
@@ -3204,5 +3468,152 @@ mod tests {
         assert!(is_api_path("/api/sessions/missing"));
         assert!(!is_api_path("/application"));
         assert!(!is_api_path("/chat/session-1"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod final_shutdown_receipt_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn private_receipt_directory() -> tempfile::TempDir {
+        use std::os::unix::fs::MetadataExt;
+        let parent = Path::new("/run/user/1000");
+        let owner = std::fs::metadata("/proc/self").unwrap().uid();
+        let metadata = std::fs::symlink_metadata(parent).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), owner);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        let directory = tempfile::Builder::new()
+            .prefix("cowd-f2-receipt-")
+            .tempdir_in(parent)
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::metadata(directory.path()).unwrap();
+        assert_eq!(metadata.uid(), owner);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        directory
+    }
+    fn target(root: &Path) -> ShutdownReceiptTarget {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ShutdownReceiptTarget {
+            directory: std::fs::File::open(root).unwrap(),
+            identity: ShutdownReceiptIdentity {
+                nonce: "a".repeat(64),
+                pid: std::process::id(),
+                starttime: ShutdownReceiptTarget::starttime(std::process::id()).unwrap(),
+                image_sha256: ShutdownReceiptTarget::image_hash(Path::new("/proc/self/exe"))
+                    .unwrap(),
+                config_sha256: "sha256:fixture-config".into(),
+            },
+        }
+    }
+    fn report() -> GatewayRuntimeShutdownReport {
+        GatewayRuntimeShutdownReport {
+            phases: vec!["original shutdown complete".into()],
+            failures: vec![],
+            execution_started: false,
+            execution: None,
+            active_turns: None,
+            memory: None,
+            tasks: Default::default(),
+        }
+    }
+    #[tokio::test]
+    async fn final_receipt_is_once_and_failed_export_is_same_for_leader_followers() {
+        for existing in [false, true] {
+            let root = private_receipt_directory();
+            let target = target(root.path());
+            let path = target.path();
+            if existing {
+                std::fs::write(&path, b"old receipt").unwrap();
+            }
+            let coordinator = GatewayRuntimeShutdownCoordinator::with_receipt(
+                GatewayRuntimeTaskSet::new(Duration::from_secs(1)),
+                Some(target),
+            );
+            let first = coordinator.coordinate(|| async { report() }).await;
+            let second = coordinator
+                .coordinate(|| async { panic!("follower must not execute another shutdown") })
+                .await;
+            assert_eq!(first, second);
+            assert_eq!(first.failures.is_empty(), !existing);
+            if existing {
+                assert_eq!(std::fs::read(&path).unwrap(), b"old receipt");
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                let page: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(page["schema_version"], 1);
+                assert_eq!(page["identity"]["pid"], std::process::id());
+                assert_eq!(page["identity"]["nonce"], "a".repeat(64));
+                assert_eq!(page["report"]["execution"], serde_json::Value::Null);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    bytes,
+                    "follower cannot overwrite first report"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn complete_execution_report_and_unclosed_axes_cannot_be_erased() {
+        for missing in [false, true] {
+            let root = private_receipt_directory();
+            let target = target(root.path());
+            let path = target.path();
+            let coordinator = GatewayRuntimeShutdownCoordinator::with_receipt(
+                GatewayRuntimeTaskSet::new(Duration::from_secs(1)),
+                Some(target),
+            );
+            let mut original = report();
+            original.execution_started = true;
+            if !missing {
+                original.execution = Some(runtime::RuntimeExecutionShutdownReport {
+                    remaining_keys: 2,
+                    forced_aborts: 3,
+                    errors: vec!["original owner unknown".into()],
+                    ..Default::default()
+                });
+            }
+            let final_report = coordinator.coordinate(|| async { original.clone() }).await;
+            assert!(!final_report.failures.is_empty());
+            assert_eq!(final_report.execution, original.execution);
+            let page: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(page["report"]["execution_started"], true);
+            assert!(!page["report"]["failures"].as_array().unwrap().is_empty());
+            if !missing {
+                assert_eq!(page["report"]["execution"]["remaining_keys"], 2);
+                assert_eq!(page["report"]["execution"]["forced_aborts"], 3);
+            }
+        }
+    }
+    #[test]
+    fn startup_image_identity_is_captured_and_nonce_is_strict() {
+        for invalid in [
+            "",
+            "../receipt",
+            &"A".repeat(64),
+            &"a".repeat(63),
+            &"g".repeat(64),
+        ] {
+            assert!(ShutdownReceiptTarget::validate_nonce(invalid).is_err());
+        }
+        assert!(ShutdownReceiptTarget::validate_nonce(&"0".repeat(64)).is_ok());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("image");
+        std::fs::write(&path, b"running original bytes").unwrap();
+        let captured = ShutdownReceiptTarget::image_hash(&path).unwrap();
+        let next = root.path().join("next");
+        std::fs::write(&next, b"replacement image").unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        assert_ne!(captured, ShutdownReceiptTarget::image_hash(&path).unwrap());
+        assert_eq!(
+            captured,
+            "sha256:f098edc257f9739f9de555b1d6aff583af3bc2ad3d4fb8be17573048acd9899d"
+        );
     }
 }
