@@ -848,7 +848,7 @@ mod pre_effect_admission_555 {
                 .unwrap()
                 .is_some());
             assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
-            runner.drain_physical_execution().await;
+            assert!(runner.drain_physical_execution().await.is_empty());
             return;
         }
         assert_eq!(
@@ -989,7 +989,7 @@ mod pre_effect_admission_555 {
         assert!(!root.join("denied.txt").exists());
         assert!(!root.join("transitive.txt").exists());
         assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
-        runner.drain_physical_execution().await;
+        assert!(runner.drain_physical_execution().await.is_empty());
     }
 
     #[tokio::test]
@@ -1556,7 +1556,7 @@ async fn real_host_518_runner_model_publication_and_original_closure_precede_syn
         .await
         .unwrap()
         .unwrap();
-    runner.drain_physical_execution().await;
+    assert!(runner.drain_physical_execution().await.is_empty());
     assert!(
         before.unwrap(),
         "successor admitted before original model publication"

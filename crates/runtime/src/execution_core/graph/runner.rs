@@ -363,8 +363,8 @@ impl ExecutionGraphRunner {
         &self.state_store
     }
 
-    pub(crate) async fn drain_physical_execution(&self) {
-        self.registry.drain_physical_execution().await;
+    pub(crate) async fn drain_physical_execution(&self) -> Vec<String> {
+        self.registry.drain_physical_execution().await
     }
 
     pub(crate) async fn recover_graph(
@@ -3876,7 +3876,7 @@ mod nodispatch_duration_617_tests {
             self.inner.recover(ticket).await
         }
 
-        async fn drain_physical_execution(&self) {
+        async fn drain_physical_execution(&self) -> Result<(), NodeExecutorError> {
             self.inner.drain_physical_execution().await
         }
     }
@@ -4093,7 +4093,7 @@ mod nodispatch_duration_617_tests {
             .lock()
             .await
             .contains_key(&(graph_id, ticket.node_id)));
-        runner.drain_physical_execution().await;
+        assert!(runner.drain_physical_execution().await.is_empty());
     }
 
     #[tokio::test]
@@ -4157,7 +4157,7 @@ mod nodispatch_duration_617_tests {
                 .unwrap()
                 .authenticate(&ticket, Some(&original.result))
                 .unwrap();
-            runner.drain_physical_execution().await;
+            assert!(runner.drain_physical_execution().await.is_empty());
         }
     }
 }

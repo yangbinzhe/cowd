@@ -20,6 +20,8 @@ pub trait ScopedNodeBackend: Send + Sync {
     fn retains_physical_execution(&self) -> bool {
         false
     }
+    /// Nonblocking signal to this exact physical backend, never a fresh resolver.
+    fn request_stop(&self, _ticket: &NodeExecutionTicket) {}
     async fn execute(
         &self,
         ticket: &NodeExecutionTicket,
@@ -40,6 +42,7 @@ enum PhysicalOutcome {
     Tool(crate::RuntimeToolExecutionOutcome),
 }
 type PhysicalWork = Shared<BoxFuture<'static, Result<PhysicalOutcome, NodeExecutorError>>>;
+type PhysicalDriver = Shared<BoxFuture<'static, Result<(), String>>>;
 
 #[derive(Clone, Default)]
 struct PhysicalEntry {
@@ -48,6 +51,9 @@ struct PhysicalEntry {
     observation: Option<Arc<super::agent_tool::NoDispatchObservation>>,
     closed: bool,
     original_binding: bool,
+    backend: Option<Arc<dyn ScopedNodeBackend>>,
+    driver: Option<PhysicalDriver>,
+    stop_requested: bool,
 }
 
 /// A fixed executor that reconstructs its backend through durable-ticket resolvers.
@@ -186,10 +192,17 @@ impl ScopedNodeExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = Self::physical_key(ticket, "");
         if physical.get(&key).is_some_and(|entry| {
-            entry.closed && entry.work.as_ref().is_none_or(|work| work.peek().is_some())
+            entry.closed
+                && entry.work.as_ref().is_none_or(|work| work.peek().is_some())
+                && entry
+                    .driver
+                    .as_ref()
+                    .is_none_or(|driver| matches!(driver.peek(), Some(Ok(()))))
         }) {
             if let Some(entry) = physical.get_mut(&key) {
                 entry.work = None;
+                entry.backend = None;
+                entry.driver = None;
                 entry.observation = None;
                 entry.publication_completed = false;
             }
@@ -203,8 +216,109 @@ impl ScopedNodeExecutor {
         }
     }
 
+    fn retain_driver(entry: &mut PhysicalEntry) {
+        if entry.driver.is_none() {
+            if let Some(work) = entry.work.as_ref().filter(|work| work.peek().is_none()) {
+                let work = work.clone();
+                let handle = tokio::spawn(async move {
+                    let _ = work.await;
+                });
+                entry.driver = Some(
+                    async move {
+                        handle
+                            .await
+                            .map_err(|_| "original physical driver join failed".to_owned())
+                    }
+                    .boxed()
+                    .shared(),
+                );
+            }
+        }
+    }
+
     fn owns_key(ticket: &NodeExecutionTicket, key: &PhysicalKey) -> bool {
         key.0 == ticket.graph_id && key.1 == ticket.node_id && key.2 == ticket.attempt
+    }
+
+    fn close_work(
+        &self,
+        ticket: &NodeExecutionTicket,
+        stop: bool,
+    ) -> (Vec<PhysicalWork>, Vec<PhysicalDriver>) {
+        let (pending, drivers, backends) = {
+            let mut physical = self
+                .physical
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::close_entry(physical.entry(Self::physical_key(ticket, "")).or_default());
+            let mut pending = Vec::new();
+            let mut drivers = Vec::new();
+            let mut backends = Vec::new();
+            for (key, entry) in physical
+                .iter_mut()
+                .filter(|(key, _)| Self::owns_key(ticket, key))
+            {
+                Self::close_entry(entry);
+                if stop && !entry.stop_requested {
+                    entry.stop_requested = true;
+                    if let Some(backend) = &entry.backend {
+                        backends.push(backend.clone());
+                    }
+                }
+                let _ = key;
+                if let Some(work) = &entry.work {
+                    pending.push(work.clone());
+                }
+                Self::retain_driver(entry);
+                if let Some(driver) = &entry.driver {
+                    drivers.push(driver.clone());
+                }
+            }
+            (pending, drivers, backends)
+        };
+        // Backend hooks can consult their own locks. Never call under physical lock.
+        for backend in backends {
+            backend.request_stop(ticket);
+        }
+        (pending, drivers)
+    }
+
+    pub(crate) async fn close_and_drain(
+        &self,
+        ticket: &NodeExecutionTicket,
+        stop: bool,
+    ) -> Result<(), NodeExecutorError> {
+        // Snapshot both under the admission lock. A result becoming available
+        // cannot erase an owned driver while this waiter is between the awaits.
+        let (pending, drivers) = self.close_work(ticket, stop);
+        for result in futures::future::join_all(drivers).await {
+            result.map_err(|reason| NodeExecutorError::Cancel {
+                node_id: ticket.node_id.clone(),
+                reason: format!("original physical driver join failed: {reason}"),
+            })?;
+        }
+        if pending.iter().any(|work| work.peek().is_none()) {
+            return Err(NodeExecutorError::Uncertain {
+                node_id: ticket.node_id.clone(),
+                reason: "original physical work has no completed driver".into(),
+            });
+        }
+        self.physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|key, entry| {
+                !Self::owns_key(ticket, key)
+                    || key.3.is_empty()
+                    || entry
+                        .work
+                        .as_ref()
+                        .is_some_and(|work| work.peek().is_none())
+                    || entry
+                        .driver
+                        .as_ref()
+                        .is_some_and(|driver| !matches!(driver.peek(), Some(Ok(()))))
+            });
+        Ok(())
     }
 
     /// Retain only an already-bound host leaf, never its orchestration caller.
@@ -253,12 +367,22 @@ impl ScopedNodeExecutor {
                 .expect("leaf entry is an execution")
         };
         let outcome = work.await;
-        // The leaf itself committed its effect/read receipt before resolving.
-        // Do not retain large tool bodies until the containing model turn ends.
-        self.physical
+        // Result availability is not a driver join. A bounded drain may be
+        // abandoned, so the original entry must retain its handle independently
+        // of both this caller and the drain waiter until a real join succeeds.
+        let mut physical = self
+            .physical
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&key);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if physical.get(&key).is_some_and(|entry| {
+            entry
+                .driver
+                .as_ref()
+                .is_none_or(|driver| matches!(driver.peek(), Some(Ok(()))))
+        }) {
+            physical.remove(&key);
+        }
+        drop(physical);
         match outcome? {
             PhysicalOutcome::Tool(outcome) => Ok(outcome),
             PhysicalOutcome::Node(_) => Err(NodeExecutorError::Invalid {
@@ -276,44 +400,21 @@ impl ScopedNodeExecutor {
 /// `budget` we stop waiting, but we do NOT drop the physical future: its
 /// scope/resource lease lives inside it, so dropping it would release a lock
 /// mid-write. Instead we keep the lease alive and drive the retained future to
-/// completion on a detached task, so the physical owner releases its own
-/// admission when it truly finishes.
+/// completion on its retained driver, so the physical owner releases its own
+/// admission when it truly finishes. The original entry also retains a join
+/// future; repeated cancellation cannot create unowned duplicate drivers, and
+/// a bounded wait expiry is an error/Pending rather than a successful drain.
 async fn cancel_scoped_bounded(
     executor: &ScopedNodeExecutor,
     ticket: &NodeExecutionTicket,
     budget: std::time::Duration,
 ) -> Result<(), NodeExecutorError> {
-    let pending = {
-        let mut physical = executor
-            .physical
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = physical
-            .entry(ScopedNodeExecutor::physical_key(ticket, ""))
-            .or_default();
-        ScopedNodeExecutor::close_entry(entry);
-        physical
-            .iter()
-            .filter(|(key, _)| ScopedNodeExecutor::owns_key(ticket, key))
-            .filter_map(|(_, entry)| entry.work.clone())
-            .collect::<Vec<_>>()
-    };
-    let retained = pending.clone();
-    match tokio::time::timeout(budget, futures::future::join_all(pending)).await {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            let orphaned = retained.len() as u64;
-            for work in retained {
-                tokio::spawn(async move {
-                    let _ = work.await;
-                });
-            }
-            crate::execution_core::performance::observe_count(
-                "scoped_cancel_orphaned_total",
-                orphaned,
-            );
-            Ok(())
-        }
+    match tokio::time::timeout(budget, executor.close_and_drain(ticket, true)).await {
+        Ok(result) => result,
+        Err(_) => Err(NodeExecutorError::Cancel {
+            node_id: ticket.node_id.clone(),
+            reason: "physical cancellation remains pending after deadline".into(),
+        }),
     }
 }
 
@@ -423,6 +524,9 @@ impl NodeExecutor for ScopedNodeExecutor {
                 });
             }
             let observation = entry.observation.clone();
+            if entry.work.is_none() {
+                entry.backend = Some(backend.clone());
+            }
             entry
                 .work
                 .get_or_insert_with(|| {
@@ -485,7 +589,7 @@ impl NodeExecutor for ScopedNodeExecutor {
         // The success path must not abandon an in-flight physical write: wait
         // for it. Bounded cancellation is reserved for cancel/abort paths, where
         // stopping is the point (PLAN W3 / R-02).
-        self.cancel(ticket).await?;
+        self.close_and_drain(ticket, false).await?;
         self.physical
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -493,12 +597,18 @@ impl NodeExecutor for ScopedNodeExecutor {
         if published {
             return Ok(());
         }
-        let backend = self
-            .resolve(ticket)
-            .ok_or_else(|| NodeExecutorError::Unavailable {
+        let original = self
+            .physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&Self::physical_key(ticket, ""))
+            .and_then(|entry| entry.backend.clone());
+        let backend = original.or_else(|| self.resolve(ticket)).ok_or_else(|| {
+            NodeExecutorError::Unavailable {
                 executor_kind: self.kind.to_string(),
                 node_id: ticket.node_id.clone(),
-            })?;
+            }
+        })?;
         backend.after_commit(ticket).await?;
         if let Some(entry) = self
             .physical
@@ -514,25 +624,12 @@ impl NodeExecutor for ScopedNodeExecutor {
             })
         {
             entry.publication_completed = true;
+            entry.backend = None;
         }
         Ok(())
     }
     async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
-        let pending = {
-            let mut physical = self
-                .physical
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = physical.entry(Self::physical_key(ticket, "")).or_default();
-            Self::close_entry(entry);
-            physical
-                .iter()
-                .filter(|(key, _)| Self::owns_key(ticket, key))
-                .filter_map(|(_, entry)| entry.work.clone())
-                .collect::<Vec<_>>()
-        };
-        futures::future::join_all(pending).await;
-        Ok(())
+        self.close_and_drain(ticket, true).await
     }
 
     async fn cancel_bounded(
@@ -547,32 +644,111 @@ impl NodeExecutor for ScopedNodeExecutor {
         // must atomically close leaf admission and drain through cancel().
         true
     }
-    async fn drain_physical_execution(&self) {
-        let pending = self
-            .physical
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.work.clone()))
-            .collect::<Vec<_>>();
-        futures::future::join_all(pending.into_iter().map(|(key, work)| async move {
-            if let Some(work) = work {
-                let _ = work.await;
-            }
+    async fn drain_physical_execution(&self) -> Result<(), NodeExecutorError> {
+        let pending = {
             let mut physical = self
                 .physical
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = physical.get_mut(&key) {
+            let parents = physical
+                .keys()
+                .map(|key| (key.0.clone(), key.1.clone(), key.2, String::new()))
+                .collect::<Vec<_>>();
+            for parent in parents {
+                Self::close_entry(physical.entry(parent).or_default());
+            }
+            for entry in physical.values_mut() {
                 Self::close_entry(entry);
-                if entry.original_binding {
+                Self::retain_driver(entry);
+            }
+            physical
+                .iter()
+                .map(|(key, entry)| {
+                    // Never repoll a Shared work that panicked. With an original
+                    // driver present, only its real JoinHandle answers for exit.
+                    let completed_without_driver = entry.driver.is_none()
+                        && entry.work.as_ref().is_none_or(|work| work.peek().is_some());
+                    (key.clone(), entry.driver.clone(), completed_without_driver)
+                })
+                .collect::<Vec<_>>()
+        };
+        let joined =
+            futures::future::join_all(pending.into_iter().map(|(key, driver, done)| async move {
+                let joined = match driver {
+                    Some(driver) => driver.await.is_ok(),
+                    None => done,
+                };
+                (key, joined)
+            }))
+            .await;
+        let mut physical = self
+            .physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut uncertain = None;
+        for (key, joined) in joined {
+            if !joined {
+                uncertain.get_or_insert_with(|| key.1.clone());
+                continue;
+            }
+            if let Some(entry) = physical.get_mut(&key) {
+                // Check driver first, so a poisoned work is never inspected
+                // after its driver reported a failed join.
+                if entry
+                    .driver
+                    .as_ref()
+                    .is_some_and(|driver| !matches!(driver.peek(), Some(Ok(()))))
+                    || entry
+                        .work
+                        .as_ref()
+                        .is_some_and(|work| work.peek().is_none())
+                {
+                    uncertain.get_or_insert_with(|| key.1.clone());
+                    continue;
+                }
+                if entry.original_binding || key.3.is_empty() {
                     entry.work = None;
                 } else {
                     physical.remove(&key);
                 }
             }
-        }))
-        .await;
+        }
+        let pending = |entry: &PhysicalEntry| {
+            entry
+                .driver
+                .as_ref()
+                .is_some_and(|driver| !matches!(driver.peek(), Some(Ok(()))))
+                || entry
+                    .work
+                    .as_ref()
+                    .is_some_and(|work| work.peek().is_none())
+        };
+        let removable = physical
+            .iter()
+            .filter(|(key, entry)| {
+                key.3.is_empty()
+                    && !entry.original_binding
+                    && entry.closed
+                    && !physical.iter().any(|(other, entry)| {
+                        other.0 == key.0 && other.1 == key.1 && other.2 == key.2 && pending(entry)
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in removable {
+            physical.remove(&key);
+        }
+        if let Some((key, _)) = physical.iter().find(|(_, entry)| pending(entry)) {
+            uncertain.get_or_insert_with(|| key.1.clone());
+        }
+        if let Some(node_id) = uncertain {
+            Err(NodeExecutorError::Uncertain {
+                node_id,
+                reason: "original physical drain could not prove every driver join".into(),
+            })
+        } else {
+            Ok(())
+        }
     }
     fn cancellation_finalized(&self, ticket: &NodeExecutionTicket) {
         let mut physical = self
@@ -583,7 +759,11 @@ impl NodeExecutor for ScopedNodeExecutor {
         // intent must not drop a still-running physical future.
         if physical.iter().any(|(key, work)| {
             Self::owns_key(ticket, key)
-                && work.work.as_ref().is_some_and(|work| work.peek().is_none())
+                && (work.work.as_ref().is_some_and(|work| work.peek().is_none())
+                    || work
+                        .driver
+                        .as_ref()
+                        .is_some_and(|driver| !matches!(driver.peek(), Some(Ok(())))))
         }) {
             return;
         }
@@ -829,6 +1009,7 @@ mod tests {
                 executor.drain_physical_execution(),
             )
             .await
+            .unwrap()
             .unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "finished");
             assert!(executor.physical.lock().unwrap().is_empty());
@@ -913,6 +1094,7 @@ mod tests {
         backend.release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(2), drain)
             .await
+            .unwrap()
             .unwrap();
         assert!(backend.completed.load(Ordering::Acquire));
         assert!(executor.physical.lock().unwrap().is_empty());
@@ -1007,7 +1189,7 @@ mod tests {
                 Err(NodeExecutorError::Unavailable { .. })
             ));
             executor.cancel(&original).await.unwrap();
-            executor.drain_physical_execution().await;
+            executor.drain_physical_execution().await.unwrap();
             executor.cancellation_finalized(&original);
             assert!(observation.witness().is_none());
             assert!(!observation.enter());
@@ -1033,7 +1215,7 @@ mod tests {
                         .cancel_bounded(&original, std::time::Duration::from_secs(1))
                         .await
                         .unwrap();
-                    executor.drain_physical_execution().await;
+                    executor.drain_physical_execution().await.unwrap();
                     executor.cancellation_finalized(&original);
                     executor.forget_closed_binding(&original);
                     executor.cancel(&original).await.unwrap();
@@ -1121,6 +1303,330 @@ mod tests {
                 .unwrap();
             executor.cancel(&original).await.unwrap();
             assert_eq!(observation.witness().as_ref(), Some(witness));
+        }
+    }
+}
+
+#[cfg(test)]
+mod controlled_stop_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Backend {
+        entered: AtomicBool,
+        stops: AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl ScopedNodeBackend for Backend {
+        fn retains_physical_execution(&self) -> bool {
+            true
+        }
+        fn request_stop(&self, _: &NodeExecutionTicket) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn execute(
+            &self,
+            _: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            self.entered.store(true, Ordering::Release);
+            self.release.notified().await;
+            Ok(NodeExecutionOutcome::new(
+                harness_contract::execution_graph::ExecutionNodeResult {
+                    status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                    result_ref: None,
+                    wait_class: None,
+                    summary: None,
+                    evidence_refs: vec![],
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                },
+            ))
+        }
+    }
+    struct Resolver(Arc<Backend>);
+    impl ScopedNodeBackendResolver for Resolver {
+        fn resolve(&self, _: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+            Some(self.0.clone())
+        }
+    }
+    fn ticket() -> NodeExecutionTicket {
+        NodeExecutionTicket {
+            graph_id: "controlled-child".into(),
+            node_id: "original-leaf".into(),
+            executor_kind: "tool_batch".into(),
+            service_class: Default::default(),
+            attempt: 3,
+            idempotency_key: "original-call".into(),
+            payload_ref: "{}".into(),
+        }
+    }
+    #[tokio::test]
+    async fn physical_drain_work_panic_uses_failed_driver_without_repolling_poisoned_work() {
+        let executor = ScopedNodeExecutor::new("tool_batch");
+        let request = ticket();
+        let (release, ready) = tokio::sync::oneshot::channel();
+        let mut leaf = Box::pin(executor.execute_physical_tool(
+            &request,
+            "panic-leaf",
+            Box::pin(async move {
+                ready.await.unwrap();
+                panic!("controlled physical work panic");
+            }),
+        ));
+        assert!(futures::poll!(&mut leaf).is_pending());
+        let mut drain = Box::pin(executor.drain_physical_execution());
+        assert!(futures::poll!(&mut drain).is_pending());
+        drop(leaf);
+        release.send(()).unwrap();
+        let result = std::panic::AssertUnwindSafe(drain)
+            .catch_unwind()
+            .await
+            .expect("physical drain must not repoll poisoned Shared work");
+        assert!(
+            matches!(result, Err(NodeExecutorError::Uncertain { ref node_id, .. }) if node_id == "original-leaf")
+        );
+        let driver = executor
+            .physical
+            .lock()
+            .unwrap()
+            .get(&ScopedNodeExecutor::physical_key(&request, "panic-leaf"))
+            .unwrap()
+            .driver
+            .clone()
+            .unwrap();
+        assert!(matches!(driver.peek(), Some(Err(_))));
+        let retry = std::panic::AssertUnwindSafe(executor.drain_physical_execution())
+            .catch_unwind()
+            .await;
+        assert!(matches!(
+            retry,
+            Ok(Err(NodeExecutorError::Uncertain { .. }))
+        ));
+        assert!(
+            executor
+                .physical
+                .lock()
+                .unwrap()
+                .get(&ScopedNodeExecutor::physical_key(&request, ""))
+                .unwrap()
+                .closed
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_drain_business_error_with_real_successful_join_is_quiescent() {
+        let executor = ScopedNodeExecutor::new("tool_batch");
+        let request = ticket();
+        let (release, ready) = tokio::sync::oneshot::channel();
+        let mut leaf = Box::pin(executor.execute_physical_tool(
+            &request,
+            "failed-business",
+            Box::pin(async move {
+                ready.await.unwrap();
+                Err(NodeExecutorError::Poll {
+                    node_id: "original-leaf".into(),
+                    reason: "business rejected".into(),
+                })
+            }),
+        ));
+        assert!(futures::poll!(&mut leaf).is_pending());
+        let mut drain = Box::pin(executor.drain_physical_execution());
+        assert!(futures::poll!(&mut drain).is_pending());
+        let driver = executor
+            .physical
+            .lock()
+            .unwrap()
+            .get(&ScopedNodeExecutor::physical_key(
+                &request,
+                "failed-business",
+            ))
+            .unwrap()
+            .driver
+            .clone()
+            .unwrap();
+        drop(leaf);
+        release.send(()).unwrap();
+        drain.await.unwrap();
+        assert!(matches!(driver.peek(), Some(Ok(()))));
+        assert!(executor.physical.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_snapshot_closes_parent_and_retains_driver_before_wait() {
+        let executor = ScopedNodeExecutor::new("tool_batch");
+        let request = ticket();
+        let (release, ready) = tokio::sync::oneshot::channel();
+        let mut leaf = Box::pin(executor.execute_physical_tool(
+            &request,
+            "shutdown-leaf",
+            Box::pin(async move {
+                ready.await.unwrap();
+                Ok(crate::RuntimeToolExecutionOutcome {
+                    tool_use_id: "shutdown-leaf".into(),
+                    tool_name: "edit".into(),
+                    status: crate::RuntimeToolExecutionStatus::Executed,
+                    category: crate::ToolSafetyCategory::WriteLocal,
+                    output: None,
+                    error: None,
+                    evidence_ref: "receipt".into(),
+                    observed_evidence: vec![],
+                })
+            }),
+        ));
+        assert!(futures::poll!(&mut leaf).is_pending());
+        let mut drain = Box::pin(executor.drain_physical_execution());
+        assert!(futures::poll!(&mut drain).is_pending());
+        let driver = {
+            let physical = executor.physical.lock().unwrap();
+            assert!(
+                physical
+                    .get(&ScopedNodeExecutor::physical_key(&request, ""))
+                    .unwrap()
+                    .closed
+            );
+            physical
+                .get(&ScopedNodeExecutor::physical_key(&request, "shutdown-leaf"))
+                .unwrap()
+                .driver
+                .clone()
+                .expect("shutdown owns original driver before await")
+        };
+        assert!(executor
+            .execute_physical_tool(
+                &request,
+                "late-leaf",
+                Box::pin(async { panic!("shutdown admitted new leaf") })
+            )
+            .await
+            .is_err());
+        release.send(()).unwrap();
+        leaf.await.unwrap();
+        drain.await.unwrap();
+        assert!(matches!(driver.peek(), Some(Ok(()))));
+        assert!(executor.physical.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_leaf_retains_original_driver_until_real_join() {
+        let executor = ScopedNodeExecutor::new("tool_batch");
+        let request = ticket();
+        let (release_work, work_ready) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(executor.execute_physical_tool(
+            &request,
+            "joined-leaf",
+            Box::pin(async move {
+                work_ready.await.unwrap();
+                Ok(crate::RuntimeToolExecutionOutcome {
+                    tool_use_id: "joined-leaf".into(),
+                    tool_name: "edit".into(),
+                    status: crate::RuntimeToolExecutionStatus::Executed,
+                    category: crate::ToolSafetyCategory::WriteLocal,
+                    output: None,
+                    error: None,
+                    evidence_ref: "committed-leaf".into(),
+                    observed_evidence: vec![],
+                })
+            }),
+        ));
+        assert!(futures::poll!(&mut caller).is_pending());
+        let key = ScopedNodeExecutor::physical_key(&request, "joined-leaf");
+        let (release_driver, driver_ready) = tokio::sync::oneshot::channel();
+        let handle = {
+            let mut physical = executor.physical.lock().unwrap();
+            let entry = physical.get_mut(&key).unwrap();
+            let work = entry.work.clone().unwrap();
+            let handle = tokio::spawn(async move {
+                let _ = work.await;
+                // A completed shared result does not imply this task has returned.
+                let _ = driver_ready.await;
+            });
+            entry.driver = Some(
+                async move { handle.await.map_err(|error| error.to_string()) }
+                    .boxed()
+                    .shared(),
+            );
+            entry.driver.clone().unwrap()
+        };
+        let mut drain = Box::pin(executor.close_and_drain(&request, true));
+        assert!(futures::poll!(&mut drain).is_pending());
+        release_work.send(()).unwrap();
+        caller.await.unwrap();
+        assert!(
+            executor.physical.lock().unwrap().contains_key(&key),
+            "the original caller must retain the not-yet-joined leaf driver"
+        );
+        assert!(futures::poll!(&mut drain).is_pending());
+        drop(drain);
+        assert!(executor.physical.lock().unwrap().contains_key(&key));
+        assert!(handle.peek().is_none());
+        release_driver.send(()).unwrap();
+        executor.close_and_drain(&request, true).await.unwrap();
+        assert!(matches!(handle.peek(), Some(Ok(()))));
+        assert!(!executor.physical.lock().unwrap().contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn normal_publication_never_stops_but_cancel_retains_original_physical_work() {
+        for cancel in [false, true] {
+            let backend = Arc::new(Backend {
+                entered: AtomicBool::new(false),
+                stops: AtomicUsize::new(0),
+                release: Default::default(),
+            });
+            let executor = Arc::new(ScopedNodeExecutor::new("tool_batch"));
+            executor.install_resolver(Arc::new(Resolver(backend.clone())));
+            let runner = {
+                let executor = executor.clone();
+                tokio::spawn(async move { executor.poll_or_await(&ticket()).await })
+            };
+            while !backend.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            let mut foreign = ticket();
+            foreign.attempt += 1;
+            executor.cancel(&foreign).await.unwrap();
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 0);
+            if cancel {
+                assert!(matches!(
+                    executor
+                        .cancel_bounded(&ticket(), std::time::Duration::from_millis(5))
+                        .await,
+                    Err(NodeExecutorError::Cancel { .. })
+                ));
+                assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
+                assert!(executor
+                    .physical
+                    .lock()
+                    .unwrap()
+                    .get(&ScopedNodeExecutor::physical_key(&ticket(), ""))
+                    .unwrap()
+                    .work
+                    .as_ref()
+                    .unwrap()
+                    .peek()
+                    .is_none());
+                backend.release.notify_one();
+                executor
+                    .cancel_bounded(&ticket(), std::time::Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
+            } else {
+                let original = ticket();
+                let mut publication = Box::pin(executor.after_commit(&original));
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(5),
+                    &mut publication
+                )
+                .await
+                .is_err());
+                assert_eq!(backend.stops.load(Ordering::SeqCst), 0);
+                backend.release.notify_one();
+                publication.await.unwrap();
+                assert_eq!(backend.stops.load(Ordering::SeqCst), 0);
+            }
+            runner.await.unwrap().unwrap();
         }
     }
 }

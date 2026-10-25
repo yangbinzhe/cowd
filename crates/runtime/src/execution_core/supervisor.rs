@@ -319,6 +319,8 @@ struct ShutdownDrainState {
     dispatcher: Option<JoinHandle<()>>,
     preserved_graphs: Option<usize>,
     errors: Vec<String>,
+    physical_drain:
+        Option<Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'static>>>,
 }
 
 /// The single Runtime owner of durable graph execution.
@@ -1268,10 +1270,32 @@ impl RuntimeExecutionSupervisor {
         // No producer/driver remains. Retained effects must finish before the
         // Runtime is reported closed; a shutdown timeout cannot unlock a write.
         // Their graph attempts remain recoverable, not business-cancelled.
-        self.runner.drain_physical_execution().await;
-        self.metrics
-            .lifecycle
-            .store(LIFECYCLE_CLOSED, Ordering::Release);
+        if shutdown.physical_drain.is_none() {
+            let runner = Arc::clone(&self.runner);
+            shutdown.physical_drain =
+                Some(Box::pin(
+                    async move { runner.drain_physical_execution().await },
+                ));
+        }
+        // The original state owns this exact aggregation, including already
+        // observed errors. Dropping a waiter must not restart and wash them out.
+        let errors = shutdown
+            .physical_drain
+            .as_mut()
+            .expect("original drain")
+            .await;
+        let drained = errors.is_empty();
+        for error in errors {
+            if !shutdown.errors.contains(&error) {
+                shutdown.errors.push(error);
+            }
+        }
+        shutdown.physical_drain = None;
+        if drained {
+            self.metrics
+                .lifecycle
+                .store(LIFECYCLE_CLOSED, Ordering::Release);
+        }
         self.shutdown_report(preserved_graphs, 0, shutdown.errors.clone())
     }
 
@@ -2269,6 +2293,213 @@ mod completion_pump_tests {
             active_nodes_per_graph,
             Duration::from_secs(2),
         )
+    }
+
+    struct PhysicalDrainProbe122 {
+        kind: &'static str,
+        calls: AtomicUsize,
+        fail_first: bool,
+        fail_always: bool,
+        panic: bool,
+        driver: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+        joined: AtomicBool,
+    }
+    impl PhysicalDrainProbe122 {
+        fn new(kind: &'static str) -> Self {
+            Self {
+                kind,
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+                fail_always: false,
+                panic: false,
+                driver: tokio::sync::Mutex::new(None),
+                joined: AtomicBool::new(false),
+            }
+        }
+    }
+    #[async_trait]
+    impl NodeExecutor for PhysicalDrainProbe122 {
+        fn kind(&self) -> &str {
+            self.kind
+        }
+        fn validate(&self, _: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+            Ok(())
+        }
+        async fn start(
+            &self,
+            _: NodeExecutionContext,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            panic!("physical-drain-only probe must not execute business work")
+        }
+        async fn poll_or_await(
+            &self,
+            _: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            panic!("physical-drain-only probe must not poll business work")
+        }
+        async fn drain_physical_execution(&self) -> Result<(), NodeExecutorError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.panic {
+                panic!("private-panic-sentinel-122");
+            }
+            if self.fail_always || (self.fail_first && call == 0) {
+                return Err(NodeExecutorError::Uncertain {
+                    node_id: "original-122".into(),
+                    reason: "fixture driver join failure".into(),
+                });
+            }
+            let mut driver = self.driver.lock().await;
+            if let Some(handle) = driver.as_mut() {
+                handle.await.map_err(|_| NodeExecutorError::Uncertain {
+                    node_id: "held-122".into(),
+                    reason: "held original driver join failed".into(),
+                })?;
+                driver.take();
+                self.joined.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_drain_failure_keeps_closing_and_deduplicates_original_errors() {
+        let executor = Arc::new(crate::execution_core::graph::ScopedNodeExecutor::new(
+            "tool_batch",
+        ));
+        let ticket = NodeExecutionTicket {
+            graph_id: "drain-122-graph".into(),
+            node_id: "panic-leaf".into(),
+            executor_kind: "tool_batch".into(),
+            service_class: Default::default(),
+            attempt: 1,
+            idempotency_key: "original-drain-122".into(),
+            payload_ref: "{}".into(),
+        };
+        let (release, ready) = tokio::sync::oneshot::channel();
+        let mut leaf = Box::pin(executor.execute_physical_tool(
+            &ticket,
+            "original-leaf",
+            Box::pin(async move {
+                ready.await.unwrap();
+                panic!("controlled original Scoped work panic");
+            }),
+        ));
+        assert!(futures::poll!(&mut leaf).is_pending());
+        let supervisor = test_supervisor_with_executors(vec![executor.clone()], 1, 1, 1);
+        let mut shutdown = Box::pin(supervisor.shutdown());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        drop(leaf);
+        release.send(()).unwrap();
+        let first = AssertUnwindSafe(shutdown)
+            .catch_unwind()
+            .await
+            .expect("real Scoped driver failure must reach the original report");
+        assert_eq!(first.errors, vec!["executor tool_batch physical drain failed: executor effect for node `panic-leaf` has uncertain completion: original physical drain could not prove every driver join"]);
+        assert_eq!(
+            supervisor.metrics.lifecycle.load(Ordering::Acquire),
+            LIFECYCLE_CLOSING
+        );
+        let second = supervisor.shutdown().await;
+        assert_eq!(
+            second.errors, first.errors,
+            "repeat must neither repoll poisoned work nor grow errors"
+        );
+        assert_eq!(
+            supervisor.metrics.lifecycle.load(Ordering::Acquire),
+            LIFECYCLE_CLOSING
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_physical_drain_keeps_first_error_and_same_held_driver() {
+        let mut failed = PhysicalDrainProbe122::new("a-drain-error");
+        failed.fail_first = true;
+        let failed = Arc::new(failed);
+        let release = Arc::new(Semaphore::new(0));
+        let exited = Arc::new(AtomicBool::new(false));
+        let mut held = PhysicalDrainProbe122::new("b-drain-held");
+        *held.driver.get_mut() = Some({
+            let release = release.clone();
+            let exited = exited.clone();
+            tokio::spawn(async move {
+                let _permit = release.acquire().await.unwrap();
+                exited.store(true, Ordering::SeqCst);
+            })
+        });
+        let held = Arc::new(held);
+        let supervisor =
+            test_supervisor_with_executors(vec![failed.clone(), held.clone()], 1, 1, 1);
+        let mut first = Box::pin(supervisor.shutdown());
+        assert!(futures::poll!(&mut first).is_pending());
+        assert_eq!(failed.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+        drop(first);
+        let mut resumed = Box::pin(supervisor.shutdown());
+        assert!(futures::poll!(&mut resumed).is_pending());
+        assert_eq!(
+            failed.calls.load(Ordering::SeqCst),
+            1,
+            "must not rerun and wash out first Err"
+        );
+        assert_eq!(
+            held.calls.load(Ordering::SeqCst),
+            1,
+            "resume same original join"
+        );
+        assert!(!exited.load(Ordering::SeqCst));
+        release.add_permits(1);
+        let report = resumed.await;
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(held.joined.load(Ordering::SeqCst));
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("a-drain-error physical drain failed"));
+        assert_eq!(
+            supervisor.metrics.lifecycle.load(Ordering::Acquire),
+            LIFECYCLE_CLOSING
+        );
+        let retry = supervisor.shutdown().await;
+        assert_eq!(
+            retry.errors, report.errors,
+            "success cannot erase historical failure"
+        );
+        assert_eq!(failed.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            supervisor.metrics.lifecycle.load(Ordering::Acquire),
+            LIFECYCLE_CLOSED
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_drain_panic_isolated_until_original_sibling_join() {
+        let mut failed = PhysicalDrainProbe122::new("a-drain-panic");
+        failed.panic = true;
+        let failed = Arc::new(failed);
+        let release = Arc::new(Semaphore::new(0));
+        let mut held = PhysicalDrainProbe122::new("b-drain-held");
+        *held.driver.get_mut() = Some({
+            let release = release.clone();
+            tokio::spawn(async move {
+                let _permit = release.acquire().await.unwrap();
+            })
+        });
+        let held = Arc::new(held);
+        let supervisor = test_supervisor_with_executors(vec![failed, held.clone()], 1, 1, 1);
+        let mut shutdown = Box::pin(supervisor.shutdown());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+        assert!(!held.joined.load(Ordering::SeqCst));
+        release.add_permits(1);
+        let report = shutdown.await;
+        assert!(held.joined.load(Ordering::SeqCst));
+        assert_eq!(
+            report.errors,
+            vec!["executor a-drain-panic physical drain panicked"]
+        );
+        assert!(!report.errors[0].contains("private-panic-sentinel"));
+        assert_eq!(
+            supervisor.metrics.lifecycle.load(Ordering::Acquire),
+            LIFECYCLE_CLOSING
+        );
     }
 
     #[tokio::test]

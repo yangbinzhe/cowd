@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionGraph, ExecutionNodeResult, ExecutionNodeSpec,
 };
@@ -157,7 +158,9 @@ pub trait NodeExecutor: Send + Sync {
     }
     /// Called after process-local drivers stop. Finish retained physical work
     /// without inventing a business cancellation or terminal graph result.
-    async fn drain_physical_execution(&self) {}
+    async fn drain_physical_execution(&self) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
     /// Release process-local cancellation intent after the graph command has
     /// either committed or definitively failed. Implementations must not
     /// mutate durable graph state from this callback.
@@ -299,20 +302,32 @@ impl NodeExecutorRegistry {
             .collect()
     }
 
-    pub(crate) async fn drain_physical_execution(&self) {
+    pub(crate) async fn drain_physical_execution(&self) -> Vec<String> {
         let executors = self
             .executors
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
+            .iter()
+            .map(|(kind, executor)| (kind.clone(), executor.clone()))
             .collect::<Vec<_>>();
-        futures::future::join_all(
-            executors
-                .iter()
-                .map(|executor| executor.drain_physical_execution()),
-        )
-        .await;
+        futures::future::join_all(executors.into_iter().map(|(kind, executor)| async move {
+            // Construct and poll inside the unwind boundary. One broken owner
+            // must not abandon another owner's real pending physical work.
+            match std::panic::AssertUnwindSafe(
+                async move { executor.drain_physical_execution().await },
+            )
+            .catch_unwind()
+            .await
+            {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("executor {kind} physical drain failed: {error}")),
+                Err(_) => Some(format!("executor {kind} physical drain panicked")),
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub fn validate_graph(&self, graph: &ExecutionGraph) -> Result<(), NodeExecutorError> {
