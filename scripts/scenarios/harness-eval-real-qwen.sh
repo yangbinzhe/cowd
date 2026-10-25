@@ -19,10 +19,34 @@ SOURCE_CONFIG_FILE="$SOURCE_CONFIG_HOME/config.yaml"
 SOURCE_MODELS_FILE="$SOURCE_CONFIG_HOME/models.yaml"
 MODEL="${COWD_EVAL_MODEL:-}"
 BIN="${COWD_BIN:-$ROOT/target/debug/cowd}"
+HARNESS_BIN="${COWD_EVAL_HARNESS_BIN:-}"
+FROZEN_MODE=0
+if [[ -n "$HARNESS_BIN" ]]; then
+  : "${COWD_BIN:?frozen evaluation requires both COWD_BIN and COWD_EVAL_HARNESS_BIN}"
+  FROZEN_MODE=1
+fi
 PORT="${COWD_EVAL_GATEWAY_PORT:-18657}"
 BASE_URL="http://127.0.0.1:$PORT"
 TOKEN="harness-eval-real-qwen-${RANDOM}-${RANDOM}"
-RUN_ROOT="$(mktemp -d /tmp/cowd-real-qwen-gateway.XXXXXX)"
+umask 077
+RUN_ROOT="$(python3 - <<'PY'
+import os, stat, tempfile
+parent = f'/run/user/{os.getuid()}'
+fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+s = os.fstat(fd)
+if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
+    raise SystemExit('runtime parent must be owned and actually0700')
+root = tempfile.mkdtemp(prefix='cowd-real-pilot-', dir=parent)
+s = os.stat(root, follow_symlinks=False)
+if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
+    raise SystemExit('runtime root is not private')
+print(root)
+PY
+)"
+PRIVATE_RUNTIME="$RUN_ROOT/run"
+mkdir -m 700 "$PRIVATE_RUNTIME"
+read -r RUNTIME_DEVICE RUNTIME_INODE < <(stat -c '%d %i' "$PRIVATE_RUNTIME")
+SHUTDOWN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 # Keep evidence under ignored build artifacts by default so a matching run can
 # be reused. A caller may choose another durable evidence root explicitly.
 EVIDENCE_ROOT="${COWD_AI_HARNESS_REPORT_DIR:-$ROOT/target/acceptance/real-qwen}"
@@ -33,8 +57,26 @@ CONFIG_HOME="$RUN_ROOT/config"
 WORKSPACE="${COWD_EVAL_WORKSPACE:-$ROOT}"
 GATEWAY_LOG="$RUN_ROOT/gateway.log"
 GATEWAY_PID=""
+GATEWAY_ORIGINAL_PID=""
 PROGRESS_PID=""
 DEEP_MONITOR_PID=""
+HARNESS_PID=""
+GATEWAY_STARTTIME=""
+HARNESS_STARTTIME=""
+OWNER_PID="$BASHPID"
+declare -A CHILD_START=() CHILD_GROUP=()
+CLEANUP_DONE=0
+GATEWAY_STOP_SECONDS=120
+GATEWAY_KILL_SECONDS=5
+MONITOR_STOP_SECONDS=2
+MONITOR_KILL_SECONDS=2
+HARNESS_STOP_SECONDS=10
+HARNESS_KILL_SECONDS=2
+GATEWAY_WAIT_STATUS="not_started"
+INPUT_BIN=""
+INPUT_HARNESS_BIN=""
+GATEWAY_BINARY_SHA256=""
+HARNESS_BINARY_SHA256=""
 DEEP_MONITOR_STALL_SECS="${COWD_EVAL_DEEP_MONITOR_STALL_SECS:-600}"
 # A single-stream local inference server cannot serve concurrent requests: the
 # runtime's default admission ceiling (provider target 64 / max 256, agents 42)
@@ -66,34 +108,406 @@ case "$SCENARIO_ID" in
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
 
+# Functions below stay in this original launch owner; no daemon or second
+# Runtime lifecycle is introduced. Local doubles extract these same functions.
+curl() { command curl --connect-timeout 2 --max-time 5 "$@"; }
+
+track_child() {
+  local pid=$1 group=${2:-0} start
+  start="$(python3 - "$pid" "$OWNER_PID" "$group" <<'PY'
+import pathlib, sys, time
+pid, parent, group = map(int, sys.argv[1:])
+for _ in range(100):
+    try:
+        fields = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        if int(fields[1]) != parent:
+            raise SystemExit('not a direct owned child')
+        if group and (int(fields[2]) != pid or int(fields[3]) != pid):
+            time.sleep(.01)
+            continue
+        print(fields[19])
+        break
+    except FileNotFoundError:
+        raise SystemExit('owned child exited before identity capture')
+else:
+    raise SystemExit('monitor did not enter its own process group')
+PY
+)" || return 1
+  CHILD_START[$pid]="$start"
+  CHILD_GROUP[$pid]="$group"
+}
+
+owned_running() {
+  python3 - "$1" "$2" <<'PY'
+import pathlib, sys
+try:
+    fields = pathlib.Path(f'/proc/{int(sys.argv[1])}/stat').read_text().rsplit(') ', 1)[1].split()
+    ok = fields[19] == sys.argv[2] and fields[0] not in ('Z', 'X')
+except (FileNotFoundError, ProcessLookupError):
+    ok = False
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+verify_child_image() {
+  local pid=$1 expected=$2
+  python3 - "$pid" "${CHILD_START[$pid]}" "$expected" "$RUN_ROOT/child-$pid.json" <<'PY'
+import hashlib, json, pathlib, sys, time
+pid, start, expected, output = sys.argv[1:]
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        fields = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        if fields[19] != start or fields[0] in ('Z', 'X'):
+            break
+        with open(f'/proc/{pid}/exe', 'rb') as image:
+            actual = hashlib.file_digest(image, 'sha256').hexdigest()
+        if actual == expected:
+            with open(output, 'x') as report:
+                json.dump({'pid': int(pid), 'starttime': int(start),
+                           'image_sha256': 'sha256:' + actual}, report)
+            raise SystemExit(0)
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        pass
+    time.sleep(.01)
+raise SystemExit('owned child startup image not confirmed')
+PY
+}
+
+group_has_members() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+group = int(sys.argv[1])
+for entry in pathlib.Path('/proc').iterdir():
+    if not entry.name.isdigit():
+        continue
+    try:
+        f = (entry / 'stat').read_text().rsplit(') ', 1)[1].split()
+        if int(f[2]) == group and int(f[3]) == group:
+            raise SystemExit(0)
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        continue
+raise SystemExit(1)
+PY
+}
+
+signal_owned() {
+  local pid=$1 signal=$2 group=${3:-0}
+  if [[ "$group" == 1 ]]; then
+    python3 - "$pid" "${CHILD_START[$pid]:-missing}" "$signal" <<'PY'
+import os, pathlib, signal, sys
+pid, start, sig = sys.argv[1:]; pid = int(pid)
+try:
+    f = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(') ',1)[1].split()
+    if f[19] != start or int(f[2]) != pid or int(f[3]) != pid:
+        raise SystemExit('monitor group identity changed')
+except FileNotFoundError:
+    # A surviving Linux process group/session pins its original leader PID
+    # number even after the leader is reaped. It cannot be reused meanwhile.
+    found = False
+    for entry in pathlib.Path('/proc').iterdir():
+        if not entry.name.isdigit(): continue
+        try: f = (entry/'stat').read_text().rsplit(') ',1)[1].split()
+        except (FileNotFoundError, ProcessLookupError, PermissionError): continue
+        found |= int(f[2]) == pid and int(f[3]) == pid
+    if not found: raise SystemExit(0)
+try: os.killpg(pid, getattr(signal, 'SIG'+sig))
+except ProcessLookupError: pass
+PY
+    return
+  fi
+  if ! owned_running "$pid" "${CHILD_START[$pid]:-missing}"; then
+    return 1
+  fi
+  kill -s "$signal" -- "$pid"
+}
+
+stop_owned() {
+  local variable=$1 term_seconds=$2 kill_seconds=$3
+  local pid=${!variable} deadline forced=0 group reaped=0
+  LAST_WAIT_STATUS=not_started
+  [[ -n "$pid" ]] || return 0
+  [[ -n "${CHILD_START[$pid]:-}" ]] || return 1
+  group=${CHILD_GROUP[$pid]}
+  if owned_running "$pid" "${CHILD_START[$pid]}" || { [[ "$group" == 1 ]] && group_has_members "$pid"; }; then
+    signal_owned "$pid" TERM "$group" || return 1
+  fi
+  deadline=$((SECONDS + term_seconds))
+  while :; do
+    if [[ "$reaped" == 0 ]] && ! owned_running "$pid" "${CHILD_START[$pid]}"; then
+      # Only this shell's original Child is waited, once, after it has exited.
+      if wait "$pid"; then LAST_WAIT_STATUS=0; else LAST_WAIT_STATUS=$?; fi
+      printf -v "$variable" '%s' ''
+      reaped=1
+      [[ "$LAST_WAIT_STATUS" != 127 ]] || return 1
+    fi
+    if [[ "$reaped" == 1 ]] && { [[ "$group" != 1 ]] || ! group_has_members "$pid"; }; then
+      break
+    fi
+    if ((SECONDS >= deadline)); then
+      [[ "$forced" == 0 ]] || return 1
+      forced=1
+      signal_owned "$pid" KILL "$group" || return 1
+      deadline=$((SECONDS + kill_seconds))
+    fi
+    sleep 0.05
+  done
+  [[ "$forced" == 0 ]]
+}
+
+prepare_binaries() {
+  local target=${CARGO_TARGET_DIR:-$ROOT/target}
+  [[ "$target" == /* ]] || target="$ROOT/$target"
+  if [[ "$FROZEN_MODE" == 0 ]]; then
+    if [[ -z "${COWD_BIN:-}" ]]; then
+      (cd "$ROOT" && cargo build -p cli --bin cowd) || return 1
+      BIN="$target/debug/cowd"
+    fi
+    (cd "$ROOT" && cargo build -p harness-eval --bin harness-eval) || return 1
+    HARNESS_BIN="$target/debug/harness-eval"
+  fi
+  local bindings
+  bindings="$(python3 - "$BIN" "$HARNESS_BIN" "$RUN_ROOT" <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+root = pathlib.Path(sys.argv[3]); (root / 'bin').mkdir(mode=0o700)
+bindings = []
+def consume(path, size=None, output=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as f:
+        meta = os.fstat(f.fileno())
+        if not stat.S_ISREG(meta.st_mode) or (size is not None and meta.st_size != size):
+            raise ValueError('binary extent/type changed')
+        left = meta.st_size; h = hashlib.sha256()
+        while left:
+            data = f.read(min(left, 1024*1024))
+            if not data: raise ValueError('binary truncated')
+            h.update(data); left -= len(data)
+            if output is not None: output.write(data)
+        if f.read(1): raise ValueError('binary grew')
+        return h.hexdigest(), meta.st_size
+for name, source in zip(('gateway', 'harness'), sys.argv[1:3]):
+    path = pathlib.Path(source).resolve(strict=True)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise SystemExit('explicit binary must be an executable regular file')
+    expected, size = consume(path)
+    frozen = root / 'bin' / name
+    with frozen.open('xb') as out:
+        actual, _ = consume(path, size, out)
+    frozen.chmod(0o500)
+    copied, _ = consume(frozen, size)
+    if actual != expected or copied != expected:
+        raise SystemExit('binary changed while freezing')
+    bindings.append({'input': str(path), 'frozen': str(frozen), 'sha256': expected, 'bytes':size})
+with (root / 'binary-bindings.json').open('x') as out:
+    json.dump(bindings, out)
+for binding in bindings:
+    print(binding['input']); print(binding['frozen']); print(binding['sha256'])
+PY
+)" || return 1
+  local -a fields
+  mapfile -t fields <<<"$bindings"
+  [[ "${#fields[@]}" == 6 ]] || return 1
+  INPUT_BIN=${fields[0]}; BIN=${fields[1]}; GATEWAY_BINARY_SHA256=${fields[2]}
+  INPUT_HARNESS_BIN=${fields[3]}; HARNESS_BIN=${fields[4]}; HARNESS_BINARY_SHA256=${fields[5]}
+}
+
+verify_binary_bindings() {
+  [[ -n "$INPUT_BIN" && -n "$INPUT_HARNESS_BIN" ]] || return 0
+  python3 - "$RUN_ROOT/binary-bindings.json" <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+for binding in json.loads(pathlib.Path(sys.argv[1]).read_text()):
+    for key in ('input', 'frozen'):
+        fd = os.open(binding[key], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as f:
+            meta = os.fstat(f.fileno()); left = binding['bytes']; h = hashlib.sha256()
+            if not stat.S_ISREG(meta.st_mode) or meta.st_size != left:
+                raise SystemExit('binary extent/type changed during run')
+            while left:
+                data = f.read(min(left,1024*1024))
+                if not data: raise SystemExit('binary truncated during run')
+                h.update(data); left -= len(data)
+            if f.read(1) or h.hexdigest() != binding['sha256']:
+                raise SystemExit('binary binding changed during run')
+PY
+}
+
+validate_shutdown_receipt() {
+  python3 - "$PRIVATE_RUNTIME" "$RUNTIME_DEVICE" "$RUNTIME_INODE" "$SHUTDOWN_NONCE" \
+    "$GATEWAY_ORIGINAL_PID" "$GATEWAY_STARTTIME" "$GATEWAY_BINARY_SHA256" "$RUN_ROOT" <<'PY'
+import hashlib, json, os, stat, sys
+path, device, inode, nonce, pid, start, image, root = sys.argv[1:]
+def require(ok, reason):
+    if not ok: raise ValueError(reason)
+def number(v):
+    require(type(v) is int and 0 <= v <= 18446744073709551615, 'missing/invalid u64 counter')
+    return v
+def strings(v):
+    require(type(v) is list and all(type(s) is str for s in v), 'missing/invalid string array')
+    return v
+def digest(v):
+    return type(v) is str and len(v) == 71 and v.startswith('sha256:') and all(c in '0123456789abcdef' for c in v[7:])
+try:
+    d = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    before = os.fstat(d)
+    require((before.st_dev, before.st_ino) == (int(device), int(inode)) and before.st_uid == os.getuid() and stat.S_IMODE(before.st_mode) == 0o700, 'private runtime identity changed')
+    f = os.open(f'shutdown-{nonce}.v1.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=d)
+    meta = os.fstat(f)
+    require(stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid() and stat.S_IMODE(meta.st_mode) == 0o600 and meta.st_size <= 2*1024*1024, 'receipt file is not private bounded regular')
+    with os.fdopen(f, 'rb') as stream: raw = stream.read(2*1024*1024+1)
+    require(len(raw) <= 2*1024*1024, 'receipt grew beyond bound')
+    current = os.stat(path, follow_symlinks=False)
+    require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino) and stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700 and current.st_uid == os.getuid(), 'runtime directory replaced during read')
+    value = json.loads(raw)
+    require(type(value['schema_version']) is int and value['schema_version'] == 1, 'unknown schema')
+    identity = value['identity']
+    require(identity['nonce'] == nonce and type(identity['pid']) is int and identity['pid'] == int(pid) and type(identity['starttime']) is int and identity['starttime'] == int(start) and identity['image_sha256'] == 'sha256:' + image, 'launch identity mismatch')
+    require(digest(identity['config_sha256']), 'invalid selected-config digest')
+    report = value['report']; strings(report['phases'])
+    require(not strings(report['failures']), 'Gateway shutdown failures')
+    require(type(report['execution_started']) is bool, 'execution_started missing or invalid')
+    execution, active, memory = (report[k] for k in ('execution', 'active_turns', 'memory'))
+    require(not report['execution_started'] or execution is not None, 'started execution report missing')
+    if execution is not None:
+        for key in ('accepted','completed','failed','preserved_graphs','cancelled_graphs','forced_aborts','remaining_keys'): number(execution[key])
+        require(execution['forced_aborts'] == 0 and execution['remaining_keys'] == 0 and not strings(execution['errors']), 'execution not drained')
+        require(type(execution['owners']) is dict, 'owners missing')
+        for owner in execution['owners'].values():
+            for key in ('submitted','active','completed','failed','aborted'): number(owner[key])
+            require(owner['active'] == 0, 'active owner remains')
+    if active is not None:
+        number(active['cancelled']); number(active['drained'])
+        require(not strings(active['remaining_turn_ids']), 'turns remain')
+    if memory is not None:
+        number(memory['joined_tasks']); number(memory['forced_aborts'])
+        require(type(memory['watcher_joined']) is bool and memory['forced_aborts'] == 0 and not strings(memory['errors']), 'memory not drained')
+    tasks = report['tasks']
+    for key in ('joined','panicked','forced_aborts','rejected'): number(tasks[key])
+    require(tasks['panicked'] == 0 and tasks['forced_aborts'] == 0, 'tasks not drained')
+    with open(root + '/shutdown-validation.json','x') as out:
+        json.dump({'status':'passed','receipt_sha256':hashlib.sha256(raw).hexdigest(), 'selected_config_digest_only':True, 'identity':identity},out)
+except Exception as error:
+    print('shutdown receipt rejected: ' + type(error).__name__, file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 cleanup() {
-  local status=$?
-  if [[ -n "$PROGRESS_PID" ]]; then
-    kill "$PROGRESS_PID" >/dev/null 2>&1 || true
-    wait "$PROGRESS_PID" >/dev/null 2>&1 || true
-  fi
+  local status=${1:-$?} secondary=0
+  [[ "$CLEANUP_DONE" == 0 ]] || return
+  CLEANUP_DONE=1
+  trap - EXIT
+  trap '' INT TERM
+  # Cleanup is explicit under set -e; never discard a secondary failure.
+  if stop_owned DEEP_MONITOR_PID "$MONITOR_STOP_SECONDS" "$MONITOR_KILL_SECONDS"; then :; else secondary=1; fi
+  if stop_owned PROGRESS_PID "$MONITOR_STOP_SECONDS" "$MONITOR_KILL_SECONDS"; then :; else secondary=1; fi
+  if stop_owned HARNESS_PID "$HARNESS_STOP_SECONDS" "$HARNESS_KILL_SECONDS"; then :; else secondary=1; fi
   if [[ -n "$GATEWAY_PID" ]]; then
-    kill "$GATEWAY_PID" >/dev/null 2>&1 || true
-    wait "$GATEWAY_PID" >/dev/null 2>&1 || true
+    if stop_owned GATEWAY_PID "$GATEWAY_STOP_SECONDS" "$GATEWAY_KILL_SECONDS"; then :; else secondary=1; fi
+    GATEWAY_WAIT_STATUS=$LAST_WAIT_STATUS
+    [[ "$GATEWAY_WAIT_STATUS" == 0 ]] || secondary=1
+    if validate_shutdown_receipt; then :; else secondary=1; fi
   fi
-  # The gateway writes its diagnostics to a file appender under
-  # $RUN_ROOT/config/logs, and only reaches stderr when COWD_LOG_STDERR is set -
-  # which this harness never sets. Two root causes were guessed wrong because
-  # the only signal for them was an `info!` line living in that file. Copy it
-  # next to the durable evidence so the next investigation looks in one place.
-  if [[ -d "$RUN_ROOT/config/logs" ]]; then
-    local log_dest="$EVIDENCE_ROOT/gateway-logs"
-    mkdir -p "$log_dest" 2>/dev/null || true
-    cp -R "$RUN_ROOT/config/logs/." "$log_dest/" 2>/dev/null || true
-  fi
-  if [[ "$status" -ne 0 || "${COWD_EVAL_KEEP_GATEWAY_ARTIFACTS:-}" == "1" ]]; then
+  if verify_binary_bindings; then :; else secondary=1; fi
+  local -a tracked=()
+  local child
+  for child in "${!CHILD_START[@]}"; do tracked+=("$child:${CHILD_START[$child]}:${CHILD_GROUP[$child]}"); done
+  if python3 - "$RUN_ROOT" "$status" "$secondary" "$GATEWAY_WAIT_STATUS" "${tracked[@]}" <<'PY'
+import json, pathlib, sys
+root, original, cleanup, gateway_exit = sys.argv[1:5]
+owned = {int(p): (start, group == '1') for p,start,group in (v.split(':') for v in sys.argv[5:])}
+remaining = []
+groups = {pid for pid, (_,group) in owned.items() if group}
+for entry in pathlib.Path('/proc').iterdir():
+    if not entry.name.isdigit(): continue
+    pid = int(entry.name)
+    try: f = (entry/'stat').read_text().rsplit(') ',1)[1].split()
+    except (FileNotFoundError, ProcessLookupError, PermissionError): continue
+    if (pid in owned and f[19] == owned[pid][0]) or (int(f[2]) in groups and int(f[3]) == int(f[2])):
+        remaining.append({'pid':pid,'state':f[0],'starttime':f[19],'pgid':int(f[2]),'sid':int(f[3])})
+with (pathlib.Path(root)/'cleanup-result.json').open('x') as out:
+    json.dump({'business_exit':int(original),'cleanup_failed':bool(int(cleanup)) or bool(remaining), 'gateway_wait_status':gateway_exit,'remaining_owned':remaining},out)
+raise SystemExit(1 if remaining else 0)
+PY
+  then :; else secondary=1; fi
+  [[ "$status" != 0 || "$secondary" == 0 ]] || status=1
+  # Raw config/logs/receipts remain private; never copy them to a mode-blind mount.
+  if [[ "$status" != 0 || "$FROZEN_MODE" == 1 || "${COWD_EVAL_KEEP_GATEWAY_ARTIFACTS:-}" == 1 ]]; then
     printf 'isolated Gateway artifacts: %s\n' "$RUN_ROOT" >&2
   else
-    rm -rf "$RUN_ROOT"
+    rm -rf -- "$RUN_ROOT"
   fi
   printf 'Harness evidence: %s\n' "$EVIDENCE_ROOT" >&2
+  exit "$status"
 }
-trap cleanup EXIT
+trap 'cleanup "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+launch_gateway() {
+  (
+    cd "$WORKSPACE"
+    exec env "${gateway_env[@]}" "$BIN" gateway run
+  ) >"$GATEWAY_LOG" 2>&1 &
+  GATEWAY_PID=$!
+  GATEWAY_ORIGINAL_PID=$GATEWAY_PID
+  track_child "$GATEWAY_PID" || return 1
+  GATEWAY_STARTTIME=${CHILD_START[$GATEWAY_PID]}
+  verify_child_image "$GATEWAY_PID" "$GATEWAY_BINARY_SHA256"
+}
+
+launch_harness() {
+  env \
+    COWD_CONFIG_HOME="$CONFIG_HOME" \
+    XDG_RUNTIME_DIR="$PRIVATE_RUNTIME" \
+    CARGO_HOME="$CARGO_HOME_DIR" \
+    RUSTUP_HOME="$RUSTUP_HOME_DIR" \
+    COWD_API_TOKEN="$TOKEN" \
+    COWD_EVAL_GATEWAY_URL="$BASE_URL" \
+    COWD_EVAL_REAL_MODEL=1 \
+    COWD_EVAL_EVIDENCE_KEY="$EVIDENCE_KEY" \
+    COWD_EVAL_BINARY_SHA256="$GATEWAY_BINARY_SHA256" \
+    COWD_EVAL_HARNESS_BINARY_SHA256="$HARNESS_BINARY_SHA256" \
+    COWD_EVAL_CANDIDATE_SHA="$CANDIDATE_SHA" \
+    COWD_EVAL_CANDIDATE_SOURCE_SHA256="$CANDIDATE_SOURCE_SHA256" \
+    COWD_EVAL_TARGET_REPO_DIRTY_STATE="$CANDIDATE_STATE" \
+    COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
+    "$HARNESS_BIN" deep-real --provider "$MODEL" --budget full --allow-real-model &
+  HARNESS_PID=$!
+  track_child "$HARNESS_PID" || return 1
+  HARNESS_STARTTIME=${CHILD_START[$HARNESS_PID]}
+  verify_child_image "$HARNESS_PID" "$HARNESS_BINARY_SHA256"
+}
+
+monitor_entry() {
+  # Run in the group's actual leader, without another asynchronous worker or
+  # inherited wait trap. The parent waits this leader AND checks the group.
+  trap 'trap - TERM INT; exit 143' TERM INT
+  "$1"
+}
+
+start_monitor() {
+  local function=$1 variable=$2 pid
+  export -f monitor_entry "$function" curl owned_running
+  export ROOT TOKEN BASE_URL GATEWAY_PID GATEWAY_STARTTIME HARNESS_PID HARNESS_STARTTIME
+  export EVIDENCE_ROOT COWD_TEST_POSTGRES_URL DEEP_MONITOR_STALL_SECS PRIVATE_RUNTIME
+  export DEEP_MONITOR_LAST_MILESTONE DEEP_MONITOR_LAST_CHANGE_TS
+  setsid bash -c 'monitor_entry "$1"' -- "$function" &
+  pid=$!
+  printf -v "$variable" '%s' "$pid"
+  if track_child "$pid" 1 2>"$RUN_ROOT/monitor-$pid-identity.stderr"; then
+    return 0
+  fi
+  # A finished short scenario may let its monitor return before /proc capture.
+  # Reap only the exact original Child, with no group left and no live PID;
+  # never wait an unconfirmed running process or signal a reused identity.
+  if [[ ! -e "/proc/$pid/stat" ]] && ! group_has_members "$pid"; then
+    local status
+    if wait "$pid"; then status=0; else status=$?; fi
+    printf -v "$variable" '%s' ''
+    return "$status"
+  fi
+  return 1
+}
 
 # A real-provider evaluation can legitimately run several nested Team graphs.
 # Keep the operator informed through the same public Mission Control projection
@@ -102,7 +516,7 @@ trap cleanup EXIT
 # generated config, headers, credentials, prompts, or model/tool payloads.
 monitor_progress() {
   local interval="${COWD_EVAL_PROGRESS_INTERVAL_SECS:-15}"
-  while kill -0 "$GATEWAY_PID" >/dev/null 2>&1; do
+  while owned_running "$GATEWAY_PID" "$GATEWAY_STARTTIME"; do
     curl -fsS \
       -H "Authorization: Bearer $TOKEN" \
       "$BASE_URL/api/mission/control/summary" 2>/dev/null \
@@ -181,8 +595,8 @@ monitor_semantic_health() {
   # first report matches the old run's last finding would escalate on its first
   # interval. The verification state belongs to this run; start it empty.
   rm -f "$state_file" 2>/dev/null || true
-  mkdir -p "$EVIDENCE_ROOT" 2>/dev/null || state_file="$(mktemp /tmp/cowd-deep-monitor-state.XXXXXX)"
-  while kill -0 "$HARNESS_PID" >/dev/null 2>&1; do
+  mkdir -p "$EVIDENCE_ROOT" 2>/dev/null || state_file="$PRIVATE_RUNTIME/deep-monitor-state.json"
+  while owned_running "$HARNESS_PID" "$HARNESS_STARTTIME"; do
     local report state milestones findings now escalate repeat_count state_persisted
     # A monitor that cannot read the database is itself a finding. Silently
     # skipping the turn made a crashing monitor indistinguishable from a quiet
@@ -190,7 +604,7 @@ monitor_semantic_health() {
     # treated each empty report as "no data" and continued, and the deep monitor
     # emitted four lines across a 35-minute run that was working the whole time.
     # Emit the failure instead of swallowing it.
-    if ! report="$(python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate --state-file "$state_file" 2>/dev/null)"; then
+    if ! report="$(timeout --foreground --signal=TERM --kill-after=2s 30s python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate --state-file "$state_file" 2>/dev/null)"; then
       printf '{"event":"harness_eval_deep_monitor_error","reason":"deep-run-monitor failed; semantic health is unobserved this interval"}\n' >&2
       sleep "$interval"
       continue
@@ -240,7 +654,7 @@ monitor_semantic_health() {
         printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-final-report.json" 2>/dev/null || true
         printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: the same finding repeated %s consecutive reports with no convergence milestone","state":"%s","stall_for_s":%d,"findings":%s}\n' \
           "${repeat_count:-0}" "$state" "$stalled_for" "$findings" >&2
-        kill "$HARNESS_PID" >/dev/null 2>&1 || true
+        if owned_running "$HARNESS_PID" "$HARNESS_STARTTIME"; then kill -TERM "$HARNESS_PID"; fi
         return 0
       fi
       # Stop path 2 (backstop): confirmed waste by silence - an active finding
@@ -252,7 +666,7 @@ monitor_semantic_health() {
         printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-final-report.json" 2>/dev/null || true
         printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: findings present, semantic milestones frozen and no durable event in the stall window","state":"%s","stall_for_s":%d,"findings":%s}\n' \
           "$state" "$stalled_for" "$findings" >&2
-        kill "$HARNESS_PID" >/dev/null 2>&1 || true
+        if owned_running "$HARNESS_PID" "$HARNESS_STARTTIME"; then kill -TERM "$HARNESS_PID"; fi
         return 0
       fi
     fi
@@ -414,7 +828,10 @@ else
 fi
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
 SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
-EVIDENCE_KEY="$(printf '%s\n' "deep-real-v4" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
+prepare_binaries
+verify_binary_bindings
+printf 'Gateway binary sha256: %s\nHarness binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" >&2
+EVIDENCE_KEY="$(printf '%s\n' "deep-real-v5" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" | sha256sum | awk '{print $1}')"
 if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   prior_evidence="$({
     find "$EVIDENCE_ROOT/runs" -type f -name report.json -exec jq -r --arg key "$EVIDENCE_KEY" '
@@ -429,6 +846,10 @@ if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   } | head -n 1)"
   case "$prior_evidence" in
     passed$'\t'*)
+      if [[ "$FROZEN_MODE" == 1 ]]; then
+        echo 'existing evidence requires separate audit; frozen pilot not dispatched' >&2
+        exit 3
+      fi
       printf 'reusing matching real-model evidence: %s\n' "${prior_evidence#*$'\t'}"
       exit 0
       ;;
@@ -444,22 +865,6 @@ if ss -ltn | rg -q ":${PORT}\\b"; then
   exit 2
 fi
 cd "$ROOT"
-# The Gateway and harness evaluator are both part of the system under test.
-# Building only harness-eval after the Gateway starts leaves an old
-# `target/debug/cowd` serving the scenario; conversely, rebuilding only Cowd
-# can make the evaluator send a stale fixture. Build both before every real
-# run so the recorded candidate SHA, Gateway, and scenario prompt are one
-# immutable candidate. An explicit COWD_BIN remains an operator-supplied
-# immutable Gateway artifact and must already be executable.
-if [[ -z "${COWD_BIN:-}" ]]; then
-  cargo build -p cli --bin cowd
-elif [[ ! -x "$BIN" ]]; then
-  echo "COWD_BIN is not executable: $BIN" >&2
-  exit 2
-fi
-cargo build -p harness-eval --bin harness-eval
-GATEWAY_BINARY_SHA256="$(sha256sum "$BIN" | awk '{print $1}')"
-printf 'Gateway binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" >&2
 
 mkdir -p "$CONFIG_HOME"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
@@ -533,6 +938,8 @@ gateway_env=(
   COWD_LOG_STDERR=1
   COWD_EVAL_HARNESS=1
   COWD_EVAL_CORPUS_ID=live-scenarios-v1
+  XDG_RUNTIME_DIR="$PRIVATE_RUNTIME"
+  COWD_TEST_SHUTDOWN_RECEIPT_NONCE="$SHUTDOWN_NONCE"
   COWD_MODEL_TEMPERATURE=0
 )
 # Optional objective-level wall-clock budget for required-Team collaboration
@@ -544,20 +951,15 @@ fi
 if [[ -n "$STAGED_CREDENTIAL_ENV" ]]; then
   gateway_env+=("$STAGED_CREDENTIAL_ENV=$PROVIDER_CREDENTIAL")
 fi
-(
-  cd "$WORKSPACE"
-  env "${gateway_env[@]}" \
-    "$BIN" gateway run >"$GATEWAY_LOG" 2>&1 &
-  echo $! >"$RUN_ROOT/gateway.pid"
-)
+launch_gateway
 # The literal credential, if present, is now only held by the isolated child.
 unset PROVIDER_CREDENTIAL
-GATEWAY_PID="$(<"$RUN_ROOT/gateway.pid")"
+printf '%s\n' "$GATEWAY_PID" >"$RUN_ROOT/gateway.pid"
 for _ in {1..240}; do
   if curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/healthz" >/dev/null 2>&1; then
     break
   fi
-  kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || {
+  owned_running "$GATEWAY_PID" "$GATEWAY_STARTTIME" || {
     echo "isolated Gateway exited; inspect protected diagnostics: $GATEWAY_LOG" >&2
     exit 1
   }
@@ -621,7 +1023,7 @@ while ((SECONDS < semantic_deadline)); do
     semantic_ready=1
     break
   fi
-  kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || {
+  owned_running "$GATEWAY_PID" "$GATEWAY_STARTTIME" || {
     echo "isolated Gateway exited; inspect protected diagnostics: $GATEWAY_LOG" >&2
     exit 1
   }
@@ -638,8 +1040,7 @@ if [[ "$semantic_ready" -ne 1 ]]; then
     }' >&2
   exit 1
 fi
-monitor_progress &
-PROGRESS_PID="$!"
+start_monitor monitor_progress PROGRESS_PID
 
 cd "$ROOT"
 # A deep real-provider run contains serial scenarios, each with its own
@@ -647,37 +1048,16 @@ cd "$ROOT"
 # handled inside the evaluator so timeout cleanup can commit a durable Session
 # cancellation receipt. Never wrap the evaluator in GNU timeout: killing the
 # observer must not silently become a business cancellation or strand a root.
-EVAL_COMMAND=(
-  cargo run -p harness-eval -- deep-real --provider "$MODEL" --budget full --allow-real-model
-)
 if [[ -n "${COWD_EVAL_TIMEOUT_SECS:-}" && -z "${COWD_EVAL_SCENARIO_TIMEOUT_SECS:-}" ]]; then
   export COWD_EVAL_SCENARIO_TIMEOUT_SECS="$COWD_EVAL_TIMEOUT_SECS"
 fi
-env \
-  COWD_CONFIG_HOME="$CONFIG_HOME" \
-  CARGO_HOME="$CARGO_HOME_DIR" \
-  RUSTUP_HOME="$RUSTUP_HOME_DIR" \
-  COWD_API_TOKEN="$TOKEN" \
-  COWD_EVAL_GATEWAY_URL="$BASE_URL" \
-  COWD_EVAL_REAL_MODEL=1 \
-  COWD_EVAL_EVIDENCE_KEY="$EVIDENCE_KEY" \
-  COWD_EVAL_BINARY_SHA256="$GATEWAY_BINARY_SHA256" \
-  COWD_EVAL_CANDIDATE_SHA="$CANDIDATE_SHA" \
-  COWD_EVAL_CANDIDATE_SOURCE_SHA256="$CANDIDATE_SOURCE_SHA256" \
-  COWD_EVAL_TARGET_REPO_DIRTY_STATE="$CANDIDATE_STATE" \
-  COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
-  "${EVAL_COMMAND[@]}" &
-HARNESS_PID="$!"
+verify_binary_bindings
+launch_harness
 
 # Run the evaluator in the background so the deep semantic monitor can stop a
 # run that burns steps without advancing the Objective. `wait` preserves the
 # evaluator's exit status for the caller.
-monitor_semantic_health &
-DEEP_MONITOR_PID="$!"
-wait "$HARNESS_PID"
-EVAL_STATUS=$?
-if [[ -n "$DEEP_MONITOR_PID" ]]; then
-  kill "$DEEP_MONITOR_PID" >/dev/null 2>&1 || true
-  wait "$DEEP_MONITOR_PID" >/dev/null 2>&1 || true
-fi
+start_monitor monitor_semantic_health DEEP_MONITOR_PID
+if wait "$HARNESS_PID"; then EVAL_STATUS=0; else EVAL_STATUS=$?; fi
+HARNESS_PID=""
 exit "$EVAL_STATUS"
