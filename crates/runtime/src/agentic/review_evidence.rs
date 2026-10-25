@@ -18,7 +18,7 @@ pub(crate) use policy::{
     validate_applied_proof_inputs, validate_proof_inputs, validate_proof_inputs_for_action,
     CompletionAdmissionContext, ProofInputSnapshot,
 };
-pub(crate) use policy::review_delivery_snapshot_from_events;
+pub(crate) use policy::read_delivery_snapshot_for_scope;
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
 

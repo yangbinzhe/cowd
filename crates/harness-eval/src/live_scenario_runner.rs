@@ -5260,9 +5260,19 @@ fn preregister_read_paths(
     if required.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let root = std::env::current_dir()
-        .map_err(|error| format!("scenario workspace unavailable: {error}"))?;
-    let resolver = runtime::path_identity::WorkspacePathIdentityResolver::discover(&root)
+    let root = match std::env::var_os("COWD_EVAL_WORKSPACE") {
+        Some(root) => std::path::PathBuf::from(root),
+        None => std::env::current_dir()
+            .map_err(|error| format!("scenario workspace unavailable: {error}"))?,
+    };
+    preregister_read_paths_at(&root, required)
+}
+
+fn preregister_read_paths_at(
+    root: &std::path::Path,
+    required: Vec<&str>,
+) -> Result<BTreeMap<String, harness_contract::context::WorkspacePathIdentity>, String> {
+    let resolver = runtime::path_identity::WorkspacePathIdentityResolver::discover(root)
         .map_err(|error| format!("scenario workspace identity unavailable: {error}"))?;
     required
         .into_iter()
@@ -5397,6 +5407,28 @@ mod tests;
 #[cfg(test)]
 mod read_evidence_consumer_tests {
     use super::*;
+
+    #[test]
+    fn read_expectation_uses_frozen_workspace_instead_of_harness_source_repo() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace.package]\nversion=\"0.0.37\"\n",
+        )
+        .unwrap();
+        let expected = preregister_read_paths_at(root.path(), vec!["Cargo.toml"]).unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let workspace = format!(
+            "workspace:{:x}",
+            Sha256::digest(canonical.to_string_lossy().as_bytes())
+        );
+        assert_eq!(expected["Cargo.toml"].workspace_id, workspace);
+        assert_eq!(expected["Cargo.toml"].workspace_relative_path, "Cargo.toml");
+        assert_ne!(expected["Cargo.toml"].repository_id, "cowd-dev");
+        assert!(
+            preregister_read_paths_at(&root.path().join("missing"), vec!["Cargo.toml"]).is_err()
+        );
+    }
 
     /// Replays an immutable page produced by the registered Gateway handler.
     /// The expected canonical identity must be supplied separately from the

@@ -297,7 +297,13 @@ pub fn run_eval_controlled(
     // rather than a later report-writing model call.
     let live_provider_evidence =
         live_gateway_provider_evidence(live_gateway_scenario_details.as_ref());
-    let mut execution_usage = merge_usage(&usage, &live_provider_evidence.usage);
+    // Local tools have no Provider token receipt. Keep their estimate as a
+    // separate diagnostic; the canonical execution total is only observed usage.
+    let mut execution_usage = execution_token_usage(
+        &usage,
+        live_gateway_scenario_details.as_ref(),
+        &live_provider_evidence.usage,
+    );
     let mut execution_provider_rounds = live_provider_evidence.provider_rounds;
     let mut execution_usage_unknown_attempts = live_provider_evidence.usage_unknown_attempts;
     let mut execution_cache_dimensions_unknown_attempts =
@@ -374,6 +380,7 @@ pub fn run_eval_controlled(
         "agentic_program_closure": agentic_program_closure,
         "next_gen_harness_closure": next_gen_harness,
         "real_tool_scenarios": real_tool_scenarios,
+        "local_tool_token_estimate": usage,
         "live_gateway_scenarios": live_gateway_scenarios,
         "live_gateway_scenario_details": live_gateway_scenario_details,
         "event_observation_parity": event_observation_parity,
@@ -572,6 +579,19 @@ fn cancelled_record(
         total_tokens: None,
         scenario_count: 0,
         message: message.into(),
+    }
+}
+
+fn execution_token_usage(
+    local_tools: &HarnessEvalUsageSummary,
+    live: Option<&Value>,
+    provider: &HarnessEvalUsageSummary,
+) -> HarnessEvalUsageSummary {
+    if live.is_some() {
+        provider.clone()
+    } else {
+        // Non-model Full/Quick reports keep their explicitly labelled estimate.
+        merge_usage(local_tools, provider)
     }
 }
 
@@ -1173,6 +1193,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_provider_total_excludes_local_tool_estimate_without_losing_unknowns() {
+        let estimate = HarnessEvalUsageSummary {
+            input_tokens: 3000,
+            output_tokens: 6000,
+            total_tokens: 9000,
+            usage_source: "deterministic_tool_estimate".into(),
+            ..Default::default()
+        };
+        let observed = HarnessEvalUsageSummary {
+            input_tokens: 50,
+            output_tokens: 23,
+            total_tokens: 73,
+            usage_source: "live_gateway_canonical_usage".into(),
+            ..Default::default()
+        };
+        let usage = execution_token_usage(&estimate, Some(&json!({})), &observed);
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (50, 23, 73)
+        );
+        assert_eq!(usage.usage_source, "live_gateway_canonical_usage");
+        let mut unknown = observed.clone();
+        unknown.usage_source.push_str("+partial");
+        assert!(!crate::report::observed_usage_source(
+            &execution_token_usage(&estimate, Some(&json!({})), &unknown).usage_source
+        ));
+        let local = execution_token_usage(&estimate, None, &empty_usage("deterministic_smoke"));
+        assert_eq!(local.total_tokens, 9000);
+        assert!(!crate::report::observed_usage_source(&local.usage_source));
+    }
+
+    #[test]
     fn live_gateway_usage_is_canonical_real_provider_evidence() {
         let details = json!({
             "model": "deepseek-v4-flash",
@@ -1334,14 +1386,21 @@ mod tests {
             .expect("detail")
             .expect("report exists");
         assert_eq!(detail.summary.status, "passed");
+        assert!(
+            detail.report["execution_trace"]["total_usage"]["total_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            detail.report["local_tool_token_estimate"]["total_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert!(detail
             .report
-            .pointer("/execution_trace/total_usage/total_tokens")
-            .and_then(Value::as_u64)
-            .is_some_and(|total| total > 0));
-        assert!(detail
-            .report
-            .pointer("/execution_trace/total_usage/usage_source")
+            .pointer("/local_tool_token_estimate/usage_source")
             .and_then(Value::as_str)
             .is_some_and(|source| source.contains("estimate")));
         assert_eq!(detail.report["report_gate"]["status"], "passed");

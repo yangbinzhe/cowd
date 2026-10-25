@@ -981,6 +981,28 @@ pub(crate) fn review_delivery_snapshot_from_events(
     program: &AgenticProgramProjection,
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     events: Vec<crate::DurableRuntimeEvent>,
+    sources: std::collections::BTreeMap<String, u64>,
+) -> Result<ReviewDeliverySnapshot, String> {
+    read_delivery_snapshot_for_scope(
+        reader,
+        &program.session_id,
+        &program.turn_id,
+        program.root_execution_id.as_deref(),
+        packet,
+        events,
+        sources,
+    )
+}
+
+// A Root read belongs to its authenticated original execution, including plain
+// Session turns without an AgenticProgram. Both consumers use the same verifier.
+pub(crate) fn read_delivery_snapshot_for_scope(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    session_id: &str,
+    turn_id: &str,
+    root_execution_id: Option<&str>,
+    packet: Option<&harness_contract::agent::AgentTaskPacket>,
+    events: Vec<crate::DurableRuntimeEvent>,
     mut sources: std::collections::BTreeMap<String, u64>,
 ) -> Result<ReviewDeliverySnapshot, String> {
     use crate::context_evidence::{
@@ -1003,7 +1025,7 @@ pub(crate) fn review_delivery_snapshot_from_events(
         }
         let material = crate::context_evidence::decode_read_delivery(&event.payload)
             .map_err(str::to_string)?;
-        if material.session_id != program.session_id || material.turn_id != program.turn_id {
+        if material.session_id != session_id || material.turn_id != turn_id {
             continue;
         }
         let seal = &material.acquisition;
@@ -1032,12 +1054,8 @@ pub(crate) fn review_delivery_snapshot_from_events(
                 };
                 let original = verify_material_event_with_reader(reader, &reference, &mut sources)?;
                 crate::context_evidence::root_read_owner_matches(owner, &original, seal)
-                    && program.root_execution_id.as_deref()
-                        == Some(owner.binding.root_execution_id.as_str())
-                    && super::binding_is_owned_by_root(
-                        &owner.binding,
-                        program.root_execution_id.as_deref(),
-                    )
+                    && root_execution_id == Some(owner.binding.root_execution_id.as_str())
+                    && super::binding_is_owned_by_root(&owner.binding, root_execution_id)
             }
             _ => false,
         };

@@ -218,9 +218,21 @@ fn select_owner<'a>(
     scope: &'a ExecutionProjectionScope,
     material: &context_evidence::ReadDeliveryMaterial,
     sources: &mut BTreeMap<String, u64>,
-) -> Result<(&'a crate::AgenticProgramProjection, Option<AgentTaskPacket>), String> {
+) -> Result<
+    (
+        Option<&'a crate::AgenticProgramProjection>,
+        Option<AgentTaskPacket>,
+    ),
+    String,
+> {
     match &material.recipient {
         ReadDeliveryRecipient::Root { owner, .. } => {
+            if !scope
+                .execution_ids
+                .contains(&owner.binding.root_execution_id)
+            {
+                return Err("read Root execution foreign".into());
+            }
             let mut matches = scope.programs.iter().filter(|program| {
                 program.session_id == material.session_id
                     && program.turn_id == material.turn_id
@@ -230,7 +242,7 @@ fn select_owner<'a>(
                         .execution_ids
                         .contains(&owner.binding.root_execution_id)
             });
-            let program = matches.next().ok_or("read Root Program missing")?;
+            let program = matches.next().map(|program| program.as_ref());
             if matches.next().is_some() {
                 return Err("read Root Program ambiguous".into());
             }
@@ -295,7 +307,7 @@ fn select_owner<'a>(
             {
                 return Err("read Agent lineage ambiguous".into());
             }
-            Ok((program, Some(packet)))
+            Ok((Some(program), Some(packet)))
         }
     }
 }
@@ -361,7 +373,9 @@ pub async fn read_evidence(
         execution_id: execution_id.into(),
         session_id: session.into(),
         turn_id: turn.into(),
-        workspace_id: context.workspace_id.clone(),
+        // File identities use the original path resolver's canonical workspace
+        // namespace. The projection cache/authorization key is a different ID.
+        workspace_id: services.path_identity_resolver().workspace_id().to_string(),
         authorization_revision: context.authorization_revision,
         redaction_revision: redaction_revision(context),
         graph_revision: graph.revision,
@@ -470,9 +484,19 @@ pub async fn read_evidence(
                 break;
             }
         };
-        let snapshot = match review_evidence::review_delivery_snapshot_from_events(
+        let root = match &material.recipient {
+            ReadDeliveryRecipient::Root { owner, .. } => {
+                Some(owner.binding.root_execution_id.as_str())
+            }
+            ReadDeliveryRecipient::AgentTask { .. } => {
+                program.and_then(|program| program.root_execution_id.as_deref())
+            }
+        };
+        let snapshot = match review_evidence::read_delivery_snapshot_for_scope(
             &mut reader,
-            program,
+            session,
+            turn,
+            root,
             packet.as_ref(),
             vec![record.as_ref().clone()],
             cuts,
@@ -534,7 +558,7 @@ pub async fn read_evidence(
         let mut verified = Vec::new();
         if let Some(scope) = &read.original_scope {
             for target in &scope.targets {
-                if target.path.workspace_id != context.workspace_id
+                if target.path.workspace_id != page.workspace_id
                     || !target.exact
                     || !target.alias_checked
                     || target.path.object_kind
@@ -901,7 +925,9 @@ fn read_evidence_fixture_fault(
         payload: json!({"objective_id":"read-objective","session_id":"read-session","turn_id":"read-turn","root_execution_id":id}),
     };
     // Explicit original Program opening, not a projection mutation.
-    store.append(opened.clone()).unwrap();
+    if !fault.is_some_and(|fault| fault.starts_with("no_program")) {
+        store.append(opened.clone()).unwrap();
+    }
     opened.payload = serde_json::Value::Null;
     drop(opened);
     for n in 0..unrelated {
@@ -923,7 +949,7 @@ fn read_evidence_fixture_fault(
     }
     let declared = json!({"resource":"file","operation":"read","target":if fault==Some("absolute") {"/private/fixture-workspace/src/a.rs"}else{"src/a.rs"}});
     let effect = json!({"tool_id":"read_file","descriptor_hash":"fixed-read-descriptor","effect_kind":"read","idempotency":"idempotent","scopes":[declared],"required_permission":"read-only","approval_class":"none","uses_network":false,"spawns_process":false,"mutates_packages":false,"mutates_system":false});
-    let scope = json!({"version":2,"descriptor_hash":"fixed-read-descriptor","complete":true,"targets":[{"path":{"workspace_id":services.workspace_key(),"repository_id":"read-repository","workspace_relative_path":"src/a.rs","repository_relative_path":"src/a.rs","object_kind":"file"},"declared_scope":declared,"access_mode":"read","coverage":"scoped_content","exact":true,"physical_identity":"fixed-object","alias_checked":true}],"scope_purposes":[{"declared_scope":declared,"purpose":"input_read"}]});
+    let scope = json!({"version":2,"descriptor_hash":"fixed-read-descriptor","complete":true,"targets":[{"path":{"workspace_id":services.path_identity_resolver().workspace_id(),"repository_id":"read-repository","workspace_relative_path":"src/a.rs","repository_relative_path":"src/a.rs","object_kind":"file"},"declared_scope":declared,"access_mode":"read","coverage":"scoped_content","exact":true,"physical_identity":"fixed-object","alias_checked":true}],"scope_purposes":[{"declared_scope":declared,"purpose":"input_read"}]});
     let root_owner = json!({"binding":owner,"attempt":1,"graph_revision":graph.revision});
     let root_context = json!({"execution_id":id,"session_id":"read-session","turn_id":"read-turn"});
     let replay = json!({"call_id":"read-call","parent_execution":if agent {json!({"graph_id":id})}else{serde_json::Value::Null},"invocation":{"effect":effect}});
@@ -1185,10 +1211,10 @@ fn read_evidence_fixture_fault(
     if fault == Some("attempt") {
         material.acquisition.attempt = 2;
     }
-    if fault == Some("primary") {
+    if matches!(fault, Some("primary" | "no_program_primary")) {
         material.acquisition.primary_key = "missing-primary".into();
     }
-    if fault == Some("index") {
+    if matches!(fault, Some("index" | "no_program_index")) {
         material.acquisition.index_key = "missing-index".into();
     }
     if fault == Some("grade") {
@@ -1258,6 +1284,64 @@ fn read_evidence_fixture_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn plain_session_root_read_needs_original_receipts_not_an_agentic_program() {
+        let (services, id, context) = read_evidence_fixture_fault(false, 0, Some("no_program"));
+        assert_eq!(
+            services
+                .event_store()
+                .stream_revision("agentic-program:read-program")
+                .unwrap(),
+            0
+        );
+        let page = read_evidence(&services, &id, &context, Default::default())
+            .await
+            .unwrap();
+        assert!(!page.incomplete, "{page:?}");
+        assert!(page.exhausted);
+        assert_eq!(
+            page.workspace_id,
+            services.path_identity_resolver().workspace_id()
+        );
+        assert_ne!(page.workspace_id, services.workspace_key());
+        assert_eq!(page.reads.len(), 1);
+        assert_eq!(page.reads[0].path.workspace_relative_path, "src/a.rs");
+        assert_eq!(page.reads[0].source_bytes, 20);
+        assert!(matches!(
+            page.reads[0].recipient,
+            ReadEvidenceRecipient::Root { .. }
+        ));
+        // A valid baseline does not authorize a foreign Session.
+        let mut foreign = context.clone();
+        foreign.session_scopes = vec!["other-session".into()];
+        assert!(read_evidence(&services, &id, &foreign, Default::default())
+            .await
+            .is_err());
+        services.shutdown_execution().await;
+    }
+    #[tokio::test]
+    async fn plain_root_without_program_still_requires_both_original_receipts() {
+        for fault in ["no_program_primary", "no_program_index"] {
+            let (services, id, context) = read_evidence_fixture_fault(false, 0, Some(fault));
+            assert_eq!(
+                services
+                    .event_store()
+                    .stream_revision("agentic-program:read-program")
+                    .unwrap(),
+                0
+            );
+            let page = read_evidence(&services, &id, &context, Default::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                page.reason,
+                Some(ReadEvidenceIncompleteReason::AuthenticationFailed),
+                "{fault}"
+            );
+            assert!(page.incomplete && !page.exhausted && page.reads.is_empty());
+            services.shutdown_execution().await;
+        }
+    }
     #[tokio::test]
     async fn original_root_and_agent_partial_delivery_are_authenticated() {
         for agent in [false, true] {
