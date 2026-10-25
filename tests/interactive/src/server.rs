@@ -1,6 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
 use std::net::TcpListener;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +12,197 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Deserialize)]
+struct LaunchIdentity {
+    nonce: String,
+    pid: u32,
+    starttime: u64,
+    image_sha256: String,
+}
+
+fn process_starttime(pid: u32) -> Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    // comm can contain spaces and parentheses; field 22 is offset 19 after comm.
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+        .ok_or_else(|| anyhow!("Missing owned process starttime"))?
+        .parse()
+        .context("Invalid owned process starttime")
+}
+
+fn wait_bounded(child: &mut Child, budget: Duration) -> Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn hash_image(path: &Path) -> Result<String> {
+    let input = File::open(path).context("Open launch image for hashing")?;
+    if !input.metadata()?.is_file() {
+        return Err(anyhow!("Launch image is not a regular file"));
+    }
+    let mut command = Command::new("/usr/bin/sha256sum")
+        .env_clear()
+        .stdin(input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if wait_bounded(&mut command, Duration::from_secs(5))?.is_none() {
+        let _ = command.kill();
+        let _ = wait_bounded(&mut command, Duration::from_secs(1));
+        return Err(anyhow!("Launch image hash timed out"));
+    }
+    let output = command.wait_with_output()?;
+    let digest = String::from_utf8(output.stdout)?;
+    let digest = digest.split_whitespace().next().unwrap_or("");
+    let result = format!("sha256:{digest}");
+    if !output.status.success() || !valid_digest(&result) {
+        return Err(anyhow!("Launch image hash failed"));
+    }
+    Ok(result)
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn private_directory(path: &Path) -> Result<File> {
+    // Linux O_DIRECTORY | O_NOFOLLOW. Keep the actual directory pinned through close.
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x10000 | 0x20000)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != std::fs::metadata("/proc/self")?.uid()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(anyhow!("Runtime directory must be owned and actually 0700"));
+    }
+    Ok(directory)
+}
+
+fn receipt_identity_and_report(bytes: &[u8], expected: &LaunchIdentity) -> Result<()> {
+    let envelope: serde_json::Value = serde_json::from_slice(bytes)?;
+    if envelope["schema_version"].as_u64() != Some(1) {
+        return Err(anyhow!("Unknown shutdown receipt schema"));
+    }
+    let identity: LaunchIdentity = serde_json::from_value(envelope["identity"].clone())?;
+    if identity.nonce != expected.nonce
+        || identity.pid != expected.pid
+        || identity.starttime != expected.starttime
+        || identity.image_sha256 != expected.image_sha256
+    {
+        return Err(anyhow!("Shutdown receipt does not match this launch"));
+    }
+    // The producer hashes SELECTED config fields, not the entire configuration.
+    if !envelope["identity"]["config_sha256"]
+        .as_str()
+        .is_some_and(valid_digest)
+    {
+        return Err(anyhow!("Missing selected-config digest"));
+    }
+    let report = &envelope["report"];
+    let strings = |value: &serde_json::Value| -> Result<usize> {
+        let values = value
+            .as_array()
+            .ok_or_else(|| anyhow!("Missing report string array"))?;
+        if values.iter().any(|v| !v.is_string()) {
+            return Err(anyhow!("Invalid report string array"));
+        }
+        Ok(values.len())
+    };
+    let number = |value: &serde_json::Value| {
+        value
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing numeric shutdown counter"))
+    };
+    strings(&report["phases"])?;
+    if strings(&report["failures"])? != 0 {
+        return Err(anyhow!("Gateway reports shutdown failures"));
+    }
+    let started = report["execution_started"]
+        .as_bool()
+        .ok_or_else(|| anyhow!("Missing execution_started"))?;
+    for key in ["execution", "active_turns", "memory"] {
+        if report.get(key).is_none() {
+            return Err(anyhow!("Missing owner report field: {key}"));
+        }
+    }
+    let execution = &report["execution"];
+    if started && execution.is_null() {
+        return Err(anyhow!("Started execution has no shutdown report"));
+    }
+    if !execution.is_null() {
+        for key in [
+            "accepted",
+            "completed",
+            "failed",
+            "preserved_graphs",
+            "cancelled_graphs",
+            "forced_aborts",
+            "remaining_keys",
+        ] {
+            number(&execution[key])?;
+        }
+        if number(&execution["forced_aborts"])? != 0
+            || number(&execution["remaining_keys"])? != 0
+            || strings(&execution["errors"])? != 0
+        {
+            return Err(anyhow!("Execution did not drain naturally"));
+        }
+        for owner in execution["owners"]
+            .as_object()
+            .ok_or_else(|| anyhow!("Missing execution owners"))?
+            .values()
+        {
+            for key in ["submitted", "active", "completed", "failed", "aborted"] {
+                number(&owner[key])?;
+            }
+            if number(&owner["active"])? != 0 {
+                return Err(anyhow!("Execution owner remains active"));
+            }
+        }
+    }
+    let active = &report["active_turns"];
+    if !active.is_null() {
+        number(&active["cancelled"])?;
+        number(&active["drained"])?;
+        if strings(&active["remaining_turn_ids"])? != 0 {
+            return Err(anyhow!("Active turns remain"));
+        }
+    }
+    let memory = &report["memory"];
+    if !memory.is_null() {
+        number(&memory["joined_tasks"])?;
+        memory["watcher_joined"]
+            .as_bool()
+            .ok_or_else(|| anyhow!("Missing Memory watcher outcome"))?;
+        if number(&memory["forced_aborts"])? != 0 || strings(&memory["errors"])? != 0 {
+            return Err(anyhow!("Memory shutdown incomplete"));
+        }
+    }
+    let tasks = &report["tasks"];
+    for key in ["joined", "panicked", "forced_aborts", "rejected"] {
+        number(&tasks[key])?;
+    }
+    if number(&tasks["panicked"])? != 0 || number(&tasks["forced_aborts"])? != 0 {
+        return Err(anyhow!("Gateway tasks did not close naturally"));
+    }
+    Ok(())
+}
 
 struct OwnedRoot {
     path: PathBuf,
@@ -139,6 +334,10 @@ pub struct ServerProcess {
     runtime_dir: PathBuf,
     cowd_bin: PathBuf,
     postgres_url: String,
+    nonce: String,
+    launch: Option<LaunchIdentity>,
+    runtime_handle: Option<File>,
+    closed: bool,
 }
 
 impl ServerProcess {
@@ -165,6 +364,16 @@ impl ServerProcess {
     }
 
     fn start_with_inputs(postgres_url: String, model: String, cowd_bin: PathBuf) -> Result<Self> {
+        let image = cowd_bin.clone();
+        Self::start_with_image(postgres_url, model, cowd_bin, image)
+    }
+
+    fn start_with_image(
+        postgres_url: String,
+        model: String,
+        cowd_bin: PathBuf,
+        expected_image: PathBuf,
+    ) -> Result<Self> {
         let root = OwnedRoot::create()?;
         let retained_path = root.path.clone();
         let result = (|| {
@@ -178,6 +387,14 @@ impl ServerProcess {
                 cowd_bin,
                 postgres_url,
                 root: Some(root),
+                nonce: {
+                    let mut bytes = [0u8; 32];
+                    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+                    bytes.iter().map(|b| format!("{b:02x}")).collect()
+                },
+                launch: None,
+                runtime_handle: None,
+                closed: false,
             };
             for path in [
                 &srv.config_home,
@@ -187,6 +404,26 @@ impl ServerProcess {
             ] {
                 std::fs::create_dir(path)?;
             }
+            std::fs::set_permissions(&srv.runtime_dir, std::fs::Permissions::from_mode(0o700))?;
+            srv.runtime_handle = match private_directory(&srv.runtime_dir) {
+                Ok(directory) => Some(directory),
+                Err(_) => {
+                    // Only this launch's private runtime subdirectory may leave Datas.
+                    let parent = Path::new("/run/user/1000");
+                    let _parent = private_directory(parent)?;
+                    srv.runtime_dir = parent.join(format!("cowd-it-{}", srv.nonce));
+                    let mut builder = std::fs::DirBuilder::new();
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700).create(&srv.runtime_dir)?;
+                    Some(private_directory(&srv.runtime_dir)?)
+                }
+            };
+            // Only runtime evidence uses the approved private fallback. General
+            // TMP/workspace remain on Datas even when it cannot enforce modes.
+            std::fs::write(
+                srv.root.as_ref().unwrap().path.join("runtime-location.txt"),
+                srv.runtime_dir.as_os_str().as_encoded_bytes(),
+            )?;
             let apps_dir = srv.workspace.join("apps");
             std::fs::create_dir(&apps_dir)?;
             let reservation = TcpListener::bind(("127.0.0.1", 0))?;
@@ -204,8 +441,21 @@ impl ServerProcess {
                 srv.config_home.join("config.yaml"),
                 serde_json::to_vec_pretty(&private_config(port, &identity, &model, &apps_dir))?,
             )?;
-            let stdout = std::fs::File::create(srv.config_home.join("gateway.stdout"))?;
-            let stderr = std::fs::File::create(srv.config_home.join("gateway.stderr"))?;
+            let log_file = |name: &str| -> Result<File> {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(0x20000)
+                    .open(srv.runtime_dir.join(name))?;
+                if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+                    return Err(anyhow!("Private runtime log is not actually0600"));
+                }
+                Ok(file)
+            };
+            let stdout = log_file("gateway.stdout")?;
+            let stderr = log_file("gateway.stderr")?;
+            let expected_image_sha256 = hash_image(&expected_image)?;
             let mut command = Command::new(&srv.cowd_bin);
             command
                 .args(["gateway", "run"])
@@ -214,6 +464,7 @@ impl ServerProcess {
                 .env("HOME", &srv.home_dir)
                 .env("COWD_CONFIG_HOME", &srv.config_home)
                 .env("XDG_RUNTIME_DIR", &srv.runtime_dir)
+                .env("COWD_TEST_SHUTDOWN_RECEIPT_NONCE", &srv.nonce)
                 .env("COWD_TEST_POSTGRES_URL", &srv.postgres_url)
                 .current_dir(&srv.workspace)
                 .stdin(Stdio::null())
@@ -223,6 +474,8 @@ impl ServerProcess {
             // before spawn; a collision must fail child/health identity admission.
             drop(reservation);
             srv.proc = Some(command.spawn().context("Spawn owned cowd gateway run")?);
+            let pid = srv.proc.as_ref().unwrap().id();
+            let starttime = process_starttime(pid)?;
             let deadline = Instant::now() + Duration::from_secs(15);
             while Instant::now() < deadline {
                 let child = srv.proc.as_mut().unwrap();
@@ -269,6 +522,19 @@ impl ServerProcess {
                             "Owned gateway exited after health validation: {status}"
                         ));
                     }
+                    let image_sha256 = hash_image(Path::new(&format!("/proc/{pid}/exe")))?;
+                    if image_sha256 != expected_image_sha256 || process_starttime(pid)? != starttime
+                    {
+                        return Err(anyhow!(
+                            "Owned child startup image/starttime differs from admitted launch"
+                        ));
+                    }
+                    srv.launch = Some(LaunchIdentity {
+                        nonce: srv.nonce.clone(),
+                        pid,
+                        starttime,
+                        image_sha256,
+                    });
                     return Ok(srv);
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -279,7 +545,7 @@ impl ServerProcess {
         })();
         result.with_context(|| {
             format!(
-                "Interactive startup failed; private evidence retained at {}",
+                "Interactive startup failed; evidence locator retained at {}",
                 retained_path.display()
             )
         })
@@ -306,15 +572,25 @@ impl ServerProcess {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.close_child_with(|child| {
-            if child.try_wait()?.is_none() {
-                child.kill()?;
+        if self.closed {
+            return Ok(());
+        }
+        // Original coordinator has serial 10/30/30/10/10-second owner drains,
+        // plus other owners. Do not preempt those with a ten-second root kill.
+        // This is a consumer waiting bound, not a claim that every owner closes.
+        let result = self.finish_close(Duration::from_secs(120));
+        if result.is_err() {
+            if let Some(root) = self.root.as_mut() {
+                root.failed = true;
             }
-            child.wait()?;
-            Ok(())
-        })
+        } else {
+            self.closed = true;
+        }
+        result.context("Interactive close unconfirmed; retain private report/root/logs")
     }
 
+    // A failed stop never removes the original evidence or certifies owner closure.
+    #[cfg(test)]
     fn close_child_with(&mut self, stop: impl FnOnce(&mut Child) -> Result<()>) -> Result<()> {
         if let Some(child) = self.proc.as_mut() {
             if let Err(error) = stop(child) {
@@ -323,17 +599,102 @@ impl ServerProcess {
                 }
                 return Err(error.context("Interactive close failed; retain private root and logs"));
             }
-            self.proc = None;
         }
-        // Reaping this Child does not certify Gateway descendants or pipes.
-        // Keep the root even on Ok; the known-resource owner must confirm it.
+        self.close()
+    }
+
+    fn finish_close(&mut self, budget: Duration) -> Result<()> {
+        if let Some(child) = self.proc.as_mut() {
+            if child.try_wait()?.is_none() {
+                if let Some(launch) = &self.launch {
+                    if child.id() != launch.pid
+                        || process_starttime(child.id())? != launch.starttime
+                    {
+                        return Err(anyhow!("Owned child identity changed before SIGTERM"));
+                    }
+                }
+                // Linux kill targets this still-owned, unreaped Child; no process search.
+                unsafe extern "C" {
+                    fn kill(pid: i32, signal: i32) -> i32;
+                }
+                let sent = unsafe { kill(child.id() as i32, 15) };
+                if sent != 0 && child.try_wait()?.is_none() {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            let status = wait_bounded(child, budget)?;
+            if status.is_none() {
+                let _ = child.kill();
+                let reaped = wait_bounded(child, Duration::from_millis(250))?.is_some();
+                return Err(anyhow!(
+                    "Forced shutdown, root reaped={reaped}; owner closure remains unconfirmed"
+                ));
+            }
+            if !status.unwrap().success() {
+                return Err(anyhow!("Owned gateway exited unsuccessfully"));
+            }
+        }
+        let launch = self
+            .launch
+            .as_ref()
+            .ok_or_else(|| anyhow!("No authenticated startup identity"))?;
+        let directory = self
+            .runtime_handle
+            .as_ref()
+            .ok_or_else(|| anyhow!("No pinned receipt directory"))?;
+        let directory_metadata = directory.metadata()?;
+        if directory_metadata.uid() != std::fs::metadata("/proc/self")?.uid()
+            || directory_metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(anyhow!(
+                "Pinned runtime directory lost private ownership/mode"
+            ));
+        }
+        // O_NOFOLLOW | O_NONBLOCK: even a malformed FIFO cannot hang close/Drop.
+        // Resolve the leaf relative to the startup-pinned directory FD.
+        let path = format!(
+            "/proc/self/fd/{}/shutdown-{}.v1.json",
+            directory.as_raw_fd(),
+            launch.nonce
+        );
+        let mut receipt = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x20000 | 0x800)
+            .open(path)?;
+        let metadata = receipt.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != std::fs::metadata("/proc/self")?.uid()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.len() > 2 * 1024 * 1024
+        {
+            return Err(anyhow!(
+                "Receipt must be private owned0600 regular bounded file"
+            ));
+        }
+        let mut bytes = Vec::new();
+        (&mut receipt)
+            .take(2 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err(anyhow!("Receipt grew beyond bound"));
+        }
+        receipt_identity_and_report(&bytes, launch)?;
+        self.proc = None;
         Ok(())
     }
 }
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        let _ = self.close();
+        if !self.closed {
+            // Drop is bounded independently of the explicit close budget.
+            let result = self.finish_close(Duration::from_millis(250));
+            if result.is_err() || std::thread::panicking() {
+                if let Some(root) = self.root.as_mut() {
+                    root.failed = true;
+                }
+            }
+        }
     }
 }
 
@@ -341,6 +702,97 @@ impl Drop for ServerProcess {
 mod tests {
     use super::{owned_health, private_config};
     use std::path::Path;
+
+    #[test]
+    fn receipt_requires_exact_launch_and_complete_original_owner_counters() {
+        use serde_json::json;
+        let identity = super::LaunchIdentity {
+            nonce: "a".repeat(64),
+            pid: 123,
+            starttime: 456,
+            image_sha256: format!("sha256:{}", "b".repeat(64)),
+        };
+        // Read-only consumer fixture, not an actual Gateway shutdown original.
+        let baseline = json!({"schema_version":1,
+            "identity":{"nonce":identity.nonce,"pid":123,"starttime":456,
+                "image_sha256":identity.image_sha256,"config_sha256":format!("sha256:{}", "c".repeat(64))},
+            "report":{"phases":["test-owner-drain"],"failures":[],"execution_started":true,
+                "execution":{"accepted":1,"completed":1,"failed":0,"preserved_graphs":0,
+                    "cancelled_graphs":0,"forced_aborts":0,"remaining_keys":0,"errors":[],
+                    "owners":{"test":{"submitted":1,"active":0,"completed":1,"failed":0,"aborted":0}}},
+                "active_turns":{"cancelled":1,"drained":1,"remaining_turn_ids":[]},
+                "memory":{"joined_tasks":1,"forced_aborts":0,"watcher_joined":true,"errors":[]},
+                "tasks":{"joined":1,"panicked":0,"forced_aborts":0,"rejected":0}}});
+        let accepted = |value: &serde_json::Value| {
+            super::receipt_identity_and_report(&serde_json::to_vec(value).unwrap(), &identity)
+                .is_ok()
+        };
+        assert!(accepted(&baseline));
+        for (pointer, bad) in [
+            ("/schema_version", json!(2)),
+            ("/identity/nonce", json!("f".repeat(64))),
+            ("/identity/pid", json!(124)),
+            ("/identity/starttime", json!(457)),
+            (
+                "/identity/image_sha256",
+                json!(format!("sha256:{}", "d".repeat(64))),
+            ),
+            ("/identity/config_sha256", json!("not-a-selected-digest")),
+            ("/report/execution_started", json!(null)),
+            ("/report/execution", json!(null)),
+            ("/report/failures", json!(["failed"])),
+            ("/report/execution/remaining_keys", json!(1)),
+            ("/report/execution/forced_aborts", json!(1)),
+            ("/report/execution/errors", json!(["error"])),
+            ("/report/execution/owners/test/active", json!(1)),
+            ("/report/active_turns/remaining_turn_ids", json!(["turn"])),
+            ("/report/memory/forced_aborts", json!(1)),
+            ("/report/memory/errors", json!(["error"])),
+            ("/report/tasks/panicked", json!(1)),
+            ("/report/tasks/forced_aborts", json!(1)),
+            ("/report/tasks/joined", json!("0")),
+            ("/report/tasks/rejected", json!(null)),
+        ] {
+            let mut changed = baseline.clone();
+            *changed.pointer_mut(pointer).unwrap() = bad;
+            assert!(!accepted(&changed), "must reject {pointer}");
+        }
+        for pointer in [
+            "/identity",
+            "/report",
+            "/report/execution",
+            "/report/execution/owners/test",
+            "/report/active_turns",
+            "/report/memory",
+            "/report/tasks",
+        ] {
+            let object = baseline.pointer(pointer).unwrap().as_object().unwrap();
+            for key in object.keys() {
+                let mut missing = baseline.clone();
+                missing
+                    .pointer_mut(pointer)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+                assert!(!accepted(&missing), "missing {pointer}/{key}");
+            }
+        }
+        let mut unstarted = baseline.clone();
+        unstarted["report"]["execution_started"] = json!(false);
+        for key in ["execution", "active_turns", "memory"] {
+            unstarted["report"][key] = json!(null);
+        }
+        assert!(
+            accepted(&unstarted),
+            "explicit unstarted/disabled options remain legal"
+        );
+        // Historical failed work is not an active owner or a shutdown failure.
+        let mut historic = baseline.clone();
+        historic["report"]["execution"]["failed"] = json!(1);
+        historic["report"]["execution"]["preserved_graphs"] = json!(1);
+        assert!(accepted(&historic));
+    }
 
     #[test]
     fn private_config_uses_existing_env_secret_and_flat_platform_fields() {
@@ -424,17 +876,22 @@ mod tests {
         let executable = fixture.path.join("gateway-double");
         let trace = fixture.path.join("trace.json");
         let script = r#"#!/usr/bin/python3
-import http.server, json, os, pathlib, signal, sys
+import hashlib, http.server, json, os, pathlib, signal, sys
 trace = pathlib.Path(TRACE_PATH)
 mode = DOUBLE_MODE
 config_home = pathlib.Path(os.environ["COWD_CONFIG_HOME"])
 root = config_home.parent
 pid = os.getpid()
-trace.write_text(json.dumps({"root": str(root), "pid": pid, "validated": False}))
+trace.write_text(json.dumps({"root": str(root), "runtime": os.environ["XDG_RUNTIME_DIR"], "pid": pid, "validated": False}))
 assert sys.argv[1:] == ["gateway", "run"]
 assert pathlib.Path(os.environ["HOME"]) == root / "home"
 assert pathlib.Path.cwd() == root / "workspace"
-assert pathlib.Path(os.environ["XDG_RUNTIME_DIR"]) == root / "run"
+runtime_dir = pathlib.Path(os.environ["XDG_RUNTIME_DIR"])
+assert runtime_dir.stat().st_mode & 0o777 == 0o700
+nonce = os.environ["COWD_TEST_SHUTDOWN_RECEIPT_NONCE"]
+assert len(nonce) == 64 and all(c in "0123456789abcdef" for c in nonce)
+starttime = int(pathlib.Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()[19])
+image = "sha256:" + hashlib.sha256(pathlib.Path("/proc/self/exe").read_bytes()).hexdigest()
 assert os.environ["PATH"] == "/usr/local/bin:/usr/bin:/bin"
 assert os.environ["COWD_TEST_POSTGRES_URL"] == "postgresql://command-double.invalid/unused"
 assert not any(key in os.environ for key in ("COWD_API_TOKEN", "ANTHROPIC_API_KEY",
@@ -448,7 +905,7 @@ assert list((root / "workspace" / "apps").iterdir()) == []
 platform, = config["gateway"]["platforms"]
 assert platform["platformType"] == "api_server" and platform["enabled"] is True
 assert platform["host"] == "127.0.0.1" and 0 < platform["port"] < 65536
-trace.write_text(json.dumps({"root": str(root), "pid": pid, "validated": True}))
+trace.write_text(json.dumps({"root": str(root), "runtime": str(runtime_dir), "pid": pid, "validated": True}))
 sys.stdout.write("owned gateway stdout evidence\n")
 sys.stdout.flush()
 sys.stderr.write("owned gateway stderr evidence\n")
@@ -476,6 +933,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 signal.alarm(25)
+def shutdown(signum, frame):
+    if mode != "missing-receipt":
+        envelope = {"schema_version": 1, "identity": {"nonce": nonce, "pid": pid,
+            "starttime": starttime, "image_sha256": image, "config_sha256": "sha256:" + "0" * 64},
+            "report": {"phases": ["local-double-drained"], "failures": [], "execution_started": False,
+                "execution": None, "active_turns": None, "memory": None,
+                "tasks": {"joined": 0, "panicked": 0, "forced_aborts": 0, "rejected": 0}}}
+        if mode == "wrong-nonce":
+            envelope["identity"]["nonce"] = "f" * 64
+        path = runtime_dir / ("shutdown-" + nonce + ".v1.json")
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+            json.dump(envelope, output)
+        if mode == "wide-receipt":
+            path.chmod(0o644)
+        if mode == "symlink-receipt":
+            saved = path.with_suffix(".original")
+            path.rename(saved)
+            path.symlink_to(saved)
+        if mode == "fifo-receipt":
+            path.unlink()
+            os.mkfifo(path, 0o600)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == "drop-stubborn" else shutdown)
 server = http.server.HTTPServer(("127.0.0.1", platform["port"]), Handler)
 pid_file.parent.mkdir(exist_ok=True)
 pid_file.write_text(str(pid))
@@ -488,15 +968,19 @@ server.serve_forever()
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Explicit inputs exercise the exact same core called by start(), with
         // no process-environment mutation or real database/model access.
-        let result = super::ServerProcess::start_with_inputs(
+        // The command double is a script; independently bind its known interpreter
+        // image. Production start_with_inputs always binds the actual cowd ELF.
+        let result = super::ServerProcess::start_with_image(
             "postgresql://command-double.invalid/unused".into(),
             "explicit-command-double-model".into(),
             executable,
+            "/usr/bin/python3".into(),
         );
         let observed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
         assert_eq!(observed["validated"], true, "{mode}: child contract checks");
         let root = Path::new(observed["root"].as_str().unwrap());
+        let runtime = Path::new(observed["runtime"].as_str().unwrap());
         let pid = observed["pid"].as_u64().unwrap().to_string();
         let child_reaped = || {
             !std::process::Command::new("/bin/kill")
@@ -527,12 +1011,19 @@ server.serve_forever()
             assert_eq!(config.workspace, server.workspace);
             assert_eq!(config.session_id, session_id);
             assert!(config.api_token.is_empty());
-            if mode == "panic" {
+            if matches!(mode, "panic" | "drop-stubborn") {
+                let started = std::time::Instant::now();
                 let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     let _server = server;
                     panic!("controlled interactive scenario panic");
                 }));
                 assert!(panicked.is_err());
+                if mode == "drop-stubborn" {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(3),
+                        "Drop must not wait for the explicit close budget"
+                    );
+                }
             } else if mode == "close-error" {
                 assert!(server
                     .close_child_with(|_| Err(anyhow::anyhow!(
@@ -541,7 +1032,7 @@ server.serve_forever()
                     .is_err());
                 assert!(root.is_dir());
                 assert_eq!(
-                    std::fs::read(root.join("config/gateway.stderr")).unwrap(),
+                    std::fs::read(runtime.join("gateway.stderr")).unwrap(),
                     b"owned gateway stderr evidence\n"
                 );
                 server.close().unwrap();
@@ -549,6 +1040,23 @@ server.serve_forever()
                 // A later successful direct reap cannot erase the earlier failure.
                 let mut failed_root = server.root.take().unwrap();
                 assert!(failed_root.remove_after_confirmed_completion().is_err());
+            } else if matches!(
+                mode,
+                "missing-receipt"
+                    | "wrong-nonce"
+                    | "wide-receipt"
+                    | "symlink-receipt"
+                    | "fifo-receipt"
+            ) {
+                assert!(
+                    server.close().is_err(),
+                    "root exit alone must not certify closure"
+                );
+                assert!(child_reaped());
+                assert!(
+                    server.close().is_err(),
+                    "failed closure cannot turn into default success"
+                );
             } else {
                 server.close().unwrap();
                 server.close().unwrap();
@@ -560,22 +1068,38 @@ server.serve_forever()
                 // stdout/stderr, no descendants or cancellable pipes. Only its
                 // owner can now confirm successful scenario + complete return.
                 let mut confirmed = server.root.take().unwrap();
+                if !runtime.starts_with(&confirmed.path) {
+                    // Only the controlled leaf's known fully returned runtime.
+                    std::fs::remove_dir_all(runtime).unwrap();
+                }
                 confirmed.remove_after_confirmed_completion().unwrap();
             }
         }
         assert!(child_reaped(), "{mode}: owned child was not reaped");
-        if matches!(mode, "exit" | "foreign" | "panic" | "close-error") {
+        if matches!(
+            mode,
+            "exit"
+                | "foreign"
+                | "panic"
+                | "drop-stubborn"
+                | "close-error"
+                | "missing-receipt"
+                | "wrong-nonce"
+                | "wide-receipt"
+                | "symlink-receipt"
+                | "fifo-receipt"
+        ) {
             assert!(root.is_dir());
             assert_eq!(
-                std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(runtime).unwrap().permissions().mode() & 0o777,
                 0o700
             );
             assert_eq!(
-                std::fs::read(root.join("config/gateway.stdout")).unwrap(),
+                std::fs::read(runtime.join("gateway.stdout")).unwrap(),
                 b"owned gateway stdout evidence\n"
             );
             assert_eq!(
-                std::fs::read(root.join("config/gateway.stderr")).unwrap(),
+                std::fs::read(runtime.join("gateway.stderr")).unwrap(),
                 b"owned gateway stderr evidence\n"
             );
             assert!(root.join("retained.txt").is_file());
@@ -612,6 +1136,22 @@ server.serve_forever()
 
     #[cfg(unix)]
     #[test]
+    fn root_exit_without_matching_receipt_never_means_owner_closure() {
+        run_child_double("missing-receipt");
+        run_child_double("wrong-nonce");
+        run_child_double("wide-receipt");
+        run_child_double("symlink-receipt");
+        run_child_double("fifo-receipt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_is_bounded_and_keeps_logs_when_child_ignores_term() {
+        run_child_double("drop-stubborn");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scenario_panic_preserves_private_root_and_logs() {
         run_child_double("panic");
     }
@@ -619,6 +1159,7 @@ server.serve_forever()
     #[cfg(unix)]
     #[test]
     fn spawn_failure_preserves_private_root_and_opened_logs() {
+        use std::os::unix::fs::PermissionsExt;
         let mut fixture = super::OwnedRoot::create().unwrap();
         let error = super::ServerProcess::start_with_inputs(
             "postgresql://command-double.invalid/unused".into(),
@@ -630,12 +1171,18 @@ server.serve_forever()
         let message = error.to_string();
         let root = Path::new(
             message
-                .strip_prefix("Interactive startup failed; private evidence retained at ")
+                .strip_prefix("Interactive startup failed; evidence locator retained at ")
                 .expect("safe failure evidence locator"),
         );
         assert!(root.is_dir());
-        assert!(root.join("config/gateway.stdout").is_file());
-        assert!(root.join("config/gateway.stderr").is_file());
+        let runtime = std::fs::read_to_string(root.join("runtime-location.txt")).unwrap();
+        let runtime = Path::new(&runtime);
+        assert!(runtime.join("gateway.stdout").is_file());
+        assert!(runtime.join("gateway.stderr").is_file());
+        assert_eq!(
+            std::fs::metadata(runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert!(root.join("retained.txt").is_file());
         fixture.remove_after_confirmed_completion().unwrap();
     }
