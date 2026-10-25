@@ -27,7 +27,7 @@ pub use types::{
     build_context_index_cards, context_index_card_digest, context_index_source_digest,
     ActiveSessionProjection, ContextIndexCard, ContextIndexCoverage, OutboxFailureClass,
     OutboxStatus, SessionActivationManifest, SessionBranchRequest, SessionBranchResult,
-    SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
+    SessionClaimEventAppend, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
     SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
     SessionMessageMetadata, SessionPresenceProjection, SessionProjectionRecoveryState,
     SessionRecord, SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,

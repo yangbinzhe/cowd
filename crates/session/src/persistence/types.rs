@@ -525,6 +525,17 @@ pub struct SessionTerminalExecutionFence {
     pub claim_fence_epoch: u64,
 }
 
+/// Owner transaction predicate for a durable observation. Runtime remains
+/// responsible for constructing and authenticating the opaque source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionClaimEventAppend {
+    pub session_id: String,
+    pub ingress_message_id: String,
+    pub turn_id: String,
+    pub fence: SessionTerminalExecutionFence,
+    pub event: crate::SessionDomainEvent,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionTerminalTranscriptCommit {
     pub terminal_message_id: String,

@@ -2,6 +2,716 @@
 
 use super::*;
 
+fn lock_claim_event_append_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    request: &SessionClaimEventAppend,
+) -> session::SessionResult<SessionEvent> {
+    let fence = &request.fence;
+    if [
+        request.session_id.as_str(),
+        request.ingress_message_id.as_str(),
+        request.turn_id.as_str(),
+        fence.request_id.as_str(),
+        fence.claim_owner.as_str(),
+        fence.claim_token.as_str(),
+        request.event.event_id.as_str(),
+    ]
+    .iter()
+    .any(|identity| identity.trim().is_empty())
+        || fence.session_generation == 0
+        || fence.claim_fence_epoch == 0
+        || request.event.session_id != request.session_id
+    {
+        return Err(session::SessionError::InvalidArgument(
+            "claim-fenced event append requires complete, matching Session identity".to_string(),
+        ));
+    }
+    let event = request.event.to_session_event()?;
+    // Session first, exact outbox second. Only this owner operation uses
+    // NO KEY UPDATE: it excludes admission/generation updates and other event
+    // allocators, but permits outbox-first workers' parent FK KEY SHARE locks.
+    // Those workers read Session without a row lock and update outbox/history/
+    // timeline/recovery rows, not session_records. FOR UPDATE here would add
+    // a real Session -> outbox -> Session-FK inverse wait.
+    transaction
+        .query_opt(
+            "SELECT session_id FROM session_records WHERE session_id=$1 FOR NO KEY UPDATE",
+            &[&request.session_id],
+        )
+        .map_err(postgres_error)?
+        .ok_or_else(|| {
+            session::SessionError::StaleExecutionFence(format!(
+                "session `{}` no longer exists",
+                request.session_id
+            ))
+        })?;
+    let admission =
+        query_input_admission_tx(transaction, &request.session_id, false)?.ok_or_else(|| {
+            session::SessionError::StaleExecutionFence(format!(
+                "session `{}` no longer exists",
+                request.session_id
+            ))
+        })?;
+    let current = runtime_outbox_for_update(transaction, &fence.request_id)?;
+    // PostgreSQL's wall clock is sampled after BOTH lock waits. Event time,
+    // caller time, transaction_timestamp and mutable row revision are not
+    // authority for this decision. Expiry is checked at admission to append.
+    let now_ms = i64_to_u64(
+        transaction
+            .query_one(
+                "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)?,
+        "claim append owner clock",
+    )?;
+    if current.session_id != request.session_id
+        || current.message_id != request.ingress_message_id
+        || current.turn_id != request.turn_id
+        || current.request_id != fence.request_id
+        || current.sequence != fence.input_sequence
+        || current.session_generation != fence.session_generation
+        || admission.session_id != request.session_id
+        || admission.generation != fence.session_generation
+        || !admission.open
+        || !matches!(
+            current.status,
+            SessionRuntimeInputStatus::Claimed | SessionRuntimeInputStatus::Running
+        )
+        || current.claim_owner.as_deref() != Some(fence.claim_owner.as_str())
+        || current.claim_token.as_deref() != Some(fence.claim_token.as_str())
+        || current.claim_fence_epoch != Some(fence.claim_fence_epoch)
+        || !current
+            .claim_expires_at_ms
+            .is_some_and(|expiry| expiry > now_ms)
+    {
+        return Err(session::SessionError::StaleExecutionFence(format!(
+            "claim event request={} generation={} claim_fence_epoch={} current_status={:?}",
+            fence.request_id, fence.session_generation, fence.claim_fence_epoch, current.status
+        )));
+    }
+    Ok(event)
+}
+
+/// Original event-ID replay comparison, shared by both append operations.
+/// Only the store-allocated sequence may differ; changed payloads conflict.
+fn matching_domain_event_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    event: &SessionEvent,
+    event_id: &str,
+) -> session::SessionResult<Option<SessionEvent>> {
+    let Some(row) = transaction
+        .query_opt(
+            "SELECT session_id, event_type, event_json, sequence, created_at_ms
+               FROM session_events
+              WHERE session_id=$1
+                AND event_type=$2
+                AND event_json::jsonb ->> 'event_id'=$3
+              LIMIT 1",
+            &[
+                &event.session_id,
+                &session::SESSION_DOMAIN_EVENT_TYPE,
+                &event_id,
+            ],
+        )
+        .map_err(postgres_error)?
+    else {
+        return Ok(None);
+    };
+    let existing = row_to_event(&row)?;
+    if !SessionDomainEvent::semantically_equivalent(&existing, event).map_err(|error| {
+        session::SessionError::Store(format!(
+            "failed to compare idempotent session-domain event content: {error}"
+        ))
+    })? {
+        return Err(session::SessionError::IdempotencyConflict {
+            namespace: "session_domain_event",
+            key: event_id.to_string(),
+        });
+    }
+    Ok(Some(existing))
+}
+
+fn append_claim_event_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    request: &SessionClaimEventAppend,
+) -> session::SessionResult<SessionEvent> {
+    let event = lock_claim_event_append_tx(transaction, request)?;
+    match matching_domain_event_tx(transaction, &event, &request.event.event_id)? {
+        Some(existing) => Ok(existing),
+        None => append_allocated_event_tx(transaction, &event),
+    }
+}
+
+#[cfg(test)]
+mod claim_append_tests {
+    use super::*;
+    use crate::claim_append_postgres_scope::PostgresTestScope;
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    struct Fixture {
+        scope: PostgresTestScope,
+        store: Arc<PostgresSessionStore>,
+        request: SessionClaimEventAppend,
+        input: SessionRuntimeOutboxRecord,
+    }
+
+    fn owner_now(store: &PostgresSessionStore) -> u64 {
+        let mut connection = store.executor.checkout_critical().unwrap();
+        let value: i64 = connection
+            .query_one(
+                "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        u64::try_from(value).unwrap()
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let scope = PostgresTestScope::new();
+            let store = Arc::new(PostgresSessionStore::new(scope.reconnect()).unwrap());
+            let session_id = "r194-claim-append";
+            store
+                .create_session(&SessionRecord {
+                    session_id: session_id.into(),
+                    platform: "test".into(),
+                    chat_id: "chat".into(),
+                    user_id: None,
+                    model: None,
+                    created_at: "2026-10-26T00:00:00Z".into(),
+                    last_activity: "2026-10-26T00:00:00Z".into(),
+                    message_count: 0,
+                    reset_policy: "manual".into(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    status: "active".into(),
+                })
+                .unwrap();
+            let now = owner_now(&store);
+            let ingress = SessionRuntimeOutboxRequest {
+                input_id: "input-r194".into(),
+                request_id: "request-r194".into(),
+                message_id: "message-r194".into(),
+                turn_id: "turn-r194".into(),
+                session_generation: 1,
+                decision: InputRoutingDecision::StartNewTurn,
+                target_turn_id: None,
+                classification_json: None,
+                task_route_hint: None,
+                created_at_ms: now,
+                runtime_options_json: None,
+            };
+            store
+                .append_ingress_with_runtime_outbox(session_id, "user", Some("[]"), now, &ingress)
+                .unwrap();
+            let input = store
+                .claim_session_runtime_outbox("worker-r194", now, 60_000, 1, &[])
+                .unwrap()
+                .remove(0);
+            let request = SessionClaimEventAppend {
+                session_id: session_id.into(),
+                ingress_message_id: ingress.message_id,
+                turn_id: ingress.turn_id,
+                fence: session::SessionTerminalExecutionFence {
+                    request_id: ingress.request_id,
+                    input_sequence: input.sequence,
+                    session_generation: 1,
+                    claim_owner: input.claim_owner.clone().unwrap(),
+                    claim_token: input.claim_token.clone().unwrap(),
+                    claim_fence_epoch: input.claim_fence_epoch.unwrap(),
+                },
+                event: SessionDomainEvent::new(
+                    session_id,
+                    0,
+                    SessionDomainScope::Tool,
+                    "r194.observation",
+                    serde_json::json!({
+                        "physical": "original", "content_digest": "sha256:original"
+                    }),
+                    now,
+                ),
+            };
+            Self {
+                scope,
+                store,
+                request,
+                input,
+            }
+        }
+
+        fn count(&self) -> i64 {
+            // Independent executor/connection, direct SQL oracle, no projection.
+            let executor = self.scope.reconnect();
+            let mut connection = executor.checkout_critical().unwrap();
+            connection
+                .query_one(
+                    "SELECT count(*) FROM session_events WHERE session_id=$1
+                 AND event_json::jsonb ->> 'event_id'=$2",
+                    &[&self.request.session_id, &self.request.event.event_id],
+                )
+                .unwrap()
+                .get(0)
+        }
+
+        fn revoke(&self) {
+            self.store
+                .cancel_session_runtime_outbox(
+                    &self.input.input_id,
+                    1,
+                    self.input.revision,
+                    "r194-test",
+                    "revoke",
+                    owner_now(&self.store),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r194_claim_append_identity_renew_and_exact_replay() {
+        let fixture = Fixture::new();
+        for field in 0..14 {
+            let mut bad = fixture.request.clone();
+            match field {
+                0 => bad.session_id = "foreign-session".into(),
+                1 => bad.ingress_message_id = "foreign-message".into(),
+                2 => bad.turn_id = "foreign-turn".into(),
+                3 => bad.fence.request_id = "foreign-request".into(),
+                4 => bad.fence.input_sequence += 1,
+                5 => bad.fence.session_generation += 1,
+                6 => bad.fence.claim_owner = "foreign-owner".into(),
+                7 => bad.fence.claim_token = "foreign-token".into(),
+                8 => bad.fence.claim_fence_epoch += 1,
+                9 => bad.event.session_id = "foreign-event-session".into(),
+                10 => bad.event.event_id = " ".into(),
+                11 => bad.fence.claim_owner.clear(),
+                12 => bad.fence.session_generation = 0,
+                _ => bad.fence.claim_fence_epoch = 0,
+            }
+            assert!(fixture
+                .store
+                .append_session_domain_event_if_claim_current(&bad)
+                .is_err());
+            assert_eq!(fixture.count(), 0);
+        }
+        let running = fixture
+            .store
+            .mark_session_runtime_outbox_running(
+                &fixture.input.request_id,
+                "worker-r194",
+                1,
+                fixture.input.claim_token.as_deref().unwrap(),
+                fixture.input.revision,
+                owner_now(&fixture.store),
+            )
+            .unwrap();
+        let renewed = fixture
+            .store
+            .renew_session_runtime_outbox_lease(
+                &running.request_id,
+                "worker-r194",
+                1,
+                running.claim_token.as_deref().unwrap(),
+                running.revision,
+                owner_now(&fixture.store),
+                60_000,
+            )
+            .unwrap();
+        assert!(renewed.revision > fixture.input.revision);
+        assert_eq!(
+            renewed.claim_fence_epoch,
+            Some(fixture.request.fence.claim_fence_epoch)
+        );
+        let stored = fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .unwrap();
+        let mut replay = fixture.request.clone();
+        replay.event.sequence = 9999;
+        assert_eq!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&replay)
+                .unwrap(),
+            stored
+        );
+        replay.event.payload = serde_json::json!({"physical": "changed"});
+        assert!(matches!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&replay),
+            Err(session::SessionError::IdempotencyConflict { .. })
+        ));
+        let mut changed_digest = fixture.request.clone();
+        changed_digest.event.payload["content_digest"] = serde_json::json!("sha256:changed");
+        assert!(matches!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&changed_digest),
+            Err(session::SessionError::IdempotencyConflict { .. })
+        ));
+        assert_eq!(fixture.count(), 1);
+        fixture
+            .store
+            .cancel_session_runtime_outbox(
+                &renewed.input_id,
+                1,
+                renewed.revision,
+                "r194-test",
+                "revoke",
+                owner_now(&fixture.store),
+            )
+            .unwrap();
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .is_err());
+        assert_eq!(fixture.count(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r194_claim_append_revoke_close_expiry_and_reclaim_reject() {
+        for invalidation in 0..4 {
+            let fixture = Fixture::new();
+            match invalidation {
+                0 => fixture.revoke(),
+                1 => {
+                    fixture
+                        .store
+                        .close_session_input_admission(
+                            &fixture.request.session_id,
+                            1,
+                            "r194-test",
+                            "close",
+                            owner_now(&fixture.store),
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    // Force actual owner-clock expiry without a timing sleep.
+                    let executor = fixture.scope.reconnect();
+                    executor.checkout_critical().unwrap().execute(
+                        "UPDATE session_runtime_outbox SET claim_expires_at_ms=0 WHERE request_id=$1",
+                        &[&fixture.input.request_id],
+                    ).unwrap();
+                    if invalidation == 3 {
+                        let reclaimed = fixture
+                            .store
+                            .claim_session_runtime_outbox(
+                                "replacement-r194",
+                                owner_now(&fixture.store),
+                                60_000,
+                                1,
+                                &[],
+                            )
+                            .unwrap()
+                            .remove(0);
+                        assert_ne!(reclaimed.claim_fence_epoch, fixture.input.claim_fence_epoch);
+                    }
+                }
+            }
+            assert!(fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request)
+                .is_err());
+            assert_eq!(fixture.count(), 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r194_claim_append_verified_then_revoke_cross_connection_zero_insert() {
+        let fixture = Fixture::new();
+        // Verification completes in its own transaction, as an earlier
+        // Runtime check would. The retained request has no lock authority.
+        let mut connection = fixture.store.executor.checkout_critical().unwrap();
+        let mut tx = connection.transaction().unwrap();
+        lock_claim_event_append_tx(&mut tx, &fixture.request).unwrap();
+        tx.commit().unwrap();
+        drop(connection);
+        let executor = fixture.scope.reconnect();
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let input = fixture.input.clone();
+        let revoker = std::thread::spawn(move || {
+            let store = PostgresSessionStore::new(executor).unwrap();
+            store
+                .cancel_session_runtime_outbox(
+                    &input.input_id,
+                    1,
+                    input.revision,
+                    "r194-test",
+                    "revoke after verification",
+                    owner_now(&store),
+                )
+                .unwrap();
+            worker_gate.wait();
+        });
+        gate.wait();
+        assert!(matches!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        revoker.join().unwrap();
+        assert_eq!(fixture.count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r194_claim_append_commit_connection_loss_returns_no_ack() {
+        let fixture = Fixture::new();
+        let executor = fixture.scope.reconnect();
+        let mut oracle = executor.checkout_critical().unwrap();
+        // Fixture-local deferred trigger severs the actual append connection
+        // at COMMIT. The production wrapper must return its commit error.
+        oracle.batch_execute(
+            "CREATE FUNCTION r194_lose_commit_connection() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NEW.event_json::jsonb ->> 'kind' = 'r194.observation' THEN
+                     PERFORM pg_terminate_backend(pg_backend_pid());
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE CONSTRAINT TRIGGER r194_lose_commit_connection
+             AFTER INSERT ON session_events DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION r194_lose_commit_connection()",
+        ).unwrap();
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .is_err());
+        assert_eq!(fixture.count(), 0);
+        oracle
+            .batch_execute(
+                "DROP TRIGGER r194_lose_commit_connection ON session_events;
+                              DROP FUNCTION r194_lose_commit_connection()",
+            )
+            .unwrap();
+        // Model a durable commit whose acknowledgment was lost by discarding
+        // its result, then retry the stable identity through the real method.
+        drop(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request)
+                .unwrap(),
+        );
+        fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .unwrap();
+        assert_eq!(fixture.count(), 1);
+        fixture.revoke();
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .is_err());
+        assert_eq!(fixture.count(), 1);
+    }
+
+    fn wait_until_blocked(executor: &PostgresExecutor, holder: i32) {
+        let mut observer = executor.checkout_online_read().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let blocked: bool = observer
+                .query_one(
+                    "SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity
+                     WHERE $1 = ANY(pg_blocking_pids(pid))
+                       AND (query LIKE '%session_runtime_outbox%'
+                            OR query LIKE '%session_records%')
+                 )",
+                    &[&holder],
+                )
+                .unwrap()
+                .get(0);
+            if blocked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cross-connection lock wait was not observed"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r194_claim_append_held_then_revoke_waits_cross_connection() {
+        let fixture = Fixture::new();
+        let executor = fixture.scope.reconnect();
+        let revoker_store = PostgresSessionStore::new(executor).unwrap();
+        let mut holder = fixture.store.executor.checkout_critical().unwrap();
+        let holder_pid: i32 = holder
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let mut tx = holder.transaction().unwrap();
+        // Hold the exact production predicate locks; the append below executes
+        // the same full transaction body as the public backend operation.
+        lock_claim_event_append_tx(&mut tx, &fixture.request).unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let input_id = fixture.input.input_id.clone();
+        let revision = fixture.input.revision;
+        let worker_gate = gate.clone();
+        let revoker = std::thread::spawn(move || {
+            let now = owner_now(&revoker_store);
+            worker_gate.wait();
+            revoker_store
+                .cancel_session_runtime_outbox(&input_id, 1, revision, "r194-test", "revoke", now)
+                .unwrap();
+        });
+        gate.wait();
+        wait_until_blocked(&fixture.scope.reconnect(), holder_pid);
+        append_claim_event_tx(&mut tx, &fixture.request).unwrap();
+        tx.commit().unwrap();
+        revoker.join().unwrap();
+        assert_eq!(fixture.count(), 1);
+        let mut fresh = fixture.request.clone();
+        fresh.event.event_id.push_str("-after-revoke");
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fresh)
+            .is_err());
+        assert!(fixture
+            .store
+            .get_session_domain_event_by_id(&fresh.session_id, &fresh.event.event_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r194_claim_append_outbox_first_worker_fk_progresses() {
+        let fixture = Fixture::new();
+        let executor = fixture.scope.reconnect();
+        let append_store = PostgresSessionStore::new(executor).unwrap();
+        let now = owner_now(&fixture.store);
+        let mut worker = fixture.store.executor.checkout_critical().unwrap();
+        let worker_pid: i32 = worker
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let mut tx = worker.transaction().unwrap();
+        tx.batch_execute("SET LOCAL lock_timeout='3s'").unwrap();
+        let current =
+            runtime_outbox_by_input_id_for_update(&mut tx, &fixture.input.input_id).unwrap();
+        let request = fixture.request.clone();
+        let gate = Arc::new(Barrier::new(2));
+        let append_gate = gate.clone();
+        let appender = std::thread::spawn(move || {
+            append_gate.wait();
+            assert!(matches!(
+                append_store.append_session_domain_event_if_claim_current(&request),
+                Err(session::SessionError::StaleExecutionFence(_))
+            ));
+        });
+        gate.wait();
+        // The actual public append now owns its Session lock and waits on
+        // this worker's outbox. Continue the original cancel SQL/helper chain
+        // on the independently held worker connection, including its triggers.
+        wait_until_blocked(&fixture.scope.reconnect(), worker_pid);
+        let changed = tx
+            .execute(
+                "UPDATE session_runtime_outbox
+                SET status='cancelled',claim_owner=NULL,claim_token=NULL,claim_fence_epoch=NULL,
+                    claim_expires_at_ms=NULL,last_error=$1,terminal_at_ms=$2,
+                    updated_at_ms=$2,revision=revision+1
+              WHERE input_id=$3 AND session_generation=$4 AND revision=$5
+                AND status NOT IN ('rejected_duplicate','rejected_policy','completed',
+                                   'supplemented','failed','cancelled','expired')",
+                &[
+                    &"r194-fk-progress",
+                    &to_u64_i64(now, "test clock").unwrap(),
+                    &current.input_id,
+                    &to_u64_i64(current.session_generation, "test generation").unwrap(),
+                    &to_u64_i64(current.revision, "test revision").unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let updated = runtime_outbox_by_input_id_for_update(&mut tx, &current.input_id).unwrap();
+        append_runtime_history_tx(
+            &mut tx,
+            &updated,
+            "cancel",
+            Some("r194-test"),
+            Some(current.revision),
+            current.status,
+            SessionRuntimeInputStatus::Cancelled,
+            Some("r194-fk-progress"),
+            now,
+        )
+        .unwrap();
+        append_input_timeline_event_tx(
+            &mut tx,
+            &request_from_outbox(&updated),
+            &updated.session_id,
+            updated.sequence,
+            "session.input.cancelled.v1",
+            updated.status,
+            Some("r194-test"),
+            Some("r194-fk-progress"),
+            now,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        appender.join().unwrap();
+        assert_eq!(fixture.count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r194_claim_append_waits_then_rechecks_owner_clock_cross_connection() {
+        let fixture = Fixture::new();
+        let mut holder = fixture.store.executor.checkout_critical().unwrap();
+        let holder_pid: i32 = holder
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let mut tx = holder.transaction().unwrap();
+        query_input_admission_tx(&mut tx, &fixture.request.session_id, true)
+            .unwrap()
+            .unwrap();
+        let executor = fixture.scope.reconnect();
+        let request = fixture.request.clone();
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let appender = std::thread::spawn(move || {
+            let store = PostgresSessionStore::new(executor).unwrap();
+            worker_gate.wait();
+            let result = store.append_session_domain_event_if_claim_current(&request);
+            assert!(matches!(
+                result,
+                Err(session::SessionError::StaleExecutionFence(_))
+            ));
+        });
+        gate.wait();
+        wait_until_blocked(&fixture.scope.reconnect(), holder_pid);
+        // Same tuple, no revision/epoch mutation. Set expiry to the owner's
+        // current clock AFTER the append has begun waiting. A clock sampled
+        // before that wait must not authorize insertion after lock release.
+        // Hold Session first: outbox updates have recovery/FK side effects.
+        tx.execute("UPDATE session_runtime_outbox
+                    SET claim_expires_at_ms=floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+                    WHERE request_id=$1",
+            &[&fixture.input.request_id]).unwrap();
+        tx.commit().unwrap();
+        appender.join().unwrap();
+        assert_eq!(fixture.count(), 0);
+    }
+}
+
 fn receipt_ack_from_row(
     row: &Row,
 ) -> session::SessionResult<harness_contract::live::SessionMessageAck> {
@@ -1595,6 +2305,19 @@ impl PostgresSessionStore {
             })
     }
 
+    /// Append under the original Session admission and exact claim locks.
+    /// Even a replay requires a current claim; stale callers receive no Ack.
+    pub fn append_session_domain_event_if_claim_current(
+        &self,
+        request: &SessionClaimEventAppend,
+    ) -> session::SessionResult<SessionEvent> {
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let stored = append_claim_event_tx(&mut transaction, request)?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(stored)
+    }
+
     pub fn append_session_domain_event_if_absent_allocating_sequence(
         &self,
         event: &SessionEvent,
@@ -1633,33 +2356,7 @@ impl PostgresSessionStore {
                 &[&event.session_id],
             )
             .map_err(postgres_error)?;
-        if let Some(row) = transaction
-            .query_opt(
-                "SELECT session_id, event_type, event_json, sequence, created_at_ms
-                   FROM session_events
-                  WHERE session_id=$1
-                    AND event_type=$2
-                    AND event_json::jsonb ->> 'event_id'=$3
-                  LIMIT 1",
-                &[
-                    &event.session_id,
-                    &session::SESSION_DOMAIN_EVENT_TYPE,
-                    &event_id,
-                ],
-            )
-            .map_err(postgres_error)?
-        {
-            let existing = row_to_event(&row)?;
-            if !SessionDomainEvent::semantically_equivalent(&existing, event).map_err(|error| {
-                session::SessionError::Store(format!(
-                    "failed to compare idempotent session-domain event content: {error}"
-                ))
-            })? {
-                return Err(session::SessionError::IdempotencyConflict {
-                    namespace: "session_domain_event",
-                    key: event_id.to_string(),
-                });
-            }
+        if let Some(existing) = matching_domain_event_tx(&mut transaction, event, event_id)? {
             transaction.commit().map_err(postgres_error)?;
             return Ok((existing, true));
         }

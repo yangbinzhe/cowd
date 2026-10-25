@@ -8,12 +8,13 @@
 use crate::error::Result;
 use crate::persistence::types::{
     ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionBranchRequest,
-    SessionBranchResult, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
-    SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
-    SessionMessageMetadata, SessionPresenceProjection, SessionRecord, SessionRecoveryManifest,
-    SessionRecoverySignal, SessionRuntimeInputStatus, SessionRuntimeOutboxHealth,
-    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
-    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
+    SessionBranchResult, SessionClaimEventAppend, SessionEvent, SessionInputAdmission,
+    SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest, SessionListOptions,
+    SessionListPage, SessionMessage, SessionMessageMetadata, SessionPresenceProjection,
+    SessionRecord, SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot, SessionTerminalTranscriptCommit,
+    SessionTerminalTranscriptReceipt, SessionUsageSummary,
 };
 use crate::{
     SessionBranchActivation, SessionBranchActivationTransition, SessionLifecycleIntent,
@@ -64,6 +65,7 @@ macro_rules! session_store_backend_contract {
             (disassociate_memory, (session_id: &str, memory_id: &str), Result<()>),
             (append_event, (event: &SessionEvent), Result<()>),
             (append_event_allocating_sequence, (event: &SessionEvent), Result<SessionEvent>),
+            (append_session_domain_event_if_claim_current, (request: &SessionClaimEventAppend), Result<SessionEvent>),
             (append_session_domain_event_if_absent_allocating_sequence, (event: &SessionEvent, event_id: &str), Result<(SessionEvent, bool)>),
             (get_session_domain_event_by_id, (session_id: &str, event_id: &str), Result<Option<SessionEvent>>),
             (append_events_allocating_sequence, (events: &[SessionEvent]), Result<Vec<SessionEvent>>),

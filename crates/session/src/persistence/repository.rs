@@ -18,12 +18,12 @@ use crate::persistence::execution_plane::{
 };
 use crate::persistence::history::SessionContextPage;
 use crate::persistence::types::{
-    ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionEvent,
-    SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
-    SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
-    SessionPresenceProjection, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
-    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
-    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
+    ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionClaimEventAppend,
+    SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
+    SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
+    SessionMessageMetadata, SessionPresenceProjection, SessionRecord, SessionRecoveryManifest,
+    SessionRecoverySignal, SessionRuntimeInputStatus, SessionRuntimeOutboxHealth,
+    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
 };
 
@@ -611,6 +611,19 @@ impl UnifiedSessionStore {
     ) -> Result<SessionEvent> {
         let event = event.to_session_event()?;
         self.append_event_allocating_sequence(&event).await
+    }
+
+    /// Append once while the exact original Session claim is current.
+    /// Authentication of the observation source belongs to Runtime.
+    pub async fn append_session_domain_event_if_claim_current(
+        &self,
+        request: &SessionClaimEventAppend,
+    ) -> Result<SessionEvent> {
+        let request = request.clone();
+        self.execute_write(move |backend| {
+            backend.append_session_domain_event_if_claim_current(&request)
+        })
+        .await
     }
 
     /// Atomically append a canonical domain event once per

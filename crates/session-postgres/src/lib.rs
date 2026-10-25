@@ -20,14 +20,15 @@ use session::{
     build_context_index_cards, context_index_card_digest, context_index_source_digest,
     ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionBranchActivation,
     SessionBranchActivationPhase, SessionBranchActivationTransition, SessionBranchRequest,
-    SessionBranchResult, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
-    SessionLifecycleIntent, SessionLifecyclePhase, SessionLifecyclePlan,
-    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionListOptions,
-    SessionListPage, SessionMessage, SessionMessageMetadata, SessionPresenceProjection,
-    SessionRecord, SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
-    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
-    SessionSearchResult, SessionSnapshot, SessionTerminalTranscriptCommit,
-    SessionTerminalTranscriptReceipt, SessionUsageBucket, SessionUsageSummary,
+    SessionBranchResult, SessionClaimEventAppend, SessionEvent, SessionInputAdmission,
+    SessionLifecycleFenceRequest, SessionLifecycleIntent, SessionLifecyclePhase,
+    SessionLifecyclePlan, SessionLifecycleTombstoneRequest, SessionLifecycleTransition,
+    SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
+    SessionPresenceProjection, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
+    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
+    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
+    SessionUsageSummary,
 };
 use session::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 #[cfg(test)]
@@ -37,6 +38,10 @@ use storage::{
 };
 
 const SESSION_DOMAIN: &str = "session";
+
+#[cfg(test)]
+#[path = "../../storage/test-support/postgres_scope.rs"]
+mod claim_append_postgres_scope;
 
 mod discovery;
 mod ingress;
@@ -2475,6 +2480,12 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         v: &SessionEvent,
     ) -> session::SessionResult<SessionEvent> {
         self.append_event_allocating_sequence(v)
+    }
+    fn append_session_domain_event_if_claim_current(
+        &self,
+        request: &SessionClaimEventAppend,
+    ) -> session::SessionResult<SessionEvent> {
+        self.append_session_domain_event_if_claim_current(request)
     }
     fn append_session_domain_event_if_absent_allocating_sequence(
         &self,
