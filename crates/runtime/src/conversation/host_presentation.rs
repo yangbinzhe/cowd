@@ -6,6 +6,215 @@ use super::*;
 #[path = "host_presentation_recovery_tests.rs"]
 mod recovery_tests;
 
+// Presentation correction may repair a diagnostic's truthfulness, but cannot
+// erase why it failed as a user answer. Keep that evidence across origin changes.
+struct TerminalPresentationValidation {
+    invalid: bool,
+    findings: Vec<String>,
+}
+
+impl TerminalPresentationValidation {
+    fn new(origin: harness_contract::outcome::AnswerOrigin, reason: Option<&str>) -> Self {
+        use harness_contract::outcome::AnswerOrigin;
+        Self {
+            invalid: matches!(
+                origin,
+                AnswerOrigin::ProgrammaticFallback | AnswerOrigin::RuntimeVerifiedFallback
+            ),
+            findings: reason.map(str::to_string).into_iter().collect(),
+        }
+    }
+
+    fn correct_truth(
+        &mut self,
+        answer: &mut String,
+        origin: &mut harness_contract::outcome::AnswerOrigin,
+        reason: &mut Option<String>,
+        attempt_id: &mut String,
+        envelope: &harness_contract::outcome::DeliveryEnvelope,
+    ) {
+        let contradictions = delivery_truth_contradictions(answer, envelope);
+        if !contradictions.is_empty() {
+            self.invalid = true;
+            self.findings.push(format!(
+                "terminal candidate contradicted committed Runtime truth: {}",
+                contradictions.join("; ")
+            ));
+            *answer = runtime_verified_delivery_fallback(envelope);
+            *origin = harness_contract::outcome::AnswerOrigin::RuntimeVerifiedFallback;
+            *reason = Some(self.findings.join("; "));
+            *attempt_id = format!("{attempt_id}:runtime-truth-fallback");
+        }
+    }
+
+    fn finish(
+        &self,
+        mut presentation: harness_contract::outcome::TerminalPresentation,
+    ) -> harness_contract::outcome::TerminalPresentation {
+        presentation.validation = harness_contract::outcome::AnswerValidation {
+            status: if self.invalid {
+                harness_contract::outcome::AnswerValidationStatus::Invalid
+            } else {
+                harness_contract::outcome::AnswerValidationStatus::Valid
+            },
+            findings: self.findings.clone(),
+            envelope_revision: Some(presentation.envelope_revision),
+        };
+        presentation
+    }
+}
+
+#[cfg(test)]
+mod terminal_validation_tests {
+    use super::*;
+    use harness_contract::outcome::*;
+
+    fn envelope(format: UserAnswerFormat) -> DeliveryEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "envelope_id":"original-envelope", "revision":7,
+            "objective_id":"original-objective", "created_at_ms":1,
+            "pipeline_status":"completed", "delivery_status":"satisfied",
+            "user_answer_contract":{"language":"zh","format":format}
+        }))
+        .unwrap()
+    }
+
+    fn construct(
+        validation: &TerminalPresentationValidation,
+        origin: AnswerOrigin,
+        reason: Option<String>,
+        attempt: String,
+    ) -> TerminalPresentation {
+        validation.finish(TerminalPresentation {
+            presentation_id: "original-presentation".into(),
+            attempt_id: attempt,
+            envelope_id: "original-envelope".into(),
+            envelope_revision: 7,
+            state: TerminalPresentationState::Committed,
+            answer_origin: origin,
+            source_execution_id: Some("original-execution".into()),
+            narrator_model: None,
+            narrator_provider: None,
+            models_attempted: Vec::new(),
+            validation: AnswerValidation::default(),
+            fallback_reason: reason,
+            generated_at_ms: 2,
+            committed_at_ms: Some(2),
+        })
+    }
+
+    #[test]
+    fn narrator_failure_survives_truth_correction_in_the_actual_presentation() {
+        let envelope = envelope(UserAnswerFormat::StrictJson);
+        let original = envelope.clone();
+        let mut origin = AnswerOrigin::ProgrammaticFallback;
+        let mut reason = Some("all configured terminal narrator candidates failed".into());
+        let mut answer = "task was not completed".to_string();
+        let mut attempt = "original-attempt:fallback".to_string();
+        let mut validation = TerminalPresentationValidation::new(origin, reason.as_deref());
+        validation.correct_truth(
+            &mut answer,
+            &mut origin,
+            &mut reason,
+            &mut attempt,
+            &envelope,
+        );
+        let presentation = construct(&validation, origin, reason, attempt);
+        assert_eq!(
+            presentation.answer_origin,
+            AnswerOrigin::RuntimeVerifiedFallback
+        );
+        assert_eq!(
+            presentation.validation.status,
+            AnswerValidationStatus::Invalid
+        );
+        assert_eq!(presentation.validation.envelope_revision, Some(7));
+        assert_eq!(presentation.validation.findings, vec![
+            "all configured terminal narrator candidates failed",
+            "terminal candidate contradicted committed Runtime truth: answer denies a satisfied delivery",
+        ]);
+        let reason = presentation.fallback_reason.unwrap();
+        assert!(reason.contains("all configured terminal narrator candidates failed"));
+        assert!(reason.contains("answer denies a satisfied delivery"));
+        assert_eq!(
+            presentation.attempt_id,
+            "original-attempt:fallback:runtime-truth-fallback"
+        );
+        let diagnostic: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(diagnostic["delivery_status"], "satisfied");
+        assert!(diagnostic.get("package_name").is_none());
+        assert_eq!(
+            envelope, original,
+            "presentation cannot rewrite business facts"
+        );
+    }
+
+    #[test]
+    fn narrator_success_with_a_truth_contradiction_is_not_validated_as_business() {
+        let envelope = envelope(UserAnswerFormat::Markdown);
+        let mut origin = AnswerOrigin::TerminalNarrator;
+        let mut reason = None;
+        let mut answer = "task was not completed".to_string();
+        let mut attempt = "original-attempt".to_string();
+        let mut validation = TerminalPresentationValidation::new(origin, None);
+        validation.correct_truth(
+            &mut answer,
+            &mut origin,
+            &mut reason,
+            &mut attempt,
+            &envelope,
+        );
+        let presentation = construct(&validation, origin, reason, attempt);
+        assert_eq!(
+            presentation.validation.status,
+            AnswerValidationStatus::Invalid
+        );
+        assert_eq!(presentation.validation.findings, vec![
+            "terminal candidate contradicted committed Runtime truth: answer denies a satisfied delivery",
+        ]);
+    }
+
+    #[test]
+    fn qualified_json_and_chinese_answers_keep_the_original_valid_path() {
+        for (format, text) in [
+            (
+                UserAnswerFormat::StrictJson,
+                r#"{"package_name":"runtime","path":"crates/runtime/Cargo.toml"}"#,
+            ),
+            (UserAnswerFormat::Markdown, "读取已完成，以上是原文件内容。"),
+        ] {
+            let envelope = envelope(format);
+            assert!(qualified_root_answer(text, &envelope));
+            let mut answer = text.to_string();
+            let mut origin = AnswerOrigin::ModelDirect;
+            let mut reason = None;
+            let mut attempt = "original-attempt".to_string();
+            let mut validation = TerminalPresentationValidation::new(origin, None);
+            validation.correct_truth(
+                &mut answer,
+                &mut origin,
+                &mut reason,
+                &mut attempt,
+                &envelope,
+            );
+            let presentation = construct(&validation, origin, reason, attempt);
+            assert_eq!(
+                presentation.validation.status,
+                AnswerValidationStatus::Valid
+            );
+            assert!(presentation.validation.findings.is_empty());
+            assert!(presentation.fallback_reason.is_none());
+            assert_eq!(presentation.answer_origin, AnswerOrigin::ModelDirect);
+            assert_eq!(answer, text);
+        }
+        let strict = envelope(UserAnswerFormat::StrictJson);
+        assert!(!qualified_root_answer(
+            "```json\n{\"package_name\":\"runtime\"}\n```",
+            &strict
+        ));
+    }
+}
+
 fn synthesize_message_value(message: &ConversationMessage) -> serde_json::Value {
     serde_json::json!({"role":message.role.role_str(),"blocks":message.blocks,"usage":message.usage})
 }
@@ -1838,17 +2047,16 @@ where
                 }
             }
         };
+        let mut terminal_validation =
+            TerminalPresentationValidation::new(answer_origin, fallback_reason.as_deref());
         if !delegated_leaf {
-            let contradictions = delivery_truth_contradictions(&final_answer, &envelope);
-            if !contradictions.is_empty() {
-                final_answer = runtime_verified_delivery_fallback(&envelope);
-                answer_origin = harness_contract::outcome::AnswerOrigin::RuntimeVerifiedFallback;
-                fallback_reason = Some(format!(
-                    "terminal candidate contradicted committed Runtime truth: {}",
-                    contradictions.join("; ")
-                ));
-                committed_attempt_id = format!("{committed_attempt_id}:runtime-truth-fallback");
-            }
+            terminal_validation.correct_truth(
+                &mut final_answer,
+                &mut answer_origin,
+                &mut fallback_reason,
+                &mut committed_attempt_id,
+                &envelope,
+            );
         }
         if self
             .runtime
@@ -1920,7 +2128,7 @@ where
         observe_stage!("terminal_state_preparation");
         let now_ms = crate::tool_invocation::now_ms();
         let presentation = execution_role.owns_root_presentation().then(|| {
-            harness_contract::outcome::TerminalPresentation {
+            terminal_validation.finish(harness_contract::outcome::TerminalPresentation {
                 presentation_id,
                 attempt_id: committed_attempt_id,
                 envelope_id: envelope.envelope_id.clone(),
@@ -1968,21 +2176,11 @@ where
                         )
                         .collect()
                 },
-                validation: harness_contract::outcome::AnswerValidation {
-                    status: if answer_origin
-                        == harness_contract::outcome::AnswerOrigin::ProgrammaticFallback
-                    {
-                        harness_contract::outcome::AnswerValidationStatus::Invalid
-                    } else {
-                        harness_contract::outcome::AnswerValidationStatus::Valid
-                    },
-                    findings: fallback_reason.clone().into_iter().collect(),
-                    envelope_revision: Some(envelope.revision),
-                },
+                validation: harness_contract::outcome::AnswerValidation::default(),
                 fallback_reason,
                 generated_at_ms: now_ms,
                 committed_at_ms: Some(now_ms),
-            }
+            })
         });
         // ── Terminal path: four kinds of special handling, and which layer owns each ──
         //
