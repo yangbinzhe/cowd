@@ -108,6 +108,12 @@ case "$SCENARIO_ID" in
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
 
+# Fixed evaluator corpus follows the exact registered scenario, never caller paths.
+case "$SCENARIO_ID" in
+  live_one_team_execution) EVALUATION_CORPUS_ID=live-one-team-v1 ;;
+  *) EVALUATION_CORPUS_ID=live-scenarios-v1 ;;
+esac
+
 # Functions below stay in this original launch owner; no daemon or second
 # Runtime lifecycle is introduced. Local doubles extract these same functions.
 curl() { command curl --connect-timeout 2 --max-time 5 "$@"; }
@@ -937,7 +943,7 @@ gateway_env=(
   COWD_CONFIG_HOME="$CONFIG_HOME"
   COWD_LOG_STDERR=1
   COWD_EVAL_HARNESS=1
-  COWD_EVAL_CORPUS_ID=live-scenarios-v1
+  "COWD_EVAL_CORPUS_ID=$EVALUATION_CORPUS_ID"
   XDG_RUNTIME_DIR="$PRIVATE_RUNTIME"
   COWD_TEST_SHUTDOWN_RECEIPT_NONCE="$SHUTDOWN_NONCE"
   COWD_MODEL_TEMPERATURE=0

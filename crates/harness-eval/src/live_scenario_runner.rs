@@ -41,6 +41,11 @@ const SMALL_TEAM_SCENARIO_ID: &str = "live_small_two_team_collaboration";
 /// the no-team and two-team scenarios: it proves a single-Team topology is
 /// reachable and honoured (floor == ceiling == 1).
 const ONE_TEAM_SCENARIO_ID: &str = "live_one_team_execution";
+const ONE_TEAM_SOURCE_PATHS: [&str; 3] = [
+    "crates/runtime/src/lib.rs",
+    "crates/tools/src/lib.rs",
+    "crates/memory/src/lib.rs",
+];
 const RELEASE_CERTIFICATION_SCENARIOS: [&str; 6] = [
     "live_direct_terminal",
     "live_tool_evidence",
@@ -1040,7 +1045,7 @@ impl LiveScenarioRunner {
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 1,
                     minimum_claimed_cross_team_edges: 0,
-                    evidence_profile: ArchitectureEvidenceProfile::Basic,
+                    evidence_profile: ArchitectureEvidenceProfile::OneTeamThreeSources,
                 },
                 timeout: LiveScenarioTimeout::team(),
             },
@@ -3326,6 +3331,7 @@ enum LiveAcceptance {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArchitectureEvidenceProfile {
     Basic,
+    OneTeamThreeSources,
     /// The unique dependency sink must itself reacquire the exact sources;
     /// global lineage coverage is insufficient because predecessor evidence
     /// proves handoff, not synthesis review.
@@ -3346,6 +3352,10 @@ impl LiveAcceptance {
                 required_read_paths,
                 ..
             } => required_read_paths.to_vec(),
+            Self::ArchitectureQuality {
+                evidence_profile: ArchitectureEvidenceProfile::OneTeamThreeSources,
+                ..
+            } => ONE_TEAM_SOURCE_PATHS.to_vec(),
             _ => Vec::new(),
         }
     }
@@ -3485,14 +3495,22 @@ impl LiveAcceptance {
                     ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => {
                         group_theory_presentation_checks(response)
                     }
-                    ArchitectureEvidenceProfile::Basic => Vec::new(),
+                    ArchitectureEvidenceProfile::Basic
+                    | ArchitectureEvidenceProfile::OneTeamThreeSources => Vec::new(),
                 };
                 let presentation_satisfied = presentation_checks
                     .iter()
                     .all(|check| check["passed"].as_bool() == Some(true));
                 let complete_source_paths =
-                    complete_exact_source_receipt_paths(timeline, projections);
+                    if evidence_profile == ArchitectureEvidenceProfile::OneTeamThreeSources {
+                        crate::facet_gate::collect_read_paths(&timeline["read_evidence"])
+                            .into_iter()
+                            .collect()
+                    } else {
+                        complete_exact_source_receipt_paths(timeline, projections)
+                    };
                 let required_complete_source_paths: &[&str] = match evidence_profile {
+                    ArchitectureEvidenceProfile::OneTeamThreeSources => &ONE_TEAM_SOURCE_PATHS,
                     ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
                         &LARGE_SCALE_SOURCE_PATHS
                     }
@@ -3508,6 +3526,7 @@ impl LiveAcceptance {
                 let independently_reviewed_source_paths =
                     independently_reviewed_complete_source_receipt_paths(timeline, projections);
                 let required_independent_source_paths: &[&str] = match evidence_profile {
+                    ArchitectureEvidenceProfile::OneTeamThreeSources => &[],
                     ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
                         &LARGE_SCALE_SOURCE_PATHS
                     }
@@ -5407,6 +5426,92 @@ mod tests;
 #[cfg(test)]
 mod read_evidence_consumer_tests {
     use super::*;
+
+    #[test]
+    fn one_team_requires_all_three_typed_sources() {
+        let acceptance = LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 1,
+            minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::OneTeamThreeSources,
+        };
+        let paths = [
+            "crates/runtime/src/lib.rs",
+            "crates/tools/src/lib.rs",
+            "crates/memory/src/lib.rs",
+        ];
+        assert_eq!(acceptance.read_obligations(), paths);
+        let basic = LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 1,
+            minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
+        };
+        assert!(basic.read_obligations().is_empty());
+        let mut page = crate::facet_gate::read_proof_tests::page();
+        let original = page.reads[0].clone();
+        page.reads.clear();
+        let mut expected = BTreeMap::new();
+        for path in paths {
+            let mut read = original.clone();
+            read.path.workspace_relative_path = path.into();
+            read.path.repository_relative_path = path.into();
+            read.path.observed_revision_or_digest = Some("source-digest".into());
+            read.delivered_extent = Some(
+                harness_contract::projection::ReadEvidenceExtent::FileLines {
+                    start_line: 1,
+                    line_count: 4,
+                    total_lines: 4,
+                    ends_with_newline: true,
+                    body_sha256: "source-digest".into(),
+                    body_bytes: 10,
+                    source_omitted: false,
+                },
+            );
+            expected.insert(path.to_string(), read.path.clone());
+            page.reads.push(read);
+        }
+        let mut proof =
+            crate::facet_gate::ReadEvidencePages::new("graph", "session", "turn", expected);
+        proof.accept(page).unwrap();
+        let valid = json!({"read_evidence":proof.report()});
+        let coverage = |timeline: &Value| {
+            let result = acceptance.evaluate("answer", timeline, &[], None, "graph");
+            result
+                .checks
+                .into_iter()
+                .find(|check| check["name"] == "runtime_attested_complete_source_coverage")
+                .unwrap()
+        };
+        assert_eq!(coverage(&valid)["passed"], true);
+        assert_eq!(coverage(&valid)["required"], 3);
+        // E1/E2 authenticates delivered content windows; U4 adds all-three
+        // coverage, not a new whole-file or history-completeness requirement.
+        let mut partial = valid.clone();
+        partial["read_evidence"]["pages"][0]["reads"][2]["delivered_extent"]["start_line"] =
+            json!(2);
+        partial["read_evidence"]["pages"][0]["reads"][2]["delivered_extent"]["line_count"] =
+            json!(1);
+        partial["read_evidence"]["pages"][0]["reads"][2]["delivered_extent"]["source_omitted"] =
+            json!(true);
+        assert_eq!(coverage(&partial)["passed"], true);
+        for fault in ["missing", "repository", "undelivered"] {
+            let mut changed = valid.clone();
+            let reads = &mut changed["read_evidence"]["pages"][0]["reads"];
+            match fault {
+                "missing" => {
+                    reads.as_array_mut().unwrap().pop();
+                }
+                "repository" => reads[2]["path"]["repository_id"] = json!("foreign"),
+                "undelivered" => reads[2]["body_delivered"] = json!(false),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                crate::facet_gate::collect_read_paths(&changed["read_evidence"]).len(),
+                2,
+                "{fault}"
+            );
+            assert_eq!(coverage(&changed)["passed"], false, "{fault}");
+        }
+    }
 
     #[test]
     fn read_expectation_uses_frozen_workspace_instead_of_harness_source_repo() {

@@ -493,6 +493,14 @@ fn evaluation_projection_resource_grants(
         (Some("1"), Some("auto-strategy-v1"), _) => vec!["resource:*".into()],
         // Fixed, preregistered live fixture; never worker scopes or caller input.
         (Some("1"), Some("live-scenarios-v1"), true) => vec!["read:Cargo.toml".into()],
+        (Some("1"), Some("live-one-team-v1"), true) => [
+            "read:crates/runtime/src/lib.rs",
+            "read:crates/tools/src/lib.rs",
+            "read:crates/memory/src/lib.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
         _ => Vec::new(),
     }
 }
@@ -679,7 +687,20 @@ mod read_evidence_api_tests {
                 .collect(),
         );
         let principal = AuthenticatedPrincipal(super::super::test_human_principal());
-        for path in ["Cargo.toml", "src/a.rs"] {
+        for (corpus, path) in ["live-scenarios-v1", "live-one-team-v1"]
+            .into_iter()
+            .flat_map(|corpus| {
+                [
+                    "Cargo.toml",
+                    "src/a.rs",
+                    "crates/runtime/src/lib.rs",
+                    "crates/tools/src/lib.rs",
+                    "crates/memory/src/lib.rs",
+                ]
+                .into_iter()
+                .map(move |path| (corpus, path))
+            })
+        {
             let state = crate::api_routes::tests::test_state();
             let supplied = state.services.runtime.as_ref().unwrap().runtime_services();
             let (runtime, execution_id, _) =
@@ -713,8 +734,8 @@ mod read_evidence_api_tests {
             let expected = harness_contract::context::WorkspacePathIdentity {
                 workspace_id: runtime.path_identity_resolver().workspace_id().into(),
                 repository_id: "read-repository".into(),
-                workspace_relative_path: "Cargo.toml".into(),
-                repository_relative_path: "Cargo.toml".into(),
+                workspace_relative_path: path.into(),
+                repository_relative_path: path.into(),
                 object_kind: harness_contract::context::WorkspaceObjectKind::File,
                 observed_revision_or_digest: None,
             };
@@ -729,7 +750,7 @@ mod read_evidence_api_tests {
                 .unwrap();
             for mode in ["owner", "missing_flag", "wrong_corpus", "shared_session"] {
                 std::env::set_var("COWD_EVAL_HARNESS", "1");
-                std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+                std::env::set_var("COWD_EVAL_CORPUS_ID", corpus);
                 if mode == "missing_flag" {
                     std::env::remove_var("COWD_EVAL_HARNESS");
                 }
@@ -764,7 +785,10 @@ mod read_evidence_api_tests {
                 .unwrap();
                 assert!(!page.incomplete, "{mode}/{path}: {page:?}");
                 assert!(page.exhausted);
-                if mode == "owner" && path == "Cargo.toml" {
+                if mode == "owner"
+                    && ((corpus == "live-scenarios-v1" && path == "Cargo.toml")
+                        || (corpus == "live-one-team-v1" && path.starts_with("crates/")))
+                {
                     assert_eq!(page.reads.len(), 1, "{page:?}");
                     let read = &page.reads[0];
                     assert_eq!(read.path, expected);
@@ -1865,7 +1889,18 @@ mod v2_upgrade_tests {
             evaluation_projection_resource_grants(Some("1"), Some("live-scenarios-v1"), true),
             vec!["read:Cargo.toml".to_string()]
         );
+        assert_eq!(
+            evaluation_projection_resource_grants(Some("1"), Some("live-one-team-v1"), true),
+            vec![
+                "read:crates/runtime/src/lib.rs",
+                "read:crates/tools/src/lib.rs",
+                "read:crates/memory/src/lib.rs"
+            ]
+        );
         for (harness, corpus, owns_session) in [
+            (None, Some("live-one-team-v1"), true),
+            (Some("0"), Some("live-one-team-v1"), true),
+            (Some("1"), Some("live-one-team-v1"), false),
             (None, Some("live-scenarios-v1"), true),
             (Some("0"), Some("live-scenarios-v1"), true),
             (Some("1"), Some("another-corpus"), true),
