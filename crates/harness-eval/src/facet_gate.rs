@@ -34,6 +34,12 @@
 //! shape: a facet that needs those is not a facet, it is the medium scenario, and
 //! the medium scenario has its own gate.
 
+use std::collections::BTreeMap;
+
+use harness_contract::{
+    context::WorkspacePathIdentity,
+    projection::{ReadEvidenceExtent, ReadEvidenceGrade, ReadEvidencePage, ReadEvidenceRecipient},
+};
 use serde_json::{json, Value};
 
 /// What one capability facet must have produced to pass.
@@ -107,15 +113,9 @@ impl FacetVerdict {
     }
 }
 
-/// PLAN L1: the paths that got a durable successful READ receipt.
-///
-/// Single implementation, used by both the runner and these tests. Reading via a
-/// batch counts as reading, and every path in the batch is unwrapped; a failed
-/// or errored read is not evidence.
-/// Every read path named by a tool input, descending into `tool_orchestrate`
-/// `steps`/`calls` so a batched read counts as reading each named file. Direct
-/// `read_file` (`path`) and `files[]` inputs are handled too.
-pub(crate) fn read_paths_from_tool_input(input: &serde_json::Value) -> Vec<String> {
+/// Target extraction for non-read tool predicates only. Input text never
+/// supplies content-read evidence.
+pub(crate) fn tool_target_paths_from_input(input: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(path) = input.get("path").and_then(serde_json::Value::as_str) {
         out.push(path.to_string());
@@ -133,118 +133,259 @@ pub(crate) fn read_paths_from_tool_input(input: &serde_json::Value) -> Vec<Strin
             if let Some(calls) = step.get("calls").and_then(serde_json::Value::as_array) {
                 for call in calls {
                     if let Some(call_input) = call.get("input") {
-                        out.extend(read_paths_from_tool_input(call_input));
+                        out.extend(tool_target_paths_from_input(call_input));
                     }
                 }
             }
             if let Some(step_input) = step.get("input") {
-                out.extend(read_paths_from_tool_input(step_input));
+                out.extend(tool_target_paths_from_input(step_input));
             }
         }
     }
     out
 }
 
-/// Read-only tools whose successful invocation proves the model accessed a path
-/// it named in the input. The capability under test is "acquire the file", not
-/// "use one specific tool", so `grep_search`/`glob_search`/`execute_code` count
-/// too — but only when the model explicitly named the path in the input of a
-/// tool that then completed successfully.
-pub(crate) const PATH_ACCESS_TOOLS: &[&str] = &[
-    "read_file",
-    "tool_orchestrate",
-    "grep_search",
-    "glob_search",
-    "execute_code",
-    "read_ref",
-    "workspace_snapshot",
-];
-
-/// Workspace-path-like tokens embedded in a tool input (the model may name a
-/// path inside a `code` string or a glob). Only tokens containing `/` that look
-/// like a real file are returned, so prose or a bare word cannot fake a
-/// receipt.
-pub(crate) fn extract_path_tokens(text: &str) -> Vec<String> {
-    text.split(|character: char| {
-        !(character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-'))
-    })
-    .map(|token| token.trim_matches(|character: char| matches!(character, '.' | '-' | '_')))
-    .filter(|token| {
-        token.contains('/')
-            && (token.ends_with(".rs")
-                || token.ends_with(".toml")
-                || token.ends_with(".md")
-                || token.contains("crates/"))
-    })
-    .map(ToString::to_string)
-    .collect()
+/// Caller-side pagination state, not a second read authenticator. Runtime owns
+/// authentication; this state prevents mixing authenticated pages from different
+/// executions, cuts, grants or storage incarnations.
+pub(crate) struct ReadEvidencePages {
+    execution: String,
+    session: String,
+    turn: String,
+    expected: BTreeMap<String, WorkspacePathIdentity>,
+    pages: Vec<ReadEvidencePage>,
+    sources: BTreeMap<String, u64>,
+    failure: Option<String>,
 }
 
-pub fn collect_read_paths(timeline: &serde_json::Value, projections: &[serde_json::Value]) -> Vec<String> {
-    let mut out = Vec::new();
-    for event in timeline
-        .get("events")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if event.get("kind").and_then(serde_json::Value::as_str) != Some("tool.invocation.completed")
-            || event.pointer("/payload/status").and_then(serde_json::Value::as_str) != Some("completed")
-            || event.pointer("/payload/is_error").and_then(serde_json::Value::as_bool) != Some(false)
-        {
-            continue;
-        }
-        let Some(tool) = event
-            .pointer("/payload/tool_name")
-            .and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        if !PATH_ACCESS_TOOLS.contains(&tool) {
-            continue;
-        }
-        let Some(input_preview) = event
-            .pointer("/payload/input_preview")
-            .and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        // Precise structured extraction (read_file `path`/`files[]`, and
-        // `tool_orchestrate` `steps[].calls[]`).
-        if let Ok(input) = serde_json::from_str::<serde_json::Value>(input_preview) {
-            out.extend(read_paths_from_tool_input(&input));
-        }
-        // Any workspace path the model explicitly named to a read-only tool that
-        // then completed successfully.
-        out.extend(extract_path_tokens(input_preview));
-    }
-    // Projection activities carry the resolved path, which is what a required
-    // path is compared against.
-    for projection in projections {
-        for activity in projection
-            .get("activities")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let kind = activity.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
-            if !matches!(kind, "tool" | "tool_batch" | "read")
-                || activity.get("status").and_then(serde_json::Value::as_str) != Some("completed")
-            {
-                continue;
-            }
-            if let Some(path) = activity
-                .get("detail")
-                .and_then(|detail| detail.get("path"))
-                .and_then(serde_json::Value::as_str)
-            {
-                out.push(path.to_string());
-            }
+impl ReadEvidencePages {
+    pub(crate) fn new(
+        execution: &str,
+        session: &str,
+        turn: &str,
+        expected: BTreeMap<String, WorkspacePathIdentity>,
+    ) -> Self {
+        Self {
+            execution: execution.to_string(),
+            session: session.to_string(),
+            turn: turn.to_string(),
+            expected,
+            pages: Vec::new(),
+            sources: BTreeMap::new(),
+            failure: None,
         }
     }
-    out.sort();
-    out.dedup();
-    out
+
+    pub(crate) fn next_after_sequence(&self) -> u64 {
+        self.pages.last().map_or(0, |page| page.next_after_sequence)
+    }
+
+    pub(crate) fn through(&self) -> Option<u64> {
+        self.pages.first().map(|page| page.through)
+    }
+
+    pub(crate) fn fail(&mut self, reason: impl Into<String>) {
+        self.failure.get_or_insert_with(|| reason.into());
+    }
+
+    pub(crate) fn accept(&mut self, page: ReadEvidencePage) -> Result<(), String> {
+        let same_identity = self.pages.first().is_none_or(|first| {
+            page.execution_id == first.execution_id
+                && page.session_id == first.session_id
+                && page.turn_id == first.turn_id
+                && page.workspace_id == first.workspace_id
+                && page.authorization_revision == first.authorization_revision
+                && page.redaction_revision == first.redaction_revision
+                && page.graph_revision == first.graph_revision
+                && page.through == first.through
+                && page.source_incarnation == first.source_incarnation
+                && page.source_mutation_epoch == first.source_mutation_epoch
+        });
+        let invalid = self.failure.is_some()
+            || self.pages.len() >= 256
+            || self.pages.last().is_some_and(|previous| previous.exhausted)
+            || page.schema_version != 1
+            || page.execution_id != self.execution
+            || page.session_id != self.session
+            || page.turn_id != self.turn
+            || page.source_incarnation.is_empty()
+            || page.incomplete
+            || page.reason.is_some()
+            || page.reads.len() > 16
+            || !same_identity
+            || self
+                .expected
+                .values()
+                .any(|path| path.workspace_id != page.workspace_id)
+            || page.next_after_sequence < self.next_after_sequence()
+            || ((!page.exhausted || !page.reads.is_empty())
+                && page.next_after_sequence == self.next_after_sequence())
+            || page.reads.iter().any(|read| {
+                read.delivery.sequence <= self.next_after_sequence()
+                    || read.delivery.sequence > page.next_after_sequence
+            });
+        if invalid {
+            self.fail("read evidence identity, authentication or progress invalid");
+        }
+        for source in &page.sources {
+            if self
+                .sources
+                .get(&source.stream_id)
+                .is_some_and(|revision| *revision != source.revision)
+            {
+                self.fail("read evidence source revision changed");
+            }
+            self.sources
+                .insert(source.stream_id.clone(), source.revision);
+        }
+        self.pages.push(page);
+        match &self.failure {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn paths(&self) -> Vec<String> {
+        if self.failure.is_some() {
+            return Vec::new();
+        }
+        self.expected
+            .iter()
+            .filter_map(|(name, expected)| {
+                self.pages
+                    .iter()
+                    .any(|page| {
+                        page.reads.iter().any(|read| {
+                            let path = &read.path;
+                            let same_path = path.workspace_id == expected.workspace_id
+                                && path.repository_id == expected.repository_id
+                                && path.workspace_relative_path == expected.workspace_relative_path
+                                && path.repository_relative_path
+                                    == expected.repository_relative_path
+                                && path.object_kind == expected.object_kind;
+                            // The producer has already checked the exact Native/Process
+                            // recipient against its admitted packet. Root delivery must be
+                            // provider-observed; a channel send never upgrades Root grade.
+                            let grade_valid = match &read.recipient {
+                                ReadEvidenceRecipient::Root { .. } => {
+                                    read.grade == ReadEvidenceGrade::ProviderModelObserved
+                                }
+                                ReadEvidenceRecipient::Agent { .. } => true,
+                            };
+                            let extent_valid = match &read.delivered_extent {
+                                Some(ReadEvidenceExtent::FileLines {
+                                    start_line,
+                                    line_count,
+                                    total_lines,
+                                    body_bytes,
+                                    source_omitted,
+                                    ..
+                                }) => {
+                                    *start_line > 0
+                                        && start_line
+                                            .checked_sub(1)
+                                            .and_then(|start| start.checked_add(*line_count))
+                                            .is_some_and(|end| end <= *total_lines)
+                                        && ((*total_lines == 0
+                                            && *line_count == 0
+                                            && read.source_bytes == 0
+                                            && *body_bytes == 0)
+                                            || (*line_count > 0 && *body_bytes > 0))
+                                        && !(*source_omitted
+                                            && *start_line == 1
+                                            && line_count == total_lines)
+                                }
+                                Some(ReadEvidenceExtent::ArtifactChunks {
+                                    total_chunks,
+                                    chunks,
+                                }) => {
+                                    if *total_chunks == 0 {
+                                        read.source_bytes == 0 && chunks.is_empty()
+                                    } else {
+                                        !chunks.is_empty()
+                                            && chunks.iter().all(|chunk| {
+                                                chunk.index < *total_chunks && chunk.body_bytes > 0
+                                            })
+                                    }
+                                }
+                                None => false,
+                            };
+                            same_path
+                                && read.body_delivered
+                                && grade_valid
+                                && extent_valid
+                                && read.step.session_id == page.session_id
+                                && read.step.turn_id == page.turn_id
+                                && !read.call_id.is_empty()
+                                && !read.invocation_id.is_empty()
+                                && [&read.delivery, &read.acquisition, &read.index].iter().all(
+                                    |reference| {
+                                        !reference.event_id.is_empty()
+                                            && !reference.stream_id.is_empty()
+                                            && reference.commit_cursor <= page.through
+                                    },
+                                )
+                        })
+                    })
+                    .then(|| name.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn satisfied(&self) -> bool {
+        !self.expected.is_empty() && self.paths().len() == self.expected.len()
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.failure.is_some() || self.pages.last().is_some_and(|page| page.exhausted)
+    }
+
+    pub(crate) fn report(&self) -> Value {
+        json!({
+            "execution_id": self.execution,
+            "session_id": self.session,
+            "turn_id": self.turn,
+            "pages": self.pages,
+            "failure": self.failure,
+            "read_paths": self.paths(),
+            "obligations_satisfied": self.satisfied(),
+            "history_complete": false,
+            "expected": self.expected,
+        })
+    }
+}
+
+/// Consume saved typed pages with independently registered path identities.
+/// Neither timeline previews nor projection activities participate in reads.
+pub(crate) fn collect_read_paths(observation: &Value) -> Vec<String> {
+    let (Some(execution), Some(session), Some(turn)) = (
+        observation.get("execution_id").and_then(Value::as_str),
+        observation.get("session_id").and_then(Value::as_str),
+        observation.get("turn_id").and_then(Value::as_str),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(expected) = serde_json::from_value::<BTreeMap<String, WorkspacePathIdentity>>(
+        observation["expected"].clone(),
+    ) else {
+        return Vec::new();
+    };
+    let mut collection = ReadEvidencePages::new(execution, session, turn, expected);
+    if !observation["failure"].is_null() {
+        return Vec::new();
+    }
+    let Some(pages) = observation.get("pages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    for value in pages {
+        let Ok(page) = serde_json::from_value(value.clone()) else {
+            return Vec::new();
+        };
+        if collection.accept(page).is_err() {
+            return Vec::new();
+        }
+    }
+    collection.paths()
 }
 
 /// Gate one facet's outcome.
@@ -265,17 +406,17 @@ pub fn evaluate_facet(acceptance: &FacetAcceptance, outcome: &FacetOutcome) -> F
 
     // (2) Required evidence must exist as durable receipts, not as claims.
     for path in &acceptance.required_read_paths {
-        let found = outcome
-            .read_paths
-            .iter()
-            .any(|read| read == path || read.ends_with(path));
+        let found = outcome.read_paths.iter().any(|read| read == path);
         requirements.push(FacetRequirement {
             requirement: format!("read_receipt:{path}"),
             passed: found,
             observed: if found {
                 format!("durable receipt for {path}")
             } else {
-                format!("no durable receipt for {path} (have: {})", outcome.read_paths.join(", "))
+                format!(
+                    "no durable receipt for {path} (have: {})",
+                    outcome.read_paths.join(", ")
+                )
             },
         });
     }
@@ -339,10 +480,10 @@ mod tests {
         }
     }
 
-    /// A batched read through `tool_orchestrate` still reads each named file, so
-    /// its steps/calls must yield the same read receipts as direct `read_file`.
+    /// Input parsing remains available to non-read tool predicates; it is not
+    /// evidence that any input reached a reader.
     #[test]
-    fn orchestrate_batch_reads_count_as_read_receipts() {
+    fn structured_tool_inputs_expose_target_names_only() {
         let input = serde_json::json!({
             "steps": [{
                 "op": "batch",
@@ -353,31 +494,17 @@ mod tests {
                 ]
             }]
         });
-        let paths = read_paths_from_tool_input(&input);
+        let paths = tool_target_paths_from_input(&input);
         assert!(paths.contains(&"crates/tools/src/lib.rs".to_string()));
         assert!(paths.contains(&"crates/runtime/src/lib.rs".to_string()));
         assert_eq!(
-            read_paths_from_tool_input(&serde_json::json!({ "path": "a.rs" })),
+            tool_target_paths_from_input(&serde_json::json!({ "path": "a.rs" })),
             vec!["a.rs".to_string()]
         );
         assert_eq!(
-            read_paths_from_tool_input(&serde_json::json!({ "files": [{ "path": "b.rs" }] })),
+            tool_target_paths_from_input(&serde_json::json!({ "files": [{ "path": "b.rs" }] })),
             vec!["b.rs".to_string()]
         );
-    }
-
-    /// (B): a path the model named to a successful read-only tool other than
-    /// `read_file` (grep/glob/execute_code) still proves the file was accessed.
-    #[test]
-    fn non_read_file_inputs_still_count_as_path_access() {
-        assert!(extract_path_tokens(
-            "count lines in crates/tools/src/lib.rs and crates/gateway/src/main.rs"
-        )
-        .contains(&"crates/tools/src/lib.rs".to_string()));
-        assert!(extract_path_tokens(r#"{"path":"crates/harness-eval/src/lib.rs"}"#)
-            .contains(&"crates/harness-eval/src/lib.rs".to_string()));
-        // Prose without a real path must not fabricate a receipt.
-        assert!(extract_path_tokens("read the file and count the mods").is_empty());
     }
 
     /// The arm-E failure, fixed: a correct answer with durable receipts passes.
@@ -441,12 +568,10 @@ mod tests {
         honest.marked_unresolved = true;
         let verdict = evaluate_facet(&strict, &honest);
         assert!(!verdict.passed);
-        assert!(
-            verdict
-                .requirements
-                .iter()
-                .any(|requirement| requirement.requirement == "no_unresolved")
-        );
+        assert!(verdict
+            .requirements
+            .iter()
+            .any(|requirement| requirement.requirement == "no_unresolved"));
     }
 
     /// A facet gate must not smuggle in collaboration requirements: those belong
@@ -466,61 +591,174 @@ mod tests {
     }
 }
 
-/// PLAN L1 integration: the gate's evidence comes from the timeline, and a
-/// batched read must count as a read. These use the shape the runner produces
-/// for `tool.invocation.completed`.
 #[cfg(test)]
-mod timeline_tests {
-    use serde_json::json;
+pub(crate) mod read_proof_tests {
+    use super::*;
 
-    // The extraction itself lives in `facet_gate::collect_read_paths` and the
-    // runner calls it, so the gate is tested against the same code it uses.
-    use super::collect_read_paths as read_paths;
+    // A wire fixture for the consumer boundary, not a claim that these literal
+    // fields constitute a Runtime-authenticated receipt.
+    pub(crate) fn page() -> ReadEvidencePage {
+        serde_json::from_value(json!({
+            "schema_version":1,"execution_id":"graph","session_id":"session","turn_id":"turn",
+            "workspace_id":"workspace","authorization_revision":1,"redaction_revision":"redaction",
+            "graph_revision":2,"through":10,"next_after_sequence":4,"exhausted":false,
+            "incomplete":false,"reason":null,"source_incarnation":"incarnation","source_mutation_epoch":0,
+            "sources":[{"stream_id":"session-stream","revision":8}],
+            "reads":[{
+                "path":{"workspace_id":"workspace","repository_id":"repository","workspace_relative_path":"src/a.rs","repository_relative_path":"src/a.rs","object_kind":"file"},
+                "scope":{"resource":"file","operation":"read","target":"src/a.rs"},
+                "recipient":{"kind":"root","binding":{"root_execution_id":"graph","session_id":"session","turn_id":"turn","root_task_id":"task","task_id":"task","activity_id":"activity","revision":2,"fence":1,"generation":1}},
+                "step":{"step_id":"step","session_id":"session","turn_id":"turn","execution_id":"graph","build_ref":"build"},
+                "call_id":"call","tool_name":"read_file","invocation_id":"call",
+                "delivery":{"stream_id":"session-stream","sequence":4,"event_id":"delivery","commit_cursor":10,"payload_digest":"delivery-digest"},
+                "acquisition":{"stream_id":"primary","sequence":1,"event_id":"primary","commit_cursor":8,"payload_digest":"primary-digest"},
+                "index":{"stream_id":"index","sequence":1,"event_id":"index","commit_cursor":8,"payload_digest":"index-digest"},
+                "source_sha256":"source-digest","source_bytes":10,
+                "delivered_extent":{"kind":"file_lines","start_line":2,"line_count":1,"total_lines":4,"ends_with_newline":true,"body_sha256":"window-digest","body_bytes":2,"source_omitted":true},
+                "grade":"provider_model_observed","body_delivered":true
+            }]
+        })).unwrap()
+    }
 
-    fn event(tool: &str, preview: &str, is_error: bool) -> serde_json::Value {
-        json!({
-            "kind": "tool.invocation.completed",
-            "status": "completed",
-            "payload": {
-                "status": "completed",
-                "is_error": is_error,
-                "tool_name": tool,
-                "input_preview": preview,
+    fn collection() -> ReadEvidencePages {
+        ReadEvidencePages::new(
+            "graph",
+            "session",
+            "turn",
+            BTreeMap::from([("src/a.rs".to_string(), page().reads[0].path.clone())]),
+        )
+    }
+
+    #[test]
+    fn authenticated_partial_window_satisfies_existing_content_obligation_without_history_complete()
+    {
+        let mut proof = collection();
+        proof.accept(page()).unwrap();
+        assert!(proof.satisfied());
+        assert!(!proof.exhausted());
+        let report = proof.report();
+        assert_eq!(report["history_complete"], false);
+        assert_eq!(collect_read_paths(&report), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn preview_parent_success_and_projection_path_cannot_create_read_evidence() {
+        let old = json!({
+            "events":[{"kind":"tool.invocation.completed","payload":{"tool_name":"tool_orchestrate","status":"completed","is_error":false,"input_preview":"src/a.rs"}}],
+            "activities":[{"kind":"read","status":"completed","detail":{"path":"src/a.rs"}}]
+        });
+        assert!(collect_read_paths(&old).is_empty());
+        let mut proof = collection();
+        let mut parent_only = page();
+        parent_only.reads.clear();
+        proof.accept(parent_only).unwrap();
+        assert!(proof.paths().is_empty());
+    }
+
+    #[test]
+    fn foreign_repository_suffix_omitted_body_and_wrong_root_grade_are_not_reads() {
+        for fault in ["repository", "suffix", "body", "extent", "grade", "future"] {
+            let mut candidate = page();
+            let read = &mut candidate.reads[0];
+            match fault {
+                "repository" => read.path.repository_id = "foreign".into(),
+                "suffix" => read.path.workspace_relative_path = "foreign/src/a.rs".into(),
+                "body" => read.body_delivered = false,
+                "extent" => read.delivered_extent = None,
+                "grade" => read.grade = ReadEvidenceGrade::AgentChannelSend,
+                "future" => read.acquisition.commit_cursor = 11,
+                _ => unreachable!(),
             }
-        })
+            let mut proof = collection();
+            proof.accept(candidate).unwrap();
+            assert!(proof.paths().is_empty(), "{fault}");
+        }
     }
 
     #[test]
-    fn a_batched_read_counts_as_a_read_of_every_file() {
-        let preview = json!({"files": [{"path": "a.rs"}, {"path": "b.rs"}]}).to_string();
-        let timeline = json!({"events": [event("tool_orchestrate", &preview, false)]});
-        let paths = read_paths(&timeline, &[]);
-        assert!(paths.contains(&"a.rs".to_string()), "{paths:?}");
-        assert!(paths.contains(&"b.rs".to_string()), "{paths:?}");
+    fn changed_cut_epoch_grant_or_stream_invalidates_previously_satisfied_pages() {
+        for fault in [
+            "cut",
+            "epoch",
+            "grant",
+            "stream",
+            "incarnation",
+            "graph",
+            "redaction",
+            "incomplete",
+            "progress",
+        ] {
+            let mut proof = collection();
+            proof.accept(page()).unwrap();
+            assert!(proof.satisfied());
+            let mut next = page();
+            next.next_after_sequence = 5;
+            next.reads.clear();
+            match fault {
+                "cut" => next.through += 1,
+                "epoch" => next.source_mutation_epoch += 1,
+                "grant" => next.authorization_revision += 1,
+                "stream" => next.sources[0].revision += 1,
+                "incarnation" => next.source_incarnation = "replaced".into(),
+                "graph" => next.graph_revision += 1,
+                "redaction" => next.redaction_revision = "changed".into(),
+                "incomplete" => next.incomplete = true,
+                "progress" => next.next_after_sequence = 4,
+                _ => unreachable!(),
+            }
+            assert!(proof.accept(next).is_err(), "{fault}");
+            assert!(proof.paths().is_empty(), "{fault}");
+            assert!(collect_read_paths(&proof.report()).is_empty(), "{fault}");
+        }
     }
 
     #[test]
-    fn single_reads_are_collected_and_sorted() {
-        let timeline = json!({"events": [
-            event("read_file", &json!({"path": "c.rs"}).to_string(), false),
-            event("read_file", &json!({"path": "a.rs"}).to_string(), false),
-            event("read_file", &json!({"path": "b.rs"}).to_string(), false),
-        ]});
-        assert_eq!(
-            read_paths(&timeline, &[]),
-            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()]
-        );
+    fn unrelated_history_advances_without_skipping_obligation_and_page_cap_is_finite() {
+        let mut proof = collection();
+        let mut empty = page();
+        empty.reads.clear();
+        for sequence in 1..=255 {
+            empty.next_after_sequence = sequence;
+            proof.accept(empty.clone()).unwrap();
+        }
+        let mut last = page();
+        last.next_after_sequence = 256;
+        last.reads[0].delivery.sequence = 256;
+        proof.accept(last).unwrap();
+        assert!(proof.satisfied());
+        empty.next_after_sequence = 257;
+        assert!(proof.accept(empty).is_err());
+        assert!(!proof.satisfied());
     }
 
     #[test]
-    fn a_failed_read_is_not_evidence() {
-        let timeline = json!({"events": [event("read_file", &json!({"path": "a.rs"}).to_string(), true)]});
-        assert!(read_paths(&timeline, &[]).is_empty(), "an errored read is not evidence");
-    }
-
-    #[test]
-    fn a_write_tool_is_not_a_read() {
-        let timeline = json!({"events": [event("edit", &json!({"path": "a.rs"}).to_string(), false)]});
-        assert!(read_paths(&timeline, &[]).is_empty(), "only reads count");
+    fn exhausted_empty_history_is_not_empty_file_delivery() {
+        let mut proof = collection();
+        let mut empty = page();
+        empty.reads.clear();
+        empty.exhausted = true;
+        empty.next_after_sequence = 0;
+        proof.accept(empty).unwrap();
+        assert!(proof.paths().is_empty());
+        let mut candidate = page();
+        candidate.reads[0].source_bytes = 0;
+        if let Some(ReadEvidenceExtent::FileLines {
+            start_line,
+            line_count,
+            total_lines,
+            body_bytes,
+            source_omitted,
+            ..
+        }) = &mut candidate.reads[0].delivered_extent
+        {
+            *start_line = 1;
+            *line_count = 0;
+            *total_lines = 0;
+            *body_bytes = 0;
+            *source_omitted = false;
+        }
+        let mut proof = collection();
+        proof.accept(candidate).unwrap();
+        assert!(proof.satisfied());
     }
 }

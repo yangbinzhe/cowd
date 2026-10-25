@@ -1135,16 +1135,62 @@ fn tool_acceptance_rejects_answer_without_runtime_evidence() {
     assert!(!result.passed);
 }
 
+fn typed_read_timeline_fixture() -> Value {
+    // Independent expected identity, rather than a path extracted from the
+    // response/tool preview. This fixture exercises consumer semantics only.
+    let expected = harness_contract::context::WorkspacePathIdentity {
+        workspace_id: "workspace".into(),
+        repository_id: "repository".into(),
+        workspace_relative_path: "Cargo.toml".into(),
+        repository_relative_path: "Cargo.toml".into(),
+        object_kind: harness_contract::context::WorkspaceObjectKind::File,
+        observed_revision_or_digest: None,
+    };
+    let mut page = crate::facet_gate::read_proof_tests::page();
+    page.execution_id = "root".into();
+    page.reads[0].path = expected.clone();
+    page.reads[0].scope.target = Some("Cargo.toml".into());
+    page.reads[0].step.execution_id = Some("root".into());
+    if let harness_contract::projection::ReadEvidenceRecipient::Root { binding } = &mut page.reads[0].recipient {
+        binding.root_execution_id = "root".into();
+    }
+    let mut evidence = crate::facet_gate::ReadEvidencePages::new(
+        "root", "session", "turn",
+        BTreeMap::from([("Cargo.toml".to_string(), expected)]),
+    );
+    evidence.accept(page).unwrap();
+    let mut timeline = successful_root_outcome_timeline(json!({}));
+    timeline["read_evidence"] = evidence.report();
+    timeline
+}
+
 #[test]
 fn tool_acceptance_requires_completed_runtime_receipt_and_succeeded_outcome() {
-    let result = tool_acceptance().evaluate(
+    let preview_only = tool_acceptance().evaluate(
         "Cargo.toml version 0.9.712",
         &successful_root_outcome_timeline(json!({"events": [completed_tool_event()]})),
         &[],
         None,
         "root",
     );
-    assert!(result.passed);
+    assert!(!preview_only.passed, "completed input preview is not delivered content");
+
+    let result = tool_acceptance().evaluate(
+        "Cargo.toml version 0.9.712", &typed_read_timeline_fixture(), &[], None, "root",
+    );
+    assert!(result.passed, "typed read plus real root success: {:?}", result.checks);
+    for fault in ["target", "grade", "cut", "omitted"] {
+        let mut timeline = typed_read_timeline_fixture();
+        let page = &mut timeline["read_evidence"]["pages"][0];
+        match fault {
+            "target" => page["reads"][0]["path"]["workspace_relative_path"] = json!("README.md"),
+            "grade" => page["reads"][0]["grade"] = json!("agent_channel_send"),
+            "cut" => page["reads"][0]["delivery"]["commit_cursor"] = json!(11),
+            "omitted" => page["reads"][0]["body_delivered"] = json!(false),
+            _ => unreachable!(),
+        }
+        assert!(!tool_acceptance().evaluate("Cargo.toml", &timeline, &[], None, "root").passed, "{fault}");
+    }
 
     let result = tool_acceptance().evaluate(
         "Cargo.toml",
@@ -1221,24 +1267,18 @@ fn local_outcome_cannot_replace_root_business_observation() {
 #[test]
 fn partial_failed_or_missing_root_outcome_fails_closed() {
     for (status, class) in [("failed", "failed"), ("partial", "partial")] {
-        let timeline = json!({"events": [
-            completed_tool_event(),
-            {
-                "kind": "runtime.outcome.recorded.v1",
-                "status": status,
-                "payload": {
-                    "identity": {"execution_graph_ref": "root", "execution_scope":"session"},
-                    "terminal": {"class": class}
-                }
-            }
-        ]});
+        let mut timeline = typed_read_timeline_fixture();
+        timeline["events"][0]["status"] = json!(status);
+        timeline["events"][0]["payload"]["terminal"]["class"] = json!(class);
         let result = tool_acceptance().evaluate("Cargo.toml", &timeline, &[], None, "root");
         assert!(!result.passed, "{status}/{class} must fail closed");
     }
 
+    let mut no_root = typed_read_timeline_fixture();
+    no_root["events"] = json!([]);
     let missing = tool_acceptance().evaluate(
         "Cargo.toml",
-        &json!({"events": [completed_tool_event()]}),
+        &no_root,
         &[],
         None,
         "root",

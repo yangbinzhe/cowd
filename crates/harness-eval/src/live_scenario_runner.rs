@@ -1264,6 +1264,21 @@ impl LiveScenarioRunner {
     ) -> Value {
         trace.extend(actor.drain_trace());
         let session_id = actor.session_id().to_string();
+        // Capture independent expectations before admitting this objective;
+        // never derive the expected repository from the proof response.
+        let expected_reads = match preregister_read_paths(spec.acceptance.read_obligations()) {
+            Ok(expected) => expected,
+            Err(error) => {
+                return failed_scenario_with_session(
+                    spec,
+                    started,
+                    trace,
+                    session_id,
+                    error,
+                    Value::Null,
+                );
+            }
+        };
         let (execution_id, turn_id) = if resume_session.is_some() {
             match self.execution_live_observation(&session_id) {
                 Ok(observation) => {
@@ -1417,6 +1432,7 @@ impl LiveScenarioRunner {
         };
         let descendant_wait = self.wait_for_descendant_team_acceptance(
             spec.acceptance,
+            &expected_reads,
             &response_text,
             &session_id,
             turn_id_ref,
@@ -1518,7 +1534,8 @@ impl LiveScenarioRunner {
                 "terminal_id": terminal_id,
                 "runtime_commit_cursor": commit_cursor,
                 "message_materialized": true,
-            }
+            },
+            "read_evidence": timeline.get("read_evidence"),
         })
     }
 
@@ -2025,6 +2042,7 @@ impl LiveScenarioRunner {
     fn wait_for_descendant_team_acceptance(
         &self,
         acceptance: LiveAcceptance,
+        expected_reads: &BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
         response_text: &str,
         session_id: &str,
         turn_id: &str,
@@ -2069,13 +2087,33 @@ impl LiveScenarioRunner {
                     observer,
                 )
                 .err();
-            let timeline = observer.timeline();
+            let mut timeline = observer.timeline();
             // The public projection makes child execution lineage explicit. A
             // session ingress graph often delegates provider/tool/team work to
             // descendants, so reporting only the root would incorrectly claim
             // zero model rounds and zero token/tool usage for a real execution.
             let projections =
                 self.execution_lineage_projections(root_execution_id, trace, &mut projection_cache);
+            if !expected_reads.is_empty() {
+                let deadline = timeout.observation_deadline(
+                    scenario_started,
+                    wait_started,
+                    Duration::from_millis(
+                        observer
+                            .since_last_progress_ms(scenario_started.elapsed().as_millis() as u64),
+                    ),
+                    observer.progress_observations() as usize,
+                );
+                timeline["read_evidence"] = self.read_evidence(
+                    root_execution_id,
+                    session_id,
+                    turn_id,
+                    expected_reads.clone(),
+                    deadline,
+                    trace,
+                    actor,
+                );
+            }
             let agentic_program = if acceptance.requires_descendant_team_closure() {
                 extract_root_program_with_retry(|| {
                     self.root_agentic_program(session_id, turn_id, trace)
@@ -2238,6 +2276,80 @@ impl LiveScenarioRunner {
             .send()
             .map_err(|error| error.to_string())?;
         response_json(response)
+    }
+
+    fn read_evidence(
+        &self,
+        execution: &str,
+        session: &str,
+        turn: &str,
+        expected: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
+        deadline: Instant,
+        trace: &mut Vec<Value>,
+        actor: &mut SessionActor<'_>,
+    ) -> Value {
+        let mut evidence =
+            crate::facet_gate::ReadEvidencePages::new(execution, session, turn, expected);
+        for _ in 0..256 {
+            if let Err(error) = actor.maintain_receipt_authority() {
+                evidence.fail(format!(
+                    "read evidence receipt authority unavailable: {error}"
+                ));
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                evidence.fail("original scenario observation deadline reached");
+                break;
+            }
+            let path = format!("/api/runtime/executions/{execution}/read-evidence");
+            let mut query = vec![
+                ("after_sequence", evidence.next_after_sequence().to_string()),
+                ("limit", "16".to_string()),
+            ];
+            if let Some(through) = evidence.through() {
+                query.push(("through", through.to_string()));
+            }
+            let response = self
+                .client
+                .get(format!("{}{}", self.base_url, path))
+                .query(&query)
+                .timeout(
+                    remaining.min(
+                        self.timeout_cap
+                            .unwrap_or(MAX_DEFAULT_SCENARIO_TIMEOUT)
+                            .saturating_add(Duration::from_secs(15)),
+                    ),
+                )
+                .send()
+                .map_err(|error| error.to_string())
+                .and_then(response_json);
+            // Keep the actual page including invalid/incomplete responses, not
+            // just the derived green paths. No snapshot cache is consulted.
+            trace.push(trace_json_entry(
+                "GET",
+                path,
+                json!({"query":query}),
+                &response,
+            ));
+            let page = match response.and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| format!("invalid read evidence page: {error}"))
+            }) {
+                Ok(page) => page,
+                Err(error) => {
+                    evidence.fail(error);
+                    break;
+                }
+            };
+            if evidence.accept(page).is_err() || evidence.satisfied() || evidence.exhausted() {
+                break;
+            }
+        }
+        if !evidence.satisfied() && !evidence.exhausted() {
+            evidence.fail("read evidence 256-page limit reached");
+        }
+        evidence.report()
     }
 
     fn root_agentic_program(
@@ -3224,6 +3336,20 @@ enum ArchitectureEvidenceProfile {
 }
 
 impl LiveAcceptance {
+    fn read_obligations(self) -> Vec<&'static str> {
+        match self {
+            Self::RequiresToolEvidence {
+                tool_name: "read_file",
+                target_path,
+            } => vec![target_path],
+            Self::Facet {
+                required_read_paths,
+                ..
+            } => required_read_paths.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
     fn requires_descendant_team_closure(self) -> bool {
         matches!(
             self,
@@ -3258,8 +3384,13 @@ impl LiveAcceptance {
                 tool_name,
                 target_path,
             } => {
-                let tool_evidence =
-                    has_successful_runtime_tool_completion(timeline, tool_name, target_path);
+                let tool_evidence = if tool_name == "read_file" {
+                    durable_read_receipt_paths(timeline)
+                        .iter()
+                        .any(|path| path == target_path)
+                } else {
+                    has_successful_runtime_tool_completion(timeline, tool_name, target_path)
+                };
                 LiveAcceptanceResult {
                     passed: !response.trim().is_empty() && tool_evidence,
                     quality: None,
@@ -3276,10 +3407,7 @@ impl LiveAcceptance {
                 answer_contains,
                 keep_unresolved_ok,
             } => {
-                // Collect the paths that actually have a durable read receipt
-                // from the timeline, so "the model claims it read X" and "the
-                // model read X" stay distinguishable.
-                let read_paths = durable_read_receipt_paths(timeline, projections);
+                let read_paths = durable_read_receipt_paths(timeline);
                 let outcome = crate::facet_gate::FacetOutcome {
                     read_paths,
                     answer: response.to_string(),
@@ -3304,17 +3432,17 @@ impl LiveAcceptance {
                 LiveAcceptanceResult {
                     passed: verdict.passed,
                     quality: None,
-                    checks: verdict
-                        .requirements
-                        .iter()
-                        .map(|requirement| {
-                            json!({
-                                "name": requirement.requirement,
-                                "passed": requirement.passed,
-                                "observed": requirement.observed,
-                            })
+                    checks: std::iter::once(json!({
+                        "name": "durable_response", "passed": !response.trim().is_empty(),
+                    }))
+                    .chain(verdict.requirements.iter().map(|requirement| {
+                        json!({
+                            "name": requirement.requirement,
+                            "passed": requirement.passed,
+                            "observed": requirement.observed,
                         })
-                        .collect(),
+                    }))
+                    .collect(),
                 }
             }
             Self::ArchitectureQuality {
@@ -5126,15 +5254,45 @@ pub(crate) fn root_business_observation(timeline: &Value, root_execution_id: &st
     })
 }
 
-/// Successful tool evidence is a canonical Runtime completion receipt. It is
-/// deliberately not a recursive key search: provider capability metadata and
-/// zero-valued usage summaries are declarations, not executed effects.
-/// PLAN L1: the paths that actually got a durable successful read receipt.
-///
-/// The extraction lives in `facet_gate::collect_read_paths` so the gate and its
-/// tests use the same code; this exists to keep the call site readable.
-fn durable_read_receipt_paths(timeline: &Value, projections: &[Value]) -> Vec<String> {
-    crate::facet_gate::collect_read_paths(timeline, projections)
+fn preregister_read_paths(
+    required: Vec<&str>,
+) -> Result<BTreeMap<String, harness_contract::context::WorkspacePathIdentity>, String> {
+    if required.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let root = std::env::current_dir()
+        .map_err(|error| format!("scenario workspace unavailable: {error}"))?;
+    let resolver = runtime::path_identity::WorkspacePathIdentityResolver::discover(&root)
+        .map_err(|error| format!("scenario workspace identity unavailable: {error}"))?;
+    required
+        .into_iter()
+        .map(|path| {
+            let identity = resolver
+                .resolve_existing(path)
+                .map_err(|error| format!("scenario read expectation {path}: {error}"))?;
+            if identity.workspace_id != resolver.workspace_id()
+                || std::path::Path::new(&identity.workspace_relative_path)
+                    .components()
+                    .any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+            {
+                return Err(format!(
+                    "scenario read expectation escapes workspace: {path}"
+                ));
+            }
+            Ok((path.to_string(), identity))
+        })
+        .collect()
+}
+
+fn durable_read_receipt_paths(timeline: &Value) -> Vec<String> {
+    crate::facet_gate::collect_read_paths(&timeline["read_evidence"])
 }
 
 /// PLAN L1: whether the final answer explicitly keeps something unresolved.
@@ -5164,10 +5322,11 @@ fn has_successful_runtime_tool_completion(
     // Reading via a batch is still reading the same file, and the model may
     // pass an absolute path. Accept equivalent tools and path forms so the
     // acceptance checks the *action*, not a presentation choice.
-    let accepts_tool = |name: &str| match expected_tool_name {
-        "read_file" => matches!(name, "read_file" | "tool_orchestrate"),
-        other => name == other,
-    };
+    // Read acceptance has no tool-completion/input-preview fallback.
+    if expected_tool_name == "read_file" {
+        return false;
+    }
+    let accepts_tool = |name: &str| name == expected_tool_name;
     let target = expected_target_path.trim_start_matches("./");
     let accepts_path = |path: &str| {
         let path = path.trim_start_matches("./");
@@ -5192,7 +5351,7 @@ fn has_successful_runtime_tool_completion(
                     .and_then(Value::as_str)
                     .and_then(|input| serde_json::from_str::<Value>(input).ok())
                     .is_some_and(|input| {
-                        crate::facet_gate::read_paths_from_tool_input(&input)
+                        crate::facet_gate::tool_target_paths_from_input(&input)
                             .iter()
                             .any(|path| accepts_path(path))
                     })
@@ -5234,6 +5393,116 @@ fn env_duration_millis(key: &str, default: Duration) -> Duration {
 #[cfg(test)]
 #[path = "live_scenario_runner/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod read_evidence_consumer_tests {
+    use super::*;
+
+    fn timeline() -> Value {
+        json!({"events":[{
+            "kind":"runtime.outcome.recorded.v1","status":"succeeded",
+            "payload":{"identity":{"execution_graph_ref":"graph","execution_scope":"session"},"terminal":{"class":"succeeded"}}
+        }]})
+    }
+
+    fn consumers() -> [LiveAcceptance; 2] {
+        [
+            LiveAcceptance::RequiresToolEvidence {
+                tool_name: "read_file",
+                target_path: "src/a.rs",
+            },
+            LiveAcceptance::Facet {
+                facet_id: "read",
+                capability: "actual content",
+                required_read_paths: &["src/a.rs"],
+                answer_contains: &["answer"],
+                keep_unresolved_ok: true,
+            },
+        ]
+    }
+
+    fn with_proof() -> Value {
+        let page = crate::facet_gate::read_proof_tests::page();
+        let mut proof = crate::facet_gate::ReadEvidencePages::new(
+            "graph",
+            "session",
+            "turn",
+            BTreeMap::from([("src/a.rs".to_string(), page.reads[0].path.clone())]),
+        );
+        proof.accept(page).unwrap();
+        let mut value = timeline();
+        value["read_evidence"] = proof.report();
+        value
+    }
+
+    #[test]
+    fn both_consumer_predicates_accept_typed_partial_and_reject_preview_parent_and_crosscut() {
+        for acceptance in consumers() {
+            let valid = with_proof();
+            let result = acceptance.evaluate("answer", &valid, &[], None, "graph");
+            assert!(result.passed, "{:?}", result.checks);
+            let mut preview = timeline();
+            preview["events"].as_array_mut().unwrap().push(json!({
+                "kind":"tool.invocation.completed","status":"completed",
+                "payload":{"status":"completed","tool_name":"tool_orchestrate","is_error":false,"invocation_id":"parent","tool_call_id":"parent","input_preview":"{\"path\":\"src/a.rs\"}"}
+            }));
+            assert!(
+                !acceptance
+                    .evaluate("answer", &preview, &[], None, "graph")
+                    .passed
+            );
+            for fault in ["parent", "repository", "epoch", "grade", "body"] {
+                let mut changed = with_proof();
+                let page = &mut changed["read_evidence"]["pages"][0];
+                match fault {
+                    "parent" => page["reads"] = json!([]),
+                    "repository" => page["reads"][0]["path"]["repository_id"] = json!("foreign"),
+                    "grade" => page["reads"][0]["grade"] = json!("agent_channel_send"),
+                    "body" => page["reads"][0]["body_delivered"] = json!(false),
+                    "epoch" => {
+                        let mut next = page.clone();
+                        next["source_mutation_epoch"] = json!(1);
+                        next["next_after_sequence"] = json!(5);
+                        next["reads"] = json!([]);
+                        changed["read_evidence"]["pages"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(next);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !acceptance
+                        .evaluate("answer", &changed, &[], None, "graph")
+                        .passed,
+                    "{fault}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_read_tool_receipt_and_answer_requirements_remain_independent() {
+        let mut value = timeline();
+        value["events"].as_array_mut().unwrap().push(json!({
+            "kind":"tool.invocation.completed","status":"completed",
+            "payload":{"status":"completed","tool_name":"edit","is_error":false,"invocation_id":"write","tool_call_id":"write","input_preview":"{\"path\":\"src/a.rs\"}"}
+        }));
+        let write = LiveAcceptance::RequiresToolEvidence {
+            tool_name: "edit",
+            target_path: "src/a.rs",
+        };
+        assert!(write.evaluate("answer", &value, &[], None, "graph").passed);
+        assert!(!write.evaluate("", &value, &[], None, "graph").passed);
+        for acceptance in consumers() {
+            assert!(
+                !acceptance
+                    .evaluate("", &with_proof(), &[], None, "graph")
+                    .passed
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tool_call_count_tests {
