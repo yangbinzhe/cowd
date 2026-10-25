@@ -925,6 +925,17 @@ fn timeline_coverage_complete(observation: &Value) -> bool {
 }
 
 pub(crate) fn canonical_total_tokens(report: &Value) -> Option<u32> {
+    if report["kind"] == "harness_eval.u5_internal" {
+        let leaves = report
+            .pointer("/live_gateway_scenarios/scenarios/0/sessions")?
+            .as_array()?;
+        let usage = u5_stage_usage(leaves).ok()?;
+        if usage != report["u5_usage"] {
+            return None;
+        }
+        return u32::try_from(usage["total_tokens"].as_u64()?).ok();
+    }
+
     if report.get("kind").and_then(Value::as_str)
         == Some("harness_eval.paired_public_api_performance")
     {
@@ -1040,7 +1051,211 @@ pub(crate) fn canonical_total_tokens(report: &Value) -> Option<u32> {
 }
 
 #[must_use]
+/// Exact physical call IDs are additive; missing outcomes/usage never mean zero.
+pub(crate) fn u5_stage_usage(leaves: &[Value]) -> Result<Value, String> {
+    let mut calls = std::collections::BTreeMap::<String, Value>::new();
+    let mut packed = std::collections::BTreeMap::new();
+    for leaf in leaves {
+        let events = leaf["u5_provider_events"]
+            .as_array()
+            .ok_or("U5 Provider source missing")?;
+        let mut leaf_ids = std::collections::BTreeSet::new();
+        for event in events {
+            let payload = &event["payload"];
+            let id = payload["request_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("U5 call identity missing")?;
+            match event["kind"].as_str() {
+                Some("context.provider_request_packed") => {
+                    if packed
+                        .insert(id.to_owned(), payload.clone())
+                        .is_some_and(|old| old != *payload)
+                    {
+                        return Err("U5 conflicting packed call".into());
+                    }
+                    leaf_ids.insert(id.to_owned());
+                }
+                Some("context.provider_attempt_outcome") => {
+                    leaf_ids.insert(id.to_owned());
+                    if calls
+                        .insert(id.to_owned(), payload.clone())
+                        .is_some_and(|old| old != *payload)
+                    {
+                        return Err("U5 conflicting call outcome".into());
+                    }
+                }
+                _ => return Err("U5 unknown Provider source".into()),
+            }
+        }
+        if leaf_ids.is_empty() {
+            return Err("U5 leaf has no physical call evidence".into());
+        }
+    }
+    if calls.is_empty()
+        || packed.keys().any(|id| !calls.contains_key(id))
+        || calls.keys().any(|id| !packed.contains_key(id))
+    {
+        return Err("U5 physical call usage unknown".into());
+    }
+    let mut result = serde_json::Map::new();
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ] {
+        let total = calls.values().try_fold(0u64, |sum, call| {
+            if call["usage_status"] != "known" {
+                return None;
+            }
+            if key.starts_with("cache_") && call["cache_dimensions_status"] != "known" {
+                return None;
+            }
+            sum.checked_add(call["usage"][key].as_u64()?)
+        });
+        if matches!(key, "input_tokens" | "output_tokens") && total.is_none() {
+            return Err("U5 required usage unknown".into());
+        }
+        result.insert(key.to_owned(), json!(total));
+    }
+    let total = [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .try_fold(0u64, |sum, key| sum.checked_add(result[*key].as_u64()?));
+    result.insert("total_tokens".into(), json!(total));
+    result.insert("physical_calls".into(), json!(calls.len()));
+    result.insert(
+        "source".into(),
+        json!("original_provider_call_id_deduplicated"),
+    );
+    Ok(Value::Object(result))
+}
+
+fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
+    let live = &report["live_gateway_scenarios"];
+    let pairs = live["scenarios"].as_array();
+    let pair = pairs.and_then(|p| p.first()).unwrap_or(&Value::Null);
+    let leaves = pair["sessions"].as_array();
+    let leaf_ok = leaves.is_some_and(|l| {
+        l.len() == 2
+            && l.iter().all(|v| {
+                v["status"] == "passed"
+                    && v["metrics"]["tool_calls"].as_u64().is_some()
+                    && v.pointer("/acceptance/passed") == Some(&Value::Bool(true))
+                    && v.pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
+                    && v.pointer("/acceptance/checks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|checks| {
+                            !checks.is_empty() && checks.iter().all(|c| c["passed"] == true)
+                        })
+            })
+    });
+    let identities = leaves.is_some_and(|l| {
+        l.len() == 2
+            && ["session_id", "turn_id", "execution_id"].iter().all(|key| {
+                l[0][key].as_str().is_some_and(|a| {
+                    !a.is_empty() && l[1][key].as_str().is_some_and(|b| !b.is_empty() && a != b)
+                })
+            })
+    });
+    let usage = leaves.and_then(|l| u5_stage_usage(l).ok());
+    let checks = [
+        (
+            "u5_exact_focused_selection",
+            report["level"] == "deep"
+                && report["authorized_real_model"] == true
+                && live["status"] == "pending_outer_cleanup"
+                && live["claim_scope"] == "focused"
+                && live["health_status"] == "passed"
+                && live["selection_status"] == "passed"
+                && live["selected_scenario_ids"] == json!(["live_u5_shared_session_fairness"])
+                && pairs.is_some_and(|p| p.len() == 1)
+                && pair["scenario_id"] == "live_u5_shared_session_fairness",
+        ),
+        (
+            "u5_two_original_leaf_business_permissions_and_ACK",
+            leaf_ok && identities,
+        ),
+        (
+            "u5_original_capacity_witness",
+            pair["status"] == "pending_outer_cleanup"
+                && pair.pointer("/acceptance/checks/internal_passed") == Some(&Value::Bool(true))
+                && [
+                    "identity",
+                    "selected_witnesses_complete",
+                    "left_business",
+                    "right_business",
+                    "capacity_competition",
+                ]
+                .iter()
+                .all(|k| pair["acceptance"]["checks"][k] == true),
+        ),
+        (
+            "u5_original_usage_complete",
+            usage
+                .as_ref()
+                .is_some_and(|u| u["total_tokens"].as_u64().is_some())
+                && usage.as_ref().is_some_and(|u| {
+                    [
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                        "total_tokens",
+                    ]
+                    .iter()
+                    .all(|key| u[*key] == report["execution_trace"]["total_usage"][*key])
+                        && u["physical_calls"] == report["execution_trace"]["provider_rounds"]
+                })
+                && usage == Some(report["u5_usage"].clone()),
+        ),
+        (
+            "u5_host_binding_present",
+            report["u5_host"]["nonce"]
+                .as_str()
+                .is_some_and(|s| s.len() == 64)
+                && report["u5_host"]["candidate"]
+                    .as_str()
+                    .is_some_and(|s| s.len() == 40),
+        ),
+    ];
+    let items = checks
+        .iter()
+        .map(|(name, ok)| {
+            HarnessEvalReportGateItem::new(
+                *name,
+                *ok,
+                true,
+                "original U5 inputs",
+                "restore exact source evidence",
+            )
+        })
+        .collect::<Vec<_>>();
+    let failed = checks.iter().filter(|(_, ok)| !*ok).count();
+    HarnessEvalReportGate {
+        kind: "harness_eval.u5_internal_gate".into(),
+        status: if failed == 0 {
+            "pending_outer_cleanup"
+        } else {
+            "failed"
+        }
+        .into(),
+        total: items.len(),
+        passed: items.len() - failed,
+        failed,
+        items,
+    }
+}
+
 pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
+    if report["kind"] == "harness_eval.u5_internal" {
+        return u5_stage_gate(report);
+    }
     if report.get("kind").and_then(Value::as_str)
         == Some("harness_eval.paired_public_api_performance")
     {
@@ -3407,7 +3622,11 @@ impl HarnessEvalReportSummary {
             scenario_count: scenarios.len(),
             failed_capabilities: scenarios
                 .iter()
-                .filter(|item| item.get("status").and_then(Value::as_str) != Some("passed"))
+                .filter(|item| {
+                    item.get("status").and_then(Value::as_str) != Some("passed")
+                        && !(report["kind"] == "harness_eval.u5_internal"
+                            && item["status"] == "pending_outer_cleanup")
+                })
                 .count(),
         }
     }
@@ -3418,4 +3637,87 @@ fn now_ms_u128() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+pub(crate) mod u5_stage_tests {
+    use super::*;
+    fn leaf(id: &str, input: u64, output: u64) -> Value {
+        json!({"session_id":format!("session-{id}"),"turn_id":format!("turn-{id}"),"execution_id":format!("root-{id}"),
+            "status":"passed","metrics":{"tool_calls":1},"acceptance":{"passed":true,"checks":[{"name":"original_read_and_ACK","passed":true}]},"actor_cleanup":{"passed":true},
+            "u5_provider_events":[{"kind":"context.provider_request_packed","payload":{"request_id":id}},
+            {"kind":"context.provider_attempt_outcome","payload":{"request_id":id,"usage_status":"known","cache_dimensions_status":"known","usage":{"input_tokens":input,"output_tokens":output,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}]})
+    }
+    pub(crate) fn original_stage() -> Value {
+        json!({"kind":"harness_eval.u5_internal","level":"deep","authorized_real_model":true,
+            "u5_host":{"nonce":"a".repeat(64),"candidate":"b".repeat(40)},
+            "scenarios":[{"capability":"live_u5_shared_session_fairness","status":"pending_outer_cleanup"}],
+            "execution_trace":{"provider_rounds":2,"tool_calls":2,"total_usage":{"input_tokens":4,"output_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"total_tokens":10,"usage_source":"live_gateway_canonical_usage"}},
+            "u5_usage":{"total_tokens":10,"physical_calls":2,"source":"original_provider_call_id_deduplicated","input_tokens":4,"output_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},
+            "live_gateway_scenarios":{"status":"pending_outer_cleanup","health_status":"passed","selection_status":"passed","claim_scope":"focused","selected_scenario_ids":["live_u5_shared_session_fairness"],
+            "scenarios":[{"scenario_id":"live_u5_shared_session_fairness","status":"pending_outer_cleanup",
+                "acceptance":{"checks":{"internal_passed":true,"identity":true,"selected_witnesses_complete":true,"left_business":true,"right_business":true,"capacity_competition":true}},
+                "sessions":[leaf("a",1,2),leaf("b",3,4)]}]}})
+    }
+    #[test]
+    fn u5_pending_requires_original_two_leaf_hardgates_and_typed_usage() {
+        let good = original_stage();
+        let gate = evaluate_report_gate(&good);
+        assert_eq!(gate.status, "pending_outer_cleanup");
+        assert_eq!(gate.failed, 0);
+        for (path,value) in [
+            ("/level",json!("quick")),("/authorized_real_model",json!(false)),
+            ("/live_gateway_scenarios/selected_scenario_ids",json!(["live_u5_shared_session_fairness","live_tool_evidence"])),
+            ("/live_gateway_scenarios/health_status",json!("failed")),
+            ("/live_gateway_scenarios/scenarios/0/sessions/0/status",json!("cancelled")),
+            ("/live_gateway_scenarios/scenarios/0/sessions/0/actor_cleanup/passed",json!(false)),
+            ("/live_gateway_scenarios/scenarios/0/sessions/0/acceptance/checks/0/passed",json!(false)),
+            ("/live_gateway_scenarios/scenarios/0/sessions/0/turn_id",json!("turn-b")),
+            ("/live_gateway_scenarios/scenarios/0/acceptance/checks/capacity_competition",json!(false)),
+            ("/live_gateway_scenarios/scenarios/0/sessions/0/u5_provider_events/1/payload/usage/input_tokens",Value::Null),
+            ("/u5_usage/input_tokens",json!(0)),
+        ] {
+            let mut bad=good.clone();*bad.pointer_mut(path).expect("independent fixture field")=value;
+            assert_eq!(evaluate_report_gate(&bad).status,"failed","{path}");
+        }
+        let mut ordinary = good;
+        ordinary["kind"] = json!("ordinary");
+        ordinary["status"] = json!("pending_outer_cleanup");
+        assert_ne!(
+            evaluate_report_gate(&ordinary).status,
+            "pending_outer_cleanup"
+        );
+    }
+    #[test]
+    fn u5_call_identity_dedup_rejects_unknown_conflicts_and_preserves_unknown_cache() {
+        let first = leaf("a", 1, 2);
+        let second = leaf("b", 3, 4);
+        let expected = json!({"total_tokens":10,"physical_calls":2,"source":"original_provider_call_id_deduplicated","input_tokens":4,"output_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":0});
+        assert_eq!(
+            u5_stage_usage(&[first.clone(), second.clone()]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            u5_stage_usage(&[first.clone(), second, first.clone()]).unwrap(),
+            expected
+        );
+        for value in [Value::Null, json!("1"), json!(-1)] {
+            let mut bad = first.clone();
+            bad["u5_provider_events"][1]["payload"]["usage"]["input_tokens"] = value;
+            assert!(u5_stage_usage(&[bad]).is_err());
+        }
+        let mut missing = first.clone();
+        missing["u5_provider_events"].as_array_mut().unwrap().pop();
+        assert!(u5_stage_usage(&[missing]).is_err());
+        let mut conflict = first.clone();
+        conflict["u5_provider_events"][1]["payload"]["usage"]["output_tokens"] = json!(99);
+        assert!(u5_stage_usage(&[first, conflict]).is_err());
+        let mut unknown = leaf("unknown", 1, 2);
+        unknown["u5_provider_events"][1]["payload"]["cache_dimensions_status"] = json!("unknown");
+        let partial = u5_stage_usage(&[unknown]).unwrap();
+        assert_eq!(partial["cache_read_input_tokens"], Value::Null);
+        assert_eq!(partial["total_tokens"], Value::Null);
+        let zero = leaf("zero", 0, 0);
+        assert_eq!(u5_stage_usage(&[zero]).unwrap()["input_tokens"], 0);
+    }
 }

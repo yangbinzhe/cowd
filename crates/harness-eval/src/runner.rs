@@ -75,6 +75,116 @@ impl HarnessEvalRunControl {
     }
 }
 
+/// A launcher-owned intermediate disposition. It is never deserialized from a report.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CliEvalDisposition {
+    Finished,
+    PendingOuterCleanup,
+}
+
+pub fn run_eval_cli(
+    store: &HarnessEvalReportStore,
+    options: HarnessEvalRunnerOptions,
+) -> Result<(HarnessEvalRunRecord, CliEvalDisposition), String> {
+    if std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_deref()
+        != Some("live_u5_shared_session_fairness")
+    {
+        return run_eval(store, options).map(|r| (r, CliEvalDisposition::Finished));
+    }
+    if options.level != HarnessEvalLevel::Deep || !options.allow_real_model {
+        return Err("U5 explicit real focused authorization required".into());
+    }
+    let host = crate::live_scenario_runner::U5Host::inherited()?;
+    let requested = now_ms();
+    let run_id = format!("harness-eval-u5-{}", uuid::Uuid::new_v4());
+    store.upsert_run(&running_record(&options, &run_id, requested))?;
+    let details = run_live_gateway_scenarios(&options);
+    let leaves = details
+        .pointer("/scenarios/0/sessions")
+        .and_then(Value::as_array);
+    let usage = leaves.and_then(|leaves| crate::report::u5_stage_usage(leaves).ok());
+    let calls = usage.as_ref().and_then(|u| u["physical_calls"].as_u64());
+    let tools = leaves.and_then(|l| {
+        l.iter().try_fold(0u64, |sum, v| {
+            sum.checked_add(v["metrics"]["tool_calls"].as_u64()?)
+        })
+    });
+    let mut trace_usage = usage.clone().unwrap_or(Value::Null);
+    if let Some(object) = trace_usage.as_object_mut() {
+        object.insert("usage_source".into(), json!("live_gateway_canonical_usage"));
+    }
+    let mut report = json!({"kind":"harness_eval.u5_internal","level":"deep","authorized_real_model":true,
+        "run_id":run_id,"u5_host":host.binding(),"u5_usage":usage,
+        "provider":options.provider,"budget":options.budget,
+        "live_gateway_scenarios":live_gateway_scenario_summary(&details),"live_gateway_scenario_details":details,
+        "scenarios":[{"capability":"live_u5_shared_session_fairness","status":"pending_outer_cleanup"}],
+        "execution_trace":{"started_at_ms":requested,"total_elapsed_ms":now_ms().saturating_sub(requested),
+            "provider_rounds":calls,"tool_calls":tools,"total_usage":trace_usage}});
+    let stable = stable_ai_report_for(&options);
+    let gate = evaluate_report_gate(&report);
+    if gate.status == "failed" {
+        report["scenarios"][0]["status"] = json!("failed");
+    }
+    let summary = store.write_report("deep", &mut report, &stable)?;
+    let pending =
+        gate.status == "pending_outer_cleanup" && summary.status == "pending_outer_cleanup";
+    let mut record = completed_record(
+        run_id,
+        &summary,
+        if pending {
+            HarnessEvalRunStatus::Gated
+        } else {
+            HarnessEvalRunStatus::Failed
+        },
+        &options,
+        requested,
+        false,
+    );
+    record.message = if pending {
+        "U5 internal stage pending original host shutdown; not accepted"
+    } else {
+        "U5 internal hardgate failed"
+    }
+    .into();
+    store.upsert_run(&record)?;
+    if !pending {
+        return Ok((record, CliEvalDisposition::Finished));
+    }
+    // Revalidate original inherited host after all actor work, before publishing
+    // the sole pending receipt. A body containing "pending" cannot enter here.
+    let current = crate::live_scenario_runner::U5Host::inherited()?;
+    if current.binding() != host.binding() {
+        return Err("U5 host changed after run".into());
+    }
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let report_path = record
+        .report_path
+        .as_deref()
+        .ok_or("U5 report not persisted")?;
+    let bytes = std::fs::read(report_path).map_err(|e| e.to_string())?;
+    use sha2::{Digest, Sha256};
+    let receipt = json!({"schema_version":1,"disposition":"pending_outer_cleanup","run_id":record.run_id,
+        "owner":host.binding(),"report_path":report_path,"report_sha256":format!("{:x}",Sha256::digest(&bytes)),
+        "scenario":"live_u5_shared_session_fairness","usage":report["u5_usage"]});
+    let path =
+        std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").map_err(|e| e.to_string())?)
+            .join("u5-inner-receipt.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(
+        serde_json::to_string(&receipt)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .and_then(|_| file.sync_all())
+    .map_err(|e| e.to_string())?;
+    Ok((record, CliEvalDisposition::PendingOuterCleanup))
+}
+
 pub fn run_eval(
     store: &HarnessEvalReportStore,
     options: HarnessEvalRunnerOptions,

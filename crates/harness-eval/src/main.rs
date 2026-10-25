@@ -1,15 +1,20 @@
 use harness_eval::{
-    default_report_root, run_auto_strategy_paired, run_certification_manifest, run_eval,
+    default_report_root, run_auto_strategy_paired, run_certification_manifest, run_eval_cli,
     run_paired_performance, run_provider_cache_calibration, terminal_gate_report_with_report,
-    write_auto_strategy_report, AutoStrategyPairedOptions, HarnessEvalLevel,
+    write_auto_strategy_report, AutoStrategyPairedOptions, CliEvalDisposition, HarnessEvalLevel,
     HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
     ProviderCacheCalibrationOptions,
 };
 use std::{path::PathBuf, time::Duration};
 
 fn main() -> std::process::ExitCode {
-    match run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+    exit_for(run())
+}
+
+fn exit_for(result: Result<CliEvalDisposition, String>) -> std::process::ExitCode {
+    match result {
+        Ok(CliEvalDisposition::Finished) => std::process::ExitCode::SUCCESS,
+        Ok(CliEvalDisposition::PendingOuterCleanup) => std::process::ExitCode::from(75),
         Err(error) => {
             eprintln!("harness-eval: {error}");
             std::process::ExitCode::FAILURE
@@ -17,14 +22,14 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<CliEvalDisposition, String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(
         args.first().map(String::as_str),
         Some("--help") | Some("-h")
     ) {
         print_help();
-        return Ok(());
+        return Ok(CliEvalDisposition::Finished);
     }
     match args.first().map(String::as_str) {
         Some("provider-cache-calibration") => {
@@ -40,7 +45,7 @@ fn run() -> Result<(), String> {
                 "warm-provider-cache-ratio-bp: {}",
                 report["summary"]["warm_provider_cache_ratio_bp"]
             );
-            return Ok(());
+            return Ok(CliEvalDisposition::Finished);
         }
         Some("auto-strategy-paired") => {
             let output = PathBuf::from(required_option(&args[1..], "--output")?);
@@ -103,7 +108,7 @@ fn run() -> Result<(), String> {
                     output.display()
                 ));
             }
-            return Ok(());
+            return Ok(CliEvalDisposition::Finished);
         }
         Some("paired-performance") => {
             let baseline_url = required_option(&args[1..], "--baseline-url")?;
@@ -178,7 +183,7 @@ fn run() -> Result<(), String> {
                     output.display()
                 ));
             }
-            return Ok(());
+            return Ok(CliEvalDisposition::Finished);
         }
         Some("review-report") => {
             let run_dir = option_value(&args[1..], "--run-dir")
@@ -193,7 +198,7 @@ fn run() -> Result<(), String> {
             let output = HarnessEvalReportStore::review_report_dir(run_dir, options)
                 .map_err(|error| format!("failed to review harness eval report: {error}"))?;
             println!("full-analysis-report: {}", output.display());
-            return Ok(());
+            return Ok(CliEvalDisposition::Finished);
         }
         Some("terminal-gate") => {
             let evidence_dir = option_value(&args[1..], "--evidence-dir").unwrap_or_else(|| {
@@ -212,7 +217,7 @@ fn run() -> Result<(), String> {
                         .unwrap_or("<report unavailable>")
                 ));
             }
-            return Ok(());
+            return Ok(CliEvalDisposition::Finished);
         }
         Some("certify") => {
             let manifest = required_option(&args[1..], "--manifest")?;
@@ -231,7 +236,7 @@ fn run() -> Result<(), String> {
                     report.required_source_failures, report.required_check_failures
                 ));
             }
-            return Ok(());
+            return Ok(CliEvalDisposition::Finished);
         }
         _ => {}
     }
@@ -262,7 +267,7 @@ fn run() -> Result<(), String> {
     };
 
     let store = HarnessEvalReportStore::new(default_report_root(default_config_home()));
-    let record = run_eval(&store, options)
+    let (record, disposition) = run_eval_cli(&store, options)
         .map_err(|error| format!("failed to run harness eval: {error}"))?;
 
     println!("mission harness {} eval: {}", record.level, record.status);
@@ -287,7 +292,7 @@ fn run() -> Result<(), String> {
                 .unwrap_or("<report unavailable>")
         ));
     }
-    Ok(())
+    Ok(disposition)
 }
 
 fn print_help() {
@@ -320,4 +325,23 @@ fn default_config_home() -> PathBuf {
                 .map(|home| home.join(".config").join("cowd"))
         })
         .unwrap_or_else(|| PathBuf::from(".cowd"))
+}
+
+#[cfg(test)]
+mod cli_disposition_tests {
+    use super::*;
+    #[test]
+    fn only_typed_pending_returns_reserved75() {
+        assert_eq!(
+            exit_for(Ok(CliEvalDisposition::PendingOuterCleanup)),
+            std::process::ExitCode::from(75)
+        );
+        assert_eq!(
+            exit_for(Ok(CliEvalDisposition::Finished)),
+            std::process::ExitCode::SUCCESS
+        );
+        for text in ["pending_outer_cleanup", "75", "failed", "cancelled"] {
+            assert_eq!(exit_for(Err(text.into())), std::process::ExitCode::FAILURE);
+        }
+    }
 }

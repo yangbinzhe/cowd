@@ -1327,3 +1327,62 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+#[cfg(test)]
+mod u5_store_tests {
+    use super::*;
+    #[test]
+    fn u5_pending_store_keeps_both_original_leaves_and_never_reports_passed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = HarnessEvalReportStore::new(root.path().to_path_buf());
+        let stable = crate::runner::run_eval(
+            &store,
+            crate::HarnessEvalRunnerOptions {
+                level: crate::HarnessEvalLevel::Quick,
+                provider: None,
+                budget: None,
+                allow_real_model: false,
+            },
+        )
+        .unwrap();
+        let stable_report = store
+            .get_report(stable.report_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        let health: crate::StableAiHealthReport =
+            serde_json::from_value(stable_report.report["stable_ai"].clone()).unwrap();
+        let mut report = crate::report::u5_stage_tests::original_stage();
+        let live = report["live_gateway_scenarios"].clone();
+        report["live_gateway_scenario_details"] = live.clone();
+        let before = evaluate_report_gate(&report);
+        let summary = store.write_report("deep", &mut report, &health).unwrap();
+        assert_eq!(summary.status, "pending_outer_cleanup");
+        assert_eq!(summary.provider_rounds, 2);
+        assert_eq!(summary.tool_calls, 2);
+        assert_eq!(summary.total_tokens, Some(10));
+        assert_eq!(summary.scenario_count, 1);
+        assert_eq!(summary.failed_capabilities, 0);
+        assert_eq!(evaluate_report_gate(&report), before);
+        let package = PathBuf::from(summary.result_package_dir.unwrap());
+        let archived: Value =
+            serde_json::from_slice(&fs::read(package.join("live-scenarios/suite.json")).unwrap())
+                .unwrap();
+        assert_eq!(archived, live);
+        assert_eq!(
+            archived["scenarios"][0]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .get_report(&summary.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .status,
+            "pending_outer_cleanup"
+        );
+    }
+}

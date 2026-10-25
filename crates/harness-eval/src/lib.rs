@@ -72,7 +72,10 @@ pub use report::{
     ToolCallSummary, UsageSummary,
 };
 pub use report_store::{default_report_root, now_ms, HarnessEvalReportStore};
-pub use runner::{run_eval, run_eval_controlled, HarnessEvalRunControl, HarnessEvalRunnerOptions};
+pub use runner::{
+    run_eval, run_eval_cli, run_eval_controlled, CliEvalDisposition, HarnessEvalRunControl,
+    HarnessEvalRunnerOptions,
+};
 pub use terminal_gate::{terminal_gate_report, terminal_gate_report_with_report};
 pub use terminal_matrix::{
     render_terminal_capability_matrix_markdown, terminal_capability_matrix,

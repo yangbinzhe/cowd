@@ -68,6 +68,221 @@ struct U5Owner {
     principal_actor: String,
 }
 
+// This is a transport, not an authorization DTO. Only the original launcher
+// may supply it through its explicitly inherited descriptor in a private run.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct U5Host {
+    pub(crate) nonce: String,
+    launcher_pid: u32,
+    launcher_start: u64,
+    pid: u32,
+    starttime: u64,
+    image_sha256: String,
+    exe_dev: u64,
+    exe_ino: u64,
+    listener_inode: u64,
+    port: u16,
+    pub(crate) candidate: String,
+    source_sha256: String,
+    pub(crate) namespace: String,
+    pub(crate) base_url: String,
+    harness_sha256: String,
+    runtime_dev: u64,
+    runtime_ino: u64,
+}
+
+fn u5_proc_stat(pid: u32) -> Result<(u32, u64), String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
+    let fields = stat
+        .rsplit_once(") ")
+        .ok_or("U5 invalid owned stat")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if matches!(fields.first(), Some(&"Z" | &"X")) {
+        return Err("U5 owned process exited".into());
+    }
+    Ok((
+        fields
+            .get(1)
+            .ok_or("U5 parent missing")?
+            .parse()
+            .map_err(|_| "U5 invalid parent")?,
+        fields
+            .get(19)
+            .ok_or("U5 start missing")?
+            .parse()
+            .map_err(|_| "U5 invalid start")?,
+    ))
+}
+
+impl U5Host {
+    pub(crate) fn inherited() -> Result<Self, String> {
+        use std::{io::Read, os::unix::fs::MetadataExt};
+        let root = std::env::var("XDG_RUNTIME_DIR").map_err(|_| "U5 private root missing")?;
+        let meta = std::fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
+        let uid = std::fs::metadata("/proc/self")
+            .map_err(|e| e.to_string())?
+            .uid();
+        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o777 != 0o700 {
+            return Err("U5 private root invalid".into());
+        }
+        let file =
+            std::fs::File::open("/proc/self/fd/9").map_err(|_| "U5 inherited host FD missing")?;
+        let fm = file.metadata().map_err(|e| e.to_string())?;
+        if !fm.is_file() || fm.uid() != uid || fm.mode() & 0o777 != 0o400 || fm.len() > 16384 {
+            return Err("U5 inherited host FD invalid".into());
+        }
+        let info = std::fs::read_to_string("/proc/self/fdinfo/9").map_err(|e| e.to_string())?;
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:\t"))
+            .and_then(|s| u64::from_str_radix(s, 8).ok())
+            .ok_or("U5 FD flags missing")?;
+        if flags & 3 != 0 {
+            return Err("U5 host FD is not read-only".into());
+        }
+        let target = std::fs::read_link("/proc/self/fd/9").map_err(|e| e.to_string())?;
+        if target != std::path::Path::new(&root).join("u5-host.json") {
+            return Err("U5 host FD outside original root".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(16385)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 16384 {
+            return Err("U5 host FD grew".into());
+        }
+        let host: Self = serde_json::from_slice(&bytes).map_err(|_| "U5 invalid host handoff")?;
+        let namespace = format!(
+            "{}:{}",
+            std::env::var("COWD_EVAL_EVIDENCE_KEY").unwrap_or_default(),
+            std::path::Path::new(&root)
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+        );
+        if host.namespace != namespace {
+            return Err("U5 namespace mismatch".into());
+        }
+        if host.runtime_dev != meta.dev()
+            || host.runtime_ino != meta.ino()
+            || host.nonce != std::env::var("COWD_EVAL_U5_NONCE").unwrap_or_default()
+            || host.nonce.len() != 64
+            || host.candidate != std::env::var("COWD_EVAL_CANDIDATE_SHA").unwrap_or_default()
+            || host.source_sha256
+                != std::env::var("COWD_EVAL_CANDIDATE_SOURCE_SHA256").unwrap_or_default()
+            || host.harness_sha256
+                != std::env::var("COWD_EVAL_HARNESS_BINARY_SHA256").unwrap_or_default()
+            || host.image_sha256
+                != format!(
+                    "sha256:{}",
+                    std::env::var("COWD_EVAL_BINARY_SHA256").unwrap_or_default()
+                )
+            || u5_proc_stat(std::process::id())?.0 != host.launcher_pid
+            || u5_proc_stat(host.launcher_pid)?.1 != host.launcher_start
+            || u5_proc_stat(host.pid)?.0 != host.launcher_pid
+        {
+            return Err("U5 original launcher binding mismatch".into());
+        }
+        host.validate_live()?;
+        Ok(host)
+    }
+
+    fn validate_live(&self) -> Result<(), String> {
+        self.validate_live_until(Instant::now() + Duration::from_secs(5))
+    }
+    fn validate_live_until(&self, deadline: Instant) -> Result<(), String> {
+        use std::{io::Read, os::unix::fs::MetadataExt};
+        if u5_proc_stat(self.pid)?.1 != self.starttime {
+            return Err("U5 Child changed".into());
+        }
+        let exe =
+            std::fs::metadata(format!("/proc/{}/exe", self.pid)).map_err(|e| e.to_string())?;
+        if (exe.dev(), exe.ino()) != (self.exe_dev, self.exe_ino) {
+            return Err("U5 Child image replaced".into());
+        }
+        let url = reqwest::Url::parse(&self.base_url).map_err(|e| e.to_string())?;
+        if url.host_str() != Some("127.0.0.1")
+            || url.scheme() != "http"
+            || url.port() != Some(self.port)
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("U5 noncanonical host URL".into());
+        }
+        let socket = format!("socket:[{}]", self.listener_inode);
+        let mut owns = false;
+        for (count, entry) in std::fs::read_dir(format!("/proc/{}/fd", self.pid))
+            .map_err(|e| e.to_string())?
+            .enumerate()
+        {
+            if count >= 4096 || Instant::now() >= deadline {
+                return Err("U5 owned listener budget exceeded".into());
+            }
+            if entry
+                .ok()
+                .and_then(|e| std::fs::read_link(e.path()).ok())
+                .is_some_and(|p| p.to_string_lossy() == socket)
+            {
+                owns = true;
+            }
+        }
+        let file = std::fs::File::open(format!("/proc/{}/net/tcp", self.pid))
+            .map_err(|e| e.to_string())?;
+        let mut table = String::new();
+        file.take(1024 * 1024 + 1)
+            .read_to_string(&mut table)
+            .map_err(|e| e.to_string())?;
+        let address = format!("0100007F:{:04X}", self.port);
+        let listening = table.lines().skip(1).any(|line| {
+            let f = line.split_whitespace().collect::<Vec<_>>();
+            f.get(1) == Some(&address.as_str())
+                && f.get(3) == Some(&"0A")
+                && f.get(9).and_then(|s| s.parse::<u64>().ok()) == Some(self.listener_inode)
+        });
+        if !owns
+            || !listening
+            || table.len() > 1024 * 1024
+            || Instant::now() >= deadline
+            || u5_proc_stat(self.pid)?.1 != self.starttime
+        {
+            return Err("U5 owned listener not authenticated".into());
+        }
+        Ok(())
+    }
+
+    fn owner(&self) -> U5Owner {
+        U5Owner {
+            pid: self.pid,
+            starttime: self.starttime,
+            image_sha256: self.image_sha256.clone(),
+            candidate: self.candidate.clone(),
+            namespace: self.namespace.clone(),
+            base_url: self.base_url.clone(),
+            principal_actor: String::new(),
+        }
+    }
+    pub(crate) fn binding(&self) -> Value {
+        json!({"nonce":self.nonce,"pid":self.pid,"starttime":self.starttime,"image_sha256":self.image_sha256,"candidate":self.candidate,"namespace":self.namespace,"source_sha256":self.source_sha256,"harness_sha256":self.harness_sha256})
+    }
+}
+
+impl U5EvidenceReader for U5Host {
+    fn owner(&self) -> Result<U5Owner, String> {
+        self.validate_live()?;
+        Ok(self.owner())
+    }
+    fn read(&self, _: &[String; 2], _: Instant) -> Result<U5ResourceEvidence, String> {
+        Err("U5 C physical active source unavailable".into())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct U5Identity {
     session: String,
@@ -320,31 +535,35 @@ fn u5_page_cursor(previous: Option<&str>, events: &[Value]) -> Result<Value, Str
 }
 
 trait U5EvidenceReader: Sync {
-    // Future trusted adapters must bind the original owner/listener and impose
-    // the approved pre-I/O byte/page/time bounds. No live adapter is enabled.
+    // The F adapter binds the original host/listener before using the bounded
+    // timeline reader. C still has no authenticated physical-active source.
     fn owner(&self) -> Result<U5Owner, String>;
     fn read(&self, sessions: &[String; 2], deadline: Instant)
         -> Result<U5ResourceEvidence, String>;
 }
 
-struct UnavailableU5Evidence;
-impl U5EvidenceReader for UnavailableU5Evidence {
-    fn owner(&self) -> Result<U5Owner, String> {
-        Err(U5_MISSING.into())
-    }
-    fn read(&self, _: &[String; 2], _: Instant) -> Result<U5ResourceEvidence, String> {
-        Err(U5_MISSING.into())
-    }
-}
-
 fn u5_gated(reason: String) -> Value {
+    let reason = if reason.starts_with("u5_evidence_missing") {
+        reason
+    } else {
+        format!("u5_evidence_missing: {reason}")
+    };
     json!({"kind":"harness_eval.live_gateway_scenarios", "status":"gated", "reason":reason,
         "model_work_started":false, "release_certified":false, "scenarios":[]})
 }
 
 fn u5_selection_preflight(selected: Option<&BTreeSet<String>>) -> Option<Value> {
     if selected.is_some_and(|ids| ids.iter().any(|id| U5Mode::from_id(id).is_some())) {
-        return UnavailableU5Evidence.owner().err().map(u5_gated);
+        if selected.is_none_or(|ids| ids.len() != 1 || !ids.contains(U5_FAIRNESS))
+            || std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_deref() != Some(U5_FAIRNESS)
+        {
+            return Some(u5_gated(
+                "U5 C/mixed selection lacks authenticated active source".into(),
+            ));
+        }
+        if let Err(error) = U5Host::inherited() {
+            return Some(u5_gated(error));
+        }
     }
     None
 }
@@ -353,7 +572,6 @@ fn u5_valid_owner(owner: &U5Owner, base_url: &str) -> bool {
     owner.pid > 0
         && owner.starttime > 0
         && !owner.namespace.is_empty()
-        && owner.principal_actor.starts_with("principal:")
         && owner.base_url == base_url
         && owner
             .image_sha256
@@ -444,7 +662,8 @@ fn u5_cancel_settled(
     ) else {
         return false;
     };
-    receipt.cancellation_id == cancellation_id
+    owner.principal_actor.starts_with("principal:")
+        && receipt.cancellation_id == cancellation_id
         && receipt.session_id == id.session
         && receipt.turn_id == id.turn
         && receipt.execution_id == id.root
@@ -1064,6 +1283,7 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
         model: options.provider.clone(),
         claim_scope,
         u5_deadline: None,
+        u5_host: None,
     };
     runner.run(provider_token_telemetry_limit)
 }
@@ -1076,6 +1296,7 @@ struct LiveScenarioRunner {
     model: Option<String>,
     claim_scope: LiveClaimScope,
     u5_deadline: Option<Instant>,
+    u5_host: Option<std::sync::Arc<U5Host>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1449,7 +1670,7 @@ impl LiveScenarioRunner {
     /// Consume only the two fresh Sessions created by this composite driver.
     /// The caller supplies the original authenticated client and trusted host
     /// owner. This method does not authenticate a caller-authored owner object;
-    /// G1 is still unavailable at live preflight.
+    /// Live F supplies only the inherited, validated host; tests may use doubles.
     fn read_u5_resource_witnesses(
         &self,
         owner: &U5Owner,
@@ -1484,6 +1705,13 @@ impl LiveScenarioRunner {
                         "U5 resource consumer time/byte/event/page budget exhausted before IO"
                             .into(),
                     );
+                }
+                if let Some(host) = &self.u5_host {
+                    host.validate_live_until(deadline)?;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("U5 host exhausted reader deadline".into());
                 }
                 pages_left -= 1;
                 let expected_cursor = observer.timeline_cursor().map(str::to_owned);
@@ -1646,6 +1874,7 @@ impl LiveScenarioRunner {
             model: self.model.clone(),
             claim_scope: self.claim_scope,
             u5_deadline: Some(deadline),
+            u5_host: self.u5_host.clone(),
         };
         let inputs = u5_inputs();
         let mut reads = Vec::new();
@@ -2174,6 +2403,15 @@ impl LiveScenarioRunner {
             && health_passed
             && selection_passed
             && passed == scenarios.len();
+        let pending_outer = claim_scope == LiveClaimScope::Focused
+            && health_passed
+            && selection_passed
+            && comparison_passed
+            && selected_scenario_ids
+                .as_ref()
+                .is_some_and(|ids| ids.len() == 1 && ids.contains(U5_FAIRNESS))
+            && scenarios.len() == 1
+            && scenarios[0]["status"] == "pending_outer_cleanup";
         let claim_status = match claim_scope {
             LiveClaimScope::Focused
                 if health_passed
@@ -2183,6 +2421,7 @@ impl LiveScenarioRunner {
             {
                 "component_passed"
             }
+            LiveClaimScope::Focused if pending_outer => "pending_outer_cleanup",
             LiveClaimScope::Focused => "component_failed",
             LiveClaimScope::ReleaseCertification if release_certified => "certified",
             LiveClaimScope::ReleaseCertification => "certification_failed",
@@ -2190,7 +2429,7 @@ impl LiveScenarioRunner {
         let metrics = aggregate_scenario_metrics(&scenarios);
         json!({
             "kind": "harness_eval.live_gateway_scenarios",
-            "status": if health_passed && selection_passed && passed == scenarios.len() && comparison_passed && (claim_scope == LiveClaimScope::Focused || release_certified) { "passed" } else { "failed" },
+            "status": if pending_outer { "pending_outer_cleanup" } else if health_passed && selection_passed && passed == scenarios.len() && comparison_passed && (claim_scope == LiveClaimScope::Focused || release_certified) { "passed" } else { "failed" },
             "claim_scope": claim_scope.as_str(),
             "claim_status": claim_status,
             "release_certified": release_certified,
@@ -2207,7 +2446,7 @@ impl LiveScenarioRunner {
             "selection_errors": selection_errors,
             "selection_status": if selection_passed { "passed" } else { "failed" },
             "passed": passed,
-            "failed": scenarios.len().saturating_sub(passed),
+            "failed": scenarios.len().saturating_sub(passed + usize::from(pending_outer)),
             "metrics": metrics,
             "scenarios": scenarios,
             "collaboration_comparison": collaboration_comparison,
@@ -2220,12 +2459,24 @@ impl LiveScenarioRunner {
         provider_token_telemetry_limit: Option<u64>,
     ) -> Value {
         if let LiveAcceptance::U5(mode) = spec.acceptance {
-            return self.run_u5_pair(
-                mode,
-                spec,
-                provider_token_telemetry_limit,
-                &UnavailableU5Evidence,
-            );
+            if mode != U5Mode::Fairness {
+                return u5_gated("U5 C active source unavailable".into());
+            }
+            let host = match U5Host::inherited() {
+                Ok(host) => std::sync::Arc::new(host),
+                Err(error) => return u5_gated(error),
+            };
+            let runner = Self {
+                client: self.client.clone(),
+                base_url: self.base_url.clone(),
+                timeout_cap: self.timeout_cap,
+                poll_interval: self.poll_interval,
+                model: self.model.clone(),
+                claim_scope: self.claim_scope,
+                u5_deadline: None,
+                u5_host: Some(host.clone()),
+            };
+            return runner.run_u5_pair(mode, spec, provider_token_telemetry_limit, host.as_ref());
         }
         let started = Instant::now();
         let mut trace = Vec::new();
@@ -2602,7 +2853,7 @@ impl LiveScenarioRunner {
         }));
         acceptance.passed &= observation_passed;
         trace.extend(observation_trace);
-        json!({
+        let mut result = json!({
             "scenario_id": spec.id,
             "status": if acceptance.passed { "passed" } else { "failed" },
             "acceptance": acceptance.to_value(),
@@ -2633,7 +2884,23 @@ impl LiveScenarioRunner {
                 "message_materialized": true,
             },
             "read_evidence": timeline.get("read_evidence"),
-        })
+        });
+        if spec.id.starts_with("u5-read-") {
+            result["u5_provider_events"] = json!(timeline
+                .get("events")
+                .and_then(Value::as_array)
+                .map(|events| events
+                    .iter()
+                    .filter(|event| matches!(
+                        event["kind"].as_str(),
+                        Some(
+                            "context.provider_request_packed" | "context.provider_attempt_outcome"
+                        )
+                    ))
+                    .cloned()
+                    .collect::<Vec<_>>()));
+        }
+        result
     }
 
     fn wait_for_terminal_message(

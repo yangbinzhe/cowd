@@ -381,6 +381,7 @@ fn u5_fixture_runner(url: &str) -> LiveScenarioRunner {
         model: None,
         claim_scope: LiveClaimScope::Focused,
         u5_deadline: None,
+        u5_host: None,
     }
 }
 
@@ -3546,4 +3547,22 @@ fn a_single_task_scenario_needs_no_synthesis() {
     let program = program_with_tasks(1, None);
     let (present, unsynthesized) = synthesized_final_artifact_findings(Some(&program));
     assert!(present, "{unsynthesized:?}");
+}
+
+#[test]
+fn u5_inherited_host_fd_contract_probe() {
+    // The shell double executes this exact reader through the original exec
+    // chain. No API/model/PG is contacted. Without that owned host it must deny.
+    let expected = std::env::var("COWD_U5_TEST_HOST_EXPECT").unwrap_or_else(|_| "deny".into());
+    match (expected.as_str(), U5Host::inherited()) {
+        ("allow", Ok(host)) => {
+            assert_eq!(host.owner().principal_actor, "");
+            assert!(u5_valid_owner(&host.owner(), &host.base_url));
+        }
+        ("deny", Err(_)) => {}
+        (_, result) => panic!(
+            "host contract unexpected disposition: {}",
+            if result.is_ok() { "allowed" } else { "denied" }
+        ),
+    }
 }
