@@ -1223,6 +1223,20 @@ fn original_root_start_record(
     attempt: u32,
     running: &DurableRuntimeEvent,
 ) -> Result<DurableRuntimeEvent, String> {
+    original_root_start_record_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        owner,
+        attempt,
+        running,
+    )
+}
+
+pub(super) fn original_root_start_record_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    owner: &harness_contract::projection::RuntimeActivityBinding,
+    attempt: u32,
+    running: &DurableRuntimeEvent,
+) -> Result<DurableRuntimeEvent, String> {
     use crate::execution_core::graph::ExecutionGraphEvent;
     use harness_contract::execution_graph::ExecutionNodeStatus;
     let node = owner
@@ -1237,7 +1251,7 @@ fn original_root_start_record(
         if sequence == 0 {
             return Err("original root start lacks a preceding graph checkpoint".into());
         }
-        let record = store
+        let record = reader
             .list_stream_after(
                 &owner.root_execution_id,
                 sequence - 1,
@@ -1262,7 +1276,7 @@ fn original_root_start_record(
         {
             return Err("original root start graph record identity mismatch".into());
         }
-        let body = store.resolve_graph_record(&record)?;
+        let body = reader.resolve_graph_record(&record)?;
         bytes = bytes.saturating_add(
             serde_json::to_vec(&body)
                 .map_err(|error| error.to_string())?
@@ -1356,22 +1370,41 @@ pub(super) fn authenticate_original_root_owner(
     ),
     String,
 > {
+    authenticate_original_root_owner_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        intent,
+        cuts,
+    )
+}
+
+pub(super) fn authenticate_original_root_owner_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    intent: &DurableRuntimeEvent,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<
+    (
+        harness_contract::projection::RuntimeActivityBinding,
+        u32,
+        u64,
+    ),
+    String,
+> {
     let (binding, attempt, revision) = original_root_effect_owner(intent)?;
     let node = binding
         .node_id
         .as_deref()
         .ok_or("original root owner has no node")?;
     let source = format!("{}:node:{node}", binding.root_execution_id);
-    pin_result_source(store, &source, cuts)?;
-    pin_result_source(store, &binding.root_execution_id, cuts)?;
-    let original = store
+    pin_result_source_with_reader(reader, &source, cuts)?;
+    pin_result_source_with_reader(reader, &binding.root_execution_id, cuts)?;
+    let original = reader
         .event_by_idempotency_key(
             &source,
             &format!("{}:{node}:{}", binding.root_execution_id, binding.revision),
         )
         .map_err(|error| error.to_string())?
         .ok_or("original root Running transition missing")?;
-    let fence = store
+    let fence = reader
         .transaction_stream_revision_exact(&intent.transaction_id, &binding.root_execution_id)
         .map_err(|error| error.to_string())?;
     if original.schema_version != 1
@@ -1391,7 +1424,7 @@ pub(super) fn authenticate_original_root_owner(
             "root effect does not authenticate its original Running owner/admission fence".into(),
         );
     }
-    original_root_start_record(store, &binding, attempt, &original)?;
+    original_root_start_record_with_reader(reader, &binding, attempt, &original)?;
     Ok((binding, attempt, revision))
 }
 
@@ -1421,17 +1454,29 @@ pub(super) fn authenticate_root_receipt_owner(
     primary: &DurableRuntimeEvent,
     cuts: &mut std::collections::BTreeMap<String, u64>,
 ) -> Result<(), String> {
+    authenticate_root_receipt_owner_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        primary,
+        cuts,
+    )
+}
+
+pub(super) fn authenticate_root_receipt_owner_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    primary: &DurableRuntimeEvent,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<(), String> {
     let key = primary.payload["idempotency_key"]
         .as_str()
         .ok_or("root receipt original identity missing")?;
-    pin_result_source(store, &primary.stream_id, cuts)?;
+    pin_result_source_with_reader(reader, &primary.stream_id, cuts)?;
     let read = primary.kind == "execution.read.receipt";
     let suffix = if read { "read-intent" } else { "intent" };
-    let intent = store
+    let intent = reader
         .event_by_idempotency_key(&primary.stream_id, &format!("{key}:{suffix}"))
         .map_err(|error| error.to_string())?
         .ok_or("root receipt original admission missing")?;
-    let (owner, attempt, _) = authenticate_original_root_owner(store, &intent, cuts)?;
+    let (owner, attempt, _) = authenticate_original_root_owner_with_reader(reader, &intent, cuts)?;
     let node = owner
         .node_id
         .as_deref()
@@ -1440,8 +1485,8 @@ pub(super) fn authenticate_root_receipt_owner(
         "execution-agent-receipts:{}:{node}:{attempt}",
         owner.root_execution_id
     );
-    pin_result_source(store, &index_source, cuts)?;
-    let index = store
+    pin_result_source_with_reader(reader, &index_source, cuts)?;
+    let index = reader
         .event_by_idempotency_key(&index_source, &format!("agent-tool-receipt:{key}"))
         .map_err(|error| error.to_string())?
         .ok_or("root receipt original real-node index missing")?;
@@ -1828,7 +1873,19 @@ pub(super) fn pin_result_source(
     source: &str,
     cuts: &mut std::collections::BTreeMap<String, u64>,
 ) -> Result<u64, String> {
-    let revision = store
+    pin_result_source_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        source,
+        cuts,
+    )
+}
+
+pub(super) fn pin_result_source_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    source: &str,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, String> {
+    let revision = reader
         .stream_revision(source)
         .map_err(|error| error.to_string())?;
     if let Some(previous) = cuts.insert(source.to_string(), revision) {

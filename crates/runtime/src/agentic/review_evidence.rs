@@ -3,6 +3,7 @@ mod current_review;
 mod identity;
 pub(crate) use identity::review_result_identity;
 mod policy;
+mod read_source;
 mod results;
 // The record-path entries re-verify a proof without a live action, so they
 // are the fixture and completion-lane entry points as well.

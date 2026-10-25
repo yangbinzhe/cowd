@@ -967,20 +967,21 @@ pub(crate) fn review_delivery_snapshot(
             PinnedEventProjection::ReadDelivery,
         )?,
     };
-    review_delivery_snapshot_from_events(store, program, packet, events, sources, |stream, key| {
-        store
-            .event_by_idempotency_key(stream, key)
-            .map_err(|error| error.to_string())
-    })
+    review_delivery_snapshot_from_events(
+        &mut super::read_source::StoreReadSource(store),
+        program,
+        packet,
+        events,
+        sources,
+    )
 }
 
 fn review_delivery_snapshot_from_events(
-    store: &RuntimeEventStore,
+    reader: &mut dyn super::read_source::ReadAuthSource,
     program: &AgenticProgramProjection,
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     events: Vec<crate::DurableRuntimeEvent>,
     mut sources: std::collections::BTreeMap<String, u64>,
-    mut original_event: impl FnMut(&str, &str) -> Result<Option<crate::DurableRuntimeEvent>, String>,
 ) -> Result<ReviewDeliverySnapshot, String> {
     use crate::context_evidence::{
         ReadDeliveryGrade, ReadDeliveryTransport, NATIVE_DELIVERY_KIND, PROCESS_DELIVERY_KIND,
@@ -1029,7 +1030,7 @@ fn review_delivery_snapshot_from_events(
                     event_id: owner.event_id.clone(),
                     payload_digest: owner.payload_digest.clone(),
                 };
-                let original = verify_material_event(store, &reference, &mut sources)?;
+                let original = verify_material_event_with_reader(reader, &reference, &mut sources)?;
                 crate::context_evidence::root_read_owner_matches(owner, &original, seal)
                     && program.root_execution_id.as_deref()
                         == Some(owner.binding.root_execution_id.as_str())
@@ -1043,9 +1044,11 @@ fn review_delivery_snapshot_from_events(
         if !recipient_matches {
             continue;
         }
-        let primary = original_event(&seal.primary_stream, &seal.primary_key)?
+        let primary = reader
+            .event_by_idempotency_key(&seal.primary_stream, &seal.primary_key)?
             .ok_or("delivered read has no original primary receipt")?;
-        let receipt = original_event(&seal.index_stream, &seal.index_key)?
+        let receipt = reader
+            .event_by_idempotency_key(&seal.index_stream, &seal.index_key)?
             .ok_or("delivered read has no original index receipt")?;
         let seal_value = serde_json::to_value(seal).map_err(|error| error.to_string())?;
         if primary.kind != "execution.read.receipt"
@@ -1080,7 +1083,11 @@ fn review_delivery_snapshot_from_events(
         let descriptor = super::results::receipt_effect_descriptor(&primary)?;
         let original_scope = read_original_scope(&primary, &descriptor, &material.acquisition)?;
         if primary.payload["replay"]["parent_execution"].is_null() {
-            super::results::authenticate_root_receipt_owner(store, &primary, &mut sources)?;
+            super::results::authenticate_root_receipt_owner_with_reader(
+                reader,
+                &primary,
+                &mut sources,
+            )?;
         }
         if primary.payload["resolved_effect_scope"] != receipt.payload["resolved_effect_scope"] {
             return Err("read delivery scope disagrees with its original primary".into());
@@ -1134,7 +1141,8 @@ fn review_delivery_snapshot_from_events(
                 );
                 let transport_key =
                     format!("completed:{:x}", Sha256::digest(request_id.as_bytes()));
-                let completed = original_event(&transport_stream, &transport_key)?
+                let completed = reader
+                    .event_by_idempotency_key(&transport_stream, &transport_key)?
                     .ok_or("Process read delivery lost its original response identity")?;
                 let output = completed.payload["response"]["output"]
                     .as_str()
@@ -1148,7 +1156,7 @@ fn review_delivery_snapshot_from_events(
                 {
                     return Err("Process delivered body does not match its actual response".into());
                 }
-                let revision = store
+                let revision = reader
                     .stream_revision(&transport_stream)
                     .map_err(|error| error.to_string())?;
                 if sources
@@ -1179,7 +1187,7 @@ fn review_delivery_snapshot_from_events(
             None => false,
         };
         for source in [&seal.primary_stream, &seal.index_stream] {
-            let revision = store
+            let revision = reader
                 .stream_revision(source)
                 .map_err(|error| error.to_string())?;
             if sources
@@ -1198,7 +1206,7 @@ fn review_delivery_snapshot_from_events(
         });
     }
     for (source, expected) in &sources {
-        if store
+        if reader
             .stream_revision(source)
             .map_err(|error| error.to_string())?
             != *expected
@@ -1263,13 +1271,9 @@ impl crate::RuntimeServices {
                    primary: crate::DurableRuntimeEvent,
                    index: crate::DurableRuntimeEvent,
                    expected_packet: &harness_contract::agent::AgentTaskPacket| {
-            review_delivery_snapshot_from_events(
-                store,
-                program,
-                Some(expected_packet),
-                vec![candidate],
-                std::collections::BTreeMap::new(),
-                |stream, key| {
+            let mut reader = super::read_source::KeyOverrideSource {
+                source: super::read_source::StoreReadSource(store),
+                key: |stream: &str, key: &str| {
                     if stream == seal.primary_stream && key == seal.primary_key {
                         Ok(Some(primary.clone()))
                     } else if stream == seal.index_stream && key == seal.index_key {
@@ -1280,6 +1284,13 @@ impl crate::RuntimeServices {
                             .map_err(|error| error.to_string())
                     }
                 },
+            };
+            review_delivery_snapshot_from_events(
+                &mut reader,
+                program,
+                Some(expected_packet),
+                vec![candidate],
+                std::collections::BTreeMap::new(),
             )
         };
         let accepted = run(event.clone(), primary.clone(), index.clone(), packet).unwrap();
@@ -1839,10 +1850,22 @@ pub(super) fn verify_material_event(
     material: &harness_contract::goal::ProofInputEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
 ) -> Result<crate::DurableRuntimeEvent, String> {
+    verify_material_event_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        material,
+        sources,
+    )
+}
+
+pub(super) fn verify_material_event_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    material: &harness_contract::goal::ProofInputEvent,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<crate::DurableRuntimeEvent, String> {
     if material.sequence == 0 {
         return Err("proof material sequence is missing".into());
     }
-    let revision = store
+    let revision = reader
         .stream_revision(&material.stream_id)
         .map_err(|error| error.to_string())?;
     if sources
@@ -1851,7 +1874,7 @@ pub(super) fn verify_material_event(
     {
         return Err("proof material source changed during validation".into());
     }
-    let events = store.list_stream_after(
+    let events = reader.list_stream_after(
         &material.stream_id,
         material.sequence - 1,
         material.sequence,
@@ -3250,16 +3273,11 @@ pub(super) fn primary_producer_immutable_inputs(
             return Err("primary acquisition has no authenticated physical producer".into());
         }
         let deliveries = review_delivery_snapshot_from_events(
-            store,
+            &mut super::read_source::StoreReadSource(store),
             &owner,
             producer.packet.as_ref(),
             events.clone(),
             std::collections::BTreeMap::new(),
-            |stream, key| {
-                store
-                    .event_by_idempotency_key(stream, key)
-                    .map_err(|error| error.to_string())
-            },
         )?;
         for (stream, revision) in deliveries.sources {
             if actual
@@ -3288,8 +3306,14 @@ pub(super) fn primary_producer_immutable_inputs(
             retain_actual_material(&mut actual.material_events, &primary);
             super::results::pin_result_source(store, &primary.stream_id, &mut actual.sources)?;
             let content = ActualImmutableInput::from_acquisition(
-                store, program, &primary, &read.receipt, &events,
-                producer.packet.as_ref(), readers, &mut actual,
+                store,
+                program,
+                &primary,
+                &read.receipt,
+                &events,
+                producer.packet.as_ref(),
+                readers,
+                &mut actual,
             )?;
             if !actual.immutable_inputs.contains(&content) {
                 actual.immutable_inputs.push(content);
@@ -9251,3 +9275,515 @@ mod own872_plan_owner_tests {
 #[cfg(test)]
 #[path = "policy_applied_carrier_tests.rs"]
 mod applied_carrier_tests;
+
+#[cfg(test)]
+mod read_auth_boundary_tests {
+    use super::super::read_source::ReadAuthSource;
+    use super::*;
+    use crate::{DurableRuntimeEvent, RuntimeEventScope};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    // Fixed originals, not validator-produced expectations. No backing store is
+    // available to this reader: every nested access must cross the five ports.
+    #[derive(Clone, Default)]
+    struct Reader {
+        keys: BTreeMap<(String, String), DurableRuntimeEvent>,
+        records: Vec<DurableRuntimeEvent>,
+        body: Value,
+        calls: Vec<&'static str>,
+        fault: Option<&'static str>,
+        fence: u64,
+        moved: bool,
+    }
+    impl Reader {
+        fn hit(&mut self, op: &'static str) -> Result<(), String> {
+            self.calls.push(op);
+            if self.fault == Some(op) {
+                Err(format!("reader:{op}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl ReadAuthSource for Reader {
+        fn stream_revision(&mut self, _: &str) -> Result<u64, String> {
+            self.hit("revision")?;
+            Ok(
+                if self.moved && self.calls.iter().filter(|op| **op == "revision").count() > 1 {
+                    8
+                } else {
+                    7
+                },
+            )
+        }
+        fn event_by_idempotency_key(
+            &mut self,
+            stream: &str,
+            key: &str,
+        ) -> Result<Option<DurableRuntimeEvent>, String> {
+            self.hit("key")?;
+            Ok(self.keys.get(&(stream.into(), key.into())).cloned())
+        }
+        fn list_stream_after(
+            &mut self,
+            stream: &str,
+            after: u64,
+            through: u64,
+            limit: usize,
+            bytes: usize,
+        ) -> Result<Vec<DurableRuntimeEvent>, String> {
+            self.hit("page")?;
+            assert_eq!((limit, bytes), (1, 4 * 1024 * 1024));
+            Ok(self
+                .records
+                .iter()
+                .filter(|r| r.stream_id == stream && r.sequence > after && r.sequence <= through)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        fn transaction_stream_revision_exact(
+            &mut self,
+            _: &str,
+            stream: &str,
+        ) -> Result<Option<crate::CommittedStreamRevision>, String> {
+            self.hit("fence")?;
+            Ok(Some(crate::CommittedStreamRevision {
+                stream_id: stream.into(),
+                expected_revision: self.fence,
+                committed_revision: self.fence,
+            }))
+        }
+        fn resolve_graph_record(&mut self, _: &DurableRuntimeEvent) -> Result<Value, String> {
+            self.hit("body")?;
+            Ok(self.body.clone())
+        }
+    }
+    fn event(stream: &str, kind: &str, cursor: u64, payload: Value) -> DurableRuntimeEvent {
+        DurableRuntimeEvent {
+            event_id: format!("event-{stream}-{cursor}"),
+            stream_id: stream.into(),
+            sequence: 1,
+            scope: RuntimeEventScope::ExecutionNode,
+            kind: kind.into(),
+            status: Some("completed".into()),
+            actor: Some("governed_tool".into()),
+            refs: vec![],
+            payload,
+            created_at_ms: 0,
+            commit_cursor: cursor,
+            transaction_id: format!("tx-{cursor}"),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: None,
+        }
+    }
+    fn root() -> (Reader, DurableRuntimeEvent) {
+        use harness_contract::execution_graph::*;
+        let binding = json!({"root_execution_id":"root","session_id":"session","turn_id":"test-turn","root_task_id":"task","task_id":"task","activity_id":"activity:execution:root:owner:model","node_id":"node","revision":2,"fence":1,"generation":1});
+        let owner = json!({"binding":binding,"attempt":1,"graph_revision":2});
+        let mut graph = ExecutionGraph::new("original root");
+        graph.id = "root".into();
+        graph.revision = 2;
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "model", "{}");
+        node.id = "node".into();
+        graph.nodes.push(node);
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: "session".into(),
+            turn_id: "test-turn".into(),
+            root_task_id: "task".into(),
+            task_id: "task".into(),
+            generation: 1,
+        });
+        graph
+            .node_statuses
+            .insert("node".into(), ExecutionNodeStatus::Running);
+        graph.recovery_cursor.node_attempts.insert("node".into(), 1);
+        let body = serde_json::to_value(
+            crate::execution_core::graph::ExecutionGraphEvent::Checkpoint {
+                cause: "execution_graph.nodes_started".into(),
+                graph,
+                bindings: BTreeMap::from([(
+                    "node".into(),
+                    crate::execution_core::graph::ExecutionNodeBinding {
+                        executor_kind: "model".into(),
+                        ticket_idempotency_key: "original-ticket".into(),
+                        attempt: 1,
+                        resource_lease_refs: vec![],
+                        scope_lease_ref: None,
+                        worktree_lease_ref: None,
+                    },
+                )]),
+                lease_closures: vec![],
+            },
+        )
+        .unwrap();
+        let mut running = event(
+            "root:node:node",
+            "execution_node.transitioned",
+            2,
+            json!({"_runtime_activity_binding":binding,"graph_id":"root","node_id":"node","graph_revision":2,"to":"running"}),
+        );
+        running.actor = Some("execution_commit_service".into());
+        let mut record = event(
+            "root",
+            "execution_graph.checkpoint",
+            2,
+            json!({"body":"external-reference"}),
+        );
+        record.sequence = 2;
+        record.schema_version = 2;
+        record.scope = RuntimeEventScope::ExecutionGraph;
+        record.actor = Some("execution_commit_service".into());
+        let intent = event(
+            "effect",
+            "execution.read.intent",
+            3,
+            json!({"root_effect_owner":owner,"root_effect_context":{"execution_id":"root","session_id":"session","turn_id":"test-turn"}}),
+        );
+        let reader = Reader {
+            keys: BTreeMap::from([(("root:node:node".into(), "root:node:2".into()), running)]),
+            records: vec![record],
+            body,
+            fence: 2,
+            ..Default::default()
+        };
+        (reader, intent)
+    }
+    #[test]
+    fn root_nested_reader_authenticates_original_and_rejects_fence_body_and_io() {
+        let (reader, intent) = root();
+        let mut good = reader.clone();
+        let (owner, attempt, revision) =
+            super::super::results::authenticate_original_root_owner_with_reader(
+                &mut good,
+                &intent,
+                &mut BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            (owner.root_execution_id.as_str(), attempt, revision),
+            ("root", 1, 2)
+        );
+        assert_eq!(
+            good.calls,
+            vec!["revision", "revision", "key", "fence", "page", "body"]
+        );
+        let mut wrong = reader.clone();
+        wrong.fence = 1;
+        assert_eq!(
+            super::super::results::authenticate_original_root_owner_with_reader(
+                &mut wrong,
+                &intent,
+                &mut BTreeMap::new()
+            )
+            .unwrap_err(),
+            "root effect does not authenticate its original Running owner/admission fence"
+        );
+        let mut wrong = reader.clone();
+        wrong.body = json!({"invalid":"graph-body"});
+        assert_eq!(
+            super::super::results::authenticate_original_root_owner_with_reader(
+                &mut wrong,
+                &intent,
+                &mut BTreeMap::new()
+            )
+            .unwrap_err(),
+            "original root start graph content is invalid"
+        );
+        for op in ["revision", "key", "fence", "page", "body"] {
+            let mut wrong = reader.clone();
+            wrong.fault = Some(op);
+            assert_eq!(
+                super::super::results::authenticate_original_root_owner_with_reader(
+                    &mut wrong,
+                    &intent,
+                    &mut BTreeMap::new()
+                )
+                .unwrap_err(),
+                format!("reader:{op}")
+            );
+            assert_eq!(wrong.calls.last(), Some(&op));
+        }
+        let mut missing = reader;
+        missing.keys.clear();
+        assert_eq!(
+            super::super::results::authenticate_original_root_owner_with_reader(
+                &mut missing,
+                &intent,
+                &mut BTreeMap::new()
+            )
+            .unwrap_err(),
+            "original root Running transition missing"
+        );
+    }
+    #[test]
+    fn root_receipt_nested_reader_requires_original_index() {
+        let (mut reader, mut intent) = root();
+        let effect = json!({"effect_kind":"read"});
+        let replay = json!({"call_id":"call", "invocation":{"effect":effect}});
+        for (key, value) in [
+            ("effect", effect.clone()),
+            ("replay", replay.clone()),
+            ("tool_use_id", json!("call")),
+            ("tool_name", json!("read_ref")),
+            ("idempotency_key", json!("call-key")),
+            ("input_sha256", json!("input")),
+        ] {
+            intent.payload[key] = value;
+        }
+        let outcome = json!({"status":"executed","tool_use_id":"call","tool_name":"read_ref"});
+        let mut primary = event(
+            "effect",
+            "execution.read.receipt",
+            4,
+            json!({"effect":effect,"replay":replay,"outcome":outcome,"tool_use_id":"call","tool_name":"read_ref","idempotency_key":"call-key","input_sha256":"input","root_effect_owner":intent.payload["root_effect_owner"],"root_effect_context":intent.payload["root_effect_context"]}),
+        );
+        primary.transaction_index = 0;
+        let mut index = event(
+            "execution-agent-receipts:root:node:1",
+            "execution.agent_tool.receipt",
+            4,
+            primary.payload.clone(),
+        );
+        index.transaction_index = 1;
+        index.payload["effect_kind"] = json!("read");
+        index.payload["sequence"] = json!(1);
+        reader
+            .keys
+            .insert(("effect".into(), "call-key:read-intent".into()), intent);
+        reader.keys.insert(
+            (
+                "execution-agent-receipts:root:node:1".into(),
+                "agent-tool-receipt:call-key".into(),
+            ),
+            index,
+        );
+        let mut good = reader.clone();
+        let mut cuts = BTreeMap::new();
+        super::super::results::authenticate_root_receipt_owner_with_reader(
+            &mut good, &primary, &mut cuts,
+        )
+        .unwrap();
+        assert_eq!(
+            cuts.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "effect",
+                "execution-agent-receipts:root:node:1",
+                "root",
+                "root:node:node"
+            ]
+        );
+        assert_eq!(good.calls.iter().filter(|op| **op == "key").count(), 3);
+        assert!(good.calls.contains(&"body"));
+        assert!(good.calls.contains(&"fence"));
+        reader.keys.remove(&(
+            "execution-agent-receipts:root:node:1".into(),
+            "agent-tool-receipt:call-key".into(),
+        ));
+        assert_eq!(
+            super::super::results::authenticate_root_receipt_owner_with_reader(
+                &mut reader,
+                &primary,
+                &mut BTreeMap::new()
+            )
+            .unwrap_err(),
+            "root receipt original real-node index missing"
+        );
+    }
+    fn agent() -> (
+        Reader,
+        AgenticProgramProjection,
+        harness_contract::agent::AgentTaskPacket,
+        DurableRuntimeEvent,
+    ) {
+        use harness_contract::agent::*;
+        let assignment = crate::test_support::agent_assignment(
+            None, "agent", "run", "task", "session", "mission", None, "graph", "node",
+        );
+        let binding = AgentBindingSnapshot {
+            binding_id: "binding".into(),
+            definition_ref: assignment.definition_ref.clone(),
+            definition_digest: "sha256:original".into(),
+            instructions: "read".into(),
+            instance: AgentInstanceRef {
+                instance_id: "agent".into(),
+                role_slot_id: None,
+            },
+            executor: AgentExecutorPolicy::CowdNative,
+            model_policy: AgentModelPolicy {
+                profile: "test".into(),
+                allowed_models: vec![],
+                fallback_allowed: false,
+            },
+            effective_capabilities: vec![],
+            skill_refs: vec![],
+            tool_contract_refs: vec!["read_ref".into()],
+            skill_tool_pins: None,
+            skill_tool_refs: None,
+            data_lease: AgentDataLease {
+                session_id: "session".into(),
+                task_id: "task".into(),
+                team_id: None,
+                read_scopes: vec![],
+                write_mode: CognitiveWriteMode::None,
+                fact_boundaries: vec![],
+                fact_refs: vec![],
+                matrix_snapshot_refs: vec![],
+            },
+            release: None,
+            evaluation: None,
+            display: None,
+            binding_digest: "binding-digest".into(),
+        };
+        let packet = AgentTaskPacket {
+            assignment,
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "read".into(),
+            required_acceptance: Default::default(),
+            output_acceptance: vec![],
+            cohort_prompt_package: None,
+            acceptance: vec![],
+            constraints: vec![],
+            context_refs: vec![],
+            agentic_binding: None,
+            evidence_refs: vec![],
+            resource_scopes: vec![],
+            allowed_tools: vec!["read_ref".into()],
+            allowed_skills: vec![],
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            policy_revision: 1,
+            model_lease: "model".into(),
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "agent",
+                1,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            binding: Some(binding),
+            managed_invocation: None,
+            idempotency_key: "packet".into(),
+        };
+        let program:AgenticProgramProjection=serde_json::from_value(json!({"program_id":"program","objective_id":"objective","session_id":"session","turn_id":"test-turn","root_execution_id":"root","required_team_count":0,"exact_team_count":null,"objective_summary":"read","model_lease":"model","permission_ceiling":"read-only","resource_scopes":[],"revision":1,"status":"open","teams":{},"agents":{},"tasks":{},"topics":{},"artifacts":{},"final_artifact_ref":null,"unresolved":[]})).unwrap();
+        let seal = json!({"schema_version":1,"primary_stream":"primary","primary_key":"read","index_stream":"execution-agent-receipts:graph:node:1","index_key":"index","session_id":"session","invocation_id":"call","tool_name":"read_ref","graph_id":"graph","node_id":"node","attempt":1,"step":{"step_id":"step","session_id":"session","turn_id":"test-turn","execution_id":"graph","run_ref":"run","actor_ref":"agent","build_ref":"test","attempt":null,"epoch":null,"goal_ref":null,"program_ref":null,"task_ref":null},"origin":{"origin_step_id":"step","call_id":"call","catalog_digest":"catalog","source":{"kind":"process","worker_id":"run","sequence":1}},"input_sha256":"input","body":{"schema_version":1,"source_ref":"artifact","source_sha256":"sha256:source","source_bytes":2,"output_sha256":"sha256:output","output_bytes":2,"extent":{"kind":"artifact_chunks","total_chunks":1,"chunks":[]}}});
+        let descriptor = json!({"tool_id":"read_ref","descriptor_hash":"descriptor","idempotency":"idempotent","effect_kind":"read","scopes":[],"required_permission":"read-only","approval_class":"none","uses_network":false,"spawns_process":false,"mutates_packages":false,"mutates_system":false});
+        let payload = json!({"read_acquisition_v1":seal,"outcome":{"status":"executed"},"tool_use_id":"call","tool_name":"read_ref","input_sha256":"input","replay":{"parent_execution":{},"invocation":{"effect":descriptor}}});
+        let primary = event("primary", "execution.read.receipt", 3, payload.clone());
+        let index = event(
+            "execution-agent-receipts:graph:node:1",
+            "execution.agent_tool.receipt",
+            3,
+            payload,
+        );
+        let presentation = "OK";
+        let delivery = json!({"schema_version":1,"grade":"agent_channel_send","acquisition":seal,"acquisition_event_id":primary.event_id,"acquisition_cursor":3,"index_event_id":index.event_id,"session_id":"session","execution_id":"graph","turn_id":"test-turn","tool_invocation_id":"call","recipient":{"kind":"agent_task","identity":packet.assignment.execution_identity},"presentation_sha256":"sha256:565339bc4d33d72817b583024112eb7f5cdf3e5eef0252d6ec1b9c9a94e12bb3","presentation_bytes":2,"body_omitted":true,"delivered_extent":null,"transport":{"kind":"process_channel_send","worker_id":"run","request_id":"call","sequence":1,"step_id":"step","request_fingerprint":"fingerprint","response_sha256":"response","response_bytes":2}});
+        let mut delivered = event(
+            "session:session",
+            crate::context_evidence::PROCESS_DELIVERY_KIND,
+            5,
+            delivery,
+        );
+        delivered.scope = RuntimeEventScope::Session;
+        delivered.actor = Some("runtime.process_jsonl".into());
+        delivered.status = Some("sent".into());
+        let identity = json!([
+            "session",
+            "graph",
+            "node",
+            "run",
+            "agent",
+            1,
+            "binding-digest"
+        ]);
+        let stream = format!(
+            "agent-process-transport:{:x}",
+            Sha256::digest(identity.to_string().as_bytes())
+        );
+        let key = format!("completed:{:x}", Sha256::digest(b"call"));
+        let transport = event(
+            &stream,
+            "agent.process_request_completed",
+            4,
+            json!({"fingerprint":"fingerprint","response":{"output":presentation}}),
+        );
+        (
+            Reader {
+                keys: BTreeMap::from([
+                    (("primary".into(), "read".into()), primary),
+                    (
+                        (
+                            "execution-agent-receipts:graph:node:1".into(),
+                            "index".into(),
+                        ),
+                        index,
+                    ),
+                    ((stream, key), transport),
+                ]),
+                ..Default::default()
+            },
+            program,
+            packet,
+            delivered,
+        )
+    }
+    #[test]
+    fn agent_reader_keeps_exact_attempt_transport_and_source_fence() {
+        let (reader, program, packet, event) = agent();
+        let run = |reader: &mut Reader, packet: &harness_contract::agent::AgentTaskPacket| {
+            review_delivery_snapshot_from_events(
+                reader,
+                &program,
+                Some(packet),
+                vec![event.clone()],
+                BTreeMap::new(),
+            )
+        };
+        let mut good = reader.clone();
+        let snapshot = run(&mut good, &packet).unwrap();
+        assert_eq!(snapshot.reads.len(), 1);
+        assert_eq!(snapshot.reads[0].event.event_id, "event-session:session-5");
+        assert_eq!(snapshot.sources.len(), 3);
+        let mut foreign = packet.clone();
+        foreign.attempt = 2;
+        let mut r = reader.clone();
+        assert!(run(&mut r, &foreign).unwrap().reads.is_empty());
+        assert!(r.calls.is_empty());
+        let mut wrong = reader.clone();
+        for r in wrong
+            .keys
+            .values_mut()
+            .filter(|r| r.kind == "agent.process_request_completed")
+        {
+            r.payload["response"]["output"] = json!("wrong");
+        }
+        assert_eq!(
+            run(&mut wrong, &packet).err().unwrap(),
+            "Process delivered body does not match its actual response"
+        );
+        let mut missing = reader.clone();
+        missing.keys.remove(&("primary".into(), "read".into()));
+        assert_eq!(
+            run(&mut missing, &packet).err().unwrap(),
+            "delivered read has no original primary receipt"
+        );
+        let mut changed = reader.clone();
+        changed.moved = true;
+        assert_eq!(
+            run(&mut changed, &packet).err().unwrap(),
+            "read delivery source moved during validation"
+        );
+        for op in ["key", "revision"] {
+            let mut bad = reader.clone();
+            bad.fault = Some(op);
+            assert_eq!(
+                run(&mut bad, &packet).err().unwrap(),
+                format!("reader:{op}")
+            );
+        }
+    }
+}
