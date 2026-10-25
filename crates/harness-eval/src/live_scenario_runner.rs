@@ -5398,6 +5398,121 @@ mod tests;
 mod read_evidence_consumer_tests {
     use super::*;
 
+    /// Replays an immutable page produced by the registered Gateway handler.
+    /// The expected canonical identity must be supplied separately from the
+    /// producer's pre-query registration, never extracted from this page.
+    #[test]
+    #[ignore = "requires original handler page and independent pre-query workspace registration"]
+    fn actual_handler_root_partial_page_reaches_both_read_consumers() {
+        let page_path = std::env::var_os("COWD_E2_HANDLER_PAGE")
+            .expect("original registered-handler page path required");
+        let expected_path = std::env::var_os("COWD_E2_HANDLER_EXPECTED_PATH")
+            .expect("independent pre-query WorkspacePathIdentity registration required");
+        let declared_digest =
+            std::env::var("COWD_E2_HANDLER_PAGE_SHA256").expect("original page SHA256 required");
+        let raw = std::fs::read(page_path).expect("original handler page must be readable");
+        let actual_digest = format!("{:x}", Sha256::digest(&raw));
+        assert_eq!(
+            actual_digest, declared_digest,
+            "original page bytes changed"
+        );
+        let expected: harness_contract::context::WorkspacePathIdentity = serde_json::from_slice(
+            &std::fs::read(expected_path)
+                .expect("original independent registration must be readable"),
+        )
+        .expect("existing WorkspacePathIdentity registration, not a new DTO");
+        // Original fixture input, fixed before either consumer sees the page.
+        assert_eq!(expected.repository_id, "read-repository");
+        assert_eq!(expected.workspace_relative_path, "src/a.rs");
+        assert_eq!(expected.repository_relative_path, "src/a.rs");
+        assert!(!expected.workspace_id.is_empty());
+        assert_eq!(
+            expected.object_kind,
+            harness_contract::context::WorkspaceObjectKind::File
+        );
+        let page: harness_contract::projection::ReadEvidencePage =
+            serde_json::from_slice(&raw).expect("actual registered-handler typed page");
+        assert_eq!(
+            page.reads.len(),
+            1,
+            "this original page proves one Root delivery only"
+        );
+        assert!(matches!(
+            page.reads[0].recipient,
+            harness_contract::projection::ReadEvidenceRecipient::Root { .. }
+        ));
+        assert!(matches!(
+            page.reads[0].delivered_extent,
+            Some(
+                harness_contract::projection::ReadEvidenceExtent::FileLines {
+                    start_line: 2,
+                    line_count: 1,
+                    total_lines: 4,
+                    source_omitted: true,
+                    ..
+                }
+            )
+        ));
+
+        let mut observed = crate::facet_gate::ReadEvidencePages::new(
+            "read-graph",
+            "read-session",
+            "read-turn",
+            BTreeMap::from([("src/a.rs".to_string(), expected.clone())]),
+        );
+        observed
+            .accept(page.clone())
+            .expect("original page must match independently registered scope");
+        assert!(observed.satisfied(), "{:?}", observed.report());
+        let mut wrong_repository = expected;
+        wrong_repository.repository_id = "foreign-repository".into();
+        let mut foreign = crate::facet_gate::ReadEvidencePages::new(
+            "read-graph",
+            "read-session",
+            "read-turn",
+            BTreeMap::from([("src/a.rs".to_string(), wrong_repository)]),
+        );
+        foreign.accept(page).unwrap();
+        let mut checks = Vec::new();
+        for acceptance in consumers() {
+            for (proof, read_expected) in [(&observed, true), (&foreign, false)] {
+                // The page contains read proof, not a Root business outcome.
+                // Do not invent a Succeeded event to promote this evidence.
+                let timeline = json!({"events":[],"read_evidence":proof.report()});
+                let result = acceptance.evaluate("answer", &timeline, &[], None, "read-graph");
+                let read_check = result
+                    .checks
+                    .iter()
+                    .find(|check| {
+                        matches!(
+                            check["name"].as_str(),
+                            Some("tool_evidence" | "read_receipt:src/a.rs")
+                        )
+                    })
+                    .expect("actual consumer must emit its read requirement");
+                assert_eq!(read_check["passed"], read_expected);
+                assert!(
+                    !result.passed,
+                    "read evidence alone cannot certify Root business success"
+                );
+                assert!(result
+                    .checks
+                    .iter()
+                    .any(|check| check["name"] == "root_business_outcome_succeeded"
+                        && check["passed"] == false));
+                checks.push(read_check.clone());
+            }
+        }
+        println!(
+            "E2_ACTUAL_HANDLER_READ_REPLAY:{}",
+            json!({
+                "page_sha256":actual_digest,"consumer_read_checks":checks,
+                "scope":"original Root partial read only","root_business_success_claimed":false,
+                "agent_or_batch_leaf_claimed":false,
+            })
+        );
+    }
+
     fn timeline() -> Value {
         json!({"events":[{
             "kind":"runtime.outcome.recorded.v1","status":"succeeded",
