@@ -31,12 +31,15 @@ struct PreparedCheckpointPayload {
 pub(super) struct RequestBudget {
     records: usize,
     records_by_key: BTreeMap<(String, String, u64), Option<std::sync::Arc<DurableRuntimeEvent>>>,
-    records_by_sequence: BTreeMap<(String, u64), BTreeMap<u64, std::sync::Arc<DurableRuntimeEvent>>>,
+    records_by_sequence:
+        BTreeMap<(String, u64), BTreeMap<u64, std::sync::Arc<DurableRuntimeEvent>>>,
     resolved_records: BTreeMap<String, (DurableRuntimeEvent, std::sync::Arc<DurableRuntimeEvent>)>,
     stream_heads: BTreeMap<(String, u64), u64>,
     bytes: usize,
     exhausted: bool,
     unknown_body_read: bool,
+    charged_records: BTreeMap<String, (DurableRuntimeEvent, usize)>,
+    raw_graph_records: BTreeMap<String, (DurableRuntimeEvent, std::sync::Arc<serde_json::Value>)>,
     checkpoints: BTreeMap<String, PendingCheckpoint>,
     prepaid_checkpoints: BTreeMap<String, PreparedCheckpointPayload>,
     prepaid_heads: BTreeSet<String>,
@@ -54,6 +57,7 @@ pub(super) struct RequestBudget {
     terminal_rechecks: BTreeSet<String>,
 }
 
+
 impl Default for RequestBudget {
     fn default() -> Self {
         Self {
@@ -65,6 +69,8 @@ impl Default for RequestBudget {
             bytes: HISTORY_REQUEST_BYTES,
             exhausted: false,
             unknown_body_read: false,
+            charged_records: BTreeMap::new(),
+            raw_graph_records: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             prepaid_checkpoints: BTreeMap::new(),
             prepaid_heads: BTreeSet::new(),
@@ -618,6 +624,8 @@ impl RequestBudget {
             self.records_by_key.clear();
             self.records_by_sequence.clear();
             self.resolved_records.clear();
+            self.charged_records.clear();
+            self.raw_graph_records.clear();
             self.stream_heads.clear();
             self.prefix_fences.clear();
             self.terminal_work = None;
@@ -666,6 +674,9 @@ impl RequestBudget {
                 self.charge(0, HISTORY_REQUEST_BYTES + 1)?;
             }
             self.unknown_body_read = true;
+            // Unknown external extents must reserve the entire legal body before IO.
+            self.charge(0, HISTORY_REQUEST_BYTES)?;
+            return Ok(HISTORY_REQUEST_BYTES);
         }
         Ok(0)
     }
@@ -675,6 +686,15 @@ impl RequestBudget {
         &mut self,
         record: &DurableRuntimeEvent,
     ) -> Result<usize, RuntimeServicesError> {
+        self.charge(0, 0)?;
+        if let Some((original, prepaid)) = self.charged_records.get(&record.event_id) {
+            if original != record {
+                return Err(RuntimeServicesError::Invariant(
+                    "charged event identity changed within request".into(),
+                ));
+            }
+            return Ok(*prepaid);
+        }
         self.charge(1, 0)?;
         let metadata = self.charge_value(record)?;
         let body = if record.scope == RuntimeEventScope::ExecutionGraph {
@@ -684,7 +704,10 @@ impl RequestBudget {
         } else {
             0
         };
-        Ok(metadata + body)
+        let prepaid = metadata + body;
+        self.charged_records
+            .insert(record.event_id.clone(), (record.clone(), prepaid));
+        Ok(prepaid)
     }
 
     pub(super) fn resolve_record(
@@ -700,23 +723,26 @@ impl RequestBudget {
                 ));
             }
             let resolved = std::sync::Arc::clone(resolved);
-            let metadata_bytes = serde_json::to_vec(&record).map_err(|_| checkpoint_error())?.len();
-            self.terminal_preflight(1, metadata_bytes)?;
-            self.charge(1, 0)?;
-            self.charge_value(&record)?;
+            self.charge(0, 0)?;
             let resolved = resolved.as_ref().clone();
             self.terminal_resolved(services, &record, &resolved)?;
             return Ok(resolved);
         }
         let body = record.payload["bytes"].as_u64().unwrap_or(0);
-        if self.terminal_work.is_some() && record.scope == RuntimeEventScope::ExecutionGraph
+        if self.terminal_work.is_some()
+            && record.scope == RuntimeEventScope::ExecutionGraph
             && record.payload["body"]["kind"].as_str() != Some("inline")
             && record.payload["bytes"].as_u64().is_none()
         {
             return Err(checkpoint_error());
         }
-        let extent = usize::try_from(body).map_err(|_| checkpoint_error())?
-            .saturating_add(serde_json::to_vec(&record).map_err(|_| checkpoint_error())?.len());
+        let extent = usize::try_from(body)
+            .map_err(|_| checkpoint_error())?
+            .saturating_add(
+                serde_json::to_vec(&record)
+                    .map_err(|_| checkpoint_error())?
+                    .len(),
+            );
         self.terminal_preflight(0, extent.saturating_add(512))?;
         let prepaid = self.charge_record(&record)?;
         self.resolve_prepaid_record(services, &record, prepaid)
@@ -731,7 +757,9 @@ impl RequestBudget {
         self.charge(0, 0)?;
         if let Some((original, resolved)) = self.resolved_records.get(&record.event_id) {
             if original != record {
-                return Err(RuntimeServicesError::Invariant("resolved event identity changed within request".into()));
+                return Err(RuntimeServicesError::Invariant(
+                    "resolved event identity changed within request".into(),
+                ));
             }
             let resolved = resolved.as_ref().clone();
             self.terminal_resolved(services, record, &resolved)?;
@@ -739,33 +767,190 @@ impl RequestBudget {
         }
         let envelope = if record.kind == "goal.observation" {
             &record.payload["observation_body"]
-        } else { &record.payload };
+        } else {
+            &record.payload
+        };
         let body = envelope["bytes"].as_u64().unwrap_or(0);
         if self.terminal_work.is_some()
-            && (record.scope == RuntimeEventScope::ExecutionGraph || record.kind == "goal.observation")
+            && (record.scope == RuntimeEventScope::ExecutionGraph
+                || record.kind == "goal.observation")
             && envelope["body"]["kind"].as_str() != Some("inline")
             && envelope["bytes"].as_u64().is_none()
         {
             return Err(checkpoint_error());
         }
-        let extent = usize::try_from(body).map_err(|_| checkpoint_error())?
-            .saturating_add(serde_json::to_vec(record).map_err(|_| checkpoint_error())?.len());
+        let extent = usize::try_from(body)
+            .map_err(|_| checkpoint_error())?
+            .saturating_add(
+                serde_json::to_vec(record)
+                    .map_err(|_| checkpoint_error())?
+                    .len(),
+            );
         self.terminal_preflight(0, extent.saturating_add(1024))?;
-        let event = services
-            .event_store()
-            .resolve_read_record(record.clone())
-            .map_err(error)?;
+        let event = if record.scope == RuntimeEventScope::ExecutionGraph {
+            let raw = self.resolve_raw_graph_record(services, record)?;
+            services
+                .event_store()
+                .hydrate_graph_record(record.clone(), raw)
+                .map_err(error)?
+        } else {
+            services
+                .event_store()
+                .resolve_read_record(record.clone())
+                .map_err(error)?
+        };
         let actual = serde_json::to_vec(&event)
             .map_err(|_| {
                 RuntimeServicesError::Invariant("projection event encoding failed".into())
             })?
             .len();
         self.charge(0, actual.saturating_sub(prepaid))?;
-        self.resolved_records.insert(record.event_id.clone(), (record.clone(), std::sync::Arc::new(event.clone())));
+        self.resolved_records.insert(
+            record.event_id.clone(),
+            (record.clone(), std::sync::Arc::new(event.clone())),
+        );
         self.terminal_resolved(services, record, &event)?;
         Ok(event)
     }
 
+    /// Raw graph content and hydrated events have distinct memo entries.
+    pub(super) fn resolve_raw_graph_record(
+        &mut self,
+        services: &RuntimeServices,
+        record: &DurableRuntimeEvent,
+    ) -> Result<serde_json::Value, RuntimeServicesError> {
+        self.charge(0, 0)?;
+        if let Some((original, raw)) = self.raw_graph_records.get(&record.event_id) {
+            if original != record {
+                return Err(RuntimeServicesError::Invariant(
+                    "raw graph identity changed within request".into(),
+                ));
+            }
+            return Ok(raw.as_ref().clone());
+        }
+        let prepaid = self.charge_record(record)?;
+        self.terminal_preflight(0, 512)?;
+        let raw = services
+            .event_store()
+            .resolve_graph_record(record)
+            .map_err(error)?;
+        let size = serde_json::to_vec(&raw)
+            .map_err(|_| checkpoint_error())?
+            .len();
+        if size > HISTORY_REQUEST_BYTES {
+            return Err(checkpoint_error());
+        }
+        self.raw_graph_records.insert(
+            record.event_id.clone(),
+            (record.clone(), std::sync::Arc::new(raw.clone())),
+        );
+        Ok(raw)
+    }
+
+    pub(super) fn read_auth_can_scan(&self) -> bool {
+        !self.exhausted && self.records >= 96 && self.bytes >= 256 * 1024
+    }
+
+    /// Caller limits constrain the physical lookup, including cache hits.
+    /// Cursor filtering is deliberately the consumer's responsibility.
+    pub(super) fn limited_source_page(
+        &mut self,
+        services: &RuntimeServices,
+        stream: &str,
+        after: u64,
+        head: u64,
+        limit: usize,
+        bytes: usize,
+        through: u64,
+    ) -> Result<Vec<std::sync::Arc<DurableRuntimeEvent>>, RuntimeServicesError> {
+        self.charge(0, 0)?;
+        if after >= head {
+            return Ok(Vec::new());
+        }
+        if limit == 0 || bytes == 0 {
+            return Err(checkpoint_error());
+        }
+        let limit = limit.min(self.records.saturating_sub(1));
+        let bytes = bytes.min(self.bytes);
+        if limit == 0 || bytes == 0 {
+            self.charge(HISTORY_REQUEST_RECORDS + 1, 0)?;
+        }
+        self.terminal_preflight(2, bytes.min(1024))?;
+        self.charge(1, 0)?;
+        let records = services
+            .event_store()
+            .list_stream_after(stream, after, head, limit, bytes)
+            .map_err(error)?;
+        if records.len() > limit {
+            return Err(checkpoint_error());
+        }
+        let mut next = after;
+        let mut encoded = 0usize;
+        let mut output = Vec::new();
+        for record in records {
+            next = next.checked_add(1).ok_or_else(checkpoint_error)?;
+            encoded = encoded.saturating_add(
+                serde_json::to_vec(&record)
+                    .map_err(|_| checkpoint_error())?
+                    .len(),
+            );
+            if record.stream_id != stream
+                || record.sequence != next
+                || record.sequence > head
+                || encoded > bytes
+            {
+                return Err(checkpoint_error());
+            }
+            self.charge_record(&record)?;
+            if record.commit_cursor <= through {
+                self.remember_sequence(&record, through)?;
+            }
+            output.push(std::sync::Arc::new(record));
+        }
+        Ok(output)
+    }
+
+    pub(super) fn read_auth_fence(
+        &mut self,
+        services: &RuntimeServices,
+        transaction: &str,
+        stream: &str,
+        through: u64,
+    ) -> Result<Option<crate::CommittedStreamRevision>, RuntimeServicesError> {
+        let mut expected = None;
+        for (record, _) in self.charged_records.values() {
+            if record.transaction_id == transaction
+                && record.commit_cursor <= through
+                && matches!(
+                    record.kind.as_str(),
+                    "execution.read.intent" | "execution.effect.intent"
+                )
+                && record.payload["root_effect_owner"]["binding"]["root_execution_id"].as_str()
+                    == Some(stream)
+            {
+                let revision = record.payload["root_effect_owner"]["graph_revision"]
+                    .as_u64()
+                    .ok_or_else(checkpoint_error)?;
+                if expected
+                    .replace(revision)
+                    .is_some_and(|old| old != revision)
+                {
+                    return Err(checkpoint_error());
+                }
+            }
+        }
+        let expected = expected.ok_or_else(|| {
+            RuntimeServicesError::Invariant("read fence lacks its bounded original intent".into())
+        })?;
+        let fence = self.terminal_fence(services, transaction, stream)?;
+        if fence
+            .as_ref()
+            .is_some_and(|f| f.stream_id != stream || f.expected_revision != expected)
+        {
+            return Err(checkpoint_error());
+        }
+        Ok(fence)
+    }
     pub(super) fn capture_source_fence(
         &mut self,
         services: &RuntimeServices,
@@ -1966,7 +2151,8 @@ mod canonical_request_413_tests {
         let metadata = serde_json::to_vec(&raw).unwrap().len();
         let second = budget.resolve_record(&services, raw.clone()).unwrap();
         assert_eq!(second, first);
-        assert_eq!(budget.consumed_work(), (before.0 + 1, before.1 + metadata));
+        assert_eq!(budget.consumed_work(), before);
+        assert!(metadata > 0);
         for field in ["payload", "stream", "key", "cursor"] {
             let mut foreign = raw.clone();
             match field {

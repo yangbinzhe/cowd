@@ -122,6 +122,17 @@ fn execution_projection_snapshot_spec(
     )
 }
 
+fn execution_read_evidence_spec() -> TypedRouteSpec<
+    (),
+    harness_contract::projection::ReadEvidenceQuery,
+    harness_contract::projection::ReadEvidencePage,
+> {
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_RUNTIME_EXECUTIONS_BY_ID_READ_EVIDENCE,
+        "runtime_execution_read_evidence",
+    )
+}
+
 fn agentic_program_root_spec(
 ) -> TypedRouteSpec<(), runtime_routes::AgenticProgramRootQuery, runtime::AgenticProgramProjection>
 {
@@ -386,6 +397,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         .metadata(Some("BranchSessionRequest"), "BranchSessionReceipt", false),
         agentic_program_root_spec().metadata(None, "AgenticProgramProjection", false),
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
+        execution_read_evidence_spec().metadata(None, "ReadEvidencePage", false),
         execution_activity_detail_spec().metadata(None, "ExecutionActivityDetailProjection", false),
         execution_projection_command_spec()
             .metadata(
@@ -620,6 +632,7 @@ pub(super) fn register_execution_projection_routes(
     router: Router<Arc<AppState>>,
 ) -> Router<Arc<AppState>> {
     let snapshot = execution_projection_snapshot_spec();
+    let reads = execution_read_evidence_spec();
     let agentic_program = agentic_program_root_spec();
     let activity = execution_activity_detail_spec();
     let command = execution_projection_command_spec();
@@ -629,6 +642,7 @@ pub(super) fn register_execution_projection_routes(
             get(runtime_routes::get_root_agentic_program),
         )
         .route(snapshot.path, get(runtime_routes::get_execution_projection))
+        .route(reads.path, get(runtime_routes::get_execution_read_evidence))
         .route(activity.path, get(runtime_routes::get_execution_activity))
         .route(
             command.path,

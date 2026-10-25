@@ -1207,17 +1207,8 @@ impl RuntimeEventStore {
             );
         }
         if record.scope == RuntimeEventScope::ExecutionGraph {
-            let binding = record
-                .payload
-                .get("_runtime_activity_binding")
-                .cloned()
-                .ok_or("graph binding missing")?;
-            let mut payload = self.resolve_graph_record(&record)?;
-            payload
-                .as_object_mut()
-                .ok_or("graph content is not an object")?
-                .insert("_runtime_activity_binding".into(), binding);
-            record.payload = payload;
+            let raw = self.resolve_graph_record(&record)?;
+            return self.hydrate_graph_record(record, raw);
         } else if record.kind == "goal.observation" {
             let observation = self.resolve_observation_record(&record)?;
             let payload = record
@@ -1319,6 +1310,28 @@ impl RuntimeEventStore {
         }
     }
 
+    /// Pure hydration of an already authenticated graph body; no second IO.
+    pub(crate) fn hydrate_graph_record(
+        &self,
+        mut record: DurableRuntimeEvent,
+        mut body: serde_json::Value,
+    ) -> Result<DurableRuntimeEvent, String> {
+        if record.schema_version != CONTENT_SCHEMA
+            || record.scope != RuntimeEventScope::ExecutionGraph
+        {
+            return Err("unsupported graph event schema".into());
+        }
+        let binding = record
+            .payload
+            .get("_runtime_activity_binding")
+            .cloned()
+            .ok_or("graph binding missing")?;
+        body.as_object_mut()
+            .ok_or("graph content is not an object")?
+            .insert("_runtime_activity_binding".into(), binding);
+        record.payload = body;
+        Ok(record)
+    }
     pub(crate) fn resolve_graph_record(
         &self,
         record: &DurableRuntimeEvent,

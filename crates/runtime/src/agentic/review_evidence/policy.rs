@@ -976,7 +976,7 @@ pub(crate) fn review_delivery_snapshot(
     )
 }
 
-fn review_delivery_snapshot_from_events(
+pub(crate) fn review_delivery_snapshot_from_events(
     reader: &mut dyn super::read_source::ReadAuthSource,
     program: &AgenticProgramProjection,
     packet: Option<&harness_contract::agent::AgentTaskPacket>,

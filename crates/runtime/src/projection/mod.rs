@@ -37,11 +37,13 @@ mod delta;
 mod history;
 #[cfg(test)]
 pub(crate) use history::own843_checkpoint_state;
+mod read_evidence;
 mod reducer_support;
 pub(crate) mod settlement;
 mod snapshot;
 
 pub use delta::delta;
+pub use read_evidence::read_evidence;
 pub use snapshot::snapshot;
 
 use reducer_support::*;
@@ -4951,3 +4953,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(any(test, feature="test-fixtures"))]
+pub use read_evidence::read_evidence_fixture;

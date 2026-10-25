@@ -1,6 +1,6 @@
 //! The original read authenticator has one storage boundary, including Root history.
 //! Event discovery remains with its caller; this port makes no budget/cut promises.
-pub(super) trait ReadAuthSource {
+pub(crate) trait ReadAuthSource {
     fn stream_revision(&mut self, stream: &str) -> Result<u64, String>;
     fn event_by_idempotency_key(
         &mut self,

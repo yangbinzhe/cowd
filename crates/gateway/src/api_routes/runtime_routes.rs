@@ -574,6 +574,137 @@ pub(super) async fn get_execution_projection(
     Ok(Json(projection))
 }
 
+/// Private extractor: clients cannot supply Runtime, Program, packet or grants.
+pub(super) struct AuthorizedReadEvidence {
+    runtime: Arc<runtime::RuntimeServices>,
+    execution_id: String,
+    context: harness_contract::projection::ProjectionQueryContext,
+    query: harness_contract::projection::ReadEvidenceQuery,
+}
+#[async_trait::async_trait]
+impl axum::extract::FromRequestParts<Arc<AppState>> for AuthorizedReadEvidence {
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        use axum::extract::FromRequestParts;
+        let Extension(principal) =
+            Extension::<AuthenticatedPrincipal>::from_request_parts(parts, state)
+                .await
+                .map_err(|_| {
+                    runtime_event_error(
+                        StatusCode::UNAUTHORIZED,
+                        "authenticated principal required",
+                    )
+                })?;
+        let Path(execution_id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                runtime_event_error(StatusCode::BAD_REQUEST, "execution identity required")
+            })?;
+        let Query(query) =
+            Query::<harness_contract::projection::ReadEvidenceQuery>::from_request_parts(
+                parts, state,
+            )
+            .await
+            .map_err(|_| {
+                runtime_event_error(StatusCode::BAD_REQUEST, "invalid read-evidence query")
+            })?;
+        if query.limit == 0 || query.limit > harness_contract::projection::READ_EVIDENCE_MAX_LIMIT {
+            return Err(runtime_event_error(
+                StatusCode::BAD_REQUEST,
+                "invalid read-evidence limit",
+            ));
+        }
+        let context = execution_projection_context(
+            state,
+            &principal,
+            &execution_id,
+            harness_contract::projection::ProjectionDetailScope::Full,
+        )
+        .await?;
+        Ok(Self {
+            runtime: execution_runtime(state)?,
+            execution_id,
+            context,
+            query,
+        })
+    }
+}
+/// The registered handler consumes only the original authenticated extractor.
+pub(super) async fn get_execution_read_evidence(
+    request: AuthorizedReadEvidence,
+) -> Result<Json<harness_contract::projection::ReadEvidencePage>, (StatusCode, Json<ErrorResponse>)>
+{
+    runtime::execution_projection::read_evidence(
+        &request.runtime,
+        &request.execution_id,
+        &request.context,
+        request.query,
+    )
+    .await
+    .map(Json)
+    .map_err(projection_error)
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod read_evidence_api_tests {
+    use super::*;
+    #[tokio::test]
+    async fn registered_handler_consumes_original_core_and_resource_authority() {
+        let (runtime, execution_id, context) =
+            runtime::execution_projection::read_evidence_fixture(false, 0);
+        let request = |context| AuthorizedReadEvidence {
+            runtime: runtime.clone(),
+            execution_id: execution_id.clone(),
+            context,
+            query: Default::default(),
+        };
+        let Json(page) = get_execution_read_evidence(request(context.clone()))
+            .await
+            .unwrap();
+        assert!(!page.incomplete, "{page:?}");
+        assert!(page.exhausted);
+        assert_eq!(page.reads.len(), 1);
+        println!("E1_API_PAGE:{}", serde_json::to_string(&page).unwrap());
+        assert_eq!(page.reads[0].path.workspace_relative_path, "src/a.rs");
+        assert!(page.reads[0].body_delivered);
+        assert!(matches!(
+            page.reads[0].delivered_extent,
+            Some(
+                harness_contract::projection::ReadEvidenceExtent::FileLines {
+                    start_line: 2,
+                    line_count: 1,
+                    total_lines: 4,
+                    ..
+                }
+            )
+        ));
+        let mut observer = context.clone();
+        observer.visibility_grants.clear();
+        let Json(hidden) = get_execution_read_evidence(request(observer))
+            .await
+            .unwrap();
+        assert!(!hidden.incomplete);
+        assert!(hidden.reads.is_empty());
+        let wire = serde_json::to_string(&hidden).unwrap();
+        assert!(!wire.contains("src/a.rs"));
+        assert!(!wire.contains("cf4771a548f1f5000749e3287eb205ad8005b26fc82a3115ee8c76f5247bce4f"));
+        assert!(!wire.contains("read-primary"));
+        let mut foreign = context;
+        foreign.session_scopes = vec!["foreign".into()];
+        assert_eq!(
+            get_execution_read_evidence(request(foreign))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        runtime.shutdown_execution().await;
+    }
+}
+
 pub(super) async fn get_execution_activity(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,

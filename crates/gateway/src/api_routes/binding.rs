@@ -985,6 +985,11 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         handler: "get_execution_projection",
     },
     GatewayRouteBinding {
+        route: routes::GET_API_RUNTIME_EXECUTIONS_BY_ID_READ_EVIDENCE,
+        source: "route_registry.rs",
+        handler: "get_execution_read_evidence",
+    },
+    GatewayRouteBinding {
         route: routes::GET_API_RUNTIME_EXECUTIONS_BY_ID_ACTIVITY,
         source: "route_registry.rs",
         handler: "get_execution_activity",

@@ -810,6 +810,10 @@ pub mod paths {
         "api_runtime_executions_by_id",
         "/api/runtime/executions/:id",
     );
+    pub const API_RUNTIME_EXECUTIONS_BY_ID_READ_EVIDENCE: GatewayPathKey = GatewayPathKey::new(
+        "api_runtime_executions_by_id_read_evidence",
+        "/api/runtime/executions/:id/read-evidence",
+    );
     pub const API_RUNTIME_EXECUTIONS_BY_ID_ACTIVITY: GatewayPathKey = GatewayPathKey::new(
         "api_runtime_executions_by_id_activity",
         "/api/runtime/executions/:id/activity",
@@ -2262,6 +2266,12 @@ pub mod routes {
         GatewayHttpMethod::Get,
         paths::API_RUNTIME_EXECUTIONS_BY_ID,
     );
+    pub const GET_API_RUNTIME_EXECUTIONS_BY_ID_READ_EVIDENCE: GatewayRouteSpec =
+        GatewayRouteSpec::new(
+            "get_api_runtime_executions_by_id_read_evidence",
+            GatewayHttpMethod::Get,
+            paths::API_RUNTIME_EXECUTIONS_BY_ID_READ_EVIDENCE,
+        );
     pub const GET_API_RUNTIME_EXECUTIONS_BY_ID_ACTIVITY: GatewayRouteSpec = GatewayRouteSpec::new(
         "get_api_runtime_executions_by_id_activity",
         GatewayHttpMethod::Get,
@@ -3981,6 +3991,7 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_RUNTIME_EVENTS_RECOVER,
     paths::API_RUNTIME_EVENTS_REPLAY_REPORT,
     paths::API_RUNTIME_EXECUTIONS_BY_ID,
+    paths::API_RUNTIME_EXECUTIONS_BY_ID_READ_EVIDENCE,
     paths::API_RUNTIME_EXECUTIONS_BY_ID_ACTIVITY,
     paths::API_RUNTIME_EXECUTIONS_BY_ID_COMMANDS,
     paths::API_RUNTIME_LIVE_SUBSCRIPTIONS,
@@ -4347,6 +4358,7 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::GET_API_RUNTIME_EVENTS,
     routes::GET_API_RUNTIME_EVENTS_REPLAY_REPORT,
     routes::GET_API_RUNTIME_EXECUTIONS_BY_ID,
+    routes::GET_API_RUNTIME_EXECUTIONS_BY_ID_READ_EVIDENCE,
     routes::GET_API_RUNTIME_EXECUTIONS_BY_ID_ACTIVITY,
     routes::GET_API_RUNTIME_LIVE_BY_ID,
     routes::GET_API_RUNTIME_MANAGED_AGENTS,
