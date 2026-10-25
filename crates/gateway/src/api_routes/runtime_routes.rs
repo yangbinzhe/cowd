@@ -457,13 +457,9 @@ pub(crate) async fn execution_projection_context(
     // principal's own resource claims can make a resource reference visible;
     // Runtime still crops every emitted reference against this list.
     let mut visibility_grants = projection_visibility_grants(&claims.scopes);
-    if evaluation_projection_resource_visibility_enabled() {
-        // The paired evaluator runs in a dedicated authenticated Gateway and
-        // must inspect the safe workspace-relative refs produced by its own
-        // frozen resource lease. Production processes never receive this
-        // grant, and raw contents remain behind normal evidence authority.
-        visibility_grants.push("resource:*".to_string());
-    }
+    // The dedicated evaluator has a frozen corpus and a private Gateway.
+    // Ordinary production and shared observers retain their signed resource scopes.
+    visibility_grants.extend(evaluation_projection_resource_grants_enabled(owns_session));
     visibility_grants.push(format!("principal:{}", claims.principal_id));
     visibility_grants.sort();
     visibility_grants.dedup();
@@ -481,14 +477,24 @@ pub(crate) async fn execution_projection_context(
     })
 }
 
-fn evaluation_projection_resource_visibility_enabled() -> bool {
+fn evaluation_projection_resource_grants_enabled(owns_session: bool) -> Vec<String> {
     let harness = std::env::var("COWD_EVAL_HARNESS").ok();
     let corpus = std::env::var("COWD_EVAL_CORPUS_ID").ok();
-    evaluation_projection_resource_visibility(harness.as_deref(), corpus.as_deref())
+    evaluation_projection_resource_grants(harness.as_deref(), corpus.as_deref(), owns_session)
 }
 
-fn evaluation_projection_resource_visibility(harness: Option<&str>, corpus: Option<&str>) -> bool {
-    harness == Some("1") && corpus == Some("auto-strategy-v1")
+fn evaluation_projection_resource_grants(
+    harness: Option<&str>,
+    corpus: Option<&str>,
+    owns_session: bool,
+) -> Vec<String> {
+    match (harness, corpus, owns_session) {
+        // Preserve the existing paired evaluator contract.
+        (Some("1"), Some("auto-strategy-v1"), _) => vec!["resource:*".into()],
+        // Fixed, preregistered live fixture; never worker scopes or caller input.
+        (Some("1"), Some("live-scenarios-v1"), true) => vec!["read:Cargo.toml".into()],
+        _ => Vec::new(),
+    }
 }
 
 fn projection_visibility_grants(claims: &[String]) -> Vec<String> {
@@ -652,6 +658,147 @@ pub(super) async fn get_execution_read_evidence(
 mod read_evidence_api_tests {
     use super::*;
     #[tokio::test]
+    async fn evaluator_owner_context_reaches_registered_read_handler() {
+        let _lock = crate::test_process_env_lock();
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        let principal = AuthenticatedPrincipal(super::super::test_human_principal());
+        for path in ["Cargo.toml", "src/a.rs"] {
+            let state = crate::api_routes::tests::test_state();
+            let supplied = state.services.runtime.as_ref().unwrap().runtime_services();
+            let (runtime, execution_id, _) =
+                runtime::execution_projection::read_evidence_fixture_in(supplied, path);
+            state
+                .services
+                .session
+                .create_stored_session_for_tests(&session::SessionRecord {
+                    session_id: "read-session".into(),
+                    platform: "api_server".into(),
+                    chat_id: "read-chat".into(),
+                    user_id: None,
+                    model: None,
+                    created_at: "2026-10-25T00:00:00Z".into(),
+                    last_activity: "2026-10-25T00:00:00Z".into(),
+                    message_count: 0,
+                    reset_policy: "manual".into(),
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "owner_principal_id": principal.0.claims().principal_id
+                        })
+                        .to_string(),
+                    ),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    status: "active".into(),
+                })
+                .await
+                .unwrap();
+            // Independent registration identity and primary, captured before the page.
+            let expected = harness_contract::context::WorkspacePathIdentity {
+                workspace_id: runtime.path_identity_resolver().workspace_id().into(),
+                repository_id: "read-repository".into(),
+                workspace_relative_path: "Cargo.toml".into(),
+                repository_relative_path: "Cargo.toml".into(),
+                object_kind: harness_contract::context::WorkspaceObjectKind::File,
+                observed_revision_or_digest: None,
+            };
+            let primary = state
+                .services
+                .selected_storage
+                .as_ref()
+                .unwrap()
+                .runtime_event_store
+                .event_by_idempotency_key("read-primary", "read-key:read-receipt")
+                .unwrap()
+                .unwrap();
+            for mode in ["owner", "missing_flag", "wrong_corpus", "shared_session"] {
+                std::env::set_var("COWD_EVAL_HARNESS", "1");
+                std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+                if mode == "missing_flag" {
+                    std::env::remove_var("COWD_EVAL_HARNESS");
+                }
+                if mode == "wrong_corpus" {
+                    std::env::set_var("COWD_EVAL_CORPUS_ID", "other");
+                }
+                let mut observer_claims = principal.0.claims().clone();
+                observer_claims.principal_id = "foreign-observer".into();
+                observer_claims.scopes = vec!["session:read-session".into()];
+                let observer = AuthenticatedPrincipal(
+                    runtime::VerifiedPrincipal::from_test_claims(observer_claims),
+                );
+                let context = execution_projection_context(
+                    &state,
+                    if mode == "shared_session" {
+                        &observer
+                    } else {
+                        &principal
+                    },
+                    &execution_id,
+                    harness_contract::projection::ProjectionDetailScope::Full,
+                )
+                .await
+                .unwrap();
+                let Json(page) = get_execution_read_evidence(AuthorizedReadEvidence {
+                    runtime: runtime.clone(),
+                    execution_id: execution_id.clone(),
+                    context,
+                    query: Default::default(),
+                })
+                .await
+                .unwrap();
+                assert!(!page.incomplete, "{mode}/{path}: {page:?}");
+                assert!(page.exhausted);
+                if mode == "owner" && path == "Cargo.toml" {
+                    assert_eq!(page.reads.len(), 1, "{page:?}");
+                    let read = &page.reads[0];
+                    assert_eq!(read.path, expected);
+                    assert_eq!(read.acquisition.event_id, primary.event_id);
+                    assert_eq!(read.acquisition.commit_cursor, read.index.commit_cursor);
+                    assert_eq!(read.source_bytes, 20);
+                    assert!(read.body_delivered);
+                    assert!(matches!(
+                        read.delivered_extent,
+                        Some(
+                            harness_contract::projection::ReadEvidenceExtent::FileLines {
+                                start_line: 2,
+                                line_count: 1,
+                                total_lines: 4,
+                                body_bytes: 4,
+                                ..
+                            }
+                        )
+                    ));
+                } else {
+                    assert!(page.reads.is_empty(), "{mode}/{path}: {page:?}");
+                    let wire = serde_json::to_string(&page).unwrap();
+                    assert!(!wire.contains("read-primary"));
+                    assert!(!wire.contains(
+                        "cf4771a548f1f5000749e3287eb205ad8005b26fc82a3115ee8c76f5247bce4f"
+                    ));
+                }
+            }
+            runtime.shutdown_execution().await;
+            runtime.shutdown_maintenance().await;
+        }
+    }
+
+    #[tokio::test]
     async fn registered_handler_consumes_original_core_and_resource_authority() {
         let (runtime, execution_id, context) =
             runtime::execution_projection::read_evidence_fixture(false, 0);
@@ -664,7 +811,7 @@ mod read_evidence_api_tests {
         // Original registration identity, captured before querying the handler.
         // Never derive the independent expected workspace from the returned page.
         let expected_path = harness_contract::context::WorkspacePathIdentity {
-            workspace_id: runtime.workspace_key().to_string(),
+            workspace_id: runtime.path_identity_resolver().workspace_id().to_string(),
             repository_id: "read-repository".into(),
             workspace_relative_path: "src/a.rs".into(),
             repository_relative_path: "src/a.rs".into(),
@@ -1609,7 +1756,7 @@ fn upgrade_cross_plane_status(status: &str) -> runtime::UpgradeCarrierStatus {
 #[cfg(test)]
 mod v2_upgrade_tests {
     use super::{
-        evaluation_projection_resource_visibility, projection_command_authorized,
+        evaluation_projection_resource_grants, projection_command_authorized,
         projection_read_authorized, projection_visibility_grants, upgrade_cross_plane_status,
     };
     use crate::api_routes::AuthenticatedPrincipal;
@@ -1703,19 +1850,31 @@ mod v2_upgrade_tests {
     }
 
     #[test]
-    fn resource_refs_are_visible_only_in_the_dedicated_paired_evaluator() {
-        assert!(evaluation_projection_resource_visibility(
-            Some("1"),
-            Some("auto-strategy-v1")
-        ));
-        assert!(!evaluation_projection_resource_visibility(
-            Some("1"),
-            Some("another-corpus")
-        ));
-        assert!(!evaluation_projection_resource_visibility(
-            None,
-            Some("auto-strategy-v1")
-        ));
+    fn resource_refs_are_visible_only_in_the_dedicated_evaluator_contract() {
+        for owns_session in [false, true] {
+            assert_eq!(
+                evaluation_projection_resource_grants(
+                    Some("1"),
+                    Some("auto-strategy-v1"),
+                    owns_session
+                ),
+                vec!["resource:*".to_string()]
+            );
+        }
+        assert_eq!(
+            evaluation_projection_resource_grants(Some("1"), Some("live-scenarios-v1"), true),
+            vec!["read:Cargo.toml".to_string()]
+        );
+        for (harness, corpus, owns_session) in [
+            (None, Some("live-scenarios-v1"), true),
+            (Some("0"), Some("live-scenarios-v1"), true),
+            (Some("1"), Some("another-corpus"), true),
+            (Some("1"), Some("live-scenarios-v1"), false),
+        ] {
+            assert!(
+                evaluation_projection_resource_grants(harness, corpus, owns_session).is_empty()
+            );
+        }
     }
 }
 

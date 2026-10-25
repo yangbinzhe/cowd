@@ -683,6 +683,40 @@ fn read_evidence_fixture_fault(
     String,
     ProjectionQueryContext,
 ) {
+    read_evidence_fixture_on(
+        RuntimeServices::in_memory().unwrap(),
+        "src/a.rs",
+        agent,
+        unrelated,
+        fault,
+    )
+}
+
+/// Reuses the original sealed transactions in a supplied Gateway test Runtime.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn read_evidence_fixture_in(
+    services: std::sync::Arc<RuntimeServices>,
+    relative_path: &str,
+) -> (
+    std::sync::Arc<RuntimeServices>,
+    String,
+    ProjectionQueryContext,
+) {
+    read_evidence_fixture_on(services, relative_path, false, 0, None)
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+fn read_evidence_fixture_on(
+    services: std::sync::Arc<RuntimeServices>,
+    relative_path: &str,
+    agent: bool,
+    unrelated: usize,
+    fault: Option<&str>,
+) -> (
+    std::sync::Arc<RuntimeServices>,
+    String,
+    ProjectionQueryContext,
+) {
     use crate::{
         AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef,
         RuntimeTransactionEventInput,
@@ -729,7 +763,6 @@ fn read_evidence_fixture_fault(
             .unwrap()
             .unwrap()
     }
-    let services = RuntimeServices::in_memory().unwrap();
     let store = services.event_store();
     let commits = services.commit_service();
     let id = "read-graph";
@@ -947,9 +980,9 @@ fn read_evidence_fixture_fault(
             })
             .unwrap();
     }
-    let declared = json!({"resource":"file","operation":"read","target":if fault==Some("absolute") {"/private/fixture-workspace/src/a.rs"}else{"src/a.rs"}});
+    let declared = json!({"resource":"file","operation":"read","target":if fault==Some("absolute") {"/private/fixture-workspace/src/a.rs"}else{relative_path}});
     let effect = json!({"tool_id":"read_file","descriptor_hash":"fixed-read-descriptor","effect_kind":"read","idempotency":"idempotent","scopes":[declared],"required_permission":"read-only","approval_class":"none","uses_network":false,"spawns_process":false,"mutates_packages":false,"mutates_system":false});
-    let scope = json!({"version":2,"descriptor_hash":"fixed-read-descriptor","complete":true,"targets":[{"path":{"workspace_id":services.path_identity_resolver().workspace_id(),"repository_id":"read-repository","workspace_relative_path":"src/a.rs","repository_relative_path":"src/a.rs","object_kind":"file"},"declared_scope":declared,"access_mode":"read","coverage":"scoped_content","exact":true,"physical_identity":"fixed-object","alias_checked":true}],"scope_purposes":[{"declared_scope":declared,"purpose":"input_read"}]});
+    let scope = json!({"version":2,"descriptor_hash":"fixed-read-descriptor","complete":true,"targets":[{"path":{"workspace_id":services.path_identity_resolver().workspace_id(),"repository_id":"read-repository","workspace_relative_path":relative_path,"repository_relative_path":relative_path,"object_kind":"file"},"declared_scope":declared,"access_mode":"read","coverage":"scoped_content","exact":true,"physical_identity":"fixed-object","alias_checked":true}],"scope_purposes":[{"declared_scope":declared,"purpose":"input_read"}]});
     let root_owner = json!({"binding":owner,"attempt":1,"graph_revision":graph.revision});
     let root_context = json!({"execution_id":id,"session_id":"read-session","turn_id":"read-turn"});
     let replay = json!({"call_id":"read-call","parent_execution":if agent {json!({"graph_id":id})}else{serde_json::Value::Null},"invocation":{"effect":effect}});
@@ -985,7 +1018,7 @@ fn read_evidence_fixture_fault(
         input_sha256: "read-input".into(),
         body: context_evidence::ReadBodySeal {
             schema_version: 1,
-            source_ref: "src/a.rs".into(),
+            source_ref: relative_path.into(),
             source_sha256:
                 "sha256:cf4771a548f1f5000749e3287eb205ad8005b26fc82a3115ee8c76f5247bce4f".into(),
             source_bytes: 20,
@@ -1233,7 +1266,7 @@ fn read_evidence_fixture_fault(
                 status: Some("completed".into()),
                 actor: Some("conversation_runtime".into()),
                 refs: vec![],
-                payload: json!({"tool_name":"batch","path":"src/a.rs","success":true}),
+                payload: json!({"tool_name":"batch","path":relative_path,"success":true}),
             })
             .unwrap();
     }

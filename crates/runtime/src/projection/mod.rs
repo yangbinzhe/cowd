@@ -4955,4 +4955,4 @@ mod tests {
 }
 
 #[cfg(any(test, feature="test-fixtures"))]
-pub use read_evidence::read_evidence_fixture;
+pub use read_evidence::{read_evidence_fixture, read_evidence_fixture_in};
