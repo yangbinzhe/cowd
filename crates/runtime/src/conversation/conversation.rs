@@ -4725,6 +4725,35 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         context: &crate::ProviderRequestEvidenceContext,
         outcome: crate::ProviderAttemptOutcomeEvidence,
     ) -> Result<(), RuntimeError> {
+        // Validate before append (and before updating usage/cache projections).
+        // This is the existing packed-request receipt set, not a new authority
+        // inferred from a sequence or a model-supplied diagnostic object.
+        let protocol_diagnostic = if let Some(diagnostic) = &outcome.protocol_diagnostic {
+            let receipts = self
+                .native_wire_receipts
+                .lock()
+                .map_err(|_| RuntimeError::new("native wire receipt projection poisoned"))?;
+            let mut matches = receipts.iter().filter(|receipt| {
+                receipt.context == *context && receipt.request_id == outcome.request_id
+            });
+            let original = matches.next().ok_or_else(|| {
+                RuntimeError::new("Provider diagnostic has no original packed request receipt")
+            })?;
+            if matches.next().is_some() {
+                return Err(RuntimeError::new(
+                    "Provider diagnostic packed request is ambiguous",
+                ));
+            }
+            let step = original.step_render.as_ref().ok_or_else(|| {
+                RuntimeError::new("Provider diagnostic packed request has no original Step")
+            })?;
+            let mut metadata = diagnostic.outcome_metadata(context, &outcome, step)?;
+            metadata["packed_sequence"] = serde_json::json!(original.packed_sequence);
+            metadata["packed_wire_sha256"] = serde_json::json!(original.wire_sha256);
+            Some(metadata)
+        } else {
+            None
+        };
         let usage_known = outcome.usage.is_some();
         let cache_dimensions_known = usage_known && outcome.cache_dimensions_observed;
         let epoch = ProviderAttemptEpoch::new(&context.execution_id, &context.turn_id);
@@ -4740,24 +4769,31 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
                 "cache_read_input_tokens": usage.cache_read_input_tokens,
             })
         });
+        let mut payload = serde_json::json!({
+            "type": "ProviderAttemptOutcome",
+            "schema_version": 2,
+            "execution_id": context.execution_id,
+            "turn_id": context.turn_id,
+            "request_sequence": context.request_sequence,
+            "request_id": outcome.request_id,
+            "logical_attempt": outcome.logical_attempt,
+            "terminal_status": outcome.terminal_status,
+            "usage_status": if usage_known { "known" } else { "unknown" },
+            "cache_dimensions_status": if cache_dimensions_known { "known" } else { "unknown" },
+            "usage": usage,
+            "cache_hit_ratio_bp": cache_hit_ratio_bp,
+        });
+        // Additive optional metadata: old outcomes stay byte-shape compatible;
+        // the nested diagnostic has its own schema version. No historical
+        // event is rewritten, and no pre-append persisted=true flag is minted.
+        if let Some(diagnostic) = protocol_diagnostic {
+            payload["protocol_diagnostic"] = diagnostic;
+        }
         let event = crate::RuntimeSessionEvent::new(
             context.session_id.clone(),
             context.request_sequence,
             crate::RuntimeSessionEventKind::ProviderAttemptOutcome,
-            serde_json::json!({
-                "type": "ProviderAttemptOutcome",
-                "schema_version": 2,
-                "execution_id": context.execution_id,
-                "turn_id": context.turn_id,
-                "request_sequence": context.request_sequence,
-                "request_id": outcome.request_id,
-                "logical_attempt": outcome.logical_attempt,
-                "terminal_status": outcome.terminal_status,
-                "usage_status": if usage_known { "known" } else { "unknown" },
-                "cache_dimensions_status": if cache_dimensions_known { "known" } else { "unknown" },
-                "usage": usage,
-                "cache_hit_ratio_bp": cache_hit_ratio_bp,
-            }),
+            payload,
             now_ms(),
         )
         .with_status(if usage_known {

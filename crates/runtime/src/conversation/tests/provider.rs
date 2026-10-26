@@ -210,7 +210,7 @@ fn provider_attempt_usage_is_summed_once_per_request_in_current_epoch() {
 
 #[tokio::test]
 async fn outcome_append_failure_leaves_packed_attempt_unknown() {
-    struct FailOutcomePort;
+    struct FailOutcomePort(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for FailOutcomePort {
@@ -250,6 +250,7 @@ async fn outcome_append_failure_leaves_packed_attempt_unknown() {
             event: &crate::RuntimeSessionEvent,
         ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
             if event.kind == crate::RuntimeSessionEventKind::ProviderAttemptOutcome {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(session::SessionError::Store(
                     "injected outcome append failure".to_string(),
                 ))
@@ -284,12 +285,13 @@ async fn outcome_append_failure_leaves_packed_attempt_unknown() {
         tracker.record_packed(Some(epoch), "request-fail".to_string());
     }
     let temporary = tempfile::tempdir().unwrap();
+    let journal = Arc::new(FailOutcomePort(std::sync::atomic::AtomicUsize::new(0)));
     let writer = super::SessionProviderWireEvidenceWriter {
         artifacts: Arc::new(
             crate::ArtifactStore::for_test(temporary.path(), crate::ArtifactStoreConfig::default())
                 .unwrap(),
         ),
-        session_port: Arc::new(FailOutcomePort),
+        session_port: journal.clone(),
         cache_dimensions: Arc::clone(&tracker),
         native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
@@ -313,11 +315,150 @@ async fn outcome_append_failure_leaves_packed_attempt_unknown() {
             terminal_status: "completed".to_string(),
             usage: Some(model_protocol::usage::TokenUsage::default()),
             cache_dimensions_observed: true,
+            protocol_diagnostic: None,
         },
     )
     .await;
     assert!(result.is_err());
     assert!(!tracker.lock().unwrap().all_known());
+    assert_eq!(journal.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The annotated path must reach the same failing journal, not fail an
+    // unrelated identity check or claim a durable diagnostic from a safe log.
+    let (evidence, identity) = r304_diagnostic_request_fixture(&context, "request-fail");
+    crate::ProviderWireEvidenceWriter::persist(&writer, &context, evidence)
+        .await
+        .unwrap();
+    let opened = crate::provider_runtime_client::ProviderPhysicalObservation::ResponseOpened {
+        identity: identity.clone(),
+    };
+    let ack = crate::ProviderWireEvidenceWriter::persist_physical(&writer, &context, opened, None)
+        .await
+        .unwrap();
+    let error = provider::ApiError::CompatibilityToolProtocol(
+        provider::CompatibilityToolProtocolFailure::MalformedFrame,
+    )
+    .with_compatibility_tool_frame_diagnostic(
+        "stream_compat_finish",
+        "unterminated",
+        b"PRIVATE_R304_FRAME",
+    );
+    let diagnostic = crate::provider_runtime_client::bind_provider_protocol_diagnostic(
+        &error,
+        &context,
+        &identity.step,
+        &identity.provider_attempt,
+        "request-fail",
+        &identity.resource_lease,
+        &ack,
+    )
+    .unwrap();
+    let result = crate::ProviderWireEvidenceWriter::persist_outcome(
+        &writer,
+        &context,
+        crate::ProviderAttemptOutcomeEvidence {
+            request_id: "request-fail".into(),
+            logical_attempt: context.attempt,
+            terminal_status: "failed".into(),
+            usage: None,
+            cache_dimensions_observed: false,
+            protocol_diagnostic: Some(diagnostic),
+        },
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("injected outcome append failure")
+    );
+    assert_eq!(journal.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(!tracker.lock().unwrap().all_known());
+    assert_eq!(
+        error.compatibility_tool_frame_metadata().unwrap()["persisted"],
+        false
+    );
+}
+
+/// A real original-writer input, with an independently declared Step/attempt
+/// and an actual wire digest so the existing native receipt owner accepts it.
+fn r304_diagnostic_request_fixture(
+    context: &crate::ProviderRequestEvidenceContext,
+    request_id: &str,
+) -> (
+    crate::ProviderWireEvidence,
+    crate::provider_runtime_client::ProviderPhysicalIdentity,
+) {
+    let identity = crate::provider_runtime_client::ProviderPhysicalIdentity {
+        session_id: context.session_id.clone(),
+        execution_id: context.execution_id.clone(),
+        turn_id: context.turn_id.clone(),
+        request_sequence: context.request_sequence,
+        request_id: request_id.into(),
+        response_id: format!("response-{request_id}"),
+        opened_at_ms: 1,
+        logical_attempt: context.attempt,
+        step: harness_contract::step::StepIdentity {
+            step_id: "r304-original-step".into(),
+            session_id: context.session_id.clone(),
+            turn_id: context.turn_id.clone(),
+            execution_id: Some(context.execution_id.clone()),
+            actor_ref: None,
+            run_ref: None,
+            attempt: Some(context.attempt),
+            epoch: None,
+            goal_ref: None,
+            program_ref: None,
+            task_ref: None,
+            build_ref: "r304-fixture".into(),
+        },
+        provider_attempt: harness_contract::step::ProviderAttemptIdentity {
+            attempt_id: "r304-original-attempt".into(),
+            origin_step_id: "r304-original-step".into(),
+            model_profile_digest: "r304-profile".into(),
+            request_digest: "r304-request-material".into(),
+        },
+        resource_lease: "r304-original-lease".into(),
+    };
+    let body = serde_json::json!({"model":"test-model", "messages":[{"role":"user", "content":"checked"}]});
+    let evidence = crate::ProviderWireEvidence {
+        step_render: Some(harness_contract::step::StepRenderRef {
+            step_id: "r304-original-step".into(),
+            attempt_id: "r304-original-attempt".into(),
+            catalog_digest: "r304-catalog".into(),
+            render_digest: "r304-render".into(),
+        }),
+        request_context: crate::ProviderRequestContext {
+            request_id: request_id.into(),
+            attempt: context.attempt,
+            profile: crate::ResolvedProviderProfile {
+                registry_revision: 3,
+                provider_name: "openai-compatible".into(),
+                model: "test-model".into(),
+                base_url: Some("https://provider.invalid/v1".into()),
+                protocol: Some("chat_completions".into()),
+                parallel_tool_calls_mode:
+                    model_protocol::provider_config::ParallelToolCallsMode::Auto,
+                effective_parallel_tool_calls: Some(true),
+                effective_early_tool_start: false,
+                model_capabilities: Vec::new(),
+                capabilities:
+                    model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
+            },
+            transport_fingerprint: crate::TransportProfileFingerprint(42),
+        },
+        wire_request: provider::ProviderWireRequest {
+            method: "POST".into(),
+            endpoint: "https://provider.invalid/v1/chat/completions".into(),
+            protocol: "openai_chat_completions".into(),
+            headers: Vec::new(),
+            body_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap())),
+            body,
+            tool_schema_sha256: None,
+        },
+        prefix_observation: crate::ProviderWirePrefixObservation::default(),
+    };
+    (evidence, identity)
 }
 
 #[tokio::test]
@@ -638,6 +779,7 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
                 cache_read_input_tokens: 5,
             }),
             cache_dimensions_observed: true,
+            protocol_diagnostic: None,
         },
     )
     .await
@@ -686,6 +828,150 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
     assert_eq!(outcome.payload["usage_status"], "known");
     assert_eq!(outcome.payload["cache_dimensions_status"], "known");
     assert_eq!(outcome.payload["cache_hit_ratio_bp"], 5_000);
+    assert!(
+        outcome.payload.get("protocol_diagnostic").is_none(),
+        "old unannotated outcomes remain valid"
+    );
+
+    let (evidence, identity) = r304_diagnostic_request_fixture(&context, "request-r304");
+    crate::ProviderWireEvidenceWriter::persist(&writer, &context, evidence)
+        .await
+        .unwrap();
+    let error = provider::ApiError::CompatibilityToolProtocol(
+        provider::CompatibilityToolProtocolFailure::MalformedFrame,
+    )
+    .with_compatibility_tool_frame_diagnostic(
+        "stream_compat_finish",
+        "unterminated",
+        b"PRIVATE_R304_FRAME",
+    );
+    // Same logical sequence, but another structurally valid Step: its genuine
+    // open receipt cannot authorize an outcome for the original packed Step.
+    let mut foreign = identity.clone();
+    foreign.response_id = "r304-foreign-response".into();
+    foreign.step.step_id = "r304-foreign-step".into();
+    foreign.provider_attempt.origin_step_id = foreign.step.step_id.clone();
+    for opened_identity in [foreign, identity.clone()] {
+        let opened = crate::provider_runtime_client::ProviderPhysicalObservation::ResponseOpened {
+            identity: opened_identity.clone(),
+        };
+        let ack =
+            crate::ProviderWireEvidenceWriter::persist_physical(&writer, &context, opened, None)
+                .await
+                .unwrap();
+        let diagnostic = crate::provider_runtime_client::bind_provider_protocol_diagnostic(
+            &error,
+            &context,
+            &opened_identity.step,
+            &opened_identity.provider_attempt,
+            "request-r304",
+            &opened_identity.resource_lease,
+            &ack,
+        )
+        .unwrap();
+        let mut annotated = crate::ProviderAttemptOutcomeEvidence {
+            request_id: "request-r304".into(),
+            logical_attempt: context.attempt,
+            terminal_status: "failed".into(),
+            usage: None,
+            cache_dimensions_observed: false,
+            protocol_diagnostic: Some(diagnostic),
+        };
+        if opened_identity.step.step_id == "r304-foreign-step" {
+            assert!(
+                crate::ProviderWireEvidenceWriter::persist_outcome(&writer, &context, annotated)
+                    .await
+                    .is_err()
+            );
+            let read = session_store
+                .session_domain_events_page(&session_id, 0, 32)
+                .await
+                .unwrap();
+            assert_eq!(
+                read.events
+                    .iter()
+                    .filter(|e| e.kind == "context.provider_attempt_outcome")
+                    .count(),
+                1,
+                "foreign binding must not partially append an outcome"
+            );
+            continue;
+        }
+        let mut foreign_context = context.clone();
+        foreign_context.turn_id = "r304-foreign-turn".into();
+        assert!(
+            crate::ProviderWireEvidenceWriter::persist_outcome(
+                &writer,
+                &foreign_context,
+                annotated.clone()
+            )
+            .await
+            .is_err()
+        );
+        annotated.logical_attempt = context.attempt + 1;
+        assert!(
+            crate::ProviderWireEvidenceWriter::persist_outcome(
+                &writer,
+                &context,
+                annotated.clone()
+            )
+            .await
+            .is_err()
+        );
+        annotated.logical_attempt = context.attempt;
+        let read = session_store
+            .session_domain_events_page(&session_id, 0, 32)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.events
+                .iter()
+                .filter(|e| e.kind == "context.provider_attempt_outcome")
+                .count(),
+            1
+        );
+        crate::ProviderWireEvidenceWriter::persist_outcome(&writer, &context, annotated)
+            .await
+            .unwrap();
+    }
+    let read = session_store
+        .session_domain_events_page(&session_id, 0, 32)
+        .await
+        .unwrap();
+    let durable = read
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == "context.provider_attempt_outcome"
+                && event.payload["request_id"] == "request-r304"
+        })
+        .unwrap();
+    let diagnostic = &durable.payload["protocol_diagnostic"];
+    assert_eq!(diagnostic["stage"], "stream_compat_finish");
+    assert_eq!(diagnostic["class"], "unterminated");
+    assert_eq!(
+        diagnostic["physical_identity"]["step"]["step_id"],
+        "r304-original-step"
+    );
+    assert_eq!(
+        diagnostic["physical_identity"]["provider_attempt"]["attempt_id"],
+        "r304-original-attempt"
+    );
+    assert_eq!(diagnostic["physical_identity"]["logical_attempt"], 7);
+    assert_eq!(durable.payload["usage_status"], "unknown");
+    assert_eq!(diagnostic["raw_omitted"], true);
+    assert_eq!(diagnostic["raw_persisted"], false);
+    assert_eq!(diagnostic["raw_replayable"], false);
+    assert_eq!(
+        diagnostic["raw_omission_reason"],
+        "private_encrypted_artifact_unavailable"
+    );
+    assert!(!durable.payload.to_string().contains("PRIVATE_R304_FRAME"));
+    assert_eq!(
+        artifacts.stats().unwrap().pins,
+        2,
+        "request artifacts only; never a plaintext response artifact"
+    );
 }
 
 #[test]

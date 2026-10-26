@@ -1014,7 +1014,12 @@ impl StreamState {
                     log_rejected_compat_tool_frame(&self.model, &frame, error);
                     // Once a provider emitted any supported protocol marker,
                     // the bytes are no longer ordinary assistant prose.
-                    return Err(compatibility_tool_protocol_error(error));
+                    return Err(compatibility_tool_protocol_error(error)
+                        .with_compatibility_tool_frame_diagnostic(
+                            "stream_compat_finish",
+                            error.class(),
+                            frame.as_bytes(),
+                        ));
                 }
             }
         }
@@ -1105,6 +1110,11 @@ impl StreamState {
             if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
                 return Err(ApiError::CompatibilityToolProtocol(
                     CompatibilityToolProtocolFailure::FrameTooLarge,
+                )
+                .with_compatibility_tool_frame_diagnostic(
+                    "stream_compat_accumulate",
+                    "frame_too_large",
+                    frame.as_bytes(),
                 ));
             }
             return Ok(());
@@ -1122,6 +1132,11 @@ impl StreamState {
             if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
                 return Err(ApiError::CompatibilityToolProtocol(
                     CompatibilityToolProtocolFailure::FrameTooLarge,
+                )
+                .with_compatibility_tool_frame_diagnostic(
+                    "stream_compat_accumulate",
+                    "frame_too_large",
+                    frame.as_bytes(),
                 ));
             }
             return Ok(());
@@ -2394,7 +2409,12 @@ fn normalize_chat_completion_response(
                 }
                 Err(error) => {
                     log_rejected_compat_tool_frame(model, protocol_frame, error);
-                    return Err(compatibility_tool_protocol_error(error));
+                    return Err(compatibility_tool_protocol_error(error)
+                        .with_compatibility_tool_frame_diagnostic(
+                            "nonstream_compat_content",
+                            error.class(),
+                            protocol_frame.as_bytes(),
+                        ));
                 }
             }
         } else {
@@ -2520,8 +2540,14 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
 }
 
 fn parse_tool_arguments(arguments: &str) -> Result<Value, ApiError> {
-    harness_contract::step::parse_strict_json(arguments).map_err(|_| ApiError::CompatibilityToolProtocol(
-        crate::CompatibilityToolProtocolFailure::MalformedFrame))
+    harness_contract::step::parse_strict_json(arguments).map_err(|_| {
+        ApiError::CompatibilityToolProtocol(crate::CompatibilityToolProtocolFailure::MalformedFrame)
+            .with_compatibility_tool_frame_diagnostic(
+                "nonstream_tool_arguments",
+                "invalid_arguments",
+                arguments.as_bytes(),
+            )
+    })
 }
 
 /// Repair an unbalanced/truncated JSON object or array left open by a stream
@@ -3418,6 +3444,87 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn compatibility_diagnostics_keep_each_decoder_class_and_stage_distinct() {
+        use super::{CompatToolFrameError, compatibility_tool_protocol_error};
+        let classes = [
+            (CompatToolFrameError::FrameTooLarge, "frame_too_large"),
+            (
+                CompatToolFrameError::UnrecognizedMarker,
+                "unrecognized_marker",
+            ),
+            (CompatToolFrameError::Unterminated, "unterminated"),
+            (
+                CompatToolFrameError::InvalidAttributes,
+                "invalid_attributes",
+            ),
+            (CompatToolFrameError::InvalidArguments, "invalid_arguments"),
+            (
+                CompatToolFrameError::DuplicateParameter,
+                "duplicate_parameter",
+            ),
+            (CompatToolFrameError::EmptyCalls, "empty_calls"),
+            (CompatToolFrameError::UnsupportedShape, "unsupported_shape"),
+        ];
+        for (error, class) in classes {
+            for stage in ["stream_compat_finish", "nonstream_compat_content"] {
+                let diagnostic = compatibility_tool_protocol_error(error)
+                    .with_compatibility_tool_frame_diagnostic(
+                        stage,
+                        error.class(),
+                        b"private decoder fixture",
+                    );
+                let metadata = diagnostic.compatibility_tool_frame_metadata().unwrap();
+                assert_eq!(metadata["stage"], stage);
+                assert_eq!(metadata["class"], class);
+                assert_eq!(
+                    diagnostic.to_string(),
+                    compatibility_tool_protocol_error(error).to_string()
+                );
+            }
+        }
+        assert_eq!(
+            parse_tool_arguments(r#"{"ok":true}"#).unwrap(),
+            json!({"ok": true})
+        );
+        for invalid in ["not-json", r#"{"a":1,"a":2}"#, r#"{"unfinished":"#] {
+            let error = parse_tool_arguments(invalid).unwrap_err();
+            let metadata = error.compatibility_tool_frame_metadata().unwrap();
+            assert_eq!(metadata["stage"], "nonstream_tool_arguments");
+            assert_eq!(metadata["class"], "invalid_arguments");
+        }
+    }
+
+    #[test]
+    fn rejected_compatibility_frame_keeps_the_actual_stream_or_nonstream_stage() {
+        let frame = "<｜｜DSML｜｜tool_calls>";
+        let mut stream = StreamState::new("diagnostic-fixture".into(), &[]);
+        stream.dsml_frame = Some(frame.into());
+        let stream_error = stream.finish().unwrap_err();
+        let response = serde_json::from_value(json!({
+            "id": "fixture-response", "model": "diagnostic-fixture",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": frame}, "finish_reason": "stop"}]
+        })).unwrap();
+        let nonstream_error =
+            super::normalize_chat_completion_response("diagnostic-fixture", response, &[])
+                .unwrap_err();
+        let stream_metadata = stream_error.compatibility_tool_frame_metadata().unwrap();
+        let nonstream_metadata = nonstream_error.compatibility_tool_frame_metadata().unwrap();
+        assert_eq!(stream_metadata["stage"], "stream_compat_finish");
+        assert_eq!(nonstream_metadata["stage"], "nonstream_compat_content");
+        assert_eq!(stream_metadata["class"], "unterminated");
+        assert_eq!(nonstream_metadata["class"], "unterminated");
+        assert_eq!(stream_metadata["sha256"], nonstream_metadata["sha256"]);
+        assert_eq!(
+            stream_error.private_compatibility_tool_frame(),
+            Some(frame.as_bytes())
+        );
+        assert_eq!(
+            nonstream_error.private_compatibility_tool_frame(),
+            Some(frame.as_bytes())
+        );
+    }
 
     #[test]
     fn wire_evidence_uses_the_selected_openai_protocol_body() {
@@ -4730,7 +4837,7 @@ mod tests {
                 usage: None,
             }),
             Err(ApiError::CompatibilityToolProtocol(
-                CompatibilityToolProtocolFailure::FrameTooLarge
+                CompatibilityToolProtocolFailure::FrameTooLargeWithDiagnostic(_)
             ))
         ));
     }

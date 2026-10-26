@@ -35,18 +35,57 @@ const QUOTA_EXHAUSTED_MARKERS: &[&str] = &[
     "plan is exhausted",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Decoder-local evidence. Raw bytes are deliberately excluded from Debug,
+/// Display and the metadata view; retaining these bytes is not persistence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CompatibilityToolFrameDiagnostic {
+    stage: &'static str,
+    class: &'static str,
+    observed_bytes: usize,
+    sha256: String,
+    private_frame: Option<Vec<u8>>,
+}
+
+impl CompatibilityToolFrameDiagnostic {
+    const CAPTURE_LIMIT: usize = 64 * 1024;
+
+    fn metadata(&self) -> serde_json::Value {
+        serde_json::json!({
+            "stage": self.stage, "class": self.class,
+            "scope": "observed_decoder_frame",
+            "observed_bytes": self.observed_bytes, "sha256": self.sha256,
+            "omitted": self.private_frame.is_none(),
+            "omission_reason": self.private_frame.is_none().then_some("diagnostic_capture_limit"),
+            "capture_limit": Self::CAPTURE_LIMIT,
+            "persisted": false, "replayable": false
+        })
+    }
+}
+
+impl std::fmt::Debug for CompatibilityToolFrameDiagnostic {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.metadata(), f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompatibilityToolProtocolFailure {
     MalformedFrame,
     FrameTooLarge,
+    MalformedFrameWithDiagnostic(CompatibilityToolFrameDiagnostic),
+    FrameTooLargeWithDiagnostic(CompatibilityToolFrameDiagnostic),
 }
 
 impl CompatibilityToolProtocolFailure {
     #[must_use]
-    pub const fn message(self) -> &'static str {
+    pub const fn message(&self) -> &'static str {
         match self {
-            Self::MalformedFrame => "malformed compatibility tool-call frame",
-            Self::FrameTooLarge => "compatibility tool-call frame exceeds byte limit",
+            Self::MalformedFrame | Self::MalformedFrameWithDiagnostic(_) => {
+                "malformed compatibility tool-call frame"
+            }
+            Self::FrameTooLarge | Self::FrameTooLargeWithDiagnostic(_) => {
+                "compatibility tool-call frame exceeds byte limit"
+            }
         }
     }
 }
@@ -118,6 +157,85 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Attach decoder evidence without changing failure or retry classification.
+    /// Only fixed decoder labels may enter the public metadata surface.
+    #[must_use]
+    pub fn with_compatibility_tool_frame_diagnostic(
+        self,
+        stage: &'static str,
+        class: &'static str,
+        frame: &[u8],
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        if !matches!(
+            stage,
+            "stream_compat_finish"
+                | "stream_compat_accumulate"
+                | "nonstream_compat_content"
+                | "nonstream_tool_arguments"
+        ) || !matches!(
+            class,
+            "frame_too_large"
+                | "unrecognized_marker"
+                | "unterminated"
+                | "invalid_attributes"
+                | "invalid_arguments"
+                | "duplicate_parameter"
+                | "empty_calls"
+                | "unsupported_shape"
+        ) {
+            return self;
+        }
+        let Self::CompatibilityToolProtocol(failure) = self else {
+            return self;
+        };
+        let diagnostic = CompatibilityToolFrameDiagnostic {
+            stage,
+            class,
+            observed_bytes: frame.len(),
+            sha256: format!("{:x}", Sha256::digest(frame)),
+            private_frame: (frame.len() <= CompatibilityToolFrameDiagnostic::CAPTURE_LIMIT)
+                .then(|| frame.to_vec()),
+        };
+        Self::CompatibilityToolProtocol(match failure {
+            CompatibilityToolProtocolFailure::MalformedFrame => {
+                CompatibilityToolProtocolFailure::MalformedFrameWithDiagnostic(diagnostic)
+            }
+            CompatibilityToolProtocolFailure::FrameTooLarge => {
+                CompatibilityToolProtocolFailure::FrameTooLargeWithDiagnostic(diagnostic)
+            }
+            already_annotated => already_annotated,
+        })
+    }
+
+    fn compatibility_tool_frame_diagnostic(&self) -> Option<&CompatibilityToolFrameDiagnostic> {
+        match self {
+            Self::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::MalformedFrameWithDiagnostic(d)
+                | CompatibilityToolProtocolFailure::FrameTooLargeWithDiagnostic(d),
+            ) => Some(d),
+            Self::RetriesExhausted { last_error, .. } => {
+                last_error.compatibility_tool_frame_diagnostic()
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn compatibility_tool_frame_metadata(&self) -> Option<serde_json::Value> {
+        self.compatibility_tool_frame_diagnostic()
+            .map(CompatibilityToolFrameDiagnostic::metadata)
+    }
+
+    /// Sensitive, bounded, in-memory bytes. Callers must use a private evidence
+    /// owner to persist them; never include this view in a report or tracing.
+    #[must_use]
+    pub fn private_compatibility_tool_frame(&self) -> Option<&[u8]> {
+        self.compatibility_tool_frame_diagnostic()?
+            .private_frame
+            .as_deref()
+    }
+
     /// Whether this failure represents a provider-emitted compatibility tool
     /// frame that was recognisable as protocol data but invalid. Runtime uses
     /// this typed classification to avoid multiplying the same bad frame
@@ -960,12 +1078,83 @@ mod tests {
     }
 
     #[test]
+    fn decoder_diagnostics_are_bounded_private_and_do_not_change_public_errors() {
+        let canary = b"PRIVATE_FRAME_CANARY_302";
+        let original =
+            ApiError::CompatibilityToolProtocol(CompatibilityToolProtocolFailure::MalformedFrame);
+        let display = original.to_string();
+        let error = original.with_compatibility_tool_frame_diagnostic(
+            "stream_compat_finish",
+            "unterminated",
+            canary,
+        );
+        let metadata = error.compatibility_tool_frame_metadata().unwrap();
+        assert_eq!(error.to_string(), display);
+        assert_eq!(metadata["observed_bytes"], canary.len());
+        assert_eq!(metadata["sha256"], "2c0cc3d922d42f995a4b4970a32562a5a56e87bd8762176bd74f87fae08f781a");
+        assert_eq!(metadata["omitted"], false);
+        assert_eq!(metadata["persisted"], false);
+        assert_eq!(metadata["replayable"], false);
+        assert_eq!(
+            error.private_compatibility_tool_frame(),
+            Some(canary.as_slice())
+        );
+        for public in [
+            error.to_string(),
+            format!("{error:?}"),
+            metadata.to_string(),
+        ] {
+            assert!(!public.contains("PRIVATE_FRAME_CANARY_302"));
+        }
+        assert!(error.is_compatibility_tool_protocol_failure());
+        assert_eq!(error.safe_failure_class(), "provider_transport");
+        let exhausted = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(error),
+        };
+        assert_eq!(
+            exhausted.compatibility_tool_frame_metadata(),
+            Some(metadata)
+        );
+
+        let large =
+            ApiError::CompatibilityToolProtocol(CompatibilityToolProtocolFailure::FrameTooLarge)
+                .with_compatibility_tool_frame_diagnostic(
+                    "stream_compat_accumulate",
+                    "frame_too_large",
+                    &vec![b'x'; 64 * 1024 + 1],
+                );
+        assert!(large.private_compatibility_tool_frame().is_none());
+        let large_metadata = large.compatibility_tool_frame_metadata().unwrap();
+        assert_eq!(large_metadata["omitted"], true);
+        assert_eq!(large_metadata["omission_reason"], "diagnostic_capture_limit");
+        assert_eq!(large_metadata["observed_bytes"], 64 * 1024 + 1);
+        assert_eq!(large_metadata["sha256"].as_str().unwrap().len(), 64);
+
+        for (stage, class) in [
+            ("PRIVATE_FRAME_CANARY_302", "unterminated"),
+            ("stream_compat_finish", "PRIVATE_FRAME_CANARY_302"),
+        ] {
+            let error = ApiError::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::MalformedFrame,
+            )
+            .with_compatibility_tool_frame_diagnostic(stage, class, canary);
+            assert!(error.compatibility_tool_frame_metadata().is_none());
+            assert!(!format!("{error:?}").contains("PRIVATE_FRAME_CANARY_302"));
+        }
+        let unrelated = ApiError::InvalidSseFrame("unrelated protocol error")
+            .with_compatibility_tool_frame_diagnostic("stream_compat_finish", "unterminated", canary);
+        assert!(unrelated.compatibility_tool_frame_metadata().is_none());
+        assert!(!unrelated.is_compatibility_tool_protocol_failure());
+    }
+
+    #[test]
     fn compatibility_tool_protocol_failures_are_typed_and_preserve_retry_classification() {
         for failure in [
             CompatibilityToolProtocolFailure::MalformedFrame,
             CompatibilityToolProtocolFailure::FrameTooLarge,
         ] {
-            let error = ApiError::CompatibilityToolProtocol(failure);
+            let error = ApiError::CompatibilityToolProtocol(failure.clone());
             assert!(error.is_compatibility_tool_protocol_failure());
             assert_eq!(error.safe_failure_class(), "provider_transport");
             assert_eq!(

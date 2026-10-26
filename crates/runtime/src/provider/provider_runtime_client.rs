@@ -508,6 +508,9 @@ pub struct ProviderAttemptOutcomeEvidence {
     /// True only when the Provider explicitly returned cache dimensions. A
     /// numeric zero without this receipt is not evidence of a cache miss.
     pub cache_dimensions_observed: bool,
+    /// Runtime-minted evidence only: no deserialization or public constructor.
+    /// Raw response bytes are not part of this outcome capability.
+    pub protocol_diagnostic: Option<BoundProviderProtocolDiagnostic>,
 }
 
 /// Identity of one returned, locally owned SDK response, not a logical retry
@@ -2415,6 +2418,10 @@ async fn forward_provider_attempt(
                     terminal_status: terminal_status.to_string(),
                     usage: attempt_usage,
                     cache_dimensions_observed: attempt_cache_dimensions_observed,
+                    protocol_diagnostic: stream_result
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.protocol_diagnostic.clone()),
                 },
             )
             .await
@@ -2450,6 +2457,7 @@ async fn forward_provider_attempt(
         tracing::warn!(
             model = %entry.model,
             error = %error,
+            protocol_diagnostic = ?error.protocol_diagnostic.as_ref().map(BoundProviderProtocolDiagnostic::metadata),
             "provider stream attempt failed before terminal completion"
         );
         let provider_context_window_limit = error.error.context_window_limit_hint();
@@ -2622,10 +2630,107 @@ enum ForwardedProviderStream {
     Stopped,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundProviderProtocolDiagnostic {
+    identity: ProviderPhysicalIdentity,
+    opened_sequence: usize,
+    opened_digest: String,
+    decoder: serde_json::Value,
+}
+
+impl BoundProviderProtocolDiagnostic {
+    fn metadata(&self) -> serde_json::Value {
+        serde_json::json!({
+            "physical_identity": self.identity,
+            "opened_sequence": self.opened_sequence,
+            "opened_digest": self.opened_digest,
+            "decoder": self.decoder,
+            "persistence_authority": "original_outcome_receipt_only"
+        })
+    }
+
+    /// Revalidate the sealed binding against the original packed request, not
+    /// just its logical sequence. Success constructs a pending payload; only
+    /// the original journal append receipt can establish that it was recorded.
+    pub(crate) fn outcome_metadata(
+        &self,
+        context: &ProviderRequestEvidenceContext,
+        outcome: &ProviderAttemptOutcomeEvidence,
+        packed_step: &harness_contract::step::StepRenderRef,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let opened = ProviderPhysicalObservation::ResponseOpened {
+            identity: self.identity.clone(),
+        };
+        opened.validate(context)?;
+        if self.identity.request_id != outcome.request_id
+            || self.identity.logical_attempt != outcome.logical_attempt
+            || outcome.logical_attempt != context.attempt
+            || outcome.terminal_status != "failed"
+            || packed_step.step_id != self.identity.step.step_id
+            || packed_step.attempt_id != self.identity.provider_attempt.attempt_id
+            || opened.digest()? != self.opened_digest
+        {
+            return Err(RuntimeError::new(
+                "Provider diagnostic does not match its original packed request/open acknowledgement",
+            ));
+        }
+        // Do not copy the decoder's in-memory capture status into a claim that
+        // ordinary session visibility provides encrypted response storage.
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "physical_identity": self.identity,
+            "opened_sequence": self.opened_sequence,
+            "opened_digest": self.opened_digest,
+            "stage": self.decoder["stage"], "class": self.decoder["class"],
+            "scope": self.decoder["scope"],
+            "observed_bytes": self.decoder["observed_bytes"],
+            "sha256": self.decoder["sha256"],
+            "capture_omitted": self.decoder["omitted"],
+            "capture_limit": self.decoder["capture_limit"],
+            "raw_omitted": true, "raw_persisted": false, "raw_replayable": false,
+            "raw_omission_reason": "private_encrypted_artifact_unavailable"
+        }))
+    }
+}
+
+/// Only the original acknowledged response can bind decoder-local evidence.
+/// This is not a persistence receipt and never mints a replacement identity.
+pub(crate) fn bind_provider_protocol_diagnostic(
+    error: &ApiError,
+    context: &ProviderRequestEvidenceContext,
+    step: &harness_contract::step::StepIdentity,
+    attempt: &harness_contract::step::ProviderAttemptIdentity,
+    request_id: &str,
+    lease: &str,
+    opened: &AcknowledgedProviderPhysicalObservation,
+) -> Option<BoundProviderProtocolDiagnostic> {
+    let decoder = error.compatibility_tool_frame_metadata()?;
+    let id = &opened.receipt.identity;
+    let observation = ProviderPhysicalObservation::ResponseOpened {
+        identity: id.clone(),
+    };
+    if observation.validate(context).is_err()
+        || &id.step != step
+        || &id.provider_attempt != attempt
+        || id.request_id != request_id
+        || id.resource_lease != lease
+        || observation.digest().ok().as_ref() != Some(&opened.receipt.observation_digest)
+    {
+        return None;
+    }
+    Some(BoundProviderProtocolDiagnostic {
+        identity: id.clone(),
+        opened_sequence: opened.receipt.session_sequence,
+        opened_digest: opened.receipt.observation_digest.clone(),
+        decoder,
+    })
+}
+
 #[derive(Debug)]
 struct ProviderStreamError {
     error: ApiError,
     physical_failure: Option<RuntimeError>,
+    protocol_diagnostic: Option<BoundProviderProtocolDiagnostic>,
 }
 
 impl ProviderStreamError {
@@ -2633,6 +2738,43 @@ impl ProviderStreamError {
         Self {
             error: ApiError::InvalidSseFrame("physical Provider evidence rejected"),
             physical_failure: Some(error),
+            protocol_diagnostic: None,
+        }
+    }
+
+    fn unbound(error: ApiError) -> Self {
+        Self {
+            error,
+            physical_failure: None,
+            protocol_diagnostic: None,
+        }
+    }
+
+    fn after_open(
+        error: ApiError,
+        control: &ProviderAttemptControl,
+        request_id: &str,
+        opened: Option<&AcknowledgedProviderPhysicalObservation>,
+    ) -> Self {
+        let protocol_diagnostic = match (&control.context, &control.step, &control.lease, opened) {
+            (Some(context), Some(step), Some(lease), Some(opened)) => {
+                let snapshot = step.snapshot();
+                bind_provider_protocol_diagnostic(
+                    &error,
+                    context,
+                    &snapshot.identity,
+                    &snapshot.provider_attempt,
+                    request_id,
+                    &lease.projection_reference(),
+                    opened,
+                )
+            }
+            _ => None,
+        };
+        Self {
+            error,
+            physical_failure: None,
+            protocol_diagnostic,
         }
     }
 }
@@ -2662,7 +2804,7 @@ async fn forward_provider_stream(
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let mut stream = tokio::select! {
         biased;
-        result = client.stream_prepared_message(message_request, prepared_wire) => result.map_err(|error| ProviderStreamError { error, physical_failure: None })?,
+        result = client.stream_prepared_message(message_request, prepared_wire) => result.map_err(ProviderStreamError::unbound)?,
         () = control.cancelled() => return Ok(ForwardedProviderStream::Stopped),
     };
     stream.set_transport_activity(transport_activity);
@@ -2716,7 +2858,7 @@ async fn forward_provider_stream(
     loop {
         let next = tokio::select! {
             biased;
-            next = stream.next_event() => next.map_err(|error| ProviderStreamError { error, physical_failure: None })?,
+            next = stream.next_event() => next.map_err(|error| ProviderStreamError::after_open(error, control, request_id, opened.as_ref()))?,
             () = control.cancelled() => {
                 drop(stream);
                 if saw_stop { return Ok(ForwardedProviderStream::Completed); }
@@ -2996,6 +3138,7 @@ async fn forward_provider_stream(
         return Err(ProviderStreamError {
             error: ApiError::InvalidSseFrame("provider stream ended before terminal message_stop"),
             physical_failure: None,
+            protocol_diagnostic: None,
         });
     }
 
@@ -3008,7 +3151,7 @@ async fn forward_provider_stream(
     };
     let response = tokio::select! {
         biased;
-        response = client.send_message(&fallback_request) => response.map_err(|error| ProviderStreamError { error, physical_failure: None })?,
+        response = client.send_message(&fallback_request) => response.map_err(ProviderStreamError::unbound)?,
         () = control.cancelled() => return Ok(ForwardedProviderStream::Stopped),
     };
     if response.usage_observed {
@@ -3844,12 +3987,202 @@ mod tests {
                 "provider stream ended before terminal message_stop",
             ),
             physical_failure: None,
+            protocol_diagnostic: None,
         };
 
         assert!(
             error
                 .to_string()
                 .contains("provider stream ended before terminal message_stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn r302_decoder_diagnostic_requires_the_exact_acknowledged_step_and_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let context = request.provider_evidence_context.as_ref().unwrap();
+        let step = request.bound_step.as_ref().unwrap().snapshot();
+        let identity = super::ProviderPhysicalIdentity {
+            session_id: context.session_id.clone(),
+            execution_id: context.execution_id.clone(),
+            turn_id: context.turn_id.clone(),
+            request_sequence: context.request_sequence,
+            request_id: "original-request".into(),
+            response_id: "original-response".into(),
+            opened_at_ms: 1,
+            logical_attempt: context.attempt,
+            step: step.identity.clone(),
+            provider_attempt: step.provider_attempt.clone(),
+            resource_lease: "original-lease".into(),
+        };
+        let error = provider::ApiError::CompatibilityToolProtocol(
+            provider::CompatibilityToolProtocolFailure::MalformedFrame,
+        )
+        .with_compatibility_tool_frame_diagnostic(
+            "stream_compat_finish",
+            "unterminated",
+            b"PRIVATE_BOUND_FRAME_302",
+        );
+        let bind = |ack: &super::AcknowledgedProviderPhysicalObservation| {
+            super::bind_provider_protocol_diagnostic(
+                &error,
+                context,
+                &step.identity,
+                &step.provider_attempt,
+                "original-request",
+                "original-lease",
+                ack,
+            )
+        };
+        let opened = super::ProviderPhysicalObservation::ResponseOpened {
+            identity: identity.clone(),
+        };
+        let ack =
+            super::AcknowledgedProviderPhysicalObservation::from_written(&opened, 17).unwrap();
+        let bound = bind(&ack).expect("original acknowledged response must bind");
+        assert_eq!(bound.identity, identity);
+        assert_eq!(bound.opened_sequence, 17);
+        assert_eq!(
+            bound.metadata()["persistence_authority"],
+            "original_outcome_receipt_only"
+        );
+        assert!(!format!("{bound:?}").contains("PRIVATE_BOUND_FRAME_302"));
+        assert!(
+            !bound
+                .metadata()
+                .to_string()
+                .contains("PRIVATE_BOUND_FRAME_302")
+        );
+        let outcome = super::ProviderAttemptOutcomeEvidence {
+            request_id: "original-request".into(),
+            logical_attempt: context.attempt,
+            terminal_status: "failed".into(),
+            usage: None,
+            cache_dimensions_observed: false,
+            protocol_diagnostic: Some(bound.clone()),
+        };
+        let packed = harness_contract::step::StepRenderRef {
+            step_id: step.identity.step_id.clone(),
+            attempt_id: step.provider_attempt.attempt_id.clone(),
+            catalog_digest: "fixture-catalog".into(),
+            render_digest: "fixture-render".into(),
+        };
+        let safe = bound.outcome_metadata(context, &outcome, &packed).unwrap();
+        assert_eq!(safe["raw_omitted"], true);
+        assert_eq!(safe["raw_persisted"], false);
+        assert_eq!(safe["raw_replayable"], false);
+        assert!(!safe.to_string().contains("PRIVATE_BOUND_FRAME_302"));
+        let mut tampered = bound.clone();
+        tampered.opened_digest.push('x');
+        assert!(
+            tampered
+                .outcome_metadata(context, &outcome, &packed)
+                .is_err()
+        );
+        let mut other_step = packed.clone();
+        other_step.step_id.push_str("-foreign");
+        assert!(
+            bound
+                .outcome_metadata(context, &outcome, &other_step)
+                .is_err()
+        );
+        let large = provider::ApiError::CompatibilityToolProtocol(
+            provider::CompatibilityToolProtocolFailure::FrameTooLarge,
+        )
+        .with_compatibility_tool_frame_diagnostic(
+            "stream_compat_accumulate",
+            "frame_too_large",
+            &vec![b'x'; 64 * 1024 + 1],
+        );
+        let large_bound = super::bind_provider_protocol_diagnostic(
+            &large,
+            context,
+            &step.identity,
+            &step.provider_attempt,
+            "original-request",
+            "original-lease",
+            &ack,
+        )
+        .unwrap();
+        let omitted = large_bound
+            .outcome_metadata(context, &outcome, &packed)
+            .unwrap();
+        assert_eq!(omitted["capture_omitted"], true);
+        assert_eq!(omitted["raw_omitted"], true);
+        assert_eq!(omitted["raw_persisted"], false);
+        assert_eq!(omitted["raw_replayable"], false);
+        for mutation in [
+            "step",
+            "attempt",
+            "session",
+            "turn",
+            "execution",
+            "request",
+            "response",
+            "lease",
+            "digest",
+            "actor",
+            "run",
+            "step_attempt",
+            "epoch",
+            "program",
+            "task",
+            "request_digest",
+            "profile_digest",
+        ] {
+            let mut changed = identity.clone();
+            match mutation {
+                "step" => {
+                    changed.step.step_id.push_str("-foreign");
+                    changed.provider_attempt.origin_step_id = changed.step.step_id.clone();
+                }
+                "attempt" => changed.provider_attempt.attempt_id.push_str("-foreign"),
+                "actor" => changed.step.actor_ref = Some("foreign-actor".into()),
+                "run" => changed.step.run_ref = Some("foreign-run".into()),
+                "step_attempt" => changed.step.attempt = Some(context.attempt.saturating_add(1)),
+                "epoch" => changed.step.epoch = Some("foreign-epoch".into()),
+                "program" => changed.step.program_ref = Some("foreign-program".into()),
+                "task" => changed.step.task_ref = Some("foreign-task".into()),
+                "request_digest" => changed.provider_attempt.request_digest.push_str("-foreign"),
+                "profile_digest" => changed
+                    .provider_attempt
+                    .model_profile_digest
+                    .push_str("-foreign"),
+                "session" => changed.session_id.push_str("-foreign"),
+                "turn" => changed.turn_id.push_str("-foreign"),
+                "execution" => changed.execution_id.push_str("-foreign"),
+                "request" => changed.request_id.push_str("-foreign"),
+                "response" => changed.response_id.push_str("-foreign"),
+                "lease" => changed.resource_lease.push_str("-foreign"),
+                "digest" => {}
+                _ => unreachable!(),
+            }
+            // Preserve the sequence deliberately: sequence alone is not identity.
+            assert_eq!(changed.request_sequence, identity.request_sequence);
+            let observation =
+                super::ProviderPhysicalObservation::ResponseOpened { identity: changed };
+            if mutation == "step" || mutation == "attempt" {
+                // A well-formed foreign binding must still fail exact identity,
+                // rather than merely failing the structural validation above.
+                observation.validate(context).unwrap();
+            }
+            let mut foreign =
+                super::AcknowledgedProviderPhysicalObservation::from_written(&observation, 17)
+                    .unwrap();
+            if mutation == "digest" || mutation == "response" {
+                // Tampering an existing ack cannot be certified by a new digest.
+                foreign.receipt.observation_digest = ack.receipt.observation_digest.clone();
+                if mutation == "digest" {
+                    foreign.receipt.observation_digest.push('x');
+                }
+            }
+            assert!(bind(&foreign).is_none(), "must refuse {mutation}");
+        }
+        assert!(
+            super::ProviderStreamError::unbound(error)
+                .protocol_diagnostic
+                .is_none()
         );
     }
 
