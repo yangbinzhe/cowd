@@ -30,6 +30,21 @@ fn invalid(message: impl Into<String>) -> MemoryKernelError {
     MemoryError::Store(message.into()).into()
 }
 
+/// Semantic catalogue identity of an observed entry and its effective lifecycle
+/// state. This pure calculation is neither an authorization nor an atomic pin.
+pub fn catalogue_revision(entry: &MemoryEntry, state: MemoryState) -> MemoryKernelResult<String> {
+    let mut revision_value = serde_json::to_value(entry).map_err(|e| invalid(e.to_string()))?;
+    if let Some(value) = revision_value.as_object_mut() {
+        value.remove("access_count");
+        value.remove("last_accessed_at");
+    }
+    Ok(Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        &serde_json::to_vec(&(revision_value, state)).map_err(|e| invalid(e.to_string()))?,
+    )
+    .to_string())
+}
+
 impl MemoryKernel {
     pub async fn discover_page(
         &self,
@@ -102,18 +117,7 @@ impl MemoryKernel {
             if matches!(atom.state, MemoryState::Superseded | MemoryState::Archived) {
                 continue;
             }
-            let mut revision_value =
-                serde_json::to_value(&entry).map_err(|e| invalid(e.to_string()))?;
-            if let Some(value) = revision_value.as_object_mut() {
-                value.remove("access_count");
-                value.remove("last_accessed_at");
-            }
-            let revision = Uuid::new_v5(
-                &Uuid::NAMESPACE_OID,
-                &serde_json::to_vec(&(revision_value, atom.state))
-                    .map_err(|e| invalid(e.to_string()))?,
-            )
-            .to_string();
+            let revision = catalogue_revision(&entry, atom.state)?;
             selected.push(MemoryDiscoveryItem {
                 atom,
                 scope: entry.scope,
@@ -140,5 +144,71 @@ impl MemoryKernel {
             next_cursor,
             scope_revisions: page.revisions,
         })
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    fn saved_entry() -> MemoryEntry {
+        serde_json::from_value(serde_json::json!({
+            "id":"00000000-0000-0000-0000-000000000209","layer":"L3","category":"Reference",
+            "priority":"Normal","source":"UserExplicit","title":"Saved revision fixture",
+            "content":"Original independent revision body","embedding":null,"tags":["u7","revision"],
+            "relations":[],"confidence":1.0,"access_count":0,"staleness":0.0,
+            "created_at":"2026-10-25T00:00:00Z","updated_at":"2026-10-25T00:00:00Z",
+            "last_accessed_at":null,"scope":"Global","session_id":null,"source_agent":null,"visibility":"Shared"
+        })).unwrap()
+    }
+
+    #[test]
+    fn catalogue_revision_preserves_frozen_original_uuid_and_semantic_changes() {
+        let entry = saved_entry();
+        // Frozen from the original inline algorithm and independent saved input,
+        // not derived from the helper under test or a consumed model reply.
+        let expected = "e1545eeb-1cde-5c6e-b760-b0849f6cf478";
+        assert_eq!(
+            catalogue_revision(&entry, MemoryState::Active).unwrap(),
+            expected
+        );
+        assert_ne!(
+            catalogue_revision(&entry, MemoryState::Stale).unwrap(),
+            expected
+        );
+        for change in ["title", "tags", "updated_at"] {
+            let mut changed = entry.clone();
+            match change {
+                "title" => changed.title.push('!'),
+                "tags" => changed.tags.push("changed".into()),
+                "updated_at" => changed.updated_at += chrono::Duration::seconds(1),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                catalogue_revision(&changed, MemoryState::Active).unwrap(),
+                expected,
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalogue_revision_ignores_access_statistics_and_rest_extra_fields() {
+        let entry = saved_entry();
+        let expected = "e1545eeb-1cde-5c6e-b760-b0849f6cf478";
+        let mut observed = entry.clone();
+        observed.access_count = 42;
+        observed.last_accessed_at = Some(entry.updated_at + chrono::Duration::seconds(2));
+        assert_eq!(
+            catalogue_revision(&observed, MemoryState::Active).unwrap(),
+            expected
+        );
+        let mut rest = serde_json::to_value(&observed).unwrap();
+        rest["lifecycle_state"] = serde_json::json!("active");
+        let typed: MemoryEntry = serde_json::from_value(rest).unwrap();
+        assert_eq!(
+            catalogue_revision(&typed, MemoryState::Active).unwrap(),
+            expected
+        );
     }
 }

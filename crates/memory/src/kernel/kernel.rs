@@ -6,7 +6,7 @@
 
 mod discovery;
 pub mod reality_recall;
-pub use discovery::{MemoryDiscoveryItem, MemoryDiscoveryResult};
+pub use discovery::{catalogue_revision, MemoryDiscoveryItem, MemoryDiscoveryResult};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
