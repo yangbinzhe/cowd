@@ -31,6 +31,7 @@ const U7_MEMORY_PROMPT: &str = "请依据已保存的 u7-memory-lighthouse 项�
 
 #[derive(serde::Serialize)]
 struct U7MemoryFixture {
+    scope: &'static str,
     lookup: String,
     warehouse: String,
     passphrase: String,
@@ -42,6 +43,7 @@ impl U7MemoryFixture {
         let warehouse = format!("WH-{}", uuid::Uuid::new_v4().simple());
         let passphrase = format!("OUT-{}", uuid::Uuid::new_v4().simple());
         Self {
+            scope: "global",
             lookup: "u7-memory-lighthouse".into(),
             content: format!("u7-memory-lighthouse 项目备件调度：仓库代号为 {warehouse}；出库口令为 {passphrase}。"),
             warehouse,
@@ -62,6 +64,7 @@ fn u7_memory_spec() -> LiveScenarioSpec {
 fn u7_persisted_record(value: &Value, id: &str, content: &str) -> bool {
     if value.get("id").and_then(Value::as_str) == Some(id)
         && value.get("content").and_then(Value::as_str) == Some(content)
+        && value.get("scope").and_then(Value::as_str) == Some("Global")
     {
         return true;
     }
@@ -97,7 +100,7 @@ fn u7_memory_checks(
                             .is_some_and(|intent| intent.contains(&fixture.lookup))
                         && envelope["selected"].as_array().is_some_and(|items| {
                             items.iter().any(|item| {
-                                item["source"].as_str() == Some("memory")
+                                item["source"].as_str() == Some("Memory")
                                     && item["content"]
                                         .as_str()
                                         .is_some_and(|text| text.contains(&fixture.content))
@@ -2765,7 +2768,7 @@ impl LiveScenarioRunner {
             self.client
                 .post(format!("{}/api/memory/L3", self.base_url))
                 .json(&json!({"title":fixture.lookup,"content":fixture.content,
-                "tags":["u7-real-memory"],"category":"Reference","priority":"High"}))
+                "tags":["u7-real-memory"],"category":"Reference","priority":"High", "scope":fixture.scope}))
                 .send()
                 .map_err(|error| error.to_string())?,
         )?;

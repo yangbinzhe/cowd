@@ -3619,6 +3619,7 @@ fn u5_inherited_host_fd_contract_probe() {
 
 fn u7_literal_fixture() -> U7MemoryFixture {
     U7MemoryFixture {
+        scope: "global",
         lookup: "independent-project".into(),
         warehouse: "WH-literal-527".into(),
         passphrase: "OUT-literal-893".into(),
@@ -3630,7 +3631,7 @@ fn u7_literal_history() -> Value {
     json!({"session_id":"s-original", "has_more":false, "envelopes":[{
     "session_id":"s-original", "type":"ContextEnvelope", "envelope":{
         "identity":{"session_id":"s-original"}, "intent":"query independent-project",
-        "selected":[{"source":"memory","content":"independent memory body 527/893"}]
+        "selected":[{"source":"Memory","content":"independent memory body 527/893"}]
     }}]})
 }
 
@@ -3697,8 +3698,25 @@ fn u7_memory_requires_original_selected_context_and_independent_answer() {
 
 #[test]
 fn u7_preparation_readback_requires_same_original_id_and_full_body() {
-    let row = json!({"entries":[{"id":"original-id","content":"literal-body"}]});
+    let row = json!({"entries":[{"id":"original-id","content":"literal-body","scope":"Global"}]});
     assert!(u7_persisted_record(&row, "original-id", "literal-body"));
+    let mut wrong_scope = row.clone();
+    wrong_scope["entries"][0]["scope"] = json!({"Session":"api-memory-create"});
+    assert!(!u7_persisted_record(
+        &wrong_scope,
+        "original-id",
+        "literal-body"
+    ));
+    wrong_scope["entries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("scope");
+    assert!(!u7_persisted_record(
+        &wrong_scope,
+        "original-id",
+        "literal-body"
+    ));
+
     assert!(!u7_persisted_record(&row, "foreign-id", "literal-body"));
     assert!(!u7_persisted_record(&row, "original-id", "literal"));
     assert!(!u7_persisted_record(
