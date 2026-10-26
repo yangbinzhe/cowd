@@ -525,15 +525,253 @@ pub struct SessionTerminalExecutionFence {
     pub claim_fence_epoch: u64,
 }
 
-/// Owner transaction predicate for a durable observation. Runtime remains
-/// responsible for constructing and authenticating the opaque source.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// This kind can only be inserted by the locked claim authorization operation.
+pub const SESSION_CANCELLATION_AUTHORIZATION_KIND: &str =
+    "session.claim.cancellation_authorized.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCancellationRequestedReference {
+    pub event_id: String,
+    pub stream_id: String,
+    pub event_sequence: u64,
+    pub commit_cursor: u64,
+    pub payload_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCancellationClaimBinding {
+    pub ingress_message_id: String,
+    pub request_id: String,
+    pub input_sequence: usize,
+    pub session_generation: u64,
+    pub claim_owner: String,
+    pub claim_fence_epoch: u64,
+    pub claim_token_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCancellationAuthorizationPayload {
+    pub schema_version: u32,
+    pub cancellation_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_cancellation_receipt")]
+    pub receipt: harness_contract::turn::CancellationReceipt,
+    pub claim_binding: SessionCancellationClaimBinding,
+    pub requested_ref: SessionCancellationRequestedReference,
+    pub authorization_digest: String,
+}
+
+fn deserialize_canonical_cancellation_receipt<'de, D>(
+    deserializer: D,
+) -> Result<harness_contract::turn::CancellationReceipt, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let receipt: harness_contract::turn::CancellationReceipt =
+        serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?;
+    let canonical = serde_json::to_value(&receipt).map_err(serde::de::Error::custom)?;
+    if value != canonical {
+        return Err(serde::de::Error::custom(
+            "authorization receipt must use the complete canonical receipt encoding",
+        ));
+    }
+    Ok(receipt)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ClaimEventPurpose {
+    Observation,
+    CancellationAuthorization {
+        receipt: harness_contract::turn::CancellationReceipt,
+        requested_ref: SessionCancellationRequestedReference,
+    },
+}
+
+/// Data remains public for the existing adapters, but purpose is neither
+/// serializable nor inferable from an event's kind or payload.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionClaimEventAppend {
     pub session_id: String,
     pub ingress_message_id: String,
     pub turn_id: String,
     pub fence: SessionTerminalExecutionFence,
     pub event: crate::SessionDomainEvent,
+    purpose: ClaimEventPurpose,
+}
+
+fn cancellation_digest(domain: &str, value: &serde_json::Value) -> crate::SessionResult<String> {
+    harness_contract::step::canonical_digest(domain, value)
+        .map_err(|error| crate::SessionError::InvalidArgument(error.to_string()))
+}
+
+impl SessionClaimEventAppend {
+    pub fn observation(
+        session_id: String,
+        ingress_message_id: String,
+        turn_id: String,
+        fence: SessionTerminalExecutionFence,
+        event: crate::SessionDomainEvent,
+    ) -> Self {
+        Self {
+            session_id,
+            ingress_message_id,
+            turn_id,
+            fence,
+            event,
+            purpose: ClaimEventPurpose::Observation,
+        }
+    }
+
+    pub fn cancellation_authorization(
+        session_id: String,
+        ingress_message_id: String,
+        turn_id: String,
+        fence: SessionTerminalExecutionFence,
+        receipt: harness_contract::turn::CancellationReceipt,
+        requested_ref: SessionCancellationRequestedReference,
+    ) -> crate::SessionResult<Self> {
+        use harness_contract::turn::CancellationStatus;
+        if [
+            &session_id,
+            &ingress_message_id,
+            &turn_id,
+            &fence.request_id,
+            &fence.claim_owner,
+            &fence.claim_token,
+            &receipt.cancellation_id,
+            &receipt.execution_id,
+            &receipt.actor_id,
+            &requested_ref.event_id,
+            &requested_ref.stream_id,
+            &requested_ref.payload_digest,
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+            || fence.session_generation == 0
+            || fence.claim_fence_epoch == 0
+            || receipt.session_id != session_id
+            || receipt.turn_id != turn_id
+            || receipt.status != CancellationStatus::Requested
+            || receipt.effective_at_ms.is_some()
+            || !requested_ref
+                .payload_digest
+                .strip_prefix("sha256:")
+                .is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        {
+            return Err(crate::SessionError::InvalidArgument(
+                "cancellation authorization requires a complete Requested receipt and claim binding".into()));
+        }
+        // Raw tokens never enter the payload, stable key or diagnostics.
+        let claim_token_digest =
+            format!("sha256:{:x}", Sha256::digest(fence.claim_token.as_bytes()));
+        let claim_binding = SessionCancellationClaimBinding {
+            ingress_message_id: ingress_message_id.clone(),
+            request_id: fence.request_id.clone(),
+            input_sequence: fence.input_sequence,
+            session_generation: fence.session_generation,
+            claim_owner: fence.claim_owner.clone(),
+            claim_fence_epoch: fence.claim_fence_epoch,
+            claim_token_digest,
+        };
+        // Mutable receipt/ref/time fields intentionally do not identify the row.
+        let key = cancellation_digest(
+            "session-cancel-authorization-key:v1",
+            &serde_json::json!({
+                "session_id": session_id, "request_id": fence.request_id,
+                "input_sequence": fence.input_sequence, "session_generation": fence.session_generation,
+                "claim_owner": fence.claim_owner, "claim_fence_epoch": fence.claim_fence_epoch,
+                "claim_token_digest": claim_binding.claim_token_digest,
+                "cancellation_id": receipt.cancellation_id,
+            }),
+        )?;
+        let unsigned = serde_json::json!({
+            "schema_version": 1, "cancellation_id": receipt.cancellation_id,
+            "receipt": receipt, "claim_binding": claim_binding, "requested_ref": requested_ref,
+        });
+        let authorization_digest = cancellation_digest(
+            "session-cancel-authorization-payload:v1",
+            &serde_json::json!({"kind": SESSION_CANCELLATION_AUTHORIZATION_KIND,
+                "session_id": session_id, "turn_id": turn_id, "payload": unsigned}),
+        )?;
+        let payload = SessionCancellationAuthorizationPayload {
+            schema_version: 1,
+            cancellation_id: receipt.cancellation_id.clone(),
+            receipt: receipt.clone(),
+            claim_binding,
+            requested_ref: requested_ref.clone(),
+            authorization_digest,
+        };
+        let event = crate::SessionDomainEvent {
+            event_id: format!("session-cancel-authorization:v1:{key}"),
+            session_id: session_id.clone(),
+            sequence: 0,
+            scope: crate::SessionDomainScope::Turn,
+            kind: SESSION_CANCELLATION_AUTHORIZATION_KIND.into(),
+            span_id: None,
+            parent_span_id: None,
+            correlation_id: None,
+            status: Some("authorized".into()),
+            refs: Vec::new(),
+            payload: serde_json::to_value(payload)?,
+            created_at_ms: receipt.requested_at_ms,
+        };
+        Ok(Self {
+            session_id,
+            ingress_message_id,
+            turn_id,
+            fence,
+            event,
+            purpose: ClaimEventPurpose::CancellationAuthorization {
+                receipt,
+                requested_ref,
+            },
+        })
+    }
+
+    /// Called by the owner while holding the Session and exact outbox locks.
+    /// This checks data integrity only; the transaction checks current authority.
+    pub fn validate_locked_event_binding(&self) -> crate::SessionResult<()> {
+        match &self.purpose {
+            ClaimEventPurpose::Observation => {
+                if self.event.kind == SESSION_CANCELLATION_AUTHORIZATION_KIND {
+                    return Err(crate::SessionError::InvalidArgument(
+                        "reserved cancellation authorization kind requires authorization purpose"
+                            .into(),
+                    ));
+                }
+            }
+            ClaimEventPurpose::CancellationAuthorization {
+                receipt,
+                requested_ref,
+            } => {
+                // Parse strictly, then compare the full canonical value as well:
+                // nested receipt defaults/unknown fields must not disappear on decode.
+                let _: SessionCancellationAuthorizationPayload =
+                    serde_json::from_value(self.event.payload.clone())?;
+                let expected = Self::cancellation_authorization(
+                    self.session_id.clone(),
+                    self.ingress_message_id.clone(),
+                    self.turn_id.clone(),
+                    self.fence.clone(),
+                    receipt.clone(),
+                    requested_ref.clone(),
+                )?;
+                if self.event != expected.event {
+                    return Err(crate::SessionError::InvalidArgument(
+                        "cancellation authorization event/key/digest does not match frozen claim payload".into()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1004,6 +1242,27 @@ pub struct SessionEvent {
     pub event_json: String,
     pub sequence: usize,
     pub created_at_ms: u64,
+}
+
+impl SessionEvent {
+    /// Ordinary writers must reject before allocation and before idempotent
+    /// readback. Inspect raw JSON even when its outer event type is different.
+    pub fn reject_reserved_cancellation_authorization(&self) -> crate::SessionResult<()> {
+        let value = serde_json::from_str::<serde_json::Value>(&self.event_json).ok();
+        if self.event_type == SESSION_CANCELLATION_AUTHORIZATION_KIND
+            || value
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some(SESSION_CANCELLATION_AUTHORIZATION_KIND)
+        {
+            return Err(crate::SessionError::InvalidArgument(
+                "reserved cancellation authorization kind requires locked authorization purpose"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A full-message-list snapshot taken at a specific event index, used

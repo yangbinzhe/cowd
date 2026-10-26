@@ -642,8 +642,9 @@ pub use provider_resources::{
     ProviderResourceGeneration,
 };
 pub use provider_runtime_client::{
-    push_provider_output_block, ProviderAttemptOutcomeEvidence, ProviderClientTemplateCache,
-    ProviderClientTemplateCacheStats, ProviderControlCompletion, ProviderOutputContentBlock,
+    push_provider_output_block, AcknowledgedProviderPhysicalObservation,
+    ProviderAttemptOutcomeEvidence, ProviderClientTemplateCache, ProviderClientTemplateCacheStats,
+    ProviderControlCompletion, ProviderOutputContentBlock, ProviderPhysicalObservation,
     ProviderPreparationFailure, ProviderRequestEvidenceContext, ProviderRequestPreparation,
     ProviderRuntimeClient, ProviderToolDefinition, ProviderWireEvidence,
     ProviderWireEvidenceWriter,

@@ -117,6 +117,7 @@ pub enum RuntimeSessionEventKind {
     ContextTurnReport,
     ProviderRequestPacked,
     ProviderAttemptOutcome,
+    ProviderPhysicalObservation,
     ContextGovernanceReport,
     ContextFactCandidateReview,
     ContextSessionCompacted,
@@ -138,6 +139,7 @@ impl RuntimeSessionEventKind {
             Self::ContextTurnReport => "context.turn_report",
             Self::ProviderRequestPacked => "context.provider_request_packed",
             Self::ProviderAttemptOutcome => "context.provider_attempt_outcome",
+            Self::ProviderPhysicalObservation => "context.provider_physical_observation",
             Self::ContextGovernanceReport => "context.governance_report",
             Self::ContextFactCandidateReview => "context.fact_candidate_review",
             Self::ContextSessionCompacted => "context.session_compacted",
@@ -166,10 +168,71 @@ impl RuntimeSessionEventKind {
             | Self::ContextTurnReport
             | Self::ProviderRequestPacked
             | Self::ProviderAttemptOutcome
+            | Self::ProviderPhysicalObservation
             | Self::ContextGovernanceReport
             | Self::ContextFactCandidateReview
             | Self::ContextSessionCompacted => session::SessionDomainScope::Context,
         }
+    }
+}
+
+#[cfg(test)]
+mod physical_observation_kind_tests {
+    use super::*;
+
+    #[test]
+    fn r189_physical_observation_has_fixed_wire_scope_and_roundtrip() {
+        let kind = RuntimeSessionEventKind::ProviderPhysicalObservation;
+        assert_eq!(kind.as_str(), "context.provider_physical_observation");
+        assert_eq!(kind.scope(), session::SessionDomainScope::Context);
+        let encoded = serde_json::to_value(kind).unwrap();
+        assert_eq!(encoded, serde_json::json!("provider_physical_observation"));
+        assert_eq!(
+            serde_json::from_value::<RuntimeSessionEventKind>(encoded).unwrap(),
+            kind
+        );
+        assert!(
+            serde_json::from_value::<RuntimeSessionEventKind>(serde_json::json!("provider_closed"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn r198_physical_constructor_cannot_select_authorization_purpose() {
+        let fence = session::SessionTerminalExecutionFence {
+            request_id: "fixture-request".into(),
+            input_sequence: 0,
+            session_generation: 1,
+            claim_owner: "fixture-worker".into(),
+            claim_token: "fixture-token".into(),
+            claim_fence_epoch: 1,
+        };
+        let make = |kind: &str| {
+            RuntimeSessionClaimEventAppend::new(
+                "fixture-session".into(),
+                "fixture-message".into(),
+                "fixture-turn".into(),
+                fence.clone(),
+                session::SessionDomainEvent::new(
+                    "fixture-session",
+                    0,
+                    session::SessionDomainScope::Context,
+                    kind,
+                    serde_json::json!({"fixture":true}),
+                    1,
+                ),
+            )
+        };
+        let normal = make("context.provider_physical_observation");
+        assert!(normal
+            .owner_request()
+            .validate_locked_event_binding()
+            .is_ok());
+        let reserved = make(session::SESSION_CANCELLATION_AUTHORIZATION_KIND);
+        assert!(matches!(
+            reserved.owner_request().validate_locked_event_binding(),
+            Err(session::SessionError::InvalidArgument(_))
+        ));
     }
 }
 
@@ -246,6 +309,11 @@ pub struct RuntimeSessionEventReceipt {
 
 #[async_trait]
 pub trait SessionRuntimeQueryPort: Send + Sync {
+    async fn cancellation_authorization_by_id(
+        &self,
+        request: &RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<Option<session::SessionDomainEvent>, SessionError>;
+
     fn history_reader(&self) -> Option<Arc<session::SessionHistoryReader>>;
 
     async fn session_record(
@@ -304,8 +372,64 @@ pub trait SessionRuntimeIngressPort: Send + Sync {
     ) -> Result<RuntimeSessionInputRecord, SessionError>;
 }
 
+/// Non-serializable write capability made only from Runtime's authenticated
+/// Requested source. Adapters may forward it to the original Session owner.
+pub struct RuntimeSessionCancellationAuthorizationRequest {
+    owner_request: session::SessionClaimEventAppend,
+}
+
+impl RuntimeSessionCancellationAuthorizationRequest {
+    pub(crate) fn new(owner_request: session::SessionClaimEventAppend) -> Self {
+        Self { owner_request }
+    }
+
+    pub fn owner_request(&self) -> &session::SessionClaimEventAppend {
+        &self.owner_request
+    }
+}
+
+pub struct RuntimeSessionClaimEventAppend {
+    owner_request: session::SessionClaimEventAppend,
+}
+
+impl RuntimeSessionClaimEventAppend {
+    pub(crate) fn new(
+        session_id: String,
+        ingress_message_id: String,
+        turn_id: String,
+        fence: session::SessionTerminalExecutionFence,
+        event: session::SessionDomainEvent,
+    ) -> Self {
+        Self {
+            owner_request: session::SessionClaimEventAppend::observation(
+                session_id,
+                ingress_message_id,
+                turn_id,
+                fence,
+                event,
+            ),
+        }
+    }
+
+    pub fn owner_request(&self) -> &session::SessionClaimEventAppend {
+        &self.owner_request
+    }
+}
+
 #[async_trait]
 pub trait SessionRuntimeJournalPort: Send + Sync {
+    async fn authorize_requested_cancellation(
+        &self,
+        request: &RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<session::SessionDomainEvent, SessionError>;
+
+    /// Check the original claim and append inside its Session owner transaction.
+    /// Implementations must not fall back to the unguarded journal operation.
+    async fn append_event_if_claim_current(
+        &self,
+        request: &RuntimeSessionClaimEventAppend,
+    ) -> Result<RuntimeSessionEventReceipt, SessionError>;
+
     async fn append_event(
         &self,
         event: &RuntimeSessionEvent,
@@ -339,6 +463,16 @@ impl TestSessionPortAdapter {
 #[cfg(any(test, feature = "test-fixtures"))]
 #[async_trait]
 impl SessionRuntimeQueryPort for TestSessionPortAdapter {
+    async fn cancellation_authorization_by_id(
+        &self,
+        request: &RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<Option<session::SessionDomainEvent>, SessionError> {
+        let owner = request.owner_request();
+        self.store
+            .get_session_domain_event_by_id(&owner.session_id, &owner.event.event_id)
+            .await
+    }
+
     fn history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
         Some(Arc::new(self.store.history_reader()))
     }
@@ -528,6 +662,30 @@ impl SessionRuntimeIngressPort for TestSessionPortAdapter {
 #[cfg(any(test, feature = "test-fixtures"))]
 #[async_trait]
 impl SessionRuntimeJournalPort for TestSessionPortAdapter {
+    async fn authorize_requested_cancellation(
+        &self,
+        request: &RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<session::SessionDomainEvent, SessionError> {
+        let stored = self
+            .store
+            .append_session_domain_event_if_claim_current(request.owner_request())
+            .await?;
+        session::SessionDomainEvent::from_session_event(&stored)
+            .map_err(|error| SessionError::Store(error.to_string()))
+    }
+
+    async fn append_event_if_claim_current(
+        &self,
+        request: &RuntimeSessionClaimEventAppend,
+    ) -> Result<RuntimeSessionEventReceipt, SessionError> {
+        self.store
+            .append_session_domain_event_if_claim_current(request.owner_request())
+            .await
+            .map(|event| RuntimeSessionEventReceipt {
+                sequence: event.sequence,
+            })
+    }
+
     async fn append_event(
         &self,
         event: &RuntimeSessionEvent,
@@ -573,8 +731,7 @@ impl SessionRuntimeJournalPort for TestSessionPortAdapter {
     }
 }
 
-#[cfg(any(test, feature = "test-fixtures"))]
-fn to_session_event(event: &RuntimeSessionEvent) -> session::SessionDomainEvent {
+pub(crate) fn to_session_event(event: &RuntimeSessionEvent) -> session::SessionDomainEvent {
     let mut domain_event = session::SessionDomainEvent::new(
         event.session_id.clone(),
         event.sequence_hint,

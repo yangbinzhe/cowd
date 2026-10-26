@@ -991,6 +991,17 @@ fn append_allocated_event_tx(
     transaction: &mut PostgresTransaction<'_>,
     event: &SessionEvent,
 ) -> session::SessionResult<SessionEvent> {
+    event.reject_reserved_cancellation_authorization()?;
+    append_locked_claim_event_unchecked_tx(transaction, event)
+}
+
+// Sole caller allowed to bypass the ordinary guard is append_claim_event_tx,
+// after locked purpose/payload and current-claim validation. Other callers use
+// append_allocated_event_tx above.
+fn append_locked_claim_event_unchecked_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    event: &SessionEvent,
+) -> session::SessionResult<SessionEvent> {
     let sequence: i64 = transaction
         .query_one(
             "SELECT COALESCE(MAX(sequence),-1)+1

@@ -550,6 +550,7 @@ impl UnifiedSessionStore {
 
     /// Append a mutation event to the session's event log.
     pub async fn append_event(&self, event: &SessionEvent) -> Result<()> {
+        event.reject_reserved_cancellation_authorization()?;
         let event = event.clone();
         self.execute_write(move |backend| backend.append_event(&event))
             .await
@@ -560,6 +561,7 @@ impl UnifiedSessionStore {
         &self,
         event: &SessionEvent,
     ) -> Result<SessionEvent> {
+        event.reject_reserved_cancellation_authorization()?;
         let event = event.clone();
         self.execute_write(move |backend| backend.append_event_allocating_sequence(&event))
             .await
@@ -570,6 +572,9 @@ impl UnifiedSessionStore {
         &self,
         events: &[SessionEvent],
     ) -> Result<Vec<SessionEvent>> {
+        for event in events {
+            event.reject_reserved_cancellation_authorization()?;
+        }
         let events = events.to_vec();
         self.execute_write(move |backend| backend.append_events_allocating_sequence(&events))
             .await
@@ -580,6 +585,7 @@ impl UnifiedSessionStore {
         &self,
         event: &SessionEvent,
     ) -> Result<bool> {
+        event.reject_reserved_cancellation_authorization()?;
         let event = event.clone();
         self.execute_write(move |backend| backend.append_context_envelope_event_if_absent(&event))
             .await
@@ -590,6 +596,7 @@ impl UnifiedSessionStore {
         &self,
         event: &SessionEvent,
     ) -> Result<Option<SessionEvent>> {
+        event.reject_reserved_cancellation_authorization()?;
         let event = event.clone();
         self.execute_write(move |backend| {
             backend.append_context_envelope_event_if_absent_allocating_sequence(&event)
@@ -635,6 +642,7 @@ impl UnifiedSessionStore {
     ) -> Result<(SessionEvent, bool)> {
         let event_id = event.event_id.clone();
         let event = event.to_session_event()?;
+        event.reject_reserved_cancellation_authorization()?;
         self.execute_write(move |backend| {
             backend.append_session_domain_event_if_absent_allocating_sequence(&event, &event_id)
         })
@@ -681,7 +689,9 @@ impl UnifiedSessionStore {
     ) -> Result<bool> {
         let mut wire_events = Vec::with_capacity(events.len());
         for event in events {
-            wire_events.push(event.to_session_event()?);
+            let event = event.to_session_event()?;
+            event.reject_reserved_cancellation_authorization()?;
+            wire_events.push(event);
         }
         let checkpoint_id = checkpoint_id.to_string();
         self.execute_write(move |backend| {

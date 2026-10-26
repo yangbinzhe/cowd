@@ -4994,6 +4994,8 @@ where
             return None;
         }
         Some(Arc::new(TurnModelStepBackend {
+            ticket: ticket.clone(),
+            stop: crate::CancellationToken::new(),
             runtime: self.runtime.upgrade()?,
             state: self.state.upgrade()?,
             services: self.services.upgrade()?,
@@ -5057,6 +5059,8 @@ where
 }
 
 struct TurnModelStepBackend<C: ApiClient, T: ToolExecutor> {
+    ticket: NodeExecutionTicket,
+    stop: crate::CancellationToken,
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,

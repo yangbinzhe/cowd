@@ -32,6 +32,17 @@ struct CalibrationEvidence {
 
 #[async_trait::async_trait]
 impl runtime::ProviderWireEvidenceWriter for CalibrationEvidence {
+    async fn persist_physical(
+        &self,
+        _context: &runtime::ProviderRequestEvidenceContext,
+        _observation: runtime::ProviderPhysicalObservation,
+        _source: Option<&runtime::execution_core::services::AuthorizedRequestedCancellation>,
+    ) -> Result<runtime::AcknowledgedProviderPhysicalObservation, runtime::RuntimeError> {
+        Err(runtime::RuntimeError::new(
+            "cache calibration has no original physical Session journal; physical evidence is unsupported",
+        ))
+    }
+
     async fn persist(
         &self,
         context: &runtime::ProviderRequestEvidenceContext,
@@ -382,6 +393,149 @@ fn write_report(path: &Path, report: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn r192_standalone_calibration_keeps_wire_outcome_and_rejects_physical_authority() {
+        use runtime::{ApiClient, ProviderWireEvidenceWriter};
+        use std::{
+            collections::{BTreeMap, HashMap},
+            io::{Read, Write},
+            time::{Duration, Instant},
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "local calibration adapter never called"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("local adapter accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0 && bytes.len() < 1024 * 1024);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..offset]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= offset + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let data = "data: {\"id\":\"calibration-local\",\"object\":\"chat.completion.chunk\",\"model\":\"calibration-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"calibration-local\",\"object\":\"chat.completion.chunk\",\"model\":\"calibration-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len()).as_bytes()).unwrap();
+        });
+        let registry = runtime::ProviderRegistry::new_with_context_windows(
+            model_protocol::provider_config::ProvidersConfig {
+                providers: HashMap::from([(
+                    "fixture".into(),
+                    model_protocol::provider_config::ProviderConfig {
+                        name: "fixture".into(),
+                        base_url: format!("http://{address}/v1"),
+                        api_key: "fixture-only".into(),
+                        models: vec!["calibration-fixture".into()],
+                        protocol: Some("completions".into()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
+                    },
+                )]),
+            },
+            BTreeMap::from([("calibration-fixture".into(), 32768)]),
+        )
+        .unwrap();
+        let mut client = runtime::ProviderRuntimeClient::new(
+            Arc::new(registry),
+            "calibration-fixture".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        let evidence = Arc::new(CalibrationEvidence::default());
+        client.configure_provider_wire_evidence(Some(evidence.clone()));
+        let mut budget = runtime::context_ledger::RequestBudgetReport::for_attempt(
+            "calibration-fixture",
+            32768,
+            64,
+            0,
+            0,
+            0,
+        );
+        budget.set_context_window_source("configured");
+        let context = runtime::ProviderRequestEvidenceContext {
+            session_id: "calibration-standalone".into(),
+            execution_id: "calibration-execution".into(),
+            turn_id: "calibration-turn".into(),
+            request_sequence: 1,
+            request_compiler_cache_hit: false,
+            budget: budget.clone(),
+            attempt: 1,
+        };
+        let events = client
+            .stream_collect(runtime::ApiRequest {
+                bound_step: None,
+                prompt: runtime::PromptAssembly::new(vec!["local calibration adapter".into()]),
+                messages: Vec::new().into(),
+                model: "calibration-fixture".into(),
+                reasoning_effort_override: None,
+                request_compiler_cache_hit: false,
+                budget,
+                preparation: Default::default(),
+                provider_evidence_context: Some(context.clone()),
+            })
+            .unwrap();
+        server.join().unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, runtime::AssistantEvent::TextDelta(text) if text == "ok")
+        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, runtime::AssistantEvent::MessageStop)));
+        assert_eq!(evidence.requests.lock().unwrap().len(), 1);
+        let outcomes = evidence.outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1.terminal_status, "completed");
+        drop(outcomes);
+        // A caller-provided, well-shaped observation still cannot turn this
+        // standalone recorder into the authoritative Session journal writer.
+        let observation: runtime::ProviderPhysicalObservation = serde_json::from_value(json!({
+            "phase":"response_opened", "identity": {
+                "session_id":context.session_id, "execution_id":context.execution_id, "turn_id":context.turn_id,
+                "request_sequence":1, "request_id":"fixture-request", "response_id":"fixture-response", "logical_attempt":1,
+                "resource_lease":"resource-lease:fixture:absent", "opened_at_ms":1,
+                "step":{"step_id":"fixture-step", "session_id":context.session_id, "turn_id":context.turn_id, "execution_id":context.execution_id,
+                    "goal_ref":null,"program_ref":null,"task_ref":null,"build_ref":"local-only"},
+                "provider_attempt":{"attempt_id":"fixture-attempt","origin_step_id":"fixture-step","model_profile_digest":"fixture-profile","request_digest":"fixture-request"}
+            }
+        })).unwrap();
+        let result =
+            futures::executor::block_on(evidence.persist_physical(&context, observation, None));
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("physical evidence is unsupported"))
+        );
+    }
     #[test]
     fn ratio_and_usage_keep_every_prompt_bucket() {
         let usage = add_usage(

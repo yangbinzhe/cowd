@@ -2101,7 +2101,12 @@ fn ten_thousand_terminal_turns_and_control_guards_leave_no_hot_entries() {
                         harness_contract::policy::SandboxPosture::ReadOnlySandbox,
                     effective_sandbox_posture:
                         harness_contract::policy::SandboxPosture::ReadOnlySandbox,
-                    cancellation_token: runtime::CancellationToken::new(),
+                    cancellation_control:
+                        runtime::execution_core::services::TurnCancellationControl::operational(
+                            &format!("session-{index}"),
+                            &turn_id,
+                            &format!("execution-{index}"),
+                        ),
                 },
             );
         drop(ActiveTurnControlGuard {

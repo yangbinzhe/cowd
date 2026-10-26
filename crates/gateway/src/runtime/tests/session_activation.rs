@@ -1314,6 +1314,8 @@ async fn cancelled_execution_fence_suppresses_late_terminal_materialization() {
         "cancel-wins-turn".to_string(),
     );
     let cancellation_id = "cancel-wins-receipt";
+    // Synthetic kernel arbitration fixture: replay a committed final receipt.
+    // This proves terminal competition, not Session command authorization.
     runtime_services
         .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
             cancellation_id: cancellation_id.to_string(),
@@ -1324,15 +1326,15 @@ async fn cancelled_execution_fence_suppresses_late_terminal_materialization() {
             cause: harness_contract::turn::CancellationCause::UserRequested,
             reason: Some("user cancelled before terminal materialization".to_string()),
             requested_at_ms: now_ms(),
-            effective_at_ms: None,
-            status: harness_contract::turn::CancellationStatus::Requested,
+            effective_at_ms: Some(now_ms()),
+            status: harness_contract::turn::CancellationStatus::Cancelled,
             journal_sequence: 0,
             projection_revision: 0,
         })
         .unwrap();
     assert_eq!(
         runtime_services
-            .resolve_requested_cancellation(cancellation_id)
+            .replay_or_resolve_inactive_cancellation(cancellation_id)
             .unwrap()
             .unwrap()
             .status,

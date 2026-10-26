@@ -84,6 +84,16 @@ impl GatewaySessionRuntimePort {
 
 #[async_trait]
 impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
+    async fn cancellation_authorization_by_id(
+        &self,
+        request: &runtime::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<Option<session::SessionDomainEvent>, session::SessionError> {
+        let owner_request = request.owner_request();
+        self.service()?
+            .stored_session_input_journal(&owner_request.session_id, &owner_request.event.event_id)
+            .await
+    }
+
     fn history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
         self.service()
             .ok()
@@ -298,6 +308,30 @@ impl runtime::SessionRuntimeIngressPort for GatewaySessionRuntimePort {
 
 #[async_trait]
 impl runtime::SessionRuntimeJournalPort for GatewaySessionRuntimePort {
+    async fn authorize_requested_cancellation(
+        &self,
+        request: &runtime::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<session::SessionDomainEvent, session::SessionError> {
+        let stored = self
+            .service()?
+            .append_runtime_claim_journal_event(request.owner_request())
+            .await?;
+        session::SessionDomainEvent::from_session_event(&stored)
+            .map_err(session::SessionError::Serialization)
+    }
+
+    async fn append_event_if_claim_current(
+        &self,
+        request: &runtime::session_runtime_port::RuntimeSessionClaimEventAppend,
+    ) -> Result<runtime::RuntimeSessionEventReceipt, session::SessionError> {
+        self.service()?
+            .append_runtime_claim_journal_event(request.owner_request())
+            .await
+            .map(|event| runtime::RuntimeSessionEventReceipt {
+                sequence: event.sequence,
+            })
+    }
+
     async fn append_event(
         &self,
         event: &runtime::RuntimeSessionEvent,

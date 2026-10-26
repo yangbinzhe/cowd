@@ -204,6 +204,14 @@ where
         );
     }
 
+    pub fn install_provider_cancellation_control(
+        &mut self,
+        control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    ) -> Result<(), RuntimeError> {
+        self.runtime_mut()
+            .install_provider_cancellation_control(control)
+    }
+
     /// The original host keeps this same scope when its turn controls change.
     pub fn hook_execution_scope(&self) -> crate::HookExecutionScope {
         self.hook_scope.clone()

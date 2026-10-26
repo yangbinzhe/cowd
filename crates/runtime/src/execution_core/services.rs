@@ -113,6 +113,543 @@ pub enum RuntimeServicesError {
     Invariant(String),
 }
 
+fn read_original_requested_event(
+    store: &RuntimeEventStore,
+    receipt: &harness_contract::turn::CancellationReceipt,
+) -> Result<
+    (
+        DurableRuntimeEvent,
+        harness_contract::turn::CancellationReceipt,
+    ),
+    RuntimeServicesError,
+> {
+    let stream_id = format!("cancellation:{}", receipt.cancellation_id);
+    let events = store
+        .list_stream_after(&stream_id, 0, 1, 1, 256 * 1024)
+        .map_err(RuntimeServicesError::Invariant)?;
+    let event = events.into_iter().next().ok_or_else(|| {
+        RuntimeServicesError::Invariant("original Requested cancellation event is missing".into())
+    })?;
+    let source = authenticate_requested_event(&event, receipt)?;
+    Ok((event, source))
+}
+
+fn authenticate_requested_event(
+    event: &DurableRuntimeEvent,
+    expected: &harness_contract::turn::CancellationReceipt,
+) -> Result<harness_contract::turn::CancellationReceipt, RuntimeServicesError> {
+    use harness_contract::turn::{CancellationCause, CancellationReceipt, CancellationStatus};
+    let reject =
+        || RuntimeServicesError::Invariant("invalid original Requested cancellation event".into());
+    let mut source: CancellationReceipt =
+        serde_json::from_value(event.payload.clone()).map_err(|_| reject())?;
+    let mut normalized = expected.clone();
+    normalized.journal_sequence = 0;
+    normalized.projection_revision = 0;
+    let refs = vec![
+        crate::RuntimeEventRef {
+            kind: "session".into(),
+            id: source.session_id.clone(),
+        },
+        crate::RuntimeEventRef {
+            kind: "execution".into(),
+            id: source.execution_id.clone(),
+        },
+        crate::RuntimeEventRef {
+            kind: "turn".into(),
+            id: source.turn_id.clone(),
+        },
+    ];
+    if source != normalized
+        || source.status != CancellationStatus::Requested
+        || source.cause != CancellationCause::UserRequested
+        || source.effective_at_ms.is_some()
+        || source.requested_at_ms == 0
+        || source.cancellation_id.is_empty()
+        || !source.actor_id.starts_with("principal:")
+        || source.actor_id.len() <= "principal:".len()
+        || source.session_id.is_empty()
+        || source.turn_id.is_empty()
+        || source.execution_id.is_empty()
+        || source.journal_sequence != 0
+        || source.projection_revision != 0
+        || event.event_id.is_empty()
+        || event.commit_cursor == 0
+        || event.sequence != 1
+        || event.stream_id != format!("cancellation:{}", source.cancellation_id)
+        || event.scope != RuntimeEventScope::Session
+        || event.kind != "session.cancellation_committed"
+        || event.status.as_deref() != Some("requested")
+        || event.actor.as_deref() != Some(source.actor_id.as_str())
+        || event.refs != refs
+        || event.schema_version != 1
+        || event.transaction_index != 0
+        || event.transaction_id
+            != format!("session-cancellation:{}:requested", source.cancellation_id)
+        || event.idempotency_key.as_deref()
+            != Some(format!("{}:requested", source.cancellation_id).as_str())
+        || (expected.journal_sequence != 0 && expected.journal_sequence != event.commit_cursor)
+        || (expected.projection_revision != 0 && expected.projection_revision != event.sequence)
+    {
+        return Err(reject());
+    }
+    source.journal_sequence = event.commit_cursor;
+    source.projection_revision = event.sequence;
+    Ok(source)
+}
+
+fn publish_requested_source(
+    control: &Arc<TurnCancellationControl>,
+    source: AuthorizedRequestedCancellation,
+) -> Result<CancellationNotificationDisposition, RuntimeServicesError> {
+    if !source
+        .source
+        .original_control
+        .ptr_eq(&Arc::downgrade(control))
+        || !control.matches_target(
+            &source.source.receipt.session_id,
+            &source.source.receipt.turn_id,
+            &source.source.receipt.execution_id,
+        )
+        || control.ingress.is_none()
+    {
+        return Err(RuntimeServicesError::Invariant(
+            "Requested source belongs to a different original control".into(),
+        ));
+    }
+    let mut cause = control
+        .first_cause
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*cause {
+        TurnCancellationCause::None => {
+            // Publish under the same cause lock before notifying. A raw token
+            // signal racing publication wins as unattributed/operational; it
+            // must never acquire the later user's identity retroactively.
+            *cause = TurnCancellationCause::AuthorizedRequested(source);
+            if !control.token.cancel_first_signal() {
+                *cause = TurnCancellationCause::Operational;
+                return Ok(CancellationNotificationDisposition::OperationalFirst);
+            }
+            return Ok(CancellationNotificationDisposition::Delivered);
+        }
+        TurnCancellationCause::Operational => {
+            return Ok(CancellationNotificationDisposition::OperationalFirst)
+        }
+        TurnCancellationCause::AuthorizedRequested(existing) => {
+            if existing.event_id() != source.event_id()
+                || existing.event_reference() != source.event_reference()
+                || existing.receipt() != source.receipt()
+                || existing.authorization != source.authorization
+            {
+                return Err(RuntimeServicesError::Invariant(
+                    "foreign Requested cancellation source".into(),
+                ));
+            }
+        }
+    }
+    control.token.cancel();
+    Ok(CancellationNotificationDisposition::Delivered)
+}
+
+/// Original cancellation source for one installed root turn. The token only wakes
+/// work; first-cause attribution is protected independently by this short lock.
+pub struct TurnCancellationControl {
+    session_id: String,
+    turn_id: String,
+    execution_id: String,
+    ingress: Option<crate::TurnIngressRef>,
+    token: crate::CancellationToken,
+    first_cause: Mutex<TurnCancellationCause>,
+}
+
+enum TurnCancellationCause {
+    None,
+    Operational,
+    AuthorizedRequested(AuthorizedRequestedCancellation),
+}
+
+/// Authenticated Runtime intent and frozen target, not Session authorization.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedRequestedCancellation {
+    receipt: harness_contract::turn::CancellationReceipt,
+    event_id: String,
+    stream_id: String,
+    sequence: u64,
+    commit_cursor: u64,
+    digest: String,
+    original_control: std::sync::Weak<TurnCancellationControl>,
+    live_binding: Option<Arc<RequestedCancellationBinding>>,
+}
+
+/// Original Session authorization, minted only after complete committed-event
+/// validation. It is not serializable or constructible from a client payload.
+#[derive(Debug, Clone)]
+pub struct AuthorizedRequestedCancellation {
+    source: AuthenticatedRequestedCancellation,
+    authorization: session::SessionDomainEvent,
+}
+
+#[derive(Debug)]
+pub enum CancellationAuthorizationOutcome {
+    Authorized(AuthorizedRequestedCancellation),
+    RejectedStale {
+        authorization_id: String,
+    },
+    Unknown {
+        authorization_id: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationNotificationDisposition {
+    Delivered,
+    NotPresent,
+    OperationalFirst,
+}
+
+/// Internal delivery result. NotActive is absence of the original local target,
+/// not proof that an authorization committed or that an execution terminated.
+#[derive(Debug)]
+pub enum RequestedCancellationDeliveryOutcome {
+    NotActive {
+        cancellation_id: String,
+    },
+    Authorized {
+        authorization: AuthorizedRequestedCancellation,
+        notification: CancellationNotificationDisposition,
+    },
+    RejectedStale {
+        authorization_id: String,
+    },
+    Unknown {
+        authorization_id: String,
+        reason: String,
+    },
+}
+
+impl AuthorizedRequestedCancellation {
+    pub fn receipt(&self) -> &harness_contract::turn::CancellationReceipt {
+        self.source.receipt()
+    }
+
+    pub fn event_reference(&self) -> (&str, u64, u64, &str) {
+        self.source.event_reference()
+    }
+
+    pub fn event_id(&self) -> &str {
+        self.source.event_id()
+    }
+    pub fn authorization_id(&self) -> &str {
+        &self.authorization.event_id
+    }
+    pub fn authorization_sequence(&self) -> usize {
+        self.authorization.sequence
+    }
+
+    pub(crate) fn claim_event_append(
+        &self,
+        event: &crate::RuntimeSessionEvent,
+        observation: &crate::provider_runtime_client::ProviderPhysicalObservation,
+    ) -> Result<crate::session_runtime_port::RuntimeSessionClaimEventAppend, String> {
+        self.source.claim_event_append(event, observation)
+    }
+
+    pub async fn verify_current(&self) -> Result<(), String> {
+        let original = self
+            .source
+            .original_control
+            .upgrade()
+            .ok_or("original Requested cancellation control was released")?;
+        let current = original
+            .requested_source()
+            .ok_or("original control has no published Requested cancellation")?;
+        if current.authorization != self.authorization
+            || current.source.event_id != self.source.event_id
+            || current.event_reference() != self.event_reference()
+            || current.receipt() != self.receipt()
+        {
+            return Err("Requested cancellation publication changed".into());
+        }
+        self.source
+            .live_binding
+            .as_ref()
+            .ok_or("Requested cancellation has no original live claim binding")?
+            .verify_current()
+            .await
+    }
+}
+
+/// Never serialized or formatted: contains the original live claim capability.
+struct RequestedCancellationBinding {
+    query: Arc<dyn crate::SessionRuntimeQueryPort>,
+    fence: crate::SessionExecutionFence,
+    ingress: crate::TurnIngressRef,
+}
+
+impl std::fmt::Debug for RequestedCancellationBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RequestedCancellationBinding { .. }")
+    }
+}
+
+impl RequestedCancellationBinding {
+    async fn verify_current(&self) -> Result<(), String> {
+        let reject = || "original Requested cancellation claim is no longer current".to_string();
+        let snapshot = self
+            .fence
+            .verify(crate::SessionExecutionFencePhase::ProviderRequest)
+            .await?;
+        let ingress = &self.ingress;
+        if snapshot.claim_fence_epoch != ingress.claim_revision {
+            return Err(reject());
+        }
+        let current = self
+            .query
+            .runtime_input(&ingress.request_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(reject)?;
+        let admission = self
+            .query
+            .input_admission(&ingress.session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(reject)?;
+        if current.request_id != ingress.request_id
+            || current.turn_id != ingress.turn_id
+            || current.message_id != ingress.message_id
+            || current.claim_fence_epoch != Some(ingress.claim_revision)
+            || current.claim_owner.as_deref() != Some(ingress.claim_owner.as_str())
+            || current.claim_token.as_deref() != Some(ingress.claim_token.as_str())
+            || current.session_id != ingress.session_id
+            || current.session_generation != ingress.session_generation
+            || current.sequence as u64 != ingress.input_sequence
+            || !matches!(
+                current.status,
+                crate::RuntimeSessionInputStatus::Claimed
+                    | crate::RuntimeSessionInputStatus::Running
+            )
+            || !current
+                .claim_expires_at_ms
+                .is_some_and(|deadline| deadline > now_ms())
+            || admission.session_id != ingress.session_id
+            || admission.generation != ingress.session_generation
+            || !admission.open
+        {
+            return Err(reject());
+        }
+        Ok(())
+    }
+}
+
+impl AuthenticatedRequestedCancellation {
+    fn authorization_request(
+        &self,
+    ) -> Result<
+        crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+        RuntimeServicesError,
+    > {
+        let binding = self.live_binding.as_ref().ok_or_else(|| {
+            RuntimeServicesError::Invariant("Requested source has no frozen original claim".into())
+        })?;
+        let ingress = &binding.ingress;
+        let owner = session::SessionClaimEventAppend::cancellation_authorization(
+            ingress.session_id.clone(),
+            ingress.message_id.clone(),
+            ingress.turn_id.clone(),
+            session::SessionTerminalExecutionFence {
+                request_id: ingress.request_id.clone(),
+                input_sequence: usize::try_from(ingress.input_sequence).map_err(|_| {
+                    RuntimeServicesError::Invariant(
+                        "claim input sequence is not representable".into(),
+                    )
+                })?,
+                session_generation: ingress.session_generation,
+                claim_owner: ingress.claim_owner.clone(),
+                claim_token: ingress.claim_token.clone(),
+                claim_fence_epoch: ingress.claim_revision,
+            },
+            self.receipt.clone(),
+            session::SessionCancellationRequestedReference {
+                event_id: self.event_id.clone(),
+                stream_id: self.stream_id.clone(),
+                event_sequence: self.sequence,
+                commit_cursor: self.commit_cursor,
+                payload_digest: self.digest.clone(),
+            },
+        )
+        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        Ok(crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest::new(owner))
+    }
+
+    fn bind_authorization(
+        self,
+        request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+        committed: session::SessionDomainEvent,
+    ) -> Result<AuthorizedRequestedCancellation, RuntimeServicesError> {
+        let expected = &request.owner_request().event;
+        let actual_row = committed.to_session_event().map_err(|error| {
+            RuntimeServicesError::Invariant(format!("invalid Session authorization event: {error}"))
+        })?;
+        let expected_row = expected.to_session_event().map_err(|error| {
+            RuntimeServicesError::Invariant(format!("invalid authorization candidate: {error}"))
+        })?;
+        let matches =
+            session::SessionDomainEvent::semantically_equivalent(&actual_row, &expected_row)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        if !matches {
+            return Err(RuntimeServicesError::Invariant(
+                "committed Session authorization conflicts with its frozen candidate".into(),
+            ));
+        }
+        Ok(AuthorizedRequestedCancellation {
+            source: self,
+            authorization: committed,
+        })
+    }
+
+    /// Build the owner transaction request from this opaque authenticated source.
+    /// The serialized observation alone cannot supply its claim capability.
+    fn claim_event_append(
+        &self,
+        event: &crate::RuntimeSessionEvent,
+        observation: &crate::provider_runtime_client::ProviderPhysicalObservation,
+    ) -> Result<crate::session_runtime_port::RuntimeSessionClaimEventAppend, String> {
+        use crate::provider_runtime_client::ProviderPhysicalObservation;
+        let ProviderPhysicalObservation::CancellationObserved {
+            identity,
+            requested,
+            ..
+        } = observation
+        else {
+            return Err("only cancellation observations consume a Requested claim".into());
+        };
+        let binding = self
+            .live_binding
+            .as_ref()
+            .ok_or("Requested cancellation has no original live claim binding")?;
+        let ingress = &binding.ingress;
+        let (stream, sequence, cursor, digest) = self.event_reference();
+        if identity.session_id != self.receipt.session_id
+            || identity.execution_id != self.receipt.execution_id
+            || identity.turn_id != self.receipt.turn_id
+            || ingress.session_id != identity.session_id
+            || ingress.turn_id != identity.turn_id
+            || event.session_id != identity.session_id
+            || event.kind != crate::RuntimeSessionEventKind::ProviderPhysicalObservation
+            || event.status.as_deref() != Some("cancel_observed")
+            || event.occurred_at_ms != observation.occurred_at_ms()
+            || event.payload
+                != serde_json::to_value(observation).map_err(|error| error.to_string())?
+            || requested.cancellation_id != self.receipt.cancellation_id
+            || requested.stream_id != stream
+            || requested.event_sequence != sequence
+            || requested.commit_cursor != cursor
+            || requested.payload_digest != digest
+        {
+            return Err("physical observation does not match its original Requested source".into());
+        }
+        let mut domain = crate::session_runtime_port::to_session_event(event);
+        domain.event_id = format!(
+            "provider-physical:{}",
+            observation.digest().map_err(|error| error.to_string())?
+        );
+        Ok(
+            crate::session_runtime_port::RuntimeSessionClaimEventAppend::new(
+                ingress.session_id.clone(),
+                ingress.message_id.clone(),
+                ingress.turn_id.clone(),
+                session::SessionTerminalExecutionFence {
+                    request_id: ingress.request_id.clone(),
+                    input_sequence: usize::try_from(ingress.input_sequence)
+                        .map_err(|_| "claim input sequence is not representable")?,
+                    session_generation: ingress.session_generation,
+                    claim_owner: ingress.claim_owner.clone(),
+                    claim_token: ingress.claim_token.clone(),
+                    claim_fence_epoch: ingress.claim_revision,
+                },
+                domain,
+            ),
+        )
+    }
+
+    pub fn receipt(&self) -> &harness_contract::turn::CancellationReceipt {
+        &self.receipt
+    }
+
+    pub fn event_reference(&self) -> (&str, u64, u64, &str) {
+        (
+            &self.stream_id,
+            self.sequence,
+            self.commit_cursor,
+            &self.digest,
+        )
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+}
+
+impl std::fmt::Debug for TurnCancellationControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnCancellationControl")
+            .field("session_id", &self.session_id)
+            .field("turn_id", &self.turn_id)
+            .field("execution_id", &self.execution_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurnCancellationControl {
+    /// Unbound helpers can stop work, but can never carry Requested evidence.
+    pub fn operational(session_id: &str, turn_id: &str, execution_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            execution_id: execution_id.into(),
+            ingress: None,
+            token: crate::CancellationToken::new(),
+            first_cause: Mutex::new(TurnCancellationCause::None),
+        })
+    }
+
+    pub fn token(&self) -> crate::CancellationToken {
+        self.token.clone()
+    }
+
+    pub fn matches_target(&self, session_id: &str, turn_id: &str, execution_id: &str) -> bool {
+        self.session_id == session_id
+            && self.turn_id == turn_id
+            && self.execution_id == execution_id
+    }
+
+    pub fn requested_source(&self) -> Option<AuthorizedRequestedCancellation> {
+        match &*self
+            .first_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            TurnCancellationCause::AuthorizedRequested(source) => Some(source.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn signal_operational(&self) {
+        let mut cause = self
+            .first_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*cause, TurnCancellationCause::None) {
+            *cause = TurnCancellationCause::Operational;
+        }
+        self.token.cancel();
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/services.rs"]
 mod tests;
@@ -2994,6 +3531,143 @@ impl RuntimeServices {
         }
     }
 
+    /// Freeze the actual root ingress binding before installing its control.
+    pub fn create_turn_cancellation_control(
+        &self,
+        execution_id: &str,
+        ingress: &crate::TurnIngressRef,
+    ) -> Result<Arc<TurnCancellationControl>, RuntimeServicesError> {
+        if execution_id
+            != crate::session_ingress_graph_id(
+                &ingress.session_id,
+                &ingress.request_id,
+                &ingress.turn_id,
+            )
+            || ingress.request_id.is_empty()
+            || ingress.session_id.is_empty()
+            || ingress.turn_id.is_empty()
+            || ingress.message_id.is_empty()
+            || ingress.primary_task_id.is_empty()
+            || ingress.root_task_id.is_empty()
+            || ingress.claim_owner.is_empty()
+            || ingress.claim_token.is_empty()
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "cancellation control requires the original root ingress binding".into(),
+            ));
+        }
+        Ok(Arc::new(TurnCancellationControl {
+            session_id: ingress.session_id.clone(),
+            turn_id: ingress.turn_id.clone(),
+            execution_id: execution_id.into(),
+            ingress: Some(ingress.clone()),
+            token: crate::CancellationToken::new(),
+            first_cause: Mutex::new(TurnCancellationCause::None),
+        }))
+    }
+
+    /// Authenticate one specific stream, never a latest Session projection.
+    pub async fn authenticate_requested_cancellation(
+        &self,
+        receipt: &harness_contract::turn::CancellationReceipt,
+        control: &Arc<TurnCancellationControl>,
+    ) -> Result<AuthenticatedRequestedCancellation, RuntimeServicesError> {
+        let reject = || {
+            RuntimeServicesError::Invariant(
+                "Requested cancellation source or frozen binding mismatch".into(),
+            )
+        };
+        let ingress = control.ingress.as_ref().ok_or_else(reject)?;
+        if !control.matches_target(&receipt.session_id, &receipt.turn_id, &receipt.execution_id) {
+            return Err(reject());
+        }
+        let (event, source) = read_original_requested_event(&self.event_store, receipt)?;
+        let query = self.session_query_port.get().ok_or_else(reject)?;
+        let fence = crate::SessionExecutionFence::from_claim(
+            Arc::clone(query),
+            ingress.request_id.clone(),
+            ingress.session_id.clone(),
+            ingress.session_generation,
+            ingress.input_sequence as usize,
+            ingress.claim_owner.clone(),
+            ingress.claim_token.clone(),
+        )
+        .map_err(RuntimeServicesError::Invariant)?;
+        let live_binding = Arc::new(RequestedCancellationBinding {
+            query: Arc::clone(query),
+            fence,
+            ingress: ingress.clone(),
+        });
+        // This phase authenticates the immutable Runtime intent/frozen binding.
+        // Current ownership is decided only by the Session write transaction;
+        // a historical committed authorization must remain confirmable.
+        Ok(AuthenticatedRequestedCancellation {
+            receipt: source,
+            event_id: event.event_id.clone(),
+            stream_id: event.stream_id.clone(),
+            sequence: event.sequence,
+            commit_cursor: event.commit_cursor,
+            digest: format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&event).map_err(|_| reject())?)
+            ),
+            original_control: Arc::downgrade(control),
+            live_binding: Some(live_binding),
+        })
+    }
+
+    pub async fn authorize_requested_cancellation(
+        &self,
+        source: AuthenticatedRequestedCancellation,
+    ) -> Result<CancellationAuthorizationOutcome, RuntimeServicesError> {
+        let request = source.authorization_request()?;
+        let authorization_id = request.owner_request().event.event_id.clone();
+        let Some(journal) = self.session_journal_port.get() else {
+            return Ok(CancellationAuthorizationOutcome::Unknown {
+                authorization_id,
+                reason: "original Session authorization writer unavailable".into(),
+            });
+        };
+        match journal.authorize_requested_cancellation(&request).await {
+            Ok(committed) => source
+                .bind_authorization(&request, committed)
+                .map(CancellationAuthorizationOutcome::Authorized),
+            Err(write_error) => {
+                // One exact read after an unsuccessful/unknown write. None is
+                // not evidence that a different connection can never commit.
+                let Some(query) = self.session_query_port.get() else {
+                    return Ok(CancellationAuthorizationOutcome::Unknown {
+                        authorization_id,
+                        reason: "authorization confirmation reader unavailable".into(),
+                    });
+                };
+                match query.cancellation_authorization_by_id(&request).await {
+                    Ok(Some(committed)) => source.bind_authorization(&request, committed)
+                        .map(CancellationAuthorizationOutcome::Authorized),
+                    Ok(None) if matches!(write_error, session::SessionError::StaleExecutionFence(_)) => {
+                        Ok(CancellationAuthorizationOutcome::RejectedStale { authorization_id })
+                    }
+                    Ok(None) => Ok(CancellationAuthorizationOutcome::Unknown {
+                        authorization_id, reason: write_error.to_string(),
+                    }),
+                    Err(read_error) => Ok(CancellationAuthorizationOutcome::Unknown {
+                        authorization_id,
+                        reason: format!("authorization write/confirmation unresolved: {write_error}; {read_error}"),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Notify only after original-owner authorization, under registry revalidation.
+    pub fn publish_requested_cancellation(
+        &self,
+        control: &Arc<TurnCancellationControl>,
+        source: AuthorizedRequestedCancellation,
+    ) -> Result<CancellationNotificationDisposition, RuntimeServicesError> {
+        publish_requested_source(control, source)
+    }
+
     /// Commit the one canonical cancellation activity receipt. The receipt is
     /// keyed by `cancellation_id`, so HTTP retries and live delivery reuse the
     /// same durable fact; a changed payload under the same id is rejected by
@@ -3201,6 +3875,7 @@ impl RuntimeServices {
     pub fn reconcile_requested_cancellations(
         &self,
         limit: usize,
+        authorized: &[AuthorizedRequestedCancellation],
     ) -> Result<Vec<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
         let mut finalized = Vec::new();
         let candidates = self
@@ -3211,7 +3886,9 @@ impl RuntimeServices {
                     return false;
                 }
                 match receipt.status {
-                    harness_contract::turn::CancellationStatus::Requested => true,
+                    harness_contract::turn::CancellationStatus::Requested => authorized
+                        .iter()
+                        .any(|grant| grant.receipt().cancellation_id == receipt.cancellation_id),
                     harness_contract::turn::CancellationStatus::Cancelled => {
                         let terminal_ref = format!("cancellation:{}", receipt.cancellation_id);
                         self.execution_live(&receipt.execution_id)
@@ -3227,14 +3904,78 @@ impl RuntimeServices {
             .take(limit)
             .collect::<Vec<_>>();
         for receipt in candidates {
-            if let Some(receipt) = self.resolve_requested_cancellation(&receipt.cancellation_id)? {
+            let resolved =
+                if receipt.status == harness_contract::turn::CancellationStatus::Requested {
+                    let Some(grant) = authorized
+                        .iter()
+                        .find(|grant| grant.receipt().cancellation_id == receipt.cancellation_id)
+                    else {
+                        continue;
+                    };
+                    self.resolve_authorized_requested_cancellation(grant)?
+                } else {
+                    self.replay_or_resolve_inactive_cancellation(&receipt.cancellation_id)?
+                };
+            if let Some(receipt) = resolved {
                 finalized.push(receipt);
             }
         }
         Ok(finalized)
     }
 
-    pub fn resolve_requested_cancellation(
+    /// Existing final carriers may replay, and a truly empty target is known
+    /// inactive. Missing local control is not an inactive execution proof.
+    pub fn replay_or_resolve_inactive_cancellation(
+        &self,
+        cancellation_id: &str,
+    ) -> Result<Option<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        let Some(receipt) = self.cancellation_receipt(cancellation_id)? else {
+            return Ok(None);
+        };
+        if receipt.status == harness_contract::turn::CancellationStatus::Requested
+            && !receipt.execution_id.is_empty()
+            && !receipt.turn_id.is_empty()
+        {
+            return Ok(None);
+        }
+        self.resolve_requested_cancellation(cancellation_id)
+    }
+
+    pub fn resolve_authorized_requested_cancellation(
+        &self,
+        authorization: &AuthorizedRequestedCancellation,
+    ) -> Result<Option<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        let request = authorization.source.authorization_request()?;
+        authorization
+            .source
+            .clone()
+            .bind_authorization(&request, authorization.authorization.clone())?;
+        let original = authorization.receipt();
+        let (event, receipt) = read_original_requested_event(&self.event_store, original)?;
+        let digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&event)
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?
+            )
+        );
+        if receipt != *original
+            || event.event_id != authorization.source.event_id
+            || event.stream_id != authorization.source.stream_id
+            || event.sequence != authorization.source.sequence
+            || event.commit_cursor != authorization.source.commit_cursor
+            || digest != authorization.source.digest
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "authorization belongs to a different Runtime Requested source".into(),
+            ));
+        }
+        self.resolve_requested_cancellation(&original.cancellation_id)
+    }
+
+    // Internal terminal-arbitration kernel. Cross-crate callers must present
+    // Session authorization or restrict themselves to already-final replay.
+    pub(crate) fn resolve_requested_cancellation(
         &self,
         cancellation_id: &str,
     ) -> Result<Option<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
@@ -5995,4 +6736,1154 @@ pub fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, Runtim
 
 pub fn canonical_workspace_identity(workspace_root: &Path) -> Result<String, RuntimeServicesError> {
     canonical_workspace_root(workspace_root).map(|root| workspace_key(&root))
+}
+
+#[cfg(test)]
+pub(crate) mod requested_cancellation_source_tests {
+    use super::*;
+    use harness_contract::turn::{CancellationCause, CancellationReceipt, CancellationStatus};
+
+    /// Real Session ingress/claim plus a committed Requested receipt. The control
+    /// is unsignalled so provider tests can publish at their own IO barrier.
+    pub(crate) async fn live_requested_fixture(
+        root: &Path,
+    ) -> (
+        Arc<RuntimeServices>,
+        Arc<TurnCancellationControl>,
+        CancellationReceipt,
+        crate::TurnIngressRef,
+    ) {
+        let (services, control, receipt, ingress, _store) =
+            live_requested_fixture_with_store(root).await;
+        (services, control, receipt, ingress)
+    }
+
+    pub(crate) async fn live_requested_fixture_with_store(
+        root: &Path,
+    ) -> (
+        Arc<RuntimeServices>,
+        Arc<TurnCancellationControl>,
+        CancellationReceipt,
+        crate::TurnIngressRef,
+        Arc<session::UnifiedSessionStore>,
+    ) {
+        let store = Arc::new(crate::test_support::session_store());
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let session_id = "requested-live-session";
+        store
+            .create_session(&session::SessionRecord {
+                session_id: session_id.into(),
+                platform: "test".into(),
+                chat_id: "requested-live-chat".into(),
+                user_id: None,
+                model: None,
+                created_at: timestamp.clone(),
+                last_activity: timestamp,
+                message_count: 0,
+                reset_policy: "manual".into(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".into(),
+            })
+            .await
+            .unwrap();
+        let workspace = root.join("requested-live-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let services = RuntimeServices::test_builder(root, &workspace)
+            .build()
+            .unwrap();
+        let router = services
+            .install_test_session_store(Arc::clone(&store))
+            .unwrap();
+        let admission = store
+            .get_session_input_admission(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = crate::RuntimeSessionIngressCommand {
+            input_id: "requested-live-input".into(),
+            request_id: "requested-live-request".into(),
+            turn_id: "requested-live-turn".into(),
+            message_id: "requested-live-message".into(),
+            session_generation: admission.generation,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
+            task_route_hint: None,
+            created_at_ms: now_ms(),
+            runtime_options_json: None,
+        };
+        router
+            .persist_input(session_id, "cancel this original turn", &request)
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("requested-live-worker", now_ms(), 120_000, 1, &[])
+            .await
+            .unwrap()
+            .pop()
+            .expect("original Session claim");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &claimed.request_id,
+                "requested-live-worker",
+                claimed.session_generation,
+                claimed
+                    .claim_token
+                    .as_deref()
+                    .expect("original claim token"),
+                claimed.revision,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let ingress = crate::TurnIngressRef {
+            request_id: running.request_id.clone(),
+            turn_id: running.turn_id.clone(),
+            message_id: running.message_id.clone(),
+            session_id: running.session_id.clone(),
+            primary_task_id: "requested-live-task".into(),
+            root_task_id: "requested-live-task".into(),
+            session_generation: running.session_generation,
+            input_sequence: running.sequence as u64,
+            claim_owner: running.claim_owner.clone().expect("original claim owner"),
+            claim_token: running.claim_token.clone().expect("original claim token"),
+            claim_revision: running
+                .claim_fence_epoch
+                .expect("original frozen claim epoch"),
+            handoff_id: None,
+        };
+        let execution_id = crate::session_ingress_graph_id(
+            &ingress.session_id,
+            &ingress.request_id,
+            &ingress.turn_id,
+        );
+        let control = services
+            .create_turn_cancellation_control(&execution_id, &ingress)
+            .unwrap();
+        let receipt = services
+            .commit_cancellation_receipt(CancellationReceipt {
+                cancellation_id: "requested-live-cancellation".into(),
+                session_id: running.session_id,
+                turn_id: running.turn_id,
+                execution_id,
+                actor_id: "principal:requested-live-owner".into(),
+                cause: CancellationCause::UserRequested,
+                reason: Some("original user request".into()),
+                requested_at_ms: now_ms(),
+                effective_at_ms: None,
+                status: CancellationStatus::Requested,
+                journal_sequence: 0,
+                projection_revision: 0,
+            })
+            .unwrap();
+        (services, control, receipt, ingress, store)
+    }
+
+    /// Use the original Session owner path; never mint a capability in fixtures.
+    pub(crate) async fn authorized_fixture_source(
+        services: &RuntimeServices,
+        control: &Arc<TurnCancellationControl>,
+        receipt: &CancellationReceipt,
+    ) -> AuthorizedRequestedCancellation {
+        let authenticated = services
+            .authenticate_requested_cancellation(receipt, control)
+            .await
+            .unwrap();
+        match services
+            .authorize_requested_cancellation(authenticated)
+            .await
+            .unwrap()
+        {
+            CancellationAuthorizationOutcome::Authorized(source) => source,
+            outcome => panic!("expected original Session authorization, got {outcome:?}"),
+        }
+    }
+
+    async fn revoke_fixture_claim(
+        store: &session::UnifiedSessionStore,
+        ingress: &crate::TurnIngressRef,
+    ) {
+        let running = store
+            .get_session_runtime_outbox(&ingress.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_claimed_session_runtime_outbox(
+                &ingress.request_id,
+                &ingress.claim_owner,
+                ingress.session_generation,
+                &ingress.claim_token,
+                running.revision,
+                harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                None,
+                None,
+                "revoke original claim for source fence test",
+                now_ms(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_requested_source_confirms_historical_authorization_but_rejects_revoked_physical_claim(
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, ingress, store) =
+            live_requested_fixture_with_store(root.path()).await;
+        assert!(control.requested_source().is_none());
+        assert!(!control.token().is_cancelled());
+        let source = authorized_fixture_source(&services, &control, &receipt).await;
+        assert_eq!(
+            services
+                .publish_requested_cancellation(&control, source)
+                .unwrap(),
+            CancellationNotificationDisposition::Delivered
+        );
+        let published = control
+            .requested_source()
+            .expect("published original Requested source");
+        assert_eq!(published.receipt(), &receipt);
+        assert_eq!(published.event_reference().1, 1);
+        assert_eq!(published.event_reference().2, receipt.journal_sequence);
+        assert!(control.token().is_cancelled());
+        published.verify_current().await.unwrap();
+
+        revoke_fixture_claim(&store, &ingress).await;
+        assert!(published.verify_current().await.is_err());
+        let historical = authorized_fixture_source(&services, &control, &receipt).await;
+        assert_eq!(historical.authorization, published.authorization);
+        assert_eq!(historical.event_reference(), published.event_reference());
+        let replacement = store
+            .claim_session_runtime_outbox("requested-replacement-worker", now_ms(), 120_000, 1, &[])
+            .await
+            .unwrap()
+            .pop()
+            .expect("replacement claim");
+        assert!(replacement.claim_token.as_deref() != Some(ingress.claim_token.as_str()));
+        assert_ne!(replacement.claim_fence_epoch, Some(ingress.claim_revision));
+        assert!(published.verify_current().await.is_err());
+        let historical = authorized_fixture_source(&services, &control, &receipt).await;
+        assert_eq!(historical.authorization_id(), published.authorization_id());
+        assert_eq!(historical.authorization, published.authorization);
+        assert!(historical.verify_current().await.is_err());
+        let mut replacement_ingress = ingress.clone();
+        replacement_ingress.claim_owner = replacement.claim_owner.unwrap();
+        replacement_ingress.claim_token = replacement.claim_token.unwrap();
+        replacement_ingress.claim_revision = replacement.claim_fence_epoch.unwrap();
+        let replacement_control = services
+            .create_turn_cancellation_control(&receipt.execution_id, &replacement_ingress)
+            .unwrap();
+        assert!(services
+            .publish_requested_cancellation(&replacement_control, historical)
+            .is_err());
+        assert!(!replacement_control.token().is_cancelled());
+        assert!(replacement_control.requested_source().is_none());
+        assert_eq!(
+            control.requested_source().unwrap().event_id(),
+            published.event_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_before_authorization_commits_no_authorization_and_signals_no_control() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, ingress, store) =
+            live_requested_fixture_with_store(root.path()).await;
+        revoke_fixture_claim(&store, &ingress).await;
+        // Immutable Runtime intent still authenticates after revocation.
+        let authenticated = services
+            .authenticate_requested_cancellation(&receipt, &control)
+            .await
+            .unwrap();
+        let request = authenticated.authorization_request().unwrap();
+        let expected_id = request.owner_request().event.event_id.clone();
+        match services
+            .authorize_requested_cancellation(authenticated)
+            .await
+            .unwrap()
+        {
+            CancellationAuthorizationOutcome::RejectedStale { authorization_id } => {
+                assert_eq!(authorization_id, expected_id);
+            }
+            outcome => panic!("revocation must reject before authorization: {outcome:?}"),
+        }
+        assert!(store
+            .get_session_domain_event_by_id(&receipt.session_id, &expected_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .count_session_domain_events_by_kind_from(
+                    &receipt.session_id,
+                    "session.claim.cancellation_authorized.v1",
+                    0,
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!control.token().is_cancelled());
+        assert!(control.requested_source().is_none());
+        assert!(matches!(
+            &*control.first_cause.lock().unwrap(),
+            TurnCancellationCause::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn authorization_commit_before_revoke_delays_notification_to_only_original_control() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, ingress, store) =
+            live_requested_fixture_with_store(root.path()).await;
+        // Commit authorization, deliberately leaving notification pending.
+        let authorized = authorized_fixture_source(&services, &control, &receipt).await;
+        assert!(!control.token().is_cancelled());
+        assert!(control.requested_source().is_none());
+        let committed = store
+            .get_session_domain_event_by_id(&receipt.session_id, authorized.authorization_id())
+            .await
+            .unwrap()
+            .expect("original committed Session authorization");
+        assert_eq!(committed, authorized.authorization);
+        revoke_fixture_claim(&store, &ingress).await;
+        let replacement = store
+            .claim_session_runtime_outbox("requested-delay-replacement", now_ms(), 120_000, 1, &[])
+            .await
+            .unwrap()
+            .pop()
+            .expect("new claim before old notification");
+        let mut replacement_ingress = ingress.clone();
+        replacement_ingress.claim_owner = replacement.claim_owner.unwrap();
+        replacement_ingress.claim_token = replacement.claim_token.unwrap();
+        replacement_ingress.claim_revision = replacement.claim_fence_epoch.unwrap();
+        assert_ne!(replacement_ingress.claim_token, ingress.claim_token);
+        assert_ne!(replacement_ingress.claim_revision, ingress.claim_revision);
+        let new_control = services
+            .create_turn_cancellation_control(&receipt.execution_id, &replacement_ingress)
+            .unwrap();
+        let historical = authorized_fixture_source(&services, &control, &receipt).await;
+        assert_eq!(historical.authorization, committed);
+        assert_eq!(historical.event_reference(), authorized.event_reference());
+        assert!(services
+            .publish_requested_cancellation(&new_control, historical.clone())
+            .is_err());
+        assert_eq!(
+            services
+                .publish_requested_cancellation(&control, historical)
+                .unwrap(),
+            CancellationNotificationDisposition::Delivered
+        );
+        assert!(control.token().is_cancelled());
+        let published = control.requested_source().unwrap();
+        assert_eq!(published.authorization, committed);
+        assert_eq!(published.receipt(), &receipt);
+        assert!(published.verify_current().await.is_err());
+        assert!(!new_control.token().is_cancelled());
+        assert!(new_control.requested_source().is_none());
+        assert!(matches!(
+            &*new_control.first_cause.lock().unwrap(),
+            TurnCancellationCause::None
+        ));
+        assert_eq!(
+            store
+                .count_session_domain_events_by_kind_from(
+                    &receipt.session_id,
+                    "session.claim.cancellation_authorized.v1",
+                    0,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        // Notification alone does not finalize the original Requested receipt.
+        let (_, original) = read_original_requested_event(&services.event_store, &receipt).unwrap();
+        assert_eq!(original, receipt);
+        assert_eq!(
+            services
+                .event_store
+                .list_stream(&format!("cancellation:{}", receipt.cancellation_id))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn receipt() -> CancellationReceipt {
+        CancellationReceipt {
+            cancellation_id: "cancel-original".into(),
+            session_id: "session-original".into(),
+            turn_id: "turn-original".into(),
+            execution_id: "execution-original".into(),
+            actor_id: "principal:owner".into(),
+            cause: CancellationCause::UserRequested,
+            reason: Some("stop".into()),
+            requested_at_ms: 10,
+            effective_at_ms: None,
+            status: CancellationStatus::Requested,
+            journal_sequence: 0,
+            projection_revision: 0,
+        }
+    }
+
+    fn event(receipt: &CancellationReceipt) -> DurableRuntimeEvent {
+        DurableRuntimeEvent {
+            event_id: "requested-event-original".into(),
+            stream_id: format!("cancellation:{}", receipt.cancellation_id),
+            sequence: 1,
+            scope: RuntimeEventScope::Session,
+            kind: "session.cancellation_committed".into(),
+            status: Some("requested".into()),
+            actor: Some(receipt.actor_id.clone()),
+            refs: vec![
+                crate::RuntimeEventRef {
+                    kind: "session".into(),
+                    id: receipt.session_id.clone(),
+                },
+                crate::RuntimeEventRef {
+                    kind: "execution".into(),
+                    id: receipt.execution_id.clone(),
+                },
+                crate::RuntimeEventRef {
+                    kind: "turn".into(),
+                    id: receipt.turn_id.clone(),
+                },
+            ],
+            payload: serde_json::to_value(receipt).unwrap(),
+            created_at_ms: 11,
+            commit_cursor: 41,
+            transaction_id: format!("session-cancellation:{}:requested", receipt.cancellation_id),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: Some(format!("{}:requested", receipt.cancellation_id)),
+        }
+    }
+
+    #[test]
+    fn missing_requested_and_final_first_cannot_authenticate() {
+        let store = RuntimeEventStore::for_test();
+        assert!(read_original_requested_event(&store, &receipt()).is_err());
+        let mut final_receipt = receipt();
+        final_receipt.status = CancellationStatus::Cancelled;
+        final_receipt.effective_at_ms = Some(20);
+        let mut final_event = event(&final_receipt);
+        final_event.status = Some("cancelled".into());
+        assert!(authenticate_requested_event(&final_event, &final_receipt).is_err());
+        assert!(authenticate_requested_event(&final_event, &receipt()).is_err());
+    }
+
+    #[test]
+    fn bounded_stream_authentication_keeps_original_after_final_commit() {
+        let store = RuntimeEventStore::for_test();
+        let requested = receipt();
+        let original_event = event(&requested);
+        let append = |payload: CancellationReceipt, revision: u64, status: &str| {
+            store
+                .append_transaction(crate::AppendTransactionRequest {
+                    transaction_id: format!(
+                        "session-cancellation:{}:{status}",
+                        payload.cancellation_id
+                    ),
+                    expected_streams: vec![crate::ExpectedStreamRevision {
+                        stream_id: original_event.stream_id.clone(),
+                        expected_revision: revision,
+                    }],
+                    events: vec![crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: original_event.stream_id.clone(),
+                            scope: original_event.scope,
+                            kind: original_event.kind.clone(),
+                            status: Some(status.into()),
+                            actor: original_event.actor.clone(),
+                            refs: original_event.refs.clone(),
+                            payload: serde_json::to_value(&payload).unwrap(),
+                        },
+                        idempotency_key: Some(format!("{}:{status}", payload.cancellation_id)),
+                        schema_version: 1,
+                    }],
+                })
+                .unwrap()
+        };
+        let original_commit = append(requested.clone(), 0, "requested");
+        let mut final_receipt = requested.clone();
+        final_receipt.status = CancellationStatus::Cancelled;
+        final_receipt.effective_at_ms = Some(20);
+        let final_commit = append(final_receipt.clone(), 1, "cancelled");
+        let (original, authenticated) = read_original_requested_event(&store, &requested).unwrap();
+        assert_eq!(original.sequence, 1);
+        assert_eq!(authenticated.status, CancellationStatus::Requested);
+        assert_eq!(
+            authenticated.journal_sequence,
+            original_commit.commit_cursor
+        );
+        assert_ne!(authenticated.journal_sequence, final_commit.commit_cursor);
+        assert!(read_original_requested_event(&store, &final_receipt).is_err());
+    }
+
+    #[test]
+    fn original_requested_checks_actor_cause_refs_target_and_position() {
+        let requested = receipt();
+        let original = event(&requested);
+        assert!(authenticate_requested_event(&original, &requested).is_ok());
+        for field in [
+            "actor", "cause", "refs", "target", "cursor", "stream", "status",
+        ] {
+            let mut candidate = original.clone();
+            match field {
+                "actor" => candidate.actor = Some("principal:foreign".into()),
+                "cause" => candidate.payload["cause"] = serde_json::json!("system"),
+                "refs" => candidate.refs[1].id = "foreign-execution".into(),
+                "target" => {
+                    candidate.payload["execution_id"] = serde_json::json!("foreign-execution")
+                }
+                "cursor" => candidate.commit_cursor = 0,
+                "stream" => candidate.stream_id = "cancellation:foreign".into(),
+                "status" => candidate.status = Some("cancelled".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                authenticate_requested_event(&candidate, &requested).is_err(),
+                "{field}"
+            );
+        }
+        let mut wrong_reference = requested;
+        wrong_reference.journal_sequence = original.commit_cursor + 1;
+        assert!(authenticate_requested_event(&original, &wrong_reference).is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_original_source_and_foreign_id_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, _) = live_requested_fixture(root.path()).await;
+        let original = authorized_fixture_source(&services, &control, &receipt).await;
+        assert_eq!(
+            services
+                .publish_requested_cancellation(&control, original.clone())
+                .unwrap(),
+            CancellationNotificationDisposition::Delivered
+        );
+        let replay = authorized_fixture_source(&services, &control, &receipt).await;
+        assert_eq!(replay.authorization, original.authorization);
+        assert_eq!(
+            services
+                .publish_requested_cancellation(&control, replay)
+                .unwrap(),
+            CancellationNotificationDisposition::Delivered
+        );
+        control.signal_operational();
+        let observed = control.requested_source().unwrap();
+        assert_eq!(observed.event_id(), original.event_id());
+        assert_eq!(observed.event_reference(), original.event_reference());
+        assert_eq!(observed.receipt().status, CancellationStatus::Requested);
+        assert_eq!(
+            observed.receipt().journal_sequence,
+            receipt.journal_sequence
+        );
+        assert_eq!(observed.authorization, original.authorization);
+        let mut foreign = original.clone();
+        foreign.source.receipt.cancellation_id = "foreign-request".into();
+        assert!(services
+            .publish_requested_cancellation(&control, foreign)
+            .is_err());
+        let mut foreign_event = original;
+        foreign_event.source.event_id = "foreign-event".into();
+        assert!(services
+            .publish_requested_cancellation(&control, foreign_event)
+            .is_err());
+        assert_eq!(
+            control.requested_source().unwrap().authorization,
+            observed.authorization
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_first_never_becomes_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, _) = live_requested_fixture(root.path()).await;
+        control.signal_operational();
+        assert!(control.requested_source().is_none());
+        let original = authorized_fixture_source(&services, &control, &receipt).await;
+        for source in [original.clone(), original] {
+            assert_eq!(
+                services
+                    .publish_requested_cancellation(&control, source)
+                    .unwrap(),
+                CancellationNotificationDisposition::OperationalFirst
+            );
+        }
+        assert!(control.token().is_cancelled());
+        assert!(control.requested_source().is_none());
+    }
+
+    #[tokio::test]
+    async fn released_original_control_rejects_source_reverification() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, _) = live_requested_fixture(root.path()).await;
+        let source = {
+            let original = authorized_fixture_source(&services, &control, &receipt).await;
+            assert_eq!(
+                services
+                    .publish_requested_cancellation(&control, original.clone())
+                    .unwrap(),
+                CancellationNotificationDisposition::Delivered
+            );
+            original
+        };
+        source.verify_current().await.unwrap();
+        drop(control);
+        assert!(source.source.original_control.upgrade().is_none());
+        let error = source.verify_current().await.unwrap_err();
+        assert_eq!(
+            error,
+            "original Requested cancellation control was released"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_control_and_unbound_control_reject_original_authorization() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, original, receipt, ingress) = live_requested_fixture(root.path()).await;
+        let source = authorized_fixture_source(&services, &original, &receipt).await;
+        let replacement = services
+            .create_turn_cancellation_control(&receipt.execution_id, &ingress)
+            .unwrap();
+        assert!(services
+            .publish_requested_cancellation(&replacement, source.clone())
+            .is_err());
+        assert!(!replacement.token().is_cancelled());
+        assert!(replacement.requested_source().is_none());
+        let unbound = TurnCancellationControl::operational(
+            &receipt.session_id,
+            &receipt.turn_id,
+            &receipt.execution_id,
+        );
+        // Keep the exact pointer predicate valid to isolate the missing ingress.
+        let mut unbound_source = source;
+        unbound_source.source.original_control = Arc::downgrade(&unbound);
+        assert!(services
+            .publish_requested_cancellation(&unbound, unbound_source)
+            .is_err());
+        assert!(!unbound.token().is_cancelled());
+        assert!(unbound.requested_source().is_none());
+    }
+}
+
+#[cfg(test)]
+mod requested_cancellation_unknown_recovery_tests {
+    use super::*;
+    use crate::session_runtime_port::{
+        RuntimeSessionCancellationAuthorizationRequest, RuntimeSessionClaimEventAppend,
+    };
+    use harness_contract::projection::ExecutionLiveStatus;
+    use harness_contract::turn::{CancellationReceipt, CancellationStatus};
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+
+    const AUTHORIZATION_KIND: &str = "session.claim.cancellation_authorized.v1";
+    const BOUND: Duration = Duration::from_secs(5);
+
+    enum JournalFault {
+        BeforeAppend,
+        // Injected result loss after the real owner returns; not a TCP cut.
+        LostResult,
+        Deferred {
+            queued: Arc<Notify>,
+            release: Arc<Notify>,
+            task: Mutex<
+                Option<JoinHandle<Result<session::SessionDomainEvent, session::SessionError>>>,
+            >,
+        },
+    }
+
+    struct FaultJournal {
+        inner: Arc<dyn crate::SessionRuntimeJournalPort>,
+        fault: JournalFault,
+        deferred_started: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::SessionRuntimeJournalPort for FaultJournal {
+        async fn authorize_requested_cancellation(
+            &self,
+            request: &RuntimeSessionCancellationAuthorizationRequest,
+        ) -> Result<session::SessionDomainEvent, session::SessionError> {
+            match &self.fault {
+                JournalFault::BeforeAppend => Err(session::SessionError::Store(
+                    "injected generic error before append".into(),
+                )),
+                JournalFault::LostResult => {
+                    self.inner.authorize_requested_cancellation(request).await?;
+                    Err(session::SessionError::Store(
+                        "injected owner result loss".into(),
+                    ))
+                }
+                JournalFault::Deferred {
+                    queued,
+                    release,
+                    task,
+                } if !self.deferred_started.swap(true, Ordering::SeqCst) => {
+                    let owned = RuntimeSessionCancellationAuthorizationRequest::new(
+                        request.owner_request().clone(),
+                    );
+                    let inner = Arc::clone(&self.inner);
+                    let queued = Arc::clone(queued);
+                    let release = Arc::clone(release);
+                    let handle = tokio::spawn(async move {
+                        queued.notify_one();
+                        release.notified().await;
+                        inner.authorize_requested_cancellation(&owned).await
+                    });
+                    *task.lock().unwrap() = Some(handle);
+                    Err(session::SessionError::Store(
+                        "injected result loss with prepared write queued".into(),
+                    ))
+                }
+                JournalFault::Deferred { .. } => {
+                    self.inner.authorize_requested_cancellation(request).await
+                }
+            }
+        }
+
+        async fn append_event_if_claim_current(
+            &self,
+            request: &RuntimeSessionClaimEventAppend,
+        ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+            self.inner.append_event_if_claim_current(request).await
+        }
+
+        async fn append_event(
+            &self,
+            event: &crate::RuntimeSessionEvent,
+        ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+            self.inner.append_event(event).await
+        }
+
+        async fn append_context_envelope_if_absent(
+            &self,
+            record: &crate::RuntimeContextEnvelopeRecord,
+        ) -> Result<Option<crate::RuntimeSessionEventReceipt>, session::SessionError> {
+            self.inner.append_context_envelope_if_absent(record).await
+        }
+
+        async fn append_compaction_bundle_if_absent(
+            &self,
+            events: &[crate::RuntimeSessionEvent],
+            checkpoint_id: &str,
+        ) -> Result<bool, session::SessionError> {
+            self.inner
+                .append_compaction_bundle_if_absent(events, checkpoint_id)
+                .await
+        }
+    }
+
+    async fn fault_fixture(
+        root: &Path,
+        fault: JournalFault,
+    ) -> (
+        Arc<RuntimeServices>,
+        Arc<TurnCancellationControl>,
+        CancellationReceipt,
+        Arc<session::UnifiedSessionStore>,
+        Arc<FaultJournal>,
+    ) {
+        let original_root = root.join("original");
+        std::fs::create_dir_all(&original_root).unwrap();
+        let (original, original_control, mut receipt, ingress, store) =
+            requested_cancellation_source_tests::live_requested_fixture_with_store(&original_root)
+                .await;
+        assert!(!original_control.token().is_cancelled());
+        let fresh_root = root.join("fault-consumer");
+        let workspace = fresh_root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let services = RuntimeServices::test_builder(&fresh_root, &workspace)
+            .build()
+            .unwrap();
+        let journal = Arc::new(FaultJournal {
+            inner: Arc::clone(original.session_journal_port.get().unwrap()),
+            fault,
+            deferred_started: AtomicBool::new(false),
+        });
+        services
+            .install_session_ports(
+                Arc::clone(original.session_query_port.get().unwrap()),
+                Arc::clone(original.session_ingress_port.get().unwrap()),
+                journal.clone(),
+                Arc::clone(original.session_application_port.get().unwrap()),
+            )
+            .unwrap();
+        receipt.journal_sequence = 0;
+        receipt.projection_revision = 0;
+        let receipt = services.commit_cancellation_receipt(receipt).unwrap();
+        let control = services
+            .create_turn_cancellation_control(&receipt.execution_id, &ingress)
+            .unwrap();
+        (services, control, receipt, store, journal)
+    }
+
+    async fn authorization_attempt(
+        services: &RuntimeServices,
+        control: &Arc<TurnCancellationControl>,
+        receipt: &CancellationReceipt,
+    ) -> (String, CancellationAuthorizationOutcome) {
+        let authenticated = services
+            .authenticate_requested_cancellation(receipt, control)
+            .await
+            .unwrap();
+        let request = authenticated.authorization_request().unwrap();
+        let id = request.owner_request().event.event_id.clone();
+        let outcome = tokio::time::timeout(
+            BOUND,
+            services.authorize_requested_cancellation(authenticated),
+        )
+        .await
+        .expect("bounded authorization")
+        .unwrap();
+        (id, outcome)
+    }
+
+    fn assert_unsignalled(control: &TurnCancellationControl) {
+        assert!(!control.token().is_cancelled());
+        assert!(control.requested_source().is_none());
+        assert!(matches!(
+            &*control.first_cause.lock().unwrap(),
+            TurnCancellationCause::None
+        ));
+    }
+
+    fn assert_requested(services: &RuntimeServices, receipt: &CancellationReceipt) {
+        assert_eq!(
+            services
+                .cancellation_receipt(&receipt.cancellation_id)
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        let rows = services
+            .event_store
+            .list_stream(&format!("cancellation:{}", receipt.cancellation_id))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "session.cancellation_committed");
+        assert_eq!(rows[0].status.as_deref(), Some("requested"));
+        let stored: CancellationReceipt = serde_json::from_value(rows[0].payload.clone()).unwrap();
+        assert_eq!(stored.status, CancellationStatus::Requested);
+        let (_, original) = read_original_requested_event(&services.event_store, receipt).unwrap();
+        assert_eq!(&original, receipt);
+    }
+
+    fn assert_live_pending(services: &RuntimeServices, receipt: &CancellationReceipt) {
+        let live = services
+            .execution_live(&receipt.execution_id)
+            .expect("actual live execution");
+        assert_eq!(live.status, ExecutionLiveStatus::Queued);
+        assert_eq!(live.terminal_ref, None);
+    }
+
+    async fn assert_authorization_count(
+        store: &session::UnifiedSessionStore,
+        receipt: &CancellationReceipt,
+        expected: usize,
+    ) {
+        let count = store
+            .count_session_domain_events_by_kind_from(&receipt.session_id, AUTHORIZATION_KIND, 0)
+            .await
+            .unwrap();
+        assert_eq!(count, expected);
+    }
+
+    #[tokio::test]
+    async fn generic_write_error_and_real_none_remain_requested_in_same_tick_reconcile() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, store, _journal) =
+            fault_fixture(root.path(), JournalFault::BeforeAppend).await;
+        assert_requested(&services, &receipt);
+        assert_unsignalled(&control);
+        assert_authorization_count(&store, &receipt, 0).await;
+        let (expected_id, outcome) = authorization_attempt(&services, &control, &receipt).await;
+        match outcome {
+            CancellationAuthorizationOutcome::Unknown {
+                authorization_id,
+                reason,
+            } => {
+                assert_eq!(authorization_id, expected_id);
+                assert!(reason.contains("injected generic error before append"));
+            }
+            other => panic!("generic error plus real None must stay Unknown: {other:?}"),
+        }
+        assert!(store
+            .get_session_domain_event_by_id(&receipt.session_id, &expected_id)
+            .await
+            .unwrap()
+            .is_none());
+        // Actual ROUND197 consumer: a live target exists before this same-tick reconcile.
+        services.record_live_execution(
+            &receipt.session_id,
+            receipt.execution_id.clone(),
+            receipt.turn_id.clone(),
+        );
+        let before = services.execution_live(&receipt.execution_id).unwrap();
+        assert_live_pending(&services, &receipt);
+        assert!(services
+            .reconcile_requested_cancellations(16, &[])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            services.execution_live(&receipt.execution_id).unwrap(),
+            before
+        );
+        assert_live_pending(&services, &receipt);
+        assert_requested(&services, &receipt);
+        assert_unsignalled(&control);
+        assert_eq!(
+            services
+                .replay_or_resolve_inactive_cancellation(&receipt.cancellation_id)
+                .unwrap(),
+            None
+        );
+        assert_requested(&services, &receipt);
+        let (retry_id, retry) = authorization_attempt(&services, &control, &receipt).await;
+        assert_eq!(retry_id, expected_id);
+        assert!(
+            matches!(retry, CancellationAuthorizationOutcome::Unknown { authorization_id, .. } if authorization_id == expected_id)
+        );
+        assert_authorization_count(&store, &receipt, 0).await;
+        assert_requested(&services, &receipt);
+        assert_unsignalled(&control);
+        assert_live_pending(&services, &receipt);
+    }
+
+    #[tokio::test]
+    async fn injected_owner_result_loss_confirms_one_row_and_protected_final_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, control, receipt, store, _journal) =
+            fault_fixture(root.path(), JournalFault::LostResult).await;
+        services.record_live_execution(
+            &receipt.session_id,
+            receipt.execution_id.clone(),
+            receipt.turn_id.clone(),
+        );
+        assert_live_pending(&services, &receipt);
+        assert_authorization_count(&store, &receipt, 0).await;
+        let (id, outcome) = authorization_attempt(&services, &control, &receipt).await;
+        let CancellationAuthorizationOutcome::Authorized(cap) = outcome else {
+            panic!("real exact read must confirm injected owner result loss: {outcome:?}");
+        };
+        assert_eq!(cap.authorization_id(), id);
+        let stored = store
+            .get_session_domain_event_by_id(&receipt.session_id, &id)
+            .await
+            .unwrap()
+            .expect("real committed authorization");
+        assert_eq!(stored.kind, AUTHORIZATION_KIND);
+        assert_eq!(stored, cap.authorization);
+        assert_authorization_count(&store, &receipt, 1).await;
+        assert_unsignalled(&control);
+        assert_requested(&services, &receipt);
+        assert_live_pending(&services, &receipt);
+        let (retry_id, retry) = authorization_attempt(&services, &control, &receipt).await;
+        let CancellationAuthorizationOutcome::Authorized(replayed) = retry else {
+            panic!("duplicate must confirm the original row: {retry:?}");
+        };
+        assert_eq!(retry_id, id);
+        assert_eq!(replayed.authorization, stored);
+        assert_eq!(replayed.event_reference(), cap.event_reference());
+        assert_eq!(
+            services
+                .publish_requested_cancellation(&control, cap.clone())
+                .unwrap(),
+            CancellationNotificationDisposition::Delivered
+        );
+        assert_eq!(
+            services
+                .publish_requested_cancellation(&control, replayed)
+                .unwrap(),
+            CancellationNotificationDisposition::Delivered
+        );
+        assert!(control.token().is_cancelled());
+        assert_eq!(control.requested_source().unwrap().authorization, stored);
+        assert_requested(&services, &receipt);
+        assert_live_pending(&services, &receipt);
+        let finalized = services
+            .reconcile_requested_cancellations(16, &[cap.clone()])
+            .unwrap();
+        assert_eq!(finalized.len(), 1);
+        let winner = &finalized[0];
+        assert_eq!(winner.status, CancellationStatus::Cancelled);
+        let live = services.execution_live(&receipt.execution_id).unwrap();
+        assert_eq!(live.status, ExecutionLiveStatus::Cancelled);
+        let terminal_ref = format!("cancellation:{}", receipt.cancellation_id);
+        assert_eq!(live.terminal_ref.as_deref(), Some(terminal_ref.as_str()));
+        // The real terminal slot is owned by cancellation, so a competing completion loses.
+        assert_eq!(
+            services
+                .claim_live_terminal_fence(
+                    &receipt.execution_id,
+                    "competing-completion".into(),
+                    ExecutionLiveStatus::Complete,
+                    receipt.requested_at_ms,
+                )
+                .unwrap(),
+            crate::execution_live::TerminalFenceClaim::ConflictingTerminal
+        );
+        let rows = services
+            .event_store
+            .list_stream(&format!("cancellation:{}", receipt.cancellation_id))
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].status.as_deref(), Some("cancelled"));
+        for _ in 0..2 {
+            assert_eq!(
+                services
+                    .replay_or_resolve_inactive_cancellation(&receipt.cancellation_id)
+                    .unwrap(),
+                Some(winner.clone())
+            );
+            assert_eq!(
+                services
+                    .resolve_authorized_requested_cancellation(&cap)
+                    .unwrap(),
+                Some(winner.clone())
+            );
+            assert!(services
+                .reconcile_requested_cancellations(16, &[])
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(
+            services
+                .event_store
+                .list_stream(&format!("cancellation:{}", receipt.cancellation_id))
+                .unwrap(),
+            rows
+        );
+        assert_eq!(
+            services.execution_live(&receipt.execution_id).unwrap(),
+            live
+        );
+        assert_eq!(
+            store
+                .get_session_domain_event_by_id(&receipt.session_id, &id)
+                .await
+                .unwrap(),
+            Some(stored)
+        );
+        assert_authorization_count(&store, &receipt, 1).await;
+    }
+
+    #[tokio::test]
+    async fn queued_original_write_real_none_is_unknown_until_owned_task_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let queued = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (services, control, receipt, store, journal) = fault_fixture(
+            root.path(),
+            JournalFault::Deferred {
+                queued: Arc::clone(&queued),
+                release: Arc::clone(&release),
+                task: Mutex::new(None),
+            },
+        )
+        .await;
+        services.record_live_execution(
+            &receipt.session_id,
+            receipt.execution_id.clone(),
+            receipt.turn_id.clone(),
+        );
+        // Catch assertion panics so every spawned writer is released and reaped even on failure.
+        let pending_phase = std::panic::AssertUnwindSafe(async {
+            assert_authorization_count(&store, &receipt, 0).await;
+            let (id, outcome) = authorization_attempt(&services, &control, &receipt).await;
+            tokio::time::timeout(BOUND, queued.notified()).await.expect("writer queued barrier");
+            assert!(matches!(outcome, CancellationAuthorizationOutcome::Unknown { authorization_id, .. } if authorization_id == id));
+            assert!(store.get_session_domain_event_by_id(&receipt.session_id, &id)
+                .await.unwrap().is_none());
+            assert_authorization_count(&store, &receipt, 0).await;
+            assert_unsignalled(&control);
+            assert_requested(&services, &receipt);
+            let before = services.execution_live(&receipt.execution_id).unwrap();
+            assert_live_pending(&services, &receipt);
+            assert!(services.reconcile_requested_cancellations(16, &[]).unwrap().is_empty());
+            assert_eq!(services.replay_or_resolve_inactive_cancellation(&receipt.cancellation_id).unwrap(), None);
+            assert_eq!(services.execution_live(&receipt.execution_id).unwrap(), before);
+            assert_requested(&services, &receipt);
+            assert_unsignalled(&control);
+            id
+        }).catch_unwind().await;
+        release.notify_one();
+        let JournalFault::Deferred { task, .. } = &journal.fault else {
+            unreachable!()
+        };
+        let handle = task.lock().unwrap().take();
+        let committed = if let Some(mut handle) = handle {
+            match tokio::time::timeout(BOUND, &mut handle).await {
+                Ok(result) => Some(
+                    result
+                        .expect("owned writer joined")
+                        .expect("real owner commit"),
+                ),
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    panic!("owned writer exceeded bounded commit; aborted and reaped");
+                }
+            }
+        } else {
+            None
+        };
+        let id = match pending_phase {
+            Ok(id) => id,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let committed = committed.expect("owned deferred write was retained and reaped");
+        assert_eq!(committed.event_id, id);
+        assert_eq!(committed.kind, AUTHORIZATION_KIND);
+        assert_eq!(
+            store
+                .get_session_domain_event_by_id(&receipt.session_id, &id)
+                .await
+                .unwrap(),
+            Some(committed.clone())
+        );
+        assert_authorization_count(&store, &receipt, 1).await;
+        // Commit alone still cannot notify or finalize: Runtime has not confirmed it yet.
+        assert_unsignalled(&control);
+        assert_requested(&services, &receipt);
+        assert!(services
+            .reconcile_requested_cancellations(16, &[])
+            .unwrap()
+            .is_empty());
+        assert_live_pending(&services, &receipt);
+        let (retry_id, outcome) = authorization_attempt(&services, &control, &receipt).await;
+        let CancellationAuthorizationOutcome::Authorized(cap) = outcome else {
+            panic!("same-key reentry must confirm the actual owner commit: {outcome:?}");
+        };
+        assert_eq!(retry_id, id);
+        assert_eq!(cap.authorization_id(), id);
+        assert_eq!(cap.authorization, committed);
+        assert_unsignalled(&control);
+        assert_requested(&services, &receipt);
+        assert_eq!(
+            services
+                .publish_requested_cancellation(&control, cap.clone())
+                .unwrap(),
+            CancellationNotificationDisposition::Delivered
+        );
+        assert!(control.token().is_cancelled());
+        let final_receipts = services
+            .reconcile_requested_cancellations(16, &[cap])
+            .unwrap();
+        assert_eq!(final_receipts.len(), 1);
+        assert_eq!(final_receipts[0].status, CancellationStatus::Cancelled);
+        assert_eq!(
+            services
+                .execution_live(&receipt.execution_id)
+                .unwrap()
+                .status,
+            ExecutionLiveStatus::Cancelled
+        );
+        assert_authorization_count(&store, &receipt, 1).await;
+    }
 }

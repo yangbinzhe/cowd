@@ -2070,7 +2070,7 @@ async fn cancel_session_turn_handler(
         .filter(|receipt| receipt.status != harness_contract::turn::CancellationStatus::Requested)
     {
         let reconciled = runtime_services
-            .resolve_requested_cancellation(&receipt.cancellation_id)
+            .replay_or_resolve_inactive_cancellation(&receipt.cancellation_id)
             .map_err(|error| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2125,14 +2125,43 @@ async fn cancel_session_turn_handler(
                 )
             })?
     };
-    let _cancel_signal_delivered = if intent.execution_id.is_empty() || intent.turn_id.is_empty() {
-        false
+    use runtime::execution_core::services::RequestedCancellationDeliveryOutcome;
+    let authorization = if intent.execution_id.is_empty() || intent.turn_id.is_empty() {
+        None
     } else {
-        required_session_service(&state)?
-            .cancel_active_execution(&id, &intent.turn_id, &intent.execution_id, reason)
+        match required_session_service(&state)?
+            .cancel_requested_execution(&intent)
+            .await
             .map_err(session_service_error)?
+        {
+            RequestedCancellationDeliveryOutcome::Authorized { authorization, .. } => {
+                Some(authorization)
+            }
+            RequestedCancellationDeliveryOutcome::Unknown {
+                authorization_id,
+                reason,
+            } => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: format!("cancellation intent `{}` recorded and pending; authorization `{authorization_id}` is unknown: {reason}", intent.cancellation_id),
+                    }),
+                ));
+            }
+            RequestedCancellationDeliveryOutcome::RejectedStale { authorization_id } => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: format!("cancellation intent `{}` recorded and pending; authorization `{authorization_id}` rejected as stale", intent.cancellation_id),
+                    }),
+                ));
+            }
+            RequestedCancellationDeliveryOutcome::NotActive { .. } => None,
+        }
     };
-    if !intent.execution_id.is_empty() {
+    let resolved = if let Some(authorization) = authorization.as_ref() {
+        // Descendant cancellation retains its independent execution owner;
+        // notification disposition is not evidence of final cancellation.
         runtime_services
             .cancel_execution_tree(
                 &intent.execution_id,
@@ -2147,9 +2176,11 @@ async fn cancel_session_turn_handler(
                     }),
                 )
             })?;
-    }
-    let receipt = runtime_services
-        .resolve_requested_cancellation(&intent.cancellation_id)
+        runtime_services.resolve_authorized_requested_cancellation(authorization)
+    } else {
+        runtime_services.replay_or_resolve_inactive_cancellation(&intent.cancellation_id)
+    };
+    let receipt = resolved
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -95,6 +95,7 @@ pub struct ProviderRequestPreparation {
     prepared: Option<Arc<PreparedRuntimeRequest>>,
     skill_tool_refs: std::collections::BTreeSet<String>,
     dispatch_lease: Option<Arc<crate::execution_core::graph::ExecutionResourceLease>>,
+    cancellation: Option<crate::CancellationToken>,
     policy_source: Option<(crate::permissions::SessionExecutionPolicyControl, u64)>,
     preparation_scope: Option<(crate::execution_core::graph::ExecutionServiceClass, String)>,
     skill_source: Option<(
@@ -201,6 +202,10 @@ impl ProviderRequestPreparation {
         lease: Option<Arc<crate::execution_core::graph::ExecutionResourceLease>>,
     ) {
         self.dispatch_lease = lease;
+    }
+
+    pub(crate) fn retain_cancellation(&mut self, cancellation: crate::CancellationToken) {
+        self.cancellation = Some(cancellation);
     }
 }
 
@@ -505,8 +510,313 @@ pub struct ProviderAttemptOutcomeEvidence {
     pub cache_dimensions_observed: bool,
 }
 
+/// Identity of one returned, locally owned SDK response, not a logical retry
+/// group or an inference from historical output bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderPhysicalIdentity {
+    pub session_id: String,
+    pub execution_id: String,
+    pub turn_id: String,
+    pub request_sequence: usize,
+    pub request_id: String,
+    pub response_id: String,
+    /// Captured by the original producer when this SDK response is returned.
+    pub opened_at_ms: u64,
+    pub logical_attempt: u32,
+    pub step: harness_contract::step::StepIdentity,
+    pub provider_attempt: harness_contract::step::ProviderAttemptIdentity,
+    pub resource_lease: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderPhysicalReceipt {
+    pub identity: ProviderPhysicalIdentity,
+    pub session_sequence: usize,
+    pub observation_digest: String,
+}
+
+/// Live acknowledgement from the original writer; unlike its serialized
+/// reference this cannot be deserialized or supplied by a model/client DTO.
+pub struct AcknowledgedProviderPhysicalObservation {
+    receipt: ProviderPhysicalReceipt,
+}
+
+impl AcknowledgedProviderPhysicalObservation {
+    pub(crate) fn from_written(
+        observation: &ProviderPhysicalObservation,
+        sequence: usize,
+    ) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            receipt: ProviderPhysicalReceipt {
+                identity: observation.identity().clone(),
+                session_sequence: sequence,
+                observation_digest: observation.digest()?,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedCancellationReference {
+    pub cancellation_id: String,
+    pub stream_id: String,
+    pub event_sequence: u64,
+    pub commit_cursor: u64,
+    pub payload_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderPhysicalObservation {
+    ResponseOpened {
+        identity: ProviderPhysicalIdentity,
+    },
+    CancellationObserved {
+        identity: ProviderPhysicalIdentity,
+        observed_at_ms: u64,
+        opened: ProviderPhysicalReceipt,
+        requested: RequestedCancellationReference,
+    },
+}
+
+impl ProviderPhysicalObservation {
+    pub(crate) fn occurred_at_ms(&self) -> u64 {
+        match self {
+            Self::ResponseOpened { identity } => identity.opened_at_ms,
+            Self::CancellationObserved { observed_at_ms, .. } => *observed_at_ms,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &ProviderPhysicalIdentity {
+        match self {
+            Self::ResponseOpened { identity } | Self::CancellationObserved { identity, .. } => {
+                identity
+            }
+        }
+    }
+
+    pub(crate) fn validate(
+        &self,
+        context: &ProviderRequestEvidenceContext,
+    ) -> Result<(), RuntimeError> {
+        let id = self.identity();
+        if id.session_id != context.session_id
+            || id.execution_id != context.execution_id
+            || id.turn_id != context.turn_id
+            || id.request_sequence != context.request_sequence
+            || id.logical_attempt != context.attempt
+            || id.request_id.is_empty()
+            || id.response_id.is_empty()
+            || id.opened_at_ms == 0
+            || self.occurred_at_ms() == 0
+            || id.resource_lease.is_empty()
+            || id.step.session_id != id.session_id
+            || id.step.turn_id != id.turn_id
+            || id.step.execution_id.as_deref() != Some(id.execution_id.as_str())
+            || id
+                .step
+                .attempt
+                .is_some_and(|attempt| attempt != context.attempt)
+            || id.provider_attempt.origin_step_id != id.step.step_id
+            || id.provider_attempt.attempt_id.is_empty()
+        {
+            return Err(RuntimeError::new(
+                "physical Provider identity does not match its original Step",
+            ));
+        }
+        if let Self::CancellationObserved {
+            opened, requested, ..
+        } = self
+        {
+            let original = Self::ResponseOpened {
+                identity: id.clone(),
+            };
+            if opened.identity != *id
+                || opened.observation_digest != original.digest()?
+                || requested.cancellation_id.is_empty()
+                || requested.stream_id != format!("cancellation:{}", requested.cancellation_id)
+                || requested.event_sequence != 1
+                || requested.commit_cursor == 0
+                || !requested
+                    .payload_digest
+                    .strip_prefix("sha256:")
+                    .is_some_and(|digest| {
+                        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+            {
+                return Err(RuntimeError::new(
+                    "physical cancellation has a foreign open or missing Requested reference",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn digest(&self) -> Result<String, RuntimeError> {
+        let value =
+            serde_json::to_value(self).map_err(|error| RuntimeError::new(error.to_string()))?;
+        harness_contract::step::canonical_digest("provider-physical-observation", &value)
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+}
+
+struct ProviderAttemptControl {
+    stop: crate::CancellationToken,
+    caller: Option<crate::CancellationToken>,
+    turn: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    context: Option<ProviderRequestEvidenceContext>,
+    step: Option<Arc<crate::step_snapshot::BoundStep>>,
+    lease: Option<Arc<crate::execution_core::graph::ExecutionResourceLease>>,
+    resources: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
+    governed: bool,
+}
+
+impl ProviderAttemptControl {
+    fn bound_turn(&self) -> Option<&Arc<crate::execution_core::services::TurnCancellationControl>> {
+        let context = self.context.as_ref()?;
+        self.turn.as_ref().filter(|turn| {
+            turn.matches_target(&context.session_id, &context.turn_id, &context.execution_id)
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.stop.is_cancelled()
+            || self.caller.as_ref().is_some_and(|c| c.is_cancelled())
+            || self
+                .bound_turn()
+                .is_some_and(|turn| turn.token().is_cancelled())
+    }
+
+    async fn cancelled(&self) {
+        let caller = async {
+            match &self.caller {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let turn = async {
+            match self.bound_turn() {
+                Some(control) => control.token().cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! { () = self.stop.cancelled() => {}, () = caller => {}, () = turn => {} }
+    }
+
+    fn physical_identity(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ProviderPhysicalIdentity>, RuntimeError> {
+        let (Some(context), Some(step), Some(lease)) = (&self.context, &self.step, &self.lease)
+        else {
+            return if self.governed {
+                Err(RuntimeError::new(
+                    "physical Provider has no original context/Step/admission",
+                ))
+            } else {
+                Ok(None)
+            };
+        };
+        let id = ProviderPhysicalIdentity {
+            session_id: context.session_id.clone(),
+            execution_id: context.execution_id.clone(),
+            turn_id: context.turn_id.clone(),
+            request_sequence: context.request_sequence,
+            request_id: request_id.into(),
+            response_id: uuid::Uuid::new_v4().to_string(),
+            opened_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| RuntimeError::new("physical response clock is invalid"))?,
+            logical_attempt: context.attempt,
+            step: step.snapshot().identity.clone(),
+            provider_attempt: step.snapshot().provider_attempt.clone(),
+            resource_lease: lease.projection_reference(),
+        };
+        ProviderPhysicalObservation::ResponseOpened {
+            identity: id.clone(),
+        }
+        .validate(context)?;
+        Ok(Some(id))
+    }
+
+    async fn record_cancel(
+        &self,
+        writer: Option<&dyn ProviderWireEvidenceWriter>,
+        opened: Option<&AcknowledgedProviderPhysicalObservation>,
+    ) -> Result<(), RuntimeError> {
+        // Freeze once in the original producer, not on each persistence retry.
+        let observed_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| RuntimeError::new("physical cancellation clock is invalid"))?;
+        let (Some(turn), Some(caller), Some(context), Some(opened)) =
+            (&self.turn, &self.caller, &self.context, opened)
+        else {
+            return Ok(());
+        };
+        if !turn.matches_target(&context.session_id, &context.turn_id, &context.execution_id)
+            || !turn.token().precedes_other_signals(caller, &self.stop)
+        {
+            return Ok(());
+        }
+        let Some(source) = turn.requested_source() else {
+            return Ok(());
+        };
+        source.verify_current().await.map_err(RuntimeError::new)?;
+        let lease = self
+            .lease
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("cancelled Provider lost original admission"))?;
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("cancelled Provider lost original resource owner"))?;
+        if !matches!(
+            resources.lease_is_active(&lease.projection_reference()),
+            Ok(Some(true))
+        ) {
+            return Err(RuntimeError::new(
+                "cancelled Provider admission is no longer active",
+            ));
+        }
+        let (stream, sequence, cursor, digest) = source.event_reference();
+        let observation = ProviderPhysicalObservation::CancellationObserved {
+            identity: opened.receipt.identity.clone(),
+            observed_at_ms,
+            opened: opened.receipt.clone(),
+            requested: RequestedCancellationReference {
+                cancellation_id: source.receipt().cancellation_id.clone(),
+                stream_id: stream.into(),
+                event_sequence: sequence,
+                commit_cursor: cursor,
+                payload_digest: digest.into(),
+            },
+        };
+        observation.validate(context)?;
+        let writer = writer.ok_or_else(|| {
+            RuntimeError::new("cancelled Provider has no durable observation writer")
+        })?;
+        let ack = writer
+            .persist_physical(context, observation.clone(), Some(&source))
+            .await?;
+        if ack.receipt.identity != opened.receipt.identity
+            || ack.receipt.observation_digest != observation.digest()?
+        {
+            return Err(RuntimeError::new(
+                "cancel observation acknowledgement belongs to another physical response",
+            ));
+        }
+        Ok(())
+    }
+}
 #[async_trait::async_trait]
 pub trait ProviderWireEvidenceWriter: Send + Sync {
+    async fn persist_physical(
+        &self,
+        context: &ProviderRequestEvidenceContext,
+        observation: ProviderPhysicalObservation,
+        source: Option<&crate::execution_core::services::AuthorizedRequestedCancellation>,
+    ) -> Result<AcknowledgedProviderPhysicalObservation, RuntimeError>;
     async fn persist(
         &self,
         context: &ProviderRequestEvidenceContext,
@@ -545,6 +855,7 @@ pub struct ProviderRuntimeClient {
     tool_schema_cache_hits: Arc<AtomicU64>,
     execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
     provider_wire_evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
+    turn_cancellation: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
     /// PLAN D1b: how long a provider stream may go without semantic progress
     /// before a probe is warranted, and how many probes are allowed. The wall
     /// clock is deliberately absent: a long healthy generation is never
@@ -660,14 +971,10 @@ impl PreparedControlAnalysis {
 
 /// Bridges one provider request into the runtime's lazy `ApiClient` stream.
 ///
-/// The provider SDK is asynchronous but does not itself implement
-/// `futures::Stream`. Keeping the producer in a cancellable task lets us
-/// expose each upstream event immediately while still aborting the request
-/// when the consumer applies a transport timeout or the turn is cancelled.
+/// The original backend polls the producer alongside this bounded receiver.
+/// There is no separately spawned request for Drop to detach.
 struct ProviderEventStream {
     receiver: tokio::sync::mpsc::Receiver<Result<AssistantEvent, RuntimeError>>,
-    producer: Option<tokio::task::JoinHandle<()>>,
-    execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
 }
 
 impl futures::Stream for ProviderEventStream {
@@ -675,25 +982,6 @@ impl futures::Stream for ProviderEventStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)
-    }
-}
-
-impl Drop for ProviderEventStream {
-    fn drop(&mut self) {
-        // The consumer owns the request lifetime. In particular, a runtime
-        // transport timeout must not leave a detached provider request running
-        // after its graph node has been failed or replanned.
-        if let Some(producer) = self.producer.take() {
-            if let Some(supervisor) = self
-                .execution_supervisor
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-            {
-                supervisor.reap_join_handle("provider_producer", producer);
-            } else {
-                producer.abort();
-            }
-        }
     }
 }
 
@@ -755,6 +1043,7 @@ impl ProviderRuntimeClient {
             tool_schema_cache_hits: Arc::new(AtomicU64::new(0)),
             execution_supervisor: None,
             provider_wire_evidence_writer: None,
+            turn_cancellation: None,
             liveness_contract: crate::liveness::LivenessContract::default(),
             liveness_stalls: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
@@ -1400,6 +1689,14 @@ impl ApiClient for ProviderRuntimeClient {
         self.provider_wire_evidence_writer = writer;
     }
 
+    fn configure_turn_cancellation(
+        &mut self,
+        control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    ) -> Result<(), RuntimeError> {
+        self.turn_cancellation = control;
+        Ok(())
+    }
+
     fn take_liveness_stalls(&mut self) -> Vec<crate::liveness::LivenessVerdict> {
         self.liveness_stalls
             .lock()
@@ -1420,7 +1717,7 @@ impl ProviderRuntimeClient {
         let recorded_stalls = Arc::clone(&self.liveness_stalls);
         let events = self
             .stream_with_activity_and_provider_snapshot(request, provider_snapshot)
-            .events;
+            .into_stream();
         // PLAN D1b (corrected): a stream that goes semantically inactive is
         // REPORTED with the idle time and the ladder step so the turn owner can
         // HELP the model (refocus / summarize / request commit / ask). The stream
@@ -1470,83 +1767,64 @@ impl ProviderRuntimeClient {
         let (sender, receiver) = tokio::sync::mpsc::channel(PROVIDER_EVENT_QUEUE_CAPACITY);
         let activity = provider::TransportActivity::default();
         let dispatch_activity = activity.clone();
-        let producer = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => Some(handle.spawn(async move {
-                let pins = match request.prompt.skill_instruction_pins() {
-                    Ok(pins) => pins,
-                    Err(error) => {
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                };
+        let stop = crate::CancellationToken::new();
+        let producer_stop = stop.clone();
+        let producer = crate::conversation::ProviderExecution::new(
+            async move {
+                if producer_stop.is_cancelled() {
+                    return Err(RuntimeError::new(
+                        "provider operation stopped before dispatch",
+                    ));
+                }
+                let pins = request.prompt.skill_instruction_pins()?;
                 let tool_ids = owner
                     .active_tool_definitions()
                     .into_iter()
                     .map(|definition| definition.name)
                     .collect();
-                if let Err(error) = request
+                request
                     .preparation
-                    .retain_actual_skill_pins(&pins, &tool_ids)
-                {
-                    let _ = sender.send(Err(error)).await;
-                    return;
-                }
-                if let Err(error) = owner.prepare_frozen_request(&mut request, &snapshot).await {
-                    let _ = sender.send(Err(error)).await;
-                    return;
+                    .retain_actual_skill_pins(&pins, &tool_ids)?;
+                tokio::select! {
+                    biased;
+                    result = owner.prepare_frozen_request(&mut request, &snapshot) => result?,
+                    () = producer_stop.cancelled() => return Err(RuntimeError::new("provider preparation stopped")),
                 }
                 if owner.registry.revision() != snapshot.revision() {
-                    let _ = sender
-                        .send(Err(RuntimeError::preparation(
-                            ProviderPreparationFailure::ProfileChanged,
-                            "provider registry changed after preparation",
-                        )))
-                        .await;
-                    return;
+                    return Err(RuntimeError::preparation(
+                        ProviderPreparationFailure::ProfileChanged,
+                        "provider registry changed after preparation",
+                    ));
                 }
                 if let Some(step) = request.bound_step.as_ref() {
                     if step.snapshot().related_revisions.get("provider_registry")
                         != Some(&snapshot.revision().to_string())
                     {
-                        let _ = sender
-                            .send(Err(RuntimeError::preparation(
-                                ProviderPreparationFailure::ProfileChanged,
-                                "provider registry changed after Step binding",
-                            )))
-                            .await;
-                        return;
+                        return Err(RuntimeError::preparation(
+                            ProviderPreparationFailure::ProfileChanged,
+                            "provider registry changed after Step binding",
+                        ));
                     }
-                    if let Err(error) = step.validate_provider_request(
+                    step.validate_provider_request(
                         &request,
                         owner.compiled_tool_schema().tools.as_ref(),
-                    ) {
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                }
-                if let Some(step) = request.bound_step.as_ref() {
-                    if let Err(error) = step.consume_provider_attempt() {
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
+                    )?;
+                    step.consume_provider_attempt()?;
                 }
                 let prepared = request
                     .preparation
                     .prepared
                     .take()
-                    .expect("original preparation completed");
+                    .ok_or_else(|| RuntimeError::new("original preparation is missing"))?;
                 if prepared
                     .consumed
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_err()
                 {
-                    let _ = sender
-                        .send(Err(RuntimeError::preparation(
-                            ProviderPreparationFailure::Consumed,
-                            "prepared Provider attempt already consumed",
-                        )))
-                        .await;
-                    return;
+                    return Err(RuntimeError::preparation(
+                        ProviderPreparationFailure::Consumed,
+                        "prepared Provider attempt already consumed",
+                    ));
                 }
                 let mut entry = prepared.entry.clone();
                 entry.request_context.attempt =
@@ -1555,22 +1833,16 @@ impl ProviderRuntimeClient {
                     entry.request_context.profile.registry_revision,
                     &entry.request_context.profile.provider_name,
                 ) {
-                    let _ = sender
-                        .send(Err(provider_account_fenced_error(
-                            &entry.request_context.profile.provider_name,
-                        )))
-                        .await;
-                    return;
+                    return Err(provider_account_fenced_error(
+                        &entry.request_context.profile.provider_name,
+                    ));
                 }
                 let lease = request.preparation.dispatch_lease.take();
                 if owner.execution_supervisor.is_some() && lease.is_none() {
-                    let _ = sender
-                        .send(Err(RuntimeError::preparation(
-                            ProviderPreparationFailure::MissingResourceOwner,
-                            "governed Provider dispatch has no original admission lease",
-                        )))
-                        .await;
-                    return;
+                    return Err(RuntimeError::preparation(
+                        ProviderPreparationFailure::MissingResourceOwner,
+                        "governed Provider dispatch has no original admission lease",
+                    ));
                 }
                 if let (Some(manager), Some(lease)) = (&owner.preparation_resources, lease.as_ref())
                 {
@@ -1578,14 +1850,21 @@ impl ProviderRuntimeClient {
                         manager.lease_is_active(&lease.projection_reference()),
                         Ok(Some(true))
                     ) {
-                        let _ = sender
-                            .send(Err(RuntimeError::new(
-                                "original Provider admission lease is not active",
-                            )))
-                            .await;
-                        return;
+                        return Err(RuntimeError::new(
+                            "original Provider admission lease is not active",
+                        ));
                     }
                 }
+                let control = ProviderAttemptControl {
+                    stop: producer_stop,
+                    caller: request.preparation.cancellation.take(),
+                    turn: owner.turn_cancellation.clone(),
+                    context: request.provider_evidence_context.clone(),
+                    step: request.bound_step.clone(),
+                    lease: lease.clone(),
+                    resources: owner.preparation_resources.clone(),
+                    governed: owner.execution_supervisor.is_some(),
+                };
                 let fence = ProviderDispatchSourceFence {
                     registry: owner.registry.clone(),
                     revision: snapshot.revision(),
@@ -1594,11 +1873,8 @@ impl ProviderRuntimeClient {
                     policy: request.preparation.policy_source.take(),
                     skill_source: request.preparation.skill_source.take(),
                 };
-                if let Err(error) = fence.validate() {
-                    let _ = sender.send(Err(error)).await;
-                    return;
-                }
-                forward_provider_attempt(
+                fence.validate()?;
+                let result = forward_provider_attempt(
                     entry,
                     Some(request.prompt.composition()),
                     prepared,
@@ -1613,26 +1889,18 @@ impl ProviderRuntimeClient {
                     owner.transport_pool.clone(),
                     dispatch_activity,
                     sender,
+                    &control,
                 )
                 .await;
-                // Retain the one original admission through the physical future,
-                // including cancellation while that future is still polling.
                 drop(lease);
-            })),
-            Err(_) => {
-                let _ = sender.try_send(Err(RuntimeError::new(
-                    "provider stream requires an active Tokio runtime",
-                )));
-                None
-            }
-        };
+                result
+            },
+            stop,
+        );
         ApiClientStream {
-            events: Box::pin(ProviderEventStream {
-                receiver,
-                producer,
-                execution_supervisor: self.execution_supervisor.clone(),
-            }),
+            events: Box::pin(ProviderEventStream { receiver }),
             transport_activity: Some(activity),
+            execution: Some(producer),
         }
     }
 }
@@ -1971,7 +2239,11 @@ async fn forward_provider_attempt(
     transport_pool: Arc<crate::ProviderTransportPool>,
     transport_activity: provider::TransportActivity,
     sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
-) {
+    control: &ProviderAttemptControl,
+) -> Result<crate::conversation::ProviderLocalExit, RuntimeError> {
+    if control.is_cancelled() {
+        return Err(RuntimeError::new("provider operation stopped before HTTP"));
+    }
     let request_context = &entry.request_context;
     tracing::debug!(
         provider_request_id = %request_context.request_id,
@@ -2006,26 +2278,28 @@ async fn forward_provider_attempt(
                     .is_some_and(|attempt| context.attempt != attempt)
         }) || evidence_writer.is_none()
         {
-            let _ = sender
-                .send(Err(RuntimeError::new(
-                    "bound provider step requires matching durable wire evidence",
-                )))
-                .await;
-            return;
+            return Err(RuntimeError::new(
+                "bound provider step requires matching durable wire evidence",
+            ));
         }
         let value = match serde_json::to_value(&wire_request) {
             Ok(value) => value,
-            Err(error) => { let _ = sender.send(Err(RuntimeError::new(error.to_string()))).await; return; }
+            Err(error) => return Err(RuntimeError::new(error.to_string())),
         };
-        let render_digest = match harness_contract::step::canonical_digest("provider-wire-render", &value) {
-            Ok(digest) => digest,
-            Err(error) => { let _ = sender.send(Err(RuntimeError::new(error.to_string()))).await; return; }
-        };
+        let render_digest =
+            match harness_contract::step::canonical_digest("provider-wire-render", &value) {
+                Ok(digest) => digest,
+                Err(error) => return Err(RuntimeError::new(error.to_string())),
+            };
         Some(harness_contract::step::StepRenderRef {
-            step_id: snapshot.identity.step_id.clone(), attempt_id: snapshot.provider_attempt.attempt_id.clone(),
-            catalog_digest: snapshot.catalog_digest.clone(), render_digest,
+            step_id: snapshot.identity.step_id.clone(),
+            attempt_id: snapshot.provider_attempt.attempt_id.clone(),
+            catalog_digest: snapshot.catalog_digest.clone(),
+            render_digest,
         })
-    } else { None };
+    } else {
+        None
+    };
     let tool_array_bytes = wire_request.body.get("tools").map_or(0, |tools| {
         serde_json::to_vec(tools).unwrap_or_default().len()
     });
@@ -2044,14 +2318,15 @@ async fn forward_provider_attempt(
         &cache_cohort_user_prefix,
     );
     let cache_behavior = ProviderCapabilityProfile::prompt_cache_behavior(&entry.model);
-    let warmup = transport_pool
-        .acquire_cache_warmup(
+    let warmup = tokio::select! {
+        warmup = transport_pool.acquire_cache_warmup(
             &cache_identity_sha256,
             &canonical_prompt,
             std::time::Duration::from_millis(cache_behavior.persistence_barrier_ms),
             cache_behavior.requires_common_prefix_discovery,
-        )
-        .await;
+        ) => warmup,
+        () = control.cancelled() => return Err(RuntimeError::new("provider operation stopped during warmup")),
+    };
     // PLAN A2: the stable leading cohort is the first wire item for
     // OpenAI-compatible transports (the system message) or the separately carried
     // system bytes. Its length in the canonical prompt is the boundary between
@@ -2081,26 +2356,24 @@ async fn forward_provider_attempt(
             )
             .await
         {
-            let _ = sender.send(Err(error)).await;
-            return;
+            return Err(error);
         }
     }
     // Persistence/cohort waits never turn a formerly prepared request into
     // fresh authorization. Read original live owners immediately before HTTP.
     if let Err(error) = dispatch_fence.validate() {
-        let _ = sender.send(Err(error)).await;
-        return;
+        return Err(error);
+    }
+    if control.is_cancelled() {
+        return Err(RuntimeError::new("provider operation stopped before HTTP"));
     }
     if transport_pool.provider_account_is_fenced(
         entry.request_context.profile.registry_revision,
         &entry.request_context.profile.provider_name,
     ) {
-        let _ = sender
-            .send(Err(provider_account_fenced_error(
-                &entry.request_context.profile.provider_name,
-            )))
-            .await;
-        return;
+        return Err(provider_account_fenced_error(
+            &entry.request_context.profile.provider_name,
+        ));
     }
     let request_guard = transport_pool.begin_request();
     let mut attempt_usage = None;
@@ -2117,6 +2390,9 @@ async fn forward_provider_attempt(
         &sender,
         &mut attempt_usage,
         &mut attempt_cache_dimensions_observed,
+        control,
+        &entry.request_context.request_id,
+        evidence_writer.as_deref(),
     )
     .await;
     // Provider transport capacity is unrelated to disk-cache persistence.
@@ -2127,6 +2403,7 @@ async fn forward_provider_attempt(
         let terminal_status = match &stream_result {
             Ok(ForwardedProviderStream::Completed) => "completed",
             Ok(ForwardedProviderStream::ConsumerDropped) => "consumer_dropped",
+            Ok(ForwardedProviderStream::Stopped) => "cancelled",
             Err(_) => "failed",
         };
         if let Err(error) = writer
@@ -2142,17 +2419,21 @@ async fn forward_provider_attempt(
             )
             .await
         {
-            tracing::warn!(
-                request_id = %entry.request_context.request_id,
-                error = %error,
-                "provider attempt outcome evidence could not be persisted"
-            );
+            return Err(error);
         }
     }
     // A dropped Runtime consumer is not evidence that the Provider completed
     // the cold request and committed its prefix.  Publishing Warm here would
     // let followers stampede into a cache entry that may never have existed.
     let provider_completed = matches!(stream_result, Ok(ForwardedProviderStream::Completed));
+    let local_exit = if matches!(
+        stream_result,
+        Ok(ForwardedProviderStream::Stopped | ForwardedProviderStream::ConsumerDropped)
+    ) {
+        crate::conversation::ProviderLocalExit::Stopped
+    } else {
+        crate::conversation::ProviderLocalExit::Completed
+    };
     // `MessageStop` is the Runtime consumer's terminal boundary. Publishing
     // it before the Provider outcome and cache-persistence barrier are
     // committed lets the consumer drop this stream and abort the producer in
@@ -2160,9 +2441,12 @@ async fn forward_provider_attempt(
     // to Cold. Keep terminal publication last. A consumer cancellation before
     // this point still drops the sender and correctly prevents false warming.
     if !commit_provider_cache_before_terminal(warmup, provider_completed, &sender).await {
-        return;
+        return Ok(local_exit);
     }
     if let Err(error) = stream_result {
+        if let Some(error) = error.physical_failure.as_ref() {
+            return Err(error.clone());
+        }
         tracing::warn!(
             model = %entry.model,
             error = %error,
@@ -2197,8 +2481,8 @@ async fn forward_provider_attempt(
             ))
             .await;
     }
+    Ok(local_exit)
 }
-
 async fn commit_provider_cache_before_terminal(
     mut warmup: crate::provider_transport_pool::ProviderCacheWarmupGuard,
     provider_completed: bool,
@@ -2335,11 +2619,22 @@ fn evaluation_request_temperature() -> Option<f64> {
 enum ForwardedProviderStream {
     Completed,
     ConsumerDropped,
+    Stopped,
 }
 
 #[derive(Debug)]
 struct ProviderStreamError {
     error: ApiError,
+    physical_failure: Option<RuntimeError>,
+}
+
+impl ProviderStreamError {
+    fn physical(error: RuntimeError) -> Self {
+        Self {
+            error: ApiError::InvalidSseFrame("physical Provider evidence rejected"),
+            physical_failure: Some(error),
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderStreamError {
@@ -2361,12 +2656,56 @@ async fn forward_provider_stream(
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
     attempt_usage: &mut Option<TokenUsage>,
     attempt_cache_dimensions_observed: &mut bool,
+    control: &ProviderAttemptControl,
+    request_id: &str,
+    writer: Option<&dyn ProviderWireEvidenceWriter>,
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
-    let mut stream = client
-        .stream_prepared_message(message_request, prepared_wire)
-        .await
-        .map_err(|error| ProviderStreamError { error })?;
+    let mut stream = tokio::select! {
+        biased;
+        result = client.stream_prepared_message(message_request, prepared_wire) => result.map_err(|error| ProviderStreamError { error, physical_failure: None })?,
+        () = control.cancelled() => return Ok(ForwardedProviderStream::Stopped),
+    };
     stream.set_transport_activity(transport_activity);
+    let identity = control
+        .physical_identity(request_id)
+        .map_err(ProviderStreamError::physical)?;
+    let opened = if let Some(identity) = identity {
+        let context = control
+            .context
+            .as_ref()
+            .expect("physical identity validated context");
+        let observation = ProviderPhysicalObservation::ResponseOpened { identity };
+        let writer = writer.ok_or_else(|| {
+            ProviderStreamError::physical(RuntimeError::new(
+                "physical Provider has no original observation writer",
+            ))
+        })?;
+        let mut persistence = Box::pin(writer.persist_physical(context, observation.clone(), None));
+        let ack = tokio::select! {
+            biased;
+            ack = persistence.as_mut() => ack.map_err(ProviderStreamError::physical)?,
+            () = control.cancelled() => {
+                // No current-read observation yet: stop IO, retain the original
+                // writer future, and never turn historical open into active C.
+                drop(stream);
+                persistence.await.map_err(ProviderStreamError::physical)?;
+                return Ok(ForwardedProviderStream::Stopped);
+            }
+        };
+        if ack.receipt.identity != *observation.identity()
+            || ack.receipt.observation_digest
+                != observation
+                    .digest()
+                    .map_err(ProviderStreamError::physical)?
+        {
+            return Err(ProviderStreamError::physical(RuntimeError::new(
+                "open acknowledgement belongs to another physical response",
+            )));
+        }
+        Some(ack)
+    } else {
+        None
+    };
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut saw_stop = false;
     let mut emitted = false;
@@ -2374,11 +2713,20 @@ async fn forward_provider_stream(
     let mut pending_text = String::new();
     let mut cumulative_usage = None;
 
-    while let Some(event) = stream
-        .next_event()
-        .await
-        .map_err(|error| ProviderStreamError { error })?
-    {
+    loop {
+        let next = tokio::select! {
+            biased;
+            next = stream.next_event() => next.map_err(|error| ProviderStreamError { error, physical_failure: None })?,
+            () = control.cancelled() => {
+                drop(stream);
+                if saw_stop { return Ok(ForwardedProviderStream::Completed); }
+                control.record_cancel(writer, opened.as_ref()).await.map_err(ProviderStreamError::physical)?;
+                return Ok(ForwardedProviderStream::Stopped);
+            }
+        };
+        let Some(event) = next else {
+            break;
+        };
         if !provider_model_emitted {
             if !forward_event(
                 sender,
@@ -2647,16 +2995,22 @@ async fn forward_provider_stream(
         // retains any durable read-only receipt and decides whether to retry.
         return Err(ProviderStreamError {
             error: ApiError::InvalidSseFrame("provider stream ended before terminal message_stop"),
+            physical_failure: None,
         });
     }
 
-    let response = client
-        .send_message(&MessageRequest {
-            stream: false,
-            ..message_request.clone()
-        })
-        .await
-        .map_err(|error| ProviderStreamError { error })?;
+    // This is a distinct nonstream SDK send. The preceding response-open is
+    // deliberately out of scope: it cannot certify active cancellation here.
+    drop(stream);
+    let fallback_request = MessageRequest {
+        stream: false,
+        ..message_request.clone()
+    };
+    let response = tokio::select! {
+        biased;
+        response = client.send_message(&fallback_request) => response.map_err(|error| ProviderStreamError { error, physical_failure: None })?,
+        () = control.cancelled() => return Ok(ForwardedProviderStream::Stopped),
+    };
     if response.usage_observed {
         *attempt_usage = Some(response.usage.token_usage());
         *attempt_cache_dimensions_observed = response.cache_dimensions_observed;
@@ -2675,7 +3029,6 @@ async fn forward_provider_stream(
         Ok(ForwardedProviderStream::ConsumerDropped)
     }
 }
-
 fn merge_provider_usage_max(current: Option<TokenUsage>, next: TokenUsage) -> TokenUsage {
     let current = current.unwrap_or_default();
     TokenUsage {
@@ -2998,7 +3351,7 @@ mod tests {
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{
         ApiClient, ApiRequest, AssistantEvent, PromptAssembly, ProviderRegistry,
-        ProviderRuntimeClient, ProviderTransportPool,
+        ProviderRuntimeClient, ProviderTransportPool, RuntimeError,
     };
     use futures::StreamExt;
     use harness_contract::tool::ToolExposureProjection;
@@ -3490,6 +3843,7 @@ mod tests {
             error: provider::ApiError::InvalidSseFrame(
                 "provider stream ended before terminal message_stop",
             ),
+            physical_failure: None,
         };
 
         assert!(
@@ -3499,6 +3853,624 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn r189_physical_wire_rejects_wrong_attempt_old_open_and_missing_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let context = request.provider_evidence_context.as_ref().unwrap();
+        let step = request.bound_step.as_ref().unwrap().snapshot();
+        let identity = super::ProviderPhysicalIdentity {
+            session_id: context.session_id.clone(),
+            execution_id: context.execution_id.clone(),
+            turn_id: context.turn_id.clone(),
+            request_sequence: context.request_sequence,
+            request_id: "original-request".into(),
+            response_id: "actual-response-A".into(),
+            opened_at_ms: 1,
+            logical_attempt: context.attempt,
+            step: step.identity.clone(),
+            provider_attempt: step.provider_attempt.clone(),
+            resource_lease: "resource-lease:fixture:original".into(),
+        };
+        let opened = super::ProviderPhysicalObservation::ResponseOpened {
+            identity: identity.clone(),
+        };
+        opened.validate(context).unwrap();
+        let receipt = super::AcknowledgedProviderPhysicalObservation::from_written(&opened, 0)
+            .unwrap()
+            .receipt;
+        let baseline = super::ProviderPhysicalObservation::CancellationObserved {
+            identity,
+            observed_at_ms: 2,
+            opened: receipt,
+            requested: super::RequestedCancellationReference {
+                cancellation_id: "original-cancel".into(),
+                stream_id: "cancellation:original-cancel".into(),
+                event_sequence: 1,
+                commit_cursor: 9,
+                payload_digest: format!("sha256:{}", "a".repeat(64)),
+            },
+        };
+        baseline.validate(context).unwrap();
+        assert_eq!(
+            serde_json::from_value::<super::ProviderPhysicalObservation>(
+                serde_json::to_value(&baseline).unwrap()
+            )
+            .unwrap(),
+            baseline
+        );
+        for mutation in [
+            "attempt",
+            "old_open",
+            "step",
+            "missing_requested",
+            "cursor",
+            "digest",
+            "opened_clock",
+            "observed_clock",
+        ] {
+            let mut candidate = baseline.clone();
+            let super::ProviderPhysicalObservation::CancellationObserved {
+                identity,
+                opened,
+                requested,
+                observed_at_ms,
+            } = &mut candidate
+            else {
+                unreachable!()
+            };
+            match mutation {
+                "attempt" => identity.logical_attempt += 1,
+                "old_open" => opened.identity.response_id = "previous-response".into(),
+                "step" => identity.provider_attempt.origin_step_id = "foreign-step".into(),
+                "missing_requested" => requested.cancellation_id.clear(),
+                "cursor" => requested.commit_cursor = 0,
+                "digest" => requested.payload_digest = "not-an-original-event-digest".into(),
+                "opened_clock" => identity.opened_at_ms = 0,
+                "observed_clock" => *observed_at_ms = 0,
+                _ => unreachable!(),
+            }
+            assert!(candidate.validate(context).is_err(), "{mutation}");
+        }
+        let mut invented = serde_json::to_value(baseline).unwrap();
+        invented["phase"] = json!("provider_closed");
+        assert!(serde_json::from_value::<super::ProviderPhysicalObservation>(invented).is_err());
+    }
+
+    #[tokio::test]
+    async fn r194_original_writer_replays_frozen_observation_and_rejects_stale_claim() {
+        // This is the writer/CAS boundary with a synthetic response identity,
+        // not evidence that a real SDK response was opened or cancelled.
+        let root = tempfile::tempdir().unwrap();
+        let (services, turn, receipt, ingress, store) =
+            crate::execution_core::services::requested_cancellation_source_tests::live_requested_fixture_with_store(root.path()).await;
+        let source = crate::execution_core::services::requested_cancellation_source_tests::authorized_fixture_source(
+            &services, &turn, &receipt,
+        ).await;
+        services
+            .publish_requested_cancellation(&turn, source)
+            .unwrap();
+        let source = turn.requested_source().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let mut context = request.provider_evidence_context.as_ref().unwrap().clone();
+        context.session_id = ingress.session_id.clone();
+        context.turn_id = ingress.turn_id.clone();
+        context.execution_id = receipt.execution_id.clone();
+        let step = request.bound_step.as_ref().unwrap().snapshot();
+        let mut step_identity = step.identity.clone();
+        step_identity.session_id = context.session_id.clone();
+        step_identity.turn_id = context.turn_id.clone();
+        step_identity.execution_id = Some(context.execution_id.clone());
+        let identity = super::ProviderPhysicalIdentity {
+            session_id: context.session_id.clone(),
+            execution_id: context.execution_id.clone(),
+            turn_id: context.turn_id.clone(),
+            request_sequence: context.request_sequence,
+            request_id: "writer-boundary-request".into(),
+            response_id: "synthetic-writer-boundary".into(),
+            opened_at_ms: 1,
+            logical_attempt: context.attempt,
+            step: step_identity,
+            provider_attempt: step.provider_attempt.clone(),
+            resource_lease: "fixture-not-physical-witness".into(),
+        };
+        let writer = crate::conversation::r189_session_provider_writer_for_test(&services);
+        let opened = writer
+            .persist_physical(
+                &context,
+                super::ProviderPhysicalObservation::ResponseOpened {
+                    identity: identity.clone(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (stream, sequence, cursor, digest) = source.event_reference();
+        let observation = super::ProviderPhysicalObservation::CancellationObserved {
+            identity,
+            observed_at_ms: 2,
+            opened: opened.receipt,
+            requested: super::RequestedCancellationReference {
+                cancellation_id: receipt.cancellation_id.clone(),
+                stream_id: stream.into(),
+                event_sequence: sequence,
+                commit_cursor: cursor,
+                payload_digest: digest.into(),
+            },
+        };
+        assert!(writer
+            .persist_physical(&context, observation.clone(), None)
+            .await
+            .is_err());
+        let first = writer
+            .persist_physical(&context, observation.clone(), Some(&source))
+            .await
+            .unwrap();
+        let second = writer
+            .persist_physical(&context, observation.clone(), Some(&source))
+            .await
+            .unwrap();
+        assert_eq!(first.receipt, second.receipt);
+        let page = store
+            .session_domain_events_page(&ingress.session_id, 0, 100)
+            .await
+            .unwrap();
+        let physical: Vec<_> = page
+            .events
+            .iter()
+            .filter(|event| event.kind == "context.provider_physical_observation")
+            .collect();
+        assert_eq!(
+            physical.len(),
+            2,
+            "one opened fixture and one idempotent cancellation fixture"
+        );
+        let cancelled = physical
+            .iter()
+            .find(|event| event.status.as_deref() == Some("cancel_observed"))
+            .unwrap();
+        assert_eq!(
+            cancelled.created_at_ms, 2,
+            "producer timestamp, not writer wall clock"
+        );
+        assert_eq!(
+            cancelled.payload,
+            serde_json::to_value(&observation).unwrap()
+        );
+        let current = store
+            .get_session_runtime_outbox(&ingress.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .requeue_claimed_session_runtime_outbox(
+                &ingress.request_id,
+                &ingress.claim_owner,
+                ingress.session_generation,
+                &ingress.claim_token,
+                current.revision,
+                harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                None,
+                None,
+                "revoke writer-boundary claim",
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(writer
+            .persist_physical(&context, observation, Some(&source))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn r189_actual_sdk_cancel_uses_original_requested_and_session_writer() {
+        use crate::execution_core::graph::*;
+        struct WriterBarrier {
+            original: Arc<dyn super::ProviderWireEvidenceWriter>,
+            fail_open: bool,
+            pause_outcome: bool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl super::ProviderWireEvidenceWriter for WriterBarrier {
+            async fn persist(
+                &self,
+                context: &super::ProviderRequestEvidenceContext,
+                evidence: super::ProviderWireEvidence,
+            ) -> Result<(), RuntimeError> {
+                self.original.persist(context, evidence).await
+            }
+            async fn persist_outcome(
+                &self,
+                context: &super::ProviderRequestEvidenceContext,
+                outcome: super::ProviderAttemptOutcomeEvidence,
+            ) -> Result<(), RuntimeError> {
+                if self.pause_outcome {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.original.persist_outcome(context, outcome).await
+            }
+            async fn persist_physical(
+                &self,
+                context: &super::ProviderRequestEvidenceContext,
+                observation: super::ProviderPhysicalObservation,
+                source: Option<&crate::execution_core::services::AuthorizedRequestedCancellation>,
+            ) -> Result<super::AcknowledgedProviderPhysicalObservation, RuntimeError> {
+                if self.fail_open
+                    && matches!(
+                        observation,
+                        super::ProviderPhysicalObservation::ResponseOpened { .. }
+                    )
+                {
+                    return Err(RuntimeError::new(
+                        "injected physical open persistence failure",
+                    ));
+                }
+                self.original
+                    .persist_physical(context, observation, source)
+                    .await
+            }
+        }
+        for condition in [
+            "user_cancel",
+            "operational_first",
+            "eof_first",
+            "open_failure",
+        ] {
+            let operational_first = condition == "operational_first";
+            let eof_first = condition == "eof_first";
+            let open_failure = condition == "open_failure";
+            let root = tempfile::tempdir().unwrap();
+            let (services, turn, original_receipt, ingress, store) = crate::execution_core::services::requested_cancellation_source_tests::live_requested_fixture_with_store(root.path()).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0 && bytes.len() < 1024 * 1024);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..offset]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= offset + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let mut data = "data: {\"id\":\"source-held\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"physical-body\"},\"finish_reason\":null}]}\n\n".to_string();
+                if eof_first {
+                    data.push_str("data: {\"id\":\"source-held\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+                }
+                let length = if eof_first { data.len() } else { 999999 };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{data}").as_bytes()).await.unwrap();
+                let mut byte = [0; 1];
+                let ended =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut byte))
+                        .await
+                        .unwrap();
+                assert!(matches!(ended, Ok(0)) || ended.is_err());
+            });
+            let (mut client, mut request) =
+                step_wire_fixture(format!("http://{address}/v1"), root.path());
+            request.budget.set_context_window_source("configured");
+            let context = request.provider_evidence_context.as_mut().unwrap();
+            context.session_id = ingress.session_id.clone();
+            context.turn_id = ingress.turn_id.clone();
+            context.execution_id = original_receipt.execution_id.clone();
+            let original_step = request.bound_step.take().unwrap();
+            let mut identity = original_step.snapshot().identity.clone();
+            identity.session_id = ingress.session_id.clone();
+            identity.turn_id = ingress.turn_id.clone();
+            identity.execution_id = Some(original_receipt.execution_id.clone());
+            request.bound_step = Some(Arc::new(
+                crate::step_snapshot::BoundStep::bind(
+                    identity,
+                    original_step.lease().clone(),
+                    &client.step_tool_definitions().unwrap(),
+                    &json!({}),
+                    &crate::step_snapshot::request_material(&request),
+                    original_step.snapshot().related_revisions.clone(),
+                    i64::MAX,
+                )
+                .unwrap(),
+            ));
+            let _skill = bind_skill_fixture(&client, &mut request);
+            let expected_step = request.bound_step.as_ref().unwrap().snapshot().clone();
+            let (manager, config) = control_resource_fixture(&client);
+            client = client.with_preparation_resources(manager.clone());
+            client
+                .configure_turn_cancellation(Some(turn.clone()))
+                .unwrap();
+            let outcome_entered = Arc::new(tokio::sync::Notify::new());
+            let outcome_release = Arc::new(tokio::sync::Notify::new());
+            client.configure_provider_wire_evidence(Some(Arc::new(WriterBarrier {
+                original: crate::conversation::r189_session_provider_writer_for_test(&services),
+                fail_open: open_failure,
+                pause_outcome: eof_first,
+                entered: outcome_entered.clone(),
+                release: outcome_release.clone(),
+            })));
+            request.preparation.retain_cancellation(turn.token());
+            client.prepare_request_budget(&mut request).await.unwrap();
+            let prepared = request.preparation.prepared.as_ref().unwrap();
+            let total =
+                (prepared.wire.body_len() as u64 + 3) / 4 + u64::from(prepared.message.max_tokens);
+            let ResourceAdmissionDecision::Granted { lease, .. } = manager
+                .admit(ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    config.admission_demands("fixture", "fixture-model", total),
+                ))
+                .await
+                .unwrap()
+            else {
+                panic!("original Provider admission");
+            };
+            let expected_lease = lease.projection_reference();
+            request
+                .preparation
+                .retain_dispatch_lease(Some(Arc::new(lease)));
+            let super::ApiClientStream {
+                mut events,
+                execution,
+                ..
+            } = client.stream_with_transport_activity(request);
+            let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = delivered.clone();
+            let (consumer, physical) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                execution.unwrap().drive(async {
+                    while let Some(event) = events.next().await {
+                        if let AssistantEvent::TextDelta(body) = event.unwrap() {
+                            assert_eq!(body, "physical-body");
+                            assert!(!observed.swap(true, Ordering::SeqCst));
+                            if eof_first {
+                                outcome_entered.notified().await;
+                            }
+                            if operational_first {
+                                turn.signal_operational();
+                            }
+                            let mut receipt = original_receipt.clone();
+                            receipt.cancellation_id = "after-real-open".into();
+                            receipt.requested_at_ms =
+                                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+                            receipt.journal_sequence = 0;
+                            receipt.projection_revision = 0;
+                            let receipt = services.commit_cancellation_receipt(receipt).unwrap();
+                            let source = crate::execution_core::services::requested_cancellation_source_tests::authorized_fixture_source(
+                                &services, &turn, &receipt,
+                            ).await;
+                            assert_eq!(
+                                services
+                                    .publish_requested_cancellation(&turn, source)
+                                    .unwrap(),
+                                if operational_first {
+                                    crate::execution_core::services::CancellationNotificationDisposition::OperationalFirst
+                                } else {
+                                    crate::execution_core::services::CancellationNotificationDisposition::Delivered
+                                }
+                            );
+                            if eof_first {
+                                outcome_release.notify_one();
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(consumer.is_ok());
+            if open_failure {
+                assert!(physical
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected physical open persistence failure"));
+            } else {
+                assert_eq!(
+                    physical.unwrap(),
+                    if eof_first {
+                        crate::conversation::ProviderLocalExit::Completed
+                    } else {
+                        crate::conversation::ProviderLocalExit::Stopped
+                    }
+                );
+            }
+            assert_eq!(
+                delivered.load(Ordering::SeqCst),
+                !open_failure,
+                "{condition}"
+            );
+            server.await.unwrap();
+            assert_eq!(
+                manager
+                    .snapshot(&ExecutionResourceKind::Provider)
+                    .unwrap()
+                    .active_leases,
+                0
+            );
+            let page = store
+                .session_domain_events_page(&ingress.session_id, 0, 100)
+                .await
+                .unwrap();
+            let physical_events: Vec<_> = page
+                .events
+                .iter()
+                .filter(|event| event.kind == "context.provider_physical_observation")
+                .map(|event| {
+                    (
+                        event.sequence,
+                        serde_json::from_value::<super::ProviderPhysicalObservation>(
+                            event.payload.clone(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                physical_events.len(),
+                if open_failure {
+                    0
+                } else if operational_first || eof_first {
+                    1
+                } else {
+                    2
+                },
+                "{condition}"
+            );
+            if open_failure {
+                continue;
+            }
+            let super::ProviderPhysicalObservation::ResponseOpened { identity: opened } =
+                &physical_events[0].1
+            else {
+                panic!("actual opened source");
+            };
+            assert_eq!(opened.step, expected_step.identity);
+            assert_eq!(opened.provider_attempt, expected_step.provider_attempt);
+            assert_eq!(opened.resource_lease, expected_lease);
+            if !operational_first && !eof_first {
+                let super::ProviderPhysicalObservation::CancellationObserved {
+                    identity,
+                    opened: reference,
+                    requested,
+                    ..
+                } = &physical_events[1].1
+                else {
+                    panic!("actual cancellation source");
+                };
+                assert_eq!(identity, opened);
+                assert_eq!(reference.session_sequence, physical_events[0].0);
+                assert_eq!(reference.identity, *opened);
+                assert_eq!(requested.cancellation_id, "after-real-open");
+                let original = services
+                    .cancellation_receipt("after-real-open")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(requested.commit_cursor, original.journal_sequence);
+                assert_eq!(requested.event_sequence, original.projection_revision);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r188_stopped_consumer_does_not_start_prepared_sdk_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut client, mut request) = step_wire_fixture(
+            format!("http://{}/v1", listener.local_addr().unwrap()),
+            workspace.path(),
+        );
+        request.budget.set_context_window_source("configured");
+        let _skill = bind_skill_fixture(&client, &mut request);
+        let recorder = Arc::new(StepWireRecorder::default());
+        client.configure_provider_wire_evidence(Some(recorder.clone()));
+        let super::ApiClientStream {
+            events, execution, ..
+        } = client.stream_with_transport_activity(request);
+        let (consumer, producer) = execution
+            .unwrap()
+            .drive(async move {
+                drop(events);
+            })
+            .await;
+        assert!(consumer.is_ok());
+        assert!(producer.is_err());
+        assert_eq!(recorder.records.lock().unwrap().len(), 0);
+        assert_eq!(client.transport_pool.stats().in_flight, 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn r188_sdk_consumer_panic_closes_the_original_held_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0 && bytes.len() < 1024 * 1024);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..offset]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= offset + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let data = "data: {\"id\":\"held\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"held\"},\"finish_reason\":null}]}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n{data}").as_bytes()).await.unwrap();
+            let mut byte = [0; 1];
+            let closed =
+                tokio::time::timeout(std::time::Duration::from_secs(3), socket.read(&mut byte))
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(closed, Ok(0)) || closed.is_err(),
+                "original socket must close without a producer task"
+            );
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut client, mut request) =
+            step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+        request.budget.set_context_window_source("configured");
+        let _skill = bind_skill_fixture(&client, &mut request);
+        client.configure_provider_wire_evidence(Some(Arc::new(StepWireRecorder::default())));
+        let super::ApiClientStream {
+            mut events,
+            execution,
+            ..
+        } = client.stream_with_transport_activity(request);
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = delivered.clone();
+        let (consumer, producer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execution.unwrap().drive(async move {
+                while let Some(event) = events.next().await {
+                    if matches!(event.unwrap(), AssistantEvent::TextDelta(_)) {
+                        observed.store(true, Ordering::SeqCst);
+                        panic!("controlled SDK receiver panic after actual response body");
+                    }
+                }
+                panic!("fixture did not deliver its body");
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(consumer.is_err());
+        assert!(
+            producer.is_ok(),
+            "physical cleanup acknowledges stop without relabeling the consumer panic"
+        );
+        assert!(delivered.load(Ordering::SeqCst));
+        server.await.unwrap();
+        assert_eq!(client.transport_pool.stats().in_flight, 0);
+    }
     #[tokio::test]
     async fn runtime_message_stop_is_published_only_after_cache_warm_commit() {
         let pool = Arc::new(ProviderTransportPool::new(2));
@@ -3593,6 +4565,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl super::ProviderWireEvidenceWriter for StepWireRecorder {
+        async fn persist_physical(
+            &self,
+            context: &super::ProviderRequestEvidenceContext,
+            observation: super::ProviderPhysicalObservation,
+            _source: Option<&crate::execution_core::services::AuthorizedRequestedCancellation>,
+        ) -> Result<super::AcknowledgedProviderPhysicalObservation, RuntimeError> {
+            observation.validate(context)?;
+            super::AcknowledgedProviderPhysicalObservation::from_written(&observation, 1)
+        }
+
         async fn persist(
             &self,
             _: &super::ProviderRequestEvidenceContext,

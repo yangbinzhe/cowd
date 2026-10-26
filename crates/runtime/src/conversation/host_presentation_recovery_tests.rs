@@ -2525,6 +2525,30 @@ struct RejectOnceContextJournal {
 
 #[async_trait::async_trait]
 impl crate::SessionRuntimeJournalPort for RejectOnceContextJournal {
+    async fn authorize_requested_cancellation(
+        &self,
+        request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<session::SessionDomainEvent, session::SessionError> {
+        if self.reject.swap(false, Ordering::SeqCst) {
+            return Err(session::SessionError::Store(
+                "471 original journal publication fault".into(),
+            ));
+        }
+        self.inner.authorize_requested_cancellation(request).await
+    }
+
+    async fn append_event_if_claim_current(
+        &self,
+        request: &crate::session_runtime_port::RuntimeSessionClaimEventAppend,
+    ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+        if self.reject.swap(false, Ordering::SeqCst) {
+            return Err(session::SessionError::Store(
+                "471 original journal publication fault".into(),
+            ));
+        }
+        self.inner.append_event_if_claim_current(request).await
+    }
+
     async fn append_event(
         &self,
         event: &crate::session_runtime_port::RuntimeSessionEvent,

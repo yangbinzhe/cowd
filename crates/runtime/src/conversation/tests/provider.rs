@@ -214,6 +214,24 @@ async fn outcome_append_failure_leaves_packed_attempt_unknown() {
 
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for FailOutcomePort {
+        async fn authorize_requested_cancellation(
+            &self,
+            _request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+        ) -> Result<session::SessionDomainEvent, session::SessionError> {
+            Err(session::SessionError::Store(
+                "outcome fixture has no cancellation authorization owner".into(),
+            ))
+        }
+
+        async fn append_event_if_claim_current(
+            &self,
+            _request: &crate::session_runtime_port::RuntimeSessionClaimEventAppend,
+        ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+            Err(session::SessionError::Store(
+                "outcome fixture has no authenticated claim writer".into(),
+            ))
+        }
+
         async fn append_event(
             &self,
             event: &crate::RuntimeSessionEvent,
@@ -4498,6 +4516,24 @@ async fn compaction_raw_journal_failure_retains_original_window() {
     struct RejectRawJournal;
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for RejectRawJournal {
+        async fn authorize_requested_cancellation(
+            &self,
+            _request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+        ) -> Result<session::SessionDomainEvent, session::SessionError> {
+            Err(session::SessionError::Store(
+                "injected raw receipt failure".into(),
+            ))
+        }
+
+        async fn append_event_if_claim_current(
+            &self,
+            _request: &crate::session_runtime_port::RuntimeSessionClaimEventAppend,
+        ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+            Err(session::SessionError::Store(
+                "injected raw receipt failure".into(),
+            ))
+        }
+
         async fn append_event(
             &self,
             _event: &crate::RuntimeSessionEvent,
@@ -4720,6 +4756,20 @@ mod r1_native_real_wire {
 
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for FallibleSessionJournal {
+        async fn authorize_requested_cancellation(
+            &self,
+            request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+        ) -> Result<session::SessionDomainEvent, session::SessionError> {
+            self.inner.authorize_requested_cancellation(request).await
+        }
+
+        async fn append_event_if_claim_current(
+            &self,
+            request: &crate::session_runtime_port::RuntimeSessionClaimEventAppend,
+        ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+            self.inner.append_event_if_claim_current(request).await
+        }
+
         async fn append_event(
             &self,
             event: &crate::RuntimeSessionEvent,

@@ -30,6 +30,7 @@ use harness_contract::{
         TurnStatus,
     },
 };
+use runtime::execution_core::services::TurnCancellationControl;
 use session::SessionLeaseRegistry;
 
 use crate::services::{
@@ -184,7 +185,7 @@ struct ActiveTurnControl {
     policy_revision: u64,
     requested_sandbox_posture: harness_contract::policy::SandboxPosture,
     effective_sandbox_posture: harness_contract::policy::SandboxPosture,
-    cancellation_token: runtime::CancellationToken,
+    cancellation_control: Arc<TurnCancellationControl>,
 }
 
 #[derive(Clone)]
@@ -216,6 +217,39 @@ impl ActiveTurnRegistry {
             changed: tokio::sync::Notify::new(),
         }
     }
+}
+
+fn publish_active_requested_control(
+    services: &runtime::RuntimeServices,
+    state: &ActiveTurnRegistryState,
+    original: &Arc<TurnCancellationControl>,
+    source: runtime::execution_core::services::AuthorizedRequestedCancellation,
+) -> Result<runtime::execution_core::services::CancellationNotificationDisposition, String> {
+    if !active_requested_control_matches(state, original, source.receipt()) {
+        return Ok(
+            runtime::execution_core::services::CancellationNotificationDisposition::NotPresent,
+        );
+    }
+    services
+        .publish_requested_cancellation(original, source)
+        .map_err(|error| error.to_string())
+}
+
+fn active_requested_control_matches(
+    state: &ActiveTurnRegistryState,
+    original: &Arc<TurnCancellationControl>,
+    receipt: &harness_contract::turn::CancellationReceipt,
+) -> bool {
+    state.controls.get(&receipt.turn_id).is_some_and(|current| {
+        current.session_id == receipt.session_id
+            && current.execution_id.as_deref() == Some(receipt.execution_id.as_str())
+            && current.cancellation_control.matches_target(
+                &receipt.session_id,
+                &receipt.turn_id,
+                &receipt.execution_id,
+            )
+            && Arc::ptr_eq(&current.cancellation_control, original)
+    })
 }
 
 struct ActiveTurnControlGuard {
@@ -1165,7 +1199,37 @@ impl RuntimeService {
         session_id: &str,
         execution_id: Option<String>,
     ) -> Result<(runtime::CancellationToken, ActiveTurnControlGuard), String> {
-        let cancellation_token = runtime::CancellationToken::new();
+        let (control, guard) =
+            self.install_bound_active_turn_control(turn_id, session_id, execution_id, None)?;
+        Ok((control.token(), guard))
+    }
+
+    fn install_bound_active_turn_control(
+        &self,
+        turn_id: &str,
+        session_id: &str,
+        execution_id: Option<String>,
+        ingress: Option<&runtime::TurnIngressRef>,
+    ) -> Result<(Arc<TurnCancellationControl>, ActiveTurnControlGuard), String> {
+        let cancellation_control = if let Some(ingress) = ingress {
+            if ingress.session_id != session_id || ingress.turn_id != turn_id {
+                return Err("cancellation ingress target mismatch".into());
+            }
+            self.runtime_services
+                .create_turn_cancellation_control(
+                    execution_id
+                        .as_deref()
+                        .ok_or("bound cancellation requires execution id")?,
+                    ingress,
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            TurnCancellationControl::operational(
+                session_id,
+                turn_id,
+                execution_id.as_deref().unwrap_or(turn_id),
+            )
+        };
         let mut state = self
             .active_turns
             .state
@@ -1198,12 +1262,12 @@ impl RuntimeService {
                 policy_revision: effective_policy.revision,
                 requested_sandbox_posture: effective_policy.sandbox_posture,
                 effective_sandbox_posture: effective_policy.sandbox_posture,
-                cancellation_token: cancellation_token.clone(),
+                cancellation_control: Arc::clone(&cancellation_control),
             },
         );
         drop(state);
         Ok((
-            cancellation_token,
+            cancellation_control,
             ActiveTurnControlGuard {
                 turn_id: turn_id.to_string(),
                 registry: Arc::clone(&self.active_turns),
@@ -1212,39 +1276,38 @@ impl RuntimeService {
     }
 
     fn cancel_active_turn_control(&self, turn_id: &str, _reason: &str) -> Option<String> {
-        let control = self
+        let state = self
             .active_turns
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .controls
-            .get(turn_id)
-            .cloned()?;
-        if let Some(execution_id) = &control.execution_id {
-            // Requested intent is already durable when the user-cancel path
-            // reaches this process-local signal. The live terminal is not
-            // exposed until the durable terminal cancellation receipt wins.
-            control.cancellation_token.cancel();
-            return Some(execution_id.clone());
-        }
-        control.cancellation_token.cancel();
-        Some(control.execution_id.unwrap_or_else(|| turn_id.to_string()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let control = state.controls.get(turn_id)?;
+        control.cancellation_control.signal_operational();
+        Some(
+            control
+                .execution_id
+                .clone()
+                .unwrap_or_else(|| turn_id.to_string()),
+        )
     }
 
-    fn cancel_active_session_turns(&self, session_id: &str, reason: &str) -> Vec<String> {
-        let turn_ids = self
+    fn cancel_active_session_turns(&self, session_id: &str, _reason: &str) -> Vec<String> {
+        let state = self
             .active_turns
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
             .controls
             .iter()
             .filter(|(_, control)| control.session_id == session_id)
-            .map(|(turn_id, _)| turn_id.clone())
-            .collect::<Vec<_>>();
-        turn_ids
-            .into_iter()
-            .filter_map(|turn_id| self.cancel_active_turn_control(&turn_id, reason))
+            .map(|(turn_id, control)| {
+                control.cancellation_control.signal_operational();
+                control
+                    .execution_id
+                    .clone()
+                    .unwrap_or_else(|| turn_id.clone())
+            })
             .collect()
     }
 
@@ -1436,9 +1499,8 @@ impl RuntimeService {
         }
     }
 
-    /// Cancel every live turn owned by one session and propagate cancellation
-    /// to the Runtime execution registry. The HTTP session-cancel endpoint
-    /// uses this owner path; broadcasting a UI event alone is not cancellation.
+    /// Operational Session stop for lifecycle, policy and shutdown callers.
+    /// User requests must use the authenticated Requested path.
     pub(crate) fn cancel_active_session(&self, session_id: &str, reason: &str) -> Vec<String> {
         self.cancel_active_session_turns(session_id, reason)
     }
@@ -1450,18 +1512,94 @@ impl RuntimeService {
         execution_id: &str,
         reason: &str,
     ) -> bool {
-        let matches_target = self
+        let state = self
             .active_turns
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .controls
-            .get(turn_id)
-            .is_some_and(|control| {
-                control.session_id == session_id
-                    && control.execution_id.as_deref() == Some(execution_id)
-            });
-        matches_target && self.cancel_active_turn_control(turn_id, reason).is_some()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(control) = state.controls.get(turn_id).filter(|control| {
+            control.session_id == session_id
+                && control.execution_id.as_deref() == Some(execution_id)
+                && control
+                    .cancellation_control
+                    .matches_target(session_id, turn_id, execution_id)
+        }) else {
+            return false;
+        };
+        let _ = reason;
+        control.cancellation_control.signal_operational();
+        true
+    }
+
+    pub(crate) async fn cancel_requested_execution(
+        &self,
+        receipt: &harness_contract::turn::CancellationReceipt,
+    ) -> Result<runtime::execution_core::services::RequestedCancellationDeliveryOutcome, String>
+    {
+        use runtime::execution_core::services::{
+            CancellationAuthorizationOutcome, RequestedCancellationDeliveryOutcome,
+        };
+        let original = {
+            let state = self
+                .active_turns
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(control) = state.controls.get(&receipt.turn_id).filter(|control| {
+                control.session_id == receipt.session_id
+                    && control.execution_id.as_deref() == Some(receipt.execution_id.as_str())
+                    && control.cancellation_control.matches_target(
+                        &receipt.session_id,
+                        &receipt.turn_id,
+                        &receipt.execution_id,
+                    )
+            }) else {
+                return Ok(RequestedCancellationDeliveryOutcome::NotActive {
+                    cancellation_id: receipt.cancellation_id.clone(),
+                });
+            };
+            Arc::clone(&control.cancellation_control)
+        };
+        // Ledger/Session reads and await happen outside the owner registry lock.
+        let source = self
+            .runtime_services
+            .authenticate_requested_cancellation(receipt, &original)
+            .await
+            .map_err(|error| error.to_string())?;
+        match self
+            .runtime_services
+            .authorize_requested_cancellation(source)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            CancellationAuthorizationOutcome::Authorized(authorization) => {
+                let state = self
+                    .active_turns
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let notification = publish_active_requested_control(
+                    &self.runtime_services,
+                    &state,
+                    &original,
+                    authorization.clone(),
+                )?;
+                Ok(RequestedCancellationDeliveryOutcome::Authorized {
+                    authorization,
+                    notification,
+                })
+            }
+            CancellationAuthorizationOutcome::RejectedStale { authorization_id } => {
+                Ok(RequestedCancellationDeliveryOutcome::RejectedStale { authorization_id })
+            }
+            CancellationAuthorizationOutcome::Unknown {
+                authorization_id,
+                reason,
+            } => Ok(RequestedCancellationDeliveryOutcome::Unknown {
+                authorization_id,
+                reason,
+            }),
+        }
     }
 
     pub(crate) fn has_active_turn_for_session(&self, session_id: &str) -> bool {
@@ -1509,7 +1647,7 @@ impl RuntimeService {
                 .collect::<Vec<_>>()
         };
         for (_, control) in &controls {
-            control.cancellation_token.cancel();
+            control.cancellation_control.signal_operational();
         }
         controls
             .into_iter()
@@ -1633,8 +1771,9 @@ impl RuntimeService {
         }) {
             cancellation = self
                 .runtime_services
-                .resolve_requested_cancellation(&requested.cancellation_id)
-                .map_err(|error| error.to_string())?;
+                .replay_or_resolve_inactive_cancellation(&requested.cancellation_id)
+                .map_err(|error| error.to_string())?
+                .or_else(|| cancellation.clone());
         }
         let durable_cancelled = cancellation_is_terminal(
             cancellation.as_ref(),
@@ -1854,27 +1993,6 @@ impl RuntimeService {
                     .map_err(|error| error.to_string())?;
             }
         }
-        let organizer = runtime::MissionOrganizer::new(Arc::clone(&self.runtime_services));
-        for binding in &task_route.bindings {
-            if let Some(task) = self
-                .runtime_services
-                .task_aggregate_service()
-                .get(&binding.task_id)?
-            {
-                if let Err(error) = organizer.enqueue_root(&task) {
-                    // Mission organization is a recoverable projection of the
-                    // canonical Root Task. The supervised organizer scans
-                    // pending roots, so this side effect must never abort the
-                    // foreground Session turn.
-                    tracing::warn!(
-                        task_id = %task.task_id,
-                        session_id = %record.session_id,
-                        %error,
-                        "deferred Mission organization after foreground enqueue failure"
-                    );
-                }
-            }
-        }
         let ingress =
             runtime::TurnIngressRef {
                 request_id: record.request_id.clone(),
@@ -1914,11 +2032,13 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (cancellation_token, _turn_control) = self.install_active_turn_control(
+        let (cancellation_control, _turn_control) = self.install_bound_active_turn_control(
             &record.turn_id,
             &record.session_id,
             Some(graph_id.clone()),
+            Some(&ingress),
         )?;
+        let cancellation_token = cancellation_control.token();
         let mut cancellation_after_control = self
             .runtime_services
             .latest_cancellation_receipt_for_execution(
@@ -1930,17 +2050,36 @@ impl RuntimeService {
         if let Some(requested) = cancellation_after_control.as_ref().filter(|receipt| {
             receipt.status == harness_contract::turn::CancellationStatus::Requested
         }) {
-            cancellation_after_control = self
-                .runtime_services
-                .resolve_requested_cancellation(&requested.cancellation_id)
-                .map_err(|error| error.to_string())?;
+            use runtime::execution_core::services::RequestedCancellationDeliveryOutcome;
+            let delivery = self.cancel_requested_execution(requested).await.map_err(|error| {
+                format!("{SESSION_RUNTIME_BUSY_ERROR}: cancellation intent {} pending; delivery failed: {error}", requested.cancellation_id)
+            })?;
+            cancellation_after_control = match delivery {
+                RequestedCancellationDeliveryOutcome::Authorized { authorization, .. } => self
+                    .runtime_services
+                    .resolve_authorized_requested_cancellation(&authorization)
+                    .map_err(|error| error.to_string())?
+                    .or_else(|| cancellation_after_control.clone()),
+                RequestedCancellationDeliveryOutcome::Unknown {
+                    authorization_id,
+                    reason,
+                } => {
+                    return Err(format!("{SESSION_RUNTIME_BUSY_ERROR}: cancellation intent {} pending; authorization {authorization_id} unknown: {reason}", requested.cancellation_id));
+                }
+                RequestedCancellationDeliveryOutcome::RejectedStale { authorization_id } => {
+                    return Err(format!("{SESSION_RUNTIME_BUSY_ERROR}: cancellation intent {} pending; authorization {authorization_id} rejected as stale", requested.cancellation_id));
+                }
+                RequestedCancellationDeliveryOutcome::NotActive { cancellation_id } => {
+                    return Err(format!("{SESSION_RUNTIME_BUSY_ERROR}: cancellation intent {cancellation_id} pending without original active control"));
+                }
+            };
         }
         if cancellation_is_terminal(
             cancellation_after_control.as_ref(),
             self.runtime_services.as_ref(),
             &graph_id,
         ) {
-            cancellation_token.cancel();
+            cancellation_control.signal_operational();
             let receipt = require_cancel(
                 cancellation_after_control,
                 "cancellation receipt disappeared after control",
@@ -1957,6 +2096,32 @@ impl RuntimeService {
                 commit_cursor: receipt.journal_sequence,
                 status: runtime::SessionIngressExecutionStatus::Cancelled,
             });
+        }
+        if cancellation_after_control.as_ref().is_some_and(|receipt| {
+            receipt.status == harness_contract::turn::CancellationStatus::Requested
+        }) {
+            return Err(format!("{SESSION_RUNTIME_BUSY_ERROR}: cancellation intent pending terminal arbitration for {graph_id}"));
+        }
+        let organizer = runtime::MissionOrganizer::new(Arc::clone(&self.runtime_services));
+        for binding in &task_route.bindings {
+            if let Some(task) = self
+                .runtime_services
+                .task_aggregate_service()
+                .get(&binding.task_id)?
+            {
+                if let Err(error) = organizer.enqueue_root(&task) {
+                    // Mission organization is a recoverable projection of the
+                    // canonical Root Task. The supervised organizer scans
+                    // pending roots, so this side effect must never abort the
+                    // foreground Session turn.
+                    tracing::warn!(
+                        task_id = %task.task_id,
+                        session_id = %record.session_id,
+                        %error,
+                        "deferred Mission organization after foreground enqueue failure"
+                    );
+                }
+            }
         }
         let execution_policy = self.effective_session_execution_policy(&record.session_id);
         let active_model = self
@@ -1990,6 +2155,7 @@ impl RuntimeService {
         let task_graph_id = graph_id.clone();
         let task_content = content.to_string();
         let task_cancellation_token = cancellation_token.clone();
+        let task_cancellation_control = Arc::clone(&cancellation_control);
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let spawn_result = self.gateway_tasks.spawn(
             crate::runtime_host::task_set::GatewayTaskKind::SessionRuntimeTurn,
@@ -2017,6 +2183,8 @@ impl RuntimeService {
                         task_cancellation_token.clone(),
                         runtime::HookAbortSignal::default().with_owner_cancellation(shutdown.clone()),
                     );
+                    runtime.install_provider_cancellation_control(Some(Arc::clone(&task_cancellation_control)))
+                        .map_err(|error| error.to_string())?;
                     service.record_live_execution(
                         &task_record.session_id,
                         task_graph_id.clone(),
@@ -2040,7 +2208,7 @@ impl RuntimeService {
                     tokio::select! {
                         result = &mut submission => result.map_err(|error| error.to_string()),
                         () = shutdown.cancelled() => {
-                            task_cancellation_token.cancel();
+                            task_cancellation_control.signal_operational();
                             tokio::time::timeout(Duration::from_secs(4), &mut submission)
                                 .await
                                 .map_err(|_| "Session Runtime turn did not quiesce after shutdown cancellation".to_string())?
@@ -2086,21 +2254,17 @@ impl RuntimeService {
             Ok(summary) => summary,
             Err(error) => {
                 let error = error.to_string();
-                if cancellation_token.is_cancelled() {
+                if let Some(source) = cancellation_control.requested_source() {
                     let mut receipt = self
                         .runtime_services
-                        .latest_cancellation_receipt_for_execution(
-                            &record.session_id,
-                            &graph_id,
-                            &record.turn_id,
-                        )
+                        .cancellation_receipt(&source.receipt().cancellation_id)
                         .map_err(|lookup_error| lookup_error.to_string())?;
-                    if let Some(requested) = receipt.as_ref().filter(|receipt| {
+                    if receipt.as_ref().is_some_and(|receipt| {
                         receipt.status == harness_contract::turn::CancellationStatus::Requested
                     }) {
                         receipt = self
                             .runtime_services
-                            .resolve_requested_cancellation(&requested.cancellation_id)
+                            .resolve_authorized_requested_cancellation(&source)
                             .map_err(|resolve_error| resolve_error.to_string())?;
                     }
                     if let Some(receipt) = receipt.filter(|receipt| {
@@ -4560,6 +4724,9 @@ impl RuntimeService {
             )));
         }
         runtime_guard.install_turn_control(cancellation_token, hook_abort_signal);
+        runtime_guard
+            .install_provider_cancellation_control(None)
+            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
         Ok(())
     }
 
@@ -5065,5 +5232,67 @@ fn upgrade_agentic_program_status(
         runtime::AgenticProgramStatus::Blocked => runtime::UpgradeCarrierStatus::Blocked,
         runtime::AgenticProgramStatus::Failed => runtime::UpgradeCarrierStatus::Failed,
         runtime::AgenticProgramStatus::Cancelled => runtime::UpgradeCarrierStatus::Cancelled,
+    }
+}
+
+#[cfg(test)]
+mod requested_control_registry_tests {
+    use super::*;
+
+    #[test]
+    fn requested_publication_rejects_replaced_or_foreign_registry_control() {
+        let original = TurnCancellationControl::operational("session", "turn", "execution");
+        let mut state = ActiveTurnRegistryState {
+            accepting: true,
+            controls: BTreeMap::new(),
+            frozen_sessions: BTreeMap::new(),
+        };
+        let receipt = harness_contract::turn::CancellationReceipt {
+            cancellation_id: "cancel".into(),
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            execution_id: "execution".into(),
+            actor_id: "principal:owner".into(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: None,
+            requested_at_ms: 1,
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 1,
+            projection_revision: 1,
+        };
+        state.controls.insert(
+            "turn".into(),
+            ActiveTurnControl {
+                session_id: "session".into(),
+                execution_id: Some("execution".into()),
+                policy_revision: 1,
+                requested_sandbox_posture:
+                    harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+                effective_sandbox_posture:
+                    harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+                cancellation_control: Arc::clone(&original),
+            },
+        );
+        assert!(active_requested_control_matches(
+            &state, &original, &receipt
+        ));
+        state.controls.get_mut("turn").unwrap().cancellation_control =
+            TurnCancellationControl::operational("session", "turn", "execution");
+        assert!(!active_requested_control_matches(
+            &state, &original, &receipt
+        ));
+        assert!(!original.token().is_cancelled());
+        state.controls.get_mut("turn").unwrap().cancellation_control = Arc::clone(&original);
+        let mut foreign = receipt.clone();
+        foreign.execution_id = "foreign-execution".into();
+        assert!(!active_requested_control_matches(
+            &state, &original, &foreign
+        ));
+        foreign = receipt;
+        foreign.session_id = "foreign-session".into();
+        assert!(!active_requested_control_matches(
+            &state, &original, &foreign
+        ));
     }
 }

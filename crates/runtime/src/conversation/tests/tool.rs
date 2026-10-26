@@ -1446,6 +1446,8 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
         }
         let state = Arc::new(tokio::sync::Mutex::new(state));
         let backend = TurnModelStepBackend {
+            ticket: ticket.clone(),
+            stop: crate::CancellationToken::new(),
             runtime,
             state: state.clone(),
             services: services.clone(),
@@ -1609,6 +1611,8 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
                 &goal_id,
             );
             let backend = TurnModelStepBackend {
+                ticket: ticket.clone(),
+                stop: crate::CancellationToken::new(),
                 runtime,
                 state: Arc::new(tokio::sync::Mutex::new(branch_state)),
                 services: services.clone(),
@@ -1890,6 +1894,8 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
             *inject.lock().unwrap() = Some((stream, session.session_id.clone()));
         }
         let backend = TurnModelStepBackend {
+            ticket: ticket.clone(),
+            stop: crate::CancellationToken::new(),
             runtime,
             state: Arc::new(tokio::sync::Mutex::new(branch_state)),
             services: services.clone(),
@@ -2592,6 +2598,8 @@ async fn r1_event_replay_host_delegated_fuse_recovery_has_no_safety_emit() {
         state.agentic_protocol_recovery_attempts = recovery_attempt;
         let state = Arc::new(tokio::sync::Mutex::new(state));
         let backend = TurnModelStepBackend {
+            ticket: ticket.clone(),
+            stop: crate::CancellationToken::new(),
             runtime,
             state: state.clone(),
             services: fixture.services.clone(),
@@ -2699,6 +2707,8 @@ async fn r1_event_replay_host_upstream_non_sources_do_not_emit() {
             &goal_id,
         );
         let backend = TurnModelStepBackend {
+            ticket: ticket.clone(),
+            stop: crate::CancellationToken::new(),
             runtime,
             state: Arc::new(tokio::sync::Mutex::new(state)),
             services: services.clone(),

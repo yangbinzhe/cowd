@@ -532,10 +532,19 @@ impl NodeExecutor for ScopedNodeExecutor {
                 .get_or_insert_with(|| {
                     let ticket = ticket.clone();
                     async move {
+                        let result = std::panic::AssertUnwindSafe(backend.execute(&ticket))
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(NodeExecutorError::Uncertain {
+                                    node_id: ticket.node_id.clone(),
+                                    reason: "original retained backend panicked".into(),
+                                })
+                            });
                         super::agent_tool::finish_observed_outcome(
                             &ticket,
                             observation.as_deref(),
-                            backend.execute(&ticket).await,
+                            result,
                         )
                         .map(PhysicalOutcome::Node)
                     }
@@ -832,6 +841,110 @@ mod tests {
             idempotency_key: "physical-request".into(),
             payload_ref: "physical-payload".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn r188_full_queue_consumer_panic_and_dropped_observer_retain_original_producer() {
+        struct State {
+            entered: tokio::sync::Notify,
+            panicked: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            released: std::sync::atomic::AtomicUsize,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        struct Lease(Arc<State>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.released.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Structured(Arc<State>);
+        #[async_trait]
+        impl ScopedNodeBackend for Structured {
+            fn retains_physical_execution(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                ticket: &NodeExecutionTicket,
+            ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+                self.0.calls.fetch_add(1, Ordering::SeqCst);
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                let state = self.0.clone();
+                let lease = Lease(state.clone());
+                let producer = crate::conversation::ProviderExecution::new(
+                    async move {
+                        let _lease = lease;
+                        tx.send(1).await.unwrap();
+                        assert_eq!(tx.capacity(), 0);
+                        state.entered.notify_one();
+                        // Receiver must be dropped on unwind, otherwise this blocks.
+                        assert!(tx.send(2).await.is_err());
+                        state.release.notified().await;
+                        Ok(crate::conversation::ProviderLocalExit::Completed)
+                    },
+                    crate::CancellationToken::new(),
+                );
+                let consumer_state = self.0.clone();
+                let (consumer, result) = producer
+                    .drive(async move {
+                        consumer_state.entered.notified().await;
+                        // Keep the actual receiver in the future being unwound.
+                        assert!(!rx.is_closed());
+                        consumer_state.panicked.notify_one();
+                        let _ = &mut rx;
+                        panic!("controlled consumer panic");
+                    })
+                    .await;
+                assert!(consumer.is_err());
+                result.unwrap();
+                Err(NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: "controlled consumer failed".into(),
+                })
+            }
+        }
+        struct StructuredResolver(Arc<State>);
+        impl ScopedNodeBackendResolver for StructuredResolver {
+            fn resolve(&self, _: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+                Some(Arc::new(Structured(self.0.clone())))
+            }
+        }
+        let state = Arc::new(State {
+            entered: Default::default(),
+            panicked: Default::default(),
+            release: Default::default(),
+            released: Default::default(),
+            calls: Default::default(),
+        });
+        let executor = Arc::new(ScopedNodeExecutor::new("inline_model"));
+        executor.install_resolver(Arc::new(StructuredResolver(state.clone())));
+        let mut request = ticket();
+        request.executor_kind = "inline_model".into();
+        let caller = {
+            let executor = executor.clone();
+            let request = request.clone();
+            tokio::spawn(async move { executor.poll_or_await(&request).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), state.panicked.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(state.released.load(Ordering::SeqCst), 0);
+        // Timeout must retain the same work/driver rather than drop its lease.
+        assert!(executor
+            .cancel_bounded(&request, std::time::Duration::from_millis(10))
+            .await
+            .is_err());
+        assert_eq!(state.released.load(Ordering::SeqCst), 0);
+        state.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), executor.cancel(&request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.released.load(Ordering::SeqCst), 1);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
     }
 
     struct Publication704 {

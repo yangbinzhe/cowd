@@ -621,10 +621,33 @@ where
     C: ApiClient + Send + Sync + 'static,
     T: ToolExecutor,
 {
+    fn retains_physical_execution(&self) -> bool {
+        true
+    }
+
+    fn request_stop(&self, ticket: &NodeExecutionTicket) {
+        if ticket.graph_id == self.ticket.graph_id
+            && ticket.node_id == self.ticket.node_id
+            && ticket.attempt == self.ticket.attempt
+            && ticket.idempotency_key == self.ticket.idempotency_key
+            && ticket.executor_kind == self.ticket.executor_kind
+            && ticket.payload_ref == self.ticket.payload_ref
+            && ticket.service_class == self.ticket.service_class
+        {
+            self.stop.cancel();
+        }
+    }
+
     async fn execute(
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        if self.stop.is_cancelled() {
+            return Err(NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "model step cancelled before execution".into(),
+            });
+        }
         let result = async {
         if self.state.lock().await.terminal_override.is_some() {
             return Ok(precommitted_terminal_outcome(ticket));
@@ -1566,7 +1589,8 @@ where
         }
         let transcript_len = runtime.session_head().await.message_count;
         let root = self.state.lock().await.execution_role == TurnExecutionRole::RootTurn;
-        let mut model_runtime = runtime.scoped_root_node_activity(ticket, root)
+        let mut step_runtime = runtime.scoped_model_stop(self.stop.clone());
+        let mut model_runtime = step_runtime.scoped_root_node_activity(ticket, root)
             .map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(), reason: error.to_string(),
             })?;
@@ -1626,6 +1650,7 @@ where
                 .await
         };
         drop(model_runtime);
+        drop(step_runtime);
         runtime
             .session_mut_async()
             .await
@@ -9297,10 +9322,59 @@ mod closed_host_continuity_475_tests {
                 .unwrap()
                 .graph;
             let hot = TurnModelStepBackend {
+                ticket: ticket.clone(),
+                stop: crate::CancellationToken::new(),
                 runtime: runtime.clone(),
                 state: state.clone(),
                 services: services.clone(),
             };
+            {
+                let mut runtime_guard = runtime.lock().await;
+                let turn_stop = runtime_guard.cancellation_token();
+                assert!(hot.retains_physical_execution());
+                for field in [
+                    "graph",
+                    "node",
+                    "attempt",
+                    "idempotency",
+                    "executor",
+                    "payload",
+                ] {
+                    let mut foreign = ticket.clone();
+                    match field {
+                        "graph" => foreign.graph_id.push_str("-foreign"),
+                        "node" => foreign.node_id.push_str("-foreign-call"),
+                        "attempt" => foreign.attempt += 1,
+                        "idempotency" => foreign.idempotency_key.push_str("-foreign"),
+                        "executor" => foreign.executor_kind.push_str("-foreign"),
+                        "payload" => foreign.payload_ref.push(' '),
+                        _ => unreachable!(),
+                    }
+                    hot.request_stop(&foreign);
+                    assert!(!hot.stop.is_cancelled(), "{field}");
+                }
+                hot.request_stop(&ticket);
+                assert!(hot.stop.is_cancelled());
+                assert!(!turn_stop.is_cancelled());
+                {
+                    let scoped = runtime_guard.scoped_model_stop(hot.stop.clone());
+                    assert!(scoped.cancellation_token().is_cancelled());
+                }
+                assert!(!runtime_guard.cancellation_token().is_cancelled());
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let scoped = runtime_guard.scoped_model_stop(hot.stop.clone());
+                    assert!(scoped.cancellation_token().is_cancelled());
+                    panic!("controlled model scope unwind");
+                }));
+                assert!(unwind.is_err());
+                assert!(!runtime_guard.cancellation_token().is_cancelled());
+                assert!(matches!(
+                    hot.execute(&ticket).await,
+                    Err(NodeExecutorError::Poll { reason, .. })
+                        if reason == "model step cancelled before execution"
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
             hot.after_commit(&ticket).await.unwrap();
             assert_eq!(
                 runtime

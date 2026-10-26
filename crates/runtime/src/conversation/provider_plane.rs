@@ -1305,9 +1305,13 @@ where
                 let source_readset = request.prompt.memory_source_readset();
                 let source_turn = self.memory_source_observation_turn(&source_readset)?;
                 token_reservations.mark_dispatched();
+                request
+                    .preparation
+                    .retain_cancellation(cancellation.clone());
                 let ApiClientStream {
                     events,
                     transport_activity,
+                    execution,
                 } = self.api_client.stream_with_transport_activity(request);
                 let events = observe_memory_source_stream(
                     events,
@@ -1315,7 +1319,7 @@ where
                     source_turn,
                     source_readset,
                 );
-                let stream_run = consume_provider_stream_with_activity(
+                let stream_run = consume_owned_provider_stream(
                     events,
                     cancellation,
                     Some(ProviderStreamTimeoutPolicy {
@@ -1325,6 +1329,7 @@ where
                     reducer,
                     None,
                     transport_activity,
+                    execution,
                 )
                 .await;
                 tracing::info!(
@@ -2533,9 +2538,13 @@ where
             let source_readset = request.prompt.memory_source_readset();
             let source_turn = self.memory_source_observation_turn(&source_readset)?;
             token_reservations.mark_dispatched();
+            request
+                .preparation
+                .retain_cancellation(cancellation.clone());
             let ApiClientStream {
                 events,
                 transport_activity,
+                execution,
             } = self.api_client.stream_with_transport_activity(request);
             let events = observe_memory_source_stream(
                 events,
@@ -2543,7 +2552,7 @@ where
                 source_turn,
                 source_readset,
             );
-            let stream_run = consume_provider_stream_with_activity(
+            let stream_run = consume_owned_provider_stream(
                 events,
                 cancellation,
                 Some(ProviderStreamTimeoutPolicy {
@@ -2553,6 +2562,7 @@ where
                 reducer,
                 early_dispatcher.clone(),
                 transport_activity,
+                execution,
             )
             .await;
             let resource_result_class = stream_run.resource_result_class;

@@ -625,6 +625,15 @@ impl SessionRepository {
             .await
     }
 
+    pub(super) async fn append_runtime_claim_domain_event(
+        &self,
+        request: &session::SessionClaimEventAppend,
+    ) -> Result<SessionEvent, SessionError> {
+        self.durable_store()?
+            .append_session_domain_event_if_claim_current(request)
+            .await
+    }
+
     pub(super) async fn append_runtime_domain_event(
         &self,
         event: &SessionDomainEvent,

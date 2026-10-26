@@ -92,6 +92,7 @@ fn lock_claim_event_append_tx(
             fence.request_id, fence.session_generation, fence.claim_fence_epoch, current.status
         )));
     }
+    request.validate_locked_event_binding()?;
     Ok(event)
 }
 
@@ -141,7 +142,7 @@ fn append_claim_event_tx(
     let event = lock_claim_event_append_tx(transaction, request)?;
     match matching_domain_event_tx(transaction, &event, &request.event.event_id)? {
         Some(existing) => Ok(existing),
-        None => append_allocated_event_tx(transaction, &event),
+        None => append_locked_claim_event_unchecked_tx(transaction, &event),
     }
 }
 
@@ -214,11 +215,11 @@ mod claim_append_tests {
                 .claim_session_runtime_outbox("worker-r194", now, 60_000, 1, &[])
                 .unwrap()
                 .remove(0);
-            let request = SessionClaimEventAppend {
-                session_id: session_id.into(),
-                ingress_message_id: ingress.message_id,
-                turn_id: ingress.turn_id,
-                fence: session::SessionTerminalExecutionFence {
+            let request = SessionClaimEventAppend::observation(
+                session_id.into(),
+                ingress.message_id,
+                ingress.turn_id,
+                session::SessionTerminalExecutionFence {
                     request_id: ingress.request_id,
                     input_sequence: input.sequence,
                     session_generation: 1,
@@ -226,7 +227,7 @@ mod claim_append_tests {
                     claim_token: input.claim_token.clone().unwrap(),
                     claim_fence_epoch: input.claim_fence_epoch.unwrap(),
                 },
-                event: SessionDomainEvent::new(
+                SessionDomainEvent::new(
                     session_id,
                     0,
                     SessionDomainScope::Tool,
@@ -236,7 +237,7 @@ mod claim_append_tests {
                     }),
                     now,
                 ),
-            };
+            );
             Self {
                 scope,
                 store,
@@ -709,6 +710,394 @@ mod claim_append_tests {
         tx.commit().unwrap();
         appender.join().unwrap();
         assert_eq!(fixture.count(), 0);
+    }
+
+    fn authorization(fixture: &Fixture) -> SessionClaimEventAppend {
+        use harness_contract::turn::{CancellationCause, CancellationReceipt, CancellationStatus};
+        SessionClaimEventAppend::cancellation_authorization(
+            fixture.request.session_id.clone(),
+            fixture.request.ingress_message_id.clone(),
+            fixture.request.turn_id.clone(),
+            fixture.request.fence.clone(),
+            CancellationReceipt {
+                cancellation_id: "r196-cancel".into(),
+                session_id: fixture.request.session_id.clone(),
+                turn_id: fixture.request.turn_id.clone(),
+                execution_id: "original-execution".into(),
+                actor_id: "original-actor".into(),
+                cause: CancellationCause::UserRequested,
+                reason: Some("original-reason".into()),
+                requested_at_ms: fixture.request.event.created_at_ms,
+                effective_at_ms: None,
+                status: CancellationStatus::Requested,
+                journal_sequence: 3,
+                projection_revision: 4,
+            },
+            session::SessionCancellationRequestedReference {
+                event_id: "original-requested".into(),
+                stream_id: "original-stream".into(),
+                event_sequence: 3,
+                commit_cursor: 4,
+                payload_digest: format!("sha256:{}", "a".repeat(64)),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r196_authorization_reserved_ordinary_writers_reject_before_readback() {
+        fn reserved_refusal<T>(result: session::SessionResult<T>) {
+            assert!(
+                matches!(result,
+                Err(session::SessionError::InvalidArgument(reason))
+                    if reason.contains("reserved cancellation authorization")),
+                "must hit the reserved-kind guard, not a sequence/uniqueness error"
+            );
+        }
+        let mut fixture = Fixture::new();
+        fixture.request = authorization(&fixture);
+        // An already committed checkpoint must not bypass the kind guard.
+        let mut checkpoint = fixture.request.event.clone();
+        checkpoint.kind = "r196.ordinary-checkpoint".into();
+        checkpoint.event_id = "r196-ordinary-checkpoint".into();
+        fixture
+            .store
+            .append_events_allocating_sequence_if_checkpoint_absent(
+                &[checkpoint.to_session_event().unwrap()],
+                "r196-checkpoint",
+            )
+            .unwrap()
+            .unwrap();
+        let mut ordinary = fixture.request.event.clone();
+        ordinary.kind = "r196.ordinary-raw-control".into();
+        ordinary.event_id = "r196-ordinary-raw-control".into();
+        ordinary.sequence = fixture
+            .store
+            .next_event_sequence(&ordinary.session_id)
+            .unwrap();
+        fixture
+            .store
+            .append_event(&ordinary.to_session_event().unwrap())
+            .unwrap();
+        // Exercise actual ordinary backend methods both before insertion and
+        // after a legitimate row exists: duplicate success must not launder it.
+        for existing in [false, true] {
+            if existing {
+                fixture
+                    .store
+                    .append_session_domain_event_if_claim_current(&fixture.request)
+                    .unwrap();
+            }
+            let mut domain = fixture.request.event.clone();
+            domain.sequence = fixture
+                .store
+                .next_event_sequence(&domain.session_id)
+                .unwrap();
+            let event = domain.to_session_event().unwrap();
+            reserved_refusal(fixture.store.append_event(&event));
+            reserved_refusal(fixture.store.append_event_allocating_sequence(&event));
+            reserved_refusal(
+                fixture
+                    .store
+                    .append_events_allocating_sequence(std::slice::from_ref(&event)),
+            );
+            reserved_refusal(
+                fixture
+                    .store
+                    .append_session_domain_event_if_absent_allocating_sequence(
+                        &event,
+                        &fixture.request.event.event_id,
+                    ),
+            );
+            reserved_refusal(
+                fixture
+                    .store
+                    .append_events_allocating_sequence_if_checkpoint_absent(
+                        std::slice::from_ref(&event),
+                        "r196-checkpoint",
+                    ),
+            );
+            reserved_refusal(
+                fixture
+                    .store
+                    .append_context_envelope_event_if_absent(&event),
+            );
+            reserved_refusal(
+                fixture
+                    .store
+                    .append_context_envelope_event_if_absent_allocating_sequence(&event),
+            );
+            let mut disguised = event.clone();
+            disguised.event_type = "ContextEnvelope".into();
+            reserved_refusal(
+                fixture
+                    .store
+                    .append_context_envelope_event_if_absent(&disguised),
+            );
+            let observation = SessionClaimEventAppend::observation(
+                fixture.request.session_id.clone(),
+                fixture.request.ingress_message_id.clone(),
+                fixture.request.turn_id.clone(),
+                fixture.request.fence.clone(),
+                fixture.request.event.clone(),
+            );
+            reserved_refusal(
+                fixture
+                    .store
+                    .append_session_domain_event_if_claim_current(&observation),
+            );
+            assert_eq!(fixture.count(), i64::from(existing));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r196_authorization_revoke_before_auth_zero_rows() {
+        let mut fixture = Fixture::new();
+        fixture.request = authorization(&fixture);
+        fixture.revoke();
+        assert!(matches!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        assert_eq!(fixture.count(), 0);
+        assert!(fixture
+            .store
+            .get_session_domain_event_by_id(
+                &fixture.request.session_id,
+                &fixture.request.event.event_id
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r196_authorization_held_before_revoke_historical_exact_read() {
+        let mut fixture = Fixture::new();
+        fixture.request = authorization(&fixture);
+        let revoker_store = PostgresSessionStore::new(fixture.scope.reconnect()).unwrap();
+        let mut holder = fixture.store.executor.checkout_critical().unwrap();
+        let holder_pid: i32 = holder
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let mut tx = holder.transaction().unwrap();
+        lock_claim_event_append_tx(&mut tx, &fixture.request).unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let input = fixture.input.clone();
+        let revoker = std::thread::spawn(move || {
+            let now = owner_now(&revoker_store);
+            worker_gate.wait();
+            revoker_store
+                .cancel_session_runtime_outbox(
+                    &input.input_id,
+                    1,
+                    input.revision,
+                    "r196-test",
+                    "revoke",
+                    now,
+                )
+                .unwrap();
+        });
+        gate.wait();
+        wait_until_blocked(&fixture.scope.reconnect(), holder_pid);
+        let committed = append_claim_event_tx(&mut tx, &fixture.request).unwrap();
+        tx.commit().unwrap();
+        revoker.join().unwrap();
+        assert_eq!(fixture.count(), 1);
+        assert!(matches!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .get_session_domain_event_by_id(
+                    &fixture.request.session_id,
+                    &fixture.request.event.event_id
+                )
+                .unwrap(),
+            Some(committed)
+        );
+        // Reading history does not confer a fresh physical-observation claim.
+        let physical = SessionClaimEventAppend::observation(
+            fixture.request.session_id.clone(),
+            fixture.request.ingress_message_id.clone(),
+            fixture.request.turn_id.clone(),
+            fixture.request.fence.clone(),
+            SessionDomainEvent::new(
+                &fixture.request.session_id,
+                0,
+                SessionDomainScope::Tool,
+                "r196.physical-observation",
+                serde_json::json!({"physical": "original"}),
+                fixture.request.event.created_at_ms,
+            ),
+        );
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&physical)
+            .is_err());
+        assert!(fixture
+            .store
+            .get_session_domain_event_by_id(&physical.session_id, &physical.event.event_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r196_authorization_changed_payload_same_key_renew_and_replay() {
+        let mut fixture = Fixture::new();
+        fixture.request = authorization(&fixture);
+        let renewed = fixture
+            .store
+            .renew_session_runtime_outbox_lease(
+                &fixture.input.request_id,
+                fixture.input.claim_owner.as_deref().unwrap(),
+                1,
+                fixture.input.claim_token.as_deref().unwrap(),
+                fixture.input.revision,
+                owner_now(&fixture.store),
+                60_000,
+            )
+            .unwrap();
+        assert!(renewed.revision > fixture.input.revision);
+        assert_eq!(
+            renewed.claim_fence_epoch,
+            Some(fixture.request.fence.claim_fence_epoch)
+        );
+        let committed = fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request)
+                .unwrap(),
+            committed
+        );
+        let payload: session::SessionCancellationAuthorizationPayload =
+            serde_json::from_value(fixture.request.event.payload.clone()).unwrap();
+        for field in 0..5 {
+            let mut receipt = payload.receipt.clone();
+            let mut reference = payload.requested_ref.clone();
+            match field {
+                0 => receipt.actor_id.push_str("-changed"),
+                1 => receipt.reason = Some("changed-reason".into()),
+                2 => receipt.execution_id.push_str("-changed"),
+                3 => reference.commit_cursor += 1,
+                _ => receipt.requested_at_ms += 1,
+            }
+            let changed = SessionClaimEventAppend::cancellation_authorization(
+                fixture.request.session_id.clone(),
+                fixture.request.ingress_message_id.clone(),
+                fixture.request.turn_id.clone(),
+                fixture.request.fence.clone(),
+                receipt,
+                reference,
+            )
+            .unwrap();
+            assert_eq!(changed.event.event_id, fixture.request.event.event_id);
+            assert!(matches!(
+                fixture
+                    .store
+                    .append_session_domain_event_if_claim_current(&changed),
+                Err(session::SessionError::IdempotencyConflict { .. })
+            ));
+        }
+        let mut forged = fixture.request.clone();
+        forged.event.payload["receipt"]["actor_id"] = serde_json::json!("forged");
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&forged)
+            .is_err());
+        let mut wrong_token = fixture.request.clone();
+        wrong_token.fence.claim_token.push_str("-foreign");
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&wrong_token)
+            .is_err());
+        assert_eq!(fixture.count(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires parent-owned isolated COWD_TEST_POSTGRES_URL"]
+    fn r196_authorization_commit_loss_and_lost_result_exact_read() {
+        let mut fixture = Fixture::new();
+        fixture.request = authorization(&fixture);
+        let executor = fixture.scope.reconnect();
+        let mut oracle = executor.checkout_critical().unwrap();
+        oracle.batch_execute(
+            "CREATE FUNCTION r196_lose_commit_connection() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NEW.event_json::jsonb ->> 'kind' = 'session.claim.cancellation_authorized.v1' THEN
+                     PERFORM pg_terminate_backend(pg_backend_pid());
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE CONSTRAINT TRIGGER r196_lose_commit_connection
+             AFTER INSERT ON session_events DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION r196_lose_commit_connection()"
+        ).unwrap();
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .is_err());
+        assert_eq!(fixture.count(), 0);
+        oracle
+            .batch_execute(
+                "DROP TRIGGER r196_lose_commit_connection ON session_events;
+            DROP FUNCTION r196_lose_commit_connection()",
+            )
+            .unwrap();
+        // Discard an actual committed result to model acknowledgment loss.
+        // This is distinct from the real pre-commit connection loss above.
+        drop(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request)
+                .unwrap(),
+        );
+        let historical = fixture
+            .store
+            .get_session_domain_event_by_id(
+                &fixture.request.session_id,
+                &fixture.request.event.event_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .append_session_domain_event_if_claim_current(&fixture.request)
+                .unwrap(),
+            historical
+        );
+        fixture.revoke();
+        assert_eq!(
+            fixture
+                .store
+                .get_session_domain_event_by_id(
+                    &fixture.request.session_id,
+                    &fixture.request.event.event_id
+                )
+                .unwrap(),
+            Some(historical)
+        );
+        assert!(fixture
+            .store
+            .append_session_domain_event_if_claim_current(&fixture.request)
+            .is_err());
+        assert_eq!(fixture.count(), 1);
     }
 }
 
@@ -1508,6 +1897,16 @@ impl PostgresSessionStore {
         &self,
         request: &SessionBranchRequest,
     ) -> session::SessionResult<SessionBranchResult> {
+        for event_json in [&request.source_event_json, &request.target_event_json] {
+            SessionEvent {
+                session_id: request.source_session_id.clone(),
+                event_type: "SessionBranched".into(),
+                event_json: event_json.clone(),
+                sequence: 0,
+                created_at_ms: request.created_at_ms,
+            }
+            .reject_reserved_cancellation_authorization()?;
+        }
         if request.operation_id.trim().is_empty()
             || request.source_session_id.trim().is_empty()
             || request.target.session_id.trim().is_empty()
@@ -1696,6 +2095,7 @@ impl PostgresSessionStore {
                 sequence: stored_sequence,
                 created_at_ms: request.created_at_ms,
             };
+            event.reject_reserved_cancellation_authorization()?;
             let allocated_json = event_json_with_allocated_sequence(&event, stored_sequence)?;
             transaction
                 .execute(
@@ -2205,6 +2605,7 @@ impl PostgresSessionStore {
     }
 
     pub fn append_event(&self, event: &SessionEvent) -> session::SessionResult<()> {
+        event.reject_reserved_cancellation_authorization()?;
         let sequence = to_i64(event.sequence, "event sequence")?;
         let created_at_ms = i64::try_from(event.created_at_ms)
             .map_err(|_| session::SessionError::Store("event time overflow".to_string()))?;
@@ -2232,6 +2633,9 @@ impl PostgresSessionStore {
         &self,
         events: &[SessionEvent],
     ) -> session::SessionResult<Vec<SessionEvent>> {
+        for event in events {
+            event.reject_reserved_cancellation_authorization()?;
+        }
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -2323,6 +2727,7 @@ impl PostgresSessionStore {
         event: &SessionEvent,
         event_id: &str,
     ) -> session::SessionResult<(SessionEvent, bool)> {
+        event.reject_reserved_cancellation_authorization()?;
         if event.event_type != session::SESSION_DOMAIN_EVENT_TYPE || event_id.trim().is_empty() {
             return Err(session::SessionError::Store(
                 "idempotent domain append requires SessionDomainEvent and a non-empty event_id"
@@ -2423,6 +2828,9 @@ impl PostgresSessionStore {
         events: &[SessionEvent],
         checkpoint_id: &str,
     ) -> session::SessionResult<Option<Vec<SessionEvent>>> {
+        for event in events {
+            event.reject_reserved_cancellation_authorization()?;
+        }
         if events.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -2502,6 +2910,7 @@ impl PostgresSessionStore {
         &self,
         event: &SessionEvent,
     ) -> session::SessionResult<Option<SessionEvent>> {
+        event.reject_reserved_cancellation_authorization()?;
         if event.event_type != "ContextEnvelope" {
             return self.append_event_allocating_sequence(event).map(Some);
         }
@@ -2988,6 +3397,7 @@ impl PostgresSessionStore {
         &self,
         request: &SessionLifecycleFenceRequest,
     ) -> session::SessionResult<SessionLifecycleIntent> {
+        request.event.reject_reserved_cancellation_authorization()?;
         validate_fence_metadata(
             &request.actor,
             &request.reason,
@@ -3154,6 +3564,7 @@ impl PostgresSessionStore {
         &self,
         request: &SessionLifecycleTombstoneRequest,
     ) -> session::SessionResult<SessionLifecycleIntent> {
+        request.event.reject_reserved_cancellation_authorization()?;
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current =

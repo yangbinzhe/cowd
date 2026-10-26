@@ -1310,6 +1310,115 @@ async fn run_session_cleanup_worker(
     Ok(())
 }
 
+#[cfg(test)]
+mod requested_signal_batch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn r190_stale_live_signal_does_not_skip_other_receipts() {
+        let receipt = |id: &str| harness_contract::turn::CancellationReceipt {
+            cancellation_id: id.into(),
+            session_id: format!("session-{id}"),
+            turn_id: format!("turn-{id}"),
+            execution_id: format!("execution-{id}"),
+            actor_id: "principal:owner".into(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: None,
+            requested_at_ms: 1,
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 1,
+            projection_revision: 1,
+        };
+        let mut signalled = Vec::new();
+        use runtime::execution_core::services::RequestedCancellationDeliveryOutcome;
+        let authorized = signal_requested_cancellation_batch(
+            vec![
+                receipt("stale"),
+                receipt("unknown"),
+                receipt("rejected"),
+                receipt("independent"),
+            ],
+            |receipt| {
+                signalled.push(receipt.cancellation_id.clone());
+                std::future::ready(match receipt.cancellation_id.as_str() {
+                    "stale" => Err("original claim no longer current".into()),
+                    "unknown" => Ok(RequestedCancellationDeliveryOutcome::Unknown {
+                        authorization_id: "original-unknown-id".into(),
+                        reason: "commit confirmation unavailable".into(),
+                    }),
+                    "rejected" => Ok(RequestedCancellationDeliveryOutcome::RejectedStale {
+                        authorization_id: "original-rejected-id".into(),
+                    }),
+                    _ => Ok(RequestedCancellationDeliveryOutcome::NotActive {
+                        cancellation_id: receipt.cancellation_id,
+                    }),
+                })
+            },
+        )
+        .await;
+        assert_eq!(
+            signalled,
+            vec!["stale", "unknown", "rejected", "independent"]
+        );
+        // Pure iteration/collection oracle; no mock mints authorization or
+        // claims progress through Session persistence or reconciliation.
+        assert!(authorized.is_empty());
+    }
+}
+
+async fn signal_requested_cancellation_batch<F, Fut>(
+    receipts: Vec<harness_contract::turn::CancellationReceipt>,
+    mut signal: F,
+) -> Vec<runtime::execution_core::services::AuthorizedRequestedCancellation>
+where
+    F: FnMut(harness_contract::turn::CancellationReceipt) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<
+            runtime::execution_core::services::RequestedCancellationDeliveryOutcome,
+            String,
+        >,
+    >,
+{
+    use runtime::execution_core::services::RequestedCancellationDeliveryOutcome;
+    let mut authorized = Vec::new();
+    for receipt in receipts {
+        let cancellation_id = receipt.cancellation_id.clone();
+        let session_id = receipt.session_id.clone();
+        match signal(receipt).await {
+            Ok(RequestedCancellationDeliveryOutcome::Authorized {
+                authorization,
+                notification,
+            }) => {
+                tracing::debug!(%cancellation_id, %session_id,
+                    authorization_id = %authorization.authorization_id(),
+                    authorization_sequence = authorization.authorization_sequence(),
+                    ?notification, "Requested cancellation authorization confirmed");
+                authorized.push(authorization);
+            }
+            Ok(RequestedCancellationDeliveryOutcome::Unknown {
+                authorization_id,
+                reason,
+            }) => {
+                tracing::warn!(%cancellation_id, %session_id, %authorization_id, %reason,
+                    "Requested cancellation authorization unknown; intent remains pending");
+            }
+            Ok(RequestedCancellationDeliveryOutcome::RejectedStale { authorization_id }) => {
+                tracing::warn!(%cancellation_id, %session_id, %authorization_id,
+                    "Requested cancellation authorization stale; intent remains pending");
+            }
+            Ok(RequestedCancellationDeliveryOutcome::NotActive { .. }) => {
+                tracing::debug!(%cancellation_id, %session_id,
+                    "Requested cancellation has no original active control; intent remains pending");
+            }
+            Err(error) => {
+                tracing::warn!(%cancellation_id, %session_id, %error,
+                    "Requested cancellation delivery failed; intent remains pending");
+            }
+        }
+    }
+    authorized
+}
 async fn run_lifecycle_reconciliation_worker(
     session_service: Arc<SessionService>,
     runtime_service: Option<Arc<RuntimeService>>,
@@ -1336,21 +1445,19 @@ async fn run_lifecycle_reconciliation_worker(
         }
         let scanned_at_ms = now_ms();
         if let Some(services) = runtime_services.as_ref() {
-            if let Some(runtime_service) = runtime_service.as_ref() {
-                for receipt in services
+            let authorized = if let Some(runtime_service) = runtime_service.as_ref() {
+                let receipts = services
                     .pending_cancellation_receipts(WORKER_BATCH)
-                    .map_err(|error| error.to_string())?
-                {
-                    let _ = runtime_service.cancel_active_execution(
-                        &receipt.session_id,
-                        &receipt.turn_id,
-                        &receipt.execution_id,
-                        receipt.reason.as_deref().unwrap_or("user_requested"),
-                    );
-                }
-            }
+                    .map_err(|error| error.to_string())?;
+                signal_requested_cancellation_batch(receipts, |receipt| async move {
+                    runtime_service.cancel_requested_execution(&receipt).await
+                })
+                .await
+            } else {
+                Vec::new()
+            };
             let receipts = services
-                .reconcile_requested_cancellations(WORKER_BATCH)
+                .reconcile_requested_cancellations(WORKER_BATCH, &authorized)
                 .map_err(|error| error.to_string())?;
             if let Some(event_bus) = event_bus.as_ref() {
                 for receipt in receipts {

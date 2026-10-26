@@ -1455,6 +1455,14 @@ impl SessionService {
         Ok(self.runtime()?.cancel_active_session(session_id, reason))
     }
 
+    pub(crate) async fn cancel_requested_execution(
+        &self,
+        receipt: &harness_contract::turn::CancellationReceipt,
+    ) -> Result<runtime::execution_core::services::RequestedCancellationDeliveryOutcome, String>
+    {
+        self.runtime()?.cancel_requested_execution(receipt).await
+    }
+
     pub(crate) fn cancel_active_execution(
         &self,
         session_id: &str,
@@ -2279,6 +2287,15 @@ impl SessionService {
         self.append_runtime_domain_event_if_absent(event)
             .await
             .map(|(_, replayed)| !replayed)
+    }
+
+    pub(crate) async fn append_runtime_claim_journal_event(
+        &self,
+        request: &session::SessionClaimEventAppend,
+    ) -> Result<SessionEvent, SessionError> {
+        self.kernel()
+            .append_runtime_claim_domain_event(request)
+            .await
     }
 
     pub(crate) async fn append_runtime_journal_event(

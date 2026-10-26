@@ -63,6 +63,8 @@ macro_rules! session_store_backend_contract {
             (associate_memory, (session_id: &str, memory_id: &str), Result<()>),
             (get_session_memories, (session_id: &str), Result<Vec<String>>),
             (disassociate_memory, (session_id: &str, memory_id: &str), Result<()>),
+            // Ordinary writers reject the reserved authorization kind before dedup/allocation.
+            // Claim append alone validates private purpose under the original owner locks.
             (append_event, (event: &SessionEvent), Result<()>),
             (append_event_allocating_sequence, (event: &SessionEvent), Result<SessionEvent>),
             (append_session_domain_event_if_claim_current, (request: &SessionClaimEventAppend), Result<SessionEvent>),

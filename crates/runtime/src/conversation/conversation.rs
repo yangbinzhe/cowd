@@ -31,6 +31,8 @@ mod turn_engine;
 struct CancellationState {
     cancelled: AtomicBool,
     notify: tokio::sync::Notify,
+    parents: Vec<CancellationToken>,
+    signal_window: std::sync::Mutex<Option<(Instant, Instant)>>,
 }
 
 #[cfg(test)]
@@ -46,26 +48,239 @@ impl CancellationToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::SeqCst)
+        let mut states = vec![self];
+        while let Some(token) = states.pop() {
+            if token.0.cancelled.load(Ordering::SeqCst) {
+                return true;
+            }
+            states.extend(token.0.parents.iter());
+        }
+        false
     }
 
     pub fn cancel(&self) {
+        let _ = self.cancel_first_signal();
+    }
+
+    pub(crate) fn cancel_first_signal(&self) -> bool {
+        let began = Instant::now();
         if !self.0.cancelled.swap(true, Ordering::SeqCst) {
+            *self
+                .0
+                .signal_window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((began, Instant::now()));
             self.0.notify.notify_waiters();
+            true
+        } else {
+            false
         }
     }
 
     pub async fn cancelled(&self) {
+        let mut states = vec![self.0.clone()];
+        let mut index = 0;
+        while index < states.len() {
+            let parents: Vec<_> = states[index]
+                .parents
+                .iter()
+                .map(|parent| parent.0.clone())
+                .collect();
+            states.extend(parents);
+            index += 1;
+        }
         loop {
-            let notified = self.0.notify.notified();
+            let notified: Vec<_> = states
+                .iter()
+                .map(|state| Box::pin(state.notify.notified()))
+                .collect();
             if self.is_cancelled() {
                 return;
             }
-            notified.await;
+            let _ = futures::future::select_all(notified).await;
         }
+    }
+
+    fn linked(turn: Self, step: Self) -> Self {
+        Self(Arc::new(CancellationState {
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+            parents: vec![turn, step],
+            signal_window: std::sync::Mutex::new(None),
+        }))
+    }
+
+    /// Local wake ordering only, never durable source authentication. Overlap,
+    /// an unfinished signal publication, or a foreign chain is unknown.
+    pub(crate) fn precedes_other_signals(&self, chain: &Self, cleanup: &Self) -> bool {
+        let Some((_, ended)) = *self
+            .0
+            .signal_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
+            return false;
+        };
+        let mut pending = vec![chain, cleanup];
+        let mut found = false;
+        while let Some(token) = pending.pop() {
+            if Arc::ptr_eq(&token.0, &self.0) {
+                found = true;
+                continue;
+            }
+            if token.0.cancelled.load(Ordering::SeqCst) {
+                let window = *token
+                    .0
+                    .signal_window
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !window.is_some_and(|(began, _)| ended < began) {
+                    return false;
+                }
+            }
+            pending.extend(token.0.parents.iter());
+        }
+        found
     }
 }
 
+#[cfg(test)]
+mod scoped_stop_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn r188_cleanup_preserves_timeout_and_cancelled_primary_result() {
+        use crate::execution_core::graph::ResourceResultClass;
+        for expected in [
+            ResourceResultClass::TimedOut,
+            ResourceResultClass::Cancelled,
+        ] {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let stop = CancellationToken::new();
+            let physical_stop = stop.clone();
+            let producer = ProviderExecution::new(
+                async move {
+                    let _sender = tx;
+                    physical_stop.cancelled().await;
+                    Err(RuntimeError::new("secondary producer stop acknowledgement"))
+                },
+                stop,
+            );
+            let cancellation = CancellationToken::new();
+            if expected == ResourceResultClass::Cancelled {
+                cancellation.cancel();
+            }
+            let events = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            });
+            let run = consume_owned_provider_stream(
+                Box::pin(events),
+                cancellation,
+                Some(ProviderStreamTimeoutPolicy {
+                    idle: Duration::from_millis(20),
+                    heartbeat_grace: Duration::ZERO,
+                }),
+                ModelStreamReducer::new(None, None, "r188-primary".into()),
+                None,
+                None,
+                Some(producer),
+            )
+            .await;
+            assert_eq!(run.resource_result_class, expected);
+            let diagnostic = run.failure.unwrap().to_string();
+            assert!(!diagnostic.contains("secondary"));
+            assert!(
+                diagnostic.contains(if expected == ResourceResultClass::Cancelled {
+                    "cancelled"
+                } else {
+                    "stalled"
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn r188_producer_panic_has_one_failed_completion_and_no_success() {
+        let bus = Arc::new(crate::CowdEventBus::new());
+        let mut observed = bus.subscribe();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let producer = ProviderExecution::new(
+            async move {
+                let _sender = tx;
+                panic!("controlled original producer panic");
+                #[allow(unreachable_code)]
+                Ok(ProviderLocalExit::Completed)
+            },
+            CancellationToken::new(),
+        );
+        let events = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        });
+        let run = consume_owned_provider_stream(
+            Box::pin(events),
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(Some(bus), None, "r188-panic".into()),
+            None,
+            None,
+            Some(producer),
+        )
+        .await;
+        assert!(run
+            .failure
+            .unwrap()
+            .to_string()
+            .contains("producer panicked"));
+        let mut statuses = Vec::new();
+        while let Ok(event) = observed.try_recv() {
+            if let crate::CowdEvent::ModelStepCompleted { status, .. } = event {
+                statuses.push(status);
+            }
+        }
+        assert_eq!(statuses, vec!["failed"]);
+    }
+
+    #[tokio::test]
+    async fn r188_exact_step_stop_is_not_a_turn_or_sibling_stop() {
+        let turn = CancellationToken::new();
+        let step_a = CancellationToken::new();
+        let step_b = CancellationToken::new();
+        let a = CancellationToken::linked(turn.clone(), step_a.clone());
+        let b = CancellationToken::linked(turn.clone(), step_b.clone());
+        step_a.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), a.cancelled())
+            .await
+            .unwrap();
+        assert!(!turn.is_cancelled());
+        assert!(!step_b.is_cancelled());
+        assert!(!b.is_cancelled());
+        turn.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), b.cancelled())
+            .await
+            .unwrap();
+        assert!(!step_b.is_cancelled());
+    }
+
+    #[test]
+    fn r189_operational_step_signal_cannot_borrow_a_later_user_signal() {
+        let user = CancellationToken::new();
+        let step = CancellationToken::new();
+        let cleanup = CancellationToken::new();
+        let chain = CancellationToken::linked(user.clone(), step.clone());
+        step.cancel();
+        user.cancel();
+        cleanup.cancel();
+        assert!(!user.precedes_other_signals(&chain, &cleanup));
+        let first = CancellationToken::new();
+        let next_step = CancellationToken::new();
+        let next_cleanup = CancellationToken::new();
+        let next_chain = CancellationToken::linked(first.clone(), next_step.clone());
+        first.cancel();
+        next_cleanup.cancel();
+        assert!(first.precedes_other_signals(&next_chain, &next_cleanup));
+        assert!(!first.precedes_other_signals(&CancellationToken::new(), &next_cleanup));
+    }
+}
 use futures::stream::Stream;
 use harness_contract::{
     context::{
@@ -1505,13 +1720,13 @@ impl ModelStreamReducer {
         Ok(())
     }
 
-    fn finish(self, status: &str) -> CollectedProviderStream {
-        if let Some(bus) = &self.bus {
-            bus.emit(crate::CowdEvent::ModelStepCompleted {
-                model_step_id: self.model_step_id.clone(),
-                status: status.to_string(),
-            });
-        }
+    fn finish(self, consumer_status: &str) -> CollectedProviderStream {
+        // This is the reducer's local result, not a lifecycle publication.
+        // The outer owned exchange alone publishes the merged completion.
+        tracing::trace!(
+            consumer_status,
+            "provider consumer reduced; producer settlement pending"
+        );
         CollectedProviderStream {
             text: self.text,
             public_reasoning: self.public_reasoning,
@@ -1602,6 +1817,7 @@ fn reasoning_activity_binding(
     Some(binding)
 }
 
+#[derive(Default)]
 struct CollectedProviderStream {
     text: String,
     public_reasoning: String,
@@ -1660,7 +1876,96 @@ async fn consume_provider_stream(
     .await
 }
 
+#[cfg(test)]
 async fn consume_provider_stream_with_activity(
+    stream: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>,
+    cancellation: CancellationToken,
+    timeout_policy: Option<ProviderStreamTimeoutPolicy>,
+    reducer: ModelStreamReducer,
+    early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
+    transport_activity: Option<provider::TransportActivity>,
+) -> ProviderStreamRun {
+    consume_owned_provider_stream(
+        stream,
+        cancellation,
+        timeout_policy,
+        reducer,
+        early_dispatcher,
+        transport_activity,
+        None,
+    )
+    .await
+}
+
+async fn consume_owned_provider_stream(
+    stream: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>,
+    cancellation: CancellationToken,
+    timeout_policy: Option<ProviderStreamTimeoutPolicy>,
+    reducer: ModelStreamReducer,
+    early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
+    transport_activity: Option<provider::TransportActivity>,
+    execution: Option<ProviderExecution<'_>>,
+) -> ProviderStreamRun {
+    use futures::FutureExt;
+    let completion_bus = reducer.bus.clone();
+    let model_step_id = reducer.model_step_id.clone();
+    let consumer = consume_provider_stream_inner(
+        stream,
+        cancellation,
+        timeout_policy,
+        reducer,
+        early_dispatcher,
+        transport_activity,
+    );
+    let (consumed, producer_result) = match execution {
+        Some(execution) => execution.drive(consumer).await,
+        None => (
+            std::panic::AssertUnwindSafe(consumer)
+                .catch_unwind()
+                .await
+                .map_err(|_| ()),
+            Ok(ProviderLocalExit::Completed),
+        ),
+    };
+    let mut run = consumed.unwrap_or_else(|_| ProviderStreamRun {
+        collected: CollectedProviderStream::default(),
+        failure: Some(RuntimeError::new("provider consumer panicked")),
+        resource_result_class: crate::execution_core::graph::ResourceResultClass::Failed,
+    });
+    if matches!(producer_result, Ok(ProviderLocalExit::Stopped)) && run.failure.is_none() {
+        run.failure = Some(RuntimeError::with_provider_failure_metadata(
+            "provider operation stopped",
+            None,
+            false,
+            crate::execution_core::graph::ResourceResultClass::Cancelled,
+        ));
+        run.resource_result_class = crate::execution_core::graph::ResourceResultClass::Cancelled;
+    }
+    if let Err(error) = producer_result {
+        // Receiver cancellation/timeout is the primary result. The producer's
+        // expected stop acknowledgement must not relabel it as Failed.
+        if run.failure.is_none() {
+            run.failure = Some(error);
+            run.resource_result_class = crate::execution_core::graph::ResourceResultClass::Failed;
+        }
+    }
+    // Publish exactly once, only after the owned physical future has returned
+    // and its result and protocol validation have joined the consumer result.
+    if let Some(bus) = completion_bus {
+        bus.emit(crate::CowdEvent::ModelStepCompleted {
+            model_step_id,
+            status: if run.failure.is_some() {
+                "failed"
+            } else {
+                "completed"
+            }
+            .into(),
+        });
+    }
+    run
+}
+
+async fn consume_provider_stream_inner(
     mut stream: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>,
     cancellation: CancellationToken,
     timeout_policy: Option<ProviderStreamTimeoutPolicy>,
@@ -1872,12 +2177,11 @@ async fn consume_provider_stream_with_activity(
     }
     drop(stream);
     let response_completed_at_ms = now_ms();
-    let status = if failure.is_some() {
+    let mut collected = reducer.finish(if failure.is_some() {
         "failed"
     } else {
         "completed"
-    };
-    let mut collected = reducer.finish(status);
+    });
     if failure.is_none() {
         if let Err(error) = tool_plan.seal(&collected.calls) {
             resource_result_class = crate::execution_core::graph::ResourceResultClass::Failed;
@@ -2419,6 +2723,7 @@ pub trait ApiClient {
         ApiClientStream {
             events: self.stream(request),
             transport_activity: None,
+            execution: None,
         }
     }
 
@@ -2455,6 +2760,18 @@ pub trait ApiClient {
     ) {
     }
 
+    fn configure_turn_cancellation(
+        &mut self,
+        control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    ) -> Result<(), RuntimeError> {
+        if control.is_some() {
+            return Err(RuntimeError::new(
+                "ApiClient has no physical cancellation source owner",
+            ));
+        }
+        Ok(())
+    }
+
     fn context_inventory(&self) -> ProviderContextInventory {
         ProviderContextInventory::default()
     }
@@ -2474,10 +2791,8 @@ pub trait ApiClient {
 
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        // Provider streams create their producer task when `stream` is called.
-        // Build the stream *inside* the runtime that will poll it so synchronous
-        // callers (evaluation, diagnostics, CLI checks) retain the same
-        // cancellation and streaming behavior as an ordinary Runtime turn.
+        // Drive the same lazy, locally owned provider future inside the runtime
+        // that owns its IO; synchronous callers do not create a detached task.
         let collect = async {
             let mut pinned = self.stream(request);
             use futures::StreamExt;
@@ -2504,8 +2819,179 @@ pub trait ApiClient {
 pub struct ApiClientStream<'a> {
     pub events: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'a>>,
     pub transport_activity: Option<provider::TransportActivity>,
+    pub(crate) execution: Option<ProviderExecution<'a>>,
 }
 
+/// The single physical future stays outside the consumer. It is never spawned
+/// or handed to a Drop reaper. A retained backend can continue polling it after
+/// its receiver, or its original caller, has gone away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderLocalExit {
+    Completed,
+    Stopped,
+}
+
+pub(crate) struct ProviderExecution<'a> {
+    work:
+        Option<Pin<Box<dyn Future<Output = Result<ProviderLocalExit, RuntimeError>> + Send + 'a>>>,
+    stop: CancellationToken,
+    result: Option<Result<ProviderLocalExit, RuntimeError>>,
+    polled: bool,
+}
+
+impl<'a> ProviderExecution<'a> {
+    pub(crate) fn new(
+        work: impl Future<Output = Result<ProviderLocalExit, RuntimeError>> + Send + 'a,
+        stop: CancellationToken,
+    ) -> Self {
+        use futures::FutureExt;
+        Self {
+            work: Some(Box::pin(async move {
+                std::panic::AssertUnwindSafe(work)
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(RuntimeError::new("provider producer panicked")))
+            })),
+            stop,
+            result: None,
+            polled: false,
+        }
+    }
+
+    fn poll_work(&mut self, cx: &mut std::task::Context<'_>) {
+        self.polled = true;
+        if let Some(work) = &mut self.work {
+            if let std::task::Poll::Ready(result) = work.as_mut().poll(cx) {
+                // Destroy the completed future (including its lease captures)
+                // before exposing its result to the backend.
+                self.work = None;
+                self.result = Some(result);
+            }
+        }
+    }
+
+    async fn finish(mut self) -> Result<ProviderLocalExit, RuntimeError> {
+        self.stop.cancel();
+        futures::future::poll_fn(|cx| {
+            self.poll_work(cx);
+            if self.work.is_none() {
+                std::task::Poll::Ready(self.result.take().unwrap_or_else(|| {
+                    Err(RuntimeError::new(
+                        "physical producer has no completion result",
+                    ))
+                }))
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn drive<T>(
+        mut self,
+        consumer: impl Future<Output = T>,
+    ) -> (Result<T, ()>, Result<ProviderLocalExit, RuntimeError>) {
+        use futures::FutureExt;
+        let mut consumer = Box::pin(std::panic::AssertUnwindSafe(consumer).catch_unwind());
+        let consumed = futures::future::poll_fn(|cx| {
+            let already_started = self.polled;
+            if already_started {
+                self.poll_work(cx);
+            }
+            // A consumer already stopped before dispatch must not start IO just
+            // because the producer happens to be polled first.
+            if let std::task::Poll::Ready(result) = consumer.as_mut().poll(cx) {
+                return std::task::Poll::Ready(result);
+            }
+            if !already_started {
+                self.poll_work(cx);
+            }
+            consumer.as_mut().poll(cx)
+        })
+        .await;
+        // Drop the receiver before waiting for producer completion. Otherwise a
+        // full event queue would keep the two halves waiting on each other.
+        drop(consumer);
+        (consumed.map_err(|_| ()), self.finish().await)
+    }
+}
+
+impl<'a> ApiClientStream<'a> {
+    /// Plain ApiClient users still drive exactly the same producer. Dropping
+    /// this adapter destroys local IO synchronously; there is no background task.
+    pub(crate) fn into_stream(
+        self,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'a>> {
+        struct Driven<'a> {
+            events: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'a>>,
+            execution: Option<ProviderExecution<'a>>,
+            terminal: Option<Result<AssistantEvent, RuntimeError>>,
+            failed: bool,
+        }
+        impl Stream for Driven<'_> {
+            type Item = Result<AssistantEvent, RuntimeError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                if self.failed {
+                    return std::task::Poll::Ready(None);
+                }
+                if let Some(execution) = &mut self.execution {
+                    execution.poll_work(cx);
+                    if matches!(
+                        execution.result,
+                        Some(Err(_)) | Some(Ok(ProviderLocalExit::Stopped))
+                    ) {
+                        let error = match execution.result.take().unwrap() {
+                            Err(error) => error,
+                            Ok(ProviderLocalExit::Stopped) => {
+                                RuntimeError::with_provider_failure_metadata(
+                                    "provider operation stopped",
+                                    None,
+                                    false,
+                                    crate::execution_core::graph::ResourceResultClass::Cancelled,
+                                )
+                            }
+                            Ok(ProviderLocalExit::Completed) => unreachable!(),
+                        };
+                        self.failed = true;
+                        self.terminal = None;
+                        return std::task::Poll::Ready(Some(Err(error)));
+                    }
+                }
+                let done = self
+                    .execution
+                    .as_ref()
+                    .is_none_or(|execution| execution.work.is_none());
+                if self.terminal.is_some() {
+                    return if done {
+                        std::task::Poll::Ready(self.terminal.take())
+                    } else {
+                        std::task::Poll::Pending
+                    };
+                }
+                match self.events.as_mut().poll_next(cx) {
+                    std::task::Poll::Ready(Some(event @ Ok(AssistantEvent::MessageStop)))
+                        if !done =>
+                    {
+                        self.terminal = Some(event);
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(None) if !done => std::task::Poll::Pending,
+                    other => other,
+                }
+            }
+        }
+        Box::pin(Driven {
+            events: self.events,
+            execution: self.execution,
+            terminal: None,
+            failed: false,
+        })
+    }
+}
 /// Per-invocation model-delivery policy resolved from an immutable execution
 /// binding. This is not proof that delivery occurred; Conversation owns that
 /// proof after a matching Provider request returns a valid response.
@@ -3738,6 +4224,22 @@ struct SessionProviderWireEvidenceWriter {
     native_wire_receipts: Arc<std::sync::Mutex<Vec<NativeWireReceipt>>>,
 }
 
+#[cfg(test)]
+pub(crate) fn r189_session_provider_writer_for_test(
+    services: &crate::RuntimeServices,
+) -> Arc<dyn crate::ProviderWireEvidenceWriter> {
+    Arc::new(SessionProviderWireEvidenceWriter {
+        artifacts: services.artifact_store().clone(),
+        session_port: services
+            .session_journal_port()
+            .expect("original Session journal"),
+        cache_dimensions: Arc::new(std::sync::Mutex::new(
+            TurnCacheDimensionsObservation::default(),
+        )),
+        native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ProviderAttemptEpoch {
     execution_id: String,
@@ -3987,6 +4489,71 @@ fn provider_attempt_usage_from_value(
 
 #[async_trait::async_trait]
 impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
+    async fn persist_physical(
+        &self,
+        context: &crate::ProviderRequestEvidenceContext,
+        observation: crate::provider_runtime_client::ProviderPhysicalObservation,
+        source: Option<&crate::execution_core::services::AuthorizedRequestedCancellation>,
+    ) -> Result<crate::provider_runtime_client::AcknowledgedProviderPhysicalObservation, RuntimeError>
+    {
+        use crate::provider_runtime_client::{
+            AcknowledgedProviderPhysicalObservation, ProviderPhysicalObservation,
+        };
+        observation.validate(context)?;
+        let status = match &observation {
+            ProviderPhysicalObservation::ResponseOpened { .. } => "opened",
+            ProviderPhysicalObservation::CancellationObserved { .. } => "cancel_observed",
+        };
+        let event = crate::RuntimeSessionEvent::new(
+            context.session_id.clone(),
+            context.request_sequence,
+            crate::RuntimeSessionEventKind::ProviderPhysicalObservation,
+            serde_json::to_value(&observation)
+                .map_err(|error| RuntimeError::new(error.to_string()))?,
+            observation.occurred_at_ms(),
+        )
+        .with_status(status)
+        .with_ref(crate::RuntimeSessionEventRef {
+            ref_type: "execution".into(),
+            id: context.execution_id.clone(),
+            label: None,
+        })
+        .with_ref(crate::RuntimeSessionEventRef {
+            ref_type: "turn".into(),
+            id: context.turn_id.clone(),
+            label: None,
+        })
+        .with_ref(crate::RuntimeSessionEventRef {
+            ref_type: "provider_request".into(),
+            id: observation.identity().request_id.clone(),
+            label: None,
+        })
+        .with_ref(crate::RuntimeSessionEventRef {
+            ref_type: "provider_response".into(),
+            id: observation.identity().response_id.clone(),
+            label: None,
+        });
+        let written = match (&observation, source) {
+            (ProviderPhysicalObservation::ResponseOpened { .. }, None) => {
+                self.session_port.append_event(&event).await
+            }
+            (ProviderPhysicalObservation::CancellationObserved { .. }, Some(source)) => {
+                let request = source
+                    .claim_event_append(&event, &observation)
+                    .map_err(RuntimeError::new)?;
+                self.session_port
+                    .append_event_if_claim_current(&request)
+                    .await
+            }
+            _ => {
+                return Err(RuntimeError::new(
+                    "physical phase requires its exact authenticated source capability",
+                ));
+            }
+        }
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        AcknowledgedProviderPhysicalObservation::from_written(&observation, written.sequence)
+    }
     async fn persist(
         &self,
         context: &crate::ProviderRequestEvidenceContext,
@@ -4216,6 +4783,51 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
     }
 }
 
+/// Temporary view of the same Runtime, not another stop/state owner. Restores
+/// the original turn token on every return/unwind without locking Runtime.
+pub(crate) struct ScopedModelStop<'a, C, T> {
+    runtime: &'a mut ConversationRuntime<C, T>,
+    previous: CancellationToken,
+}
+
+impl<C, T> std::ops::Deref for ScopedModelStop<'_, C, T> {
+    type Target = ConversationRuntime<C, T>;
+    fn deref(&self) -> &Self::Target {
+        self.runtime
+    }
+}
+impl<C, T> std::ops::DerefMut for ScopedModelStop<'_, C, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.runtime
+    }
+}
+impl<C, T> Drop for ScopedModelStop<'_, C, T> {
+    fn drop(&mut self) {
+        self.runtime.cancellation_token = self.previous.clone();
+    }
+}
+impl<C, T> ConversationRuntime<C, T> {
+    pub(crate) fn scoped_model_stop(
+        &mut self,
+        stop: CancellationToken,
+    ) -> ScopedModelStop<'_, C, T> {
+        let previous = self.cancellation_token.clone();
+        self.cancellation_token = CancellationToken::linked(previous.clone(), stop);
+        ScopedModelStop {
+            runtime: self,
+            previous,
+        }
+    }
+}
+
+impl<C: ApiClient, T> ConversationRuntime<C, T> {
+    pub fn install_provider_cancellation_control(
+        &mut self,
+        control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    ) -> Result<(), RuntimeError> {
+        self.api_client.configure_turn_cancellation(control)
+    }
+}
 pub struct ConversationRuntime<C, T> {
     session_id: String,
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock

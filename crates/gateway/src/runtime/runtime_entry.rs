@@ -68,6 +68,14 @@ impl GatewayRuntimeEntry {
             .install_turn_control(cancellation_token, hook_abort_signal);
     }
 
+    pub(crate) fn install_provider_cancellation_control(
+        &mut self,
+        control: Option<std::sync::Arc<runtime::execution_core::services::TurnCancellationControl>>,
+    ) -> Result<(), runtime::RuntimeError> {
+        self.runtime_mut()
+            .install_provider_cancellation_control(control)
+    }
+
     pub(crate) fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
