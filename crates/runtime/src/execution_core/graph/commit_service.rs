@@ -2268,6 +2268,149 @@ mod scope_commit_tests {
     }
 
     #[test]
+    fn original_write_intent_authenticates_proof_child_sequence() {
+        let (store, service, graph, _root, _owner) = root_fixture();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("proof.txt"), "before").unwrap();
+        let host = tools::ToolHost::builtin("scope2-proof-writer", workspace.path());
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let mut request = bound_request(
+            &host,
+            "edit",
+            json!({"action":"write","path":"proof.txt","content":"after"}),
+        );
+        request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: graph.id.clone(),
+                node_id: "scope2-node".into(),
+            });
+        request.parent_execution_attempt = Some(1);
+        let descriptor = &request.compiled_invocation.as_ref().unwrap().effect;
+        request.authorization = Some(harness_contract::tool::ToolExecutionAuthorization {
+            request_id: request.tool_use_id.clone(),
+            tool_id: request.tool_name.clone(),
+            descriptor_hash: descriptor.descriptor_hash.clone(),
+            policy_revision: 1,
+            scope: descriptor.scopes[0].clone(),
+            timeout_lease: "timeout:5".into(),
+            idempotency_key: Some(request.idempotency_key.clone()),
+            authorization_lease: harness_contract::policy::AuthorizationLease {
+                lease_id: "proof-intent-fixture".into(),
+                principal_id: "scope2-test".into(),
+                parent_lease_id: None,
+                capability: request.tool_name.clone(),
+                scopes: descriptor.scopes.clone(),
+                ceiling: descriptor.required_permission,
+                issued_at_ms: 0,
+                expires_at_ms: u64::MAX,
+                max_uses: 1,
+                remaining_uses: 1,
+                idempotency_key: request.idempotency_key.clone(),
+                policy_revision: 1,
+                effect_descriptor_hash: descriptor.descriptor_hash.clone(),
+                signature: "fixture-original-authority".into(),
+                status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+            },
+        });
+        let effect = &request.compiled_invocation.as_ref().unwrap().effect;
+        let scope = crate::bound_tool_batch::admitted_effect_scope(
+            &request,
+            effect,
+            Some(host.pin_snapshot()),
+            &resolver,
+        )
+        .unwrap();
+        service
+            .begin_bound_tool_effect(&request, effect, &scope)
+            .unwrap();
+        let primary = store
+            .event_by_idempotency_key(
+                &format!("execution-effect:{}", request.idempotency_key),
+                &format!("{}:intent", request.idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        let index = store
+            .event_by_idempotency_key(
+                "execution-agent-receipts:scope2-graph:scope2-node:1",
+                &format!("agent-tool-intent:{}", request.idempotency_key),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(primary.kind, "execution.effect.intent");
+        assert_eq!(index.kind, "execution.agent_tool.intent");
+        assert_eq!(index.schema_version, 1);
+        assert_eq!(primary.commit_cursor, index.commit_cursor);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("proof.txt")).unwrap(),
+            "before"
+        );
+        ExecutionCommitService::validate_proof_bound_tool_request(&request, &primary, &index)
+            .expect("original admitted write intent must authenticate its proof child");
+        for sequence in [
+            serde_json::Value::Null,
+            json!("0"),
+            json!(-1),
+            json!(request.observation_wave_sequence + 1),
+        ] {
+            let mut bad = index.clone();
+            bad.payload["sequence"] = sequence;
+            assert!(ExecutionCommitService::validate_proof_bound_tool_request(
+                &request, &primary, &bad
+            )
+            .is_err());
+        }
+        let mut missing = index.clone();
+        missing.payload.as_object_mut().unwrap().remove("sequence");
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(
+            &request, &primary, &missing
+        )
+        .is_err());
+        for schema in [0, 2] {
+            let mut bad = index.clone();
+            bad.schema_version = schema;
+            assert!(ExecutionCommitService::validate_proof_bound_tool_request(
+                &request, &primary, &bad
+            )
+            .is_err());
+        }
+        let mut wrong_kind = index.clone();
+        wrong_kind.kind = "execution.agent_tool.receipt".into();
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(
+            &request,
+            &primary,
+            &wrong_kind
+        )
+        .is_err());
+        let mut foreign_call = request.clone();
+        foreign_call.tool_use_id.push_str("-foreign");
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(
+            &foreign_call,
+            &primary,
+            &index
+        )
+        .is_err());
+        let mut foreign_attempt = request.clone();
+        foreign_attempt.parent_execution_attempt = Some(2);
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(
+            &foreign_attempt,
+            &primary,
+            &index
+        )
+        .is_err());
+        let mut foreign_scope = index.clone();
+        foreign_scope.payload["effect_scope"] = serde_json::Value::Null;
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(
+            &request,
+            &primary,
+            &foreign_scope
+        )
+        .is_err());
+    }
+
+    #[test]
     fn root_read_and_write_fix_original_owner_scope_and_atomic_index() {
         for (read, cancel_before_receipt) in
             [(false, false), (true, false), (false, true), (true, true)]
@@ -4581,6 +4724,15 @@ impl ExecutionCommitService {
         };
         let source = delegated_agent_receipt_stream_id(request).ok_or_else(denied)?;
         let read = primary.kind == "execution.read.receipt";
+        // Write retirement authenticates the original admission intent, not a
+        // completed receipt. Each original producer owns its sequence encoding.
+        let observation_sequence = if read {
+            Self::receipt_observation_sequence(index)
+        } else if index.kind == "execution.agent_tool.intent" && index.schema_version == 1 {
+            index.payload["sequence"].as_u64()
+        } else {
+            None
+        };
         if primary.stream_id != format!("execution-effect:{}", request.idempotency_key)
             || primary.actor.as_deref() != Some("governed_tool")
             || index.stream_id != source
@@ -4589,7 +4741,7 @@ impl ExecutionCommitService {
             || index.payload["idempotency_key"] != request.idempotency_key
             || primary.payload["tool_use_id"] != request.tool_use_id
             || primary.payload["tool_name"] != request.tool_name
-            || Self::receipt_observation_sequence(&index) != Some(request.observation_wave_sequence)
+            || observation_sequence != Some(request.observation_wave_sequence)
             || index.payload["effect_scope"]
                 != serde_json::to_value(
                     request
