@@ -3503,7 +3503,7 @@ async fn connector_service_tools_and_execute_use_management_routes() {
         let n = socket.read(&mut buf).await.expect("read execute");
         let req = String::from_utf8_lossy(&buf[..n]);
         assert!(req.starts_with("POST /api/connectors/services/local.docs/execute HTTP/1.1"));
-        assert!(req.contains("\"tool_id\":\"service.local.docs.read\""));
+        assert!(req.contains("\"tool_id\":\"service.local.docs.summarize_ref\""));
         assert!(req.contains("\"mode\":\"dry_run\""));
         socket
                 .write_all(
@@ -3524,7 +3524,7 @@ async fn connector_service_tools_and_execute_use_management_routes() {
             "local.docs",
             serde_json::json!({
                 "actor_principal": "tui:operator",
-                "tool_id": "service.local.docs.read",
+                "tool_id": "service.local.docs.summarize_ref",
                 "resource_id": "tui-doc",
                 "title": "TUI Doc",
                 "mode": "dry_run",

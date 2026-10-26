@@ -412,7 +412,7 @@ async fn cross_plane_and_connector_routes_reject_payload_principals_and_inject_t
                 .uri("/api/connectors/services/local.docs/execute")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"actor_principal":"user:forged","tool_id":"service.local.docs.read","resource_id":"doc","title":"Forged","mode":"dry_run"}"#,
+                    r#"{"actor_principal":"user:forged","tool_id":"service.local.docs.summarize_ref","resource_id":"doc","title":"Forged","mode":"dry_run"}"#,
                 ))
                 .expect("connector request"),
         )
@@ -428,7 +428,7 @@ async fn cross_plane_and_connector_routes_reject_payload_principals_and_inject_t
                 .uri("/api/cross-plane/action/preflight")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"actor_principal":"user:forged","requested_capability":"service.local.docs.read"}"#,
+                    r#"{"actor_principal":"user:forged","requested_capability":"service.local.docs.summarize_ref"}"#,
                 ))
                 .expect("cross-plane request"),
         )
@@ -444,7 +444,7 @@ async fn cross_plane_and_connector_routes_reject_payload_principals_and_inject_t
                 .uri("/api/cross-plane/action/preflight")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"requested_capability":"service.local.docs.read","risk":"low","data_classification":"internal","identity_trust":"unknown"}"#,
+                    r#"{"requested_capability":"service.local.docs.summarize_ref","risk":"low","data_classification":"internal","identity_trust":"unknown"}"#,
                 ))
                 .expect("trusted intent request"),
         )

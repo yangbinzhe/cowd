@@ -221,10 +221,14 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
         source_agent: Some("connector-resource-bridge".to_string()),
         visibility: AgentVisibility::Shared,
     };
+    let source_session = entry
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "connector-resource-bridge".to_string());
     match state
         .services
         .memory
-        .remember_entry_with_context(entry, "connector-resource-bridge", "api")
+        .remember_entry_with_context(entry, &source_session, "connector-resource-bridge")
         .await
     {
         Ok(()) => serde_json::json!({

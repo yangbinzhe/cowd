@@ -883,10 +883,10 @@ impl ServiceConnector for LocalDocsServiceConnector {
     }
 
     fn capabilities(&self) -> Vec<CapabilityManifest> {
-        ["read", "export", "summarize_ref"]
-            .into_iter()
-            .map(|operation| CapabilityManifest::service_readonly("local.docs", operation))
-            .collect()
+        vec![CapabilityManifest::service_readonly(
+            "local.docs",
+            "summarize_ref",
+        )]
     }
 
     fn execute_tool(&self, request: ServiceToolRequest) -> ServiceToolResult {
@@ -896,21 +896,25 @@ impl ServiceConnector for LocalDocsServiceConnector {
             title,
             input: _,
         } = request;
-        let operation = tool_id
-            .rsplit('.')
-            .next()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("read")
-            .to_string();
+        if tool_id != "service.local.docs.summarize_ref" {
+            return ServiceToolResult {
+                status: "unsupported".to_string(),
+                tool_id,
+                resource: None,
+                output: serde_json::json!({"error":"unsupported tool ID"}),
+            };
+        }
         let resource = ExternalResourceRef::new("local.docs", "document", &resource_id, &title);
         ServiceToolResult {
             status: "ok".to_string(),
             tool_id,
             resource: Some(resource.clone()),
             output: serde_json::json!({
-                "operation": operation,
-                "summary": format!("Local document `{title}` resolved as {}", resource.reference),
+                "operation": "summarize_ref",
+                "summary": format!("Reference metadata for `{title}`: {}. Document content was not read.", resource.reference),
                 "read_only": true,
+                "metadata_only": true,
+                "content_read": false,
             }),
         }
     }
@@ -1029,30 +1033,72 @@ mod tests {
     }
 
     #[test]
-    fn local_docs_service_connector_returns_resource_ref() {
-        let connector = LocalDocsServiceConnector::new();
+    fn local_docs_service_connector_only_summarizes_reference_metadata() {
+        let registry = builtin_service_connector_registry();
+        let connector = registry.connector("local.docs").unwrap();
         let capabilities = connector.capabilities();
         assert!(capabilities
             .iter()
             .any(
-                |capability| capability.capability_id == "service.local.docs.read"
+                |capability| capability.capability_id == "service.local.docs.summarize_ref"
                     && capability.plane == ConnectorPlane::Service
                     && capability.supports_commit
                     && !capability.requires_approval
             ));
 
         let result = connector.execute_tool(ServiceToolRequest {
-            tool_id: "service.local.docs.read".to_string(),
+            tool_id: "service.local.docs.summarize_ref".to_string(),
             resource_id: "doc-1".to_string(),
             title: "Architecture".to_string(),
             input: serde_json::json!({}),
         });
 
         assert_eq!(result.status, "ok");
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(result.output["operation"], "summarize_ref");
+        assert_eq!(result.output["content_read"], false);
+        assert_eq!(result.output["metadata_only"], true);
         assert_eq!(
             result.resource.unwrap().reference,
             "service://local.docs/document/doc-1"
         );
+    }
+
+    #[test]
+    fn local_docs_registry_rejects_retired_and_noncanonical_tool_ids() {
+        let registry = builtin_service_connector_registry();
+        let connector = registry.connector("local.docs").unwrap();
+        for id in [
+            "service.local.docs.read",
+            "service.local.docs.export",
+            "summarize_ref",
+            "foreign.summarize_ref",
+            "service.local.docs.summarize_ref.extra",
+            "service.local.docs.read.summarize_ref",
+            "service.local.docs.",
+            "",
+        ] {
+            let result = connector.execute_tool(ServiceToolRequest {
+                tool_id: id.into(),
+                resource_id: "doc-1".into(),
+                title: "Architecture".into(),
+                input: serde_json::json!({}),
+            });
+            assert_eq!(result.status, "unsupported", "{id}");
+            assert_eq!(result.tool_id, id);
+            assert!(result.resource.is_none(), "{id}");
+        }
+    }
+
+    #[test]
+    fn historical_local_docs_read_result_remains_metadata_not_read_proof() {
+        let original = serde_json::json!({
+            "status":"ok", "tool_id":"service.local.docs.read",
+            "resource":null,
+            "output":{"operation":"read", "summary":"Historical reference metadata", "read_only":true}
+        });
+        let decoded: ServiceToolResult = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), original);
     }
 
     #[test]

@@ -606,7 +606,7 @@
             workspace,
         ));
         let request = serde_json::json!({
-            "tool_id": "service.local.docs.read",
+            "tool_id": "service.local.docs.summarize_ref",
             "resource_id": "context-doc",
             "title": "Context Resource Plan",
             "mode": "dry_run",
@@ -668,7 +668,7 @@
             workspace,
         ));
         let request = serde_json::json!({
-            "tool_id": "service.local.docs.read",
+            "tool_id": "service.local.docs.summarize_ref",
             "resource_id": "evidence-doc",
             "title": "Evidence Resource",
             "mode": "dry_run",

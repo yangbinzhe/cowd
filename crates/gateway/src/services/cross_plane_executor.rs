@@ -71,7 +71,8 @@ impl ScopedNodeBackend for GatewayConnectorServiceExecutor {
             })?),
             wait_class: None,
             summary: Some(format!(
-                "Cross-plane operation completed with status {status:?}"
+                "Connector service returned {} ({status:?})",
+                result.status
             )),
             evidence_refs: Vec::new(),
             failure: None,
@@ -256,6 +257,83 @@ mod tests {
     use super::*;
     use runtime::{CrossPlaneOutboundMessagePlan, RuntimeEventStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn local_docs_executor_rejects_retired_ids_without_completing_a_node() {
+        for tool_id in [
+            "service.local.docs.read",
+            "service.local.docs.export",
+            "foreign.summarize_ref",
+            "service.local.docs.summarize_ref.extra",
+            "service.local.docs.summarize_ref",
+        ] {
+            let executor = GatewayConnectorServiceExecutor::new(
+                "local.docs".into(),
+                ServiceToolRequest {
+                    tool_id: tool_id.into(),
+                    resource_id: "metadata-only-doc".into(),
+                    title: "Reference metadata".into(),
+                    input: serde_json::Value::Null,
+                },
+            );
+            let outcome = executor
+                .execute(&NodeExecutionTicket {
+                    graph_id: "local-docs-graph".into(),
+                    node_id: "metadata-operation".into(),
+                    executor_kind: "connector_service".into(),
+                    service_class:
+                        harness_contract::execution_graph::ExecutionServiceClass::Foreground,
+                    attempt: 1,
+                    idempotency_key: format!("local-docs:{tool_id}"),
+                    payload_ref: "local-docs-request".into(),
+                })
+                .await
+                .unwrap();
+            let result: connector::ServiceToolResult =
+                serde_json::from_str(outcome.result.result_ref.as_deref().unwrap()).unwrap();
+            if tool_id == "service.local.docs.summarize_ref" {
+                assert_eq!(outcome.result.status, ExecutionNodeStatus::Completed);
+                assert_eq!(result.status, "ok");
+                assert_eq!(result.output["content_read"], false);
+                assert_eq!(result.output["metadata_only"], true);
+            } else {
+                assert_eq!(
+                    outcome.result.status,
+                    ExecutionNodeStatus::Failed,
+                    "{tool_id}"
+                );
+                assert_eq!(result.status, "unsupported");
+                assert!(result.resource.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retired_local_docs_receipt_remains_readable_without_reexecution() {
+        let original = serde_json::json!({
+            "id":"historical-local-docs-receipt", "timestamp":"2026-10-01T00:00:00Z",
+            "idempotency_key":"historical-local-docs", "mode":"commit",
+            "status":"executed", "dispatch_status":"service_executed",
+            "action":runtime::CrossPlaneAction::new("user:historical", "service.local.docs.read"),
+            "decision":{
+                "decision":"allow", "reason":"historical decision",
+                "matched_grant":null, "required_approval":null, "degrade_to":null
+            },
+            "blockers":[], "audit_record_id":null,
+            "execution_graph_id":null, "dispatch_target":null, "dispatch_outcome":null
+        });
+        let receipt: runtime::CrossPlaneExecutionReceipt =
+            serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(
+            receipt.action.requested_capability,
+            "service.local.docs.read"
+        );
+        assert_eq!(serde_json::to_value(receipt).unwrap(), original);
+        assert!(!builtin_service_connector_registry()
+            .capabilities()
+            .iter()
+            .any(|capability| capability.capability_id == "service.local.docs.read"));
+    }
 
     struct CountingSender {
         sends: AtomicUsize,

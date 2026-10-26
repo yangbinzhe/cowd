@@ -662,21 +662,21 @@ impl CommandPalette {
         if let Some(docs_provider) = snapshot
             .connector_capabilities
             .iter()
-            .find(|capability| capability.capability_id == "service.local.docs.read")
+            .find(|capability| capability.capability_id == "service.local.docs.summarize_ref")
             .map(|capability| capability.provider.as_str())
         {
             let docs_label = connector_docs_label(docs_provider);
             self.all_commands.push(CommandEntry::dynamic(
                 format!("{docs_label} Dry Run"),
                 format!(
-                    "Use {docs_provider} connector console contract for a non-destructive service read"
+                    "Use {docs_provider} connector console contract for a non-destructive reference metadata summary"
                 ),
                 Action::Execute("/cross-plane".into()),
             ));
             self.all_commands.push(CommandEntry::dynamic(
                 format!("{docs_label} Commit"),
                 format!(
-                    "Commit a governed {docs_provider} connector service read and persist the resource ref"
+                    "Commit a governed {docs_provider} connector reference metadata summary and persist the resource ref"
                 ),
                 Action::Execute("/cross-plane".into()),
             ));
@@ -1528,7 +1528,7 @@ mod tests {
             }],
             connector_capabilities: vec![
                 crate::runtime_control_store::ConnectorCapabilitySummary {
-                    capability_id: "service.local.docs.read".to_string(),
+                    capability_id: "service.local.docs.summarize_ref".to_string(),
                     provider: "mock".to_string(),
                     plane: "service".to_string(),
                     risk: "low".to_string(),

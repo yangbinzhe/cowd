@@ -3163,7 +3163,7 @@ mod tests {
         }]);
         panel.set_connector_capabilities(vec![
             ConnectorCapabilitySummary {
-                capability_id: "service.local.docs.read".to_string(),
+                capability_id: "service.local.docs.summarize_ref".to_string(),
                 provider: "mock".to_string(),
                 plane: "service".to_string(),
                 risk: "low".to_string(),
@@ -3212,7 +3212,8 @@ mod tests {
             "Should show connector account, got: {joined}"
         );
         assert!(
-            joined.contains("service.local.docs.read") && joined.contains("mcp.filesystem.server"),
+            joined.contains("service.local.docs.summarize_ref")
+                && joined.contains("mcp.filesystem.server"),
             "Should show connector capabilities, got: {joined}"
         );
         assert!(

@@ -709,7 +709,7 @@
             .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
         assert!(list
             .iter()
-            .any(|item| item["capability_id"] == "service.local.docs.read"
+            .any(|item| item["capability_id"] == "service.local.docs.summarize_ref"
                 && item["plane"] == "service"));
         assert!(!list.iter().any(|item| {
             item["capability_id"]
@@ -912,12 +912,32 @@
         assert_eq!(json["kind"], "connector_service_tools");
         assert_eq!(json["service"]["id"], "local.docs");
         assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
-            tool["capability_id"] == "service.local.docs.read" && tool["plane"] == "service"
+            tool["capability_id"] == "service.local.docs.summarize_ref" && tool["plane"] == "service"
         }));
+        assert_eq!(json["tools"].as_array().unwrap().len(), 1);
+        for retired in ["service.local.docs.read", "service.local.docs.export"] {
+            let response = app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/local.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({
+                        "tool_id":retired, "resource_id":"retired-doc", "title":"Retired operation",
+                        "mode":"commit", "idempotency_key":format!("retired-{}", uuid::Uuid::new_v4())
+                    }).to_string()))
+                    .unwrap()
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let denied: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(denied["result"]["status"], "blocked");
+            assert_eq!(denied["receipt"]["dispatch_status"], "not_dispatched");
+            assert!(denied["execution_graph"].is_null());
+        }
 
         let key = format!("mock-docs-{}", uuid::Uuid::new_v4());
         let request = serde_json::json!({
-            "tool_id": "service.local.docs.read",
+            "tool_id": "service.local.docs.summarize_ref",
             "resource_id": "doc-1",
             "title": "Architecture",
             "mode": "dry_run",
@@ -948,7 +968,7 @@
         );
         assert_eq!(
             first_json["receipt"]["action"]["requested_capability"],
-            "service.local.docs.read"
+            "service.local.docs.summarize_ref"
         );
         assert_eq!(
             first_json["receipt"]["action"]["resource_ref"],
@@ -1005,7 +1025,7 @@
             workspace.clone(),
         ));
         let request = serde_json::json!({
-            "tool_id": "service.local.docs.read",
+            "tool_id": "service.local.docs.summarize_ref",
             "resource_id": "persisted-doc",
             "title": "Persisted Runtime Resource",
             "mode": "dry_run",
@@ -1082,7 +1102,7 @@
             workspace,
         ));
         let request = serde_json::json!({
-            "tool_id": "service.local.docs.read",
+            "tool_id": "service.local.docs.summarize_ref",
             "resource_id": "revalidate-doc",
             "title": "Revalidate Doc",
             "mode": "commit",
@@ -1154,9 +1174,12 @@
                 .await
                 .unwrap(),
         );
-        let app = api_router(test_state_with_memory_and_workspace(manager, tmp.clone()));
+        let app = api_router(test_state_with_memory_and_workspace(
+            manager.clone(),
+            tmp.clone(),
+        ));
         let request = serde_json::json!({
-            "tool_id": "service.local.docs.read",
+            "tool_id": "service.local.docs.summarize_ref",
             "resource_id": "memory-doc",
             "title": "Memory Bridge Doc",
             "mode": "commit",
@@ -1196,7 +1219,11 @@
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "connector_resource_memory_promotion");
-        assert_eq!(json["ok"], true);
+        assert_eq!(
+            json["ok"], true,
+            "memory promotion refused: {}",
+            json["reason"]
+        );
         assert_eq!(json["layer"], "L3");
         let first_memory_id = json["memory_id"].clone();
 
@@ -1221,6 +1248,7 @@
         assert_eq!(json["memory_id"], first_memory_id);
 
         let entries = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/memory/L3")
@@ -1254,6 +1282,93 @@
             })
             .count();
         assert_eq!(duplicate_count, 1);
+        let mut ids = vec![first_memory_id.clone()];
+        let mut cases = vec![(Some("resource-memory-session"), first_memory_id)];
+        for requested_session in [Some("resource-memory-other"), None] {
+            let request = serde_json::json!({
+                "reference":"service://local.docs/document/memory-doc",
+                "session_id":requested_session
+            });
+            let mut memory_id = serde_json::Value::Null;
+            for replayed in [false, true] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/connectors/resources/promote-memory")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(result["ok"], true, "{}", result["reason"]);
+                if replayed {
+                    assert_eq!(result["replayed"], true);
+                    assert_eq!(result["memory_id"], memory_id);
+                } else {
+                    memory_id = result["memory_id"].clone();
+                    assert!(memory_id.as_str().is_some_and(|id| !id.is_empty()));
+                    assert!(
+                        !ids.contains(&memory_id),
+                        "different scopes must not deduplicate"
+                    );
+                    ids.push(memory_id.clone());
+                }
+            }
+            cases.push((requested_session, memory_id));
+        }
+        let stored = manager.list_all_entries().await.unwrap();
+        for (session, id) in cases {
+            let entry = stored
+                .iter()
+                .find(|entry| serde_json::json!(entry.id) == id)
+                .unwrap();
+            let expected_scope = match session {
+                Some(session) => memory::MemoryScope::Session(session.to_string()),
+                None => memory::MemoryScope::Project("connector-resource".to_string()),
+            };
+            assert_eq!(entry.scope, expected_scope);
+            assert_eq!(
+                entry.session_id.as_deref(),
+                Some(session.unwrap_or("connector-resource-bridge"))
+            );
+            assert_eq!(
+                entry.source_agent.as_deref(),
+                Some("connector-resource-bridge")
+            );
+            assert!(entry.content.contains("body_policy: metadata_only"));
+            assert!(!entry.content.contains("external document body"));
+            // Independent origin checks retain a valid baseline and change
+            // only one context identity at a time, without persisting writes.
+            let mut seed = entry.clone();
+            seed.tags.retain(|tag| !tag.starts_with("memory-turn:"));
+            let ctx = memory::MemoryTurnContext::new(
+                session.unwrap_or("connector-resource-bridge"),
+                "connector-resource-bridge",
+            );
+            assert!(
+                memory::store::MemoryExtractionOrigin::for_turn_entry(&ctx, &mut seed.clone()).is_ok()
+            );
+            for (writer_session, writer_agent) in [
+                ("foreign-session", "connector-resource-bridge"),
+                (
+                    session.unwrap_or("connector-resource-bridge"),
+                    "foreign-agent",
+                ),
+            ] {
+                let wrong = memory::MemoryTurnContext::new(writer_session, writer_agent);
+                assert!(memory::store::MemoryExtractionOrigin::for_turn_entry(
+                    &wrong,
+                    &mut seed.clone()
+                )
+                .is_err());
+            }
+        }
         std::fs::remove_dir_all(tmp).ok();
     }
 
@@ -1367,7 +1482,7 @@
         let app = api_router(state);
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = "service.local.docs.read";
+        let capability = "service.local.docs.summarize_ref";
         let grant_id = format!("grant-service-commit-{suffix}");
         let grant = serde_json::json!({
             "id": grant_id,
