@@ -1274,6 +1274,15 @@ impl U5SingleCaseHttpFixture {
     // close-delimited bodies exercise unknown Content-Length; delay starts
     // after headers so timeout tests cover an in-flight body read.
     fn start_wire(script: Vec<(String, Value, bool, Duration)>) -> Self {
+        Self::start_status(
+            script
+                .into_iter()
+                .map(|(p, v, u, d)| (p, v, u, d, 200))
+                .collect(),
+        )
+    }
+
+    fn start_status(script: Vec<(String, Value, bool, Duration, u16)>) -> Self {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1283,7 +1292,7 @@ impl U5SingleCaseHttpFixture {
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut requests = Vec::new();
-            for (expected, response, unknown_length, delay) in script {
+            for (expected, response, unknown_length, delay, status) in script {
                 let mut stream = loop {
                     if stopping.load(std::sync::atomic::Ordering::SeqCst)
                         || Instant::now() >= deadline
@@ -1341,12 +1350,14 @@ impl U5SingleCaseHttpFixture {
                     .to_string();
                 assert_eq!(request, expected, "NoRealU5 request order");
                 requests.push((request, headers, body));
+                if status == 0 {
+                    return requests; // Original transport EOF, without an HTTP response.
+                }
                 let body = serde_json::to_vec(&response).unwrap();
                 let header = if unknown_length {
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-                        .to_string()
+                    format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
                 } else {
-                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                    format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
                 };
                 // A bounded consumer may close early on size/deadline errors.
                 // Request parsing/order and all consumer assertions still fail normally.
@@ -1385,6 +1396,236 @@ impl Drop for U5SingleCaseHttpFixture {
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
+    }
+}
+
+// Exercise the original observer and SessionActor over the existing loopback
+// assembly. The wire records are independent fixtures, not a live ACL claim.
+fn u5_event_first_observation_case(case: &str) -> Result<(Value, U5CancelContext), String> {
+    const EVENTS: &str =
+        "GET /api/sessions/session-a/events?from_seq=0&limit=100&include_payload=true";
+    const GRAPH: &str = "GET /api/runtime/executions/root-a?detail_scope=summary";
+    let page = |events: Vec<Value>| {
+        json!({"session_id":"session-a","from_seq":0,
+        "limit":100,"include_payload":true,"total":events.len(),"has_more":false,"events":events})
+    };
+    let wire = |p: &str, v, status| (p.to_string(), v, false, Duration::ZERO, status);
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    let mut script = vec![
+        wire("POST /api/sessions", json!({"id":"session-a"}), 200),
+        wire(
+            "POST /api/sessions/session-a/attach",
+            json!({"ok":true,"session_id":"session-a",
+            "receipt_attachment":{"client_id":"a1111111-1111-4111-8111-111111111111",
+            "client_expires_at_ms":expires,"receipt_protocol":"session-public-v1"}}),
+            200,
+        ),
+        wire(
+            "POST /api/runtime/session-leases/acquire",
+            json!({"ok":true}),
+            200,
+        ),
+    ];
+    let mut open = u5_fixture_physical_events()[0].clone();
+    if ["success", "foreign", "stale", "already-outcome"].contains(&case) {
+        let mut initial = Vec::new();
+        if case != "success" {
+            let mut old = open.clone();
+            match case {
+                "foreign" => old["payload"]["identity"]["turn_id"] = json!("foreign-turn"),
+                "stale" => old["payload"]["identity"]["step"]["turn_id"] = json!("stale-turn"),
+                "already-outcome" => (),
+                _ => unreachable!(),
+            }
+            initial.push(old);
+            initial.push(json!({"session_id":"session-a","sequence":2,"event_id":"outcome-a",
+                "type":"context.provider_attempt_outcome","payload":{"request_id":"provider-call-a"}}));
+        }
+        script.push(wire(EVENTS, page(initial.clone()), 200));
+        if !initial.is_empty() {
+            open["event_id"] = json!("fresh-open");
+            open["sequence"] = json!(3);
+            open["payload"]["identity"]["request_id"] = json!("fresh-call");
+            open["payload"]["identity"]["response_id"] = json!("fresh-response");
+        }
+        initial.push(open.clone());
+        script.push(wire(EVENTS, page(initial), 200));
+    } else if case != "deadline" {
+        let mut response = page(vec![open.clone()]);
+        if case == "wrong-page" {
+            response["session_id"] = json!("foreign");
+        }
+        if case == "event-budget" {
+            response["total"] = json!(513);
+        }
+        script.push(wire(
+            EVENTS,
+            response,
+            if case == "permission" { 403 } else { 200 },
+        ));
+    }
+    let before_graph_failure =
+        ["deadline", "permission", "wrong-page", "event-budget"].contains(&case);
+    let selected_failure = [
+        "selected-404",
+        "selected-invariant",
+        "selected-transport",
+        "terminal",
+    ]
+    .contains(&case);
+    if !before_graph_failure {
+        let (status, projection) = match case {
+            "selected-404" => (404, json!({"error":"original selected graph missing"})),
+            "selected-invariant" => (404, json!({"error":"history prefix: graph source changed"})),
+            "selected-transport" => (0, Value::Null),
+            "terminal" => (
+                200,
+                json!({"terminal_axes":{"execution":{"phase":"terminal"}}}),
+            ),
+            _ => (
+                200,
+                json!({"terminal_axes":{"execution":{"phase":"active"}}}),
+            ),
+        };
+        script.push(wire(GRAPH, projection, status));
+        if !selected_failure {
+            let mut receipt = u5_fixture_cancelled()["receipt"].clone();
+            if case != "success" && case != "post-404" {
+                receipt["status"] = json!("already_terminal");
+            }
+            script.push(wire("POST /api/sessions/session-a/cancel", receipt, 200));
+            if case == "success" {
+                script.push(wire(
+                    GRAPH,
+                    u5_fixture_cancelled()["projection"].clone(),
+                    200,
+                ));
+                script.push(wire(EVENTS, page(u5_fixture_physical_events()), 200));
+                let [a, b] = u5_fixture_resource_events();
+                script.push(wire(
+                    &u5_resource_path("session-a", None, 100),
+                    u5_resource_page("session-a", None, Some("v2:0:1:0"), false, a),
+                    200,
+                ));
+                script.push(wire(
+                    &u5_resource_path("session-b", None, 100),
+                    u5_resource_page("session-b", None, Some("v2:0:3:0"), false, b),
+                    200,
+                ));
+            } else if case == "post-404" {
+                script.push(wire(
+                    GRAPH,
+                    json!({"error":"post-cancel original graph missing"}),
+                    404,
+                ));
+            }
+        }
+    }
+    // A deliberate transport close also closes the scripted server; do not
+    // turn the consequent cleanup refusal into evidence of business success.
+    if case != "selected-transport" {
+        script.push(wire(
+            "POST /api/runtime/session-leases/release",
+            json!({"ok":true}),
+            200,
+        ));
+        script.push(wire(
+            "POST /api/sessions/session-a/detach",
+            json!({"ok":true}),
+            200,
+        ));
+    }
+    let expected = script.len();
+    let mut fixture = U5SingleCaseHttpFixture::start_status(script);
+    let mut runner = u5_fixture_runner(&fixture.url);
+    let now = Instant::now();
+    runner.u5_deadline = Some(now + Duration::from_secs(2));
+    let mut owner = u5_fixture_owner();
+    owner.base_url = fixture.url.clone();
+    struct UnusedSource;
+    impl U5EvidenceReader for UnusedSource {
+        fn owner(&self) -> Result<U5Owner, String> {
+            panic!("observer must use its original supplied owner")
+        }
+    }
+    let mut actor = SessionActor::create(
+        &runner.client,
+        &fixture.url,
+        None,
+        "event-first-fixture",
+        now + Duration::from_secs(2),
+    )
+    .unwrap();
+    let result = runner.observe_u5_cancel(
+        &u5_fixture_id("a"),
+        &owner,
+        &UnusedSource,
+        &["session-a".into(), "session-b".into()],
+        &mut actor,
+        if case == "deadline" {
+            now - Duration::from_secs(91)
+        } else {
+            now
+        },
+        "fixture-cancel",
+    );
+    let cleanup = actor.finish();
+    let requests = fixture.finish();
+    assert_eq!(
+        requests.len(),
+        expected,
+        "{case}: every expected boundary must be reached"
+    );
+    if case != "selected-transport" {
+        cleanup.unwrap();
+    }
+    if let Some((_, _, body)) = requests
+        .iter()
+        .find(|(path, _, _)| path == "POST /api/sessions/session-a/cancel")
+    {
+        assert_eq!(
+            body,
+            &json!({"cancellation_id":"fixture-cancel","expected_execution_id":"root-a","expected_turn_id":"turn-a"})
+        );
+    }
+    result
+}
+
+#[test]
+fn u5_event_first_original_observer_waits_for_open_then_proves_physical_cancel() {
+    let (result, request) = u5_event_first_observation_case("success").unwrap();
+    assert_eq!(request.started_source, "opened-a");
+    assert_eq!(result["status"], "cancelled");
+    assert!(result["physical_cancellation"].is_object());
+    assert_eq!(
+        result["projection"]["terminal_axes"]["execution"]["settlement"],
+        "proven_settled"
+    );
+}
+
+#[test]
+fn u5_event_first_original_observer_rejects_foreign_closed_and_failed_boundaries() {
+    for (case, expected) in [
+        ("foreign", "AlreadyTerminal"),
+        ("stale", "AlreadyTerminal"),
+        ("already-outcome", "AlreadyTerminal"),
+        ("already-terminal", "AlreadyTerminal"),
+        ("terminal", "EOF/terminal"),
+        ("selected-404", "404"),
+        ("selected-invariant", "history prefix"),
+        ("selected-transport", "error sending request"),
+        ("post-404", "404"),
+        ("permission", "evidence response rejected"),
+        ("wrong-page", "page identity mismatch"),
+        ("event-budget", "exceeds event budget"),
+        ("deadline", "coverage missing"),
+    ] {
+        let error = u5_event_first_observation_case(case).err().expect(case);
+        assert!(error.contains(expected), "{case}: {error}");
     }
 }
 

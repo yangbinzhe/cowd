@@ -2636,19 +2636,6 @@ impl LiveScenarioRunner {
             }
             actor.maintain_receipt_authority()?;
             let events = self.read_u5_session_events(&identity.session, start_deadline)?;
-            let projection = self.get_json(&format!(
-                "/api/runtime/executions/{}?detail_scope=summary",
-                identity.root
-            ))?;
-            if projection
-                .pointer("/terminal_axes/execution/phase")
-                .and_then(Value::as_str)
-                == Some("terminal")
-            {
-                return Err(
-                    "U5 EOF/terminal won before active cancellation; coverage not hit".into(),
-                );
-            }
             if let Some(event) = events.iter().rev().find(|event| {
                 u5_opened_identity(event, identity).is_some_and(|physical| {
                     !events.iter().any(|later| {
@@ -2665,6 +2652,17 @@ impl LiveScenarioRunner {
                     .min(start_deadline.saturating_duration_since(Instant::now())),
             );
         };
+        let projection = self.get_json(&format!(
+            "/api/runtime/executions/{}?detail_scope=summary",
+            identity.root
+        ))?;
+        if projection
+            .pointer("/terminal_axes/execution/phase")
+            .and_then(Value::as_str)
+            == Some("terminal")
+        {
+            return Err("U5 EOF/terminal won before active cancellation; coverage not hit".into());
+        }
         let request = U5CancelContext {
             identity: identity.clone(),
             cancellation_id: cancellation_id.to_owned(),
