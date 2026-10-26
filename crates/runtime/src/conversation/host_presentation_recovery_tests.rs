@@ -3975,6 +3975,85 @@ async fn real_host_471_cli_original_terminal_recovers_after_owner_restart() {
 }
 
 #[tokio::test]
+async fn real_host_213_strict_json_survives_synthesize_commit_and_recovery() {
+    const ANSWER: &str = "  {\"summary\":\"literal data\",\"package_name\":\"runtime\",\"path\":\"crates/runtime/Cargo.toml\"}\n";
+    let fixture = PublicationFixture::new();
+    let hot = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
+    {
+        let mut state = hot.state.lock().await;
+        state.content = "Return strict JSON only with summary, package_name and path.".into();
+        state.terminal_override = Some((GoalCompletion::Satisfied, ANSWER.into()));
+    }
+    let outcome = hot.synthesize(&fixture.ticket).await.unwrap();
+    assert_eq!(
+        outcome
+            .delivery_envelope
+            .as_ref()
+            .unwrap()
+            .user_answer_contract
+            .format,
+        harness_contract::outcome::UserAnswerFormat::StrictJson
+    );
+    assert_eq!(
+        outcome
+            .terminal_presentation
+            .as_ref()
+            .unwrap()
+            .validation
+            .status,
+        harness_contract::outcome::AnswerValidationStatus::Valid
+    );
+    fixture.commit(&outcome);
+    let document = fixture
+        .services
+        .commit_service()
+        .committed_host_transcript(&fixture.ticket)
+        .unwrap();
+    assert_eq!(document.messages.len(), 1);
+    let committed = synthesize_publication_message(&document.messages[0]).unwrap();
+    assert_eq!(synthesize_terminal_text(&committed), Some(ANSWER));
+    hot.after_commit(&fixture.ticket).await.unwrap();
+    assert_eq!(
+        hot.state
+            .lock()
+            .await
+            .summary
+            .as_ref()
+            .unwrap()
+            .final_answer,
+        ANSWER
+    );
+    let published = messages(&hot).await;
+    assert_eq!(
+        synthesize_terminal_text(published.last().unwrap()),
+        Some(ANSWER)
+    );
+    let parsed: serde_json::Value = serde_json::from_str(ANSWER).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "summary":"literal data", "package_name":"runtime",
+            "path":"crates/runtime/Cargo.toml"
+        })
+    );
+    drop(hot);
+    let cold = fixture.host(fixture.restart_services(), fixture.session.clone(), false);
+    cold.after_commit(&fixture.ticket).await.unwrap();
+    assert_eq!(
+        cold.state
+            .lock()
+            .await
+            .summary
+            .as_ref()
+            .unwrap()
+            .final_answer,
+        ANSWER
+    );
+    assert_eq!(messages(&cold).await, published);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn real_host_471_hot_repeated_and_concurrent_after_commit_append_once() {
     let fixture = PublicationFixture::new();
     let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);

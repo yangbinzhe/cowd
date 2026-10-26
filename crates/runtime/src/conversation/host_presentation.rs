@@ -104,6 +104,56 @@ mod terminal_validation_tests {
     }
 
     #[test]
+    fn strict_json_two_fields_preserve_literal_terminal_bytes() {
+        let text = "  {\"package_name\":\"runtime\",\"path\":\"crates/runtime/Cargo.toml\"}\n";
+        let envelope = envelope(UserAnswerFormat::StrictJson);
+        assert!(qualified_root_answer(text, &envelope));
+        assert_eq!(
+            visible_final_answer(text, envelope.user_answer_contract.format),
+            text
+        );
+    }
+
+    #[test]
+    fn strict_json_summary_is_data_not_a_replacement_answer() {
+        let text = r#"{"summary":"keep this field","answer":"also data","content":"literal","package_name":"runtime"}"#;
+        let envelope = envelope(UserAnswerFormat::StrictJson);
+        assert!(qualified_root_answer(text, &envelope));
+        assert_eq!(
+            visible_final_answer(text, envelope.user_answer_contract.format),
+            text
+        );
+    }
+
+    #[test]
+    fn strict_json_qualification_and_markdown_rendering_remain_distinct() {
+        let strict = envelope(UserAnswerFormat::StrictJson);
+        for malformed in [
+            "{",
+            r#"{"package_name":}"#,
+            "```json\n{}\n```",
+            "plain text",
+        ] {
+            assert!(!qualified_root_answer(malformed, &strict), "{malformed}");
+        }
+        let markdown = envelope(UserAnswerFormat::Markdown);
+        assert_eq!(
+            visible_final_answer(
+                r#"{"package_name":"runtime","path":"crates/runtime/Cargo.toml"}"#,
+                markdown.user_answer_contract.format,
+            ),
+            "已完成：\n- package_name: runtime\n- path: crates/runtime/Cargo.toml\n"
+        );
+        assert_eq!(
+            visible_final_answer(
+                r#"{"summary":"render this summary","extra":"retained source data"}"#,
+                markdown.user_answer_contract.format,
+            ),
+            "render this summary"
+        );
+    }
+
+    #[test]
     fn narrator_failure_survives_truth_correction_in_the_actual_presentation() {
         let envelope = envelope(UserAnswerFormat::StrictJson);
         let original = envelope.clone();
@@ -1921,7 +1971,8 @@ where
                 attempt_id.clone(),
             )
         } else if let Some(answer) = direct_answer {
-            let visible_answer = visible_final_answer(&answer);
+            let visible_answer =
+                visible_final_answer(&answer, envelope.user_answer_contract.format);
             if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
                 bus.emit_synthetic_text_item("terminal-presentation", &visible_answer);
                 bus.emit(CowdEvent::TerminalDelivery {
@@ -3524,9 +3575,15 @@ pub(super) fn user_facing_blocked_answer(raw: &str, language: &str) -> String {
     markdown
 }
 
-/// Convert a structured JSON contract answer into user-visible Markdown without
-/// corrupting the raw `assistant_json:` result_ref consumed by validators.
-pub(super) fn visible_final_answer(text: &str) -> String {
+/// Preserve an already-qualified strict JSON answer byte for byte. Other answer
+/// contracts retain the user-visible rendering of structured model results.
+pub(super) fn visible_final_answer(
+    text: &str,
+    format: harness_contract::outcome::UserAnswerFormat,
+) -> String {
+    if format == harness_contract::outcome::UserAnswerFormat::StrictJson {
+        return text.to_string();
+    }
     let trimmed = text.trim();
     if let Ok(serde_json::Value::Object(object)) =
         serde_json::from_str::<serde_json::Value>(trimmed)
