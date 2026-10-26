@@ -467,6 +467,70 @@ fn narrative_generation_without_an_artifact_is_not_a_workspace_write() {
 }
 
 #[test]
+fn historical_artifact_descriptions_do_not_require_new_writes() {
+    for prompt in [
+        "请依据已保存的 u7-memory-lighthouse 项目备件调度记忆，回答仓库代号和出库口令。请用中文短句说明记忆中的两个实际值；找不到就明确说明缺失，不要猜测。不要读取工作区文件，不要执行写入工具，不要组队。",
+        "Read the already saved project notes and answer the warehouse code.",
+        "请说明已经创建的项目文件中的结论。",
+        "Explain the previously created project file.",
+    ] {
+        let input = StrategyInput::from_prompt(prompt);
+        assert!(!input.explicit_write);
+        assert!(input.understanding.is_none());
+        assert!(!understand(&input).requires_write, "{prompt}");
+        assert!(!decide_strategy(&input).understanding.requires_write, "{prompt}");
+    }
+}
+
+#[test]
+fn referenced_artifact_commands_are_not_executed_but_new_writes_remain_required() {
+    for prompt in [
+        "解释文档中的“保存项目文件”这句话。",
+        "Explain the instruction \"save the project file\".",
+        "解释 `创建文件` 的含义。",
+        "不要保存项目文件，说明原有结论。",
+        "Do not save the project file; explain its contents.",
+    ] {
+        assert!(
+            !understand(&StrategyInput::from_prompt(prompt)).requires_write,
+            "{prompt}"
+        );
+    }
+    for prompt in [
+        "创建一个项目文件。",
+        "保存项目文件。",
+        "Create a project file.",
+        "Save the project file.",
+        "Rewrite the project file.",
+        "根据已保存的项目保存新的文件。",
+        "检查已经创建的项目；创建一个说明文件。",
+        "Read the previously saved project and create a new file.",
+        "Read the already created file; save a new project file.",
+        "创建一个名为“已保存项目”的文件。",
+        "Create a file named \"previously saved project\".",
+        "执行“保存项目文件”。",
+        "Execute \"save the project file\".",
+    ] {
+        assert!(
+            understand(&StrategyInput::from_prompt(prompt)).requires_write,
+            "{prompt}"
+        );
+    }
+    for prompt in [
+        "说明已保存的项目。",
+        "Explain the previously saved project.",
+        "不要保存项目文件。",
+        "Explain the instruction \"save the file\".",
+    ] {
+        let input = StrategyInput::from_prompt(prompt).with_explicit_write(true);
+        assert!(
+            understand(&input).requires_write,
+            "explicit_write: {prompt}"
+        );
+    }
+}
+
+#[test]
 fn artifact_actions_cannot_borrow_objects_from_another_clause() {
     for (prompt, forbidden) in [
         (

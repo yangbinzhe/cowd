@@ -3144,7 +3144,72 @@ fn requests_persisted_artifact(normalized: &str) -> bool {
         .split([
             '，', ',', '。', '.', '；', ';', '！', '!', '？', '?', '\n', '\r',
         ])
-        .any(|clause| contains_any(clause, ACTIONS) && contains_any(clause, ARTIFACTS))
+        .any(|clause| {
+            contains_any(clause, ARTIFACTS)
+                && ACTIONS.iter().any(|action| {
+                    clause.match_indices(action).any(|(offset, _)| {
+                        let before = &clause[..offset];
+                        // A reference to an existing artifact is not a new
+                        // command. Inspect each verb independently so a later
+                        // affirmative write in the same clause still counts.
+                        let historical = [
+                            "已经",
+                            "已",
+                            "曾经",
+                            "曾",
+                            "此前",
+                            "之前",
+                            "先前",
+                            "already ",
+                            "previously ",
+                            "formerly ",
+                        ]
+                        .iter()
+                        .any(|prefix| before.ends_with(prefix));
+                        !historical && !inside_action_reference(before)
+                    })
+                })
+        })
+}
+
+/// A request to explain or quote an instruction does not execute that text.
+/// Do not suppress other quoted commands (`execute "save the file"`) or
+/// affirmative verbs outside quoted artifact names.
+fn inside_action_reference(prefix: &str) -> bool {
+    let instruction = prefix.trim_start();
+    let instruction = instruction.strip_prefix("请").unwrap_or(instruction);
+    let instruction = instruction.strip_prefix("please ").unwrap_or(instruction);
+    if !["解释", "说明", "引用", "explain ", "describe ", "quote "]
+        .iter()
+        .any(|verb| instruction.starts_with(verb))
+    {
+        return false;
+    }
+    let mut closing = None;
+    let mut escaped = false;
+    for ch in prefix.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if closing == Some(ch) {
+            closing = None;
+        } else if closing.is_none() {
+            closing = match ch {
+                '"' | '`' => Some(ch),
+                '“' => Some('”'),
+                '‘' => Some('’'),
+                '「' => Some('」'),
+                '『' => Some('』'),
+                _ => None,
+            };
+        }
+    }
+    closing.is_some()
 }
 
 /// Returns whether an explicitly requested Team, rather than the parent
